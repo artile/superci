@@ -37,8 +37,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "What your CI is called where people read it: the dashboard's header, the GitHub App's name for an organization\nadded from then on, and what a job's page says when it could not be run. SuperCI unless you name it.\n\nupdate    Calls it NAME (\"AcmeCI\", \"Acme CI\"): 2 to 24 letters, digits, spaces and dashes. `SuperCI` puts it back.\n          The command stays `superci`; what workflows name is `superci labels`."),
     ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--arch=x64|arm64] [--os=linux|windows] [--on-demand=true|false]",
         "The machine `runs-on: superci` alone gets. A job's label can ask for another (`superci-8cpu-arm64`)."),
-    ("limits", "  superci limits retrieve\n  superci limits update [--max-cpu=N] [--max-hours=N]",
-        "--max-cpu     The largest machine a label may ask for (32 unless set). A label asking for more is refused.\n--max-hours   The longest a job may run: its machine is ended after this (6 unless set, as on GitHub's own runners;\n              120 at most). Whatever is set, a machine on Cloudflare lives 6 hours at most and one on Modal 24. A\n              workflow's timeout-minutes ends a job sooner."),
+    ("limits", "  superci limits retrieve\n  superci limits update [--max-cpu=N] [--max-hours=N] [--monthly-usd=N|none]",
+        "--monthly-usd The most the CI may spend on machines in a month, all providers together (no limit unless set).\n              At it no job starts until next month or a higher limit. A cloud account's own limit is\n              `superci accounts update aws --monthly-usd=N`; a provider's, `superci runners update`.\n--max-cpu     The largest machine a label may ask for (32 unless set). A label asking for more is refused.\n--max-hours   The longest a job may run: its machine is ended after this (6 unless set, as on GitHub's own runners;\n              120 at most). Whatever is set, a machine on Cloudflare lives 6 hours at most and one on Modal 24. A\n              workflow's timeout-minutes ends a job sooner."),
     ("public_repos", "  superci public_repos list\n  superci public_repos create OWNER/REPO\n  superci public_repos delete OWNER/REPO",
         "Public repositories allowed to run here. Jobs from public repositories are refused unless the repository is allowed.\nEven then, a fork's pull request and `pull_request_target` runs are refused."),
     ("connections", "  superci connections list\n  superci connections create github OWNER [--host=https://github.example.com]\n  superci connections create gitlab --url=https://gitlab.com [--gitlab=ID|new]\n  superci connections delete github OWNER --confirm\n  superci connections delete gitlab [ID] --confirm",
@@ -47,8 +47,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "What GitHub says of the events it sent your control plane lately: for a job that never got a machine.\n\nlist      The newest hundred: when, what (a job queued, begun, ended), and how it was answered. A job that is in no\n          line was never sent by GitHub; the control plane finds such jobs by asking, within a few minutes.\nretrieve  One of them, with the job it was about, the address it was sent to and what was answered."),
     ("projects", "  superci projects list [--gitlab=ID]\n  superci projects update PROJECT_ID --enabled=true|false [--gitlab=ID]\n  superci projects update --all --enabled=true [--gitlab=ID]",
         "The projects a GitLab connection's token reaches (on GitHub, repositories are chosen where the App is installed).\n\nlist      Each with its id and whether its jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
-    ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]",
-        "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
+    ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]\n  superci accounts update aws --monthly-usd=N|none",
+        "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most the AWS account may spend on machines in a month, its spot and on-demand machines together\n          (`none` lifts it). At it, jobs go to the providers of other accounts in the order. The whole CI's limit\n          is `superci limits update --monthly-usd=N`.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
     ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
@@ -431,6 +431,19 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let said = if accounts.is_empty() { vec![NOT_SIGNED_IN.to_string()] } else { accounts.iter().map(|a| format!("{:<11} {}{}", a["cloud"].as_str().unwrap_or_default(), a["id"].as_str().unwrap_or_default(), a["signed_in_as"].as_str().map(|w| format!("  {w}")).unwrap_or_default()).trim_end().to_string()).collect() };
             Ok(Done { said, data: json!({ "accounts": accounts }) })
         }
+        // An account's limit for a month, its providers together (AWS: spot and on-demand machines).
+        ("accounts", "update") => {
+            if w(2) != "aws" { return usage("Say which cloud's: `superci accounts update aws --monthly-usd=200`. Another provider's limit is its own: `superci runners update CLOUD --monthly-usd=N`.") }
+            let Some(usd) = args.get("monthly-usd") else { return usage("Say what to change: `superci accounts update aws --monthly-usd=200` (`none` lifts it).") };
+            let usd = dollars(usd)?;
+            let mut d = signed_in();
+            to_set(&mut d)?;
+            in_use(&d)?;
+            apply!(d, args, if usd.is_empty() { "lift the AWS account's limit for a month".to_string() } else { format!("let the AWS account spend up to ${usd} a month on machines (spot and on-demand together)") }, "/routing", &[field("action", "account_usd"), field("account", "aws"), field("usd", usd)]);
+            let v = view(&mut d)?;
+            let (spent, cap) = (v.spend_account("aws"), v.routing().account_usd.get("aws").copied());
+            Ok(Done { said: vec![month_line("The AWS account", spent, cap)], data: json!({ "ok": true, "cloud": "aws", "monthly_usd": cap, "spent_usd": spent }) })
+        }
         ("accounts", "retrieve") => {
             if w(2) != "aws" { return usage("Say which cloud's: `superci accounts retrieve aws` (the look is at AWS accounts; other clouds have nothing to look for yet).") }
             let mut d = signed_in();
@@ -690,15 +703,21 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("limits", operation @ ("retrieve" | "update")) => {
             let mut d = signed_in();
             if operation == "update" {
-                if !args.has("max-cpu") && !args.has("max-hours") { return usage("Say what to change: `superci limits update --max-hours=12` (see `superci help limits`).") }
+                if !args.has("max-cpu") && !args.has("max-hours") && !args.has("monthly-usd") { return usage("Say what to change: `superci limits update --monthly-usd=200` (see `superci help limits`).") }
                 to_set(&mut d)?;
                 in_use(&d)?;
                 if let Some(max) = args.get("max-cpu") { apply!(d, args, format!("let a label ask for up to {max} CPUs"), "/routing", &[field("action", "max_cpu"), field("max_cpu", max)]); }
                 if let Some(hours) = args.get("max-hours") { apply!(d, args, format!("let a job run for up to {hours} hours"), "/routing", &[field("action", "max_hours"), field("max_hours", hours)]); }
+                if let Some(usd) = args.get("monthly-usd") {
+                    let usd = dollars(usd)?;
+                    apply!(d, args, if usd.is_empty() { "lift the CI's limit for a month".to_string() } else { format!("let the CI spend up to ${usd} a month on machines") }, "/routing", &[field("action", "monthly_usd"), field("usd", usd)]);
+                }
             }
-            let routing = view(&mut d)?.routing();
-            let (cpu, hours) = (routing.max_cpu.unwrap_or(superci_core::plane::MAX_CPU), routing.max_minutes.unwrap_or(superci_core::plane::MAX_JOB_MINUTES) / 60);
-            Ok(Done { said: vec![format!("A label may ask for up to {cpu} CPUs."), format!("A job may run for up to {hours} hours (6 at most on Cloudflare, 24 on Modal).")], data: json!({ "ok": true, "max_cpu": cpu, "max_hours": hours }) })
+            let v = view(&mut d)?;
+            let routing = v.routing();
+            let (cpu, hours, spent) = (routing.max_cpu.unwrap_or(superci_core::plane::MAX_CPU), routing.max_minutes.unwrap_or(superci_core::plane::MAX_JOB_MINUTES) / 60, v.spend_total());
+            Ok(Done { said: vec![month_line("The CI", spent, routing.monthly_usd), format!("A label may ask for up to {cpu} CPUs."), format!("A job may run for up to {hours} hours (6 at most on Cloudflare, 24 on Modal).")],
+                data: json!({ "ok": true, "max_cpu": cpu, "max_hours": hours, "monthly_usd": routing.monthly_usd, "spent_usd": spent }) })
         }
         ("public_repos", "list") => {
             let allowed = view(&mut signed_in())?.routing().public_repos;
@@ -771,6 +790,17 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             None => format!("`{word}` is not a command of superci."),
         }),
     }
+}
+
+/// A limit in dollars a month as a command gives it: a whole number of dollars, or `none` (empty: no limit).
+fn dollars(given: &str) -> Result<String> {
+    if given == "none" { return Ok(String::new()) }
+    match given.parse::<u32>() { Ok(n) if n >= 1 => Ok(n.to_string()), _ => Err("A limit is a whole number of dollars a month (`--monthly-usd=200`), or `none`.".into()) }
+}
+
+/// What was spent on machines this month and the limit it counts against, in a line.
+fn month_line(whose: &str, spent: f64, cap: Option<f64>) -> String {
+    match cap { Some(cap) => format!("{whose} spent ${spent:.2} on machines this month, of ${cap:.0} allowed."), None => format!("{whose} spent ${spent:.2} on machines this month; no limit is set.") }
 }
 
 /// `superci dashboard`, `superci login [cloud]` and `superci connections create github`: the dashboard, or the dashboard opened
@@ -1013,6 +1043,15 @@ mod tests {
     use super::*;
 
     fn args(line: &str) -> Args { Args::parse(&line.split_whitespace().map(str::to_string).collect::<Vec<_>>()).unwrap() }
+
+    /// A limit a month is whole dollars or `none`; what was spent is said against it.
+    #[test]
+    fn a_monthly_limit_is_whole_dollars_or_none() {
+        assert_eq!((dollars("200").unwrap(), dollars("none").unwrap()), ("200".to_string(), String::new()));
+        for bad in ["0", "-5", "12.5", "lots", ""] { assert!(dollars(bad).is_err(), "{bad}") }
+        assert_eq!(month_line("The CI", 14.224, Some(100.0)), "The CI spent $14.22 on machines this month, of $100 allowed.");
+        assert_eq!(month_line("The AWS account", 0.0, None), "The AWS account spent $0.00 on machines this month; no limit is set.");
+    }
 
     #[test]
     fn a_name_that_is_none_of_the_control_planes_here_stops_the_command() {

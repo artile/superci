@@ -944,6 +944,8 @@ impl<'a> ControlPlane<'a> {
             "read_keys": if self.dashboard(req) { serde_json::json!(self.config.read_keys.iter().map(|(until, name, _)| serde_json::json!({ "name": name, "until_ms": until })).collect::<Vec<_>>()) } else { serde_json::Value::Null },
             "machine": self.config.machine,
             "spend": self.month_spend(&jobs_all).await,
+            // (It keeps the CI's and a cloud account's limit for the month: one from before would drop them unsaid.)
+            "account_limits": true,
             // Machines up now in each cloud, over every job (`jobs` is the newest fifty).
             "active": jobs_all.iter().filter(|j| active(j) && !j.cloud.is_empty()).fold(HashMap::<String, u32>::new(), |mut m, j| { *m.entry(place_of(j).to_string()).or_default() += 1; m }),
             // What the clouds and code hosts allow it (see permissions.rs): what the App asks for (each installation's

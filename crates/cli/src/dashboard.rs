@@ -2408,10 +2408,23 @@ impl Dashboard {
             ("POST", "/routing") => {
                 let plane = self.plane()?;
                 // Changed from what the control plane has now; never from a guess (that would drop its other rules).
-                let Some(mut routing) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()) else {
+                let status = status_soon(plane.url(), &self.status_key);
+                let Some(mut routing) = status.as_ref().and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
+                // A dollar amount a month, or none (empty, `none`, zero).
+                let usd = || field("usd").parse::<f64>().ok().filter(|n| *n > 0.0 && n.is_finite());
+                if ["monthly_usd", "account_usd"].contains(&field("action").as_str()) && !status.as_ref().is_some_and(|s| s["account_limits"] == true) {
+                    return Ok(message(409, "Update the control plane first", "A limit for the whole CI or for a cloud account needs a newer control plane: update it on the Control plane page (or `superci planes update`), then set the limit."))
+                }
                 match field("action").as_str() {
+                    // The whole CI's limit for a month, and a cloud account's (its providers together).
+                    "monthly_usd" => routing.monthly_usd = usd(),
+                    "account_usd" => {
+                        let account = field("account");
+                        if account != "aws" { return Ok(message(400, "Which account?", "An account's limit is for a cloud with several providers: aws (its spot and on-demand machines). Another provider's limit is its own: its settings on Runners.")) }
+                        match usd() { Some(n) => { routing.account_usd.insert(account, n); } None => { routing.account_usd.remove(&account); } }
+                    }
                     "default" => routing.default = Some(field("cloud")).filter(|c| !c.is_empty()),
                     "add" => {
                         let repo = field("repo");
@@ -3084,7 +3097,7 @@ mark();load()})();</script>"#;
             let account = aws_account(v);
             let signed_in: Vec<&str> = [("aws", self.aws.iter().chain(&self.aws_others).any(|a| Some(&a.account_id) == account.as_ref())), ("modal", self.modal.is_some()), ("cloudflare", self.cf.is_some())]
                 .into_iter().filter(|(_, yes)| *yes).map(|(c, _)| c).collect();
-            pools_card(v, &self.quotas, self.cf_month, self.modal_month.as_ref(), &signed_in, self.aws_look())
+            format!("{}{}", pools_card(v, &self.quotas, self.cf_month, self.modal_month.as_ref(), &signed_in, self.aws_look()), spending_card(v))
         };
         let note = match &self.flash { Some(f) => format!(r#"<div class="notice">{}<span>{}</span></div>"#, icon("check"), esc(f)), None => String::new() };
         format!(r#"<div class="bar"><h1 class="page-title">Runners</h1>{add}</div>{note}<div class="cards">{body}</div>"#)
@@ -4411,6 +4424,39 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
     let rules = v.routing().rules.iter().map(|r| format!(r#"<form method="post" action="/routing" class="rule"><input type="hidden" name="action" value="remove"><input type="hidden" name="repo" value="{}"><span class="note"><code>{}</code> only uses {} (a rule from before; a workflow can say <code>runs-on: {}-{}</code> instead)</span><button class="chip">Remove</button></form>"#,
         esc(&r.repo), esc(&r.repo), esc(cloud_name(&r.cloud)), esc(&v.label()), esc(&r.cloud))).collect::<String>();
     format!(r#"<section class="card"><div class="card-head"><h2>Runner providers</h2><span class="order-note" id="order-note" aria-live="polite"></span></div><p class="note">Each provider starts a fresh runner for every job. A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next. When all are full, it waits. Drag to reorder.</p>{waiting}<ol class="pools" data-order="{}">{rows}</ol>{rules}{dialogs}</section>"#, esc(&current))
+}
+
+/// SuperCI's own mark on a tile, as a provider's logo is (for a row that is about all of them).
+fn brand_logo(size: u32) -> String {
+    format!(r#"<span class="logo" style="width:{size}px;height:{size}px;background:color-mix(in srgb,var(--ink) 10%,var(--card))">{}</span>"#, MARK.replacen(r#"class="mark""#, &format!(r#"width="{0}" height="{0}""#, size * 58 / 100), 1))
+}
+
+/// What the CI may spend on machines in a month: all its providers together, and a cloud account with several
+/// providers (AWS: its spot and on-demand machines together). A provider's own budget is in its settings. Each is a
+/// row with what was spent this month and its limit, changed in its own dialog.
+fn spending_card(v: &PlaneView) -> String {
+    let head = r#"<section class="card" id="limits"><div class="card-head"><h2>Monthly limits</h2></div>"#;
+    // A control plane from before these limits would drop them unsaid: said, in their place.
+    if !v.account_limits() { return format!(r#"{head}<p class="note">A limit for everything, and for a cloud account, needs a newer control plane: <a href="/?p=planes">update it on the Control plane page</a>. A provider's own budget is in its settings above.</p></section>"#) }
+    let routing = v.routing();
+    let estimate = "It counts the machines jobs ran on, as estimated here. A cloud's bill also has storage and small fees, and jobs already running finish.";
+    let mut rows = vec![("all".to_string(), "monthly_usd", String::new(), brand_logo(32), "Everything".to_string(), "All providers together. At the limit no job starts until next month.".to_string(), v.spend_total(), routing.monthly_usd,
+        "At the limit no job starts, until next month or a higher limit.")];
+    if let Some(account) = aws_account(v).filter(|_| v.order().iter().any(|p| p.cloud == "aws")) {
+        rows.push(("aws".to_string(), "account_usd", "aws".to_string(), logo("aws", 32), format!("AWS account {account}"), "Its spot and on-demand machines together. At the limit, jobs go to other providers.".to_string(), v.spend_account("aws"), routing.account_usd.get("aws").copied(),
+            "At the limit, jobs go to the providers of other accounts in the order; with none, they fail saying so."));
+    }
+    let (mut list, mut dialogs) = (String::new(), String::new());
+    for (id, action, account, mark, name, what, spent, cap, at_limit) in rows {
+        let now = match cap {
+            Some(cap) => format!(r#"<span class="lim">{} of {}</span>{}"#, usd(spent), usd(cap), if spent >= cap { pill("bad", "at its limit") } else { String::new() }),
+            None => format!(r#"<span class="lim">{} this month</span><span class="lim">No limit</span>"#, usd(spent)),
+        };
+        list.push_str(&format!(r#"<li class="pool limit"><span></span>{mark}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{now}</span><button type="button" class="icon-btn" aria-label="{} limit" onclick="document.getElementById('limit-{id}').showModal()">{ICON_GEAR}</button></li>"#, esc(&name), esc(&what), esc(&name)));
+        dialogs.push_str(&format!(r#"<dialog class="dlg" id="limit-{id}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="{action}"><input type="hidden" name="account" value="{account}"><div class="dlg-head">{mark}<span><strong>{}</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><label class="field"><span>Monthly limit</span><span class="money">$<input type="number" name="usd" min="1" step="1" placeholder="No limit"{} autofocus></span><small>{} this month. {at_limit} {estimate}</small></label><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
+            esc(&name), esc(&what), cap.map(|n| format!(r#" value="{n:.0}""#)).unwrap_or_default(), usd(spent)));
+    }
+    format!(r#"{head}<p class="note">The most {} may spend on machines in a month. A provider's own budget is in its settings above.</p><ol class="pools">{list}</ol>{dialogs}</section>"#, esc(&v.name()))
 }
 
 /// Machines: the default machine (what plain `runs-on: superci` gets, and any part a label leaves out), changed in
@@ -6005,6 +6051,22 @@ mod tests {
         assert!(html.contains("Spot machines of any size") && !html.contains("not allowed"), "an account that allows them says nothing of it");
         assert!(html.contains(">$0.82 this month · included<"), "cf");
         assert!(html.contains(">$1.50 this month · $0.50 billed<"), "modal");
+        // Monthly limits, below the providers. A control plane from before them says so in their place.
+        assert!(html.contains(r#"<section class="card" id="limits">"#) && html.contains(r#"<a href="/?p=planes">update it on the Control plane page</a>"#) && !html.contains("limit-all"), "{html}");
+        // One that keeps them: the whole CI's, and the AWS account's (its spot and on-demand machines together),
+        // each with what was spent this month, its limit, and a dialog of its own to change it.
+        let mut newer = view.clone();
+        { let st = newer.status.as_mut().unwrap(); st["account_limits"] = true.into(); st["routing"]["monthly_usd"] = 100.0.into(); st["routing"]["account_usd"] = serde_json::json!({ "aws": 12.0 }); st["spend"]["aws-on-demand"] = 1.0.into(); }
+        let limits = d.render("runners", &[newer], None);
+        preview("runners-limits", &limits);
+        for said in [r#"<strong>Everything</strong><small>All providers together. At the limit no job starts until next month.</small></span><span class="pool-now"><span class="lim">$14.22 of $100.00</span></span>"#,
+            r#"<strong>AWS account 123456789012</strong><small>Its spot and on-demand machines together. At the limit, jobs go to other providers.</small></span><span class="pool-now"><span class="lim">$13.40 of $12.00</span><span class="pill bad"><i></i>At its limit</span></span>"#,
+            r#"<dialog class="dlg" id="limit-all" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="monthly_usd">"#,
+            r#"<input type="hidden" name="action" value="account_usd"><input type="hidden" name="account" value="aws">"#,
+            r#"<input type="number" name="usd" min="1" step="1" placeholder="No limit" value="12" autofocus>"#,
+            "$13.40 this month. At the limit, jobs go to the providers of other accounts in the order; with none, they fail saying so."] {
+            assert!(limits.contains(said), "{said}\n\n{limits}");
+        }
         assert!(!html.contains(">$12.40 this month<"), "a budget already says the spend");
         // The pools as ordered; ones added since (Modal) after them.
         let at = |s: &str| html.find(s).unwrap_or_else(|| panic!("{s}"));
