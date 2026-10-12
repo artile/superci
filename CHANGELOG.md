@@ -7,7 +7,6 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A burst of launches that AWS refuses for their rate ("RequestLimitExceeded", seen from the eighth job of a burst on) is asked again within the same seconds. Before, those jobs waited for the next sweep, up to two minutes.
 - A control plane in AWS sweeps every minute (before: every two). `superci planes update` changes the schedule.
 - A job that ran on an on-demand machine because spot was refused says so, in its row and in `superci jobs list`: "On-demand: your AWS spot limit in N. Virginia was reached". When that happened in the last day, a line above the jobs says how many, with the link to ask AWS for more. Before, only "on-demand" beside the machine showed it, at about twice the price.
-- The plugins of the unreleased 0.13.0 in this repository (the switch, `superci plugins`, `superci files`) are gone again: `actions/upload-artifact` keeps what a job leaves, and it works on SuperCI's machines as on GitHub's.
 - `superci login aws` opens on a page of SuperCI's with one button to AWS. When AWS answers “400 Bad Request” (an old AWS sign-in in the browser is in the way), Back comes to that page again, which then offers to sign out of AWS and try again.
 
 ## 0.12.0 — 2026-10-09
