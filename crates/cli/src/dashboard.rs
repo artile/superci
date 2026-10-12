@@ -53,6 +53,10 @@ pub struct Dashboard {
     /// SuperCI's folder on this machine, where its sign-ins are kept (none: nothing is kept), what was last written
     /// there, the control plane in use as kept (for commands, before any cloud was asked), and whether writing failed.
     store: Option<Store>,
+    /// The workspace's name as this dashboard's addresses carry it (`w`). Empty: the one pages without it are of.
+    w: String,
+    /// What the workspace's CI was last seen to be called and whose jobs it runs (kept, for the list of workspaces).
+    last_seen: Option<crate::store::Seen>,
     kept_as: String,
     kept_plane: Option<Plane>,
     keep_failed: bool,
@@ -231,9 +235,28 @@ struct Deploy {
     result: Option<std::result::Result<Plane, String>>,
 }
 
+thread_local! {
+    /// The workspace the request in hand is of (see `respond`): what a page's frame says is kept by workspace.
+    static HERE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// A workspace's own two notes for its pages' frame (see `side` and `called`).
+#[cfg(not(test))]
+fn frame(which: usize) -> &'static Mutex<String> {
+    type Notes = [&'static Mutex<String>; 2];
+    static ALL: Mutex<Vec<(String, Notes)>> = Mutex::new(Vec::new());
+    let name = HERE.with(|h| h.borrow().clone());
+    let mut all = lock(&ALL);
+    if let Some((_, notes)) = all.iter().find(|(n, _)| *n == name) { return notes[which] }
+    let note = || -> &'static Mutex<String> { Box::leak(Box::new(Mutex::new(String::new()))) };
+    let notes = [note(), note()];
+    all.push((name, notes));
+    notes[which]
+}
+
 /// The sidebar's update card as last drawn, so each page's frame has it at once (asking the control plane comes after).
 #[cfg(not(test))]
-fn side() -> &'static Mutex<String> { static SIDE: Mutex<String> = Mutex::new(String::new()); &SIDE }
+fn side() -> &'static Mutex<String> { frame(0) }
 /// Tests run side by side: each its own.
 #[cfg(test)]
 fn side() -> &'static Mutex<String> { thread_local!(static SIDE: &'static Mutex<String> = Box::leak(Box::new(Mutex::new(String::new())))); SIDE.with(|s| *s) }
@@ -241,7 +264,7 @@ fn side() -> &'static Mutex<String> { thread_local!(static SIDE: &'static Mutex<
 /// What the control plane in use is called, as last seen: the page's frame is drawn before it is asked, and says
 /// this until the page's live part says otherwise.
 #[cfg(not(test))]
-fn called() -> &'static Mutex<String> { static CALLED: Mutex<String> = Mutex::new(String::new()); &CALLED }
+fn called() -> &'static Mutex<String> { frame(1) }
 #[cfg(test)]
 fn called() -> &'static Mutex<String> { thread_local!(static CALLED: &'static Mutex<String> = Box::leak(Box::new(Mutex::new(String::new())))); CALLED.with(|s| *s) }
 fn called_now() -> String { let c = lock(called()); if c.is_empty() { "SuperCI".to_string() } else { c.clone() } }
@@ -432,7 +455,6 @@ fn jobs_word(n: u32) -> String { if n == 1 { "1 job".into() } else { format!("{n
 
 /// The mark: four broad petals, one solid shape (the same outline as on superci.dev).
 const MARK: &str = r#"<svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M4.31 12.77L4.58 12.25L4.56 11.66L4.40 11.34L3.58 10.29L3.10 9.39L2.72 8.33L2.51 7.12L2.51 5.99L2.69 4.85L3.16 3.56L3.52 3.18L4.53 2.79L5.54 2.56L6.65 2.48L7.69 2.58L8.65 2.81L9.52 3.15L10.48 3.71L11.42 4.45L11.97 4.61L12.56 4.46L13.62 3.64L14.61 3.10L15.56 2.75L16.65 2.53L17.89 2.50L19.04 2.67L20.42 3.15L20.82 3.52L21.21 4.53L21.44 5.54L21.52 6.65L21.42 7.69L21.19 8.65L20.85 9.52L20.29 10.48L19.55 11.42L19.39 11.97L19.54 12.56L20.36 13.62L20.90 14.61L21.28 15.65L21.47 16.65L21.51 17.81L21.33 19.04L20.85 20.42L20.48 20.82L19.47 21.21L18.46 21.44L17.35 21.52L16.31 21.42L15.35 21.19L14.50 20.86L13.60 20.34L12.58 19.55L11.99 19.39L11.42 19.55L10.40 20.34L9.50 20.86L8.57 21.21L7.69 21.42L6.65 21.52L5.54 21.44L4.53 21.21L3.56 20.84L3.16 20.44L2.69 19.15L2.51 18.01L2.52 16.79L2.72 15.67L3.10 14.61L3.64 13.62L4.31 12.77Z"/></svg>"#;
-const ICON_THEME: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.2 15.1A8.4 8.4 0 0 1 8.9 3.8 8.5 8.5 0 1 0 20.2 15.1Z"/></svg>"#;
 
 fn row(dot: &str, name: &str, sub: &str, end: &str) -> String {
     format!(r#"<div class="row"><span class="dot {dot}"></span><span><span class="row-name">{name}</span>{}</span><span class="row-end">{end}</span></div>"#,
@@ -635,7 +657,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), last_seen: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -665,6 +687,7 @@ impl Dashboard {
         if let Some(p) = &kept.plane { d.planes.push(p.clone()); d.preloaded = Some(p.plane_id().to_string()) }
         for p in kept.planes_more { if !d.planes.iter().any(|x| x.plane_id() == p.plane_id()) { d.planes.push(p) } }
         d.kept_plane = kept.plane;
+        d.last_seen = kept.seen;
         d.store = Some(store);
         d.kept_as = serde_json::to_string(&d.kept()).unwrap_or_default();
         d
@@ -725,7 +748,7 @@ impl Dashboard {
                     (self.modal, self.modal_pending, self.looked_modal) = (Some(session), None, false);
                     return Some(self.done_page())
                 }
-                return Some(back_to("Approve it in Modal's tab", "This tab goes on by itself once you have.", &format!("{}/", self.base)))
+                return Some(back_to("Approve it in Modal's tab", "This tab goes on by itself once you have.", &self.back_url("")))
             }
         }
         // AWS's sign-in can end on AWS's own "400 Bad Request" (see `aws_stuck`), and Back from there has to find a
@@ -956,6 +979,7 @@ impl Dashboard {
         if !self.modal_given { self.modal = None }
         self.aws = None;
         self.aws_others.clear();
+        self.last_seen = None;
         (self.aws_ended, self.looked_cf, self.looked_aws, self.looked_modal) = (false, false, false, false);
         (self.planes, self.selected, self.kept_plane, self.preloaded, self.views) = (vec![], 0, None, None, None);
         self.cf_accounts.clear();
@@ -979,6 +1003,42 @@ impl Dashboard {
             plane: self.planes.get(self.selected).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
             planes_more: self.planes.iter().enumerate().filter(|(i, p)| *i != self.selected && !matches!(p, Plane::Seen { .. })).map(|(_, p)| p.clone()).collect(),
             aws_ended: self.aws_ended && self.aws.is_none() && self.aws_others.is_empty(),
+            seen: self.last_seen.clone(),
+        }
+    }
+
+    /// Notes what the control plane in use is called and whose jobs it runs, once it has said: kept, so that a list of
+    /// workspaces can say it of this one without asking its control plane.
+    fn note_seen(&mut self, views: &[PlaneView]) {
+        let Some(v) = views.get(view::in_use(views)).filter(|v| v.status.is_some() && !matches!(v.plane, Plane::Seen { .. })) else { return };
+        let st = v.status.clone().unwrap_or_default();
+        let mut hosts: Vec<(String, String)> = status_apps(&st).iter().filter_map(|a| a["owner"].as_str().map(|o| ("github".to_string(), o.to_string()))).collect();
+        hosts.extend(v.gitlabs().into_iter().map(|(_, url, _)| ("gitlab".to_string(), url.trim_start_matches("https://").to_string())));
+        self.last_seen = Some(crate::store::Seen { called: v.name(), hosts });
+    }
+
+    /// This workspace's name: its folder's.
+    fn workspace(&self) -> String { self.store.as_ref().map(|s| s.workspace()).unwrap_or_else(|| crate::store::FIRST.to_string()) }
+
+    /// An address of this dashboard to come back to (`query`: nothing, or `?p=…`), naming this workspace where its
+    /// addresses do.
+    fn back_url(&self, query: &str) -> String {
+        let query = query.trim_start_matches('/');
+        let named = query.trim_start_matches('?').split('&').any(|kv| kv.starts_with("w="));
+        if self.w.is_empty() || named { return format!("{}/{query}", self.base) }
+        format!("{}/{query}{}w={}", self.base, if query.is_empty() { "?" } else { "&" }, self.w)
+    }
+
+    /// Whether a sign-in or an App that comes back from elsewhere (see `respond`) was started in this workspace.
+    fn awaits(&self, req: &Req) -> bool {
+        let state = req.query.iter().find(|(k, _)| k == "state").map(|(_, v)| v.as_str()).unwrap_or("");
+        let is = |s: &str| !state.is_empty() && safe_eq(state.as_bytes(), s.as_bytes());
+        match req.path.as_str() {
+            "/oauth/callback" => self.aws_pending.as_ref().is_some_and(|p| is(&p.state)) || self.cf_pending.as_ref().is_some_and(|p| is(&p.state)),
+            "/github/callback" => self.manifest_state.as_ref().is_some_and(|(s, ..)| is(s)),
+            "/github/installed" => self.github_for.is_some() || self.github_expected.is_some(),
+            "/oauth/modal" => self.modal_pending.is_some(),
+            _ => false,
         }
     }
 
@@ -1055,8 +1115,10 @@ impl Dashboard {
         }
     }
 
-    /// Serves the dashboard until you quit it (or Ctrl-C), opening it in the browser.
-    pub fn serve(mut self, open_browser: bool) -> Result<()> {
+    /// Serves the dashboard until you quit it (or Ctrl-C), opening it in the browser: this workspace's pages, and
+    /// every other workspace's behind the switcher. `several`: started with several workspaces and none named, so it
+    /// opens on the list of them and this one is not served.
+    pub fn serve(mut self, open_browser: bool, several: bool) -> Result<()> {
         // "localhost" can mean either loopback address to a browser: listen on both.
         let (tx, rx) = mpsc::channel::<TcpStream>();
         let mut listening = 0;
@@ -1100,9 +1162,12 @@ impl Dashboard {
         }
         // One thread per connection, each with a read timeout: a browser's idle spare connection cannot hold up a page.
         // The page frame needs no shared state, so it is drawn at once; the live part holds it only briefly.
-        let key = self.key.clone();
         let for_task = self.task.is_some();
+        let name = self.workspace();
+        let hub = Arc::new(Hub { root: self.store.as_ref().and_then(|s| s.root()).or_else(crate::store::root), key: self.key.clone(), base: self.base.clone(),
+            first: Mutex::new((!several).then(|| name.clone())), boards: Mutex::new(HashMap::new()) });
         let shared = Arc::new(Mutex::new(self));
+        if !several { lock(&hub.boards).insert(name, shared.clone()); }
         if for_task {
             // Done: kept, said, and (a moment later, so the tab gets its last page) ended.
             let shared = shared.clone();
@@ -1129,12 +1194,12 @@ impl Dashboard {
             });
         }
         for stream in rx {
-            let (shared, key) = (shared.clone(), key.clone());
+            let hub = hub.clone();
             std::thread::spawn(move || {
                 let mut stream = stream;
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                 let Some(req) = read_request(&mut stream) else { return };
-                write_response(&mut stream, &respond(&shared, &key, &req));
+                write_response(&mut stream, &respond(&hub, &req));
             });
         }
         Ok(())
@@ -1381,8 +1446,8 @@ impl Dashboard {
         let q = |n: &str| req.query.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str()).unwrap_or("");
         // Back to the dashboard after a sign-in elsewhere: a same-site navigation, so the page's cookie goes along
         // (a plain redirect at the end of another site's redirect chain would count as cross-site and lose it).
-        let base = self.base.clone();
-        let back = |heading: &str, text: &str| back_to(heading, text, &format!("{base}/"));
+        let home = self.back_url("");
+        let back = |heading: &str, text: &str| back_to(heading, text, &home);
         let form: Vec<(String, String)> = url::form_urlencoded::parse(&req.body).into_owned().collect();
         let field = |n: &str| form.iter().find(|(k, _)| k == n).map(|(_, v)| v.trim().to_string()).unwrap_or_default();
         let form_has = |n: &str| form.iter().any(|(k, _)| k == n);
@@ -1607,7 +1672,7 @@ impl Dashboard {
                 let session = aws::exchange(pending, q("code"))?;
                 println!("Signed in to AWS account {}.", session.account_id);
                 self.add_account(session);
-                Ok(back_to("Signed in with AWS", "Looking for SuperCI in your account…", &format!("{}/{}", self.base, self.return_to)))
+                Ok(back_to("Signed in with AWS", "Looking for SuperCI in your account…", &self.back_url(&self.return_to)))
             }
             ("GET", "/oauth/callback") => {
                 let fresh = self.cf_pending.as_ref().is_some_and(|p| safe_eq(q("state").as_bytes(), p.state.as_bytes()));
@@ -1618,7 +1683,7 @@ impl Dashboard {
                 println!("Signed in to Cloudflare.");
                 self.cf_accounts.clear();
                 self.looked_cf = false;
-                Ok(back_to("Signed in with Cloudflare", "Looking for SuperCI in your accounts…", &format!("{}/{}", self.base, self.return_to)))
+                Ok(back_to("Signed in with Cloudflare", "Looking for SuperCI in your accounts…", &self.back_url(&self.return_to)))
             }
             ("POST", "/aws/signin") => {
                 self.return_to = safe_return(&field("next"));
@@ -1920,7 +1985,7 @@ impl Dashboard {
                 self.github_expected.get_or_insert(now_ms() + 120_000);
                 // Back to that control plane's pages (with several control planes, a page says which one it shows).
                 match self.github_for.take().filter(|_| self.planes.len() > 1) {
-                    Some(id) => Ok(back_to("Installed on GitHub", "Back to your dashboard…", &format!("{}/?p=repos&c={id}", self.base))),
+                    Some(id) => Ok(back_to("Installed on GitHub", "Back to your dashboard…", &self.back_url(&format!("?p=repos&c={id}")))),
                     None => Ok(back("Installed on GitHub", "Back to your dashboard…")),
                 }
             }
@@ -1972,7 +2037,7 @@ impl Dashboard {
                 self.modal_pending = Some(pending);
                 Ok(Response::redirect(&link))
             }
-            ("GET", "/oauth/modal") => Ok(back_to("Signed in with Modal", "Back to where you were…", &format!("{}/{}", self.base, self.return_to))),
+            ("GET", "/oauth/modal") => Ok(back_to("Signed in with Modal", "Back to where you were…", &self.back_url(&self.return_to))),
             ("POST", "/runners/modal") => {
                 let plane = self.plane()?;
                 let session = self.modal.clone().ok_or("Sign in with Modal first.")?;
@@ -2249,9 +2314,11 @@ impl Dashboard {
         // page stays as it is (a thin bar at the top) until the next one is ready, so nothing flashes in between.
         let script = r#"<script>(function(){var main=document.getElementById('live'),timer;
 var sections={plane:'planes','add-runners':'runners',gitlab:'repos'};
-function cc(){return new URLSearchParams(location.search).get('c')||''}
-function keep(u){if(!u.searchParams.has('c')){if(cc())u.searchParams.set('c',cc())}else if(!u.searchParams.get('c'))u.searchParams.delete('c');return u}
-function mark(){var sw=main.querySelector('[data-switch]'),ss=document.getElementById('side-switch');if(sw&&ss){if(ss.innerHTML!==sw.innerHTML)ss.innerHTML=sw.innerHTML;sw.remove()}if(ss)ss.parentNode.classList.toggle('has',!!ss.innerHTML);document.querySelectorAll('a[href^="/?"],a[href="/"]').forEach(function(a){if(a.target)return;var u=new URL(a.getAttribute('href'),location.href);if(u.searchParams.has('c'))return;keep(u);a.setAttribute('href',u.pathname+u.search+u.hash)});document.body.classList.toggle('listing',!!main.querySelector('[data-list]'))}
+function qp(n){return new URLSearchParams(location.search).get(n)||''}
+function cc(){return qp('c')}
+function keep(u){['w','c'].forEach(function(n){if(!u.searchParams.has(n)){if(qp(n))u.searchParams.set(n,qp(n))}else if(!u.searchParams.get(n))u.searchParams.delete(n)});return u}
+(function(){var u=new URL(location.href);if(u.searchParams.has('c')&&!u.searchParams.get('c')){u.searchParams.delete('c');history.replaceState(null,'',u.pathname+u.search+u.hash)}})();
+function mark(){var sw=main.querySelector('[data-switch]'),ss=document.getElementById('side-switch');if(sw&&ss){if(ss.innerHTML!==sw.innerHTML)ss.innerHTML=sw.innerHTML;sw.remove()}if(ss)ss.parentNode.classList.toggle('has',!!ss.innerHTML);document.querySelectorAll('a[href^="/"]').forEach(function(a){if(a.target)return;var u=new URL(a.getAttribute('href'),location.href);if(u.pathname==='/workspaces')return;if(!u.searchParams.has('w')&&qp('w'))u.searchParams.set('w',qp('w'));if(!u.searchParams.has('c')&&cc())u.searchParams.set('c',cc());a.setAttribute('href',u.pathname+u.search+u.hash)});document.body.classList.toggle('listing',!!main.querySelector('[data-list]'))}
 function frag(){var q=location.search;return '/'+(q?q+'&fragment=1':'?fragment=1')}
 function current(){var p=new URLSearchParams(location.search).get('p')||'overview';p=sections[p]||p;document.querySelectorAll('.side .nav a').forEach(function(a){a.setAttribute('aria-current',String(new URL(a.href).searchParams.get('p')===p))})}
 var shown='';
@@ -2259,7 +2326,7 @@ function show(h){var to=h.match(/data-go="([^"]+)"/);if(to){go(to[1]);return}doc
 function load(){fetch(frag(),{credentials:'same-origin'}).then(function(r){return r.text()}).then(show).catch(function(){document.body.classList.remove('busy');main.innerHTML='<div class="empty">The dashboard stopped. Run superci dashboard again.</div>'})}
 function go(url){document.querySelectorAll('details.menu[open]').forEach(function(d){d.open=false});var u=keep(new URL(url,location.href));history.pushState(null,'',u.pathname+u.search+u.hash);current();clearTimeout(timer);document.body.classList.add('busy');window.scrollTo(0,0);load()}
 document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a||a.target||e.defaultPrevented||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;var u=new URL(a.href,location.href);if(u.origin!==location.origin||u.pathname!=='/'||u.searchParams.has('k')||(u.search===location.search&&u.hash))return;e.preventDefault();go(u.href)});
-document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute('action')||'';if(e.defaultPrevented||(f.getAttribute('method')||'').toLowerCase()!=='post'||act.charAt(0)!=='/')return;if(/signin$|^\/github\/start/.test(act)){if(cc()&&!f.querySelector('[name=c]')){var ci=document.createElement('input');ci.type='hidden';ci.name='c';ci.value=cc();f.appendChild(ci)}return}e.preventDefault();var d=f.closest('dialog');document.body.classList.add('busy');var b=e.submitter||f.querySelector('button:not([type=button])');if(b&&!b.disabled){b.disabled=true;b.innerHTML='<span class="mini-spin"></span>'+(b.classList.contains('danger')?'Working…':'Saving…');b.classList.add('working')}fetch(act+(cc()?(act.indexOf('?')<0?'?':'&')+'c='+encodeURIComponent(cc()):''),{method:'POST',body:new URLSearchParams(new FormData(f,e.submitter)),credentials:'same-origin'}).then(function(r){if(d&&d.open)d.close();var u=new URL(r.url);if(r.redirected&&u.origin===location.origin){go(u.href);return}if(r.redirected){location.href=r.url;return}return r.text().then(function(t){document.open();document.write(t);document.close()})}).catch(function(){f.submit()})});
+document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute('action')||'';if(e.defaultPrevented||(f.getAttribute('method')||'').toLowerCase()!=='post'||act.charAt(0)!=='/')return;if(/signin$|^\/github\/start/.test(act)){['c','w'].forEach(function(n){if(qp(n)&&!f.querySelector('[name='+n+']')){var ci=document.createElement('input');ci.type='hidden';ci.name=n;ci.value=qp(n);f.appendChild(ci)}});return}e.preventDefault();var d=f.closest('dialog');document.body.classList.add('busy');var b=e.submitter||f.querySelector('button:not([type=button])');if(b&&!b.disabled){b.disabled=true;b.innerHTML='<span class="mini-spin"></span>'+(b.classList.contains('danger')?'Working…':'Saving…');b.classList.add('working')}var qs=['w','c'].filter(qp).map(function(n){return n+'='+encodeURIComponent(qp(n))}).join('&');fetch(act+(qs?(act.indexOf('?')<0?'?':'&')+qs:''),{method:'POST',body:new URLSearchParams(new FormData(f,e.submitter)),credentials:'same-origin'}).then(function(r){if(d&&d.open)d.close();var u=new URL(r.url);if(r.redirected&&u.origin===location.origin&&u.pathname==='/'){go(u.href);return}if(r.redirected){location.href=r.url;return}return r.text().then(function(t){document.open();document.write(t);document.close()})}).catch(function(){f.submit()})});
 window.addEventListener('popstate',function(){current();document.body.classList.add('busy');load()});
 window.addEventListener('pageshow',function(e){if(e.persisted)load()});
 mark();load()})();</script>"#;
@@ -2352,6 +2419,7 @@ mark();load()})();</script>"#;
         // Kept to show again only when complete: a control plane still taking this session's key is read again next time.
         let complete = views.iter().all(|v| !v.online || v.status.is_some() || !d.keyed.contains(v.plane.plane_id()));
         let views = d.remember(views);
+        d.note_seen(&views);
         d.views = if complete { Some((views.clone(), now_ms())) } else { None };
         Dashboard::measure(shared, &mut d);
         d.check_permissions();
@@ -2387,11 +2455,37 @@ mark();load()})();</script>"#;
         format!(r#"<div class="notice warn"><span>Your AWS sign-in has ended (AWS ends one after 12 hours). You can look around; sign in again to change things in AWS.</span>{}</div>"#, signin_button("aws", "Sign in with AWS", false))
     }
 
+    /// A page's live part, with the workspace switcher's rows (see `workspaces_menu`).
     fn render(&self, section: &str, views: &[PlaneView], last: Option<&str>) -> String {
+        format!("{}{}", self.render_page(section, views, last), self.workspaces_menu(views))
+    }
+
+    /// The switcher under the name at the top of the sidebar: the workspaces kept on this computer, each by its name
+    /// with its code host's logo once one is connected, the one shown marked; under them, making a new one. Picking
+    /// one goes to its own pages: nothing of one workspace is on another's.
+    fn workspaces_menu(&self, views: &[PlaneView]) -> String {
+        let Some(root) = self.store.as_ref().and_then(|s| s.root()) else { return String::new() };
+        let me = self.workspace();
+        let rows = crate::store::listed(&root, Some(&me)).into_iter().map(|mut l| {
+            let current = l.name == me;
+            // This one as it is now (what it keeps is written after the page is drawn).
+            if current {
+                let seen = self.last_seen.clone().unwrap_or_default();
+                (l.called, l.hosts, l.signed_in) = (seen.called, seen.hosts, self.signed_in_as().is_some());
+                l.place = views.get(view::in_use(views)).map(|v| v.plane.place()).unwrap_or_default();
+            }
+            format!(r#"<a class="space" href="/?w={}&c=" aria-current="{current}">{}<span>{}</span><small>{}</small></a>"#, esc(&l.name), workspace_logo(&l, 28), esc(&l.name), esc(&workspace_sub(&l)))
+        }).collect::<String>();
+        format!(r##"<div data-switch hidden>{rows}<hr><a href="#" onclick="this.closest('details').open=false;document.getElementById('new-workspace').showModal();return false"><span>New workspace…</span></a></div>"##)
+    }
+
+    fn render_page(&self, section: &str, views: &[PlaneView], last: Option<&str>) -> String {
         let section = section_name(section);
         // No cloud signed in to: whether (and where) SuperCI runs is not known yet.
         if self.cf.is_none() && self.aws.is_none() && self.modal.is_none() && views.is_empty() {
             lock(side()).clear();
+            // Settings is there before anything is set up: the workspace's name, and removing it.
+            if section == "settings" { return format!(r#"{}<div data-called="SuperCI" hidden></div>"#, self.settings_page(None)) }
             // Back from Modal's sign-in: the page looks again until it is approved.
             let gate = self.gate(section, last);
             return if self.modal_pending.is_some() { format!(r#"<div data-refresh="3"></div>{gate}"#) } else { gate }
@@ -2400,7 +2494,7 @@ mark();load()})();</script>"#;
         // up belongs to none of them.) A page that names one shows that one.
         if section == "all" || (view::several(views).is_some() && section != "plane") {
             lock(side()).clear();
-            return format!(r#"{}<div data-list hidden></div><div data-called="SuperCI" hidden></div>{}"#, self.all_page(views), switcher(views, None));
+            return format!(r#"{}<div data-list hidden></div><div data-called="SuperCI" hidden></div>"#, self.all_page(views));
         }
         let current = views.get(view::in_use(views));
         // A control plane that has not picked up this session's key yet: look again in a moment.
@@ -2454,7 +2548,6 @@ mark();load()})();</script>"#;
         let name = current.map(|v| v.name()).unwrap_or_else(|| "SuperCI".to_string());
         *lock(called()) = name.clone();
         let html = format!(r#"{html}<div data-called="{}" hidden></div>"#, esc(&name));
-        let html = format!("{html}{}", switcher(views, current));
         let html = if card.is_empty() { html } else { format!(r#"{html}<div data-side hidden>{card}</div>"#) };
         if waiting || settling { format!(r#"<div data-refresh="{}"></div>{html}"#, if settling { 2 } else { 5 }) } else { html }
     }
@@ -2467,9 +2560,9 @@ mark();load()})();</script>"#;
         // At the bottom: an update for the control plane, when it needs one (filled in by the page's live part), the
         // control plane itself, its settings (and signing SuperCI out on this computer), and what is new.
         let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("settings", "Settings", ICON_SETTINGS), link("changes", "Changelog", ICON_NEWS));
-        // The name at the top is the switcher: the control planes known here, the list of them, and adding an
-        // organization (its rows come with each page's live part, see `switcher`).
-        format!(r#"<aside class="side"><details class="menu brand brand-menu"><summary>{MARK}<span>{}</span><svg class="chev" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></svg></summary><div class="menu-pop" id="side-switch"></div></details>{nav}{foot}</aside>"#, esc(&called_now()))
+        // The name at the top is the switcher between workspaces (its rows come with each page's live part, see
+        // `workspaces_menu`).
+        format!(r#"<aside class="side"><details class="menu brand brand-menu"><summary>{MARK}<span>{}</span><svg class="chev" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></svg></summary><div class="menu-pop" id="side-switch"></div></details>{nav}{foot}</aside>{}"#, esc(&called_now()), new_workspace_dialog())
     }
 
     /// Where a control plane runs: reachable from Settings to add another. The connect screen's list: a row per cloud with
@@ -2874,14 +2967,30 @@ mark();load()})();</script>"#;
         format!(r#"<div class="bar"><h1 class="page-title">Control planes</h1><a class="button primary sm" href="/?p=plane&c=">New control plane</a></div><p class="note" style="margin:-4px 0 18px">A control plane is one CI: its own cloud account, name, runners and limits. Each runs the jobs of one or more organizations; add an organization on its Repositories page.</p><div class="cards"><section class="card"><div class="picks">{rows}</div></section></div>"#)
     }
 
-    /// Settings: what the control plane is called and answers to, its limits, and SuperCI's sign-ins on this computer.
+    /// Settings: what the control plane is called and answers to, its limits, and this workspace on this computer
+    /// (its name, SuperCI's sign-ins, and forgetting it when there are others).
     fn settings_page(&self, v: Option<&PlaneView>) -> String {
         let bar = r#"<div class="bar"><h1 class="page-title">Settings</h1></div>"#;
         let logo = |icon: &str| format!(r#"<span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{icon}</span>"#);
+        let close = r#"<button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>"#;
         let who = self.signed_in_as().map(|w| format!("Signed in: {}.", esc(&w))).unwrap_or_else(|| "Not signed in to any cloud.".into());
-        let here = format!(r#"<section class="card dm-card"><div class="default-machine">{}<span class="dm-main"><strong>This computer</strong><small>{who} Signing out removes SuperCI's sign-ins from it; your runners keep working.</small></span><form method="post" action="/signout"><button class="button secondary sm">Sign out</button></form></div></section>"#, logo(ICON_SIGNOUT));
-        // (The switch between light and dark lives here: the name at the top of the sidebar is the switcher now.)
-        let here = here.replacen("</div></section>", &format!(r#"</div><div class="default-machine">{}<span class="dm-main"><strong>Appearance</strong><small>Light or dark, in this browser.</small></span><form onsubmit="superciTheme();return false"><button class="button secondary sm">Switch</button></form></div></section>"#, logo(ICON_THEME)), 1);
+        let mut rows = vec![];
+        let mut dialogs = String::new();
+        // The workspace: a folder of SuperCI's on this computer (none: nothing is kept here, and there is no other).
+        let root = self.store.as_ref().and_then(|s| s.root());
+        let name = esc(&self.workspace());
+        if root.is_some() {
+            rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Workspace</strong><small>One company's SuperCI on this computer: its own sign-ins, control plane and runners.</small></span><span class="dm-spec"><span class="lim">{name}</span></span><button type="button" class="button secondary sm" onclick="document.getElementById('rename-workspace').showModal()">Rename</button></div>"#, logo(ICON_WORKSPACE)));
+            dialogs.push_str(&format!(r#"<dialog class="dlg" id="rename-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Workspace</strong><small>Its name here, and what <code>--workspace</code> takes.</small></span>{close}</div><form method="post" action="/workspaces/rename" class="limit-do"><input type="hidden" name="w" value="{name}"><input name="name" value="{name}" aria-label="Its name" autofocus onfocus="this.select()" pattern="[a-z][a-z0-9\-]{{1,23}}" title="2 to 24 lowercase letters, digits and dashes" required spellcheck="false" autocomplete="off" autocapitalize="none"><button class="button primary sm">Save</button></form></div></dialog>"#, logo(ICON_WORKSPACE)));
+        }
+        // (Nothing to sign out of in a workspace that is signed in nowhere.)
+        if self.signed_in_as().is_some() || self.aws_ended { rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>This computer</strong><small>{who} Signing out removes this workspace's sign-ins from it; your runners keep working.</small></span><form method="post" action="/signout"><button class="button secondary sm">Sign out</button></form></div>"#, logo(ICON_SIGNOUT))) }
+        // With other workspaces beside it, this one can be forgotten here.
+        if root.is_some_and(|r| crate::store::listed(&r, Some(&self.workspace())).len() > 1) {
+            rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Remove this workspace</strong><small>Forgets {name} on this computer. Nothing in its clouds is deleted.</small></span><button type="button" class="button danger sm" onclick="document.getElementById('remove-workspace').showModal()">Remove</button></div>"#, logo(ICON_REMOVE)));
+            dialogs.push_str(&format!(r#"<dialog class="dlg" id="remove-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Remove {name}?</strong><small>Its sign-ins are forgotten on this computer. Its control plane and runners keep working: nothing in its clouds is deleted.</small></span>{close}</div><form method="post" action="/workspaces/remove" class="limit-do"><input type="hidden" name="w" value="{name}"><button class="button danger sm">Remove from this computer</button></form></div></dialog>"#, logo(ICON_REMOVE)));
+        }
+        let here = format!(r#"<section class="card dm-card">{}</section>{dialogs}"#, rows.concat());
         let Some(v) = v else { return format!(r#"{bar}<div class="cards">{here}</div>"#) };
         // The public repositories GitHub's App is installed on (none when GitHub is not connected).
         let public = if v.github { cloudflare::plane_get(v.plane.url(), &self.status_key, "/github/public-repos").ok().and_then(|r| r["repos"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())) } else { Some(vec![]) };
@@ -3437,22 +3546,6 @@ fn serves(v: &PlaneView) -> String {
     if what.is_empty() && v.github { what.push("GitHub".into()) }
     if what.is_empty() && v.gitlab { what.push("GitLab".into()) }
     what.join(", ")
-}
-
-/// The switcher under the name in the sidebar. Two things, kept apart in words: a control plane (one CI: its name,
-/// its cloud account, its runners and limits) and the organizations whose jobs it runs. Its rows are the control
-/// planes known here, each by its name with what it serves; under them, adding an organization to the one shown,
-/// setting up a new control plane, and (with several) the list of them.
-fn switcher(views: &[PlaneView], current: Option<&PlaneView>) -> String {
-    let known: Vec<&PlaneView> = views.iter().filter(|v| !matches!(v.plane, Plane::Seen { .. }) && v.moved_to.is_none()).collect();
-    let rows = known.iter().map(|v| {
-        let (name, what) = if v.serves_its_own() || known.len() == 1 { (v.name(), serves(v)) } else { ("A new control plane".to_string(), "Serves nothing yet".to_string()) };
-        let sub = [what, v.plane.place()].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ");
-        format!(r#"<a href="/?c={}" aria-current="{}"><span>{}</span><small>{}</small></a>"#, esc(v.plane.plane_id()), current.is_some_and(|c| c.plane.plane_id() == v.plane.plane_id()), esc(&name), esc(&sub))
-    }).collect::<String>();
-    let add = current.filter(|c| !matches!(c.plane, Plane::Seen { .. })).map(|c| format!(r#"<a href="/?p=repos&c={}&open=gh-add"><span>Add an organization to {}…</span></a>"#, esc(c.plane.plane_id()), esc(&c.name()))).unwrap_or_default();
-    let all = if known.len() > 1 { r#"<a href="/?p=all&c="><span>All control planes</span></a>"# } else { "" };
-    format!(r#"<div data-switch hidden>{rows}<hr>{add}<a href="/?p=plane&c="><span>New control plane…</span></a>{all}</div>"#)
 }
 
 /// What to send an owner of an organization one does not own: GitHub shows the page that creates the organization's
@@ -4352,28 +4445,160 @@ fn github_owner_at(api: &str, host: Option<&str>, login: &str) -> Result<Owner> 
 /// A GitLab connection's name as it may appear in an address or a setting's name: lowercase letters and digits only.
 fn safe_id(id: &str) -> String { id.chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).take(12).collect() }
 
-/// A page to come back to after a sign-in: only this dashboard's own `?p=…` pages.
+/// A page to come back to after a sign-in: only this dashboard's own pages (`?p=…`, with the workspace and the
+/// control plane their address names).
 fn safe_return(next: &str) -> String {
-    let ok = next.starts_with("?p=") && next.len() < 80 && next[1..].bytes().all(|b| b.is_ascii_alphanumeric() || b"=&-_".contains(&b));
+    let ok = next.starts_with('?') && next.len() < 120 && next[1..].bytes().all(|b| b.is_ascii_alphanumeric() || b"=&-_".contains(&b));
     if ok { next.to_string() } else { String::new() }
 }
 
-/// One request: the key and cookie checked, the page frame drawn at once, its live part asked for without holding the
-/// dashboard's state, and everything else handled with it.
-fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
+/// Every workspace's dashboard behind one address: each a world of its own (its sign-ins, its control planes, what
+/// is on its way), made when a page first asks for it. A request says which workspace it is for in its address or its
+/// form (`w`).
+struct Hub {
+    /// SuperCI's folder (none: nothing is kept on this machine, and there is the one workspace).
+    root: Option<std::path::PathBuf>,
+    key: String,
+    base: String,
+    /// The workspace the program was started in: what a page whose address names none is of. None: it was started
+    /// with several and none named, and such a page is the list of them.
+    first: Mutex<Option<String>>,
+    boards: Mutex<HashMap<String, Arc<Mutex<Dashboard>>>>,
+}
+
+impl Hub {
+    fn first(&self) -> Option<String> { lock(&self.first).clone() }
+
+    /// The workspaces here, by name: those kept, and the one this was started in (which has no folder until it
+    /// keeps something).
+    fn names(&self) -> Vec<String> {
+        let mut names = self.root.as_ref().map(|r| crate::store::workspaces_in(r)).unwrap_or_default();
+        if let Some(f) = self.first().filter(|f| !names.contains(f)) { names.push(f); names.sort() }
+        names
+    }
+
+    fn has(&self, name: &str) -> bool { self.names().iter().any(|n| n == name) }
+
+    /// A workspace's dashboard: the one made for it before, or a new one from what it keeps.
+    fn board(&self, name: &str) -> Arc<Mutex<Dashboard>> {
+        let first = self.first();
+        let mut boards = lock(&self.boards);
+        if let Some(b) = boards.get(name) { return b.clone() }
+        let mut d = Dashboard::signed_in(self.root.as_ref().map(|r| Store::under(r, name)));
+        (d.key, d.base, d.w) = (self.key.clone(), self.base.clone(), if first.as_deref() == Some(name) { String::new() } else { name.to_string() });
+        let b = Arc::new(Mutex::new(d));
+        boards.insert(name.to_string(), b.clone());
+        b
+    }
+
+    /// The workspace a sign-in or an App that comes back from elsewhere was started in (its address names none).
+    fn awaiting(&self, req: &Req) -> Option<String> {
+        let boards: Vec<(String, Arc<Mutex<Dashboard>>)> = lock(&self.boards).iter().map(|(n, b)| (n.clone(), b.clone())).collect();
+        boards.into_iter().find(|(_, b)| lock(b).awaits(req)).map(|(n, _)| n)
+    }
+
+    /// The list of workspaces, each a link to its pages, and making a new one: what the dashboard opens on when it
+    /// was started with several and none named.
+    fn list_page(&self) -> Response {
+        let rows = self.root.as_ref().map(|r| crate::store::listed(r, self.first().as_deref())).unwrap_or_default().iter().map(|l|
+            format!(r#"<a class="pick" href="/?w={}&c=">{}<span><strong>{}</strong><small>{}</small></span><span class="pick-end">{}</span></a>"#, esc(&l.name), workspace_logo(l, 36), esc(&l.name), esc(&workspace_sub(l)), icon("arrow"))).collect::<String>();
+        document(200, "SuperCI", &format!(r#"<div class="spaces"><div>{MARK}<h1>Workspaces</h1><p>Each is one company's SuperCI on this computer, with sign-ins, a control plane and runners of its own.</p><div class="picks">{rows}</div><button type="button" class="button secondary" onclick="document.getElementById('new-workspace').showModal()">New workspace</button></div></div>{}"#, new_workspace_dialog()), None)
+    }
+
+    /// A new, empty workspace. Its name.
+    fn create(&self, name: &str) -> Result<String> {
+        let root = self.root.as_ref().ok_or("SuperCI keeps nothing on this machine (it has no home folder), so there is the one workspace.")?;
+        let name = name.trim().to_lowercase();
+        crate::store::valid_name(&name)?;
+        if self.has(&name) { return Err(format!("There is a workspace named {name} already.")) }
+        // The one this was started in has no folder until it keeps something: it gets one now, so that it stays
+        // listed beside the new one.
+        if let Some(first) = self.first() { Store::under(root, &first).make()? }
+        Store::under(root, &name).make()?;
+        Ok(name)
+    }
+
+    /// A workspace under a new name: its folder is renamed, and its dashboard goes on under it.
+    fn rename(&self, from: &str, to: &str) -> Result<String> {
+        let root = self.root.as_ref().ok_or("SuperCI keeps nothing on this machine (it has no home folder).")?;
+        let to = to.trim().to_lowercase();
+        crate::store::valid_name(&to)?;
+        if to == from { return Ok(to) }
+        if self.has(&to) { return Err(format!("There is a workspace named {to} already.")) }
+        let board = lock(&self.boards).remove(from);
+        if let Some(b) = &board { lock(b).keep() }
+        if let Err(e) = crate::store::rename(root, from, &to) {
+            if let Some(b) = board { lock(&self.boards).insert(from.to_string(), b); }
+            return Err(e)
+        }
+        if let Some(b) = board {
+            { let mut d = lock(&b); d.store = Some(Store::under(root, &to)); if !d.w.is_empty() { d.w = to.clone() } }
+            lock(&self.boards).insert(to.clone(), b);
+        }
+        let mut first = lock(&self.first);
+        if first.as_deref() == Some(from) { *first = Some(to.clone()) }
+        Ok(to)
+    }
+
+    /// Forgets a workspace on this computer: signed out as Sign out does, then its folder goes. Nothing in its clouds
+    /// is deleted. Where to go from there: the only one left, or the list.
+    fn remove(&self, name: &str) -> Result<String> {
+        let root = self.root.as_ref().ok_or("SuperCI keeps nothing on this machine (it has no home folder).")?;
+        let board = self.board(name);
+        lock(&self.boards).remove(name);
+        {
+            let mut d = lock(&board);
+            d.sign_out()?;
+            // (Whatever of it is still on its way writes nowhere from here on.)
+            d.store = None;
+        }
+        Store::under(root, name).forget()?;
+        let left = crate::store::workspaces_in(root);
+        let mut first = lock(&self.first);
+        if first.as_deref() == Some(name) || left.len() < 2 { *first = match left.as_slice() { [] => Some(crate::store::FIRST.to_string()), [only] => Some(only.clone()), _ => None } }
+        Ok(match left.as_slice() { [only] => format!("/?w={only}&c="), [] => "/".to_string(), _ => "/workspaces".to_string() })
+    }
+}
+
+/// A workspace's mark in a list: its code host's logo once one is connected, its initial until then.
+fn workspace_logo(l: &crate::store::Listed, size: u32) -> String {
+    match l.hosts.first() {
+        Some((kind, _)) => logo(kind, size),
+        None => format!(r#"<span class="logo initial" style="width:{size}px;height:{size}px;font-size:{}px">{}</span>"#, size * 45 / 100, esc(&l.name.chars().take(1).collect::<String>().to_uppercase())),
+    }
+}
+
+/// A workspace in a few words: what its CI is called (when it was named) and whose jobs it runs; before that, where
+/// its control plane is, or that nothing is set up.
+fn workspace_sub(l: &crate::store::Listed) -> String {
+    let mut parts: Vec<String> = if l.called.is_empty() || l.called == "SuperCI" { vec![] } else { vec![l.called.clone()] };
+    parts.extend(l.hosts.iter().map(|(_, name)| name.clone()));
+    if parts.is_empty() && !l.place.is_empty() { parts.push(l.place.clone()) }
+    if parts.is_empty() { parts.push(if l.signed_in { "No control plane yet" } else { "Nothing set up yet" }.to_string()) }
+    parts.join(" · ")
+}
+
+/// The dialog that makes a workspace: its name, and nothing else.
+fn new_workspace_dialog() -> String {
+    format!(r#"<dialog class="dlg" id="new-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_WORKSPACE}</span><span><strong>New workspace</strong><small>Another company's SuperCI on this computer, with sign-ins of its own.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><form method="post" action="/workspaces" class="limit-do"><input name="name" placeholder="acme" aria-label="Its name" autofocus pattern="[a-z][a-z0-9\-]{{1,23}}" title="2 to 24 lowercase letters, digits and dashes" required spellcheck="false" autocomplete="off" autocapitalize="none"><button class="button primary sm">Create</button></form></div></dialog>"#)
+}
+
+const ICON_REMOVE: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14M10 7V5h4v2M7 7l.8 12h8.4L17 7M10.5 11v5M13.5 11v5"/></svg>"#;
+const ICON_WORKSPACE: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V6.5A1.5 1.5 0 0 1 5.5 5h8A1.5 1.5 0 0 1 15 6.5V20M15 10h3.5a1.5 1.5 0 0 1 1.5 1.5V20M2.5 20h19M8 9h3M8 12.5h3M8 16h3"/></svg>"#;
+
+/// The key and cookie checked, and where a request comes from. What it is refused with, or (on the first visit) sent
+/// on with; nothing when it may go on.
+fn admit(key: &str, req: &Req) -> Option<Response> {
     let q = |n: &str| req.query.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str()).unwrap_or("");
-    // The control plane this request names: in its address (`c`), or in its form.
-    let c = Some(q("c").to_string()).filter(|c| !c.is_empty()).or_else(|| url::form_urlencoded::parse(&req.body).find(|(k, _)| k == "c").map(|(_, v)| v.into_owned()));
-    view::name(c.as_deref().filter(|c| c.len() <= 24 && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())));
     // The first visit carries the key; later ones its cookie. SameSite=Lax: other sites' requests and form posts never carry it,
     // but coming back from a sign-in does (AWS's returns to 127.0.0.1, which is another site to a browser than localhost).
     if req.path == "/" && safe_eq(q("k").as_bytes(), key.as_bytes()) {
-        return Response::redirect("/").with_header("set-cookie", &format!("{}={key}; Path=/; HttpOnly; SameSite=Lax", key_cookie(&req.host)));
+        return Some(Response::redirect("/").with_header("set-cookie", &format!("{}={key}; Path=/; HttpOnly; SameSite=Lax", key_cookie(&req.host))));
     }
     // Only as this computer's own address (no other name pointing here), and changes only from the dashboard's own pages:
     // a page on another local port shares the cookie (cookies are not kept per port), not the origin.
     let local = ["localhost:", "127.0.0.1:", "[::1]:"].iter().any(|p| req.host.strip_prefix(p).is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())));
-    if !local { return message(403, "Not this computer's address", "Open the dashboard at the link `superci dashboard` printed when it started.") }
+    if !local { return Some(message(403, "Not this computer's address", "Open the dashboard at the link `superci dashboard` printed when it started.")) }
     // Browsers say where a request comes from (Sec-Fetch-Site; "same-origin" from these pages). Without it, the Origin
     // (which these pages' no-referrer policy turns into "null" on their own forms, so it only counts when it names a site).
     let own = match req.fetch_site.as_deref() {
@@ -4381,12 +4606,91 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
         None => req.origin.as_deref().is_none_or(|o| o == "null" || o == format!("http://{}", req.host)),
     };
     if req.method == "POST" && !own {
-        return message(403, "Not from your dashboard", "Changes are made from the dashboard's own page. Nothing has changed.");
+        return Some(message(403, "Not from your dashboard", "Changes are made from the dashboard's own page. Nothing has changed."));
     }
     // Redirects back from GitHub, Cloudflare, AWS and Modal come from their sites: no cookie; the state they carry guards them.
-    if !req.cookie.as_deref().is_some_and(|c| safe_eq(c.as_bytes(), key.as_bytes())) && !["/github/callback", "/github/installed", "/oauth/callback", "/oauth/modal"].contains(&req.path.as_str()) {
-        return message(403, "This tab is not connected to your dashboard", &format!("Open the link `superci dashboard` printed in your terminal when it started (it begins with http://{}/?k=). Nothing has changed.", req.host.replace("127.0.0.1", "localhost").replace("[::1]", "localhost")));
+    if !req.cookie.as_deref().is_some_and(|c| safe_eq(c.as_bytes(), key.as_bytes())) && !CALLBACKS.contains(&req.path.as_str()) {
+        return Some(message(403, "This tab is not connected to your dashboard", &format!("Open the link `superci dashboard` printed in your terminal when it started (it begins with http://{}/?k=). Nothing has changed.", esc(&req.host))));
     }
+    None
+}
+
+/// Where GitHub, Cloudflare, AWS and Modal come back to: their addresses were fixed when the sign-in began, and name
+/// no workspace.
+const CALLBACKS: [&str; 4] = ["/github/callback", "/github/installed", "/oauth/callback", "/oauth/modal"];
+
+/// One request: admitted, then handed to the dashboard of the workspace it names. With one workspace none needs
+/// naming. With several, a page's address says which (one that says none is sent on to the one the program was
+/// started in, or to the list), and anything that is not a page stops unless it says which: nothing picks a workspace
+/// for a change.
+fn respond(hub: &Hub, req: &Req) -> Response {
+    if let Some(answer) = admit(&hub.key, req) { return answer }
+    let q = |n: &str| req.query.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str()).unwrap_or("");
+    let field = |n: &str| url::form_urlencoded::parse(&req.body).find(|(k, _)| k == n).map(|(_, v)| v.trim().to_string()).unwrap_or_default();
+    let said = |r: Result<Response>| r.unwrap_or_else(|e| message(400, "That did not work", &esc(&e)));
+    let named = Some(q("w").to_string()).filter(|w| !w.is_empty()).or_else(|| Some(field("w")).filter(|w| !w.is_empty()));
+    // The workspaces themselves: the list of them, a new one, a new name for one, and forgetting one.
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/workspaces") => return hub.list_page(),
+        ("POST", "/workspaces") => return said(hub.create(&field("name")).map(|name| { println!("POST /workspaces → {name}"); Response::redirect(&format!("/?w={name}&c=")) })),
+        ("POST", "/workspaces/rename") => {
+            let Some(from) = named.clone().or_else(|| hub.first()).filter(|w| hub.has(w)) else { return message(409, "Which workspace?", "Open one from the list of workspaces and rename it from its Settings. Nothing has changed.") };
+            return said(hub.rename(&from, &field("name")).map(|to| { println!("POST /workspaces/rename → {to}"); Response::redirect(&format!("/?p=settings&w={to}")) }))
+        }
+        ("POST", "/workspaces/remove") => {
+            // Only the one its own page names: nothing picks a workspace to forget.
+            let Some(name) = named.clone().filter(|w| hub.has(w)) else { return message(409, "Which workspace?", "Open one from the list of workspaces and remove it from its Settings. Nothing has changed.") };
+            return said(hub.remove(&name).map(|to| { println!("POST /workspaces/remove → {name}"); Response::redirect(&to) }))
+        }
+        _ => {}
+    }
+    let page = req.method == "GET" && req.path == "/";
+    let gone = |heading: &str, text: &str| {
+        if page && q("fragment") == "1" { Response::new(200, "text/html; charset=utf-8", format!(r#"<div class="empty">{heading}. <a href="/workspaces" target="_top">Workspaces</a></div>"#)) }
+        else if page { Response::redirect("/workspaces") }
+        else { message(409, heading, text) }
+    };
+    let several = hub.names().len() > 1;
+    let name = match named {
+        Some(w) if hub.has(&w) => w,
+        Some(_) => return gone("That workspace is not kept on this computer", "Open one from the list of workspaces. Nothing has changed."),
+        None if CALLBACKS.contains(&req.path.as_str()) => match hub.awaiting(req).or_else(|| hub.first()) { Some(w) => w, None => return message(400, "This sign-in has expired", "Start again from the dashboard.") },
+        None => match hub.first() {
+            // A page: its address is given the name, so that everything done on it says which workspace it is for.
+            Some(first) if several && page && q("fragment") != "1" => {
+                let rest: String = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(req.query.iter().map(|(k, v)| (k.as_str(), v.as_str()))).finish();
+                return Response::redirect(&format!("/?{}{}w={first}", rest, if rest.is_empty() { "" } else { "&" }))
+            }
+            Some(first) if !several || page => first,
+            _ => return gone("Which workspace?", "Several workspaces are kept on this computer, and this page does not say which it is for. Open it again from the dashboard. Nothing has changed."),
+        },
+    };
+    let shared = hub.board(&name);
+    HERE.with(|h| h.borrow_mut().clone_from(&name));
+    let answer = respond_in(&shared, req);
+    // Where it sends the page on within the dashboard, the workspace goes along.
+    if !several { return answer }
+    carry(answer, &name)
+}
+
+/// A redirect to one of the dashboard's own pages, with its workspace named in the address.
+fn carry(mut answer: Response, workspace: &str) -> Response {
+    for (_, v) in answer.headers.iter_mut().filter(|(k, _)| k == "location") {
+        if v != "/" && !v.starts_with("/?") { continue }
+        let query = v.trim_start_matches('/').trim_start_matches('?').to_string();
+        if query.split('&').any(|kv| kv.starts_with("w=")) { continue }
+        *v = format!("/?{query}{}w={workspace}", if query.is_empty() { "" } else { "&" });
+    }
+    answer
+}
+
+/// One request within a workspace: the page frame drawn at once, its live part asked for without holding the
+/// dashboard's state, and everything else handled with it.
+fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
+    let q = |n: &str| req.query.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str()).unwrap_or("");
+    // The control plane this request names: in its address (`c`), or in its form.
+    let c = Some(q("c").to_string()).filter(|c| !c.is_empty()).or_else(|| url::form_urlencoded::parse(&req.body).find(|(k, _)| k == "c").map(|(_, v)| v.into_owned()));
+    view::name(c.as_deref().filter(|c| c.len() <= 24 && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())));
     // A command's tab (a sign-in, a GitHub App): what it is for, in the dashboard's place. A page that looks again by
     // itself is told when it is done.
     if req.method == "GET" && req.path == "/" {
@@ -4673,6 +4977,119 @@ mod tests {
         d
     }
 
+    /// One dashboard as the only workspace's, with no folder (as on a machine that keeps nothing).
+    fn hub_of(d: Dashboard, key: &str) -> Hub {
+        let mut d = d;
+        d.key = key.to_string();
+        Hub { root: None, key: key.to_string(), base: d.base.clone(), first: Mutex::new(Some("default".into())), boards: Mutex::new(HashMap::from([("default".to_string(), Arc::new(Mutex::new(d)))])) }
+    }
+
+    /// Two companies on one computer: each workspace has its own sign-ins and its own pages, a page's address says
+    /// which it is of, and nothing that changes something picks one by itself.
+    #[test]
+    fn workspaces_are_worlds_of_their_own() {
+        let root = std::env::temp_dir().join(format!("superci-hub-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        Store::under(&root, "acme").write(&Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme-team".into() }),
+            seen: Some(crate::store::Seen { called: "AcmeCI".into(), hosts: vec![("github".into(), "acme".into())] }), ..Default::default() }).unwrap();
+        Store::under(&root, "globex").make().unwrap();
+        let key = "k".repeat(32);
+        let hub = Hub { root: Some(root.clone()), key: key.clone(), base: "http://localhost:8976".into(), first: Mutex::new(Some("acme".into())), boards: Mutex::new(HashMap::new()) };
+        let ask = |method: &str, path: &str, query: &[(&str, &str)], body: &str| {
+            let r = respond(&hub, &Req { method: method.into(), path: path.into(), query: query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), cookie: Some(key.clone()), last: None, body: body.as_bytes().to_vec(),
+                host: "localhost:8976".into(), origin: None, fetch_site: Some("same-origin".into()) });
+            (r.status, r.headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.clone()).unwrap_or_default(), String::from_utf8_lossy(&r.body).to_string())
+        };
+        // A page that names none is sent on to the one the program was started in, by name.
+        assert_eq!(ask("GET", "/", &[], "").1, "/?w=acme");
+        assert_eq!(ask("GET", "/", &[("p", "settings")], "").1, "/?p=settings&w=acme");
+        // Each has its own dashboard, from its own folder: nothing of acme is in globex.
+        assert_eq!(lock(&hub.board("acme")).signed_in_as().as_deref(), Some("Modal workspace acme-team"));
+        assert!(lock(&hub.board("globex")).signed_in_as().is_none() && lock(&hub.board("globex")).w == "globex" && lock(&hub.board("acme")).w.is_empty());
+        // Globex's page is the first screen of a new SuperCI, with the switcher's rows: both workspaces, this one
+        // marked, acme with its code host's logo and what it was last seen as, and making a new one.
+        let (status, _, page) = ask("GET", "/", &[("w", "globex"), ("fragment", "1")], "");
+        assert!(status == 200 && page.contains("data-gated") && page.contains("Where is your control plane?"), "{page}");
+        assert!(page.contains(r#"<a class="space" href="/?w=acme&c=" aria-current="false"><span class="logo""#) && page.contains("<span>acme</span><small>AcmeCI · acme</small></a>"), "{page}");
+        assert!(page.contains(r#"<a class="space" href="/?w=globex&c=" aria-current="true"><span class="logo initial""#) && page.contains(">G</span><span>globex</span><small>Nothing set up yet</small></a>"), "{page}");
+        assert!(page.contains("<span>New workspace…</span>") && !page.contains("acme-team") && !page.contains("Add an organization"));
+        // Its frame has the dialog that makes one.
+        assert!(ask("GET", "/", &[("w", "globex")], "").2.contains(r#"<dialog class="dlg" id="new-workspace""#));
+        // What changes something says which workspace it is for, or stops: nothing picks one.
+        let (status, _, said) = ask("POST", "/routing", &[], "action=max_cpu&max_cpu=8");
+        assert!(status == 409 && said.contains("Which workspace?") && said.contains("Nothing has changed."), "{status} {said}");
+        let (status, _, said) = ask("GET", "/connect/aws", &[], "");
+        assert!(status == 409 && said.contains("Which workspace?"), "a sign-in is started in a workspace: {status}");
+        // One that is not kept here is none: a page goes to the list, a change stops.
+        assert_eq!(ask("GET", "/", &[("w", "nope")], "").1, "/workspaces");
+        assert!(ask("GET", "/", &[("w", "nope"), ("fragment", "1")], "").2.contains("That workspace is not kept on this computer"));
+        assert_eq!(ask("POST", "/routing", &[("w", "nope")], "action=max_cpu&max_cpu=8").0, 409);
+        // A sign-in that comes back from elsewhere names none: it goes to the workspace that started it, and from
+        // there back to that workspace's pages.
+        lock(&hub.board("globex")).github_expected = Some(now_ms() + 60_000);
+        let (_, _, back) = ask("GET", "/github/installed", &[], "");
+        assert!(back.contains("url=http://localhost:8976/?w=globex"), "{back}");
+        lock(&hub.board("globex")).github_expected = None;
+        // The list of them.
+        let (_, _, list) = ask("GET", "/workspaces", &[], "");
+        assert!(list.contains("<h1>Workspaces</h1>") && list.contains(r#"<a class="pick" href="/?w=acme&c=">"#) && list.contains(r#"<a class="pick" href="/?w=globex&c=">"#) && list.contains(">New workspace</button>"), "{list}");
+        // A new one: a name, and nothing else. It opens on its own pages, with no control plane named.
+        assert_eq!(ask("POST", "/workspaces", &[("w", "acme")], "name=Initech").1, "/?w=initech&c=");
+        assert!(lock(&hub.board("initech")).render("overview", &[], None).contains(r#"href="/?w=acme&c=" aria-current="false""#), "the others are in its switcher");
+        assert_eq!(crate::store::workspaces_in(&root), ["acme", "globex", "initech"]);
+        let (status, _, said) = ask("POST", "/workspaces", &[], "name=initech");
+        assert!(status == 400 && said.contains("There is a workspace named initech already."));
+        assert!(ask("POST", "/workspaces", &[], "name=two+words").2.contains("A workspace&#39;s name is 2 to 24 lowercase letters") || ask("POST", "/workspaces", &[], "name=two+words").2.contains("A workspace's name is 2 to 24 lowercase letters"));
+        // A new name for one: its folder is renamed and its pages go on under it.
+        assert_eq!(ask("POST", "/workspaces/rename", &[("w", "initech")], "name=umbrella").1, "/?p=settings&w=umbrella");
+        assert_eq!(crate::store::workspaces_in(&root), ["acme", "globex", "umbrella"]);
+        assert!(ask("POST", "/workspaces/rename", &[("w", "umbrella")], "name=acme").2.contains("There is a workspace named acme already."));
+        // Settings of one among several: its name with Rename, signing out of it, and removing it from this computer.
+        let settings = lock(&hub.board("umbrella")).settings_page(None);
+        assert!(settings.contains(r#"<span class="lim">umbrella</span>"#) && settings.contains(r#"action="/workspaces/rename""#) && !settings.contains("Sign out") && settings.contains(r#"action="/workspaces/remove" class="limit-do"><input type="hidden" name="w" value="umbrella">"#), "{settings}");
+        // (Settings is there in a workspace with nothing set up: that is where it is renamed or removed.)
+        let (_, _, page) = ask("GET", "/", &[("w", "umbrella"), ("p", "settings"), ("fragment", "1")], "");
+        assert!(page.contains(r#"<h1 class="page-title">Settings</h1>"#) && page.contains("Remove this workspace") && !page.contains("data-gated"), "{page}");
+        // Forgetting one takes its name from its own page: without it nothing is forgotten.
+        assert_eq!(ask("POST", "/workspaces/remove", &[], "").0, 409);
+        assert_eq!(crate::store::workspaces_in(&root).len(), 3);
+        assert_eq!(ask("POST", "/workspaces/remove", &[("w", "umbrella")], "").1, "/workspaces");
+        assert_eq!(ask("POST", "/workspaces/remove", &[], "w=globex").1, "/?w=acme&c=");
+        // The one left is as it was, and with it alone nothing needs naming again.
+        assert_eq!(crate::store::workspaces_in(&root), ["acme"]);
+        assert!(Store::under(&root, "acme").read().signed_in());
+        let alone = lock(&hub.board("acme")).settings_page(None);
+        assert!(alone.contains(r#"<span class="lim">acme</span>"#) && !alone.contains("Remove this workspace") && alone.contains("Signed in: Modal workspace acme-team. Signing out removes this workspace's sign-ins from it"));
+        assert_eq!(ask("GET", "/", &[], "").0, 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The first workspace has no folder until it keeps something: making a second gives it one, so both are listed.
+    #[test]
+    fn the_first_workspace_stays_listed_when_a_second_is_made() {
+        let root = std::env::temp_dir().join(format!("superci-hub-first-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        let hub = Hub { root: Some(root.clone()), key: "k".repeat(32), base: "http://localhost:8976".into(), first: Mutex::new(Some("default".into())), boards: Mutex::new(HashMap::new()) };
+        assert_eq!(hub.names(), ["default"]);
+        assert_eq!(hub.create("acme").unwrap(), "acme");
+        assert_eq!(crate::store::workspaces_in(&root), ["acme", "default"]);
+        let menu = lock(&hub.board("acme")).render("overview", &[], None);
+        assert!(menu.contains(r#"href="/?w=default&c=" aria-current="false""#) && menu.contains(r#"href="/?w=acme&c=" aria-current="true""#), "{menu}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_workspace_goes_along_in_its_addresses() {
+        // Where the dashboard sends a page on, the workspace is named; an address that names one is left as it is.
+        let to = |location: &str| carry(Response::redirect(location), "acme").headers.into_iter().find(|(k, _)| k == "location").unwrap().1;
+        assert_eq!((to("/"), to("/?p=repos"), to("/?p=repos&w=globex"), to("/?w=acme&c=")), ("/?w=acme".to_string(), "/?p=repos&w=acme".to_string(), "/?p=repos&w=globex".to_string(), "/?w=acme&c=".to_string()));
+        assert_eq!((to("/workspaces"), to("https://github.com/login")), ("/workspaces".to_string(), "https://github.com/login".to_string()));
+        // Back from a sign-in elsewhere: to this workspace's page, as its address was.
+        let mut d = Dashboard::new();
+        assert_eq!((d.back_url(""), d.back_url("?p=repos")), ("http://localhost:8976/".to_string(), "http://localhost:8976/?p=repos".to_string()));
+        d.w = "acme".into();
+        assert_eq!((d.back_url(""), d.back_url("?p=repos"), d.back_url("?p=repos&w=acme&c=abc")), ("http://localhost:8976/?w=acme".to_string(), "http://localhost:8976/?p=repos&w=acme".to_string(), "http://localhost:8976/?p=repos&w=acme&c=abc".to_string()));
+        assert_eq!((safe_return("?w=acme&p=add-runners&c=abc123"), safe_return("?p=repos"), safe_return("//evil.example"), safe_return("?p=x&next=https://evil.example")), ("?w=acme&p=add-runners&c=abc123".to_string(), "?p=repos".to_string(), String::new(), String::new()));
+    }
+
     /// With SUPERCI_PREVIEW_DIR set, each screen is also written there as a page, to look at.
     fn preview(name: &str, fragment: &str) {
         let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") else { return };
@@ -4808,19 +5225,15 @@ mod tests {
         preview("all", &list);
         assert!(list.contains(r#"<h1 class="page-title">Control planes</h1>"#) && list.contains(&format!(r#"href="/?c={}">Open</a>"#, view.plane.plane_id())) && list.contains(r#"href="/?c=xyz000000001">Open</a>"#), "{}", &list[..400.min(list.len())]);
         assert!(list.contains(r#"<a class="button primary sm" href="/?p=plane&c=">New control plane</a>"#) && list.contains("A control plane is one CI") && list.contains("data-list") && !list.contains("Add an organization"));
-        // The switcher under the name in the sidebar comes with every page: the control planes, a new one, the list.
-        // The two words are kept apart: its rows are control planes; an organization is added to the one shown.
-        assert!(list.contains(r#"<div data-switch hidden><a href="/?c="#) && list.contains(r#"<a href="/?c=xyz000000001" aria-current="false">"#) && list.contains(r#"<hr><a href="/?p=plane&c="><span>New control plane…</span></a><a href="/?p=all&c="><span>All control planes</span></a>"#));
+        // (The switcher at the top is between workspaces: it lists no control plane and adds no organization.)
+        assert!(!list.contains("data-switch") && !list.contains("All control planes"));
         assert!(!list.contains("Move here") && !list.contains(r#"action="/plane/"#) && d.render("jobs", &[view.clone(), theirs.clone()], None).contains("Control planes</h1>"), "every page is the list until one is named");
         // A page that names one shows that one, and offers nothing of the other.
         view::name(Some(view.plane.plane_id()));
         let beside = d.render("planes", &[view.clone(), theirs.clone()], None);
         preview("planes-two-teams", &beside);
         assert!(beside.contains("pick act current") && beside.contains("Serves a code host of its own") && !beside.contains("Move here</button>") && !beside.contains(r#"action="/plane/delete""#), "nothing of another team's is offered");
-        assert!(beside.contains(&format!(r#"<a href="/?c={}" aria-current="true">"#, view.plane.plane_id())), "the one shown is marked in the switcher");
-        assert!(beside.contains(&format!(r#"<a href="/?p=repos&c={}&open=gh-add"><span>Add an organization to SuperCI…</span></a>"#, view.plane.plane_id())));
-        // With one control plane the switcher has no list to offer.
-        assert!(!d.render("jobs", &[view.clone()], None).contains("All control planes"));
+        assert!(!beside.contains("Add an organization to"));
         view::name(Some("xyz000000001"));
         assert_eq!(view::in_use(&[view.clone(), theirs.clone()]), 1, "the one named, not the first that answers");
         view::name(None);
@@ -5424,33 +5837,33 @@ mod tests {
         let to_cf = d.handle(&get("/connect/cloudflare")).unwrap();
         assert!(to_cf.status == 409 && String::from_utf8_lossy(&to_cf.body).contains("needs port 8976") && d.cf_pending.is_none());
         // The first visit sets this port's cookie, and the other port's cookie is not this one's.
-        let shared = Arc::new(Mutex::new(Dashboard::new()));
+        let shared = hub_of(Dashboard::new(), &"k".repeat(32));
         let mut first = get("/");
         first.query = vec![("k".into(), "k".repeat(32))];
-        let set = respond(&shared, &"k".repeat(32), &first);
+        let set = respond(&shared, &first);
         assert!(set.headers.iter().any(|(k, v)| k == "set-cookie" && v.starts_with(&format!("superci_local_8977={}", "k".repeat(32)))));
     }
 
     #[test]
     fn it_answers_only_on_this_computers_address_and_changes_only_from_its_own_pages() {
-        let shared = Arc::new(Mutex::new(with_cloudflare(&[("a1", "Acme Inc.")])));
+        let shared = hub_of(with_cloudflare(&[("a1", "Acme Inc.")]), &"k".repeat(32));
         let req = |host: &str, origin: Option<&str>| Req { method: "POST".into(), path: "/routing".into(), query: vec![], cookie: Some("k".repeat(32)), last: None, body: b"action=max_cpu&max_cpu=8".to_vec(), host: host.into(), origin: origin.map(str::to_string),
             fetch_site: origin.map(|o| if o == "http://localhost:8976" || o == "null" { "same-origin".to_string() } else { "same-site".to_string() }) };
         let text = |r: Response| (r.status, String::from_utf8_lossy(&r.body).to_string());
-        let (status, body) = text(respond(&shared, &"k".repeat(32), &req("localhost:8976", Some("http://localhost:3000"))));
+        let (status, body) = text(respond(&shared, &req("localhost:8976", Some("http://localhost:3000"))));
         assert!(status == 403 && body.contains("Not from your dashboard"), "{status}");
-        let (status, body) = text(respond(&shared, &"k".repeat(32), &req("attacker.example:8976", Some("http://attacker.example:8976"))));
+        let (status, body) = text(respond(&shared, &req("attacker.example:8976", Some("http://attacker.example:8976"))));
         assert!(status == 403 && body.contains("Not this computer"), "{status}");
         // From its own page it goes through (and here finds no control plane to change), its Origin given or, as these
         // pages' no-referrer policy makes browsers send it, "null".
         for origin in ["http://localhost:8976", "null"] {
-            let (status, body) = text(respond(&shared, &"k".repeat(32), &req("localhost:8976", Some(origin))));
+            let (status, body) = text(respond(&shared, &req("localhost:8976", Some(origin))));
             assert!(!body.contains("Not from your dashboard") && !body.contains("Not this computer"), "{origin}: {status}");
         }
         // Another local page, its browser saying so.
         let mut other = req("localhost:8976", Some("null"));
         other.fetch_site = Some("same-site".into());
-        assert_eq!(respond(&shared, &"k".repeat(32), &other).status, 403);
+        assert_eq!(respond(&shared, &other).status, 403);
     }
 
     #[test]

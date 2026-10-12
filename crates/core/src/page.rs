@@ -104,12 +104,14 @@ tr.soon td{color:var(--faint)}tr.soon .logo{filter:grayscale(1);opacity:.55}
 :root[data-theme=dark] .gate-panel{box-shadow:0 1px 2px rgba(0,0,0,.4),0 28px 70px rgba(0,0,0,.55)}
 .gate-panel h2{font-size:22px;letter-spacing:-.035em}.gate-panel .lede{margin-top:7px;color:var(--muted);font-size:13.5px}
 .gate-back{justify-self:start;font-size:13px;font-weight:550;margin-bottom:-4px}.gate-foot{padding-top:14px;border-top:1px solid var(--rule-soft);color:var(--faint);font-size:12.5px}
-.gated .side .nav a{opacity:.4;pointer-events:none}.listing .side>.nav{visibility:hidden}
+.gated .side .nav a:not([href*="p=settings"]){opacity:.4;pointer-events:none}.listing .side>.nav{visibility:hidden}
 /* The name at the top of the sidebar is the switcher between control planes. */
 .brand-menu{display:block;padding:0}.brand-menu>summary{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:10px}.brand-menu>summary>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.brand-menu.has>summary:hover,.brand-menu[open]>summary{background:var(--card)}.brand-menu:not(.has)>summary{pointer-events:none}.brand-menu:not(.has) .chev{display:none}
 .brand-menu>summary .mark{width:22px;height:22px;fill:currentColor;stroke:none}.brand-menu>summary .chev{width:16px;height:16px;color:var(--faint)}
 .brand-menu .menu-pop{left:0;right:auto;min-width:248px;font-weight:500;letter-spacing:-.015em}
-.menu-pop a{display:grid;gap:1px;padding:8px 11px;border-radius:8px;font-size:13.5px;color:var(--ink);text-decoration:none}.menu-pop a small{color:var(--faint);font-size:12px;font-weight:400}.menu-pop a:hover,.menu-pop a[aria-current=true]{background:var(--card-2)}.menu-pop hr{width:100%;border:0;border-top:1px solid var(--rule-soft);margin:4px 0}
+.menu-pop a{display:grid;gap:1px;padding:8px 11px;border-radius:8px;font-size:13.5px;color:var(--ink);text-decoration:none}.menu-pop a small{color:var(--faint);font-size:12px;font-weight:400}.menu-pop a:hover,.menu-pop a[aria-current=true]{background:var(--card-2)}.menu-pop a.space{grid-template-columns:28px minmax(0,1fr);column-gap:10px;align-items:center}.menu-pop a.space>.logo{grid-row:1/3;border-radius:7px}.menu-pop a.space>span:not(.logo),.menu-pop a.space>small{grid-column:2;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.menu-pop a.space[aria-current=true]>span:not(.logo)::after{content:"✓";float:right;color:var(--accent);font-weight:600}
+.logo.initial{background:var(--card-2);color:var(--muted);font-weight:600;letter-spacing:0;line-height:1}.menu-pop a.space[aria-current=true]>.logo.initial,.menu-pop a.space:hover>.logo.initial{background:var(--card)}
+.spaces{display:grid;place-items:center;min-height:100vh;padding:24px}.spaces>div{display:grid;gap:14px;width:min(460px,100%)}.spaces .mark{width:30px;height:30px}.spaces h1{font-size:26px;letter-spacing:-.035em;margin-top:6px}.spaces p{color:var(--muted);font-size:14.5px;line-height:1.5;margin-bottom:6px}.spaces .picks{display:grid;gap:8px}.spaces .button{justify-self:start;margin-top:6px}.menu-pop hr{width:100%;border:0;border-top:1px solid var(--rule-soft);margin:4px 0}
 .side-foot{display:grid;gap:12px;margin-top:auto;padding-top:20px}.side-foot .nav{margin-top:0}#side-update:empty{display:none}
 .side-update{display:grid;gap:6px;padding:12px;border:1px solid var(--rule-soft);border-radius:12px;background:var(--card);box-shadow:var(--shadow)}
 .side-update strong{display:flex;align-items:center;gap:8px;font-size:12.5px;letter-spacing:-.01em}.side-update small{color:var(--muted);font-size:11.5px;line-height:1.45}
@@ -277,7 +279,7 @@ input[type=number]{height:32px;padding:0 10px;border:1px solid var(--rule);borde
 .default-machine{display:grid;grid-template-columns:36px minmax(0,1fr) auto auto;gap:14px;align-items:center;padding:14px 14px 14px 12px;border:1px solid var(--rule-soft);border-radius:12px}
 .dm-main{display:grid;gap:2px;min-width:0}.dm-main strong{font-size:13.5px;letter-spacing:-.015em}.dm-main small{color:var(--muted);font-size:12px}.dm-spec{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}
 .picker-head{display:grid;gap:4px;padding-top:6px}.picker-head h3{font-size:13.5px;letter-spacing:-.01em}
-.default-machine>form{display:contents}.default-machine>form>.button{grid-column:4}
+.default-machine>form{display:contents}.default-machine>form>.button{grid-column:4}.default-machine>.button{grid-column:4}
 @media (max-width:680px){.default-machine{grid-template-columns:36px minmax(0,1fr)}.dm-spec{grid-column:1/-1;justify-content:flex-start}.default-machine .button,.default-machine>form>.button{grid-column:1/-1;justify-self:start}}
 .picks.compact .pick{padding:10px 12px}.picks.compact .logo{width:30px!important;height:30px!important}.steps .picks.compact{margin-top:10px}
 details.connect{display:block}details.connect>summary{margin:0}details.connect>summary .button{pointer-events:none}details.connect[open]>summary{border-bottom-left-radius:0;border-bottom-right-radius:0}details.connect .gl-form{padding:16px 18px 18px;border:1px solid var(--rule-soft);border-top:0;border-radius:0 0 12px 12px;background:var(--card)}
@@ -360,9 +362,8 @@ body.busy::before{content:"";position:fixed;z-index:50;top:0;left:0;height:2px;w
 @media (max-width:980px){.layout{display:block}.side{position:relative;height:auto;padding:12px 16px}.side-foot{margin-top:2px;padding-top:0;gap:2px}.side-update{margin:8px 0}}
 @media (max-width:680px){.main{padding:0 16px 56px}.bar{padding:12px 0}.row{grid-template-columns:8px minmax(0,1fr)}.row-end{grid-column:2;justify-content:flex-start}}"#;
 
-/// Follows the system's light or dark, unless the page's toggle chose one (kept in this browser only).
-const THEME: &str = r#"<script>(function(){var t;try{t=localStorage.getItem('superci-theme')}catch(e){}document.documentElement.dataset.theme=t||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')})();
-function superciTheme(){var d=document.documentElement,n=d.dataset.theme==='dark'?'light':'dark';d.dataset.theme=n;try{localStorage.setItem('superci-theme',n)}catch(e){}}</script>"#;
+/// Follows the system's light or dark, also when it changes while the page is open.
+const THEME: &str = r#"<script>(function(){var m=matchMedia('(prefers-color-scheme: dark)');function f(){document.documentElement.dataset.theme=m.matches?'dark':'light'}f();if(m.addEventListener)m.addEventListener('change',f)})();</script>"#;
 
 /// A full page with the shared look; `body` is placed as is.
 pub fn document(status: u16, title: &str, body: &str, refresh_secs: Option<u32>) -> Response {

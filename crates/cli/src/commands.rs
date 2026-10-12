@@ -16,10 +16,10 @@ use crate::store;
 /// [--param=value]`, the operations `list`, `retrieve`, `create`, `update` and `delete` wherever they fit.
 const HELP: &[(&str, &str, &str)] = &[
     ("dashboard", "  superci dashboard                 Opens your dashboard in the browser (on this machine only, while it runs).",
-        "Set up or find SuperCI in your cloud, connect repositories and runner providers, and see your jobs. It opens signed in\nonce you have signed in before. Ctrl-C stops it; your runners keep working without it.\n\n  --no-browser    Prints its link without opening it."),
+        "Set up or find SuperCI in your cloud, connect repositories and runner providers, and see your jobs. It opens signed in\nonce you have signed in before. Ctrl-C stops it; your runners keep working without it. With several workspaces, the\nname at the top of its sidebar switches between them.\n\n  --no-browser    Prints its link without opening it."),
     ("login", "  superci login [CLOUD]             Signs in with a cloud in the browser (aws, cloudflare, modal), and ends.",
-        "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci) and commands use it from then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again. A sign-in adds an account beside the others:\n`superci login aws --add` signs in to one more AWS account.\n\n  --no-browser    Prints the link without opening it.\n  --add           One more AWS account, beside those signed in to."),
-    ("logout", "  superci logout                    Removes SuperCI's sign-ins from this machine.",
+        "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci, by workspace) and commands use it\nfrom then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again. A sign-in adds an account beside the others:\n`superci login aws --add` signs in to one more AWS account.\n\n  --no-browser    Prints the link without opening it.\n  --add           One more AWS account, beside those signed in to."),
+    ("logout", "  superci logout                    Removes SuperCI's sign-ins from this machine (the workspace's).",
         "It also asks Cloudflare to end its sign-in, and the control plane to forget this machine's key. Your control plane\nand runners keep working."),
     ("status", "  superci status                    The control plane in use: where, its version, whether jobs can run.",
         "With --json: the control plane, and under \"status\" everything it says of itself (repositories, runner providers,\nlimits, the latest jobs)."),
@@ -49,14 +49,17 @@ const HELP: &[(&str, &str, &str)] = &[
         "list      The projects a GitLab connection's token reaches, with their ids and whether their jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
+    ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update NAME --name=NEW\n  superci workspaces delete NAME --confirm",
+        "A workspace is one company's SuperCI on this machine: its own sign-ins to its clouds, and through them its control\nplane, runners and repositories. Nothing of one is seen from another. There is one (`default`) until you make more.\nWith several, a command says which: --workspace=NAME, or SUPERCI_WORKSPACE=NAME for a whole terminal. A command that\nnames none stops and lists them.\n\ncreate    Makes an empty one: 2 to 24 lowercase letters, digits and dashes. Then `superci login --workspace=NAME`.\nupdate    Renames one.\ndelete    Signs it out and forgets it on this machine. Nothing in its clouds is deleted: its control plane and\n          runners keep working (`superci leave --workspace=NAME --confirm` stops them first)."),
     ("leave", "  superci leave --confirm           Stops using SuperCI: what it made in your clouds is deleted.",
-        "GitHub and GitLab stop sending jobs, then the control plane is deleted with what was made for it, and with it the\nones that serve nothing. Another one that serves a code host of its own is left as it is: `--plane=ID` stops that\none by itself. The GitHub App itself is deleted on GitHub; change `runs-on: superci` back in your workflows first."),
+        "GitHub and GitLab stop sending jobs, then the control plane is deleted with what was made for it, and with it the\nones that serve nothing. Another one that serves a code host of its own is left as it is: `--plane=ID` stops that\none by itself. The GitHub App itself is deleted on GitHub; change `runs-on: superci` back in your workflows first.\nWith several workspaces it takes --workspace=NAME on the command itself, never from SUPERCI_WORKSPACE."),
 ];
 
-const FLAGS: &str = "  --param=value   What an operation takes (also `--param value`). An id or a name comes before the flags.
-  --json          One JSON object: what was done or read, or \"error\" with \"needs\" (the command a person runs first).
-  --dry-run       Checks a change and says what it would do, without doing it.
-  --confirm       Needed by what deletes something. Nothing is ever asked in the terminal.
+const FLAGS: &str = "  --param=value      What an operation takes (also `--param value`). An id or a name comes before the flags.
+  --workspace=NAME   Which workspace, when several are kept on this machine (see `superci help workspaces`).
+  --json             One JSON object: what was done or read, or \"error\" with \"needs\" (the command a person runs first).
+  --dry-run          Checks a change and says what it would do, without doing it.
+  --confirm          Needed by what deletes something. Nothing is ever asked in the terminal.
 
 Status: 0 done · 1 failed · 2 not a command, or not a whole one · 3 a person is needed first (see \"needs\").";
 
@@ -87,15 +90,18 @@ Repositories:
 Coding agents and scripts:
 {}
 
+Workspaces:
+{}
+
 {}
 
   superci help RESOURCE             More about one (also: superci RESOURCE --help).
 
 {FLAGS}
-SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere) and reads no other tool's. On a
-machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
+SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
+tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
 SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "labels", "name", "machine", "limits"]),
-                group(&["github", "github_deliveries", "gitlab", "gitlab_projects", "public_repos"]), group(&["keys"]), group(&["leave"]))
+                group(&["github", "github_deliveries", "gitlab", "gitlab_projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
 }
@@ -122,7 +128,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 10] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add"];
-const VALUES: [&str; 24] = ["enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 26] = ["workspace", "name", "enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -172,7 +178,51 @@ const NO_PLANE: &str = "There is no control plane yet. Set one up: `superci plan
 
 const ONLY_READS: &str = "SUPERCI_KEY only reads. A change needs SuperCI's own sign-in on this machine: `superci login`.";
 
-fn signed_in() -> Dashboard { Dashboard::signed_in(store::Store::new()) }
+thread_local! {
+    /// The workspace this command is in (see `enter`). None: nothing is kept for it (no home folder, or a key that
+    /// only reads, given by name, is all it uses).
+    static IN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One workspace, or several with none named.
+enum Which { One(Option<String>), Several(Vec<String>) }
+
+/// Which workspace a command is in: `--workspace=NAME`, then SUPERCI_WORKSPACE (not for `flag_only`: what deletes
+/// everything takes it from the command itself); with neither, the only one. A name that is none of those kept here
+/// stops the command and never falls through to another.
+fn which_workspace(args: &Args, flag_only: bool) -> Result<Which> {
+    let Some(root) = store::root() else { return Ok(Which::One(None)) };
+    let var = std::env::var("SUPERCI_WORKSPACE").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).filter(|_| !flag_only);
+    let (named, by) = match args.get("workspace").map(str::trim).filter(|w| !w.is_empty()) { Some(w) => (Some(w.to_string()), "--workspace"), None => (var, "SUPERCI_WORKSPACE") };
+    match store::which(&root, named.as_deref()) {
+        Ok(name) if named.is_none() || store::kept_here(&root, &name) => Ok(Which::One(Some(name))),
+        Ok(name) => {
+            let all = store::workspaces_in(&root);
+            let here = if all.is_empty() { "the only one is default".to_string() } else { format!("here: {}", all.join(", ")) };
+            Err(Fail::Failed(format!("{by} names the workspace {name}, and none is called that on this machine ({here}). Nothing was done. `superci workspaces create {name}` makes it.")))
+        }
+        Err(all) => Ok(Which::Several(all)),
+    }
+}
+
+fn several_workspaces(all: &[String], flag_only: bool) -> Fail {
+    Fail::Failed(format!("{} workspaces are kept on this machine: {}. Say which: --workspace=NAME{}. Nothing was done.", all.len(), all.join(", "), if flag_only { " (on this command itself)" } else { " (or SUPERCI_WORKSPACE=NAME)" }))
+}
+
+/// Puts a command in its workspace, before it does anything. With several and none named it stops and lists them,
+/// unless a key that only reads was given by name: that reads its control plane and uses nothing of a workspace.
+fn enter(args: &Args) -> Result<()> {
+    let flag_only = args.word(0) == "leave";
+    let name = match which_workspace(args, flag_only)? {
+        Which::One(name) => name,
+        Which::Several(_) if given_key().is_some() => None,
+        Which::Several(all) => return Err(several_workspaces(&all, flag_only)),
+    };
+    IN.with(|w| *w.borrow_mut() = name);
+    Ok(())
+}
+
+fn signed_in() -> Dashboard { Dashboard::signed_in(IN.with(|w| w.borrow().clone()).and_then(|w| store::Store::of(&w))) }
 
 /// A dashboard ready for a change: signed in, its clouds looked in, the control plane in use chosen.
 fn ready() -> Result<Dashboard> {
@@ -281,8 +331,10 @@ macro_rules! apply {
 
 /// Runs a command that is not the dashboard itself. `steps` is told each step of a long one as it begins.
 pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
-    name_plane(args);
     let w = |i: usize| args.word(i);
+    if w(0) == "workspaces" { return workspaces(args) }
+    enter(args)?;
+    name_plane(args);
     match (w(0), w(1)) {
         ("status", "") => {
             let mut d = signed_in();
@@ -290,7 +342,12 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 Some(_) => ("with a key that only reads (SUPERCI_KEY)".to_string(), Some(look(&mut d)?.0)),
                 None => { let v = d.current()?; if let Some(v) = &v { named_is(v.plane.plane_id(), v.plane.url(), &v.plane.place())? } (d.signed_in_as().unwrap_or_else(|| "nowhere now (AWS's sign-in has ended; this is read with this machine's key)".into()), v) }
             };
-            let v = match view { Some(v) => json!({ "signed_in": signed_in, "control_plane": plane_json(&v), "status": v.status }), None => json!({ "signed_in": signed_in, "control_plane": null }) };
+            let mut v = match view { Some(v) => json!({ "signed_in": signed_in, "control_plane": plane_json(&v), "status": v.status }), None => json!({ "signed_in": signed_in, "control_plane": null }) };
+            // Which workspace this is, said to a person only when there are several.
+            if let Some(name) = IN.with(|w| w.borrow().clone()) {
+                v["workspace"] = name.into();
+                v["workspaces"] = store::root().map(|r| store::workspaces_in(&r).len()).unwrap_or(0).into();
+            }
             Ok(Done { said: status_lines(&v), data: v })
         }
         ("jobs", "list") => jobs(),
@@ -631,8 +688,17 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
 /// for the one thing a person does in the browser (it ends when that is done). None: not one of these.
 pub fn in_browser(args: &Args) -> Option<Result<()>> {
     let open = !args.has("no-browser");
+    if !matches!((args.word(0), args.word(1)), ("dashboard", "") | ("login", _) | ("github", "create")) { return None }
+    // The dashboard serves every workspace: with several and none named it opens on the list of them.
+    if args.word(0) == "dashboard" {
+        return Some(match which_workspace(args, false) {
+            Ok(Which::One(name)) => { IN.with(|w| *w.borrow_mut() = name); signed_in().serve(open, false).map_err(Fail::from) }
+            Ok(Which::Several(_)) => Dashboard::signed_in(None).serve(open, true).map_err(Fail::from),
+            Err(e) => Err(e),
+        })
+    }
+    if let Err(e) = enter(args) { return Some(Err(e)) }
     match (args.word(0), args.word(1)) {
-        ("dashboard", "") => Some(signed_in().serve(open).map_err(Fail::from)),
         ("login", cloud) => {
             let cloud: Option<&'static str> = match cloud {
                 "" => None,
@@ -647,7 +713,7 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
                 return Some(Ok(()))
             }
             d.adding = add;
-            Some(d.for_task(Task::Login(cloud)).serve(open).map_err(Fail::from))
+            Some(d.for_task(Task::Login(cloud)).serve(open, false).map_err(Fail::from))
         }
         ("github", "create") => Some((|| {
             let owner = args.word(2);
@@ -658,7 +724,7 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
             let note = crate::dashboard::owner_note(owner, &plane.place());
             if args.has("dry-run") { println!("Would open GitHub in the browser, for a person to create the App for {owner} and choose its repositories. Nothing was changed.\nOnly an owner of {owner} can create it. A note to send one:\n\n{note}"); return Ok(()) }
             println!("Only an owner of {owner} can create its App (GitHub shows anyone else a 404). Not an owner? `superci github create {owner} --dry-run` prints a note to send one.");
-            Ok(d.for_task(Task::GitHub { login: owner.to_string(), host: args.get("host").unwrap_or_default().to_string(), started: false, done: false }).serve(open)?)
+            Ok(d.for_task(Task::GitHub { login: owner.to_string(), host: args.get("host").unwrap_or_default().to_string(), started: false, done: false }).serve(open, false)?)
         })()),
         _ => None,
     }
@@ -666,6 +732,7 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
 
 fn status_lines(v: &Value) -> Vec<String> {
     let mut out = vec![format!("Signed in     {}", v["signed_in"].as_str().unwrap_or_default())];
+    if v["workspaces"].as_u64().unwrap_or(0) > 1 { out.insert(0, format!("Workspace     {}", v["workspace"].as_str().unwrap_or_default())) }
     let p = &v["control_plane"];
     if p.is_null() { out.push(format!("Control plane none found in the clouds signed in to. {}", NO_PLANE.trim_start_matches("There is no control plane yet. "))); return out }
     let s = |x: &Value| x.as_str().unwrap_or_default().to_string();
@@ -678,6 +745,63 @@ fn status_lines(v: &Value) -> Vec<String> {
     let count = |states: &[&str]| jobs.iter().filter(|j| states.contains(&j["state"].as_str().unwrap_or_default())).count();
     out.push(format!("Jobs          {} listed · {} running · {} starting · {} waiting", jobs.len(), count(&["running"]), count(&["launching", "launched"]), count(&["waiting"])));
     out
+}
+
+/// `superci workspaces …`: the workspaces kept on this machine. Each is read from its own folder; no cloud is asked.
+fn workspaces(args: &Args) -> Result<Done> {
+    let w = |i: usize| args.word(i);
+    let root = store::root().ok_or("SuperCI keeps nothing on this machine (it has no home folder).")?;
+    let name = w(2).trim().to_lowercase();
+    let known = |name: &str| if store::workspaces_in(&root).iter().any(|n| n == name) { Ok(()) } else { Err(Fail::Failed(format!("There is no workspace named {name} on this machine (`superci workspaces list`)."))) };
+    match w(1) {
+        "list" => {
+            let all = store::listed(&root, None);
+            let line = |l: &store::Listed| {
+                let mut parts: Vec<String> = vec![];
+                if !l.called.is_empty() { parts.push(l.called.clone()) }
+                parts.extend(l.hosts.iter().map(|(kind, name)| format!("{} {name}", if kind == "gitlab" { "GitLab" } else { "GitHub" })));
+                if !l.place.is_empty() { parts.push(l.place.clone()) }
+                if !l.signed_in { parts.push(if parts.is_empty() { "nothing set up yet".into() } else { "signed out".into() }) }
+                format!("{:<24} {}", l.name, parts.join(" · "))
+            };
+            let said = if all.is_empty() { vec!["None yet: the first one (default) is made when you sign in (`superci login`).".to_string()] } else { all.iter().map(line).collect() };
+            let data: Vec<Value> = all.iter().map(|l| json!({ "name": l.name, "called": l.called, "hosts": l.hosts.iter().map(|(kind, name)| json!({ "kind": kind, "name": name })).collect::<Vec<_>>(), "control_plane": l.place, "signed_in": l.signed_in })).collect();
+            Ok(Done { said, data: json!({ "workspaces": data }) })
+        }
+        "create" => {
+            if name.is_empty() { return usage("Give it a name: `superci workspaces create acme`.") }
+            store::valid_name(&name)?;
+            if root.join("workspaces").join(&name).exists() { return Err(format!("There is a workspace named {name} already.").into()) }
+            if let Some(done) = dry(args, &format!("make an empty workspace named {name}"), "workspaces", &[]) { return Ok(done) }
+            store::Store::under(&root, &name).make()?;
+            Ok(Done { said: vec![format!("The workspace {name} is made, with nothing in it yet."), format!("Sign in to its clouds: `superci login --workspace={name}`, or open it: `superci dashboard --workspace={name}`.")], data: json!({ "ok": true, "workspace": name }) })
+        }
+        "update" => {
+            let Some(to) = args.get("name").map(|n| n.trim().to_lowercase()) else { return usage("Say its new name: `superci workspaces update NAME --name=NEW`.") };
+            if name.is_empty() { return usage("Say which: `superci workspaces update NAME --name=NEW`.") }
+            known(&name)?;
+            store::valid_name(&to)?;
+            if let Some(done) = dry(args, &format!("rename the workspace {name} to {to}"), "workspaces", &[]) { return Ok(done) }
+            store::rename(&root, &name, &to)?;
+            Ok(Done { said: vec![format!("The workspace {name} is called {to} now.")], data: json!({ "ok": true, "workspace": to }) })
+        }
+        "delete" => {
+            if name.is_empty() { return usage("Say which: `superci workspaces delete NAME --confirm`.") }
+            let would = format!("sign the workspace {name} out and forget it on this machine; nothing in its clouds is deleted");
+            confirmed(args, &would)?;
+            known(&name)?;
+            if let Some(done) = dry(args, &would, "workspaces", &[]) { return Ok(done) }
+            let store = store::Store::under(&root, &name);
+            // As `superci logout` does there first (its key leaves its control plane, Cloudflare ends its sign-in).
+            let mut said = Dashboard::signed_in(Some(store.clone())).logout()?;
+            said.retain(|line| line != "Nothing was kept on this machine.");
+            store.forget()?;
+            said.push(format!("The workspace {name} is forgotten on this machine. Nothing in its clouds was deleted."));
+            Ok(Done { data: json!({ "ok": true, "done": said }), said })
+        }
+        "" => usage("`superci workspaces` takes an operation."),
+        operation => usage(format!("`{operation}` is not an operation of `superci workspaces`.")),
+    }
 }
 
 fn jobs() -> Result<Done> {
@@ -787,13 +911,14 @@ mod tests {
             let one = help(word);
             assert!(one.starts_with(usage) && one.contains("--json") && !one.contains("Runners:"), "{word} has its own help");
         }
-        assert!(all.starts_with("SuperCI —") && all.contains("superci <resource> <operation> [id] [--param=value]") && all.contains("superci help RESOURCE") && all.contains("SUPERCI_HOME"));
+        assert!(all.starts_with("SuperCI —") && all.contains("superci <resource> <operation> [id] [--param=value]") && all.contains("superci help RESOURCE") && all.contains("SUPERCI_HOME") && all.contains("--workspace=NAME") && help("workspaces").contains("SUPERCI_WORKSPACE=NAME"));
         assert!(help("runners").contains("aws-on-demand") && help("gitlab").contains("SUPERCI_GITLAB_TOKEN") && help("github").contains("GitHub offers that nowhere else"));
         // Every command `run` and `in_browser` know is in some resource's lines.
         for command in ["superci dashboard", "superci login", "superci logout", "superci status", "superci jobs list", "superci jobs retrieve ID", "superci keys list", "superci keys create NAME", "superci keys delete NAME",
             "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci labels list", "superci labels create NAME", "superci labels delete NAME", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
             "superci planes list", "superci planes create", "superci planes update", "superci planes move ID", "superci planes allow", "superci planes delete ID", "superci leave --confirm", "superci github list", "superci github create OWNER", "superci github delete OWNER",
-            "superci github_deliveries list", "superci github_deliveries retrieve ID", "superci gitlab list", "superci gitlab create", "superci gitlab delete", "superci gitlab_projects list", "superci gitlab_projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete"] {
+            "superci github_deliveries list", "superci github_deliveries retrieve ID", "superci gitlab list", "superci gitlab create", "superci gitlab delete", "superci gitlab_projects list", "superci gitlab_projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete",
+            "superci workspaces list", "superci workspaces create NAME", "superci workspaces update NAME --name=NEW", "superci workspaces delete NAME --confirm"] {
             assert!(all.contains(command), "{command}");
         }
     }
@@ -850,6 +975,45 @@ mod tests {
         std::env::set_var("SUPERCI_PLANE", "plane.example");
         assert!(matches!(run("status"), Fail::Usage(e) if e.starts_with("SUPERCI_PLANE is the control plane's address")));
         for name in ["SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
+        // Workspaces. None yet: the first one is there without being made, and another name is none.
+        std::env::remove_var("SUPERCI_WORKSPACE");
+        let ok = |line: &str| super::run(&args(line), &mut |_| {}).unwrap().said;
+        assert_eq!(ok("workspaces list"), ["None yet: the first one (default) is made when you sign in (`superci login`)."]);
+        assert_eq!(run("status --workspace=acme"), Fail::Failed("--workspace names the workspace acme, and none is called that on this machine (the only one is default). Nothing was done. `superci workspaces create acme` makes it.".into()));
+        assert_eq!(run("status --workspace=default"), signed_out);
+        // One: nothing needs naming.
+        assert_eq!(ok("workspaces create Acme")[0], "The workspace acme is made, with nothing in it yet.");
+        assert_eq!(run("status"), signed_out);
+        assert_eq!(run("workspaces create acme"), Fail::Failed("There is a workspace named acme already.".into()));
+        // Two: a command says which, or stops and lists them. Nothing picks one.
+        ok("workspaces create globex");
+        let which = Fail::Failed("2 workspaces are kept on this machine: acme, globex. Say which: --workspace=NAME (or SUPERCI_WORKSPACE=NAME). Nothing was done.".into());
+        for line in ["status", "jobs list", "planes list", "runners update aws --max-jobs=3", "logout", "planes delete abcdef123456 --confirm", "name update AcmeCI"] { assert_eq!(run(line), which, "{line}") }
+        assert_eq!(in_browser(&args("login aws")).unwrap().unwrap_err(), which);
+        assert_eq!(in_browser(&args("github create acme")).unwrap().unwrap_err(), which);
+        assert_eq!(run("status --workspace=globex"), signed_out);
+        std::env::set_var("SUPERCI_WORKSPACE", "acme");
+        assert_eq!(run("status"), signed_out);
+        // What stops everything takes its workspace from the command itself, never from the terminal's variable.
+        assert_eq!(run("leave --confirm"), Fail::Failed("2 workspaces are kept on this machine: acme, globex. Say which: --workspace=NAME (on this command itself). Nothing was done.".into()));
+        assert_eq!(run("leave --confirm --workspace=acme"), signed_out);
+        // A name that is none of them stops the command: it never falls through to another.
+        std::env::set_var("SUPERCI_WORKSPACE", "initech");
+        assert_eq!(run("status"), Fail::Failed("SUPERCI_WORKSPACE names the workspace initech, and none is called that on this machine (here: acme, globex). Nothing was done. `superci workspaces create initech` makes it.".into()));
+        assert_eq!(run("status --workspace=acme"), signed_out, "the flag comes before the variable");
+        std::env::remove_var("SUPERCI_WORKSPACE");
+        // The list, a new name, and forgetting one (which needs --confirm and a name that is one of them).
+        assert_eq!(ok("workspaces list"), [format!("{:<24} nothing set up yet", "acme"), format!("{:<24} nothing set up yet", "globex")]);
+        assert_eq!(ok("workspaces update globex --name=initech"), ["The workspace globex is called initech now."]);
+        assert_eq!(run("workspaces update acme --name=initech"), Fail::Failed("There is a workspace named initech already.".into()));
+        assert!(matches!(run("workspaces delete initech"), Fail::Unconfirmed(e) if e.starts_with("This would sign the workspace initech out and forget it on this machine")));
+        assert_eq!(run("workspaces delete nope --confirm"), Fail::Failed("There is no workspace named nope on this machine (`superci workspaces list`).".into()));
+        assert_eq!(ok("workspaces delete initech --dry-run"), ["Would sign the workspace initech out and forget it on this machine; nothing in its clouds is deleted. Nothing was changed."]);
+        assert_eq!(ok("workspaces delete initech --confirm"), ["The workspace initech is forgotten on this machine. Nothing in its clouds was deleted."]);
+        assert_eq!(run("status"), signed_out, "one is left: nothing needs naming again");
+        for (line, says) in [("workspaces", "`superci workspaces` takes an operation."), ("workspaces create", "Give it a name:"), ("workspaces create 9lives", "A workspace's name is"), ("workspaces update acme", "Say its new name:"), ("workspaces delete", "Say which:"), ("workspaces frob", "`frob` is not an operation of `superci workspaces`.")] {
+            assert!(matches!(run(line), Fail::Usage(e) | Fail::Failed(e) if e.starts_with(says)), "{line}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
