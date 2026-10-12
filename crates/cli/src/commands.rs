@@ -401,7 +401,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             Ok(Done::said(format!("The key {} no longer reads.", w(2).to_lowercase())))
         }
         // In a debug build only, to see (and record, with SUPERCI_RECORD) what a real account answers:
-        // `superci debug ec2 REGION ACTION Key=Value…`, or `superci debug json REGION SERVICE TARGET '{…}'`.
+        // `superci debug ec2 REGION ACTION Key=Value…`, or `superci debug json REGION SERVICE TARGET '{…}'`. A SERVICE
+        // with a dot in it is the whole host (budgets.amazonaws.com), a TARGET that starts with a slash is a path
+        // (/listRegions), and one that ends in @1.0 is asked in that JSON version.
         #[cfg(debug_assertions)]
         ("debug", kind @ ("ec2" | "json")) => {
             let mut d = signed_in();
@@ -414,7 +416,10 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             } else {
                 let body: Value = serde_json::from_str(w(5)).map_err(|e| e.to_string())?;
                 let service = w(3).split('.').next().unwrap_or_default().to_string();
-                futures::executor::block_on(superci_core::aws::json_call(&http, "POST", &format!("https://{}.{}.amazonaws.com/", w(3), w(2)), w(2), &service, Some(w(4)), "application/x-amz-json-1.1", Some(&body), &creds, now)).map(|v| v.to_string())
+                let host = if w(3).contains('.') { w(3).to_string() } else { format!("{}.{}.amazonaws.com", w(3), w(2)) };
+                let (target, kind) = match w(4).strip_suffix("@1.0") { Some(t) => (t, "application/x-amz-json-1.0"), None => (w(4), "application/x-amz-json-1.1") };
+                let (path, target) = if target.starts_with('/') { (target, None) } else { ("/", Some(target)) };
+                futures::executor::block_on(superci_core::aws::json_call(&http, "POST", &format!("https://{host}{path}"), w(2), &service, target, if target.is_some() { kind } else { "application/json" }, Some(&body), &creds, now)).map(|v| v.to_string())
             };
             let said = match answer { Ok(a) => a, Err(e) => format!("refused or failed: {e}") };
             Ok(Done { data: json!({ "answer": said }), said: vec![said] })
