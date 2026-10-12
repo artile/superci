@@ -435,6 +435,9 @@ pub struct Routing {
 /// The cloud account a place in the order spends in: AWS's on-demand machines are the same account's as its spot ones.
 pub fn account_of(cloud: &str) -> &str { if cloud == AWS_ON_DEMAND { "aws" } else { cloud } }
 
+/// A limit in dollars as it is said: whole dollars without cents ($200), another amount with them ($12.50).
+pub fn dollars(usd: f64) -> String { if usd.fract() == 0.0 { format!("${usd:.0}") } else { format!("${usd:.2}") } }
+
 /// What a month's spending by place (`month_spend`) comes to in one cloud account.
 pub fn account_spend(spend: &HashMap<String, f64>, account: &str) -> f64 { spend.iter().filter(|(c, _)| account_of(c) == account).map(|(_, usd)| usd).sum() }
 
@@ -1408,7 +1411,7 @@ impl<'a> ControlPlane<'a> {
         // The whole CI's limit for the month: at it nothing is started, wherever.
         if let Some(cap) = routing.monthly_usd {
             let spent: f64 = spend.values().sum();
-            if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of ${cap:.0} a month (${spent:.2} spent on machines): no job starts until next month, or until the limit is raised (Runners in the dashboard, or `superci limits update --monthly-usd=N`)", self.config.name()))) }
+            if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of {} a month (${spent:.2} spent on machines): no job starts until next month, or until the limit is raised (Runners in the dashboard, or `superci limits update --monthly-usd=N`)", self.config.name(), dollars(cap)))) }
         }
         let (mut later, mut never, mut places) = (vec![], vec![], vec![]);
         for cloud in &candidates {
@@ -1424,13 +1427,13 @@ impl<'a> ControlPlane<'a> {
             // Its cloud account's limit for the month, its providers together.
             if let Some(cap) = routing.account_usd.get(account_of(cloud)) {
                 if account_spend(&spend, account_of(cloud)) >= *cap {
-                    let said = format!("the {} account reached its ${cap:.0} a month", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default());
+                    let said = format!("the {} account reached its {} a month", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap));
                     if !never.contains(&said) { never.push(said) }
                     continue
                 }
             }
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
-                if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its ${cap:.0} a month")); continue }
+                if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month", dollars(cap))); continue }
             }
             if let Some(max) = pool.and_then(|p| p.max_jobs).or(Some(if cloud == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE })) {
                 if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
@@ -1900,6 +1903,8 @@ impl<'a> ControlPlane<'a> {
         let mac = self.config.parse(&label).and_then(|s| s.ok()).is_some_and(|s| s.os() == "macos") && why.starts_with("nowhere to run");
         let called = self.config.name();
         let line = if mac { format!("::error title={called} could not run this job::{called} runs no macOS jobs yet. Use runs-on: macos-latest for GitHub's own.") }
+            // A limit for the month: what to do is raising it or waiting (the whole CI's says so itself).
+            else if why.contains(" reached its ") { format!("::error title={called} could not run this job::{}.{}", why.replace(['\r', '\n'], " ").trim_end_matches('.'), if why.contains("until the limit is raised") { String::new() } else { format!(" Raise that limit on Runners in the {called} dashboard, or wait for next month.") }) }
             else { format!("::error title={called} could not run this job::{}. Change its runs-on, or add a place that can run it in the {called} dashboard.", why.replace(['\r', '\n'], " ").trim_end_matches('.')) };
         let work = Work::Fail { jit, why: crate::crypto::b64(line.as_bytes()) };
         let size = Size { cpu: 1, ram_gb: 4, disk_gb: 8, gpu: None };

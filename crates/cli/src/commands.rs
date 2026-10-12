@@ -792,15 +792,15 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
     }
 }
 
-/// A limit in dollars a month as a command gives it: a whole number of dollars, or `none` (empty: no limit).
+/// A limit in dollars a month as a command gives it: an amount above zero, or `none` (empty: no limit).
 fn dollars(given: &str) -> Result<String> {
     if given == "none" { return Ok(String::new()) }
-    match given.parse::<u32>() { Ok(n) if n >= 1 => Ok(n.to_string()), _ => Err("A limit is a whole number of dollars a month (`--monthly-usd=200`), or `none`.".into()) }
+    match given.parse::<f64>() { Ok(n) if n > 0.0 && n.is_finite() => Ok(given.to_string()), _ => Err("A limit is dollars a month (`--monthly-usd=200`), or `none`.".into()) }
 }
 
 /// What was spent on machines this month and the limit it counts against, in a line.
 fn month_line(whose: &str, spent: f64, cap: Option<f64>) -> String {
-    match cap { Some(cap) => format!("{whose} spent ${spent:.2} on machines this month, of ${cap:.0} allowed."), None => format!("{whose} spent ${spent:.2} on machines this month; no limit is set.") }
+    match cap { Some(cap) => format!("{whose} spent ${spent:.2} on machines this month, of {} allowed.", superci_core::plane::dollars(cap)), None => format!("{whose} spent ${spent:.2} on machines this month; no limit is set.") }
 }
 
 /// `superci dashboard`, `superci login [cloud]` and `superci connections create github`: the dashboard, or the dashboard opened
@@ -1044,11 +1044,11 @@ mod tests {
 
     fn args(line: &str) -> Args { Args::parse(&line.split_whitespace().map(str::to_string).collect::<Vec<_>>()).unwrap() }
 
-    /// A limit a month is whole dollars or `none`; what was spent is said against it.
+    /// A limit a month is dollars or `none`; what was spent is said against it.
     #[test]
-    fn a_monthly_limit_is_whole_dollars_or_none() {
-        assert_eq!((dollars("200").unwrap(), dollars("none").unwrap()), ("200".to_string(), String::new()));
-        for bad in ["0", "-5", "12.5", "lots", ""] { assert!(dollars(bad).is_err(), "{bad}") }
+    fn a_monthly_limit_is_dollars_or_none() {
+        assert_eq!((dollars("200").unwrap(), dollars("12.5").unwrap(), dollars("none").unwrap()), ("200".to_string(), "12.5".to_string(), String::new()));
+        for bad in ["0", "-5", "lots", "", "inf"] { assert!(dollars(bad).is_err(), "{bad}") }
         assert_eq!(month_line("The CI", 14.224, Some(100.0)), "The CI spent $14.22 on machines this month, of $100 allowed.");
         assert_eq!(month_line("The AWS account", 0.0, None), "The AWS account spent $0.00 on machines this month; no limit is set.");
     }
