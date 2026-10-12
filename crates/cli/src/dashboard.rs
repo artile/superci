@@ -1697,9 +1697,15 @@ impl Dashboard {
                     _ => String::new(),
                 };
                 let more = left.iter().map(|l| format!("<li>{}</li>", esc(l))).collect::<String>();
-                let (heading, said) = if another_ci { ("That control plane is stopped", format!("{} and what was made for it are deleted. Your other control plane goes on as before.", esc(&used.place()))) }
+                let (heading, said) = if another_ci { ("That control plane is stopped", format!("{} and what was made for it are deleted.", esc(&used.place()))) }
                     else { ("SuperCI is stopped", "Its control planes and what was made for them are deleted from your clouds.".to_string()) };
-                Ok(message(200, heading, &format!(r#"{said}</p><ul class="checks" style="margin-top:12px">{app_link}<li>Change <code>runs-on: superci</code> back in your workflows (and <code>tags:</code> in GitLab).</li>{more}</ul><p>"#)))
+                // Workflows change back only where it served any: all of them when SuperCI is stopped, those of its
+                // own repositories when another control plane goes on.
+                let served = !app.is_null() || !status["gitlab"].is_null() || status["gitlabs"].as_array().is_some_and(|g| !g.is_empty());
+                let back = if !served { "" }
+                    else if another_ci { "<li>Change <code>runs-on</code> back in the workflows of the repositories it served (and <code>tags:</code> in GitLab).</li>" }
+                    else { "<li>Change <code>runs-on: superci</code> back in your workflows (and <code>tags:</code> in GitLab).</li>" };
+                Ok(message(200, heading, &format!(r#"{said}</p><ul class="checks" style="margin-top:12px">{app_link}{back}{more}</ul><p>"#)))
             }
             ("POST", "/plane/update") => {
                 // Which: its id (or, from before, its place in the list); none: the one in use.
@@ -5130,7 +5136,7 @@ mod tests {
         let live = seen(theirs.clone(), true, None, false, true);
         assert!(live.serves_its_own() && !live.takes_a_move_from(ours.url()));
         // Stopping ours leaves theirs, with the command that stops theirs later; a spare is theirs to move to then.
-        assert_eq!(live.goes_with(&ours, true), Err("AWS · 222222222222 · us-east-1 serves a code host of its own and was left as it is (`superci leave --plane=bbbbbbbbbbbb --confirm` stops that one)".to_string()));
+        assert_eq!(live.goes_with(&ours, true), Err("AWS · 222222222222 · us-east-1 serves a code host of its own and goes on as before (`superci leave --plane=bbbbbbbbbbbb --confirm` stops that one)".to_string()));
         // One that serves nothing yet: a place to move to, deletable, and gone with ours.
         let empty = seen(spare.clone(), false, None, false, true);
         assert!(!empty.serves_its_own() && empty.takes_a_move_from(ours.url()));

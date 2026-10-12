@@ -125,7 +125,7 @@ impl PlaneView {
     pub fn goes_with(&self, used: &Plane, another_ci: bool) -> std::result::Result<bool, String> {
         let (place, id) = (self.plane.place(), self.plane.plane_id());
         if self.moved_to.as_deref() == Some(used.url()) { return Ok(true) }
-        if self.serves_its_own() { return Err(format!("{place} serves a code host of its own and was left as it is (`superci leave --plane={id} --confirm` stops that one)")) }
+        if self.serves_its_own() { return Err(format!("{place} serves a code host of its own and goes on as before (`superci leave --plane={id} --confirm` stops that one)")) }
         if !self.online { return Err(format!("{place} did not answer and was left as it is (`superci planes delete {id} --confirm` deletes it)")) }
         Ok(!another_ci)
     }
