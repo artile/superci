@@ -401,16 +401,20 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             Ok(Done::said(format!("The key {} no longer reads.", w(2).to_lowercase())))
         }
         // In a debug build only, to see (and record, with SUPERCI_RECORD) what a real account answers:
-        // `superci debug ec2 REGION ACTION Key=Value…`, or `superci debug json REGION SERVICE TARGET '{…}'`. A SERVICE
+        // `superci debug ec2 REGION ACTION Key=Value…`, `superci debug iam ACTION Key=Value…`, or
+        // `superci debug json REGION SERVICE TARGET '{…}'`. A SERVICE
         // with a dot in it is the whole host (budgets.amazonaws.com), a TARGET that starts with a slash is a path
         // (/listRegions), and one that ends in @1.0 is asked in that JSON version.
         #[cfg(debug_assertions)]
-        ("debug", kind @ ("ec2" | "json")) => {
+        ("debug", kind @ ("ec2" | "json" | "iam")) => {
             let mut d = signed_in();
             let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
             let http = crate::aws::Blocking::new();
-            let answer = if kind == "ec2" {
+            let answer = if kind == "iam" {
+                let params: serde_json::Map<String, Value> = args.words[3.min(args.words.len())..].iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), Value::from(v))).collect();
+                futures::executor::block_on(superci_core::aws::iam(&http, &creds, w(2), Value::Object(params), now))
+            } else if kind == "ec2" {
                 let params: serde_json::Map<String, Value> = args.words[4.min(args.words.len())..].iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), Value::from(v))).collect();
                 futures::executor::block_on(superci_core::aws::ec2(&http, w(2), &creds, w(3), Value::Object(params), now))
             } else {
