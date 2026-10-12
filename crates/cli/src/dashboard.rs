@@ -3737,7 +3737,7 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     let kept = labels.iter().enumerate().map(|(i, l)| format!(r#"<form method="post" action="/labels" class="kept-label"><input type="hidden" name="action" value="remove"><input type="hidden" name="label" value="{l}"><span><code>{l}</code>{}</span>{}</form>"#,
         if i == 0 && labels.len() > 1 { r#" <small class="faint">shown in examples</small>"# } else { "" },
         if labels.len() > 1 { r#"<button class="button secondary sm">Remove</button>"# } else { "" }, l = esc(l))).collect::<String>();
-    let label_dialog = format!(r#"<dialog class="dlg" id="labels" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Labels</strong><small>A workflow may name any of them in <code>runs-on</code>.</small></span>{close}</div><div class="kept-labels">{kept}</div><form method="post" action="/labels" class="limit-do"><input name="label" placeholder="soroci" aria-label="A label to add" pattern="[a-z][a-z0-9]{{1,23}}" required spellcheck="false" autocomplete="off"><button class="button primary sm">Add</button></form></div></dialog>"#, logo(ICON_TAG));
+    let label_dialog = format!(r#"<dialog class="dlg" id="labels" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Labels</strong><small>A workflow may name any of them in <code>runs-on</code>.</small></span>{close}</div><div class="kept-labels">{kept}</div><form method="post" action="/labels" class="limit-do"><input name="label" placeholder="acmeci" aria-label="A label to add" pattern="[a-z][a-z0-9]{{1,23}}" required spellcheck="false" autocomplete="off"><button class="button primary sm">Add</button></form></div></dialog>"#, logo(ICON_TAG));
     let label_row = format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Labels</strong><small>What workflows name in <code>runs-on</code>.</small></span><span class="dm-spec">{}</span><button type="button" class="button secondary sm" onclick="document.getElementById('labels').showModal()">Change</button></div>"#,
         logo(ICON_TAG), labels.iter().map(|l| format!(r#"<span class="lim">{}</span>"#, esc(l))).collect::<String>());
     // Its name: what it is called in the dashboard and on GitHub.
@@ -4687,12 +4687,12 @@ mod tests {
         assert!(html.contains("<strong>Labels</strong>") && html.contains(r#"<form method="post" action="/labels" class="kept-label">"#) && !html.contains(r#"<button class="button secondary sm">Remove</button>"#));
         // Named, with a label added: the page's frame says the name, and each label can go.
         let mut named = view;
-        named.status.as_mut().unwrap()["name"] = "SoroCI".into();
-        named.status.as_mut().unwrap()["labels"] = serde_json::json!(["soroci", "superci"]);
-        let soro = d.render("workflows", &[named], None);
-        preview("workflows-named", &soro);
-        assert!(soro.contains(r#"data-called="SoroCI""#) && soro.contains(r#"name="name" value="SoroCI""#) && soro.matches(r#"<button class="button secondary sm">Remove</button>"#).count() == 2);
-        assert!(soro.contains(r#"<code>soroci</code> <small class="faint">shown in examples</small>"#) && Dashboard::sidebar("workflows").contains("<span>SoroCI</span>"));
+        named.status.as_mut().unwrap()["name"] = "AcmeCI".into();
+        named.status.as_mut().unwrap()["labels"] = serde_json::json!(["acmeci", "superci"]);
+        let renamed = d.render("workflows", &[named], None);
+        preview("workflows-named", &renamed);
+        assert!(renamed.contains(r#"data-called="AcmeCI""#) && renamed.contains(r#"name="name" value="AcmeCI""#) && renamed.matches(r#"<button class="button secondary sm">Remove</button>"#).count() == 2);
+        assert!(renamed.contains(r#"<code>acmeci</code> <small class="faint">shown in examples</small>"#) && Dashboard::sidebar("workflows").contains("<span>AcmeCI</span>"));
         *lock(called()) = String::new();
         // The default machine, in words, changed in its own dialog (which starts at it).
         assert!(html.contains(r#"<span class="lim">4 CPU</span><span class="lim">100 GB disk</span><span class="lim">x64</span><span class="lim">Linux</span><span class="lim">spot</span>"#));

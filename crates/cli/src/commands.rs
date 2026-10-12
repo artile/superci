@@ -30,9 +30,9 @@ const HELP: &[(&str, &str, &str)] = &[
     ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
         "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's limits: jobs at once, dollars a month (`none` lifts one). --enabled: aws-on-demand only.\n          --regions and --networks are AWS's (a network of your own per region; give --networks once per region),\n          --location and --image Cloudflare's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal. A job goes to the first that can run it and is\n          within its limits; when one cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
     ("labels", "  superci labels list\n  superci labels create NAME\n  superci labels delete NAME --confirm",
-        "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: soroci`, `soroci-8cpu`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
+        "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: acmeci`, `acmeci-8cpu`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
     ("name", "  superci name retrieve\n  superci name update NAME",
-        "What your CI is called where people read it: the dashboard's header, the GitHub App's name for an organization\nadded from then on, and what a job's page says when it could not be run. SuperCI unless you name it.\n\nupdate    Calls it NAME (\"SoroCI\", \"Acme CI\"): 2 to 24 letters, digits, spaces and dashes. `SuperCI` puts it back.\n          The command stays `superci`; what workflows name is `superci labels`."),
+        "What your CI is called where people read it: the dashboard's header, the GitHub App's name for an organization\nadded from then on, and what a job's page says when it could not be run. SuperCI unless you name it.\n\nupdate    Calls it NAME (\"AcmeCI\", \"Acme CI\"): 2 to 24 letters, digits, spaces and dashes. `SuperCI` puts it back.\n          The command stays `superci`; what workflows name is `superci labels`."),
     ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--arch=x64|arm64] [--os=linux|windows] [--on-demand=true|false]",
         "The machine `runs-on: superci` alone gets. A job's label can ask for another (`superci-8cpu-arm64`)."),
     ("limits", "  superci limits retrieve\n  superci limits update [--max-cpu=N] [--max-hours=N]",
@@ -471,7 +471,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             Ok(Done { said: vec![name.clone()], data: json!({ "name": name }) })
         }
         ("name", "update") => {
-            if w(2).is_empty() { return usage("Say what to call it: `superci name update SoroCI`.") }
+            if w(2).is_empty() { return usage("Say what to call it: `superci name update AcmeCI`.") }
             let mut d = ready_to_set()?;
             in_use(&d)?;
             apply!(d, args, format!("call it {}", w(2)), "/name", &[field("name", w(2))]);
@@ -742,7 +742,7 @@ mod tests {
         for name in ["SUPERCI_GITLAB_TOKEN", "SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
         let run = |line: &str| run(&args(line), &mut |_| {}).map(|d| d.said).unwrap_err();
         let signed_out = Fail::Failed(NOT_SIGNED_IN.into());
-        for line in ["status", "jobs list", "jobs retrieve 7", "github_deliveries list", "github_deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create soroci", "name retrieve", "name update SoroCI", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
+        for line in ["status", "jobs list", "jobs retrieve 7", "github_deliveries list", "github_deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create acmeci", "name retrieve", "name update AcmeCI", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
             "planes update", "planes create modal", "planes create aws --region=us-east-1", "runners create aws", "runners order aws", "runners update aws --max-jobs=3", "limits retrieve", "limits update --max-cpu=8", "limits update --max-hours 12",
             "public_repos create acme/site", "public_repos delete acme/site", "gitlab_projects list", "gitlab_projects update 7 --enabled=true", "gitlab_projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
             "planes update --dry-run", "runners create cloudflare --dry-run"] {

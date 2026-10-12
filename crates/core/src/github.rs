@@ -65,7 +65,7 @@ pub fn valid_login(login: &str) -> bool {
 }
 
 /// The App a control plane asks GitHub to create: private, webhook to the control plane, only the permissions runners need.
-/// The App's name starts with what the control plane is called (SuperCI, or its own name: SoroCI acme …); the person
+/// The App's name starts with what the control plane is called (SuperCI, or its own name: AcmeCI acme …); the person
 /// can change it on GitHub's page before it is made.
 pub fn app_manifest(plane_url: &str, owner: &Owner, called: &str, label: &str, plane_id: &str) -> serde_json::Value {
     let brand = if called.is_empty() { "SuperCI" } else { called };

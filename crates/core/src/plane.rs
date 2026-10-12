@@ -40,7 +40,7 @@ pub struct Config {
     pub label: String,
     pub more_labels: Vec<String>,
     /// What it is called where people read it (the dashboard's header, the App's name, what it says on a job it
-    /// could not run), when that is not SuperCI: a team's own name for its CI (SoroCI).
+    /// could not run), when that is not SuperCI: a team's own name for its CI (AcmeCI).
     pub name: Option<String>,
     pub app: Option<App>,
     /// GitHub Apps for further organizations (a private App belongs to one account, so each has its own); `app` is
