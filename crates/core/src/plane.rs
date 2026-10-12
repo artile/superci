@@ -359,6 +359,16 @@ const WAIT_FOR_SPOT: &str = "waiting: AWS has no spot machine for it now, and no
 /// that is full; with none of its own running it is tried again and then fails, saying which limits to raise.
 const AT_LIMIT: &str = "at the AWS account's limits: ";
 
+/// What a job's machine is called in AWS's console (its Name tag): the CI's name, the repository and the job, so that
+/// a list of machines says whose each is. Nothing reads it: a machine is known by its `superci-plane` and
+/// `superci-job` tags, and GitHub knows the runner by another name, which carries the control plane's id. So a CI
+/// that is given another name later just names its next machines by it.
+pub fn machine_name_in_aws(ci: &str, repo: &str, job: u64) -> String {
+    let ci: String = ci.trim().to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let repo: String = repo.rsplit('/').next().unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(60).collect();
+    [ci.trim_matches('-'), repo.as_str(), &job.to_string()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
+}
+
 /// What a job that ran on-demand is told of spot when the account's AWS organization allows none (see `aws::refusal`).
 pub const SPOT_NOT_ALLOWED: &str = "SpotNotAllowedByOrganization";
 
@@ -1614,7 +1624,7 @@ impl<'a> ControlPlane<'a> {
                         let on_demand = place == AWS_ON_DEMAND;
                         if on_demand { tried_on_demand = true } else { tried_spot = true }
                         let creds = self.aws_creds(plane_url, &a).await?;
-                        let tags = vec![("Name".to_string(), name.clone()), ("superci-plane".into(), self.config.plane_id.clone()), ("superci-job".into(), job.job_id.to_string()), ("superci-repo".into(), job.repo.clone())];
+                        let tags = vec![("Name".to_string(), machine_name_in_aws(self.config.name(), &job.repo, job.job_id)), ("superci-plane".into(), self.config.plane_id.clone()), ("superci-job".into(), job.job_id.to_string()), ("superci-repo".into(), job.repo.clone())];
                         // The standard machine keeps the configured types; a sized one gets the types that fit it.
                         let types = if spec.cpu.is_none() && spec.ram_gb.is_none() && spec.arch() == "x64" && spec.gpu.is_none() { self.config.instance_types.clone() } else { aws_instance_types(&spec) };
                         let mut disk_gb = spec.disk_gb.unwrap_or(60);
@@ -1863,7 +1873,7 @@ impl<'a> ControlPlane<'a> {
                     }
                     Place::Aws(a) => {
                         let creds = self.aws_creds(plane_url, &a).await?;
-                        let tags = vec![("Name".to_string(), name.clone()), ("superci-plane".into(), self.config.plane_id.clone()), ("superci-job".into(), job.job_id.to_string())];
+                        let tags = vec![("Name".to_string(), machine_name_in_aws(self.config.name(), &job.repo, job.job_id)), ("superci-plane".into(), self.config.plane_id.clone()), ("superci-job".into(), job.job_id.to_string())];
                         let types = ["t3a.small".to_string(), "t3.small".into(), "m7a.large".into()];
                         let user_data = aws::runner_user_data(&work, 10)?;
                         // A spot machine in the first region that has one; where spot is refused (its limit may be

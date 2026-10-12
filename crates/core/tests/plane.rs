@@ -186,6 +186,10 @@ fn aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines() {
     assert_eq!((field("ImageId").as_str(), field("InstanceType").as_str(), field("InstanceMarketOptions.MarketType").as_str()), ("ami-new", "c8a.xlarge", "spot"));
     assert!(String::from_utf8(STANDARD.decode(field("UserData")).unwrap()).unwrap().contains("./run.sh --jitconfig JITCONFIG+/="));
     assert!(fields.iter().any(|(k, v)| k.starts_with("TagSpecification.1.Tag.") && v == PLANE_ID));
+    // In AWS's console the machine is called by the CI's name, the repository and the job (nothing reads that name).
+    assert!(fields.iter().any(|(k, v)| k.starts_with("TagSpecification.1.Tag.") && v == "superci-app-7"), "{fields:?}");
+    assert_eq!(superci_core::plane::machine_name_in_aws("Acme CI", "acme/web.app", 42), "acme-ci-web.app-42");
+    assert_eq!(superci_core::plane::machine_name_in_aws("SuperCI", "", 42), "superci-42");
     assert_eq!(run(webhook("queued", None)).status, 202, "a repeated delivery launches nothing more");
     store.0.borrow_mut().insert("job:77".into(), serde_json::json!({ "job_id": 77, "run_id": 3, "repo": "acme/app", "state": "launching", "at_ms": 1_789_999_000_000u64, "installation_id": 42, "cloud": "", "seen_in_progress": false }).to_string());
     run(job_event("queued", 77, "acme/app", None));
