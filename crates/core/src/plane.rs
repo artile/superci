@@ -1720,9 +1720,9 @@ impl<'a> ControlPlane<'a> {
                         failures.push(("aws".into(), why));
                         answers.clear();
                     }
-                    // Every refusal was for the account's limits (spot's, and on-demand's where it was asked), for a
-                    // machine that is no GPU one (those are said above).
-                    if failures.is_empty() && !out_of_time && quota_only && !answers.is_empty() && spec.gpu.is_none() { return Err(format!("{AT_LIMIT}{}", answers.join("; "))) }
+                    // Every refusal was for the account's limits, on-demand's among them, for a machine that is no GPU
+                    // one (those are said above). (With only spot asked, the job waits for a spot machine as before.)
+                    if failures.is_empty() && !out_of_time && quota_only && tried_on_demand && !answers.is_empty() && spec.gpu.is_none() { return Err(format!("{AT_LIMIT}{}", answers.join("; "))) }
                     return Err(match failures.len() {
                         0 if out_of_time => last,
                         // Only spot machines were asked for, no region has one, and nothing else in the order can run
