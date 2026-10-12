@@ -235,7 +235,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
     reader.read_line(&mut line).ok()?;
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next()?.to_string(), parts.next()?.to_string());
-    let (mut length, mut cookie, mut last, mut host, mut origin, mut fetch_site) = (0usize, None, None, String::new(), None, None);
+    let (mut length, mut cookies, mut last, mut host, mut origin, mut fetch_site) = (0usize, String::new(), None, String::new(), None, None);
     loop {
         let mut h = String::new();
         if reader.read_line(&mut h).ok()? == 0 || h == "\r\n" || h == "\n" { break }
@@ -247,7 +247,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
             "sec-fetch-site" => fetch_site = Some(value.trim().to_ascii_lowercase()),
             "cookie" => {
                 let find = |name: &str| value.split(';').map(str::trim).find_map(|c| c.strip_prefix(name)).map(str::to_string);
-                cookie = find("superci_local=");
+                cookies = value.to_string();
                 last = find("superci_last=").filter(|c| CLOUDS.contains(&c.as_str()));
             }
             _ => {}
@@ -256,7 +256,17 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
     let mut body = vec![0u8; length.min(64 * 1024)];
     reader.read_exact(&mut body).ok()?;
     let url = url::Url::parse(&format!("http://local{target}")).ok()?;
+    // This dashboard's own cookie: named for its port, since a browser keeps cookies per computer name and not per
+    // port (two dashboards would take each other's).
+    let name = format!("{}=", key_cookie(&host));
+    let cookie = cookies.split(';').map(str::trim).find_map(|c| c.strip_prefix(name.as_str())).map(str::to_string);
     Some(Req { method, path: url.path().to_string(), query: url.query_pairs().into_owned().collect(), cookie, last, body, host, origin, fetch_site })
+}
+
+/// The name of the cookie that holds a dashboard's key: `superci_local` on the usual port, with the port after it
+/// on another.
+fn key_cookie(host: &str) -> String {
+    match host.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) { Some(p) if p != OAUTH_PORT => format!("superci_local_{p}"), _ => "superci_local".into() }
 }
 
 fn write_response(stream: &mut TcpStream, r: &Response) {
@@ -622,6 +632,9 @@ impl Dashboard {
     /// A dashboard opened for one thing a person does in the browser.
     pub fn for_task(mut self, task: Task) -> Self { self.task = Some(task); self }
 
+    /// The port this dashboard is served on.
+    fn port(&self) -> u16 { self.base.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(OAUTH_PORT) }
+
     fn signed_in_with(&self, cloud: &str) -> bool { match cloud { "aws" => self.aws.is_some(), "cloudflare" => self.cf.is_some(), _ => self.modal.is_some() } }
 
     /// The task is done: what to say in the terminal.
@@ -927,16 +940,34 @@ impl Dashboard {
         // "localhost" can mean either loopback address to a browser: listen on both.
         let (tx, rx) = mpsc::channel::<TcpStream>();
         let mut listening = 0;
-        // Another port (SUPERCI_PORT) is for trying a second dashboard: Cloudflare's browser sign-in needs 8976.
-        let port: u16 = std::env::var("SUPERCI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(OAUTH_PORT);
-        if port != OAUTH_PORT { self.base = format!("http://localhost:{port}") }
-        for addr in [format!("127.0.0.1:{port}"), format!("[::1]:{port}")] {
-            let Ok(listener) = TcpListener::bind(&addr) else { continue };
-            listening += 1;
-            let tx = tx.clone();
-            std::thread::spawn(move || for s in listener.incoming().flatten() { if tx.send(s).is_err() { break } });
+        // Port 8976, or the next free one when another SuperCI has it (or the one SUPERCI_PORT names). Only
+        // Cloudflare's browser sign-in needs 8976 itself: it comes back to no other.
+        let asked: Option<u16> = std::env::var("SUPERCI_PORT").ok().and_then(|p| p.parse().ok());
+        let ports: Vec<u16> = match asked {
+            Some(p) => vec![p],
+            None if matches!(self.task, Some(Task::Login(Some("cloudflare")))) => vec![OAUTH_PORT],
+            None => (OAUTH_PORT..OAUTH_PORT + 10).collect(),
+        };
+        let mut port = ports[0];
+        for p in ports {
+            port = p;
+            for addr in [format!("127.0.0.1:{p}"), format!("[::1]:{p}")] {
+                let Ok(listener) = TcpListener::bind(&addr) else { continue };
+                listening += 1;
+                let tx = tx.clone();
+                std::thread::spawn(move || for s in listener.incoming().flatten() { if tx.send(s).is_err() { break } });
+            }
+            if listening > 0 { break }
         }
-        if listening == 0 { return Err(format!("port {port} is in use (is another SuperCI or `wrangler login` running?)")) }
+        if listening == 0 {
+            return Err(if port == OAUTH_PORT && asked.is_none() { format!("Cloudflare's sign-in comes back to port {OAUTH_PORT} only, and another program has it (another SuperCI, or `wrangler login`). Stop that one, or sign in to Cloudflare there.") }
+                else { format!("port {port} is in use (is another SuperCI running?)") })
+        }
+        if port != OAUTH_PORT {
+            self.base = format!("http://localhost:{port}");
+            let shared = if std::env::var_os("SUPERCI_HOME").is_some_and(|v| !v.is_empty()) { "" } else { " Both use the same sign-ins (SUPERCI_HOME gives this one a folder of its own)." };
+            if asked.is_none() { println!("Port {OAUTH_PORT} is taken (another SuperCI?): this one is on {port}.{shared}") }
+        }
         let link = format!("{}/?k={}", self.base, self.key);
         println!("{}: {link}", match &self.task { Some(Task::Login(_)) => "Sign in with your cloud here (on this machine only)", Some(Task::GitHub { .. }) => "Create the GitHub App and choose its repositories here (on this machine only)", None => "SuperCI dashboard (on this machine only)" });
         if self.task.is_some() {
@@ -1191,6 +1222,8 @@ impl Dashboard {
         match (req.method.as_str(), req.path.as_str()) {
 
             // The connect screen's links: each remembers itself as the cloud picked last ("Last used"), in this browser only.
+            ("GET", "/connect/cloudflare") | ("POST", "/cloudflare/signin") if self.port() != OAUTH_PORT => Ok(message(409, "Cloudflare's sign-in needs port 8976",
+                &format!("Cloudflare's sign-in comes back to http://localhost:{OAUTH_PORT} only, and this dashboard is on port {}. Stop the SuperCI that has {OAUTH_PORT} and start this one again, or sign in to Cloudflare there.", self.port()))),
             ("GET", "/connect/cloudflare") => {
                 let (link, pending) = cloudflare::authorize();
                 self.cf_pending = Some(pending);
@@ -1198,7 +1231,7 @@ impl Dashboard {
                 Ok(leave(&link, "Cloudflare").with_header("set-cookie", &last_used_cookie("cloudflare")))
             }
             ("GET", "/connect/aws") => {
-                let (link, pending) = aws::authorize("us-east-1", &format!("http://127.0.0.1:{OAUTH_PORT}/oauth/callback"));
+                let (link, pending) = aws::authorize("us-east-1", &format!("http://127.0.0.1:{}/oauth/callback", self.port()));
                 self.aws_pending = Some(pending);
                 self.aws_asked_ms = now_ms();
                 self.return_to.clear();
@@ -1423,8 +1456,9 @@ impl Dashboard {
             }
             ("POST", "/aws/signin") => {
                 self.return_to = safe_return(&field("next"));
-                // AWS's developer-tools sign-in allows only this return path (Cloudflare's shares it; `state` tells them apart).
-                let (link, pending) = aws::authorize("us-east-1", &format!("http://127.0.0.1:{OAUTH_PORT}/oauth/callback"));
+                // AWS's developer-tools sign-in allows only this return path, on any port of this computer (Cloudflare's
+                // shares the path; `state` tells them apart).
+                let (link, pending) = aws::authorize("us-east-1", &format!("http://127.0.0.1:{}/oauth/callback", self.port()));
                 self.aws_pending = Some(pending);
                 self.aws_asked_ms = now_ms();
                 // Again after AWS's "400 Bad Request": signed out of AWS first (see `aws_stuck`).
@@ -4013,12 +4047,12 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     // The first visit carries the key; later ones its cookie. SameSite=Lax: other sites' requests and form posts never carry it,
     // but coming back from a sign-in does (AWS's returns to 127.0.0.1, which is another site to a browser than localhost).
     if req.path == "/" && safe_eq(q("k").as_bytes(), key.as_bytes()) {
-        return Response::redirect("/").with_header("set-cookie", &format!("superci_local={key}; Path=/; HttpOnly; SameSite=Lax"));
+        return Response::redirect("/").with_header("set-cookie", &format!("{}={key}; Path=/; HttpOnly; SameSite=Lax", key_cookie(&req.host)));
     }
     // Only as this computer's own address (no other name pointing here), and changes only from the dashboard's own pages:
     // a page on another local port shares the cookie (cookies are not kept per port), not the origin.
     let local = ["localhost:", "127.0.0.1:", "[::1]:"].iter().any(|p| req.host.strip_prefix(p).is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())));
-    if !local { return message(403, "Not this computer's address", "Open the dashboard at http://localhost:8976.") }
+    if !local { return message(403, "Not this computer's address", "Open the dashboard at the link `superci dashboard` printed when it started.") }
     // Browsers say where a request comes from (Sec-Fetch-Site; "same-origin" from these pages). Without it, the Origin
     // (which these pages' no-referrer policy turns into "null" on their own forms, so it only counts when it names a site).
     let own = match req.fetch_site.as_deref() {
@@ -4030,7 +4064,7 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     }
     // Redirects back from GitHub, Cloudflare, AWS and Modal come from their sites: no cookie; the state they carry guards them.
     if !req.cookie.as_deref().is_some_and(|c| safe_eq(c.as_bytes(), key.as_bytes())) && !["/github/callback", "/github/installed", "/oauth/callback", "/oauth/modal"].contains(&req.path.as_str()) {
-        return message(403, "This tab is not connected to your dashboard", "Open the link `superci dashboard` printed in your terminal when it started (it begins with http://localhost:8976/?k=). Nothing has changed.");
+        return message(403, "This tab is not connected to your dashboard", &format!("Open the link `superci dashboard` printed in your terminal when it started (it begins with http://{}/?k=). Nothing has changed.", req.host.replace("127.0.0.1", "localhost").replace("[::1]", "localhost")));
     }
     // A command's tab (a sign-in, a GitHub App): what it is for, in the dashboard's place. A page that looks again by
     // itself is told when it is done.
@@ -4866,6 +4900,28 @@ mod tests {
         assert!(cost_text(&j(None, "cloudflare"), 0.0123).contains("Estimated until Cloudflare&#39;s metering has it") || cost_text(&j(None, "cloudflare"), 0.0123).contains("Estimated until Cloudflare's metering has it"));
         assert!(cost_text(&j(Some("measured"), "cloudflare"), 0.0123).contains(r#"title="As Cloudflare metered it">$0.0123<"#));
         assert!(cost_text(&j(Some("prices"), "aws"), 0.5).contains(">$0.50<") && !cost_text(&j(Some("prices"), "aws"), 0.5).contains('≈'));
+    }
+
+    #[test]
+    fn a_second_dashboard_on_another_port_keeps_its_own_tab_and_signs_in_to_aws_there() {
+        // A browser keeps cookies per computer name, not per port: each dashboard's key has a name of its own.
+        assert_eq!((key_cookie("localhost:8976"), key_cookie("127.0.0.1:8977"), key_cookie("")), ("superci_local".to_string(), "superci_local_8977".to_string(), "superci_local".to_string()));
+        let mut d = Dashboard::new();
+        assert_eq!(d.port(), 8976);
+        d.base = "http://localhost:8977".into();
+        let get = |path: &str| Req { method: "GET".into(), path: path.into(), query: vec![], cookie: None, last: None, body: vec![], host: "localhost:8977".into(), origin: None, fetch_site: None };
+        // AWS's sign-in comes back to the port this dashboard is on (AWS allows any port of this computer).
+        let to_aws = d.handle(&get("/connect/aws")).unwrap();
+        assert!(String::from_utf8_lossy(&to_aws.body).contains("127.0.0.1%3A8977%2Foauth%2Fcallback") || to_aws.headers.iter().any(|(_, v)| v.contains("127.0.0.1%3A8977%2Foauth%2Fcallback")), "{}", String::from_utf8_lossy(&to_aws.body));
+        // Cloudflare's comes back to 8976 only: said, not tried.
+        let to_cf = d.handle(&get("/connect/cloudflare")).unwrap();
+        assert!(to_cf.status == 409 && String::from_utf8_lossy(&to_cf.body).contains("needs port 8976") && d.cf_pending.is_none());
+        // The first visit sets this port's cookie, and the other port's cookie is not this one's.
+        let shared = Arc::new(Mutex::new(Dashboard::new()));
+        let mut first = get("/");
+        first.query = vec![("k".into(), "k".repeat(32))];
+        let set = respond(&shared, &"k".repeat(32), &first);
+        assert!(set.headers.iter().any(|(k, v)| k == "set-cookie" && v.starts_with(&format!("superci_local_8977={}", "k".repeat(32)))));
     }
 
     #[test]

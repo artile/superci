@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.13.2 — unreleased
+- A second dashboard on the same computer works. With port 8976 taken, `superci dashboard` and `superci login aws` use the next free port and say so (before: "port 8976 is in use"). Signing in with AWS, Modal or GitHub comes back to that port (before, AWS's always came back to 8976, into the other dashboard). Each dashboard keeps its own tab signed in (before, opening one signed the other's tab out). Only Cloudflare's browser sign-in still needs port 8976 itself, and says so.
+
 ## 0.13.1 — 2026-10-12
 - A Settings page, below Control plane in the sidebar: the name, the labels and the limits (largest machine, longest job, public repositories) moved there from Workflows, and so did signing out, which was under More. Workflows keeps the default machine and how to use your label.
 
