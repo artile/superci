@@ -107,6 +107,26 @@ impl PlaneView {
 /// This dashboard's version: what an update brings a control plane to.
 pub const DASHBOARD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+impl PlaneView {
+    /// A CI of its own: GitHub or GitLab sends jobs to it, it has not moved away, and it is not standing by for a
+    /// move. Another such control plane beside the one in use is another team's: never a place to move to, never
+    /// deleted from beside it.
+    pub fn serves_its_own(&self) -> bool { (self.github || self.gitlab) && self.moved_to.is_none() && !self.standby }
+
+    /// Whether the control plane at `from` may move here: only onto one that serves nothing yet, or back onto the
+    /// one it moved from (a move replaces the target's GitHub App and settings).
+    pub fn takes_a_move_from(&self, from: &str) -> bool { !(self.github || self.gitlab) || self.standby || self.moved_to.as_deref() == Some(from) }
+
+    /// Whether stopping SuperCI at `used` deletes this one too, or why not: itself, the ones that serve nothing and
+    /// the ones it moved from, yes; one that does not answer, or serves a code host of its own, no.
+    pub fn goes_with(&self, used: &Plane) -> std::result::Result<(), String> {
+        if self.plane.plane_id() == used.plane_id() { return Ok(()) }
+        if !self.online { return Err(format!("{} did not answer and was left as it is (`superci planes delete {}` deletes it)", self.plane.place(), self.plane.plane_id())) }
+        if self.takes_a_move_from(used.url()) || self.moved_to.as_deref() == Some(used.url()) { return Ok(()) }
+        Err(format!("{} serves a code host of its own and was left as it is", self.plane.place()))
+    }
+}
+
 /// Whether version `a` (none: from before versions) is older than `b`.
 /// The first version that can move to another control plane.
 pub const MOVE_VERSION: &str = "0.9.3";

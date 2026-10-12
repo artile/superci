@@ -3,6 +3,9 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.13.2 — unreleased
+- Control planes of two teams reached from one computer (two cloud accounts signed in to, one after the other or side by side) can no longer damage each other. `superci leave` deletes the control plane it lets go of and the ones that serve nothing, and leaves one that serves a code host of its own (before: every control plane it found). A move refuses a target that serves a code host of its own (before: that one's GitHub App and settings were replaced). Delete refuses such a one as well. And a setting, an update or a delete is refused when SuperCI is signed in to another account than the control plane's own, saying which (before: it was written into the other account, or nowhere, and reported as done).
+- `--plane=ID` is a check: a command stops, with nothing done, when the control plane it would act on is another one. `SUPERCI_PLANE` given without `SUPERCI_KEY` does the same, by id or by address. Before, the flag was accepted and ignored, and the variable alone too.
+- `superci planes update ID` no longer makes the control plane it updated the one later commands act on.
 - A second dashboard on the same computer works. With port 8976 taken, `superci dashboard` and `superci login aws` use the next free port and say so (before: "port 8976 is in use"). Signing in with AWS, Modal or GitHub comes back to that port (before, AWS's always came back to 8976, into the other dashboard). Each dashboard keeps its own tab signed in (before, opening one signed the other's tab out). Only Cloudflare's browser sign-in still needs port 8976 itself, and says so.
 
 ## 0.13.1 — 2026-10-12

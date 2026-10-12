@@ -50,7 +50,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
     ("leave", "  superci leave --confirm           Stops using SuperCI: everything it made in your clouds is deleted.",
-        "GitHub and GitLab stop sending jobs, then every control plane is deleted with what was made for it. The GitHub App\nitself is deleted on GitHub; change `runs-on: superci` back in your workflows first."),
+        "GitHub and GitLab stop sending jobs, then the control plane is deleted with what was made for it, and with it the\nones that serve nothing. One that serves a code host of its own is left as it is. The GitHub App itself is deleted\non GitHub; change `runs-on: superci` back in your workflows first."),
 ];
 
 const FLAGS: &str = "  --param=value   What an operation takes (also `--param value`). An id or a name comes before the flags.
@@ -179,10 +179,40 @@ fn ready() -> Result<Dashboard> {
     let mut d = signed_in();
     if d.signed_in_as().is_none() && given_key().is_some() { return Err(ONLY_READS.into()) }
     d.ready()?;
+    named_is_in_use(&d)?;
     Ok(d)
 }
 
 fn in_use(d: &Dashboard) -> Result<Plane> { Ok(d.plane_in_use().ok_or(NO_PLANE)?) }
+
+thread_local! {
+    /// The control plane a command was told to act on (`--plane=ID`, or `SUPERCI_PLANE` with no key), and where that
+    /// was said. A check: a command acts on the control plane in use, and stops when that is another one.
+    static NAMED: std::cell::RefCell<Option<(String, &'static str)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Notes what this command names (see `NAMED`).
+fn name_plane(args: &Args) {
+    let var = |n: &str| std::env::var(n).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let named = match args.get("plane").map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => Some((p.to_string(), "--plane")),
+        // With a key the variable is the address that key reads (see `given_key`); alone it names the control plane.
+        None if var("SUPERCI_KEY").is_none() => var("SUPERCI_PLANE").map(|p| (p, "SUPERCI_PLANE")),
+        None => None,
+    };
+    NAMED.with(|n| *n.borrow_mut() = named);
+}
+
+/// Stops a command whose named control plane (its id, or its address) is not the one it would act on.
+fn named_is(id: &str, url: &str, place: &str) -> Result<()> {
+    let Some((named, by)) = NAMED.with(|n| n.borrow().clone()) else { return Ok(()) };
+    if named == id || named.trim_end_matches('/') == url.trim_end_matches('/') { return Ok(()) }
+    Err(Fail::Failed(format!("{by} names the control plane {named}, and the one in use here is {id} ({place}). Nothing was done. `superci planes list` lists them.")))
+}
+
+fn named_is_in_use(d: &Dashboard) -> Result<()> {
+    match d.plane_in_use() { Some(p) => named_is(p.plane_id(), p.url(), &p.place()), None => Ok(()) }
+}
 
 /// A dashboard ready to change a setting of the control plane in use (its limits, its order, its keys): as `ready`,
 /// without looking through the clouds again when that control plane is known.
@@ -191,7 +221,8 @@ fn ready_to_set() -> Result<Dashboard> { let mut d = signed_in(); to_set(&mut d)
 /// The same, of a dashboard that has read already. A key that only reads is no sign-in, and is said to be none.
 fn to_set(d: &mut Dashboard) -> Result<()> {
     if d.signed_in_as().is_none() && given_key().is_some() { return Err(ONLY_READS.into()) }
-    Ok(d.ready_for_settings()?)
+    d.ready_for_settings()?;
+    named_is_in_use(d)
 }
 
 /// A key that only reads, given by name with its control plane's address (SUPERCI_PLANE, SUPERCI_KEY): what a coding
@@ -204,11 +235,16 @@ fn given_key() -> Option<(String, String)> {
 /// What a command that looks reads: the control plane, and the key it is read with. With a key given by name: that
 /// control plane, with no sign-in. Else the one in use, with this machine's key.
 fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
-    let Some((url, key)) = given_key() else { let v = d.current()?.ok_or(NO_PLANE)?; return Ok((v, d.key().to_string())) };
+    let Some((url, key)) = given_key() else {
+        let v = d.current()?.ok_or(NO_PLANE)?;
+        named_is(v.plane.plane_id(), v.plane.url(), &v.plane.place())?;
+        return Ok((v, d.key().to_string()))
+    };
     if !url.starts_with("https://") { return usage("SUPERCI_PLANE is the control plane's address, starting with https:// (`superci status` says it).") }
     let health = crate::cloudflare::health(&url).ok_or("The control plane at SUPERCI_PLANE did not answer.")?;
     let v = crate::view::plane_view(&Plane::Seen { url, plane_id: health["plane"].as_str().unwrap_or_default().to_string() }, Some(&key));
     if v.status.is_none() { return Err("The control plane did not take SUPERCI_KEY: it has ended, was revoked, or is another control plane's (keys that only read need control plane 0.11.0 or newer).".into()) }
+    named_is(v.plane.plane_id(), v.plane.url(), "the one SUPERCI_PLANE and SUPERCI_KEY read")?;
     Ok((v, key))
 }
 
@@ -243,13 +279,14 @@ macro_rules! apply {
 
 /// Runs a command that is not the dashboard itself. `steps` is told each step of a long one as it begins.
 pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
+    name_plane(args);
     let w = |i: usize| args.word(i);
     match (w(0), w(1)) {
         ("status", "") => {
             let mut d = signed_in();
             let (signed_in, view) = match given_key() {
                 Some(_) => ("with a key that only reads (SUPERCI_KEY)".to_string(), Some(look(&mut d)?.0)),
-                None => { let v = d.current()?; (d.signed_in_as().unwrap_or_else(|| "nowhere now (AWS's sign-in has ended; this is read with this machine's key)".into()), v) }
+                None => { let v = d.current()?; if let Some(v) = &v { named_is(v.plane.plane_id(), v.plane.url(), &v.plane.place())? } (d.signed_in_as().unwrap_or_else(|| "nowhere now (AWS's sign-in has ended; this is read with this machine's key)".into()), v) }
             };
             let v = match view { Some(v) => json!({ "signed_in": signed_in, "control_plane": plane_json(&v), "status": v.status }), None => json!({ "signed_in": signed_in, "control_plane": null }) };
             Ok(Done { said: status_lines(&v), data: v })
@@ -687,6 +724,23 @@ mod tests {
     use super::*;
 
     fn args(line: &str) -> Args { Args::parse(&line.split_whitespace().map(str::to_string).collect::<Vec<_>>()).unwrap() }
+
+    #[test]
+    fn a_named_control_plane_that_is_not_the_one_in_use_stops_the_command() {
+        let (id, url, place) = ("aaaaaaaaaaaa", "https://a.lambda-url.us-east-1.on.aws", "AWS · 111111111111 · us-east-1");
+        // Nothing named: as before.
+        name_plane(&args("status"));
+        assert!(named_is(id, url, place).is_ok());
+        // Named by its id or by its address: the one in use passes, another stops with what was named and where.
+        name_plane(&args("runners update aws --max-jobs=5 --plane=aaaaaaaaaaaa"));
+        assert!(named_is(id, url, place).is_ok());
+        name_plane(&args("status --plane=https://a.lambda-url.us-east-1.on.aws/"));
+        assert!(named_is(id, url, place).is_ok());
+        name_plane(&args("runners update aws --max-jobs=5 --plane=bbbbbbbbbbbb"));
+        let Err(Fail::Failed(said)) = named_is(id, url, place) else { panic!("another control plane named") };
+        assert_eq!(said, "--plane names the control plane bbbbbbbbbbbb, and the one in use here is aaaaaaaaaaaa (AWS · 111111111111 · us-east-1). Nothing was done. `superci planes list` lists them.");
+        name_plane(&args("status"));
+    }
 
     #[test]
     fn words_and_flags() {

@@ -157,10 +157,32 @@ struct Move { to: String, at: usize, result: Option<Result<Vec<String>>>, ended_
 const MOVE_STEPS: [&str; 4] = ["Copying your settings and history", "Bringing your runner providers", "Switching GitHub and GitLab over", "Checking it answers"];
 
 /// Writes control planes' secrets from a background thread, with the sign-ins it was given.
-struct Writer { cf: Option<cloudflare::Cloudflare>, aws: Option<superci_core::aws::Credentials>, modal: Option<modal::Session> }
+struct Writer { cf: Option<cloudflare::Cloudflare>, aws: Option<superci_core::aws::Credentials>, modal: Option<modal::Session>, own: Own }
+
+/// Whose the sign-ins kept are: the AWS account, the Cloudflare accounts the login reaches (none: not asked yet), the
+/// Modal workspace.
+#[derive(Clone, Default)]
+struct Own { aws: Option<String>, cf: Vec<String>, modal: Option<String> }
+
+impl Own {
+    /// A control plane is changed only with the sign-in of the account it lives in: with another account's the cloud
+    /// would take the change somewhere else, or refuse it, and nothing here would know.
+    fn check(&self, plane: &Plane) -> Result<()> {
+        let other = |cloud: &str, its: &str, ours: &str| Err(format!("This control plane is in {cloud} {its}, and SuperCI is signed in to {ours}. Sign in to {its} to change it. Nothing has changed."));
+        match plane {
+            Plane::Aws { account_id, .. } => match &self.aws { Some(a) if a != account_id => other("AWS account", account_id, a), _ => Ok(()) },
+            Plane::Modal { workspace, .. } => match &self.modal { Some(w) if w != workspace => other("the Modal workspace", workspace, w), _ => Ok(()) },
+            Plane::Cloudflare { account_id, account_name, .. } if !self.cf.is_empty() && !self.cf.contains(account_id) => {
+                Err(format!("This control plane is in the Cloudflare account {account_name}, which the Cloudflare sign-in kept does not reach. Sign in to it to change it. Nothing has changed."))
+            }
+            _ => Ok(()),
+        }
+    }
+}
 
 impl Writer {
     fn put(&self, plane: &Plane, name: &str, value: &str) -> Result<()> {
+        self.own.check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cf.as_ref().ok_or("Sign in with Cloudflare first.")?.put_secret(account_id, script, name, value),
             Plane::Aws { region, plane_id, .. } => aws_plane::put_secret(self.aws.as_ref().ok_or("Sign in with AWS first.")?, region, plane_id, name, value),
@@ -171,6 +193,7 @@ impl Writer {
 
     /// Removes a setting (Modal's is emptied: its settings are entries of one Dict).
     fn drop(&self, plane: &Plane, name: &str) -> Result<()> {
+        self.own.check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cf.as_ref().ok_or("Sign in with Cloudflare first.")?.delete_secret(account_id, script, name),
             Plane::Aws { region, plane_id, .. } => aws_plane::delete_secret(self.aws.as_ref().ok_or("Sign in with AWS first.")?, region, plane_id, name),
@@ -880,7 +903,7 @@ impl Dashboard {
         let mut said = vec![];
         if store.read().key.is_some() {
             if let Some(p) = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id())) {
-                let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone() };
+                let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
                 match writer.drop(&p, &self.status_secret) {
                     Ok(()) => said.push(format!("The control plane ({}) no longer takes this machine's key.", p.place())),
                     Err(_) => said.push(format!("The control plane ({}) still has this machine's key, which only reads; it ends by itself by {}.", p.place(), day(key_until(&self.status_secret)))),
@@ -1026,8 +1049,14 @@ impl Dashboard {
 
     fn plane(&self) -> Result<Plane> { self.planes.get(self.selected).cloned().ok_or_else(|| "no control plane yet".to_string()) }
 
+    /// Whose the sign-ins kept are (see `Own`).
+    fn own(&self) -> Own {
+        Own { aws: self.aws.as_ref().map(|a| a.account_id.clone()), cf: self.cf_accounts.iter().map(|(id, _)| id.clone()).collect(), modal: self.modal.as_ref().map(|m| m.workspace.clone()) }
+    }
+
     /// Writes one of a control plane's secrets through its cloud's API (a Worker secret; an SSM parameter).
     fn put_secret(&mut self, plane: &Plane, name: &str, value: &str) -> Result<()> {
+        self.own().check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.put_secret(account_id, script, name, value),
             Plane::Aws { region, plane_id, .. } => aws_plane::put_secret(&self.aws_creds()?, region, plane_id, name, value),
@@ -1038,6 +1067,7 @@ impl Dashboard {
 
     /// Removes a setting from the control plane (Modal's are emptied: its store keeps names).
     fn drop_secret(&mut self, plane: &Plane, name: &str) -> Result<()> {
+        self.own().check(plane)?;
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.delete_secret(account_id, script, name),
             Plane::Aws { region, plane_id, .. } => aws_plane::delete_secret(&self.aws_creds()?, region, plane_id, name),
@@ -1156,7 +1186,7 @@ impl Dashboard {
         let unkeyed: Vec<Plane> = self.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. }) && !self.keyed.contains(p.plane_id())).cloned().collect();
         if unkeyed.is_empty() { return }
         // Handed to each at once.
-        let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone() };
+        let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
         let (name, key) = (self.status_secret.clone(), self.status_key.clone());
         let done: Vec<String> = std::thread::scope(|s| {
             let hs: Vec<_> = unkeyed.iter().map(|p| { let (writer, name, key) = (&writer, &name, &key); s.spawn(move || timed(&format!("{}: hand it this session's key", p.place()), || writer.put(p, name, key)).ok().map(|_| p.plane_id().to_string())) }).collect();
@@ -1536,9 +1566,14 @@ impl Dashboard {
                 let from = self.plane()?;
                 if to.plane_id() == from.plane_id() { return Ok(Response::redirect("/?p=planes")) }
                 let (from_view, to_view) = (view::plane_view(&from, Some(&key)), view::plane_view(&to, Some(&key)));
+                // Only to a control plane that serves nothing yet, or back to the one this one moved from: a move
+                // replaces the target's GitHub App and settings, and one that has its own is another CI.
+                if !to_view.takes_a_move_from(from.url()) {
+                    return Ok(message(409, "That control plane serves a code host of its own", "A move would replace its GitHub App and its settings. Move to one that serves nothing yet; to bring an organization there, add it on its Repositories page. Nothing has changed."))
+                }
                 let plan = self.carry_plan(&from_view, &to_view);
                 if let Some(Carry::NeedsSignIn(p)) = plan.iter().find(|c| matches!(c, Carry::NeedsSignIn(_))) { return Ok(message(409, &format!("Sign in with {} first", provider_name(p)), "Its runners come along with the move.")) }
-                let writer = Writer { cf: self.cf.as_mut().map(|s| s.client()).transpose()?, aws: self.aws.as_mut().map(|s| s.credentials()).transpose()?, modal: self.modal.clone() };
+                let writer = Writer { cf: self.cf.as_mut().map(|s| s.client()).transpose()?, aws: self.aws.as_mut().map(|s| s.credentials()).transpose()?, modal: self.modal.clone(), own: self.own() };
                 let aws_account = self.aws.as_ref().map(|a| a.account_id.clone());
                 let cf_account = match &from { Plane::Cloudflare { account_id, .. } => Some(account_id.clone()), _ => self.cf_accounts.first().map(|a| a.0.clone()) };
                 let state = self.moving.clone();
@@ -1556,6 +1591,11 @@ impl Dashboard {
                 let key = self.status_key.clone();
                 if self.plane().is_ok_and(|p| p.plane_id() == plane.plane_id()) { return Ok(message(409, "This control plane is in use", "Move to another one first, or stop using SuperCI.")) }
                 if lock(&self.moving).as_ref().is_some_and(|m| m.result.is_none() && m.to == plane.plane_id()) { return Ok(message(409, "A move to it is under way", "")) }
+                // One that GitHub or GitLab sends jobs to is a CI of its own (another team's, reached with the same
+                // sign-ins): never deleted from beside it. One that moved away, or stands by for a move, is not.
+                if view::plane_view(&plane, None).serves_its_own() {
+                    return Ok(message(409, "This control plane serves a code host", "GitHub or GitLab sends jobs to it. Stop using SuperCI there first (`superci leave`), then delete it. Nothing was deleted."))
+                }
                 let status = cloudflare::status(plane.url(), &key).unwrap_or_default();
                 let running = status["jobs"].as_array().into_iter().flatten().filter(|j| ["launching", "launched", "running"].contains(&j["state"].as_str().unwrap_or_default())).count();
                 if running > 0 { return Ok(message(409, &format!("{running} job{} still running there", if running == 1 { " is" } else { "s are" }), "Delete it when they finish.")) }
@@ -1563,8 +1603,10 @@ impl Dashboard {
                 self.flash = Some(format!("Deleted {}.{}", plane.place(), left.iter().map(|l| format!(" Left: {l}")).collect::<String>()));
                 Ok(Response::redirect("/?p=planes"))
             }
-            // Stopping SuperCI: GitHub and GitLab stop sending jobs, then every control plane is deleted with what
-            // was made for it. The GitHub App itself is deleted on GitHub (it has no way to delete itself).
+            // Stopping SuperCI: GitHub and GitLab stop sending jobs, then the control plane is deleted with what was
+            // made for it, and with it the ones that serve nothing (places it could have moved to, ones it moved
+            // from). A control plane that serves a code host of its own is another CI: left as it is. The GitHub App
+            // itself is deleted on GitHub (it has no way to delete itself).
             ("POST", "/plane/leave") => {
                 if field("confirm").trim() != "superci" { return Ok(message(400, "Type superci to confirm", "")) }
                 let used = self.plane()?;
@@ -1574,6 +1616,9 @@ impl Dashboard {
                 cloudflare::plane_post(used.url(), &key, "/leave", &serde_json::json!({})).map_err(|e| format!("GitHub and GitLab could not be let go of yet ({e}); nothing was deleted."))?;
                 let mut left = vec![];
                 for p in self.planes.clone() {
+                    if p.plane_id() != used.plane_id() {
+                        if let Err(why) = view::plane_view(&p, None).goes_with(&used) { left.push(why); continue }
+                    }
                     let st = cloudflare::status(p.url(), &key).unwrap_or_default();
                     match self.delete_plane(&p, &st) { Ok(l) => left.extend(l), Err(e) => left.push(format!("{}: {e}", p.place())) }
                 }
@@ -1588,8 +1633,13 @@ impl Dashboard {
             ("POST", "/plane/update") => {
                 // Which: its id (or, from before, its place in the list); none: the one in use.
                 let which = field("plane");
+                // Updating another one does not make it the one that later pages and commands act on.
+                let was = self.selected;
                 if let Some(i) = self.planes.iter().position(|p| p.plane_id() == which).or_else(|| which.parse::<usize>().ok().filter(|i| *i < self.planes.len())) { self.selected = i }
-                let plane = self.plane()?;
+                let plane = self.plane();
+                self.selected = was;
+                let plane = plane?;
+                self.own().check(&plane)?;
                 // What it runs now: whether its jobs' containers come along, and whether any would be cut short.
                 let Some(status) = status_soon(plane.url(), &self.status_key) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
@@ -2762,6 +2812,7 @@ load()})();</script>"#;
     /// Deletes a control plane from its cloud, and the runner agents and AWS role made for it in other clouds (those
     /// this session is signed in to). Returns what could not be removed, in words.
     fn delete_plane(&mut self, plane: &Plane, status: &serde_json::Value) -> Result<Vec<String>> {
+        self.own().check(plane)?;
         let mut left = vec![];
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.delete_plane(account_id, script, plane.plane_id())?,
@@ -4900,6 +4951,46 @@ mod tests {
         assert!(cost_text(&j(None, "cloudflare"), 0.0123).contains("Estimated until Cloudflare&#39;s metering has it") || cost_text(&j(None, "cloudflare"), 0.0123).contains("Estimated until Cloudflare's metering has it"));
         assert!(cost_text(&j(Some("measured"), "cloudflare"), 0.0123).contains(r#"title="As Cloudflare metered it">$0.0123<"#));
         assert!(cost_text(&j(Some("prices"), "aws"), 0.5).contains(">$0.50<") && !cost_text(&j(Some("prices"), "aws"), 0.5).contains('≈'));
+    }
+
+    #[test]
+    fn another_teams_control_plane_is_never_moved_onto_deleted_or_written_with_the_wrong_sign_in() {
+        let aws = |id: &str, account: &str| Plane::Aws { account_id: account.into(), region: "us-east-1".into(), url: format!("https://{id}.lambda-url.us-east-1.on.aws"), plane_id: id.into(), label: "superci".into() };
+        let seen = |plane: Plane, github: bool, moved_to: Option<&str>, standby: bool, online: bool| PlaneView { plane, online, github, installed: github, aws: true, runners: true, gitlab: false,
+            moved_to: moved_to.map(str::to_string), standby, version: Some(superci_core::plane::VERSION.into()), status: None };
+        let (ours, theirs, spare) = (aws("aaaaaaaaaaaa", "111111111111"), aws("bbbbbbbbbbbb", "222222222222"), aws("cccccccccccc", "111111111111"));
+        // Another team's: GitHub sends it jobs. Not a place to move to, not deleted from beside ours, and not deleted
+        // when SuperCI is stopped at ours.
+        let live = seen(theirs.clone(), true, None, false, true);
+        assert!(live.serves_its_own() && !live.takes_a_move_from(ours.url()));
+        assert_eq!(live.goes_with(&ours), Err("AWS · 222222222222 · us-east-1 serves a code host of its own and was left as it is".to_string()));
+        // One that serves nothing yet: a place to move to, deletable, and gone with ours.
+        let empty = seen(spare.clone(), false, None, false, true);
+        assert!(!empty.serves_its_own() && empty.takes_a_move_from(ours.url()) && empty.goes_with(&ours).is_ok());
+        // The one ours moved from still holds its App (it passes late events on): a move back is allowed, it can be
+        // deleted, and it goes with ours. One that stands by for a move under way is no CI of its own either.
+        let old = seen(spare.clone(), true, Some(ours.url()), false, true);
+        assert!(!old.serves_its_own() && old.goes_with(&ours).is_ok());
+        assert!(seen(ours.clone(), true, Some(spare.url()), false, true).takes_a_move_from(spare.url()), "back to where it came from");
+        let standing_by = seen(spare.clone(), true, None, true, true);
+        assert!(!standing_by.serves_its_own() && standing_by.takes_a_move_from(ours.url()));
+        // One that does not answer is left alone when SuperCI is stopped (it may be anyone's), and said.
+        assert!(seen(theirs.clone(), false, None, false, false).goes_with(&ours).unwrap_err().contains("did not answer and was left as it is (`superci planes delete bbbbbbbbbbbb`"));
+        assert!(seen(ours.clone(), true, None, false, true).goes_with(&ours).is_ok(), "the one that is let go of");
+
+        // A change is written only with the sign-in of the control plane's own account or workspace.
+        let own = Own { aws: Some("111111111111".into()), cf: vec!["cf-a".into()], modal: Some("acme".into()) };
+        assert!(own.check(&ours).is_ok());
+        assert_eq!(own.check(&theirs).unwrap_err(), "This control plane is in AWS account 222222222222, and SuperCI is signed in to 111111111111. Sign in to 222222222222 to change it. Nothing has changed.");
+        let cf = |account: &str| Plane::Cloudflare { account_id: account.into(), account_name: "Other Inc.".into(), script: "superci".into(), url: "https://superci.other.workers.dev".into(), plane_id: "dddddddddddd".into(), label: "superci".into() };
+        assert!(own.check(&cf("cf-a")).is_ok() && own.check(&cf("cf-b")).unwrap_err().contains("the Cloudflare account Other Inc., which the Cloudflare sign-in kept does not reach"));
+        let modal = |workspace: &str| Plane::Modal { workspace: workspace.into(), url: "https://x.modal.run".into(), plane_id: "eeeeeeeeeeee".into(), label: "superci".into() };
+        assert!(own.check(&modal("acme")).is_ok() && own.check(&modal("other")).unwrap_err().contains("the Modal workspace other, and SuperCI is signed in to acme"));
+        // Not signed in to that cloud at all: the existing "Sign in with … first" says it, not this check.
+        assert!(Own::default().check(&theirs).is_ok());
+        // The dashboard's own writers carry it: a setting of another account's control plane is refused before any call.
+        let writer = Writer { cf: None, aws: None, modal: None, own: own.clone() };
+        assert!(writer.put(&theirs, "ROUTING", "{}").unwrap_err().starts_with("This control plane is in AWS account 222222222222") && writer.drop(&theirs, "ROUTING").is_err());
     }
 
     #[test]
