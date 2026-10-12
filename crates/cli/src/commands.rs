@@ -14,8 +14,9 @@ use crate::store;
 /// What help is made of: a resource by its name, its commands (a resource, an operation, then what it takes), and
 /// what more `superci help <resource>` says. The shape is the Stripe CLI's: `superci <resource> <operation> [id]
 /// [--param=value]`, the operations `list`, `retrieve`, `create`, `update` and `delete` wherever they fit. What belongs
-/// to one provider is under its name, as Stripe's namespaces are (`superci aws accounts list`, `superci github
-/// deliveries list`, `superci gitlab projects update`).
+/// to a code host is under its name, as Stripe's namespaces are (`superci github deliveries list`, `superci gitlab
+/// projects update`). A cloud is never a command of its own (there will be many): it is what an operation takes
+/// (`superci runners create aws`, `superci accounts retrieve aws`).
 const HELP: &[(&str, &str, &str)] = &[
     ("dashboard", "  superci dashboard                 Opens your dashboard in the browser (on this machine only, while it runs).",
         "Set up or find SuperCI in your cloud, connect repositories and runner providers, and see your jobs. It opens signed in\nonce you have signed in before. Ctrl-C stops it; your runners keep working without it. With several workspaces, the\nname at the top of its sidebar switches between them.\n\n  --no-browser    Prints its link without opening it."),
@@ -45,8 +46,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "list      The GitHub accounts connected, and where each one's App is installed.\ncreate    Opens GitHub in the browser, where a person creates the App for OWNER (an organization, or your own name)\n          and chooses its repositories. GitHub offers that nowhere else. It ends when the App is installed.\n          --host: a GitHub Enterprise Server, or GitHub Enterprise Cloud with data residency.\ndelete    A further organization: its App is uninstalled and forgotten. The first one goes with `superci leave`.\n\ndeliveries: what GitHub says of the events it sent your control plane lately, for a job that never got a machine.\nlist      The newest hundred: when, what (a job queued, begun, ended), and how it was answered. A job that is in no\n          line was never sent by GitHub; the control plane finds such jobs by asking, within a few minutes.\nretrieve  One of them, with the job it was about, the address it was sent to and what was answered."),
     ("gitlab", "  superci gitlab list\n  superci gitlab create --url=https://gitlab.com [--gitlab=ID|new]\n  superci gitlab delete [ID] --confirm\n  superci gitlab projects list [--gitlab=ID]\n  superci gitlab projects update PROJECT_ID --enabled=true|false [--gitlab=ID]\n  superci gitlab projects update --all --enabled=true [--gitlab=ID]",
         "create    The token is read from SUPERCI_GITLAB_TOKEN (--token-env=NAME for another variable): a project, group or\n          personal access token with the scopes api, create_runner and manage_runner. It goes to your control plane\n          and is not kept on this machine. --gitlab=new: a further connection beside the first.\ndelete    Its projects stop sending jobs here, and its token is forgotten.\n\nprojects: the projects a GitLab connection's token reaches.\nlist      Each with its id and whether its jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
-    ("aws", "  superci aws accounts list\n  superci aws accounts retrieve [ID]",
-        "accounts: the AWS accounts signed in to.\nlist      Each with who is signed in.\nretrieve  What an account allows of what SuperCI does there: the regions, spot and on-demand machines, and how many\n          vCPUs it may run at once. It is asked with reads and dry runs only: nothing is made, started or changed.\n          An account in an AWS organization can be held to some regions or kept from spot by the organization's\n          policies, which nothing inside the account lifts; this says so, with the policy and whose it is."),
+    ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]",
+        "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
     ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces delete ID --confirm",
@@ -100,7 +101,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "aws", "labels", "name", "machine", "limits"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "accounts", "labels", "name", "machine", "limits"]),
                 group(&["github", "gitlab", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -415,16 +416,18 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let said = match answer { Ok(a) => a, Err(e) => format!("refused or failed: {e}") };
             Ok(Done { data: json!({ "answer": said }), said: vec![said] })
         }
-        ("aws", "accounts") if w(2) == "list" => {
+        ("accounts", "list") => {
             let d = signed_in();
-            let accounts = d.aws_accounts_signed_in();
-            let said = if accounts.is_empty() { vec!["Signed in to no AWS account: `superci login aws`.".to_string()] } else { accounts.iter().map(|(id, who)| format!("{id}  {who}")).collect() };
-            Ok(Done { said, data: json!({ "aws_accounts": accounts.iter().map(|(id, who)| json!({ "id": id, "signed_in_as": who })).collect::<Vec<_>>() }) })
+            let mut accounts: Vec<Value> = d.aws_accounts_signed_in().into_iter().map(|(id, who)| json!({ "cloud": "aws", "id": id, "signed_in_as": who })).collect();
+            accounts.extend(d.other_accounts_signed_in().into_iter().map(|(cloud, id)| json!({ "cloud": cloud, "id": id })));
+            let said = if accounts.is_empty() { vec![NOT_SIGNED_IN.to_string()] } else { accounts.iter().map(|a| format!("{:<11} {}{}", a["cloud"].as_str().unwrap_or_default(), a["id"].as_str().unwrap_or_default(), a["signed_in_as"].as_str().map(|w| format!("  {w}")).unwrap_or_default()).trim_end().to_string()).collect() };
+            Ok(Done { said, data: json!({ "accounts": accounts }) })
         }
-        ("aws", "accounts") if w(2) == "retrieve" => {
+        ("accounts", "retrieve") => {
+            if w(2) != "aws" { return usage("Say which cloud's: `superci accounts retrieve aws` (the look is at AWS accounts; other clouds have nothing to look for yet).") }
             let mut d = signed_in();
-            let (account, who, look) = d.look_at_aws(w(3))?;
-            Ok(Done { said: aws_look_lines(&account, &who, &look), data: json!({ "id": account, "signed_in_as": who, "kind": look.kind(), "allowed_regions": look.allowed_regions(), "organization": look.organization().map(|r| json!({ "management_account": r.management_account(), "policy": r.policy_id() })), "allows": look }) })
+            let (account, who, look) = d.look_at_aws(args.get("account").unwrap_or_default())?;
+            Ok(Done { said: aws_look_lines(&account, &who, &look), data: json!({ "cloud": "aws", "id": account, "signed_in_as": who, "kind": look.kind(), "allowed_regions": look.allowed_regions(), "organization": look.organization().map(|r| json!({ "management_account": r.management_account(), "policy": r.policy_id() })), "allows": look }) })
         }
         ("runners", "list") => runners_of(&mut signed_in()),
         ("github", "list") => github(),
@@ -705,7 +708,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             apply!(d, args, would, "/gitlab/disconnect", &[field("gitlab", w(2))]);
             Ok(Done::said("GitLab is disconnected."))
         }
-        (word @ ("aws" | "github" | "gitlab"), thing @ ("accounts" | "deliveries" | "projects")) => usage(if w(2).is_empty() { format!("`superci {word} {thing}` takes an operation.") } else { format!("`{}` is not an operation of `superci {word} {thing}`.", w(2)) }),
+        (word @ ("github" | "gitlab"), thing @ ("deliveries" | "projects")) => usage(if w(2).is_empty() { format!("`superci {word} {thing}` takes an operation.") } else { format!("`{}` is not an operation of `superci {word} {thing}`.", w(2)) }),
         (word, operation) => usage(match HELP.iter().find(|(w, ..)| *w == word) {
             Some(_) if operation.is_empty() => format!("`superci {word}` takes an operation."),
             Some(_) => format!("`{operation}` is not an operation of `superci {word}`."),
@@ -1002,7 +1005,7 @@ mod tests {
             "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci labels list", "superci labels create NAME", "superci labels delete NAME", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
             "superci planes list", "superci planes create", "superci planes update", "superci planes move ID", "superci planes allow", "superci planes delete ID", "superci leave --confirm", "superci github list", "superci github create OWNER", "superci github delete OWNER",
             "superci github deliveries list", "superci github deliveries retrieve ID", "superci gitlab list", "superci gitlab create", "superci gitlab delete", "superci gitlab projects list", "superci gitlab projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete",
-            "superci aws accounts list", "superci aws accounts retrieve", "superci github deliveries list", "superci gitlab projects update PROJECT_ID",
+            "superci accounts list", "superci accounts retrieve aws", "superci github deliveries list", "superci gitlab projects update PROJECT_ID",
             "superci workspaces list", "superci workspaces create NAME", "superci workspaces update ID --id=NEW", "superci workspaces delete ID --confirm"] {
             assert!(all.contains(command), "{command}");
         }
@@ -1044,15 +1047,15 @@ mod tests {
             ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
             ("gitlab projects update 7", "Say which way:"), ("gitlab projects update --all --enabled=false", "Projects are switched off one at a time"),
             ("planes", "`superci planes` takes an operation."), ("limits", "`superci limits` takes an operation."), ("runners frob", "`frob` is not an operation of `superci runners`."), ("limits set", "`set` is not an operation of `superci limits`."),
-            ("aws", "`superci aws` takes an operation."), ("aws accounts", "`superci aws accounts` takes an operation."), ("aws accounts frob", "`frob` is not an operation of `superci aws accounts`."),
+            ("aws", "`aws` is not a command of superci."), ("accounts", "`superci accounts` takes an operation."), ("accounts frob", "`frob` is not an operation of `superci accounts`."), ("accounts retrieve", "Say which cloud's:"), ("accounts retrieve modal", "Say which cloud's:"),
             ("github deliveries", "`superci github deliveries` takes an operation."), ("gitlab projects frob", "`frob` is not an operation of `superci gitlab projects`."),
             ("github_deliveries list", "`github_deliveries` is not a command of superci."), ("frobnicate", "`frobnicate` is not a command of superci.")] {
             assert!(matches!(run(line), Fail::Usage(e) if e.starts_with(says)), "{line}");
         }
         assert_eq!(super::run(&args("logout"), &mut |_| {}).unwrap().said, ["Nothing was kept on this machine."]);
-        // A provider's own things are under its name.
-        assert_eq!(super::run(&args("aws accounts list"), &mut |_| {}).unwrap().said, ["Signed in to no AWS account: `superci login aws`."]);
-        assert_eq!(run("aws accounts retrieve"), Fail::Failed("Sign in with AWS first.".into()));
+        // A cloud is what an operation takes, never a command of its own.
+        assert_eq!(super::run(&args("accounts list"), &mut |_| {}).unwrap().said, [NOT_SIGNED_IN]);
+        assert_eq!(run("accounts retrieve aws"), Fail::Failed("Sign in with AWS first.".into()));
         assert_eq!(needs("Sign in with AWS first."), Some("superci login aws"));
         // What opens the browser asks for the same first.
         assert!(matches!(in_browser(&args("login gcp")), Some(Err(Fail::Usage(_)))) && matches!(in_browser(&args("github create")), Some(Err(Fail::Usage(_)))));

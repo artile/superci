@@ -1092,6 +1092,18 @@ impl Dashboard {
         }
     }
 
+    /// The other clouds signed in to, each with its account as far as the sign-in says it (Cloudflare's sign-in
+    /// reaches accounts that only asking it lists; Modal's is for one workspace).
+    pub fn other_accounts_signed_in(&self) -> Vec<(&'static str, String)> {
+        let mut out = vec![];
+        if self.cf.is_some() {
+            if self.cf_accounts.is_empty() { out.push(("cloudflare", if self.cf_given { "a token given for this run".to_string() } else { "signed in".to_string() })) }
+            for (id, name) in &self.cf_accounts { out.push(("cloudflare", format!("{id}  {name}"))) }
+        }
+        if let Some(m) = &self.modal { out.push(("modal", m.workspace.clone())) }
+        out
+    }
+
     /// The AWS accounts signed in to, each with who is signed in.
     pub fn aws_accounts_signed_in(&self) -> Vec<(String, String)> { self.aws_accounts().into_iter().map(|a| (a.account_id, a.who)).collect() }
 
