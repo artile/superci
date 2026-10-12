@@ -13,7 +13,9 @@ use crate::store;
 
 /// What help is made of: a resource by its name, its commands (a resource, an operation, then what it takes), and
 /// what more `superci help <resource>` says. The shape is the Stripe CLI's: `superci <resource> <operation> [id]
-/// [--param=value]`, the operations `list`, `retrieve`, `create`, `update` and `delete` wherever they fit.
+/// [--param=value]`, the operations `list`, `retrieve`, `create`, `update` and `delete` wherever they fit. What belongs
+/// to one provider is under its name, as Stripe's namespaces are (`superci aws accounts list`, `superci github
+/// deliveries list`, `superci gitlab projects update`).
 const HELP: &[(&str, &str, &str)] = &[
     ("dashboard", "  superci dashboard                 Opens your dashboard in the browser (on this machine only, while it runs).",
         "Set up or find SuperCI in your cloud, connect repositories and runner providers, and see your jobs. It opens signed in\nonce you have signed in before. Ctrl-C stops it; your runners keep working without it. With several workspaces, the\nname at the top of its sidebar switches between them.\n\n  --no-browser    Prints its link without opening it."),
@@ -39,18 +41,14 @@ const HELP: &[(&str, &str, &str)] = &[
         "--max-cpu     The largest machine a label may ask for (32 unless set). A label asking for more is refused.\n--max-hours   The longest a job may run: its machine is ended after this (6 unless set, as on GitHub's own runners;\n              120 at most). Whatever is set, a machine on Cloudflare lives 6 hours at most and one on Modal 24. A\n              workflow's timeout-minutes ends a job sooner."),
     ("public_repos", "  superci public_repos list\n  superci public_repos create OWNER/REPO\n  superci public_repos delete OWNER/REPO",
         "Public repositories allowed to run here. Jobs from public repositories are refused unless the repository is allowed.\nEven then, a fork's pull request and `pull_request_target` runs are refused."),
-    ("github", "  superci github list\n  superci github create OWNER [--host=https://github.example.com]\n  superci github delete OWNER --confirm",
-        "list      The GitHub accounts connected, and where each one's App is installed.\ncreate    Opens GitHub in the browser, where a person creates the App for OWNER (an organization, or your own name)\n          and chooses its repositories. GitHub offers that nowhere else. It ends when the App is installed.\n          --host: a GitHub Enterprise Server, or GitHub Enterprise Cloud with data residency.\ndelete    A further organization: its App is uninstalled and forgotten. The first one goes with `superci leave`."),
-    ("github_deliveries", "  superci github_deliveries list\n  superci github_deliveries retrieve ID",
-        "What GitHub says of the events it sent your control plane lately: for a job that never got a machine.\n\nlist      The newest hundred: when, what (a job queued, begun, ended), and how it was answered. A job that is in no\n          line was never sent by GitHub; the control plane finds such jobs by asking, within a few minutes.\nretrieve  One of them, with the job it was about, the address it was sent to and what was answered."),
-    ("gitlab", "  superci gitlab list\n  superci gitlab create --url=https://gitlab.com [--gitlab=ID|new]\n  superci gitlab delete [ID] --confirm",
-        "create    The token is read from SUPERCI_GITLAB_TOKEN (--token-env=NAME for another variable): a project, group or\n          personal access token with the scopes api, create_runner and manage_runner. It goes to your control plane\n          and is not kept on this machine. --gitlab=new: a further connection beside the first.\ndelete    Its projects stop sending jobs here, and its token is forgotten."),
-    ("gitlab_projects", "  superci gitlab_projects list [--gitlab=ID]\n  superci gitlab_projects update PROJECT_ID --enabled=true|false [--gitlab=ID]\n  superci gitlab_projects update --all --enabled=true [--gitlab=ID]",
-        "list      The projects a GitLab connection's token reaches, with their ids and whether their jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
+    ("github", "  superci github list\n  superci github create OWNER [--host=https://github.example.com]\n  superci github delete OWNER --confirm\n  superci github deliveries list\n  superci github deliveries retrieve ID",
+        "list      The GitHub accounts connected, and where each one's App is installed.\ncreate    Opens GitHub in the browser, where a person creates the App for OWNER (an organization, or your own name)\n          and chooses its repositories. GitHub offers that nowhere else. It ends when the App is installed.\n          --host: a GitHub Enterprise Server, or GitHub Enterprise Cloud with data residency.\ndelete    A further organization: its App is uninstalled and forgotten. The first one goes with `superci leave`.\n\ndeliveries: what GitHub says of the events it sent your control plane lately, for a job that never got a machine.\nlist      The newest hundred: when, what (a job queued, begun, ended), and how it was answered. A job that is in no\n          line was never sent by GitHub; the control plane finds such jobs by asking, within a few minutes.\nretrieve  One of them, with the job it was about, the address it was sent to and what was answered."),
+    ("gitlab", "  superci gitlab list\n  superci gitlab create --url=https://gitlab.com [--gitlab=ID|new]\n  superci gitlab delete [ID] --confirm\n  superci gitlab projects list [--gitlab=ID]\n  superci gitlab projects update PROJECT_ID --enabled=true|false [--gitlab=ID]\n  superci gitlab projects update --all --enabled=true [--gitlab=ID]",
+        "create    The token is read from SUPERCI_GITLAB_TOKEN (--token-env=NAME for another variable): a project, group or\n          personal access token with the scopes api, create_runner and manage_runner. It goes to your control plane\n          and is not kept on this machine. --gitlab=new: a further connection beside the first.\ndelete    Its projects stop sending jobs here, and its token is forgotten.\n\nprojects: the projects a GitLab connection's token reaches.\nlist      Each with its id and whether its jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
+    ("aws", "  superci aws accounts list\n  superci aws accounts retrieve [ID]",
+        "accounts: the AWS accounts signed in to.\nlist      Each with who is signed in.\nretrieve  What an account allows of what SuperCI does there: the regions, spot and on-demand machines, and how many\n          vCPUs it may run at once. It is asked with reads and dry runs only: nothing is made, started or changed.\n          An account in an AWS organization can be held to some regions or kept from spot by the organization's\n          policies, which nothing inside the account lifts; this says so, with the policy and whose it is."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
-    ("aws_accounts", "  superci aws_accounts list\n  superci aws_accounts retrieve [ID]",
-        "list      The AWS accounts signed in to.\nretrieve  What an account allows of what SuperCI does there: the regions, spot and on-demand machines, and how many\n          vCPUs it may run at once. It is asked with reads and dry runs only: nothing is made, started or changed.\n          An account in an AWS organization can be held to some regions or kept from spot by the organization's\n          policies, which nothing inside the account lifts; this says so, with the policy and whose it is."),
     ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces delete ID --confirm",
         "A workspace has its own sign-ins to its clouds, and through them its own control plane, runners and repositories.\nNothing of one is seen from another. There is one (`default`) until you make more. With several, a command says\nwhich, by its id: --workspace=ID, or SUPERCI_WORKSPACE=ID for a whole terminal. A command that names none stops\nand lists them.\n\ncreate    Makes an empty one called NAME (AcmeCI, Build Farm), which its CI is called too. Its id is made from the\n          name (acmeci, build-farm). Then `superci login --workspace=ID`.\nupdate    Gives one another id. What it is called is `superci name update`.\ndelete    Signs it out and forgets it on this machine. Nothing in its clouds is deleted: its control plane and\n          runners keep working (`superci leave --workspace=ID --confirm` stops them first)."),
     ("leave", "  superci leave --confirm           Stops using SuperCI: what it made in your clouds is deleted.",
@@ -102,8 +100,8 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "aws_accounts", "labels", "name", "machine", "limits"]),
-                group(&["github", "github_deliveries", "gitlab", "gitlab_projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "aws", "labels", "name", "machine", "limits"]),
+                group(&["github", "gitlab", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
 }
@@ -417,22 +415,22 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let said = match answer { Ok(a) => a, Err(e) => format!("refused or failed: {e}") };
             Ok(Done { data: json!({ "answer": said }), said: vec![said] })
         }
-        ("aws_accounts", "list") => {
+        ("aws", "accounts") if w(2) == "list" => {
             let d = signed_in();
             let accounts = d.aws_accounts_signed_in();
             let said = if accounts.is_empty() { vec!["Signed in to no AWS account: `superci login aws`.".to_string()] } else { accounts.iter().map(|(id, who)| format!("{id}  {who}")).collect() };
             Ok(Done { said, data: json!({ "aws_accounts": accounts.iter().map(|(id, who)| json!({ "id": id, "signed_in_as": who })).collect::<Vec<_>>() }) })
         }
-        ("aws_accounts", "retrieve") => {
+        ("aws", "accounts") if w(2) == "retrieve" => {
             let mut d = signed_in();
-            let (account, who, look) = d.look_at_aws(w(2))?;
+            let (account, who, look) = d.look_at_aws(w(3))?;
             Ok(Done { said: aws_look_lines(&account, &who, &look), data: json!({ "id": account, "signed_in_as": who, "kind": look.kind(), "allowed_regions": look.allowed_regions(), "organization": look.organization().map(|r| json!({ "management_account": r.management_account(), "policy": r.policy_id() })), "allows": look }) })
         }
         ("runners", "list") => runners_of(&mut signed_in()),
         ("github", "list") => github(),
-        ("github_deliveries", operation @ ("list" | "retrieve")) => {
-            let id = w(2);
-            if operation == "retrieve" && (id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit())) { return usage("Say which: `superci github_deliveries retrieve ID` (ids are in `superci github_deliveries list`).") }
+        ("github", "deliveries") if ["list", "retrieve"].contains(&w(2)) => {
+            let (operation, id) = (w(2), w(3));
+            if operation == "retrieve" && (id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit())) { return usage("Say which: `superci github deliveries retrieve ID` (ids are in `superci github deliveries list`).") }
             let mut d = signed_in();
             let (v, key) = look(&mut d)?;
             let got = crate::cloudflare::plane_get(v.plane.url(), &key, &if operation == "retrieve" { format!("/github/deliveries?id={id}") } else { "/github/deliveries".to_string() })
@@ -676,22 +674,22 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut d = ready()?;
             in_use(&d)?;
             let said = apply!(d, args, format!("connect {url} with the token in {name}"), "/gitlab/connect", &[field("url", url), field("token", token), field("which", args.get("gitlab").unwrap_or_default())]);
-            Ok(Done::said(if said.is_empty() { "GitLab is connected. Its projects send jobs here once switched on: `superci gitlab_projects list`, then `superci gitlab_projects update PROJECT_ID --enabled=true`.".to_string() } else { said }))
+            Ok(Done::said(if said.is_empty() { "GitLab is connected. Its projects send jobs here once switched on: `superci gitlab projects list`, then `superci gitlab projects update PROJECT_ID --enabled=true`.".to_string() } else { said }))
         }
-        ("gitlab_projects", "list") => {
+        ("gitlab", "projects") if w(2) == "list" => {
             let mut d = signed_in();
             let (view, key) = look(&mut d)?;
             let v = crate::cloudflare::plane_get(view.plane.url(), &key, &format!("/gitlab/projects?g={}", args.get("gitlab").unwrap_or_default()))?;
             let said = v["projects"].as_array().into_iter().flatten().map(|p| format!("{:>10}  {}  {}", p["id"].as_u64().unwrap_or_default(), if p["enabled"] == true { "on " } else { "off" }, p["path"].as_str().unwrap_or_default())).collect::<Vec<_>>();
             Ok(Done { said: if said.is_empty() { vec!["No projects this token can reach.".into()] } else { said }, data: v })
         }
-        ("gitlab_projects", "update") => {
-            let Some(enabled) = truth(args, "enabled")? else { return usage("Say which way: `superci gitlab_projects update PROJECT_ID --enabled=true` (or false).") };
+        ("gitlab", "projects") if w(2) == "update" => {
+            let Some(enabled) = truth(args, "enabled")? else { return usage("Say which way: `superci gitlab projects update PROJECT_ID --enabled=true` (or false).") };
             let mut fields = vec![field("gitlab", args.get("gitlab").unwrap_or_default())];
-            let would = match (enabled, args.has("all"), w(2)) {
+            let would = match (enabled, args.has("all"), w(3)) {
                 (true, true, _) => { fields.push(field("all", "on")); "send every project's jobs here".to_string() }
-                (false, true, _) => return usage("Projects are switched off one at a time: `superci gitlab_projects update PROJECT_ID --enabled=false`."),
-                (_, _, "") => return usage("Say which: `superci gitlab_projects update PROJECT_ID --enabled=true` (ids are in `superci gitlab_projects list`)."),
+                (false, true, _) => return usage("Projects are switched off one at a time: `superci gitlab projects update PROJECT_ID --enabled=false`."),
+                (_, _, "") => return usage("Say which: `superci gitlab projects update PROJECT_ID --enabled=true` (ids are in `superci gitlab projects list`)."),
                 (_, _, id) => { fields.push(field("id", id)); fields.push(field("enabled", if enabled { "true" } else { "false" })); format!("{} project {id}'s jobs here", if enabled { "send" } else { "stop sending" }) }
             };
             let mut d = ready_to_set()?;
@@ -707,6 +705,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             apply!(d, args, would, "/gitlab/disconnect", &[field("gitlab", w(2))]);
             Ok(Done::said("GitLab is disconnected."))
         }
+        (word @ ("aws" | "github" | "gitlab"), thing @ ("accounts" | "deliveries" | "projects")) => usage(if w(2).is_empty() { format!("`superci {word} {thing}` takes an operation.") } else { format!("`{}` is not an operation of `superci {word} {thing}`.", w(2)) }),
         (word, operation) => usage(match HELP.iter().find(|(w, ..)| *w == word) {
             Some(_) if operation.is_empty() => format!("`superci {word}` takes an operation."),
             Some(_) => format!("`{operation}` is not an operation of `superci {word}`."),
@@ -1002,7 +1001,8 @@ mod tests {
         for command in ["superci dashboard", "superci login", "superci logout", "superci status", "superci jobs list", "superci jobs retrieve ID", "superci keys list", "superci keys create NAME", "superci keys delete NAME",
             "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci labels list", "superci labels create NAME", "superci labels delete NAME", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
             "superci planes list", "superci planes create", "superci planes update", "superci planes move ID", "superci planes allow", "superci planes delete ID", "superci leave --confirm", "superci github list", "superci github create OWNER", "superci github delete OWNER",
-            "superci github_deliveries list", "superci github_deliveries retrieve ID", "superci gitlab list", "superci gitlab create", "superci gitlab delete", "superci gitlab_projects list", "superci gitlab_projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete",
+            "superci github deliveries list", "superci github deliveries retrieve ID", "superci gitlab list", "superci gitlab create", "superci gitlab delete", "superci gitlab projects list", "superci gitlab projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete",
+            "superci aws accounts list", "superci aws accounts retrieve", "superci github deliveries list", "superci gitlab projects update PROJECT_ID",
             "superci workspaces list", "superci workspaces create NAME", "superci workspaces update ID --id=NEW", "superci workspaces delete ID --confirm"] {
             assert!(all.contains(command), "{command}");
         }
@@ -1028,9 +1028,9 @@ mod tests {
         for name in ["SUPERCI_GITLAB_TOKEN", "SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
         let run = |line: &str| run(&args(line), &mut |_| {}).map(|d| d.said).unwrap_err();
         let signed_out = Fail::Failed(NOT_SIGNED_IN.into());
-        for line in ["status", "jobs list", "jobs retrieve 7", "github_deliveries list", "github_deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create acmeci", "name retrieve", "name update AcmeCI", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
+        for line in ["status", "jobs list", "jobs retrieve 7", "github deliveries list", "github deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create acmeci", "name retrieve", "name update AcmeCI", "github list", "gitlab list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
             "planes update", "planes create modal", "planes create aws --region=us-east-1", "runners create aws", "runners order aws", "runners update aws --max-jobs=3", "limits retrieve", "limits update --max-cpu=8", "limits update --max-hours 12",
-            "public_repos create acme/site", "public_repos delete acme/site", "gitlab_projects list", "gitlab_projects update 7 --enabled=true", "gitlab_projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
+            "public_repos create acme/site", "public_repos delete acme/site", "gitlab projects list", "gitlab projects update 7 --enabled=true", "gitlab projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
             "planes update --dry-run", "runners create cloudflare --dry-run"] {
             assert_eq!(run(line), signed_out, "{line}");
         }
@@ -1042,12 +1042,18 @@ mod tests {
         for (line, says) in [("runners create gcp", "Say which: `superci runners create aws`"), ("planes create", "Say where: `superci planes create aws"), ("planes create aws", "Say where: --region"), ("planes move", "Say where to:"), ("planes delete", "Say which:"),
             ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("gitlab create", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("gitlab create --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
             ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
-            ("gitlab_projects update 7", "Say which way:"), ("gitlab_projects update --all --enabled=false", "Projects are switched off one at a time"),
+            ("gitlab projects update 7", "Say which way:"), ("gitlab projects update --all --enabled=false", "Projects are switched off one at a time"),
             ("planes", "`superci planes` takes an operation."), ("limits", "`superci limits` takes an operation."), ("runners frob", "`frob` is not an operation of `superci runners`."), ("limits set", "`set` is not an operation of `superci limits`."),
-            ("frobnicate", "`frobnicate` is not a command of superci.")] {
+            ("aws", "`superci aws` takes an operation."), ("aws accounts", "`superci aws accounts` takes an operation."), ("aws accounts frob", "`frob` is not an operation of `superci aws accounts`."),
+            ("github deliveries", "`superci github deliveries` takes an operation."), ("gitlab projects frob", "`frob` is not an operation of `superci gitlab projects`."),
+            ("github_deliveries list", "`github_deliveries` is not a command of superci."), ("frobnicate", "`frobnicate` is not a command of superci.")] {
             assert!(matches!(run(line), Fail::Usage(e) if e.starts_with(says)), "{line}");
         }
         assert_eq!(super::run(&args("logout"), &mut |_| {}).unwrap().said, ["Nothing was kept on this machine."]);
+        // A provider's own things are under its name.
+        assert_eq!(super::run(&args("aws accounts list"), &mut |_| {}).unwrap().said, ["Signed in to no AWS account: `superci login aws`."]);
+        assert_eq!(run("aws accounts retrieve"), Fail::Failed("Sign in with AWS first.".into()));
+        assert_eq!(needs("Sign in with AWS first."), Some("superci login aws"));
         // What opens the browser asks for the same first.
         assert!(matches!(in_browser(&args("login gcp")), Some(Err(Fail::Usage(_)))) && matches!(in_browser(&args("github create")), Some(Err(Fail::Usage(_)))));
         assert_eq!(in_browser(&args("github create acme")).unwrap().unwrap_err(), signed_out);
