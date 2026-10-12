@@ -3059,16 +3059,21 @@ load()})();</script>"#;
             let updating_it = busy(o).is_some();
             let end = if !o.online { pill("bad", "not answering") }
                 else if updating_it { String::new() }
+                // A CI of its own (another team's, reached with the same sign-ins): no place to move to, and not
+                // deleted from here.
+                else if o.serves_its_own() { r#"<span class="note">Serves a code host of its own</span>"#.to_string() }
                 else if view::older(o.version.as_deref(), view::MOVE_VERSION) { upd.clone() }
                 else if view::older(v.version.as_deref(), view::MOVE_VERSION) { r#"<span class="note">Update the one in use first</span>"#.to_string() }
                 else if !signed_in(o) { sign_in(o.plane.cloud()) }
                 else if !signed_in(v) { sign_in(v.plane.cloud()) }
                 else { format!(r#"<button type="button" class="button secondary sm" onclick="document.getElementById('move-{i}').showModal()">Move here</button>"#) };
             let before = "";
-            let items = if signed_in(o) { vec![("Delete…", format!("delete-{i}"))] } else { vec![] };
+            let items = if signed_in(o) && !o.serves_its_own() { vec![("Delete…", format!("delete-{i}"))] } else { vec![] };
             let what = match o.plane { Plane::Cloudflare { .. } => "its Worker, its storage and its containers", Plane::Aws { .. } => "its function, table, schedule, parameters and role", _ => "its app and its Dicts" };
-            dialogs.push_str(&format!(r#"<dialog class="dlg" id="delete-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/delete" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Deleting…'"><input type="hidden" name="plane" value="{}"><div class="dlg-head">{}<span><strong>Delete {}?</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><p class="note">This deletes {what} from {}, and the runner agents made for it. The control plane in use, your jobs and your history are not touched.</p><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Delete</button></div></form></dialog>"#,
+            if !o.serves_its_own() {
+                dialogs.push_str(&format!(r#"<dialog class="dlg" id="delete-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/delete" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Deleting…'"><input type="hidden" name="plane" value="{}"><div class="dlg-head">{}<span><strong>Delete {}?</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><p class="note">This deletes {what} from {}, and the runner agents made for it. The control plane in use, your jobs and your history are not touched.</p><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Delete</button></div></form></dialog>"#,
                 esc(o.plane.plane_id()), logo(provider(o), 36), esc(&o.plane.place()), esc(o.plane.url().trim_start_matches("https://")), provider_name(provider(o))));
+            }
             let end = if upd.is_empty() || end == upd { end } else { format!("{upd}{end}") };
             rows.push_str(&row("", o, format!("{before}{end}{}", menu(&items))));
         }
@@ -4510,6 +4515,12 @@ mod tests {
         let html = d.render("planes", &[other.clone(), view.clone()], None);
         preview("planes-move", &html);
         assert!(html.contains(r#"onclick="document.getElementById('move-0').showModal()">Move here</button>"#) && html.find("pick act current").unwrap() < html.find("Move here</button>").unwrap());
+        // Another one that serves a code host of its own (another team's): shown, with no Move here and no Delete.
+        let mut theirs = other.clone();
+        (theirs.github, theirs.installed) = (true, true);
+        let beside = d.render("planes", &[view.clone(), theirs], None);
+        preview("planes-two-teams", &beside);
+        assert!(beside.contains("Serves a code host of its own") && !beside.contains("Move here</button>") && !beside.contains(r#"action="/plane/delete""#), "nothing of another team's is offered");
         // Move here's confirmation says what comes along; the other one can be deleted.
         assert!(html.contains(r#"<dialog class="dlg" id="move-0""#) && html.contains("Your GitHub App and its installations") && html.contains(r#"<input type="hidden" name="plane" value="xyz000000001"><button class="button primary sm">Move</button>"#));
         assert!(html.contains(r#"<form method="post" action="/plane/delete""#) && html.contains("Delete Modal · acme?") && html.contains(r#"document.getElementById('delete-0').showModal()">Delete…</button>"#));
