@@ -12,7 +12,7 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
 
 - **The dashboard** runs on your computer (`localhost:8976`). It opens with a random key in its URL, which becomes a
   cookie. It answers only on this computer's own address, and makes changes only on requests from its own pages.
-- **SuperCI's sign-ins** are its own, kept on your computer in `~/.superci/sign-ins.json` (readable by you alone), so
+- **SuperCI's sign-ins** are its own, kept on your computer by workspace, in `~/.superci/workspaces/ID/sign-ins.json` (readable by you alone; a workspace reads no other's), so
   the dashboard opens signed in and commands such as `superci status` run without a browser. It reads no other
   tool's credentials: no AWS profile, no wrangler or Modal login, none of their environment variables. What is kept:
   - AWS: the browser sign-in. It can do what you can in that account, and AWS ends it after twelve hours at most.

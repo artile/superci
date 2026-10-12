@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.14.0 — unreleased
+## 0.14.0 — 2026-10-12
 - Workspaces: several CIs looked after from one computer, each apart from the others. A workspace has its own sign-ins to its clouds, and through them its own control plane, runners, repositories and settings. Nothing of one shows in another, and signing out of one leaves the others signed in. With one workspace nothing changes and nothing needs naming.
 - The name at the top of the dashboard's sidebar is the switcher: your workspaces, each with its GitHub organization's picture once one is connected (GitLab's logo for GitLab), and "New workspace…", which asks what it is called (AcmeCI) and opens a clean first screen. The first control plane set up there gets that name. One dashboard serves them all; a page's address says which workspace it is of, so two tabs can show two. A sign-in comes back to the workspace that started it. The picture also stands beside the name at the top; it is asked for from GitHub when the dashboard starts and once a day, so a logo set there later shows by itself.
 - A workspace has an id, made from its name (Acme CI: `acme-ci`): what commands take. Settings shows it, with Change, and, when there are other workspaces, "Remove this workspace": it is signed out and forgotten on this computer, and nothing in its clouds is deleted.
