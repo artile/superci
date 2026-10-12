@@ -1795,7 +1795,7 @@ impl<'a> ControlPlane<'a> {
                             match machine {
                                 Ok(m) => {
                                     // (A machine started: the budget's rule, if it was on the role, is off it.)
-                                    if self.config.routing.aws_budget.is_some() && self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().is_some() { let _ = self.store.delete(BUDGET_STOPPED_KEY).await; }
+                                    if self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().is_some() { let _ = self.store.delete(BUDGET_STOPPED_KEY).await; }
                                     launched = Some((region.clone(), m, network.is_some_and(|n| n.private)));
                                     break
                                 }
