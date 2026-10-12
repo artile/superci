@@ -179,9 +179,12 @@ pub async fn latest_image(http: &dyn Http, region: &str, creds: &Credentials, ow
     latest_image_sized(http, region, creds, owner, name, now_ms).await.map(|(id, _)| id)
 }
 
-/// The newest image of an owner matching a name pattern, and the size of its disk (a machine's may not be smaller).
+/// The newest image of an owner (or the account's own) matching a name pattern, and the size of its disk (a
+/// machine's may not be smaller).
 pub async fn latest_image_sized(http: &dyn Http, region: &str, creds: &Credentials, owner: &str, name: &str, now_ms: u64) -> Result<(String, u32)> {
-    let xml = ec2(http, region, creds, "DescribeImages", serde_json::json!({ "Owner": [owner], "Filter": [{ "Name": "name", "Value": [name] }, { "Name": "state", "Value": ["available"] }] }), now_ms).await?;
+    // (Its owner's, or the account's own copy of it under the same name: a region the image is not published in
+    // has it once it is copied there.)
+    let xml = ec2(http, region, creds, "DescribeImages", serde_json::json!({ "Owner": [owner, "self"], "Filter": [{ "Name": "name", "Value": [name] }, { "Name": "state", "Value": ["available"] }] }), now_ms).await?;
     let mut images: Vec<(String, String, u32)> = xml.split("<imageId>").skip(1).filter_map(|chunk| {
         let id = chunk.split('<').next()?.to_string();
         Some((xml_tag(chunk, "creationDate")?.to_string(), id, xml_tag(chunk, "volumeSize").and_then(|v| v.parse().ok()).unwrap_or(0)))

@@ -547,6 +547,49 @@ impl Http for Kinds {
     }
 }
 
+/// The fake clouds, in an account whose AWS organization allows no spot machines: a spot launch is answered as a
+/// project of AWS's new sign-up answered one (recorded there on 12 October 2026; the fixture has stand-in ids).
+struct NoSpot { clouds: FakeClouds, refusal: String }
+impl NoSpot {
+    fn new() -> NoSpot {
+        let recording = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../cli/fixtures/aws/project-paid/more.jsonl")).expect("the project's recording");
+        let refusal = recording.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|x| x["asked"].as_str().is_some_and(|a| a.contains("Action=RunInstances") && a.contains("MarketType=spot")))
+            .map(|x| x["answer"].as_str().unwrap().to_string()).expect("a refused spot launch in the recording");
+        NoSpot { clouds: FakeClouds::default(), refusal }
+    }
+}
+#[async_trait(?Send)]
+impl Http for NoSpot {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        if body.contains("Action=RunInstances") && body.contains("MarketType=spot") {
+            self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body));
+            return Ok(Response::new(403, "text/xml", self.refusal.clone()));
+        }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn an_organization_that_allows_no_spot_sends_the_job_on_demand_and_is_no_missing_permission() {
+    let (store, clouds, wakes, cache) = (Mem::default(), NoSpot::new(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    // One spot launch asked for and refused (no second region is tried: the organization's rule is the account's
+    // everywhere), then an on-demand one, which starts.
+    let asked = launches(&clouds.clouds);
+    assert_eq!(asked.iter().map(|l| field(l, "InstanceMarketOptions.MarketType")).collect::<Vec<_>>(), ["spot", ""]);
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["on_demand"].as_bool(), j["machine_id"].as_str()), (Some("launched"), Some(true), Some("i-0abc")), "{j}");
+    // The job says why it is on-demand, in a word the dashboard reads.
+    assert!(j["spot_refused"].as_str().is_some_and(|s| s.contains("SpotNotAllowedByOrganization")), "{j}");
+    // And no permission of the control plane's is noted as missing: its role lacks nothing.
+    assert!(block_on(store.get("denied:aws:LaunchOnlyTaggedMachines")).unwrap().is_none());
+}
+
 #[test]
 fn gpus_and_windows_get_their_own_images_types_and_prices() {
     let (store, clouds, wakes, cache) = (Mem::default(), Kinds { clouds: FakeClouds::default(), no_gpus: false }, Wakes::default(), Cache::default());

@@ -359,6 +359,9 @@ const WAIT_FOR_SPOT: &str = "waiting: AWS has no spot machine for it now, and no
 /// that is full; with none of its own running it is tried again and then fails, saying which limits to raise.
 const AT_LIMIT: &str = "at the AWS account's limits: ";
 
+/// What a job that ran on-demand is told of spot when the account's AWS organization allows none (see `aws::refusal`).
+pub const SPOT_NOT_ALLOWED: &str = "SpotNotAllowedByOrganization";
+
 /// How a job fails when AWS lets the account run no GPU machines (followed by the quota to raise).
 const NO_GPU_QUOTA: &str = "AWS lets this account run no GPU machines yet: ask AWS for more in Service Quotas, ";
 
@@ -960,6 +963,9 @@ impl<'a> ControlPlane<'a> {
     async fn note_permission<T>(&self, cloud: &str, id: &str, result: &Result<T>) {
         let key = format!("denied:{cloud}:{id}");
         match result {
+            // (A refusal by the account's organization is no permission this control plane's role lacks: giving the
+            // role more would change nothing.)
+            Err(e) if aws::refusal(e).is_some_and(|r| matches!(r.by, aws::By::Organization | aws::By::OrganizationResources)) => {}
             Err(e) if ["AccessDenied", "UnauthorizedOperation", "not authorized"].iter().any(|d| e.contains(d)) => {
                 let _ = put_json(self.store, &key, &serde_json::json!({ "at_ms": self.clock.now_ms(), "error": e.chars().take(300).collect::<String>() })).await;
             }
@@ -1636,6 +1642,15 @@ impl<'a> ControlPlane<'a> {
                                 asked += 1;
                                 self.timer.pause(300 + (job.job_id % 8) * 120 + asked * 250).await;
                                 machine = aws::run_instance(self.http, &creds, &launch, self.clock.now_ms()).await;
+                            }
+                            // The account's AWS organization allows no spot machines (a policy of the organization, which
+                            // nothing in the account lifts: no permission of the control plane's is missing). As with no
+                            // room for one, the job goes on down the order, and says why it ran on-demand.
+                            if !on_demand && machine.as_ref().is_err_and(|e| aws::refusal(e).is_some_and(|r| r.by == aws::By::Organization)) {
+                                quota_only = false;
+                                answers.push(said(SPOT_NOT_ALLOWED));
+                                last = said(machine.as_ref().err().map(String::as_str).unwrap_or_default());
+                                break
                             }
                             self.note_permission("aws", "LaunchOnlyTaggedMachines", &machine).await;
                             match machine {

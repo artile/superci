@@ -616,6 +616,8 @@ fn runner_text(j: &serde_json::Value) -> (String, String) {
 fn off_spot(j: &serde_json::Value) -> Option<(String, Option<String>)> {
     if j["on_demand"] != true || j["cloud"] != "aws" { return None }
     let said = j["spot_refused"].as_str()?;
+    // The account's AWS organization allows no spot machines: no limit to raise, and nothing of AWS's to wait for.
+    if said.contains(superci_core::plane::SPOT_NOT_ALLOWED) { return Some(("On-demand: your AWS organization does not allow spot machines".into(), None)) }
     let limited = said.split("; ").find(|a| a.contains("MaxSpotInstanceCountExceeded")).and_then(|a| a.split(':').next());
     Some(match limited {
         Some(region) => (format!("On-demand: your AWS spot limit in {} was reached", region_short(region)), Some(region.to_string())),
