@@ -372,6 +372,9 @@ pub fn machine_name_in_aws(ci: &str, repo: &str, job: u64) -> String {
 /// What a job that ran on-demand is told of spot when the account's AWS organization allows none (see `aws::refusal`).
 pub const SPOT_NOT_ALLOWED: &str = "SpotNotAllowedByOrganization";
 
+/// Where the control plane notes when its organization last refused a spot machine (see where it is read).
+const SPOT_NOT_ALLOWED_KEY: &str = "aws:spot-not-allowed";
+
 /// How a job fails when AWS lets the account run no GPU machines (followed by the quota to raise).
 const NO_GPU_QUOTA: &str = "AWS lets this account run no GPU machines yet: ask AWS for more in Service Quotas, ";
 
@@ -1623,6 +1626,14 @@ impl<'a> ControlPlane<'a> {
                     Runner::Aws(a) => async {
                         let on_demand = place == AWS_ON_DEMAND;
                         if on_demand { tried_on_demand = true } else { tried_spot = true }
+                        // An organization that allowed no spot machine within the last hour is not asked again for
+                        // each job (it would refuse each one, a second lost every time): the job goes on down the order.
+                        if !on_demand && self.store.get(SPOT_NOT_ALLOWED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 3_600_000) {
+                            answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.aws_regions(&a).first().cloned().unwrap_or_default()));
+                            quota_only = false;
+                            job.spot_refused = Some(answers.join("; ").chars().take(300).collect());
+                            return Ok(Tried::NoRoom)
+                        }
                         let creds = self.aws_creds(plane_url, &a).await?;
                         let tags = vec![("Name".to_string(), machine_name_in_aws(self.config.name(), &job.repo, job.job_id)), ("superci-plane".into(), self.config.plane_id.clone()), ("superci-job".into(), job.job_id.to_string()), ("superci-repo".into(), job.repo.clone())];
                         // The standard machine keeps the configured types; a sized one gets the types that fit it.
@@ -1658,6 +1669,7 @@ impl<'a> ControlPlane<'a> {
                             // room for one, the job goes on down the order, and says why it ran on-demand.
                             if !on_demand && machine.as_ref().is_err_and(|e| aws::refusal(e).is_some_and(|r| r.by == aws::By::Organization)) {
                                 quota_only = false;
+                                let _ = self.store.put(SPOT_NOT_ALLOWED_KEY, now.to_string()).await;
                                 answers.push(said(SPOT_NOT_ALLOWED));
                                 last = said(machine.as_ref().err().map(String::as_str).unwrap_or_default());
                                 break

@@ -117,6 +117,8 @@ pub struct Dashboard {
     /// What each AWS account signed in to allows (see `aws::Look`), and when it was asked: looked at where a control
     /// plane or runners are set up, again after ten minutes.
     aws_looks: HashMap<String, (u64, aws::Look)>,
+    /// The regions AWS is copying the image jobs run on into, by account (asked with the look).
+    aws_copying: HashMap<String, Vec<String>>,
     /// Each control plane's last status read in this session: a slow answer (a Lambda starting) shows the last one
     /// rather than the page waiting again. Kept only while the dashboard runs.
     seen: HashMap<String, serde_json::Value>,
@@ -696,7 +698,7 @@ impl Dashboard {
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
             status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
-            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
+            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
     /// A dashboard that remembers: with SuperCI's own sign-ins from its folder, kept there again as they change. A
@@ -1181,9 +1183,11 @@ impl Dashboard {
         // Where it may work but the image jobs run on is not there.
         let without = look.regions_without_image();
         if look.usable_regions().is_empty() && !without.is_empty() {
-            said.push_str(&format!(" The image SuperCI's jobs run on is not in {} yet, so no job can start there until it is copied in.", names(&without)));
+            said.push_str(&format!(" The image SuperCI's jobs run on is not in {} yet, so no job can start there until it is copied in: about ten minutes, and about $1.50 a month for the copy's storage in your account.", names(&without)));
         }
-        format!(r#"<div class="notice warn"><span>{} <code>superci accounts retrieve aws</code> shows all of it.</span></div>"#, esc(said.trim()))
+        // Few CPUs at once (a new account's limit): how many jobs that is, and where to ask AWS for more.
+        let limit = look.low_limit().map(|(cpus, link)| format!(r#" It may run {cpus} CPUs at once ({} of the default size). <a href="{}" target="_blank" rel="noopener">Ask AWS for more ↗</a>"#, if cpus < 8 { "one job".to_string() } else { format!("{} jobs", cpus / 4) }, esc(&link))).unwrap_or_default();
+        format!(r#"<div class="notice warn"><span>{}{limit} <code>superci accounts retrieve aws</code> shows all of it.</span></div>"#, esc(said.trim()))
     }
 
     /// Every AWS account signed in to, in one order (by account) whichever is in hand.
@@ -1908,6 +1912,24 @@ impl Dashboard {
                 });
                 Ok(Response::redirect(if self.planes.is_empty() { "/?p=plane" } else { "/?p=planes" }))
             }
+            // The image jobs run on, copied into a region of the account in hand that lacks it (see `aws::copy_image`).
+            ("POST", "/aws/image") => {
+                let region = field("region");
+                if !REGIONS.contains(&region.as_str()) { return Ok(message(400, "Choose a region from the list", "")) }
+                if !field("account").is_empty() && !self.hold_account(&field("account")) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {}.", esc(&field("account"))))) }
+                let account = self.aws.as_ref().ok_or("Sign in with AWS first.")?.account_id.clone();
+                let creds = self.aws_creds()?;
+                // (One copy is enough: with one there or on its way, nothing more is asked for.)
+                if aws::copied_images(&creds, &region)?.is_empty() {
+                    let source = aws::copy_source_for(&region, None)?;
+                    aws::copy_image_into(&creds, &region, &source)?;
+                }
+                let copying = self.aws_copying.entry(account.clone()).or_default();
+                if !copying.contains(&region) { copying.push(region) }
+                // (Looked at again at the next page: when the copy is there, the region can be set up in.)
+                if let Some((at, _)) = self.aws_looks.get_mut(&account) { *at = 0 }
+                Ok(Response::redirect("/?p=plane"))
+            }
             // A deploy that stopped is let go of: back to choosing where (what it made stays, and is reused or found
             // by a later try).
             ("POST", "/plane/start-over") => {
@@ -2531,7 +2553,7 @@ mark();load()})();</script>"#;
             let stale = account.as_ref().is_some_and(|a| d.quotas_for.as_ref().is_none_or(|(b, at)| b != a || now_ms() > at + 600_000));
             let quota_creds = if stale && ["add-runners", "runners"].contains(&section) { d.aws_creds().ok().zip(account.clone()) } else { None };
             // Where a control plane or runners are set up: what the account in hand allows (its regions, spot).
-            let unlooked = account.as_ref().is_some_and(|a| d.aws_looks.get(a).is_none_or(|(at, _)| now_ms() > at + 600_000));
+            let unlooked = account.as_ref().is_some_and(|a| { let copying = d.aws_copying.get(a).is_some_and(|c| !c.is_empty()); d.aws_looks.get(a).is_none_or(|(at, _)| now_ms() > at + if copying { 15_000 } else { 600_000 }) });
             let look_creds = if unlooked && ["plane", "planes", "add-runners"].contains(&section_name(section)) { d.aws_creds().ok().zip(account) } else { None };
             (d.planes.iter().map(|p| (p.clone(), d.keyed.contains(p.plane_id()))).collect::<Vec<_>>(), d.status_key.clone(), d.modal_pending.clone(), quota_creds, look_creds)
         };
@@ -2571,7 +2593,12 @@ mark();load()})();</script>"#;
         };
         let (views, modal, quotas, looked) = match cached { Some(v) => (v, None, HashMap::new(), None), None => std::thread::scope(|s| {
             let handles: Vec<_> = planes.iter().map(|(p, keyed)| { let key = key.clone(); s.spawn(move || view::plane_view(p, keyed.then_some(key.as_str()))) }).collect();
-            let looking = look_creds.as_ref().map(|(creds, _)| s.spawn(move || aws::look_at(creds)));
+            let looking = look_creds.as_ref().map(|(creds, _)| s.spawn(move || {
+                let look = aws::look_at(creds);
+                // Where the image is missing: whether a copy of it is on its way there.
+                let copying: Vec<String> = look.regions_without_image().into_iter().filter(|r| aws::copied_images(creds, r).is_ok_and(|copies| copies.iter().any(|c| c.state == "pending"))).map(str::to_string).collect();
+                (look, copying)
+            }));
             let quotas: Vec<_> = quota_creds.iter().flat_map(|(creds, _)| REGIONS.iter().map(move |r| s.spawn(move || {
                 let http = aws::Blocking::new();
                 (r.to_string(), futures::executor::block_on(superci_core::aws::spot_cpu_quota(&http, r, creds, now_ms())))
@@ -2618,7 +2645,7 @@ mark();load()})();</script>"#;
         // The page shows, and changes, the control plane in use.
         if let Some(i) = views.get(view::in_use(&views)).and_then(|v| d.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { d.select(i) }
         if let Some((_, account)) = quota_creds { d.quotas = quotas; d.quotas_for = Some((account, now_ms())); }
-        if let (Some((_, account)), Some(look)) = (look_creds, looked) { d.aws_looks.insert(account, (now_ms(), look)); }
+        if let (Some((_, account)), Some((look, copying))) = (look_creds, looked) { d.aws_copying.insert(account.clone(), copying); d.aws_looks.insert(account, (now_ms(), look)); }
         if let Some(Ok(Some(session))) = modal { d.modal = Some(session); d.modal_pending = None; d.looked_modal = false; }
         // The App is installed (or the wait is over): nothing more to wait for.
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
@@ -2775,7 +2802,8 @@ mark();load()})();</script>"#;
             return format!(r#"<div class="bar"><h1 class="page-title">Setting up your control plane</h1></div><div class="cards">{progress}</div>"#)
         }
         let rows = self.plane_rows();
-        format!(r#"<div class="bar"><h1 class="page-title">Set up a control plane</h1></div>{}<p class="note" style="margin-bottom:22px">The always-on part GitHub and GitLab send jobs to, in your own cloud account. Runners can be on other clouds too.</p><div class="picks page">{rows}</div>"#, self.aws_account_notice())
+        let copying = if self.aws.as_ref().and_then(|a| self.aws_copying.get(&a.account_id)).is_some_and(|c| !c.is_empty()) { r#"<div data-refresh="10"></div>"# } else { "" };
+        format!(r#"{copying}<div class="bar"><h1 class="page-title">Set up a control plane</h1></div>{}<p class="note" style="margin-bottom:22px">The always-on part GitHub and GitLab send jobs to, in your own cloud account. Runners can be on other clouds too.</p><div class="picks page">{rows}</div>"#, self.aws_account_notice())
     }
 
     /// Where a control plane can be set up: a row per cloud with its one action (connect, then set up); an account
@@ -2812,7 +2840,16 @@ mark();load()})();</script>"#;
                 // The regions the account in hand can use (all of them until it has been looked at): one alone is
                 // said, several are chosen among, none leaves nothing to set up.
                 match self.aws_look().map(|l| l.usable_regions()) {
-                    Some(usable) if usable.is_empty() => Some(r#"<span class="note">No region to set it up in</span>"#.to_string()),
+                    // Allowed somewhere, but the image jobs run on is not there: copied in first (one press, AWS
+                    // takes about ten minutes), then set up.
+                    Some(usable) if usable.is_empty() => {
+                        let (without, copying) = (self.aws_look().map(|l| l.regions_without_image()).unwrap_or_default(), self.aws.as_ref().and_then(|a| self.aws_copying.get(&a.account_id)).cloned().unwrap_or_default());
+                        Some(match without.first() {
+                            Some(region) if copying.iter().any(|c| c == region) => format!(r#"<span class="waiting-for"><span class="mini-spin"></span>Copying the image into {}: about ten minutes</span>"#, esc(&region_short(region))),
+                            Some(region) => format!(r#"<form method="post" action="/aws/image">{account}<input type="hidden" name="region" value="{}"><button class="button primary sm">Copy the image into {}</button></form>"#, esc(region), esc(&region_short(region))),
+                            None => r#"<span class="note">No region to set it up in</span>"#.to_string(),
+                        })
+                    }
                     Some(usable) if usable.len() == 1 => Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add">{account}<input type="hidden" name="region" value="{0}"><span class="note">{1}</span><button class="button primary sm">Set up</button></form>"#, esc(usable[0]), esc(&region_short(usable[0])))),
                     Some(usable) => Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add">{account}<details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Set up</button></form>"#, region_options_among(&usable))),
                     None => Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add">{account}<details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Set up</button></form>"#, region_options())),
@@ -4967,7 +5004,7 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
             None => return message(404, "That control plane is not known here", "Open the dashboard again and pick one from the list. Nothing has changed."),
         },
         None => {
-            let apart = ["/signout", "/aws/signin", "/cloudflare/signin", "/modal/", "/plane/aws", "/plane/cloudflare", "/plane/modal", "/plane/start-over", "/plane/delete", "/connect/", "/oauth/", "/github/callback", "/github/installed"];
+            let apart = ["/signout", "/aws/signin", "/cloudflare/signin", "/modal/", "/plane/aws", "/plane/cloudflare", "/plane/modal", "/plane/start-over", "/aws/image", "/plane/delete", "/connect/", "/oauth/", "/github/callback", "/github/installed"];
             if !apart.iter().any(|a| req.path.starts_with(a)) && d.planes.len() > 1 {
                 let views = d.views.clone().map(|(v, _)| v).unwrap_or_else(|| d.planes.iter().map(|p| view::plane_view(p, None)).collect());
                 if view::several(&views).is_some() { return message(409, "Which control plane?", "Several control planes are live here. Open one from the list and do this on its pages. Nothing has changed.") }
@@ -5355,8 +5392,14 @@ mod tests {
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-paid/look.jsonl"))));
         let page = d.plane_page();
         preview("plane-aws-project", &page);
-        assert!(page.contains(r#"<div class="notice warn"><span>AWS account 111111111111 is a project of AWS&#39;s new sign-up. AWS keeps it to Stockholm and allows it no spot machines, so jobs run on on-demand machines, at about twice the price. The image SuperCI&#39;s jobs run on is not in Stockholm yet, so no job can start there until it is copied in. <code>superci accounts retrieve aws</code> shows all of it.</span></div>"#), "{page}");
-        assert!(page.contains(r#"<span class="note">No region to set it up in</span>"#) && !page.contains(r#"action="/plane/aws""#), "nothing to press where nothing can work");
+        assert!(page.contains(r#"<div class="notice warn"><span>AWS account 111111111111 is a project of AWS&#39;s new sign-up. AWS keeps it to Stockholm and allows it no spot machines, so jobs run on on-demand machines, at about twice the price. The image SuperCI&#39;s jobs run on is not in Stockholm yet, so no job can start there until it is copied in: about ten minutes, and about $1.50 a month for the copy&#39;s storage in your account. It may run 5 CPUs at once (one job of the default size). <a href="https://eu-north-1.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-1216C47A" target="_blank" rel="noopener">Ask AWS for more ↗</a> <code>superci accounts retrieve aws</code> shows all of it.</span></div>"#), "{page}");
+        // The one thing to press is copying the image in; setting up comes after.
+        assert!(page.contains(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><button class="button primary sm">Copy the image into Stockholm</button></form>"#) && !page.contains(r#"action="/plane/aws""#), "{page}");
+        // While AWS copies, that is said, and the page looks again by itself.
+        d.aws_copying.insert("111111111111".into(), vec!["eu-north-1".into()]);
+        let copying = d.plane_page();
+        assert!(copying.starts_with(r#"<div data-refresh="10"></div>"#) && copying.contains(r#"<span class="waiting-for"><span class="mini-spin"></span>Copying the image into Stockholm: about ten minutes</span>"#) && !copying.contains(r#"action="/aws/image""#));
+        d.aws_copying.clear();
         // A deploy asked for anyway (a command, an old page) is refused, with what the account can use.
         // (What a page that says one thing said: its heading and its text.)
         let post = |d: &mut Dashboard, region: &str| { let r = d.handle(&Req { method: "POST".into(), path: "/plane/aws".into(), query: vec![], cookie: None, last: None, body: format!("region={region}").into_bytes(), host: String::new(), origin: None, fetch_site: None }).unwrap();

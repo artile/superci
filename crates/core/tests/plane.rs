@@ -592,6 +592,12 @@ fn an_organization_that_allows_no_spot_sends_the_job_on_demand_and_is_no_missing
     assert!(j["spot_refused"].as_str().is_some_and(|s| s.contains("SpotNotAllowedByOrganization")), "{j}");
     // And no permission of the control plane's is noted as missing: its role lacks nothing.
     assert!(block_on(store.get("denied:aws:LaunchOnlyTaggedMachines")).unwrap().is_none());
+    // The next job within the hour does not ask for a spot machine again: straight to on-demand, saying the same.
+    block_on(plane.handle(labelled("queued", 8, "acme/app", None, "superci")));
+    let asked = launches(&clouds.clouds);
+    assert_eq!(asked.iter().map(|l| field(l, "InstanceMarketOptions.MarketType")).collect::<Vec<_>>(), ["spot", "", ""], "no second spot try");
+    let j = job(&store, 8);
+    assert!(j["state"] == "launched" && j["on_demand"] == true && j["spot_refused"].as_str().is_some_and(|s| s.contains("SpotNotAllowedByOrganization")), "{j}");
 }
 
 #[test]
