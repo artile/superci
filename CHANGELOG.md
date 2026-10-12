@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.13.0 — unreleased
+## 0.13.0 — 2026-10-12
 - Many jobs queued at once no longer leave a machine idling and a job called failed that passed. GitHub gives a waiting job to any idle runner with its label, so jobs often run on each other's machines; with three or more passing theirs around, the control plane could start one machine too many, let it idle for ten minutes, and then say "Its machine never started the job" of a job that had run elsewhere (seen with 16 jobs at once). No such machine is started now; a machine that ended with another job's work keeps its cost in the list; and a machine nobody waits for is ended at the first sweep after it had time to come up (a minute and a half on AWS), not after eight to ten minutes. Before ending one, the control plane asks GitHub whether its runner is busy, and a job that still waits with no machine coming gets that one.
 - A burst of launches that AWS refuses for their rate ("RequestLimitExceeded", seen from the eighth job of a burst on) is asked again within the same seconds. Before, those jobs waited for the next sweep, up to two minutes.
 - A control plane in AWS sweeps every minute (before: every two). `superci planes update` changes the schedule.
