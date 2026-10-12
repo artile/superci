@@ -364,9 +364,25 @@ const AT_LIMIT: &str = "at the AWS account's limits: ";
 /// `superci-job` tags, and GitHub knows the runner by another name, which carries the control plane's id. So a CI
 /// that is given another name later just names its next machines by it.
 pub fn machine_name_in_aws(ci: &str, repo: &str, job: u64) -> String {
-    let ci: String = ci.trim().to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let ci = name_in_names(ci);
     let repo: String = repo.rsplit('/').next().unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).take(60).collect();
-    [ci.trim_matches('-'), repo.as_str(), &job.to_string()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
+    [ci.as_str(), repo.as_str(), &job.to_string()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
+}
+
+/// A CI's name as it stands in the names of things made for it: lowercase letters and digits, a dash for anything
+/// else (Acme CI: acme-ci).
+fn name_in_names(ci: &str) -> String {
+    let named: String = ci.trim().to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    named.trim_matches('-').to_string()
+}
+
+/// How a runner's name begins where people read it (a job's log at GitHub says which runner took it; GitLab lists
+/// its runners): the CI's name, then this control plane's id. `superci-<id>` unless the CI is named, as it was for
+/// every CI before. Nothing reads a name back by how it begins (a runner is found by the whole name kept with its
+/// job), so a CI given another name just names its next runners by it.
+fn runner_prefix(ci: &str, plane_id: &str) -> String {
+    let named = name_in_names(ci);
+    format!("{}-{plane_id}", if named.is_empty() { "superci" } else { named.as_str() })
 }
 
 /// What a job that ran on-demand is told of spot when the account's AWS organization allows none (see `aws::refusal`).
@@ -1101,7 +1117,7 @@ impl<'a> ControlPlane<'a> {
         let signing = self.identity().await?.signing;
         let secs = now / 1000;
         let token = signing.jwt(&serde_json::json!({ "iss": plane_url, "sub": format!("plane:{}", self.config.plane_id), "aud": AUDIENCE, "iat": secs, "exp": secs + 300 }))?;
-        let creds = aws::assume_role_with_web_identity(self.http, &a.region, &a.role_arn, &token, &format!("superci-{}", self.config.plane_id), now).await?;
+        let creds = aws::assume_role_with_web_identity(self.http, &a.region, &a.role_arn, &token, &runner_prefix(self.config.name(), &self.config.plane_id), now).await?;
         self.cache.creds.replace(Some(creds.clone()));
         Ok(creds)
     }
@@ -1614,7 +1630,7 @@ impl<'a> ControlPlane<'a> {
             job.error = None;
             job.cloud = cloud_of(&places[0].1);
             job.on_demand = places[0].0 == AWS_ON_DEMAND;
-            let name = format!("superci-{}-{}{}{}", self.config.plane_id, if gitlab { "gl" } else { "" }, if gitlab { gitlab::local(&job.gitlab, job.job_id) } else { job.job_id.to_string() }, job.runner_suffix);
+            let name = format!("{}-{}{}{}", runner_prefix(self.config.name(), &self.config.plane_id), if gitlab { "gl" } else { "" }, if gitlab { gitlab::local(&job.gitlab, job.job_id) } else { job.job_id.to_string() }, job.runner_suffix);
             let work = if gitlab {
                 let gl = self.gitlab_of(job).ok_or("its GitLab is not connected any more")?;
                 let token = self.gitlab_runner(gl, job).await?;
@@ -1895,7 +1911,7 @@ impl<'a> ControlPlane<'a> {
         let owner = Self::owner_of(app);
         let Ok(token) = self.installation_token(app, job.installation_id).await else { return };
         let label = if job.label.is_empty() { self.config.label.clone() } else { job.label.clone() };
-        let name = format!("superci-{}-{}{FAILING}", self.config.plane_id, job.job_id);
+        let name = format!("{}-{}{FAILING}", runner_prefix(self.config.name(), &self.config.plane_id), job.job_id);
         let Ok((jit, runner_id)) = github::jit_config(self.http, &app.api(), &token, &owner, &job.repo, &name, &[&label], "/home/runner/work").await else { return self.fail_later(job, why).await };
         // Known by its name, as a job's runner is: it may take another job with the label (see `failed_by_runner`).
         let _ = put_json(self.store, &format!("runner:{name}"), &job.job_id).await;

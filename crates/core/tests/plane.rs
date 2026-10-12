@@ -2001,6 +2001,25 @@ fn a_control_plane_is_called_what_it_is_named_where_people_read_it() {
     assert!(named("AcmeCI").starts_with("AcmeCI acme ") && named("SuperCI").starts_with("SuperCI acme ") && named("").starts_with("SuperCI acme "));
     config.set_name("SuperCI");
     assert!(config.name.is_none());
+
+    // Its runners are named by it too, where developers read it (a job's log at GitHub says which runner took the
+    // job): the name, then the control plane's id and the job. One that is not named keeps `superci`.
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.set_name("Acme CI");
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 41, "acme/app", None)));
+    assert_eq!((job(&store, 41)["state"].as_str(), job(&store, 41)["runner"].as_str()), (Some("launched"), Some(format!("acme-ci-{PLANE_ID}-41").as_str())), "{}", job(&store, 41));
+    // Given another name later, the next runner is named by that; the one already out keeps its name and is still
+    // known by it when its job starts.
+    config.set_name("Globex");
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 42, "acme/app", None)));
+    assert_eq!(job(&store, 42)["runner"], format!("globex-{PLANE_ID}-42"));
+    block_on(plane.handle(job_event("in_progress", 41, "acme/app", Some(&format!("acme-ci-{PLANE_ID}-41")))));
+    assert_eq!(job(&store, 41)["state"], "running", "{}", job(&store, 41));
 }
 
 #[test]
