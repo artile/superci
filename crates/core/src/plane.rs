@@ -1626,9 +1626,10 @@ impl<'a> ControlPlane<'a> {
                     Runner::Aws(a) => async {
                         let on_demand = place == AWS_ON_DEMAND;
                         if on_demand { tried_on_demand = true } else { tried_spot = true }
-                        // An organization that allowed no spot machine within the last hour is not asked again for
-                        // each job (it would refuse each one, a second lost every time): the job goes on down the order.
-                        if !on_demand && self.store.get(SPOT_NOT_ALLOWED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 3_600_000) {
+                        // An organization that allowed no spot machine within the last ten minutes is not asked again
+                        // for each job (it would refuse each one, a second lost every time): the job goes on down the
+                        // order. Not longer: once its owner changes that rule, jobs are on spot within ten minutes.
+                        if !on_demand && self.store.get(SPOT_NOT_ALLOWED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000) {
                             answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.aws_regions(&a).first().cloned().unwrap_or_default()));
                             quota_only = false;
                             job.spot_refused = Some(answers.join("; ").chars().take(300).collect());
