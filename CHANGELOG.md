@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.13.2 — unreleased
+## 0.13.2 — 2026-10-12
 - A job that AWS refuses because your account's limit of running CPUs is in use by your own jobs now waits for one of them to end, as it would on GitHub's own runners, and starts at the next sweep after. Before, it was tried three times in forty seconds and then failed. When nothing of yours runs there (the limit is below what the job asks, or something else in the account uses it), it still fails after three tries, and now says so plainly: how many CPUs it asked for, and the two limits to raise in Service Quotas, with their links.
 - The runner that fails a job on GitHub with the reason is asked for as a spot machine and then as an on-demand one, in each of your regions (before: spot only, in the first region). So the reason is delivered even when the spot limit is the reason. Not when on-demand is turned off in your order.
 - Jobs GitHub never told your control plane of are also looked for in repositories whose last job was up to two weeks ago, five of them at each look (before: only repositories with a job in the last day). The first push after a quiet weekend no longer rests on one event.
