@@ -422,7 +422,21 @@ pub struct Routing {
     /// longer than its cloud lets a machine live (`max_minutes`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_minutes: Option<u32>,
+    /// The most this CI may spend on machines in a month, all its providers together (USD, estimated as on the
+    /// dashboard). At it no job is started, until the month ends or the limit is raised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly_usd: Option<f64>,
+    /// The most a cloud account may spend on machines in a month, its providers together (by `account_of`: `aws` is
+    /// AWS's spot and on-demand machines). At it, jobs go to the providers of other accounts in the order.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub account_usd: std::collections::BTreeMap<String, f64>,
 }
+
+/// The cloud account a place in the order spends in: AWS's on-demand machines are the same account's as its spot ones.
+pub fn account_of(cloud: &str) -> &str { if cloud == AWS_ON_DEMAND { "aws" } else { cloud } }
+
+/// What a month's spending by place (`month_spend`) comes to in one cloud account.
+pub fn account_spend(spend: &HashMap<String, f64>, account: &str) -> f64 { spend.iter().filter(|(c, _)| account_of(c) == account).map(|(_, usd)| usd).sum() }
 
 /// The longest a job may run unless the dashboard sets another: six hours, as on GitHub's own runners.
 pub const MAX_JOB_MINUTES: u32 = 360;
@@ -1389,6 +1403,11 @@ impl<'a> ControlPlane<'a> {
         if candidates.is_empty() { return Ok(Placement::Fail(format!("no cloud connected for jobs: connect one in the {} dashboard", self.config.name()))) }
         let jobs: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
         let spend = self.month_spend(&jobs).await;
+        // The whole CI's limit for the month: at it nothing is started, wherever.
+        if let Some(cap) = routing.monthly_usd {
+            let spent: f64 = spend.values().sum();
+            if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of ${cap:.0} a month (${spent:.2} spent on machines): no job starts until next month, or until the limit is raised (Runners in the dashboard, or `superci limits update --monthly-usd=N`)", self.config.name()))) }
+        }
         let (mut later, mut never, mut places) = (vec![], vec![], vec![]);
         for cloud in &candidates {
             let name = cloud_name(cloud);
@@ -1400,6 +1419,14 @@ impl<'a> ControlPlane<'a> {
             // Limits from the order: turned off, jobs at once, spend this month.
             let pool = routing.pool(cloud);
             if pool.is_some_and(|p| p.off) { never.push(format!("{name} is turned off")); continue }
+            // Its cloud account's limit for the month, its providers together.
+            if let Some(cap) = routing.account_usd.get(account_of(cloud)) {
+                if account_spend(&spend, account_of(cloud)) >= *cap {
+                    let said = format!("the {} account reached its ${cap:.0} a month", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default());
+                    if !never.contains(&said) { never.push(said) }
+                    continue
+                }
+            }
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
                 if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its ${cap:.0} a month")); continue }
             }

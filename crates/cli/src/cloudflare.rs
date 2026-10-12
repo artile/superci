@@ -436,6 +436,13 @@ fn quick() -> ureq::Agent {
 }
 
 pub fn health(plane_url: &str) -> Option<Value> {
+    // One miss is not "not answering": a dropped connection or a passing error is asked again once, at once. (Not
+    // after a time-out: a page never waits long on one that does not answer.)
+    let began = std::time::Instant::now();
+    health_once(plane_url).or_else(|| (began.elapsed() < Duration::from_secs(3)).then(|| health_once(plane_url)).flatten())
+}
+
+fn health_once(plane_url: &str) -> Option<Value> {
     let mut r = quick().get(&format!("{plane_url}/health")).call().ok()?;
     if r.status().as_u16() != 200 { return None }
     serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()

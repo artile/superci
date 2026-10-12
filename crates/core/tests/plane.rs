@@ -756,6 +756,38 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     let e = job(&store, 52)["error"].as_str().unwrap().to_string();
     assert_eq!(job(&store, 52)["state"], "failed");
     assert!(e.contains("AWS reached its $1 a month") && e.contains("AWS on-demand is turned off"), "{e}");
+
+    // A cloud account's limit is for its providers together: AWS's spot and on-demand machines. Under it, a job
+    // starts; at it, neither takes one (said once), and the job fails with why.
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.account_usd.insert("aws".into(), 3.0);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 53, "acme/app", None)));
+    assert_eq!(job(&store, 53)["state"], "launched", "{}", job(&store, 53));
+    // (Job 50 cost $2 on spot machines; one more dollar on on-demand ones makes the account's three.)
+    store.0.borrow_mut().insert("job:54".into(), serde_json::json!({ "job_id": 54, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_996_400_000u64, "ended_ms": 1_790_000_000_000u64,
+        "installation_id": 42, "cloud": "aws", "on_demand": true, "usd_per_hour": 1.0, "seen_in_progress": true }).to_string());
+    block_on(plane.handle(job_event("queued", 55, "acme/app", None)));
+    let e = job(&store, 55)["error"].as_str().unwrap().to_string();
+    assert_eq!(job(&store, 55)["state"], "failed", "{e}");
+    assert!(e.contains("nowhere to run") && e.matches("the AWS account reached its $3 a month").count() == 1, "{e}");
+    // The whole CI's limit: at it no job starts anywhere, and the job says what to do.
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.monthly_usd = Some(3.0);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 56, "acme/app", None)));
+    let e = job(&store, 56)["error"].as_str().unwrap().to_string();
+    assert_eq!(job(&store, 56)["state"], "failed", "{e}");
+    assert!(e.contains("SuperCI reached its limit of $3 a month ($3.") && e.contains("no job starts until next month, or until the limit is raised"), "{e}");
+    // A dollar more room: it starts.
+    config.routing.monthly_usd = Some(40.0);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 57, "acme/app", None)));
+    assert_eq!(job(&store, 57)["state"], "launched", "{}", job(&store, 57));
 }
 
 struct MovingClock(std::cell::Cell<u64>);
