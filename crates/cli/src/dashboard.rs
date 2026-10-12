@@ -2720,10 +2720,11 @@ mark();load()})();</script>"#;
             "plane" if !views.is_empty() => (self.planes_page(views), self.deploy_running()),
             "plane" => (self.plane_page(), false),
             "runners" => (self.runners_page(current), false),
-            "add-runners" => (self.add_runners_page(current), self.modal_pending.is_some()),
+            // (With what the AWS account in hand allows, when that is not everything.)
+            "add-runners" => (format!("{}{}", self.aws_account_notice(), self.add_runners_page(current)), self.modal_pending.is_some()),
             _ if self.modal_pending.is_some() && current.is_none() => (self.overview_page(current).0, true),
             "jobs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1></div><div class="cards">{}</div>"#, jobs_card(current, 200)), false),
-            "planes" => (self.planes_page(views), self.deploy_running()),
+            "planes" => (format!("{}{}", self.aws_account_notice(), self.planes_page(views)), self.deploy_running()),
             "changes" => (changes_page(views, &views.get(view::in_use(views)).map(|v| self.aws_lacks(v)).unwrap_or_default()), false),
             "workflows" => (self.workflows_page(current), false),
             "settings" => (self.settings_page(current), false),
