@@ -624,7 +624,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: random_token(24), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -640,6 +640,8 @@ impl Dashboard {
         d.aws_ended = kept.aws_ended && d.aws.is_none();
         // The key the control planes were handed, while it lasts another day; else a new one, good for thirty days.
         match kept.key.filter(|k| key_until(&k.name) > now_ms() / 1000 + 86_400) {
+            // (One from before each control plane had a key of its own goes on working until it can be replaced
+            // everywhere: see `renew_folder_key`.)
             Some(k) => { d.status_key = k.value; d.status_secret = k.name; d.keyed = k.planes.into_iter().collect() }
             None => d.status_secret = format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()),
         }
@@ -902,11 +904,15 @@ impl Dashboard {
         let Some(store) = self.store.clone() else { return Ok(vec!["Nothing is kept on this machine (it has no home folder).".into()]) };
         let mut said = vec![];
         if store.read().key.is_some() {
-            if let Some(p) = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id())) {
-                let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+            // From every control plane that has it: the ones listed, and the kept one if it is not among them.
+            let mut have: Vec<Plane> = self.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. })).cloned().collect();
+            if let Some(k) = self.kept_plane.clone().filter(|k| !have.iter().any(|p| p.plane_id() == k.plane_id())) { have.push(k) }
+            have.retain(|p| self.keyed.contains(p.plane_id()));
+            let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+            for p in have {
                 match writer.drop(&p, &self.status_secret) {
                     Ok(()) => said.push(format!("The control plane ({}) no longer takes this machine's key.", p.place())),
-                    Err(_) => said.push(format!("The control plane ({}) still has this machine's key, which only reads; it ends by itself by {}.", p.place(), day(key_until(&self.status_secret)))),
+                    Err(_) => said.push(format!("The control plane ({}) still has this machine's key; it ends by itself by {}.", p.place(), day(key_until(&self.status_secret)))),
                 }
             }
         }
@@ -924,7 +930,7 @@ impl Dashboard {
         (self.planes, self.selected, self.kept_plane, self.preloaded, self.views) = (vec![], 0, None, None, None);
         self.cf_accounts.clear();
         self.keyed.clear();
-        self.status_key = random_token(24);
+        self.status_key = folder_key();
         self.status_secret = format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase());
         self.kept_as = serde_json::to_string(&self.kept()).unwrap_or_default();
         Ok(said)
@@ -944,10 +950,31 @@ impl Dashboard {
         }
     }
 
+    /// What another process on the same folder wrote since this one last read or wrote the file (a `superci login`
+    /// in a terminal while the dashboard runs, a second dashboard): taken, for each sign-in that this process has not
+    /// changed itself meanwhile. Without it the next write here would put the old state back and undo that sign-in.
+    fn take_in(&mut self) {
+        let Some(store) = self.store.clone() else { return };
+        let on_disk = store.read();
+        let value = |k: &Kept| serde_json::to_value(k).unwrap_or_default();
+        let (disk, last, mine) = (value(&on_disk), serde_json::from_str::<serde_json::Value>(&self.kept_as).unwrap_or_default(), value(&self.kept()));
+        if disk == last { return }
+        let theirs = |field: &str| mine[field] == last[field] && disk[field] != last[field];
+        let mut took = false;
+        if theirs("aws") || (theirs("aws_ended") && self.aws.is_none()) {
+            (self.aws, self.aws_ended, self.looked_aws, took) = (on_disk.aws, on_disk.aws_ended, false, true);
+        }
+        if theirs("cloudflare") && !self.cf_given { (self.cf, self.looked_cf, took) = (on_disk.cloudflare, false, true); self.cf_accounts.clear(); }
+        if theirs("modal") && !self.modal_given { (self.modal, self.looked_modal, took) = (on_disk.modal, false, true) }
+        if theirs("key") { if let Some(k) = on_disk.key { (self.status_key, self.status_secret, self.keyed, took) = (k.value, k.name, k.planes.into_iter().collect(), true) } }
+        if took { self.views = None }
+    }
+
     /// Keeps the sign-ins as they are now (a new one, a renewed one, one that ended), when they changed. Signed in
     /// nowhere: nothing is kept.
     fn keep(&mut self) {
         let Some(store) = self.store.clone() else { return };
+        self.take_in();
         let kept = self.kept();
         let text = serde_json::to_string(&kept).unwrap_or_default();
         if text == self.kept_as { return }
@@ -1188,16 +1215,37 @@ impl Dashboard {
         Ok(())
     }
 
+    /// A key kept from before each control plane had one of its own is the same value in every control plane that
+    /// has it. It is replaced once every control plane listed can be handed its own key (each written with its own
+    /// account's sign-in); until then it goes on working, so that nothing becomes unreadable (a control plane whose
+    /// AWS sign-in has ended is still read with it). Tried again at each look.
+    fn renew_folder_key(&mut self) {
+        if self.status_key.starts_with(cloudflare::FOLDER_KEY) { return }
+        let planes: Vec<Plane> = self.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. })).cloned().collect();
+        if planes.is_empty() {
+            if self.keyed.is_empty() { self.status_key = folder_key() }
+            return;
+        }
+        let (new, name) = (folder_key(), format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()));
+        let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+        if !planes.iter().all(|p| writer.put(p, &name, &cloudflare::plane_key(&new, p.url())).is_ok()) { return }
+        let old = std::mem::replace(&mut self.status_secret, name);
+        for p in &planes { let _ = writer.drop(p, &old); }
+        self.status_key = new;
+        self.keyed = planes.iter().map(|p| p.plane_id().to_string()).collect();
+    }
+
     /// Lets every control plane this dashboard can change accept this session's status key. Earlier sessions' keys that
     /// have expired are removed afterwards, in the background: the page does not wait for that.
     fn key_planes(&mut self) {
+        self.renew_folder_key();
         let unkeyed: Vec<Plane> = self.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. }) && !self.keyed.contains(p.plane_id())).cloned().collect();
         if unkeyed.is_empty() { return }
         // Handed to each at once.
         let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
         let (name, key) = (self.status_secret.clone(), self.status_key.clone());
         let done: Vec<String> = std::thread::scope(|s| {
-            let hs: Vec<_> = unkeyed.iter().map(|p| { let (writer, name, key) = (&writer, &name, &key); s.spawn(move || timed(&format!("{}: hand it this session's key", p.place()), || writer.put(p, name, key)).ok().map(|_| p.plane_id().to_string())) }).collect();
+            let hs: Vec<_> = unkeyed.iter().map(|p| { let (writer, name, key) = (&writer, &name, &key); s.spawn(move || timed(&format!("{}: hand it this session's key", p.place()), || writer.put(p, name, &cloudflare::plane_key(key, p.url()))).ok().map(|_| p.plane_id().to_string())) }).collect();
             hs.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
         });
         self.keyed.extend(done);
@@ -4171,6 +4219,7 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
     d.views = None;
     // Actions and sign-ins are told in the terminal too (never their codes or tokens).
+    d.take_in();
     let r = d.handle(req);
     d.keep();
     // The dashboard's terminal says each action; a command that only opened the browser for one thing says that thing.
@@ -4196,6 +4245,9 @@ fn status_soon(plane_url: &str, key: &str) -> Option<serde_json::Value> {
 }
 
 /// Whether it did.
+/// A new key for this folder's control planes (see `cloudflare::FOLDER_KEY`).
+fn folder_key() -> String { format!("{}{}", cloudflare::FOLDER_KEY, random_token(24)) }
+
 fn wait_for(plane_url: &str, key: &str, done: impl Fn(&serde_json::Value) -> bool) -> bool {
     for _ in 0..40 {
         if cloudflare::status_light(plane_url, key).is_some_and(|s| done(&s)) { return true }
@@ -4993,6 +5045,67 @@ mod tests {
         assert!(cost_text(&j(None, "cloudflare"), 0.0123).contains("Estimated until Cloudflare&#39;s metering has it") || cost_text(&j(None, "cloudflare"), 0.0123).contains("Estimated until Cloudflare's metering has it"));
         assert!(cost_text(&j(Some("measured"), "cloudflare"), 0.0123).contains(r#"title="As Cloudflare metered it">$0.0123<"#));
         assert!(cost_text(&j(Some("prices"), "aws"), 0.5).contains(">$0.50<") && !cost_text(&j(Some("prices"), "aws"), 0.5).contains('≈'));
+    }
+
+    #[test]
+    fn a_sign_in_made_by_another_process_is_taken_in_not_undone() {
+        let dir = std::env::temp_dir().join(format!("superci-two-{}", random_token(6)));
+        let store = Store::at(&dir);
+        let session = |workspace: &str| modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: workspace.into() };
+        // A dashboard runs, signed in to Cloudflare only (so something is kept).
+        store.write(&crate::store::Kept { cloudflare: with_cloudflare(&[("a1", "Acme Inc.")]).cf.clone(), ..Default::default() }).unwrap();
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.keep();
+        assert!(d.modal.is_none() && d.cf.is_some());
+        // `superci login modal` in a terminal: another process reads the file, adds its sign-in and writes it.
+        let mut other = store.read();
+        other.modal = Some(session("acme"));
+        store.write(&other).unwrap();
+        // The dashboard's next page has it, and its next write keeps it (before: the write put the old state back).
+        d.take_in();
+        assert_eq!(d.modal.as_ref().map(|m| m.workspace.as_str()), Some("acme"));
+        d.keep();
+        assert_eq!(store.read().modal.map(|m| m.workspace), Some("acme".to_string()));
+        // What this process changed itself is not replaced by what another wrote meanwhile: its own is the newer.
+        d.modal = Some(session("mine"));
+        let mut other = store.read();
+        other.modal = Some(session("theirs"));
+        store.write(&other).unwrap();
+        d.keep();
+        assert_eq!(store.read().modal.map(|m| m.workspace), Some("mine".to_string()));
+        // `superci logout` elsewhere removes the file: this dashboard is signed out too, and does not write it back.
+        store.remove().unwrap();
+        d.take_in();
+        d.keep();
+        assert!(d.modal.is_none() && d.cf.is_none() && !store.path().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_control_plane_is_asked_with_a_key_of_its_own() {
+        // The folder's key is never sent as itself: each address gets its own key from it, always the same one.
+        let d = Dashboard::new();
+        assert!(d.status_key.starts_with(cloudflare::FOLDER_KEY) && d.status_key.len() > 40);
+        let (a, b) = (cloudflare::plane_key(&d.status_key, "https://a.example"), cloudflare::plane_key(&d.status_key, "https://b.example/"));
+        assert!(a.len() == 64 && a != b && !a.contains(&d.status_key) && a == cloudflare::plane_key(&d.status_key, "https://a.example/"));
+        assert_ne!(a, cloudflare::plane_key(&Dashboard::new().status_key, "https://a.example"), "another folder's key opens nothing here");
+        // A key that only reads is one control plane's already: sent as it is.
+        assert_eq!(cloudflare::plane_key("a-key-that-only-reads-0001", "https://a.example"), "a-key-that-only-reads-0001");
+        let dir = std::env::temp_dir().join(format!("superci-keys-{}", random_token(6)));
+        let store = Store::at(&dir);
+        let name = format!("DASHBOARD_KEY_{}_ABCDEF", now_ms() / 1000 + 20 * 86_400);
+        store.write(&crate::store::Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() }),
+            key: Some(crate::store::Key { name: name.clone(), value: "an-old-shared-key-value-0001".into(), planes: vec!["abcdef123456".into()] }), ..Default::default() }).unwrap();
+        // A key kept from before (one value in every control plane) goes on working until every control plane
+        // listed has been handed its own: with none listed and one known to have it, nothing changes yet.
+        let mut again = Dashboard::signed_in(Some(store.clone()));
+        again.renew_folder_key();
+        assert!(again.status_key == "an-old-shared-key-value-0001" && again.status_secret == name && again.keyed.contains("abcdef123456"));
+        // With no control plane having it, there is nothing to carry: a new one at once.
+        again.keyed.clear();
+        again.renew_folder_key();
+        assert!(again.status_key.starts_with(cloudflare::FOLDER_KEY));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

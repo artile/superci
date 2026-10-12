@@ -441,8 +441,20 @@ pub fn health(plane_url: &str) -> Option<Value> {
     serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()
 }
 
+/// What the key a folder keeps for its control planes begins with. Such a key is never sent anywhere as itself: each
+/// control plane is handed, and asked with, a key of its own made from it and the control plane's address
+/// (`plane_key`). So no control plane, and nobody who can read its settings in its cloud, holds a key that another
+/// control plane takes. A key that only reads (`SUPERCI_KEY`) is one control plane's already and is sent as it is.
+pub const FOLDER_KEY: &str = "superci-folder-";
+
+pub fn plane_key(key: &str, plane_url: &str) -> String {
+    if !key.starts_with(FOLDER_KEY) { return key.to_string() }
+    superci_core::crypto::sha256_hex(format!("{key}\n{}", plane_url.trim_end_matches('/')).as_bytes())
+}
+
 /// Something the control plane looks up for the dashboard (GitLab's projects), asked with this session's key.
 pub fn plane_get(plane_url: &str, key: &str, path: &str) -> Result<Value> {
+    let key = &plane_key(key, plane_url);
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(40))).build().into();
     let mut r = agent.get(&format!("{plane_url}{path}")).header("authorization", &format!("Bearer {key}")).call().map_err(|e| e.to_string())?;
     let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
@@ -452,6 +464,7 @@ pub fn plane_get(plane_url: &str, key: &str, path: &str) -> Result<Value> {
 
 /// A change the control plane makes itself (no restart), asked with this session's key.
 pub fn plane_post(plane_url: &str, key: &str, path: &str, body: &Value) -> Result<Value> {
+    let key = &plane_key(key, plane_url);
     let mut r = quick().post(&format!("{plane_url}{path}")).header("authorization", &format!("Bearer {key}")).header("content-type", "application/json")
         .send(body.to_string()).map_err(|e| e.to_string())?;
     if r.status().as_u16() != 200 { return Err(format!("the control plane answered {}", r.status())) }
@@ -461,6 +474,7 @@ pub fn plane_post(plane_url: &str, key: &str, path: &str, body: &Value) -> Resul
 /// A step of moving between control planes: with this session's key and the plane's one-time move token. Its status
 /// too (403: the token is not there yet, or was used).
 pub fn plane_move_call(plane_url: &str, key: &str, token: &str, path: &str, body: &Value) -> Result<(u16, Value)> {
+    let key = &plane_key(key, plane_url);
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(60))).build().into();
     let mut r = agent.post(&format!("{plane_url}{path}")).header("authorization", &format!("Bearer {key}")).header("x-move-token", token)
         .header("content-type", "application/json").send(body.to_string()).map_err(|e| e.to_string())?;
@@ -476,6 +490,7 @@ pub fn status(plane_url: &str, key: &str) -> Option<Value> { status_of(plane_url
 pub fn status_light(plane_url: &str, key: &str) -> Option<Value> { status_of(plane_url, key, "?light=1") }
 
 fn status_of(plane_url: &str, key: &str, query: &str) -> Option<Value> {
+    let key = &plane_key(key, plane_url);
     let mut r = quick().get(&format!("{plane_url}/status{query}")).header("authorization", &format!("Bearer {key}")).call().ok()?;
     if r.status().as_u16() != 200 { return None }
     serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()
