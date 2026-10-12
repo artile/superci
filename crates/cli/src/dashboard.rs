@@ -432,7 +432,7 @@ fn jobs_word(n: u32) -> String { if n == 1 { "1 job".into() } else { format!("{n
 
 /// The mark: four broad petals, one solid shape (the same outline as on superci.dev).
 const MARK: &str = r#"<svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M4.31 12.77L4.58 12.25L4.56 11.66L4.40 11.34L3.58 10.29L3.10 9.39L2.72 8.33L2.51 7.12L2.51 5.99L2.69 4.85L3.16 3.56L3.52 3.18L4.53 2.79L5.54 2.56L6.65 2.48L7.69 2.58L8.65 2.81L9.52 3.15L10.48 3.71L11.42 4.45L11.97 4.61L12.56 4.46L13.62 3.64L14.61 3.10L15.56 2.75L16.65 2.53L17.89 2.50L19.04 2.67L20.42 3.15L20.82 3.52L21.21 4.53L21.44 5.54L21.52 6.65L21.42 7.69L21.19 8.65L20.85 9.52L20.29 10.48L19.55 11.42L19.39 11.97L19.54 12.56L20.36 13.62L20.90 14.61L21.28 15.65L21.47 16.65L21.51 17.81L21.33 19.04L20.85 20.42L20.48 20.82L19.47 21.21L18.46 21.44L17.35 21.52L16.31 21.42L15.35 21.19L14.50 20.86L13.60 20.34L12.58 19.55L11.99 19.39L11.42 19.55L10.40 20.34L9.50 20.86L8.57 21.21L7.69 21.42L6.65 21.52L5.54 21.44L4.53 21.21L3.56 20.84L3.16 20.44L2.69 19.15L2.51 18.01L2.52 16.79L2.72 15.67L3.10 14.61L3.64 13.62L4.31 12.77Z"/></svg>"#;
-const THEME_TOGGLE: &str = r#"<button class="toggle" onclick="superciTheme()" aria-label="Switch light or dark"><svg viewBox="0 0 24 24"><path d="M20.2 15.1A8.4 8.4 0 0 1 8.9 3.8 8.5 8.5 0 1 0 20.2 15.1Z"/></svg></button>"#;
+const ICON_THEME: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.2 15.1A8.4 8.4 0 0 1 8.9 3.8 8.5 8.5 0 1 0 20.2 15.1Z"/></svg>"#;
 
 fn row(dot: &str, name: &str, sub: &str, end: &str) -> String {
     format!(r#"<div class="row"><span class="dot {dot}"></span><span><span class="row-name">{name}</span>{}</span><span class="row-end">{end}</span></div>"#,
@@ -2248,16 +2248,16 @@ impl Dashboard {
         // The live part is fetched by the page itself. Links and forms within the dashboard change only that part: the
         // page stays as it is (a thin bar at the top) until the next one is ready, so nothing flashes in between.
         let script = r#"<script>(function(){var main=document.getElementById('live'),timer;
-var sections={plane:'planes',settings:'planes','add-runners':'runners',gitlab:'repos'};
+var sections={plane:'planes','add-runners':'runners',gitlab:'repos'};
 function cc(){return new URLSearchParams(location.search).get('c')||''}
 function keep(u){if(!u.searchParams.has('c')){if(cc())u.searchParams.set('c',cc())}else if(!u.searchParams.get('c'))u.searchParams.delete('c');return u}
-function mark(){document.querySelectorAll('a[href^="/?"],a[href="/"]').forEach(function(a){if(a.target)return;var u=keep(new URL(a.getAttribute('href'),location.href));a.setAttribute('href',u.pathname+u.search+u.hash)});var all=document.getElementById('side-all'),list=!!main.querySelector('[data-list]');if(all){all.hidden=!main.querySelector('[data-many]');if(list)all.setAttribute('aria-current','true')}document.body.classList.toggle('listing',list)}
+function mark(){var sw=main.querySelector('[data-switch]'),ss=document.getElementById('side-switch');if(sw&&ss){if(ss.innerHTML!==sw.innerHTML)ss.innerHTML=sw.innerHTML;sw.remove()}if(ss)ss.parentNode.classList.toggle('has',!!ss.innerHTML);document.querySelectorAll('a[href^="/?"],a[href="/"]').forEach(function(a){if(a.target)return;var u=new URL(a.getAttribute('href'),location.href);if(u.searchParams.has('c'))return;keep(u);a.setAttribute('href',u.pathname+u.search+u.hash)});document.body.classList.toggle('listing',!!main.querySelector('[data-list]'))}
 function frag(){var q=location.search;return '/'+(q?q+'&fragment=1':'?fragment=1')}
 function current(){var p=new URLSearchParams(location.search).get('p')||'overview';p=sections[p]||p;document.querySelectorAll('.side .nav a').forEach(function(a){a.setAttribute('aria-current',String(new URL(a.href).searchParams.get('p')===p))})}
 var shown='';
 function show(h){var to=h.match(/data-go="([^"]+)"/);if(to){go(to[1]);return}document.body.classList.remove('busy');clearTimeout(timer);var ld=h.match(/data-loading="([^"]+)"/),cur=main.querySelector('[data-loading]'),again=h.match(/data-refresh="(\d+)"/);if(h===shown||(ld&&cur&&cur.getAttribute('data-loading')===ld[1])){if(again)timer=setTimeout(load,again[1]*1000);return}shown=h;main.innerHTML=h;mark();main.querySelectorAll('form.picker').forEach(superciPick);if(location.hash){var hd=document.getElementById(location.hash.slice(1));if(hd){if(hd.tagName==='DETAILS')hd.open=true;hd.scrollIntoView({block:'center'})}}document.body.classList.toggle('gated',!!main.querySelector('[data-gated]'));var cl=main.querySelector('[data-called]');if(cl){var cn=cl.getAttribute('data-called'),cb=document.querySelector('.brand span');if(cb.textContent!==cn)cb.textContent=cn;if(document.title!==cn)document.title=cn}var u=main.querySelector('[data-side]'),su=document.getElementById('side-update'),nx=u?u.innerHTML:'';if(u)u.remove();if(su.innerHTML!==nx)su.innerHTML=nx;document.querySelectorAll('input[name=next]').forEach(function(i){i.value=location.search+(i.dataset.open&&location.search?'&open='+i.dataset.open:'')});var op=new URLSearchParams(location.search).get('open');if(op){var od=document.getElementById(op);if(od&&od.showModal)od.showModal();if(od||!main.querySelector('[data-refresh]')){var ou=new URL(location.href);ou.searchParams.delete('open');history.replaceState(null,'',ou.pathname+ou.search+ou.hash)}}clearTimeout(timer);var t=main.querySelector('[data-refresh]');if(t)timer=setTimeout(load,t.getAttribute('data-refresh')*1000)}
 function load(){fetch(frag(),{credentials:'same-origin'}).then(function(r){return r.text()}).then(show).catch(function(){document.body.classList.remove('busy');main.innerHTML='<div class="empty">The dashboard stopped. Run superci dashboard again.</div>'})}
-function go(url){var u=keep(new URL(url,location.href));history.pushState(null,'',u.pathname+u.search+u.hash);current();clearTimeout(timer);document.body.classList.add('busy');window.scrollTo(0,0);load()}
+function go(url){document.querySelectorAll('details.menu[open]').forEach(function(d){d.open=false});var u=keep(new URL(url,location.href));history.pushState(null,'',u.pathname+u.search+u.hash);current();clearTimeout(timer);document.body.classList.add('busy');window.scrollTo(0,0);load()}
 document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a||a.target||e.defaultPrevented||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;var u=new URL(a.href,location.href);if(u.origin!==location.origin||u.pathname!=='/'||u.searchParams.has('k')||(u.search===location.search&&u.hash))return;e.preventDefault();go(u.href)});
 document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute('action')||'';if(e.defaultPrevented||(f.getAttribute('method')||'').toLowerCase()!=='post'||act.charAt(0)!=='/')return;if(/signin$|^\/github\/start/.test(act)){if(cc()&&!f.querySelector('[name=c]')){var ci=document.createElement('input');ci.type='hidden';ci.name='c';ci.value=cc();f.appendChild(ci)}return}e.preventDefault();var d=f.closest('dialog');document.body.classList.add('busy');var b=e.submitter||f.querySelector('button:not([type=button])');if(b&&!b.disabled){b.disabled=true;b.innerHTML='<span class="mini-spin"></span>'+(b.classList.contains('danger')?'Working…':'Saving…');b.classList.add('working')}fetch(act+(cc()?(act.indexOf('?')<0?'?':'&')+'c='+encodeURIComponent(cc()):''),{method:'POST',body:new URLSearchParams(new FormData(f,e.submitter)),credentials:'same-origin'}).then(function(r){if(d&&d.open)d.close();var u=new URL(r.url);if(r.redirected&&u.origin===location.origin){go(u.href);return}if(r.redirected){location.href=r.url;return}return r.text().then(function(t){document.open();document.write(t);document.close()})}).catch(function(){f.submit()})});
 window.addEventListener('popstate',function(){current();document.body.classList.add('busy');load()});
@@ -2400,7 +2400,7 @@ mark();load()})();</script>"#;
         // up belongs to none of them.) A page that names one shows that one.
         if section == "all" || (view::several(views).is_some() && section != "plane") {
             lock(side()).clear();
-            return format!(r#"{}<div data-many data-list hidden></div><div data-called="SuperCI" hidden></div>"#, self.all_page(views));
+            return format!(r#"{}<div data-list hidden></div><div data-called="SuperCI" hidden></div>{}"#, self.all_page(views), switcher(views, None));
         }
         let current = views.get(view::in_use(views));
         // A control plane that has not picked up this session's key yet: look again in a moment.
@@ -2454,8 +2454,7 @@ mark();load()})();</script>"#;
         let name = current.map(|v| v.name()).unwrap_or_else(|| "SuperCI".to_string());
         *lock(called()) = name.clone();
         let html = format!(r#"{html}<div data-called="{}" hidden></div>"#, esc(&name));
-        // With more than one control plane known, the sidebar offers the list of them.
-        let html = if views.iter().filter(|v| !matches!(v.plane, Plane::Seen { .. })).count() > 1 { format!("{html}<div data-many hidden></div>") } else { html };
+        let html = format!("{html}{}", switcher(views, current));
         let html = if card.is_empty() { html } else { format!(r#"{html}<div data-side hidden>{card}</div>"#) };
         if waiting || settling { format!(r#"<div data-refresh="{}"></div>{html}"#, if settling { 2 } else { 5 }) } else { html }
     }
@@ -2467,9 +2466,10 @@ mark();load()})();</script>"#;
             link("workflows", "Workflows", ICON_WORKFLOWS), link("jobs", "Jobs", ICON_JOBS));
         // At the bottom: an update for the control plane, when it needs one (filled in by the page's live part), the
         // control plane itself, its settings (and signing SuperCI out on this computer), and what is new.
-        let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("settings", "Settings", ICON_SETTINGS), link("changes", "Changelog", ICON_NEWS))
-            .replacen(r#"<nav class="nav">"#, &format!(r#"<nav class="nav"><a id="side-all" hidden href="/?p=all&c=" aria-current="false">{ICON_OVERVIEW}<span>All control planes</span></a>"#), 1);
-        format!(r#"<aside class="side"><div class="brand">{MARK}<span>{}</span>{THEME_TOGGLE}</div>{nav}{foot}</aside>"#, esc(&called_now()))
+        let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("settings", "Settings", ICON_SETTINGS), link("changes", "Changelog", ICON_NEWS));
+        // The name at the top is the switcher: the control planes known here, the list of them, and adding an
+        // organization (its rows come with each page's live part, see `switcher`).
+        format!(r#"<aside class="side"><details class="menu brand brand-menu"><summary>{MARK}<span>{}</span><svg class="chev" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></svg></summary><div class="menu-pop" id="side-switch"></div></details>{nav}{foot}</aside>"#, esc(&called_now()))
     }
 
     /// Where a control plane runs: reachable from Settings to add another. The connect screen's list: a row per cloud with
@@ -2896,6 +2896,8 @@ mark();load()})();</script>"#;
         let logo = |icon: &str| format!(r#"<span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{icon}</span>"#);
         let who = self.signed_in_as().map(|w| format!("Signed in: {}.", esc(&w))).unwrap_or_else(|| "Not signed in to any cloud.".into());
         let here = format!(r#"<section class="card dm-card"><div class="default-machine">{}<span class="dm-main"><strong>This computer</strong><small>{who} Signing out removes SuperCI's sign-ins from it; your runners keep working.</small></span><form method="post" action="/signout"><button class="button secondary sm">Sign out</button></form></div></section>"#, logo(ICON_SIGNOUT));
+        // (The switch between light and dark lives here: the name at the top of the sidebar is the switcher now.)
+        let here = here.replacen("</div></section>", &format!(r#"</div><div class="default-machine">{}<span class="dm-main"><strong>Appearance</strong><small>Light or dark, in this browser.</small></span><button type="button" class="button secondary sm" onclick="superciTheme()">Switch</button></div></section>"#, logo(ICON_THEME)), 1);
         let Some(v) = v else { return format!(r#"{bar}<div class="cards">{here}</div>"#) };
         // The public repositories GitHub's App is installed on (none when GitHub is not connected).
         let public = if v.github { cloudflare::plane_get(v.plane.url(), &self.status_key, "/github/public-repos").ok().and_then(|r| r["repos"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())) } else { Some(vec![]) };
@@ -3441,6 +3443,16 @@ fn where_choices(name: &str, public: (&str, &str), own: (&str, &str), field: &st
 <label class="prompt-modal-choice is-selected"><input type="radio" name="{name}" value="public" checked><span><strong>{}</strong><small>{}</small></span></label>
 <label class="prompt-modal-choice"><input type="radio" name="{name}" value="own"><span><strong>{}</strong><small>{}</small></span></label></fieldset>
 <div class="perm-field" data-own hidden>{field}</div>"#, public.0, public.1, own.0, own.1)
+}
+
+/// The rows of the switcher under the name in the sidebar: each control plane known here (the one a page shows
+/// marked), the list of them, and adding an organization.
+fn switcher(views: &[PlaneView], current: Option<&PlaneView>) -> String {
+    let rows = views.iter().filter(|v| !matches!(v.plane, Plane::Seen { .. }) && v.moved_to.is_none()).map(|v| {
+        let name = if v.serves_its_own() || views.len() == 1 { v.name() } else { "Serves nothing yet".to_string() };
+        format!(r#"<a href="/?c={}" aria-current="{}"><span>{}</span><small>{}</small></a>"#, esc(v.plane.plane_id()), current.is_some_and(|c| c.plane.plane_id() == v.plane.plane_id()), esc(&name), esc(&v.plane.place()))
+    }).collect::<String>();
+    format!(r#"<div data-switch hidden>{rows}<hr><a href="/?p=all&c="><span>All control planes</span></a><a href="/?p=all&c=&open=add-org"><span>Add an organization…</span></a></div>"#)
 }
 
 /// What to send an owner of an organization one does not own: GitHub shows the page that creates the organization's
@@ -4797,13 +4809,16 @@ mod tests {
         let list = d.render("planes", &[view.clone(), theirs.clone()], None);
         preview("all", &list);
         assert!(list.contains(r#"<h1 class="page-title">Control planes</h1>"#) && list.contains(&format!(r#"href="/?c={}">Open</a>"#, view.plane.plane_id())) && list.contains(r#"href="/?c=xyz000000001">Open</a>"#), "{}", &list[..400.min(list.len())]);
-        assert!(list.contains("Add an organization</button>") && list.contains(r#"href="/?p=repos&c=xyz000000001""#) && list.contains("On a new control plane") && list.contains(r#"href="/?p=plane&c=""#) && list.contains("data-many"));
+        assert!(list.contains("Add an organization</button>") && list.contains(r#"href="/?p=repos&c=xyz000000001""#) && list.contains("On a new control plane") && list.contains(r#"href="/?p=plane&c=""#) && list.contains("data-list"));
+        // The switcher under the name in the sidebar comes with every page: each control plane, the list, adding one.
+        assert!(list.contains(r#"<div data-switch hidden><a href="/?c="#) && list.contains(r#"<a href="/?c=xyz000000001" aria-current="false">"#) && list.contains(r#"<a href="/?p=all&c="><span>All control planes</span></a><a href="/?p=all&c=&open=add-org"><span>Add an organization…</span></a>"#));
         assert!(!list.contains("Move here") && !list.contains(r#"action="/plane/"#) && d.render("jobs", &[view.clone(), theirs.clone()], None).contains("Control planes</h1>"), "every page is the list until one is named");
         // A page that names one shows that one, and offers nothing of the other.
         view::name(Some(view.plane.plane_id()));
         let beside = d.render("planes", &[view.clone(), theirs.clone()], None);
         preview("planes-two-teams", &beside);
-        assert!(beside.contains("pick act current") && beside.contains("Serves a code host of its own") && !beside.contains("Move here</button>") && !beside.contains(r#"action="/plane/delete""#) && beside.contains("data-many"), "nothing of another team's is offered");
+        assert!(beside.contains("pick act current") && beside.contains("Serves a code host of its own") && !beside.contains("Move here</button>") && !beside.contains(r#"action="/plane/delete""#), "nothing of another team's is offered");
+        assert!(beside.contains(&format!(r#"<a href="/?c={}" aria-current="true">"#, view.plane.plane_id())), "the one shown is marked in the switcher");
         view::name(Some("xyz000000001"));
         assert_eq!(view::in_use(&[view.clone(), theirs.clone()]), 1, "the one named, not the first that answers");
         view::name(None);
