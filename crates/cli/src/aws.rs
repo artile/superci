@@ -34,8 +34,27 @@ impl Http for Blocking {
         let status = response.status().as_u16();
         let headers: Vec<(String, String)> = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect();
         let body = response.body_mut().read_to_vec().map_err(|e| e.to_string())?;
+        #[cfg(debug_assertions)]
+        record(&r, status, &body);
         Ok(Response { status, headers, body })
     }
+}
+
+/// In a debug build with `SUPERCI_RECORD=FILE`: every exchange with AWS is appended to that file, a line each (the
+/// address, what was asked, the status and the whole answer), to make test fixtures of what a real account answers.
+/// No header is kept (the credentials are in them), nor a sign-in's exchange. The answers name the account: they are
+/// sanitized before they are kept anywhere (`scripts/sanitize-recording.py`).
+#[cfg(debug_assertions)]
+fn record(r: &Request, status: u16, body: &[u8]) {
+    let Some(file) = std::env::var_os("SUPERCI_RECORD").filter(|f| !f.is_empty()) else { return };
+    if r.url.contains("signin.") || r.url.contains("/oauth") { return }
+    let target = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-amz-target")).map(|(_, v)| v.clone()).unwrap_or_default();
+    let line = serde_json::json!({ "method": r.method, "url": r.url, "target": target, "asked": String::from_utf8_lossy(&r.body), "status": status, "answer": String::from_utf8_lossy(body) });
+    use std::io::Write;
+    // (One line at a time: questions are asked side by side.)
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) { let _ = f.write_all(format!("{line}\n").as_bytes()); }
 }
 
 /// How an error starts when AWS says a sign-in is over (see `Session::credentials`).
@@ -210,6 +229,132 @@ pub fn delete_networks(creds: &Credentials, plane_id: &str, regions: &[&str]) ->
     done.into_iter().collect()
 }
 
+/// What AWS answered when asked whether something may be done in an account.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer {
+    Allowed,
+    /// Refused for want of permission: by whom, and by which policy when AWS says.
+    Refused(aws::Refusal),
+    /// AWS answered something else (said as it said it): not known either way.
+    Unknown(String),
+}
+
+impl Answer {
+    pub fn allowed(&self) -> bool { matches!(self, Answer::Allowed) }
+    /// Refused by a policy of the account's organization, which nothing inside the account can lift.
+    pub fn by_organization(&self) -> Option<&aws::Refusal> { match self { Answer::Refused(r) if r.by == aws::By::Organization => Some(r), _ => None } }
+    fn of(result: Result<()>) -> Answer {
+        match result { Ok(()) => Answer::Allowed, Err(e) => match aws::refusal(&e) { Some(r) => Answer::Refused(r), None => Answer::Unknown(e) } }
+    }
+}
+
+/// What kind of account this is for SuperCI, from what it allows.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// Nothing SuperCI needs is refused.
+    Open,
+    /// A project of AWS's new sign-up: AWS runs its organization, pins it to one region and refuses spot there.
+    Project { region: String },
+    /// Its organization's policies (or the sign-in's own permissions) refuse some regions, or spot.
+    Restricted,
+}
+
+/// The regions AWS's new sign-up puts projects in (by the contact address: the Americas, Europe with Africa and the
+/// Middle East, Asia Pacific).
+pub const PROJECT_REGIONS: [&str; 3] = ["us-east-2", "eu-north-1", "ap-southeast-2"];
+
+/// What an AWS account allows of what SuperCI does there: asked with reads and dry runs only, so nothing is made,
+/// started or changed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Look {
+    /// Each region SuperCI offers: whether machines' networks can be read there (the first thing a set-up does).
+    pub regions: Vec<(String, Answer)>,
+    /// The region the questions below were asked in: the first one allowed.
+    pub asked_in: Option<String>,
+    /// Whether a spot machine and an on-demand one of the default size could be started.
+    pub spot: Option<Answer>,
+    pub on_demand: Option<Answer>,
+    /// How many vCPUs of each the account may run at once there.
+    pub spot_cpus: Option<u32>,
+    pub on_demand_cpus: Option<u32>,
+    /// Whether the image jobs run on is published in that region (not known: AWS did not say).
+    pub image: Option<bool>,
+    /// The AWS organization the account is in, when it is in one: its id and its management account.
+    pub organization_id: Option<String>,
+    pub management_account: Option<String>,
+}
+
+impl Look {
+    pub fn allowed_regions(&self) -> Vec<&str> { self.regions.iter().filter(|(_, a)| a.allowed()).map(|(r, _)| r.as_str()).collect() }
+
+    /// The organization's refusal, when there is one (a region's, else spot's): it names the policy and the
+    /// organization's management account.
+    pub fn organization(&self) -> Option<&aws::Refusal> {
+        self.regions.iter().filter_map(|(_, a)| a.by_organization()).chain(self.spot.iter().filter_map(|a| a.by_organization())).find(|r| !r.policy.is_empty())
+            .or_else(|| self.regions.iter().filter_map(|(_, a)| a.by_organization()).chain(self.spot.iter().filter_map(|a| a.by_organization())).next())
+    }
+
+    pub fn kind(&self) -> Kind {
+        let allowed = self.allowed_regions();
+        let refused = |region: &str| self.regions.iter().any(|(r, a)| r == region && a.by_organization().is_some());
+        let spot_refused = self.spot.as_ref().is_some_and(|a| a.by_organization().is_some());
+        // The new sign-up's mark: us-east-1 refused for what is regional, one home region of its three allowed, and
+        // no spot, all by the organization's policies.
+        if let [only] = allowed.as_slice() {
+            if PROJECT_REGIONS.contains(only) && refused("us-east-1") && spot_refused { return Kind::Project { region: only.to_string() } }
+        }
+        // (An account that manages its own organization, or is in none, with nothing refused, is open.)
+        let any_refused = self.regions.iter().any(|(_, a)| matches!(a, Answer::Refused(_))) || matches!(self.spot, Some(Answer::Refused(_))) || matches!(self.on_demand, Some(Answer::Refused(_)));
+        if any_refused { Kind::Restricted } else { Kind::Open }
+    }
+}
+
+/// Asks an AWS account what it allows (see `Look`): a read in each region at once, then, in the first region
+/// allowed, whether a spot and an on-demand machine could be started (dry runs) and how many vCPUs it may run.
+pub fn look_at(creds: &Credentials) -> Look { look_with(&Blocking::new, creds) }
+
+/// As `look_at`, over whatever answers for AWS (`http` makes a client for each question, asked side by side).
+pub fn look_with<H: Http>(http: &(dyn Fn() -> H + Sync), creds: &Credentials) -> Look {
+    let regions: Vec<(String, Answer)> = std::thread::scope(|s| {
+        let each: Vec<_> = superci_core::page::REGIONS.iter().map(|r| s.spawn(move || {
+            let read = futures::executor::block_on(aws::ec2(&http(), r, creds, "DescribeVpcs", serde_json::json!({ "MaxResults": 5 }), now_ms())).map(|_| ());
+            (r.to_string(), Answer::of(read))
+        })).collect();
+        each.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    let mut look = Look { regions, asked_in: None, spot: None, on_demand: None, spot_cpus: None, on_demand_cpus: None, image: None, organization_id: None, management_account: None };
+    // The organization it is in, if any (a member may read this much of it; never its policies).
+    if let Ok(org) = futures::executor::block_on(aws::json_call(&http(), "POST", "https://organizations.us-east-1.amazonaws.com/", "us-east-1", "organizations", Some("AWSOrganizationsV20161128.DescribeOrganization"), "application/x-amz-json-1.1", Some(&serde_json::json!({})), creds, now_ms())) {
+        look.organization_id = org["Organization"]["Id"].as_str().map(str::to_string);
+        look.management_account = org["Organization"]["MasterAccountId"].as_str().map(str::to_string);
+    }
+    let Some(region) = look.allowed_regions().first().map(|r| r.to_string()) else { return look };
+    let config = superci_core::plane::Config::new(String::new());
+    let kind = superci_core::spec::aws_instance_types(&superci_core::spec::Spec::default()).into_iter().next().unwrap_or_else(|| "c8a.xlarge".into());
+    // The image jobs run on. A dry run has to name an image that exists: where ours is not published, Amazon's own
+    // Linux (its id is a public parameter in every region).
+    let ours = futures::executor::block_on(aws::latest_image(&http(), &region, creds, &config.image_owner, &config.image_name, now_ms()));
+    look.image = match &ours { Ok(_) => Some(true), Err(e) if e.starts_with("no image ") => Some(false), Err(_) => None };
+    let image = match ours {
+        Ok(id) => Some(id),
+        Err(_) => futures::executor::block_on(aws::json_call(&http(), "POST", &format!("https://ssm.{region}.amazonaws.com/"), &region, "ssm", Some("AmazonSSM.GetParameter"), "application/x-amz-json-1.1",
+            Some(&serde_json::json!({ "Name": "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64" })), creds, now_ms())).ok().and_then(|v| v["Parameter"]["Value"].as_str().map(str::to_string)),
+    };
+    look.asked_in = Some(region.clone());
+    let Some(image) = image else { return look };
+    std::thread::scope(|s| {
+        let spot = s.spawn(|| Answer::of(futures::executor::block_on(aws::could_run(&http(), &region, creds, &image, &kind, true, now_ms()))));
+        let on_demand = s.spawn(|| Answer::of(futures::executor::block_on(aws::could_run(&http(), &region, creds, &image, &kind, false, now_ms()))));
+        let spot_cpus = s.spawn(|| futures::executor::block_on(aws::cpu_quota(&http(), &region, creds, aws::SPOT_CPU_QUOTA, now_ms())).ok());
+        let on_demand_cpus = s.spawn(|| futures::executor::block_on(aws::cpu_quota(&http(), &region, creds, aws::ON_DEMAND_CPU_QUOTA, now_ms())).ok());
+        (look.spot, look.on_demand) = (spot.join().ok(), on_demand.join().ok());
+        (look.spot_cpus, look.on_demand_cpus) = (spot_cpus.join().ok().flatten(), on_demand_cpus.join().ok().flatten());
+    });
+    look
+}
+
 /// The policy in an IAM GetRolePolicy answer (URL-encoded JSON in XML).
 fn policy_document(xml: &str) -> Option<serde_json::Value> {
     let encoded = aws::xml_tag(xml, "PolicyDocument")?;
@@ -345,5 +490,170 @@ mod live_role {
         let missing = super::runner_role_missing(&creds, &std::env::var("SUPERCI_LIVE_AWS_ACCOUNT").unwrap(), "doesnotexist", &["us-east-1".to_string()]);
         eprintln!("{:?} in {:?}", missing.as_ref().map(|m| m.len()), t.elapsed());
         assert!(t.elapsed() < std::time::Duration::from_secs(20));
+    }
+}
+
+/// AWS as it answered once: a recording of a real account (sanitized, see `scripts/sanitize-recording.py`) played
+/// back, so that tests meet exactly what the service says. A question that was not recorded is no answer at all (a
+/// status of 599), which fails whatever asked it.
+#[cfg(test)]
+pub mod replay {
+    use super::*;
+
+    #[derive(Clone)]
+    pub struct Replay(std::sync::Arc<Vec<serde_json::Value>>);
+
+    impl Replay {
+        pub fn of(recording: &str) -> Replay { Replay(std::sync::Arc::new(recording.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).expect("a recording is a JSON object a line")).collect())) }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Http for Replay {
+        async fn send(&self, r: Request) -> io::Result<Response> {
+            let target = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-amz-target")).map(|(_, v)| v.as_str()).unwrap_or_default();
+            let asked = String::from_utf8_lossy(&r.body);
+            let found = self.0.iter().find(|x| x["method"] == r.method.as_str() && x["url"] == r.url.as_str() && x["target"] == target && x["asked"] == asked.as_ref());
+            Ok(match found {
+                Some(x) => Response { status: x["status"].as_u64().unwrap_or(0) as u16, headers: vec![], body: x["answer"].as_str().unwrap_or_default().as_bytes().to_vec() },
+                None => Response { status: 599, headers: vec![], body: format!("<Response><Errors><Error><Code>NotRecorded</Code><Message>{} {} {target} {asked}</Message></Error></Errors></Response>", r.method, r.url).into_bytes() },
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod look_tests {
+    use super::replay::Replay;
+    use super::*;
+
+    fn creds() -> Credentials { Credentials { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "secret".into(), session_token: Some("token".into()), expires_at_ms: 0 } }
+
+    fn look(recording: &'static str) -> Look { let aws = Replay::of(recording); look_with(&|| aws.clone(), &creds()) }
+
+    /// A project of AWS's new sign-up, on its paid plan, before its advanced features are activated (recorded on
+    /// 12 October 2026 in a project AWS had put in Stockholm).
+    #[test]
+    fn a_project_of_the_new_sign_up_is_known_by_what_it_allows() {
+        let l = look(include_str!("../fixtures/aws/project-paid/look.jsonl"));
+        assert_eq!(l.allowed_regions(), ["eu-north-1"]);
+        assert_eq!(l.kind(), Kind::Project { region: "eu-north-1".into() });
+        // Every other region is refused by one policy of the organization, spot by another; on-demand is allowed.
+        let refused: Vec<&aws::Refusal> = l.regions.iter().filter_map(|(_, a)| a.by_organization()).collect();
+        assert_eq!(refused.len(), 11);
+        assert!(refused.iter().all(|r| r.action == "ec2:DescribeVpcs" && r.policy_id() == Some("p-example1") && r.management_account() == Some("222222222222")), "{refused:?}");
+        let spot = l.spot.as_ref().and_then(|a| a.by_organization()).expect("spot is refused by the organization");
+        assert_eq!((spot.action.as_str(), spot.policy_id()), ("ec2:RunInstances", Some("p-example2")));
+        assert_eq!(l.on_demand, Some(Answer::Allowed));
+        assert_eq!((l.asked_in.as_deref(), l.spot_cpus, l.on_demand_cpus), (Some("eu-north-1"), Some(5), Some(5)));
+        // The image jobs run on is not published in Stockholm; the account is a member of an organization it does
+        // not manage.
+        assert_eq!(l.image, Some(false));
+        assert_eq!((l.organization_id.as_deref(), l.management_account.as_deref()), (Some("o-example001"), Some("222222222222")));
+        assert_eq!(crate::commands::aws_look_lines("111111111111", "arn:aws:sts::111111111111:assumed-role/AccountFullAccessRole/someone", &l), [
+            "AWS account   111111111111 · signed in as arn:aws:sts::111111111111:assumed-role/AccountFullAccessRole/someone",
+            "Kind          an AWS project (AWS's new sign-up): it works in eu-north-1 only, and spot machines are refused",
+            "Regions       allowed: eu-north-1",
+            "              refused by your AWS organization's policy p-example1 (management account 222222222222): us-east-1, us-east-2, us-west-2, ca-central-1, eu-west-1, eu-west-2, eu-central-1, ap-south-1, ap-northeast-1, ap-southeast-1, ap-southeast-2",
+            "Spot          refused by your AWS organization's policy p-example2 (management account 222222222222) (asked in eu-north-1)",
+            "On-demand     allowed (asked in eu-north-1)",
+            "At once       spot 5 vCPUs · on-demand 5 vCPUs",
+            "Runner image  not published in eu-north-1: jobs cannot start there until it is copied in",
+            "Organization  o-example001, managed from account 222222222222: its policies are not this account's to read or change",
+        ]);
+    }
+
+    /// An account from AWS's standard sign-up, in no organization (recorded the same day).
+    #[test]
+    fn an_account_of_its_own_allows_everything() {
+        let l = look(include_str!("../fixtures/aws/classic/look.jsonl"));
+        assert_eq!(l.allowed_regions().len(), 12);
+        assert_eq!(l.kind(), Kind::Open);
+        assert_eq!((l.spot.clone(), l.on_demand.clone()), (Some(Answer::Allowed), Some(Answer::Allowed)));
+        assert_eq!((l.asked_in.as_deref(), l.spot_cpus, l.on_demand_cpus, l.image), (Some("us-east-1"), Some(96), Some(64), Some(true)));
+        assert!(l.organization_id.is_none() && l.organization().is_none());
+        assert_eq!(crate::commands::aws_look_lines("111111111111", "arn:aws:iam::111111111111:root", &l), [
+            "AWS account   111111111111 · signed in as arn:aws:iam::111111111111:root",
+            "Kind          open: nothing SuperCI does is refused",
+            "Regions       allowed: us-east-1, us-east-2, us-west-2, ca-central-1, eu-west-1, eu-west-2, eu-central-1, eu-north-1, ap-south-1, ap-northeast-1, ap-southeast-1, ap-southeast-2",
+            "Spot          allowed (asked in us-east-1)",
+            "On-demand     allowed (asked in us-east-1)",
+            "At once       spot 96 vCPUs · on-demand 64 vCPUs",
+        ]);
+    }
+
+    /// What the project answered to further questions, each as AWS worded it.
+    #[test]
+    fn what_a_project_refuses_is_read_as_aws_says_it() {
+        let aws = Replay::of(include_str!("../fixtures/aws/project-paid/more.jsonl"));
+        let asked = |region: &str, action: &str, params: serde_json::Value| futures::executor::block_on(aws::ec2(&aws, region, &creds(), action, params, 0));
+        let image = "ami-04c267a6ca05944f8";
+        // On-demand machines of any size pass the policies (the account's limit of five vCPUs is met only at a real start).
+        for kind in ["t3.micro", "c8a.xlarge", "c8a.8xlarge", "g4dn.xlarge"] {
+            let e = asked("eu-north-1", "RunInstances", serde_json::json!({ "DryRun": "true", "ImageId": image, "InstanceType": kind, "MinCount": "1", "MaxCount": "1" })).unwrap_err();
+            assert!(e.starts_with("DryRunOperation") && aws::refusal(&e).is_none(), "{kind}: {e}");
+        }
+        // A spot request of the older kind is refused as a spot launch is.
+        let e = asked("eu-north-1", "RequestSpotInstances", serde_json::json!({ "DryRun": "true", "InstanceCount": "1", "LaunchSpecification.ImageId": image, "LaunchSpecification.InstanceType": "c8a.xlarge" })).unwrap_err();
+        let r = aws::refusal(&e).unwrap();
+        assert_eq!((r.action.as_str(), r.by, r.policy_id()), ("ec2:RequestSpotInstances", aws::By::Organization, Some("p-example2")));
+        // The runner image could be copied into the project's region from one that has it.
+        let e = asked("eu-north-1", "CopyImage", serde_json::json!({ "DryRun": "true", "SourceRegion": "eu-west-1", "SourceImageId": "ami-0ea113836c24cdf49", "Name": "superci-probe" })).unwrap_err();
+        assert!(e.starts_with("DryRunOperation"), "{e}");
+        // A member account cannot read its organization's policies: what they say is known only by what they refuse.
+        let e = futures::executor::block_on(aws::json_call(&aws, "POST", "https://organizations.us-east-1.amazonaws.com/", "us-east-1", "organizations", Some("AWSOrganizationsV20161128.DescribePolicy"),
+            "application/x-amz-json-1.1", Some(&serde_json::json!({ "PolicyId": "p-example1" })), &creds(), 0)).unwrap_err();
+        assert!(e.starts_with("AccessDeniedException"), "{e}");
+        assert_eq!(aws::refusal(&e).map(|r| r.by), Some(aws::By::Unsaid));
+        // Stockholm has the older machine families and not the newest.
+        let offered = asked("eu-north-1", "DescribeInstanceTypeOfferings", serde_json::json!({ "LocationType": "region", "Filter.1.Name": "instance-type", "Filter.1.Value.1": "c8a.xlarge", "Filter.1.Value.2": "c7a.xlarge",
+            "Filter.1.Value.3": "m7a.xlarge", "Filter.1.Value.4": "c7i.xlarge", "Filter.1.Value.5": "c8g.xlarge", "Filter.1.Value.6": "c7g.xlarge", "Filter.1.Value.7": "m8a.xlarge" })).unwrap();
+        assert!(offered.contains("<instanceType>c7a.xlarge</instanceType>") && !offered.contains("<instanceType>c8a.xlarge</instanceType>"));
+        // A question nobody recorded has no answer: a test cannot pass on a guess.
+        assert!(asked("eu-north-1", "DescribeSubnets", serde_json::json!({})).unwrap_err().starts_with("NotRecorded"));
+    }
+}
+
+/// The recordings kept as fixtures name no real account: whatever is the account's own was replaced by a stand-in
+/// when the fixture was made, and this holds every fixture to it.
+#[cfg(test)]
+mod fixture_tests {
+    const FIXTURES: [(&str, &str); 3] = [
+        ("project-paid/look", include_str!("../fixtures/aws/project-paid/look.jsonl")),
+        ("project-paid/more", include_str!("../fixtures/aws/project-paid/more.jsonl")),
+        ("classic/look", include_str!("../fixtures/aws/classic/look.jsonl")),
+    ];
+
+    /// Every run of `len` or more characters that `is` holds for, with what stands right before it.
+    fn runs<'a>(text: &'a str, len: usize, is: impl Fn(u8) -> bool) -> Vec<(&'a str, &'a str)> {
+        let (bytes, mut out, mut i) = (text.as_bytes(), vec![], 0);
+        while i < bytes.len() {
+            if is(bytes[i]) {
+                let start = i;
+                while i < bytes.len() && is(bytes[i]) { i += 1 }
+                if i - start >= len { out.push((&text[start.saturating_sub(12)..start], &text[start..i])) }
+            } else { i += 1 }
+        }
+        out
+    }
+
+    #[test]
+    fn fixtures_name_no_real_account() {
+        for (name, text) in FIXTURES {
+            // Account numbers: twelve digits. Only stand-ins (one digit twelve times), the public owner of the
+            // runner image, and the counters that stand in for request ids.
+            for (before, digits) in runs(text, 12, |b| b.is_ascii_digit()) {
+                let stand_in = digits.len() == 12 && (digits.bytes().all(|b| b == digits.as_bytes()[0]) || digits == "135269210855" || digits.starts_with("0000000"));
+                // (A number's digits after its point are no account.)
+                assert!(stand_in || digits.len() != 12 || before.ends_with('.'), "{name}: {before}{digits}");
+            }
+            // Organizations, policies, request and session ids, addresses, and AWS's sealed message.
+            for id in text.split("o-").skip(1).filter(|rest| rest.len() > 10 && rest.as_bytes()[..10].iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())) { assert!(id.starts_with("example"), "{name}: o-{}", &id[..10]) }
+            for id in text.split("service_control_policy/").skip(1) { assert!(id.starts_with("p-example"), "{name}: {}", &id[..12.min(id.len())]) }
+            for at in text.split('@').skip(1) { assert!(at.starts_with("example.com"), "{name}: @{}", &at[..16.min(at.len())]) }
+            for sealed in text.split("Encoded authorization failure message: ").skip(1) { assert!(sealed.starts_with("(removed)"), "{name}: a sealed message was kept") }
+            for (_, uuid) in runs(text, 36, |b| b.is_ascii_hexdigit() || b == b'-').into_iter().filter(|(_, u)| u.len() == 36 && u.as_bytes()[8] == b'-') { assert!(uuid.starts_with("00000000-0000-4000-8000-"), "{name}: {uuid}") }
+            // No long opaque token is left (a key, a sealed message under another name).
+            for (_, token) in runs(text, 80, |b| b.is_ascii_alphanumeric() || b"+/_=-".contains(&b)) { assert!(token.contains("ami-amazon-linux") || token.contains("AccountFullAccessRole"), "{name}: {}…", &token[..30]) }
+        }
     }
 }

@@ -556,9 +556,65 @@ pub fn out_of_room(e: &str) -> bool {
 pub const SPOT_CPU_QUOTA: &str = "L-34B43A08";
 
 /// How many spot vCPUs this account may run at once in a region (its applied quota, else AWS's default).
-pub async fn spot_cpu_quota(http: &dyn Http, region: &str, creds: &Credentials, now_ms: u64) -> Result<u32> {
+pub async fn spot_cpu_quota(http: &dyn Http, region: &str, creds: &Credentials, now_ms: u64) -> Result<u32> { cpu_quota(http, region, creds, SPOT_CPU_QUOTA, now_ms).await }
+
+/// Whose rule refused a call. An organization's policies bind every sign-in in the account, its administrators too:
+/// nothing done inside the account lifts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum By {
+    /// A service control policy of the AWS organization the account is in.
+    Organization,
+    /// A resource control policy of that organization.
+    OrganizationResources,
+    /// A permissions boundary on the role or user signed in as.
+    Boundary,
+    /// The sign-in's own permissions (its role or user is not allowed this).
+    Identity,
+    /// The policy of this one session.
+    Session,
+    /// The policy on the resource asked for.
+    Resource,
+    /// AWS did not say.
+    Unsaid,
+}
+
+/// AWS refusing a call for want of permission, as it says it: what was refused, whose rule it was, and the policy
+/// when AWS names it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Refusal { pub action: String, pub by: By, pub policy: String }
+
+impl Refusal {
+    /// The organization's management account, from the policy's name (`arn:aws:organizations::ACCOUNT:policy/…`).
+    pub fn management_account(&self) -> Option<&str> {
+        self.policy.strip_prefix("arn:aws:organizations::")?.split(':').next().filter(|a| a.len() == 12 && a.bytes().all(|b| b.is_ascii_digit()))
+    }
+    /// The policy's id (`p-…`), as AWS Organizations lists it.
+    pub fn policy_id(&self) -> Option<&str> { self.policy.rsplit('/').next().filter(|p| p.starts_with("p-")) }
+}
+
+/// Reads a refusal out of an AWS error (None: the error is something else). AWS words them alike in every service:
+/// "… is not authorized to perform: ACTION … with an explicit deny in a service control policy: ARN", or "… because
+/// no identity-based policy allows the ACTION action".
+pub fn refusal(e: &str) -> Option<Refusal> {
+    let denied = ["UnauthorizedOperation", "AccessDenied", "AccessDeniedException", "AuthorizationError", "Client.UnauthorizedOperation"].iter().any(|c| e.starts_with(c))
+        || e.contains("not authorized to perform") || e.contains("explicit deny");
+    if !denied { return None }
+    let word = |after: &str| e.split(after).nth(1).map(|rest| rest.split(|c: char| c.is_whitespace()).next().unwrap_or_default().trim_end_matches(['.', ',', ';']).to_string());
+    let by = [("service control policy", By::Organization), ("resource control policy", By::OrganizationResources), ("permissions boundary", By::Boundary),
+        ("session policy", By::Session), ("identity-based policy", By::Identity), ("resource-based policy", By::Resource), ("VPC endpoint policy", By::Resource)]
+        .iter().find(|(words, _)| e.contains(words)).map(|(_, by)| *by).unwrap_or(By::Unsaid);
+    Some(Refusal { action: word("not authorized to perform: ").unwrap_or_default(), by, policy: word("policy: ").filter(|p| p.starts_with("arn:")).unwrap_or_default() })
+}
+
+/// Service Quotas' code for "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances": the vCPUs of
+/// on-demand machines an account may run at once in a region.
+pub const ON_DEMAND_CPU_QUOTA: &str = "L-1216C47A";
+
+/// How many vCPUs of a kind (a quota's code) this account may run at once in a region.
+pub async fn cpu_quota(http: &dyn Http, region: &str, creds: &Credentials, code: &str, now_ms: u64) -> Result<u32> {
     let url = format!("https://servicequotas.{region}.amazonaws.com/");
-    let body = serde_json::json!({ "ServiceCode": "ec2", "QuotaCode": SPOT_CPU_QUOTA });
+    let body = serde_json::json!({ "ServiceCode": "ec2", "QuotaCode": code });
     let call = |target: &'static str| json_call(http, "POST", &url, region, "servicequotas", Some(target), "application/x-amz-json-1.1", Some(&body), creds, now_ms);
     let v = match call("ServiceQuotasV20190624.GetServiceQuota").await {
         Ok(v) => v,
@@ -566,6 +622,19 @@ pub async fn spot_cpu_quota(http: &dyn Http, region: &str, creds: &Credentials, 
         Err(e) => return Err(e),
     };
     v["Quota"]["Value"].as_f64().map(|n| n as u32).ok_or_else(|| "Service Quotas answered without a value".into())
+}
+
+/// Asks AWS whether a machine of this kind could be started here, without starting one (a dry run): `Ok(())` when it
+/// could. A refusal comes back as AWS words it (see `refusal`).
+pub async fn could_run(http: &dyn Http, region: &str, creds: &Credentials, image: &str, instance_type: &str, spot: bool, now_ms: u64) -> Result<()> {
+    let mut params = serde_json::json!({ "DryRun": "true", "ImageId": image, "InstanceType": instance_type, "MinCount": 1, "MaxCount": 1 });
+    if spot { params["InstanceMarketOptions"] = serde_json::json!({ "MarketType": "spot", "SpotOptions": { "SpotInstanceType": "one-time", "InstanceInterruptionBehavior": "terminate" } }); }
+    match ec2(http, region, creds, "RunInstances", params, now_ms).await {
+        // (A dry run that would have worked is answered as an error of this name.)
+        Err(e) if e.starts_with("DryRunOperation") => Ok(()),
+        Err(e) => Err(e),
+        Ok(_) => Err("AWS started a machine although asked only whether it could".into()),
+    }
 }
 
 /// Where to ask AWS for a higher spot quota in a region.
@@ -698,6 +767,31 @@ poweroff
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AWS's refusals as it words them (the first two as a project of its new sign-up answered on 12 October 2026,
+    /// with stand-in ids; the others as its documentation gives them).
+    #[test]
+    fn a_refusal_says_whose_rule_it_is() {
+        let scp = "UnauthorizedOperation: You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/AccountFullAccessRole/someone is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-example001/service_control_policy/p-example1";
+        let r = refusal(scp).unwrap();
+        assert_eq!((r.action.as_str(), r.by, r.policy_id(), r.management_account()), ("ec2:DescribeVpcs", By::Organization, Some("p-example1"), Some("222222222222")));
+        let on_resource = "UnauthorizedOperation: You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/AccountFullAccessRole/someone is not authorized to perform: ec2:RunInstances on resource: arn:aws:ec2:eu-north-1:111111111111:instance/* with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-example001/service_control_policy/p-example2. Encoded authorization failure message: abc";
+        let r = refusal(on_resource).unwrap();
+        assert_eq!((r.action.as_str(), r.by, r.policy_id()), ("ec2:RunInstances", By::Organization, Some("p-example2")));
+        for (said, by) in [
+            ("AccessDenied: User: arn:aws:iam::111111111111:user/ci is not authorized to perform: lambda:CreateFunction on resource: arn:aws:lambda:us-east-1:111111111111:function:x because no identity-based policy allows the lambda:CreateFunction action", By::Identity),
+            ("AccessDenied: User: arn:aws:iam::111111111111:role/ci is not authorized to perform: iam:CreateRole on resource: arn:aws:iam::111111111111:role/x with an explicit deny in a permissions boundary", By::Boundary),
+            ("AccessDenied: User: arn:aws:sts::111111111111:assumed-role/ci/s is not authorized to perform: s3:GetObject on resource: arn:aws:s3:::b/k with an explicit deny in a resource control policy", By::OrganizationResources),
+            ("AccessDenied: User: arn:aws:sts::111111111111:assumed-role/ci/s is not authorized to perform: ssm:PutParameter on resource: x because no session policy allows the ssm:PutParameter action", By::Session),
+            ("AccessDenied: User: arn:aws:sts::111111111111:assumed-role/ci/s is not authorized to perform: dynamodb:CreateTable on resource: x because no service control policy allows the dynamodb:CreateTable action", By::Organization),
+            ("AccessDeniedException: You don't have permissions to access this resource.", By::Unsaid),
+            ("UnauthorizedOperation: You are not authorized to perform this operation. Encoded authorization failure message: abc", By::Unsaid),
+        ] { assert_eq!(refusal(said).map(|r| r.by), Some(by), "{said}") }
+        // What is no refusal is none: a machine that would have started, a limit, a missing image.
+        for said in ["DryRunOperation: Request would have succeeded, but DryRun flag is set.", "VcpuLimitExceeded: You have requested more vCPU capacity than your current vCPU limit of 5 allows", "InvalidAMIID.NotFound: The image id '[ami-0]' does not exist", "no image 135269210855/x in eu-north-1"] {
+            assert_eq!(refusal(said), None, "{said}");
+        }
+    }
 
     /// EC2 holding one account's networks, answering the calls `make_network` and `find_network` make.
     #[derive(Default)]

@@ -49,6 +49,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "list      The projects a GitLab connection's token reaches, with their ids and whether their jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
+    ("aws_accounts", "  superci aws_accounts list\n  superci aws_accounts retrieve [ID]",
+        "list      The AWS accounts signed in to.\nretrieve  What an account allows of what SuperCI does there: the regions, spot and on-demand machines, and how many\n          vCPUs it may run at once. It is asked with reads and dry runs only: nothing is made, started or changed.\n          An account in an AWS organization can be held to some regions or kept from spot by the organization's\n          policies, which nothing inside the account lifts; this says so, with the policy and whose it is."),
     ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces delete ID --confirm",
         "A workspace has its own sign-ins to its clouds, and through them its own control plane, runners and repositories.\nNothing of one is seen from another. There is one (`default`) until you make more. With several, a command says\nwhich, by its id: --workspace=ID, or SUPERCI_WORKSPACE=ID for a whole terminal. A command that names none stops\nand lists them.\n\ncreate    Makes an empty one called NAME (AcmeCI, Build Farm), which its CI is called too. Its id is made from the\n          name (acmeci, build-farm). Then `superci login --workspace=ID`.\nupdate    Gives one another id. What it is called is `superci name update`.\ndelete    Signs it out and forgets it on this machine. Nothing in its clouds is deleted: its control plane and\n          runners keep working (`superci leave --workspace=ID --confirm` stops them first)."),
     ("leave", "  superci leave --confirm           Stops using SuperCI: what it made in your clouds is deleted.",
@@ -100,7 +102,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "labels", "name", "machine", "limits"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "aws_accounts", "labels", "name", "machine", "limits"]),
                 group(&["github", "github_deliveries", "gitlab", "gitlab_projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -395,6 +397,36 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if let Some(done) = dry(args, &format!("end the key named {}", w(2)), "keys", &[]) { return Ok(done) }
             d.revoke_key(w(2))?;
             Ok(Done::said(format!("The key {} no longer reads.", w(2).to_lowercase())))
+        }
+        // In a debug build only, to see (and record, with SUPERCI_RECORD) what a real account answers:
+        // `superci debug ec2 REGION ACTION Key=Value…`, or `superci debug json REGION SERVICE TARGET '{…}'`.
+        #[cfg(debug_assertions)]
+        ("debug", kind @ ("ec2" | "json")) => {
+            let mut d = signed_in();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
+            let http = crate::aws::Blocking::new();
+            let answer = if kind == "ec2" {
+                let params: serde_json::Map<String, Value> = args.words[4.min(args.words.len())..].iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), Value::from(v))).collect();
+                futures::executor::block_on(superci_core::aws::ec2(&http, w(2), &creds, w(3), Value::Object(params), now))
+            } else {
+                let body: Value = serde_json::from_str(w(5)).map_err(|e| e.to_string())?;
+                let service = w(3).split('.').next().unwrap_or_default().to_string();
+                futures::executor::block_on(superci_core::aws::json_call(&http, "POST", &format!("https://{}.{}.amazonaws.com/", w(3), w(2)), w(2), &service, Some(w(4)), "application/x-amz-json-1.1", Some(&body), &creds, now)).map(|v| v.to_string())
+            };
+            let said = match answer { Ok(a) => a, Err(e) => format!("refused or failed: {e}") };
+            Ok(Done { data: json!({ "answer": said }), said: vec![said] })
+        }
+        ("aws_accounts", "list") => {
+            let d = signed_in();
+            let accounts = d.aws_accounts_signed_in();
+            let said = if accounts.is_empty() { vec!["Signed in to no AWS account: `superci login aws`.".to_string()] } else { accounts.iter().map(|(id, who)| format!("{id}  {who}")).collect() };
+            Ok(Done { said, data: json!({ "aws_accounts": accounts.iter().map(|(id, who)| json!({ "id": id, "signed_in_as": who })).collect::<Vec<_>>() }) })
+        }
+        ("aws_accounts", "retrieve") => {
+            let mut d = signed_in();
+            let (account, who, look) = d.look_at_aws(w(2))?;
+            Ok(Done { said: aws_look_lines(&account, &who, &look), data: json!({ "id": account, "signed_in_as": who, "kind": look.kind(), "allowed_regions": look.allowed_regions(), "organization": look.organization().map(|r| json!({ "management_account": r.management_account(), "policy": r.policy_id() })), "allows": look }) })
         }
         ("runners", "list") => runners_of(&mut signed_in()),
         ("github", "list") => github(),
@@ -727,6 +759,56 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
             Ok(d.for_task(Task::GitHub { login: owner.to_string(), host: args.get("host").unwrap_or_default().to_string(), started: false, done: false }).serve(open, false)?)
         })()),
         _ => None,
+    }
+}
+
+/// What an AWS account allows, in lines: what kind of account it is for SuperCI, its regions, spot and on-demand, and
+/// how many vCPUs it may run.
+pub fn aws_look_lines(account: &str, who: &str, look: &crate::aws::Look) -> Vec<String> {
+    use crate::aws::{Answer, Kind};
+    let whose = |a: &Answer| match a {
+        Answer::Allowed => "allowed".to_string(),
+        Answer::Refused(r) => format!("refused by {}", refused_by(r)),
+        Answer::Unknown(e) => format!("not known (AWS answered: {})", e.chars().take(140).collect::<String>()),
+    };
+    let mut out = vec![format!("AWS account   {account}{}", if who.is_empty() { String::new() } else { format!(" · signed in as {who}") })];
+    out.push(format!("Kind          {}", match look.kind() {
+        Kind::Open => "open: nothing SuperCI does is refused".to_string(),
+        Kind::Project { region } => format!("an AWS project (AWS's new sign-up): it works in {region} only, and spot machines are refused"),
+        Kind::Restricted => "restricted: some regions or spot machines are refused".to_string(),
+    }));
+    let allowed = look.allowed_regions();
+    let refused: Vec<&(String, Answer)> = look.regions.iter().filter(|(_, a)| !a.allowed()).collect();
+    out.push(format!("Regions       {}", if allowed.is_empty() { "none allowed".to_string() } else { format!("allowed: {}", allowed.join(", ")) }));
+    // Refusals alike are said once, with their regions.
+    let mut said: Vec<(String, Vec<&str>)> = vec![];
+    for (region, answer) in refused { let why = whose(answer); match said.iter_mut().find(|(w, _)| *w == why) { Some((_, regions)) => regions.push(region), None => said.push((why, vec![region])) } }
+    for (why, regions) in said { out.push(format!("              {why}: {}", regions.join(", "))) }
+    let at = look.asked_in.as_deref().map(|r| format!(" (asked in {r})")).unwrap_or_default();
+    if let Some(spot) = &look.spot { out.push(format!("Spot          {}{at}", whose(spot))) }
+    if let Some(on_demand) = &look.on_demand { out.push(format!("On-demand     {}{at}", whose(on_demand))) }
+    let cpus = |n: Option<u32>| n.map(|n| format!("{n} vCPUs")).unwrap_or_else(|| "not known".into());
+    if look.asked_in.is_some() { out.push(format!("At once       spot {} · on-demand {}", cpus(look.spot_cpus), cpus(look.on_demand_cpus))) }
+    if let (Some(false), Some(region)) = (look.image, &look.asked_in) { out.push(format!("Runner image  not published in {region}: jobs cannot start there until it is copied in")) }
+    if let Some(org) = &look.organization_id {
+        let managed = look.management_account.as_deref().filter(|m| *m != account);
+        out.push(format!("Organization  {org}{}", match managed { Some(m) => format!(", managed from account {m}: its policies are not this account's to read or change"), None => ", managed from this account".to_string() }));
+    }
+    out
+}
+
+/// Whose rule a refusal is, in words.
+fn refused_by(r: &superci_core::aws::Refusal) -> String {
+    use superci_core::aws::By;
+    let policy = r.policy_id().map(|p| format!(" {p}")).unwrap_or_default();
+    match r.by {
+        By::Organization => format!("your AWS organization's policy{policy}{}", r.management_account().map(|a| format!(" (management account {a})")).unwrap_or_default()),
+        By::OrganizationResources => format!("your AWS organization's resource policy{policy}"),
+        By::Boundary => "the permissions boundary of the role signed in as".to_string(),
+        By::Identity => "the permissions of the role signed in as".to_string(),
+        By::Session => "this sign-in's session policy".to_string(),
+        By::Resource => "the resource's own policy".to_string(),
+        By::Unsaid => "AWS, which did not say whose rule it is".to_string(),
     }
 }
 

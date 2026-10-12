@@ -1090,6 +1090,30 @@ impl Dashboard {
         }
     }
 
+    /// The AWS accounts signed in to, each with who is signed in.
+    pub fn aws_accounts_signed_in(&self) -> Vec<(String, String)> { self.aws_accounts().into_iter().map(|a| (a.account_id, a.who)).collect() }
+
+    /// What an AWS account signed in to allows (see `aws::Look`): the one named, or the only one.
+    pub fn look_at_aws(&mut self, account: &str) -> Result<(String, String, aws::Look)> {
+        let (account, creds) = self.aws_account(account)?;
+        let who = self.aws.as_ref().map(|a| a.who.clone()).unwrap_or_default();
+        Ok((account, who, aws::look_at(&creds)))
+    }
+
+    /// An AWS account signed in to (the one named, or the only one), taken in hand, with its credentials.
+    pub fn aws_account(&mut self, account: &str) -> Result<(String, superci_core::aws::Credentials)> {
+        let all = self.aws_accounts();
+        let account = match (account, all.as_slice()) {
+            ("", [only]) => only.account_id.clone(),
+            ("", []) => return Err(if self.aws_ended { AWS_ENDED.into() } else { "Sign in with AWS first.".to_string() }),
+            ("", several) => return Err(format!("Say which account: {}.", several.iter().map(|a| a.account_id.clone()).collect::<Vec<_>>().join(", "))),
+            (id, _) => id.to_string(),
+        };
+        if !self.hold_account(&account) { return Err(format!("Sign in with AWS first: SuperCI is not signed in to account {account}.")) }
+        let creds = self.aws_creds()?;
+        Ok((account, creds))
+    }
+
     /// Every AWS account signed in to, in one order (by account) whichever is in hand.
     fn aws_accounts(&self) -> Vec<aws::Session> {
         let mut all: Vec<aws::Session> = self.aws.iter().chain(&self.aws_others).cloned().collect();
@@ -1799,6 +1823,13 @@ impl Dashboard {
                     Ok(Plane::Aws { account_id, region, url: deployed.url, plane_id, label })
                 });
                 Ok(Response::redirect(if self.planes.is_empty() { "/?p=plane" } else { "/?p=planes" }))
+            }
+            // A deploy that stopped is let go of: back to choosing where (what it made stays, and is reused or found
+            // by a later try).
+            ("POST", "/plane/start-over") => {
+                let mut deploying = lock(&self.deploying);
+                if deploying.as_ref().is_some_and(|d| matches!(d.result, Some(Err(_)))) { *deploying = None }
+                Ok(Response::redirect("/?p=plane"))
             }
             // Moving to another control plane: the one in use hands over its settings (with a one-time token set
             // through its cloud's API), the new one takes them and points GitHub's App and GitLab's webhooks at
@@ -2739,7 +2770,8 @@ mark();load()})();</script>"#;
             format!(r#"<li class="{state}"><span class="tick">{}</span>{}</li>"#, match state { "done" => icon("check"), "failed" => "!".to_string(), _ => String::new() }, esc(s))
         }).collect::<String>();
         let retry = if running { String::new() } else {
-            format!(r#"<form method="post" action="/plane/{}" class="deploy-do">{}<button class="button primary">Try again</button><span class="note">Anything already created is reused.</span></form>"#,
+            // Again as it was (what the first try made is reused), or back to choosing where: another region, another cloud.
+            format!(r#"<div class="deploy-do"><form method="post" action="/plane/{}">{}<button class="button primary">Try again</button></form><form method="post" action="/plane/start-over"><button class="button secondary">Choose another place</button></form><span class="note">Anything already created is reused.</span></div>"#,
                 d.cloud, d.form.iter().map(|(k, v)| format!(r#"<input type="hidden" name="{k}" value="{}">"#, esc(v))).collect::<String>())
         };
         Some(format!(r#"{}<section class="card deploy{}"><div class="deploy-head">{}<div><h2>{}</h2><p class="note">{sub}</p></div></div><ol class="progress">{steps}</ol>{retry}</section>"#,
@@ -4827,7 +4859,7 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
             None => return message(404, "That control plane is not known here", "Open the dashboard again and pick one from the list. Nothing has changed."),
         },
         None => {
-            let apart = ["/signout", "/aws/signin", "/cloudflare/signin", "/modal/", "/plane/aws", "/plane/cloudflare", "/plane/modal", "/plane/delete", "/connect/", "/oauth/", "/github/callback", "/github/installed"];
+            let apart = ["/signout", "/aws/signin", "/cloudflare/signin", "/modal/", "/plane/aws", "/plane/cloudflare", "/plane/modal", "/plane/start-over", "/plane/delete", "/connect/", "/oauth/", "/github/callback", "/github/installed"];
             if !apart.iter().any(|a| req.path.starts_with(a)) && d.planes.len() > 1 {
                 let views = d.views.clone().map(|(v, _)| v).unwrap_or_else(|| d.planes.iter().map(|p| view::plane_view(p, None)).collect());
                 if view::several(&views).is_some() { return message(409, "Which control plane?", "Several control planes are live here. Open one from the list and do this on its pages. Nothing has changed.") }
