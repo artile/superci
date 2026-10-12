@@ -256,8 +256,8 @@ pub enum Kind {
     /// Nothing SuperCI needs is refused.
     Open,
     /// A project of AWS's new sign-up: its organization pins it to one region. Until its owner activates AWS's
-    /// "advanced features", AWS runs that organization and refuses spot too; after (`activated`), spot is allowed and
-    /// the region rule is the owner's to change, from the organization's management account.
+    /// "advanced features", AWS refuses spot there too; after (`activated`), spot is allowed. SuperCI works with
+    /// what such an account allows as it is: it asks for no rule to be changed.
     Project { region: String, activated: bool },
     /// Its organization's policies (or the sign-in's own permissions) refuse some regions, or spot.
     Restricted,
@@ -648,7 +648,8 @@ mod look_tests {
         assert_eq!(l.usable_regions(), ["eu-north-1"]);
         assert_eq!((l.organization_id.as_deref(), l.management_account.as_deref()), (Some("o-example001"), Some("222222222222")));
         let lines = crate::commands::aws_look_lines("111111111111", "", &l);
-        assert_eq!(lines[1], "Kind          an AWS project (AWS's new sign-up) with advanced features on: its organization keeps it to eu-north-1, a rule its management account can change");
+        // It is said as it is: where it works and what is allowed there. Nothing is asked to be changed.
+        assert_eq!(lines[1], "Kind          an AWS project (AWS's new sign-up): it works in eu-north-1 only, with spot machines");
         assert_eq!(lines[4], "Spot          allowed (asked in eu-north-1)");
     }
 

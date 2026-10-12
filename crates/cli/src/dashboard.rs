@@ -1196,7 +1196,7 @@ impl Dashboard {
         let (kind, tone, says) = match look.kind() {
             aws::Kind::Open => ("Nothing refused", "good", "Nothing SuperCI does there is refused.".to_string()),
             aws::Kind::Project { region, activated: false } => ("AWS project", "open", format!("A project of AWS's new sign-up: AWS keeps it to {} and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.", region_short(&region))),
-            aws::Kind::Project { region, activated: true } => ("AWS project", "open", format!("A project of AWS's new sign-up with advanced features on: its organization keeps it to {}. That rule can be changed from the organization's management account.", region_short(&region))),
+            aws::Kind::Project { region, activated: true } => ("AWS project", "good", format!("A project of AWS's new sign-up: it works in {} only. Everything SuperCI does works there.", region_short(&region))),
             aws::Kind::Restricted => ("Restricted", "open", "Some of what SuperCI does there is refused: see below.".to_string()),
         };
         let mut rows = vec![];
@@ -5530,6 +5530,17 @@ mod tests {
         let (status, said) = post(&mut d, "eu-north-1");
         assert!(status == 409 && said.contains("No job could start in Stockholm") && said.contains("The image SuperCI's jobs run on is not in eu-north-1 yet"), "{status} {said}");
         assert!(lock(&d.deploying).is_none(), "nothing was started");
+        // The same project once its owner activated AWS's advanced features: spot is allowed. It is said as it is,
+        // with nothing to change: SuperCI works where the account may.
+        d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-activated/look.jsonl"))));
+        let page = d.plane_page();
+        preview("plane-aws-project-activated", &page);
+        for said in [r#"<small>A project of AWS&#39;s new sign-up: it works in Stockholm only. Everything SuperCI does works there.</small></span><span class="pill good"><i></i>AWS project</span>"#,
+            "<dt>Regions</dt><dd>Stockholm<small>The other 11 are refused. By its AWS organization (policy p-example1).</small></dd></div>",
+            "<dt>Spot machines</dt><dd>Allowed</dd>", "<dt>Runner image</dt><dd>In Stockholm</dd>"] {
+            assert!(page.contains(said), "{said}\n\n{page}");
+        }
+        assert!(!page.contains("management account") && !page.contains("Open the rule"), "{page}");
         // An account of its own: its section says nothing is refused, with its limits, and the regions offered are
         // the ones the image is in.
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/classic/look.jsonl"))));
