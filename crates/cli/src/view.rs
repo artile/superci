@@ -117,13 +117,17 @@ impl PlaneView {
     /// one it moved from (a move replaces the target's GitHub App and settings).
     pub fn takes_a_move_from(&self, from: &str) -> bool { !(self.github || self.gitlab) || self.standby || self.moved_to.as_deref() == Some(from) }
 
-    /// Whether stopping SuperCI at `used` deletes this one too, or why not: itself, the ones that serve nothing and
-    /// the ones it moved from, yes; one that does not answer, or serves a code host of its own, no.
-    pub fn goes_with(&self, used: &Plane) -> std::result::Result<(), String> {
-        if self.plane.plane_id() == used.plane_id() { return Ok(()) }
-        if !self.online { return Err(format!("{} did not answer and was left as it is (`superci planes delete {}` deletes it)", self.plane.place(), self.plane.plane_id())) }
-        if self.takes_a_move_from(used.url()) || self.moved_to.as_deref() == Some(used.url()) { return Ok(()) }
-        Err(format!("{} serves a code host of its own and was left as it is", self.plane.place()))
+    /// Whether stopping the control plane `used` deletes this other one too (true), leaves it without a word
+    /// (false), or leaves it and says why. One that `used` moved from always goes with it. With another CI still
+    /// running here (`another_ci`), nothing else goes: the ones that serve nothing may be that CI's places to move to.
+    /// With none, SuperCI is stopped altogether and the ones that serve nothing go too. One that does not answer
+    /// cannot say what it serves: left, with the command that deletes it.
+    pub fn goes_with(&self, used: &Plane, another_ci: bool) -> std::result::Result<bool, String> {
+        let (place, id) = (self.plane.place(), self.plane.plane_id());
+        if self.moved_to.as_deref() == Some(used.url()) { return Ok(true) }
+        if self.serves_its_own() { return Err(format!("{place} serves a code host of its own and was left as it is (`superci leave --plane={id} --confirm` stops that one)")) }
+        if !self.online { return Err(format!("{place} did not answer and was left as it is (`superci planes delete {id} --confirm` deletes it)")) }
+        Ok(!another_ci)
     }
 }
 

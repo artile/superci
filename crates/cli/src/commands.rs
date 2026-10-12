@@ -27,7 +27,7 @@ const HELP: &[(&str, &str, &str)] = &[
         "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job, with the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, a million at most). GitHub keeps a job's log once the job has ended."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
-    ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
+    ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
         "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's limits: jobs at once, dollars a month (`none` lifts one). --enabled: aws-on-demand only.\n          --regions and --networks are AWS's (a network of your own per region; give --networks once per region),\n          --location and --image Cloudflare's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal. A job goes to the first that can run it and is\n          within its limits; when one cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
     ("labels", "  superci labels list\n  superci labels create NAME\n  superci labels delete NAME --confirm",
         "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: acmeci`, `acmeci-8cpu`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
@@ -49,8 +49,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "list      The projects a GitLab connection's token reaches, with their ids and whether their jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
-    ("leave", "  superci leave --confirm           Stops using SuperCI: everything it made in your clouds is deleted.",
-        "GitHub and GitLab stop sending jobs, then the control plane is deleted with what was made for it, and with it the\nones that serve nothing. One that serves a code host of its own is left as it is. The GitHub App itself is deleted\non GitHub; change `runs-on: superci` back in your workflows first."),
+    ("leave", "  superci leave --confirm           Stops using SuperCI: what it made in your clouds is deleted.",
+        "GitHub and GitLab stop sending jobs, then the control plane is deleted with what was made for it, and with it the\nones that serve nothing. Another one that serves a code host of its own is left as it is: `--plane=ID` stops that\none by itself. The GitHub App itself is deleted on GitHub; change `runs-on: superci` back in your workflows first."),
 ];
 
 const FLAGS: &str = "  --param=value   What an operation takes (also `--param value`). An id or a name comes before the flags.
@@ -416,11 +416,19 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             Ok(Done::said(apply!(d, args, would, "/plane/delete", &[field("plane", w(2))])))
         }
         ("leave", "") => {
-            let would = "stop SuperCI: GitHub and GitLab stop sending jobs, and every control plane is deleted with what was made for it";
-            confirmed(args, would)?;
+            // Here `--plane=ID` says which one is stopped (the others go on); without it, the one in use.
+            let named = args.get("plane").map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
+            if named.is_some() { NAMED.with(|n| n.borrow_mut().take()); }
+            let would = match &named {
+                Some(id) => format!("stop the control plane {id}: GitHub and GitLab stop sending it jobs, and it is deleted with what was made for it"),
+                None => "stop SuperCI: GitHub and GitLab stop sending jobs, and the control plane is deleted with what was made for it, with the ones that serve nothing".to_string(),
+            };
+            confirmed(args, &would)?;
             let mut d = ready()?;
             in_use(&d)?;
-            Ok(Done::said(apply!(d, args, would, "/plane/leave", &[field("confirm", "superci")])))
+            let mut fields = vec![field("confirm", "superci")];
+            if let Some(id) = &named { fields.push(field("plane", id)) }
+            Ok(Done::said(apply!(d, args, would, "/plane/leave", &fields)))
         }
 
         ("runners", "create") => {
@@ -435,7 +443,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 ("aws", _) => match args.get("region") { Some(r) => ("/aws/connect", vec![field("region", r)]), None => return usage("Say where its machines start: `superci runners create aws --region=us-east-1`.") },
                 ("modal", Plane::Modal { .. }) => ("/runners/modal-own", vec![]),
                 ("modal", _) => ("/runners/modal", vec![]),
-                _ => ("/runners/cloudflare", vec![]),
+                _ => ("/runners/cloudflare", args.get("account").map(|a| vec![field("account", a)]).unwrap_or_default()),
             };
             let said = apply!(d, args, format!("let {cloud} run jobs for the control plane in use ({})", plane.place()), path, &fields);
             Ok(Done::said(if said.is_empty() { format!("{cloud} runs jobs now.") } else { said }))

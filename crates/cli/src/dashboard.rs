@@ -1049,6 +1049,14 @@ impl Dashboard {
 
     fn plane(&self) -> Result<Plane> { self.planes.get(self.selected).cloned().ok_or_else(|| "no control plane yet".to_string()) }
 
+    /// After a setting was written: waits for the control plane to show it. One that does not show it in twenty
+    /// seconds is said as that, never as done (it may not have started again with it, or reads another place).
+    fn shown(&mut self, plane: &Plane, done: impl Fn(&serde_json::Value) -> bool) -> Result<()> {
+        self.views = None;
+        if wait_for(plane.url(), &self.status_key, done) { return Ok(()) }
+        Err("The change was written to the control plane's cloud, but the control plane did not show it within twenty seconds. Look again in a moment (`superci status`); if it still shows the old setting, the change did not take.".into())
+    }
+
     /// Whose the sign-ins kept are (see `Own`).
     fn own(&self) -> Own {
         Own { aws: self.aws.as_ref().map(|a| a.account_id.clone()), cf: self.cf_accounts.iter().map(|(id, _)| id.clone()).collect(), modal: self.modal.as_ref().map(|m| m.workspace.clone()) }
@@ -1594,7 +1602,7 @@ impl Dashboard {
                 // One that GitHub or GitLab sends jobs to is a CI of its own (another team's, reached with the same
                 // sign-ins): never deleted from beside it. One that moved away, or stands by for a move, is not.
                 if view::plane_view(&plane, None).serves_its_own() {
-                    return Ok(message(409, "This control plane serves a code host", "GitHub or GitLab sends jobs to it. Stop using SuperCI there first (`superci leave`), then delete it. Nothing was deleted."))
+                    return Ok(message(409, "This control plane serves a code host", &format!("GitHub or GitLab sends jobs to it. `superci leave --plane={} --confirm` stops it and deletes it. Nothing was deleted.", esc(plane.plane_id()))))
                 }
                 let status = cloudflare::status(plane.url(), &key).unwrap_or_default();
                 let running = status["jobs"].as_array().into_iter().flatten().filter(|j| ["launching", "launched", "running"].contains(&j["state"].as_str().unwrap_or_default())).count();
@@ -1609,26 +1617,41 @@ impl Dashboard {
             // itself is deleted on GitHub (it has no way to delete itself).
             ("POST", "/plane/leave") => {
                 if field("confirm").trim() != "superci" { return Ok(message(400, "Type superci to confirm", "")) }
-                let used = self.plane()?;
+                // The one in use, or the one named (another CI kept on this computer, stopped by itself).
+                let used = match field("plane") {
+                    named if named.is_empty() => self.plane()?,
+                    named => self.planes.iter().find(|p| p.plane_id() == named).cloned().ok_or("That control plane is not known here")?,
+                };
+                // Before GitHub is let go of: what follows must be able to delete it.
+                self.own().check(&used)?;
                 let key = self.status_key.clone();
+                let others: Vec<PlaneView> = self.planes.iter().filter(|p| p.plane_id() != used.plane_id()).map(|p| view::plane_view(p, None)).collect();
+                let another_ci = others.iter().any(|o| o.serves_its_own());
                 let status = cloudflare::status(used.url(), &key).unwrap_or_default();
                 let app = status["app"].clone();
                 cloudflare::plane_post(used.url(), &key, "/leave", &serde_json::json!({})).map_err(|e| format!("GitHub and GitLab could not be let go of yet ({e}); nothing was deleted."))?;
                 let mut left = vec![];
-                for p in self.planes.clone() {
-                    if p.plane_id() != used.plane_id() {
-                        if let Err(why) = view::plane_view(&p, None).goes_with(&used) { left.push(why); continue }
+                match self.delete_plane(&used, &status) { Ok(l) => left.extend(l), Err(e) => left.push(format!("{}: {e}", used.place())) }
+                for o in others {
+                    match o.goes_with(&used, another_ci) {
+                        Ok(false) => {}
+                        Err(why) => left.push(why),
+                        Ok(true) => {
+                            let st = cloudflare::status(o.plane.url(), &key).unwrap_or_default();
+                            match self.delete_plane(&o.plane, &st) { Ok(l) => left.extend(l), Err(e) => left.push(format!("{}: {e}", o.plane.place())) }
+                        }
                     }
-                    let st = cloudflare::status(p.url(), &key).unwrap_or_default();
-                    match self.delete_plane(&p, &st) { Ok(l) => left.extend(l), Err(e) => left.push(format!("{}: {e}", p.place())) }
                 }
+                self.views = None;
                 let app_link = match (app["slug"].as_str(), app["owner"].as_str()) {
                     (Some(slug), Some(owner)) => format!(r#"<li>Delete the GitHub App <a href="{}" target="_blank" rel="noopener">{}</a> on GitHub (Advanced → Delete). It is uninstalled already.</li>"#,
                         esc(&format!("{}/advanced", app_settings_link(app["host"].as_str(), owner, slug, app["org"] == true))), esc(slug)),
                     _ => String::new(),
                 };
                 let more = left.iter().map(|l| format!("<li>{}</li>", esc(l))).collect::<String>();
-                Ok(message(200, "SuperCI is stopped", &format!(r#"Its control planes and what was made for them are deleted from your clouds.</p><ul class="checks" style="margin-top:12px">{app_link}<li>Change <code>runs-on: superci</code> back in your workflows (and <code>tags:</code> in GitLab).</li>{more}</ul><p>"#)))
+                let (heading, said) = if another_ci { ("That control plane is stopped", format!("{} and what was made for it are deleted. Your other control plane goes on as before.", esc(&used.place()))) }
+                    else { ("SuperCI is stopped", "Its control planes and what was made for them are deleted from your clouds.".to_string()) };
+                Ok(message(200, heading, &format!(r#"{said}</p><ul class="checks" style="margin-top:12px">{app_link}<li>Change <code>runs-on: superci</code> back in your workflows (and <code>tags:</code> in GitLab).</li>{more}</ul><p>"#)))
             }
             ("POST", "/plane/update") => {
                 // Which: its id (or, from before, its place in the list); none: the one in use.
@@ -1847,7 +1870,15 @@ impl Dashboard {
                     // A control plane elsewhere cannot start Cloudflare containers: a small agent in Cloudflare does.
                     _ => {
                         let mut agents: Vec<superci_core::plane::Agent> = serde_json::from_value(status["agents"].clone()).unwrap_or_default();
-                        let account = self.cf_accounts.first().map(|a| a.0.clone()).ok_or("no Cloudflare account")?;
+                        // Which Cloudflare account its runners go into: the only one the sign-in reaches, or the one
+                        // named. Never just the first of several (it may be another company's).
+                        let account = match (self.cf_accounts.as_slice(), field("account")) {
+                            ([], _) => return Err("no Cloudflare account".into()),
+                            (all, named) if !named.is_empty() => all.iter().find(|a| a.0 == named).map(|a| a.0.clone()).ok_or("The Cloudflare sign-in does not reach that account.")?,
+                            ([only], _) => only.0.clone(),
+                            (all, _) => return Ok(message(409, "Which Cloudflare account?", &format!("Your Cloudflare sign-in reaches {}: {}. Say which one the runners go into: `superci runners create cloudflare --account=ID`. Nothing has changed.",
+                                all.len(), esc(&all.iter().map(|a| format!("{} ({})", a.1, a.0)).collect::<Vec<_>>().join(", "))))),
+                        };
                         let url = cf.deploy_runners(&account, plane.url(), plane.plane_id())?;
                         agents.retain(|a| a.cloud != "cloudflare");
                         agents.push(superci_core::plane::Agent { cloud: "cloudflare".into(), url });
@@ -1880,9 +1911,8 @@ impl Dashboard {
                 }
                 let want = serde_json::to_value(&labels).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "LABELS", &want.to_string())?;
-                wait_for(plane.url(), &self.status_key, |s| s["labels"] == want);
                 if let Some(p) = self.planes.get_mut(self.selected) { p.set_label(&labels[0]) }
-                self.views = None;
+                self.shown(&plane, |s| s["labels"] == want)?;
                 Ok(Response::redirect("/?p=settings"))
             }
             // What it is called where people read it: the dashboard's header, the App's name for further
@@ -1893,8 +1923,7 @@ impl Dashboard {
                 let name = field("name").trim().to_string();
                 if let Err(e) = superci_core::spec::valid_name(&name) { return Ok(message(400, "That cannot be its name", &esc(&e))) }
                 self.put_secret(&plane, "NAME", &name)?;
-                wait_for(plane.url(), &self.status_key, |s| s["name"] == name.as_str());
-                self.views = None;
+                self.shown(&plane, |s| s["name"] == name.as_str())?;
                 Ok(Response::redirect("/?p=settings"))
             }
             // The default machine: what `runs-on: superci` alone gets.
@@ -1906,7 +1935,7 @@ impl Dashboard {
                 if spec.arch.is_some() && spec.os.is_some() { return Ok(message(400, "Windows machines are x64", "Choose x64 for Windows, or Linux for arm64.")) }
                 let want = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "MACHINE", &want.to_string())?;
-                wait_for(plane.url(), &self.status_key, |s| s["machine"] == want);
+                self.shown(&plane, |s| s["machine"] == want)?;
                 Ok(Response::redirect("/?p=runners"))
             }
             // Review → Allow: the control plane's AWS runner role gets what this version asks for.
@@ -2003,7 +2032,7 @@ impl Dashboard {
                                     }
                                 }
                                 self.put_secret(&plane, "AWS_NETWORKS", &want.to_string())?;
-                                wait_for(plane.url(), &self.status_key, |s| s["aws_networks"] == want);
+                                self.shown(&plane, |s| s["aws_networks"] == want)?;
                             }
                         }
                         // AWS's regions, in order (the next when one has no spot capacity left).
@@ -2024,7 +2053,7 @@ impl Dashboard {
                                 let own: Vec<String> = regions.iter().filter(|r| given.get(r.as_str()).is_none()).cloned().collect();
                                 if self.aws.as_ref().is_some_and(|a| Some(&a.account_id) == account.as_ref()) { aws::make_networks(&self.aws_creds()?, plane.plane_id(), &own)?; }
                                 self.put_secret(&plane, "AWS_REGIONS", &want.to_string())?;
-                                wait_for(plane.url(), &self.status_key, |s| s["aws_regions"] == want);
+                                self.shown(&plane, |s| s["aws_regions"] == want)?;
                             }
                         }
                         // Cloudflare's location (where its containers start).
@@ -2033,7 +2062,7 @@ impl Dashboard {
                             let have = cloudflare::status(plane.url(), &self.status_key).and_then(|s| s["cloudflare_location"].as_str().map(str::to_string));
                             if have.as_deref() != Some(location.as_str()) {
                                 self.put_secret(&plane, "CF_LOCATION", &location)?;
-                                wait_for(plane.url(), &self.status_key, |s| s["cloudflare_location"] == location.as_str());
+                                self.shown(&plane, |s| s["cloudflare_location"] == location.as_str())?;
                             }
                         }
                         // Cloudflare: GitHub's full image, by the address it is published at (empty: the small image).
@@ -2042,7 +2071,7 @@ impl Dashboard {
                             if have != want {
                                 self.put_secret(&plane, "CF_IMAGE", want.as_deref().unwrap_or("none"))?;
                                 let w = want.clone();
-                                wait_for(plane.url(), &self.status_key, move |s| s["cloudflare_image"].as_str().map(str::to_string) == w);
+                                self.shown(&plane, move |s| s["cloudflare_image"].as_str().map(str::to_string) == w)?;
                             }
                         }
                         for p in order.iter_mut().filter(|p| p.cloud == cloud) {
@@ -2058,7 +2087,7 @@ impl Dashboard {
                 }
                 let want = serde_json::to_value(&routing).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "ROUTING", &want.to_string())?;
-                wait_for(plane.url(), &self.status_key, |s| s["routing"] == want);
+                self.shown(&plane, |s| s["routing"] == want)?;
                 Ok(Response::redirect(if field("action").starts_with("public") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
             }
 
@@ -3001,7 +3030,9 @@ load()})();</script>"#;
         }
         let used = view::in_use(views);
         let v = &views[used];
-        let signed_in = |v: &PlaneView| match v.plane { Plane::Cloudflare { .. } => self.cf.is_some(), Plane::Aws { .. } => self.aws.is_some(), Plane::Modal { .. } => self.modal.is_some(), Plane::Seen { .. } => false };
+        // Signed in to the account it lives in (another account of the same cloud is no sign-in to this one).
+        let own = self.own();
+        let signed_in = |v: &PlaneView| own.check(&v.plane).is_ok() && match v.plane { Plane::Cloudflare { .. } => self.cf.is_some(), Plane::Aws { .. } => self.aws.is_some(), Plane::Modal { .. } => self.modal.is_some(), Plane::Seen { .. } => false };
         let provider = |v: &PlaneView| v.plane.cloud();
         let updating = lock(&self.updating);
         // (An update under way shows in the row's second line instead.)
@@ -4974,20 +5005,21 @@ mod tests {
         // when SuperCI is stopped at ours.
         let live = seen(theirs.clone(), true, None, false, true);
         assert!(live.serves_its_own() && !live.takes_a_move_from(ours.url()));
-        assert_eq!(live.goes_with(&ours), Err("AWS · 222222222222 · us-east-1 serves a code host of its own and was left as it is".to_string()));
+        // Stopping ours leaves theirs, with the command that stops theirs later; a spare is theirs to move to then.
+        assert_eq!(live.goes_with(&ours, true), Err("AWS · 222222222222 · us-east-1 serves a code host of its own and was left as it is (`superci leave --plane=bbbbbbbbbbbb --confirm` stops that one)".to_string()));
         // One that serves nothing yet: a place to move to, deletable, and gone with ours.
         let empty = seen(spare.clone(), false, None, false, true);
-        assert!(!empty.serves_its_own() && empty.takes_a_move_from(ours.url()) && empty.goes_with(&ours).is_ok());
+        assert!(!empty.serves_its_own() && empty.takes_a_move_from(ours.url()));
+        assert_eq!((empty.goes_with(&ours, false), empty.goes_with(&ours, true)), (Ok(true), Ok(false)), "gone when SuperCI is stopped altogether, kept while another CI runs here");
         // The one ours moved from still holds its App (it passes late events on): a move back is allowed, it can be
         // deleted, and it goes with ours. One that stands by for a move under way is no CI of its own either.
         let old = seen(spare.clone(), true, Some(ours.url()), false, true);
-        assert!(!old.serves_its_own() && old.goes_with(&ours).is_ok());
+        assert!(!old.serves_its_own() && old.goes_with(&ours, false) == Ok(true) && old.goes_with(&ours, true) == Ok(true));
         assert!(seen(ours.clone(), true, Some(spare.url()), false, true).takes_a_move_from(spare.url()), "back to where it came from");
         let standing_by = seen(spare.clone(), true, None, true, true);
         assert!(!standing_by.serves_its_own() && standing_by.takes_a_move_from(ours.url()));
         // One that does not answer is left alone when SuperCI is stopped (it may be anyone's), and said.
-        assert!(seen(theirs.clone(), false, None, false, false).goes_with(&ours).unwrap_err().contains("did not answer and was left as it is (`superci planes delete bbbbbbbbbbbb`"));
-        assert!(seen(ours.clone(), true, None, false, true).goes_with(&ours).is_ok(), "the one that is let go of");
+        assert!(seen(theirs.clone(), false, None, false, false).goes_with(&ours, false).unwrap_err().contains("did not answer and was left as it is (`superci planes delete bbbbbbbbbbbb --confirm` deletes it)"));
 
         // A change is written only with the sign-in of the control plane's own account or workspace.
         let own = Own { aws: Some("111111111111".into()), cf: vec!["cf-a".into()], modal: Some("acme".into()) };
