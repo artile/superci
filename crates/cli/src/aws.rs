@@ -279,8 +279,9 @@ pub struct Look {
     /// How many vCPUs of each the account may run at once there.
     pub spot_cpus: Option<u32>,
     pub on_demand_cpus: Option<u32>,
-    /// Whether the image jobs run on is published in that region (not known: AWS did not say).
-    pub image: Option<bool>,
+    /// The regions allowed, each with whether the image jobs run on is there (published, or the account's own copy;
+    /// not known: AWS did not say).
+    pub images: Vec<(String, Option<bool>)>,
     /// The AWS organization the account is in, when it is in one: its id and its management account.
     pub organization_id: Option<String>,
     pub management_account: Option<String>,
@@ -288,6 +289,13 @@ pub struct Look {
 
 impl Look {
     pub fn allowed_regions(&self) -> Vec<&str> { self.regions.iter().filter(|(_, a)| a.allowed()).map(|(r, _)| r.as_str()).collect() }
+
+    /// The regions jobs can run in as things are: allowed, and with the image jobs run on.
+    pub fn usable_regions(&self) -> Vec<&str> { self.images.iter().filter(|(_, there)| *there == Some(true)).map(|(r, _)| r.as_str()).collect() }
+
+    /// The regions allowed where the image jobs run on is missing: a control plane there could start no job until
+    /// the image is copied in.
+    pub fn regions_without_image(&self) -> Vec<&str> { self.images.iter().filter(|(_, there)| *there == Some(false)).map(|(r, _)| r.as_str()).collect() }
 
     /// The organization's refusal, when there is one (a region's, else spot's): it names the policy and the
     /// organization's management account.
@@ -324,19 +332,26 @@ pub fn look_with<H: Http>(http: &(dyn Fn() -> H + Sync), creds: &Credentials) ->
         })).collect();
         each.into_iter().filter_map(|h| h.join().ok()).collect()
     });
-    let mut look = Look { regions, asked_in: None, spot: None, on_demand: None, spot_cpus: None, on_demand_cpus: None, image: None, organization_id: None, management_account: None };
+    let mut look = Look { regions, asked_in: None, spot: None, on_demand: None, spot_cpus: None, on_demand_cpus: None, images: vec![], organization_id: None, management_account: None };
     // The organization it is in, if any (a member may read this much of it; never its policies).
     if let Ok(org) = futures::executor::block_on(aws::json_call(&http(), "POST", "https://organizations.us-east-1.amazonaws.com/", "us-east-1", "organizations", Some("AWSOrganizationsV20161128.DescribeOrganization"), "application/x-amz-json-1.1", Some(&serde_json::json!({})), creds, now_ms())) {
         look.organization_id = org["Organization"]["Id"].as_str().map(str::to_string);
         look.management_account = org["Organization"]["MasterAccountId"].as_str().map(str::to_string);
     }
-    let Some(region) = look.allowed_regions().first().map(|r| r.to_string()) else { return look };
     let config = superci_core::plane::Config::new(String::new());
+    // The image jobs run on, in each region allowed.
+    let allowed: Vec<String> = look.allowed_regions().into_iter().map(str::to_string).collect();
+    let found: Vec<(String, Result<String>)> = std::thread::scope(|s| {
+        let each: Vec<_> = allowed.iter().map(|r| { let config = &config; s.spawn(move || (r.clone(), futures::executor::block_on(aws::latest_image(&http(), r, creds, &config.image_owner, &config.image_name, now_ms())))) }).collect();
+        each.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    look.images = found.iter().map(|(r, image)| (r.clone(), match image { Ok(_) => Some(true), Err(e) if e.starts_with("no image ") => Some(false), Err(_) => None })).collect();
+    // The rest is asked in one region: the first that has the image, else the first allowed.
+    let Some(region) = look.usable_regions().first().or(allowed.first().map(String::as_str).as_ref()).map(|r| r.to_string()) else { return look };
+    let ours = found.into_iter().find(|(r, _)| *r == region).map(|(_, image)| image).unwrap_or_else(|| Err("not asked".into()));
     let kind = superci_core::spec::aws_instance_types(&superci_core::spec::Spec::default()).into_iter().next().unwrap_or_else(|| "c8a.xlarge".into());
-    // The image jobs run on. A dry run has to name an image that exists: where ours is not published, Amazon's own
-    // Linux (its id is a public parameter in every region).
-    let ours = futures::executor::block_on(aws::latest_image(&http(), &region, creds, &config.image_owner, &config.image_name, now_ms()));
-    look.image = match &ours { Ok(_) => Some(true), Err(e) if e.starts_with("no image ") => Some(false), Err(_) => None };
+    // A dry run has to name an image that exists: where ours is not, Amazon's own Linux (its id is a public
+    // parameter in every region).
     let image = match ours {
         Ok(id) => Some(id),
         Err(_) => futures::executor::block_on(aws::json_call(&http(), "POST", &format!("https://ssm.{region}.amazonaws.com/"), &region, "ssm", Some("AmazonSSM.GetParameter"), "application/x-amz-json-1.1",
@@ -353,6 +368,19 @@ pub fn look_with<H: Http>(http: &(dyn Fn() -> H + Sync), creds: &Credentials) ->
         (look.spot_cpus, look.on_demand_cpus) = (spot_cpus.join().ok().flatten(), on_demand_cpus.join().ok().flatten());
     });
     look
+}
+
+/// Whether a control plane with runners can be set up in a region, asked before anything is made there: the region
+/// is the account's to use (the read a set-up starts with), and the image jobs run on is there.
+pub fn region_ready(creds: &Credentials, region: &str) -> Result<()> {
+    let http = Blocking::new();
+    futures::executor::block_on(aws::ec2(&http, region, creds, "DescribeVpcs", serde_json::json!({ "MaxResults": 5 }), now_ms())).map_err(|e| format!("{region}: {e}"))?;
+    let config = superci_core::plane::Config::new(String::new());
+    match futures::executor::block_on(aws::latest_image(&http, region, creds, &config.image_owner, &config.image_name, now_ms())) {
+        Err(e) if e.starts_with("no image ") => Err(format!("The image SuperCI's jobs run on is not in {region} yet, so no job could start there. Choose another region.")),
+        // (Whatever else AWS says of the image is left to the set-up, which says it where it meets it.)
+        _ => Ok(()),
+    }
 }
 
 /// The policy in an IAM GetRolePolicy answer (URL-encoded JSON in XML).
@@ -547,7 +575,8 @@ mod look_tests {
         assert_eq!((l.asked_in.as_deref(), l.spot_cpus, l.on_demand_cpus), (Some("eu-north-1"), Some(5), Some(5)));
         // The image jobs run on is not published in Stockholm; the account is a member of an organization it does
         // not manage.
-        assert_eq!(l.image, Some(false));
+        assert_eq!(l.images, [("eu-north-1".to_string(), Some(false))]);
+        assert!(l.usable_regions().is_empty() && l.regions_without_image() == ["eu-north-1"]);
         assert_eq!((l.organization_id.as_deref(), l.management_account.as_deref()), (Some("o-example001"), Some("222222222222")));
         assert_eq!(crate::commands::aws_look_lines("111111111111", "arn:aws:sts::111111111111:assumed-role/AccountFullAccessRole/someone", &l), [
             "AWS account   111111111111 · signed in as arn:aws:sts::111111111111:assumed-role/AccountFullAccessRole/someone",
@@ -557,7 +586,7 @@ mod look_tests {
             "Spot          refused by your AWS organization's policy p-example2 (management account 222222222222) (asked in eu-north-1)",
             "On-demand     allowed (asked in eu-north-1)",
             "At once       spot 5 vCPUs · on-demand 5 vCPUs",
-            "Runner image  not published in eu-north-1: jobs cannot start there until it is copied in",
+            "Runner image  not in eu-north-1: jobs cannot start there until it is copied in",
             "Organization  o-example001, managed from account 222222222222: its policies are not this account's to read or change",
         ]);
     }
@@ -569,7 +598,10 @@ mod look_tests {
         assert_eq!(l.allowed_regions().len(), 12);
         assert_eq!(l.kind(), Kind::Open);
         assert_eq!((l.spot.clone(), l.on_demand.clone()), (Some(Answer::Allowed), Some(Answer::Allowed)));
-        assert_eq!((l.asked_in.as_deref(), l.spot_cpus, l.on_demand_cpus, l.image), (Some("us-east-1"), Some(96), Some(64), Some(true)));
+        assert_eq!((l.asked_in.as_deref(), l.spot_cpus, l.on_demand_cpus), (Some("us-east-1"), Some(96), Some(64)));
+        // The image jobs run on is published in ten of the twelve regions SuperCI offers.
+        assert_eq!(l.usable_regions(), ["us-east-1", "us-east-2", "us-west-2", "eu-west-1", "eu-west-2", "eu-central-1", "ap-south-1", "ap-northeast-1", "ap-southeast-1", "ap-southeast-2"]);
+        assert_eq!(l.regions_without_image(), ["ca-central-1", "eu-north-1"]);
         assert!(l.organization_id.is_none() && l.organization().is_none());
         assert_eq!(crate::commands::aws_look_lines("111111111111", "arn:aws:iam::111111111111:root", &l), [
             "AWS account   111111111111 · signed in as arn:aws:iam::111111111111:root",
@@ -578,6 +610,7 @@ mod look_tests {
             "Spot          allowed (asked in us-east-1)",
             "On-demand     allowed (asked in us-east-1)",
             "At once       spot 96 vCPUs · on-demand 64 vCPUs",
+            "Runner image  not in ca-central-1, eu-north-1: jobs cannot start there until it is copied in",
         ]);
     }
 

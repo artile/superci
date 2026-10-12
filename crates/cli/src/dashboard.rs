@@ -114,6 +114,9 @@ pub struct Dashboard {
     /// Spot CPU quotas per region for the AWS account signed in (read from AWS, kept a few minutes while this runs).
     quotas: HashMap<String, Result<u32>>,
     quotas_for: Option<(String, u64)>,
+    /// What each AWS account signed in to allows (see `aws::Look`), and when it was asked: looked at where a control
+    /// plane or runners are set up, again after ten minutes.
+    aws_looks: HashMap<String, (u64, aws::Look)>,
     /// Each control plane's last status read in this session: a slow answer (a Lambda starting) shows the last one
     /// rather than the page waiting again. Kept only while the dashboard runs.
     seen: HashMap<String, serde_json::Value>,
@@ -419,6 +422,12 @@ fn ago(at_ms: u64) -> String {
 
 fn region_options() -> String { region_select_options("us-east-1", &HashMap::new(), &closest(None)) }
 
+/// The same, of the regions an account can use: the first of them chosen (N. Virginia when it is one).
+fn region_options_among(usable: &[&str]) -> String {
+    let best = closest(None);
+    usable.iter().enumerate().map(|(i, r)| format!(r#"<option value="{r}"{}>{} · {r}{}</option>"#, if i == 0 { " selected" } else { "" }, region_name(r), if *r == "us-east-1" { format!(" · {best}") } else { String::new() })).collect()
+}
+
 /// Why one place is best for runners: where the code hosts connected are (GitHub's Actions and gitlab.com both run
 /// in the eastern US). A GitLab of your own is wherever it is: not counted.
 fn closest(v: Option<&PlaneView>) -> String {
@@ -438,6 +447,25 @@ fn region_select_options(selected: &str, quotas: &HashMap<String, Result<u32>>, 
         let best = if *r == "us-east-1" { format!(" · {best}") } else { String::new() };
         format!(r#"<option value="{r}"{}>{} · {r}{best}{quota}</option>"#, if *r == selected { " selected" } else { "" }, region_name(r))
     }).collect()
+}
+
+/// An AWS refusal in plain words: whose rule it is, and what can be done about it. None: the error is something
+/// else, and is said as it is.
+pub fn plain_refusal(e: &str) -> Option<String> {
+    use superci_core::aws::By;
+    let r = superci_core::aws::refusal(e)?;
+    // (A region's errors start with its name: "us-east-1: UnauthorizedOperation: …".)
+    let region = e.split(": ").next().filter(|r| REGIONS.contains(r)).map(|r| format!(" in {} ({r})", region_short(r))).unwrap_or_default();
+    let what = if r.action.is_empty() { "this".to_string() } else { format!("this ({})", r.action) };
+    let policy = r.policy_id().map(|p| format!(" Its policy is {p}{}.", r.management_account().map(|a| format!(", managed from account {a}")).unwrap_or_default())).unwrap_or_default();
+    Some(match r.by {
+        By::Organization => format!("AWS refuses {what}{region} for the whole account: the AWS organization the account is in does not allow it, and nothing inside the account lifts that.{policy} `superci accounts retrieve aws` shows what the account allows."),
+        By::OrganizationResources => format!("AWS refuses {what}{region}: a resource policy of the AWS organization the account is in does not allow it, and nothing inside the account lifts that.{policy}"),
+        By::Identity => format!("The AWS role or user you signed in as may not do {what}{region}. Sign in with one that administers the account: `superci login aws`."),
+        By::Boundary => format!("The AWS role or user you signed in as has a permissions boundary that does not allow {what}{region}. Sign in with one that administers the account: `superci login aws`."),
+        By::Session => format!("This AWS sign-in's session does not allow {what}{region}. Sign in again: `superci login aws`."),
+        By::Resource | By::Unsaid => return None,
+    })
 }
 
 /// A region's short name: "N. Virginia" for us-east-1.
@@ -668,7 +696,7 @@ impl Dashboard {
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
             status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
-            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
+            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
     /// A dashboard that remembers: with SuperCI's own sign-ins from its folder, kept there again as they change. A
@@ -839,7 +867,7 @@ impl Dashboard {
         loop {
             let (steps, at, ended): (Vec<String>, usize, Option<Result<String>>) = match what {
                 Background::Deploy => { let g = lock(&self.deploying); let d = g.as_ref().ok_or("no deploy was started")?;
-                    (d.steps.iter().map(|s| s.to_string()).collect(), d.at, d.result.as_ref().map(|r| r.as_ref().map(|p| format!("The control plane is running: {} ({})", p.url(), p.place())).map_err(|e| e.clone()))) }
+                    (d.steps.iter().map(|s| s.to_string()).collect(), d.at, d.result.as_ref().map(|r| r.as_ref().map(|p| format!("The control plane is running: {} ({})", p.url(), p.place())).map_err(|e| plain_refusal(e).unwrap_or_else(|| e.clone())))) }
                 Background::Update => { let g = lock(&self.updating); let u = g.as_ref().ok_or("no update was started")?;
                     (u.steps.iter().map(|s| s.to_string()).collect(), u.at, u.result.as_ref().map(|r| r.as_ref().map(|_| format!("Updated to {DASHBOARD_VERSION}.")).map_err(|e| e.clone()))) }
                 Background::Move => { let g = lock(&self.moving); let m = g.as_ref().ok_or("no move was started")?;
@@ -1126,6 +1154,36 @@ impl Dashboard {
         if !self.hold_account(&account) { return Err(format!("Sign in with AWS first: SuperCI is not signed in to account {account}.")) }
         let creds = self.aws_creds()?;
         Ok((account, creds))
+    }
+
+    /// What the AWS account in hand allows, as last looked at (see `aws::Look`).
+    fn aws_look(&self) -> Option<&aws::Look> { self.aws.as_ref().and_then(|a| self.aws_looks.get(&a.account_id)).map(|(_, look)| look) }
+
+    /// Said where a control plane or runners are set up, when the AWS account in hand does not allow everything:
+    /// which regions it works in, that it may start no spot machines, and that the image jobs run on is missing
+    /// where it is, each with whose rule it is.
+    fn aws_account_notice(&self) -> String {
+        let (Some(account), Some(look)) = (self.aws.as_ref().map(|a| a.account_id.clone()), self.aws_look()) else { return String::new() };
+        let names = |regions: &[&str]| regions.iter().map(|r| region_short(r)).collect::<Vec<_>>().join(", ");
+        let spot_refused = look.spot.as_ref().is_some_and(|a| matches!(a, aws::Answer::Refused(_)));
+        let allowed = look.allowed_regions();
+        let mut said = match look.kind() {
+            aws::Kind::Open if look.usable_regions().is_empty() && !look.regions_without_image().is_empty() => String::new(),
+            aws::Kind::Open => return String::new(),
+            aws::Kind::Project { region } => format!("AWS account {account} is a project of AWS's new sign-up. AWS keeps it to {} and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.", region_short(&region)),
+            aws::Kind::Restricted => {
+                let whose = match look.organization() { Some(_) => "Its AWS organization", None => "The role or user signed in as" };
+                let regions = if allowed.len() < look.regions.len() { if allowed.is_empty() { " allows it none of the regions SuperCI works in".to_string() } else { format!(" allows it only {}", names(&allowed)) } } else { String::new() };
+                let spot = if spot_refused { if regions.is_empty() { " allows it no spot machines, so jobs run on on-demand machines, at about twice the price" } else { ", and no spot machines, so jobs run on on-demand machines, at about twice the price" } } else { "" };
+                format!("AWS account {account} is restricted. {whose}{regions}{spot}.")
+            }
+        };
+        // Where it may work but the image jobs run on is not there.
+        let without = look.regions_without_image();
+        if look.usable_regions().is_empty() && !without.is_empty() {
+            said.push_str(&format!(" The image SuperCI's jobs run on is not in {} yet, so no job can start there until it is copied in.", names(&without)));
+        }
+        format!(r#"<div class="notice warn"><span>{} <code>superci accounts retrieve aws</code> shows all of it.</span></div>"#, esc(said.trim()))
     }
 
     /// Every AWS account signed in to, in one order (by account) whichever is in hand.
@@ -1825,12 +1883,24 @@ impl Dashboard {
                 // In the account named (one of those signed in to), else the one in hand.
                 if !field("account").is_empty() && !self.hold_account(&field("account")) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {}.", esc(&field("account"))))) }
                 let account_id = self.aws.as_ref().ok_or("Sign in with AWS first.")?.account_id.clone();
+                // A region the account is known not to have (refused to it, or without the image jobs run on):
+                // said before anything is made there.
+                if let Some(look) = self.aws_look() {
+                    if let Some((_, aws::Answer::Refused(r))) = look.regions.iter().find(|(name, _)| *name == region) {
+                        let allowed = look.allowed_regions();
+                        let whose = if r.by == superci_core::aws::By::Organization { "The AWS organization the account is in does not allow it there" } else { "The sign-in is not allowed there" };
+                        return Ok(message(409, &format!("AWS account {account_id} cannot use {}", region_short(&region)), &format!("{whose}. {}", if allowed.is_empty() { "It allows none of the regions SuperCI works in.".to_string() } else { format!("It can use: {}.", allowed.iter().map(|r| format!("{} ({r})", region_short(r))).collect::<Vec<_>>().join(", ")) })))
+                    }
+                    if look.regions_without_image().contains(&region.as_str()) { return Ok(message(409, &format!("No job could start in {}", region_short(&region)), &format!("The image SuperCI's jobs run on is not in {region} yet. Choose another region."))) }
+                }
                 let label = "superci".to_string();
                 // Trying again after a stop reuses what the first try created (same id, same names).
                 let again = field("plane");
                 let plane_id = if again.len() == 12 && again.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { again } else { superci_core::crypto::random_id(12) };
                 let creds = self.aws_creds()?;
                 self.start_deploy("aws", format!("account {account_id} · {region}"), &aws_plane::DEPLOY_STEPS, vec![("region", region.clone()), ("plane", plane_id.clone())], move |step| {
+                    // Before anything is made: the region is the account's to use, and has the image jobs run on.
+                    aws::region_ready(&creds, &region)?;
                     let deployed = aws_plane::deploy_with(&creds, &account_id, &region, &plane_id, &label, true, step)?;
                     step(5);
                     wait_online(&deployed.url);
@@ -2440,7 +2510,7 @@ mark();load()})();</script>"#;
     /// the dashboard's state meanwhile.
     fn live(shared: &Arc<Mutex<Dashboard>>, section: &str, plane: Option<usize>, new_here: Option<bool>, last: Option<&str>) -> String {
         let lock = || shared.lock().unwrap_or_else(|e| e.into_inner());
-        let (planes, key, pending, quota_creds) = {
+        let (planes, key, pending, quota_creds, look_creds) = {
             let mut d = lock();
             if let Some(i) = plane { if i < d.planes.len() { d.selected = i } }
             if let Some(n) = new_here { d.show_setup = n }
@@ -2459,8 +2529,11 @@ mark();load()})();</script>"#;
             // The AWS pages say what the account may run in each region: asked again after ten minutes.
             let account = d.aws.as_ref().map(|a| a.account_id.clone());
             let stale = account.as_ref().is_some_and(|a| d.quotas_for.as_ref().is_none_or(|(b, at)| b != a || now_ms() > at + 600_000));
-            let quota_creds = if stale && ["add-runners", "runners"].contains(&section) { d.aws_creds().ok().zip(account) } else { None };
-            (d.planes.iter().map(|p| (p.clone(), d.keyed.contains(p.plane_id()))).collect::<Vec<_>>(), d.status_key.clone(), d.modal_pending.clone(), quota_creds)
+            let quota_creds = if stale && ["add-runners", "runners"].contains(&section) { d.aws_creds().ok().zip(account.clone()) } else { None };
+            // Where a control plane or runners are set up: what the account in hand allows (its regions, spot).
+            let unlooked = account.as_ref().is_some_and(|a| d.aws_looks.get(a).is_none_or(|(at, _)| now_ms() > at + 600_000));
+            let look_creds = if unlooked && ["plane", "planes", "add-runners"].contains(&section_name(section)) { d.aws_creds().ok().zip(account) } else { None };
+            (d.planes.iter().map(|p| (p.clone(), d.keyed.contains(p.plane_id()))).collect::<Vec<_>>(), d.status_key.clone(), d.modal_pending.clone(), quota_creds, look_creds)
         };
         // Read a moment ago, and nothing changed since: shown at once, read again in the background. A page shown from
         // what was kept looks again in a moment (`look_again`), so it does not stay on what was true before.
@@ -2477,7 +2550,7 @@ mark();load()})();</script>"#;
             let restarting = d.updating.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|u| d.views.as_ref().is_some_and(|(views, _)| views.iter().any(|v| u.restarting(v))));
             let same = same && !restarting;
             match d.views.clone() {
-                Some((views, at)) if same && pending.is_none() && quota_creds.is_none() && !expecting && now_ms() < at + 120_000 => {
+                Some((views, at)) if same && pending.is_none() && quota_creds.is_none() && look_creds.is_none() && !expecting && now_ms() < at + 120_000 => {
                     look_again = now_ms() > at + 3_000;
                     if now_ms() > at + 3_000 && !d.refreshing {
                         d.refreshing = true;
@@ -2496,15 +2569,16 @@ mark();load()})();</script>"#;
                 _ => None,
             }
         };
-        let (views, modal, quotas) = match cached { Some(v) => (v, None, HashMap::new()), None => std::thread::scope(|s| {
+        let (views, modal, quotas, looked) = match cached { Some(v) => (v, None, HashMap::new(), None), None => std::thread::scope(|s| {
             let handles: Vec<_> = planes.iter().map(|(p, keyed)| { let key = key.clone(); s.spawn(move || view::plane_view(p, keyed.then_some(key.as_str()))) }).collect();
+            let looking = look_creds.as_ref().map(|(creds, _)| s.spawn(move || aws::look_at(creds)));
             let quotas: Vec<_> = quota_creds.iter().flat_map(|(creds, _)| REGIONS.iter().map(move |r| s.spawn(move || {
                 let http = aws::Blocking::new();
                 (r.to_string(), futures::executor::block_on(superci_core::aws::spot_cpu_quota(&http, r, creds, now_ms())))
             }))).collect();
             // A Modal sign-in in the browser: asked about briefly on each look until it is approved.
             let modal = pending.as_ref().map(|p| modal::wait(p, 1.0));
-            (handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<PlaneView>>(), modal, quotas.into_iter().filter_map(|h| h.join().ok()).collect::<HashMap<_, _>>())
+            (handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<PlaneView>>(), modal, quotas.into_iter().filter_map(|h| h.join().ok()).collect::<HashMap<_, _>>(), looking.and_then(|h| h.join().ok()))
         }) };
         // A control plane that moved says where: when that one is in a cloud this session is not signed in to, it is
         // still the one in use. It is shown (known by its address), and nothing is changed until signed in there.
@@ -2544,6 +2618,7 @@ mark();load()})();</script>"#;
         // The page shows, and changes, the control plane in use.
         if let Some(i) = views.get(view::in_use(&views)).and_then(|v| d.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { d.select(i) }
         if let Some((_, account)) = quota_creds { d.quotas = quotas; d.quotas_for = Some((account, now_ms())); }
+        if let (Some((_, account)), Some(look)) = (look_creds, looked) { d.aws_looks.insert(account, (now_ms(), look)); }
         if let Some(Ok(Some(session))) = modal { d.modal = Some(session); d.modal_pending = None; d.looked_modal = false; }
         // The App is installed (or the wait is over): nothing more to wait for.
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
@@ -2699,7 +2774,7 @@ mark();load()})();</script>"#;
             return format!(r#"<div class="bar"><h1 class="page-title">Setting up your control plane</h1></div><div class="cards">{progress}</div>"#)
         }
         let rows = self.plane_rows();
-        format!(r#"<div class="bar"><h1 class="page-title">Set up a control plane</h1></div><p class="note" style="margin-bottom:22px">The always-on part GitHub and GitLab send jobs to, in your own cloud account. Runners can be on other clouds too.</p><div class="picks page">{rows}</div>"#)
+        format!(r#"<div class="bar"><h1 class="page-title">Set up a control plane</h1></div>{}<p class="note" style="margin-bottom:22px">The always-on part GitHub and GitLab send jobs to, in your own cloud account. Runners can be on other clouds too.</p><div class="picks page">{rows}</div>"#, self.aws_account_notice())
     }
 
     /// Where a control plane can be set up: a row per cloud with its one action (connect, then set up); an account
@@ -2733,7 +2808,14 @@ mark();load()})();</script>"#;
             (_, []) => Some(r#"<form method="post" action="/aws/signin"><input type="hidden" name="next"><button class="button secondary sm">Another AWS account</button></form>"#.to_string()),
             (_, free) => {
                 let account = match free { [id] => format!(r#"<input type="hidden" name="account" value="{}">"#, esc(id)), list => format!(r#"<select name="account" aria-label="Account">{}</select>"#, list.iter().map(|id| format!(r#"<option value="{0}">account {0}</option>"#, esc(id))).collect::<String>()) };
-                Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add">{account}<details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Set up</button></form>"#, region_options()))
+                // The regions the account in hand can use (all of them until it has been looked at): one alone is
+                // said, several are chosen among, none leaves nothing to set up.
+                match self.aws_look().map(|l| l.usable_regions()) {
+                    Some(usable) if usable.is_empty() => Some(r#"<span class="note">No region to set it up in</span>"#.to_string()),
+                    Some(usable) if usable.len() == 1 => Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add">{account}<input type="hidden" name="region" value="{0}"><span class="note">{1}</span><button class="button primary sm">Set up</button></form>"#, esc(usable[0]), esc(&region_short(usable[0])))),
+                    Some(usable) => Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add">{account}<details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Set up</button></form>"#, region_options_among(&usable))),
+                    None => Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add">{account}<details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Set up</button></form>"#, region_options())),
+                }
             }
         };
         let modal = match &self.modal {
@@ -2776,7 +2858,7 @@ mark();load()})();</script>"#;
         let name = provider_name(d.cloud);
         let (title, sub, running) = match &d.result {
             None => (format!("Deploying to {name}"), format!("{} · {}", esc(&d.place), match d.cloud { "aws" => "about a minute", "modal" => "about 2 minutes", _ => "about 20 seconds" }), true),
-            Some(Err(e)) => (format!("The deploy to {name} stopped"), esc(e), false),
+            Some(Err(e)) => (format!("The deploy to {name} stopped"), esc(&plain_refusal(e).unwrap_or_else(|| e.clone())), false),
             Some(Ok(_)) => return None,
         };
         let steps = d.steps.iter().enumerate().map(|(i, s)| {
@@ -5240,6 +5322,54 @@ mod tests {
         let menu = lock(&hub.board("acme")).render("overview", &[], None);
         assert!(menu.contains(r#"href="/?w=default&c=" aria-current="false""#) && menu.contains(r#"href="/?w=acme&c=" aria-current="true""#), "{menu}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a real account answered (a recording, see `aws::replay`), as the look the dashboard keeps of it.
+    fn looked(recording: &'static str) -> aws::Look {
+        let answers = aws::replay::Replay::of(recording);
+        aws::look_with(&|| answers.clone(), &superci_core::aws::Credentials { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "secret".into(), session_token: None, expires_at_ms: 0 })
+    }
+
+    /// An AWS account that does not allow everything (here a project of AWS's new sign-up, as one really answered):
+    /// the set-up page says what it allows and whose rule that is, offers no region it cannot use, and a deploy to
+    /// one is refused in plain words before anything is made.
+    #[test]
+    fn a_restricted_aws_account_is_said_and_only_what_it_allows_is_offered() {
+        let mut d = Dashboard::new();
+        d.aws = Some(aws::Session::for_test("111111111111"));
+        // Not looked at yet: nothing is said, every region is offered.
+        assert!(d.aws_account_notice().is_empty() && d.plane_page().contains(r#"<option value="eu-north-1">"#));
+        // The project: Stockholm only, no spot, and the image jobs run on is not there.
+        d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-paid/look.jsonl"))));
+        let page = d.plane_page();
+        preview("plane-aws-project", &page);
+        assert!(page.contains(r#"<div class="notice warn"><span>AWS account 111111111111 is a project of AWS&#39;s new sign-up. AWS keeps it to Stockholm and allows it no spot machines, so jobs run on on-demand machines, at about twice the price. The image SuperCI&#39;s jobs run on is not in Stockholm yet, so no job can start there until it is copied in. <code>superci accounts retrieve aws</code> shows all of it.</span></div>"#), "{page}");
+        assert!(page.contains(r#"<span class="note">No region to set it up in</span>"#) && !page.contains(r#"action="/plane/aws""#), "nothing to press where nothing can work");
+        // A deploy asked for anyway (a command, an old page) is refused, with what the account can use.
+        // (What a page that says one thing said: its heading and its text.)
+        let post = |d: &mut Dashboard, region: &str| { let r = d.handle(&Req { method: "POST".into(), path: "/plane/aws".into(), query: vec![], cookie: None, last: None, body: format!("region={region}").into_bytes(), host: String::new(), origin: None, fetch_site: None }).unwrap();
+            (r.status, SAID.with(|s| s.borrow().clone()).map(|(_, heading, text)| format!("{heading} | {text}")).unwrap_or_default()) };
+        let (status, said) = post(&mut d, "us-east-1");
+        assert!(status == 409 && said.contains("AWS account 111111111111 cannot use N. Virginia") && said.contains("The AWS organization the account is in does not allow it there. It can use: Stockholm (eu-north-1)."), "{status} {said}");
+        let (status, said) = post(&mut d, "eu-north-1");
+        assert!(status == 409 && said.contains("No job could start in Stockholm") && said.contains("The image SuperCI's jobs run on is not in eu-north-1 yet"), "{status} {said}");
+        assert!(lock(&d.deploying).is_none(), "nothing was started");
+        // An account of its own: nothing is said, and the regions offered are the ones the image is in.
+        d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/classic/look.jsonl"))));
+        let page = d.plane_page();
+        assert!(d.aws_account_notice().is_empty() && page.contains(r#"<option value="us-east-1" selected>"#) && page.contains(r#"<option value="eu-west-1">"#) && !page.contains(r#"<option value="eu-north-1">"#) && !page.contains(r#"<option value="ca-central-1">"#), "{page}");
+        // A refusal in plain words, by whose rule it is (the first as the project answered a deploy to N. Virginia).
+        let refused = "us-east-1: UnauthorizedOperation: You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/AccountFullAccessRole/someone is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-example001/service_control_policy/p-example1";
+        assert_eq!(plain_refusal(refused).unwrap(), "AWS refuses this (ec2:DescribeVpcs) in N. Virginia (us-east-1) for the whole account: the AWS organization the account is in does not allow it, and nothing inside the account lifts that. Its policy is p-example1, managed from account 222222222222. `superci accounts retrieve aws` shows what the account allows.");
+        assert_eq!(plain_refusal("AccessDenied: User: arn:aws:iam::111111111111:user/ci is not authorized to perform: iam:CreateRole on resource: x because no identity-based policy allows the iam:CreateRole action").unwrap(),
+            "The AWS role or user you signed in as may not do this (iam:CreateRole). Sign in with one that administers the account: `superci login aws`.");
+        assert!(plain_refusal("ResourceConflictException: the function exists").is_none() && plain_refusal("UnauthorizedOperation: You are not authorized to perform this operation.").is_none());
+        // A deploy that stopped on one says it so, and offers choosing another place.
+        *lock(&d.deploying) = Some(Deploy { cloud: "aws", place: "account 111111111111 · us-east-1".into(), steps: &aws_plane::DEPLOY_STEPS, at: 0, form: vec![("region", "us-east-1".into())], result: Some(Err(refused.into())) });
+        let stopped = d.plane_page();
+        assert!(stopped.contains("AWS refuses this (ec2:DescribeVpcs) in N. Virginia (us-east-1) for the whole account") && !stopped.contains("explicit deny") && stopped.contains(r#"<form method="post" action="/plane/start-over"><button class="button secondary">Choose another place</button></form>"#), "{stopped}");
+        let r = d.handle(&Req { method: "POST".into(), path: "/plane/start-over".into(), query: vec![], cookie: None, last: None, body: vec![], host: String::new(), origin: None, fetch_site: None }).unwrap();
+        assert!(r.status == 303 && lock(&d.deploying).is_none() && d.plane_page().contains("Set up a control plane"));
     }
 
     #[test]

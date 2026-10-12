@@ -791,7 +791,8 @@ pub fn aws_look_lines(account: &str, who: &str, look: &crate::aws::Look) -> Vec<
     if let Some(on_demand) = &look.on_demand { out.push(format!("On-demand     {}{at}", whose(on_demand))) }
     let cpus = |n: Option<u32>| n.map(|n| format!("{n} vCPUs")).unwrap_or_else(|| "not known".into());
     if look.asked_in.is_some() { out.push(format!("At once       spot {} · on-demand {}", cpus(look.spot_cpus), cpus(look.on_demand_cpus))) }
-    if let (Some(false), Some(region)) = (look.image, &look.asked_in) { out.push(format!("Runner image  not published in {region}: jobs cannot start there until it is copied in")) }
+    let without = look.regions_without_image();
+    if !without.is_empty() { out.push(format!("Runner image  not in {}: jobs cannot start there until it is copied in", without.join(", "))) }
     if let Some(org) = &look.organization_id {
         let managed = look.management_account.as_deref().filter(|m| *m != account);
         out.push(format!("Organization  {org}{}", match managed { Some(m) => format!(", managed from account {m}: its policies are not this account's to read or change"), None => ", managed from this account".to_string() }));
