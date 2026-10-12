@@ -58,6 +58,13 @@ pub struct Dashboard {
     keep_failed: bool,
     /// A kept AWS sign-in turned out to have ended (AWS ends one after twelve hours at most).
     aws_ended: bool,
+    /// A sign-in to AWS came back in this run (what `superci login aws --add` waits for), and whether one is awaited
+    /// although an account is signed in to already.
+    aws_came: bool,
+    pub adding: bool,
+    /// The other AWS accounts signed in to. `aws` is the one in hand: the account of the control plane a page or a
+    /// command acts on (see `hold_account`), so everything that writes to AWS writes with the right one.
+    aws_others: Vec<aws::Session>,
     /// The dashboard opened by a command for the one thing a person must do in a browser (see `Task`): once it is
     /// done, the page says so and the program ends.
     task: Option<Task>,
@@ -85,10 +92,14 @@ pub struct Dashboard {
     show_setup: bool,
     /// An App being made on GitHub: the state it comes back with, whose it is, and where that GitHub is (none: github.com).
     manifest_state: Option<(String, Owner, Option<String>)>,
+    /// The control plane a GitHub App is being created for: GitHub comes back with no word of it.
+    github_for: Option<String>,
     /// A control plane being deployed in the background (the page shows its steps), or one that stopped.
     deploying: Arc<Mutex<Option<Deploy>>>,
     /// A deploy just finished: the page that showed it goes to Overview, once.
     deployed: Arc<Mutex<bool>>,
+    /// The control plane that was just set up (its pages are where the person goes on, beside any others).
+    deployed_to: Arc<Mutex<Option<String>>>,
     /// A move to another control plane, under way in the background (its steps), or how it ended.
     moving: Arc<Mutex<Option<Move>>>,
     /// An update of a control plane, under way in the background (its steps), or how it ended.
@@ -624,8 +635,8 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
-            manifest_state: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
     /// A dashboard that remembers: with SuperCI's own sign-ins from its folder, kept there again as they change. A
@@ -635,7 +646,11 @@ impl Dashboard {
         let Some(store) = store else { return d };
         let kept = store.read();
         if d.cf.is_none() { d.cf = kept.cloudflare }
-        d.aws = kept.aws;
+        // Every AWS account kept; in hand, the kept control plane's own (else the first).
+        let mut accounts: Vec<aws::Session> = kept.aws.into_iter().chain(kept.aws_more).collect();
+        let its = match &kept.plane { Some(Plane::Aws { account_id, .. }) => accounts.iter().position(|a| &a.account_id == account_id), _ => None };
+        if !accounts.is_empty() { d.aws = Some(accounts.remove(its.unwrap_or(0))) }
+        d.aws_others = accounts;
         if d.modal.is_none() { d.modal = kept.modal }
         d.aws_ended = kept.aws_ended && d.aws.is_none();
         // The key the control planes were handed, while it lasts another day; else a new one, good for thirty days.
@@ -648,6 +663,7 @@ impl Dashboard {
         // The control plane in use is listed at once: its pages are read with the kept key, whether or not its
         // cloud's sign-in still stands (AWS ends one after twelve hours).
         if let Some(p) = &kept.plane { d.planes.push(p.clone()); d.preloaded = Some(p.plane_id().to_string()) }
+        for p in kept.planes_more { if !d.planes.iter().any(|x| x.plane_id() == p.plane_id()) { d.planes.push(p) } }
         d.kept_plane = kept.plane;
         d.store = Some(store);
         d.kept_as = serde_json::to_string(&d.kept()).unwrap_or_default();
@@ -666,6 +682,7 @@ impl Dashboard {
     fn task_done(&self) -> Option<String> {
         let kept = || self.store.as_ref().map(|s| s.path().display().to_string()).unwrap_or_else(|| "nothing (no home folder)".into());
         match self.task.as_ref()? {
+            Task::Login(Some("aws")) if self.adding && !self.aws_came => None,
             Task::Login(cloud) if cloud.is_none_or(|c| self.signed_in_with(c)) => self.signed_in_as().map(|now| format!("Signed in: {now}. Kept in {}; `superci logout` removes it.", kept())),
             Task::GitHub { login, done: true, .. } => Some(format!("GitHub is connected for {login}: its App is installed. Jobs with `runs-on: superci` in its repositories now come here.")),
             _ => None,
@@ -733,14 +750,18 @@ impl Dashboard {
 
     /// For a command that changes something: signed in, the clouds looked in, and the control plane in use chosen, as a
     /// page's first load does.
-    pub fn ready(&mut self) -> Result<()> {
+    pub fn ready(&mut self) -> Result<()> { self.look(true) }
+
+    /// As `ready`; `one`: stops when several control planes are live and none is named (a listing passes false).
+    fn look(&mut self, one: bool) -> Result<()> {
         self.signed_in_as().ok_or(if self.aws_ended { AWS_ENDED } else { NOT_SIGNED_IN })?;
         self.discover()?;
         if self.signed_in_as().is_none() { return Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
+        if let Some(live) = view::several(&views).filter(|_| one) { return Err(view::name_one(&live)) }
         if !views.is_empty() {
             let id = views[view::in_use(&views)].plane.plane_id().to_string();
-            if let Some(i) = self.planes.iter().position(|p| p.plane_id() == id) { self.selected = i }
+            if let Some(i) = self.planes.iter().position(|p| p.plane_id() == id) { self.select(i) }
         }
         self.keep();
         Ok(())
@@ -816,7 +837,14 @@ impl Dashboard {
         // Signed in nowhere: only what is left of a sign-in AWS ended can still be read (with the kept key).
         let only_reading = self.signed_in_as().is_none();
         if only_reading && !(self.aws_ended && self.kept_plane.is_some()) { return Err(NOT_SIGNED_IN.into()) }
-        let kept = self.kept_plane.clone().filter(|p| self.keyed.contains(p.plane_id()));
+        // The one named, when it is known here; with none named, the kept one only when no other is known (with
+        // several known, which of them are live is asked first, below).
+        let known = match view::named() {
+            Some(n) => self.planes.iter().find(|p| view::is(p, &n)).cloned(),
+            None if self.planes.len() <= 1 || only_reading => self.kept_plane.clone(),
+            None => None,
+        };
+        let kept = known.filter(|p| self.keyed.contains(p.plane_id()));
         // (One that says it moved away is no longer the one in use: found again below.)
         if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some() && (v.moved_to.is_none() || only_reading)) { return Ok(Some(v)) }
         // Nothing to find it again with: as it answers now (not at all, or without taking the key any more).
@@ -826,8 +854,9 @@ impl Dashboard {
         self.discover()?;
         if self.planes.is_empty() { return if self.signed_in_as().is_none() { Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) } else { Ok(None) } }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
+        if let Some(live) = view::several(&views) { return Err(view::name_one(&live)) }
         let p = views[view::in_use(&views)].plane.clone();
-        if let Some(i) = self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { self.selected = i }
+        if let Some(i) = self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { self.select(i) }
         let mut v = view::plane_view(&p, Some(&self.status_key));
         // Just handed the key: its whole status, once it takes it (a few tries).
         for _ in 0..8 { if !v.online || v.status.is_some() || !self.keyed.contains(p.plane_id()) { break } std::thread::sleep(Duration::from_millis(1500)); v.status = cloudflare::status(p.url(), &self.status_key) }
@@ -837,7 +866,7 @@ impl Dashboard {
 
     /// Every control plane found in the clouds signed in to, the one in use marked.
     pub fn all(&mut self) -> Result<(Vec<PlaneView>, usize)> {
-        self.ready()?;
+        self.look(false)?;
         let key = self.status_key.clone();
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, Some(&key))).collect();
         let used = view::in_use(&views);
@@ -857,7 +886,7 @@ impl Dashboard {
     /// Where SuperCI is signed in, in words (nothing: nowhere).
     pub fn signed_in_as(&self) -> Option<String> {
         let mut at = vec![];
-        if let Some(a) = &self.aws { at.push(format!("AWS account {}", a.account_id)) }
+        for a in self.aws_accounts() { at.push(format!("AWS account {}", a.account_id)) }
         if self.cf.is_some() { at.push(if self.cf_given { "Cloudflare (a token given for this run)".to_string() } else { "Cloudflare".to_string() }) }
         if let Some(m) = &self.modal { at.push(format!("Modal workspace {}", m.workspace)) }
         if at.is_empty() { None } else { Some(at.join(", ")) }
@@ -926,6 +955,7 @@ impl Dashboard {
         if !self.cf_given { self.cf = None }
         if !self.modal_given { self.modal = None }
         self.aws = None;
+        self.aws_others.clear();
         (self.aws_ended, self.looked_cf, self.looked_aws, self.looked_modal) = (false, false, false, false);
         (self.planes, self.selected, self.kept_plane, self.preloaded, self.views) = (vec![], 0, None, None, None);
         self.cf_accounts.clear();
@@ -942,12 +972,46 @@ impl Dashboard {
         planes.sort();
         Kept {
             cloudflare: if self.cf_given { None } else { self.cf.clone() },
-            aws: self.aws.clone(),
+            aws: self.aws_accounts().into_iter().next(),
+            aws_more: self.aws_accounts().into_iter().skip(1).collect(),
             modal: if self.modal_given { None } else { self.modal.clone() },
             key: Some(Key { name: self.status_secret.clone(), value: self.status_key.clone(), planes }),
             plane: self.planes.get(self.selected).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
-            aws_ended: self.aws_ended && self.aws.is_none(),
+            planes_more: self.planes.iter().enumerate().filter(|(i, p)| *i != self.selected && !matches!(p, Plane::Seen { .. })).map(|(_, p)| p.clone()).collect(),
+            aws_ended: self.aws_ended && self.aws.is_none() && self.aws_others.is_empty(),
         }
+    }
+
+    /// Every AWS account signed in to, in one order (by account) whichever is in hand.
+    fn aws_accounts(&self) -> Vec<aws::Session> {
+        let mut all: Vec<aws::Session> = self.aws.iter().chain(&self.aws_others).cloned().collect();
+        all.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+        all
+    }
+
+    /// Takes the sign-in to an AWS account in hand, when it is kept: what is done next for a control plane in that
+    /// account, or for its runners there, is done with that account's sign-in and no other. Whether it is in hand.
+    fn hold_account(&mut self, account: &str) -> bool {
+        if self.aws.as_ref().is_some_and(|a| a.account_id == account) { return true }
+        let Some(i) = self.aws_others.iter().position(|a| a.account_id == account) else { return false };
+        let theirs = self.aws_others.remove(i);
+        if let Some(was) = self.aws.replace(theirs) { self.aws_others.push(was) }
+        // (What was asked about the account in hand, its quotas, is asked again for this one.)
+        self.quotas_for = None;
+        true
+    }
+
+    /// Makes one of the control planes listed the one that pages and changes act on, with its own account's sign-in.
+    fn select(&mut self, i: usize) {
+        self.selected = i;
+        if let Some(Plane::Aws { account_id, .. }) = self.planes.get(i).cloned() { self.hold_account(&account_id); }
+    }
+
+    /// A sign-in to AWS that just came back: a new account is added beside the others, a known one is renewed.
+    fn add_account(&mut self, session: aws::Session) {
+        self.aws_others.retain(|a| a.account_id != session.account_id);
+        if let Some(was) = self.aws.replace(session) { if self.aws.as_ref().is_some_and(|now| now.account_id != was.account_id) { self.aws_others.push(was) } }
+        (self.aws_ended, self.looked_aws, self.aws_came) = (false, false, true);
     }
 
     /// What another process on the same folder wrote since this one last read or wrote the file (a `superci login`
@@ -961,8 +1025,14 @@ impl Dashboard {
         if disk == last { return }
         let theirs = |field: &str| mine[field] == last[field] && disk[field] != last[field];
         let mut took = false;
-        if theirs("aws") || (theirs("aws_ended") && self.aws.is_none()) {
-            (self.aws, self.aws_ended, self.looked_aws, took) = (on_disk.aws, on_disk.aws_ended, false, true);
+        // (The AWS accounts as one: which of them is first in the file says nothing.)
+        let accounts = |v: &serde_json::Value| (v["aws"].clone(), v["aws_more"].clone());
+        if (accounts(&mine) == accounts(&last) && accounts(&disk) != accounts(&last)) || (theirs("aws_ended") && self.aws.is_none() && self.aws_others.is_empty()) {
+            let held = self.aws.as_ref().map(|a| a.account_id.clone());
+            let mut all: Vec<aws::Session> = on_disk.aws.into_iter().chain(on_disk.aws_more).collect();
+            let at = held.and_then(|h| all.iter().position(|a| a.account_id == h)).unwrap_or(0);
+            self.aws = if all.is_empty() { None } else { Some(all.remove(at)) };
+            (self.aws_others, self.aws_ended, self.looked_aws, took) = (all, on_disk.aws_ended, false, true);
         }
         if theirs("cloudflare") && !self.cf_given { (self.cf, self.looked_cf, took) = (on_disk.cloudflare, false, true); self.cf_accounts.clear(); }
         if theirs("modal") && !self.modal_given { (self.modal, self.looked_modal, took) = (on_disk.modal, false, true) }
@@ -1124,15 +1194,27 @@ impl Dashboard {
     fn discover(&mut self) -> Result<()> {
         // Every cloud signed in to and not looked in yet, at once.
         let cf = if self.cf.is_some() && !self.looked_cf { Some(self.cloudflare()?) } else { None };
-        let asked = if self.looked_aws { None } else { self.aws.as_mut().map(|s| (s.credentials(), s.account_id.clone())) };
-        let aws = match asked {
-            Some((Ok(creds), account)) => Some((creds, account)),
-            // Over on AWS's side (a sign-in lasts twelve hours at most, and one kept from yesterday has ended):
-            // forgotten, so the pages ask for it again.
-            Some((Err(e), _)) if e.starts_with(aws::ENDED) => { self.aws = None; self.aws_ended = true; None }
-            Some((Err(e), _)) => return Err(e),
-            None => None,
-        };
+        // Every AWS account signed in to: the one in hand, then the others.
+        let mut aws: Vec<(superci_core::aws::Credentials, String)> = vec![];
+        if !self.looked_aws {
+            match self.aws.as_mut().map(|s| (s.credentials(), s.account_id.clone())) {
+                Some((Ok(creds), account)) => aws.push((creds, account)),
+                // Over on AWS's side (a sign-in lasts twelve hours at most, and one kept from yesterday has ended):
+                // forgotten, so the pages ask for it again.
+                Some((Err(e), _)) if e.starts_with(aws::ENDED) => { self.aws = None; self.aws_ended = true }
+                Some((Err(e), _)) => return Err(e),
+                None => {}
+            }
+            let mut ended = vec![];
+            for s in self.aws_others.iter_mut() {
+                match s.credentials() {
+                    Ok(creds) => aws.push((creds, s.account_id.clone())),
+                    Err(e) if e.starts_with(aws::ENDED) => ended.push(s.account_id.clone()),
+                    Err(e) => return Err(e),
+                }
+            }
+            self.aws_others.retain(|s| !ended.contains(&s.account_id));
+        }
         let modal = if self.looked_modal { None } else { self.modal.clone() };
         let accounts = self.cf_accounts.clone();
         let (cf_found, aws_found, modal_found) = std::thread::scope(|s| {
@@ -1141,7 +1223,7 @@ impl Dashboard {
                 let planes = timed("Cloudflare: find control planes", || cf.find_planes(&accounts))?;
                 Ok((accounts, planes))
             }) });
-            let a = aws.as_ref().map(|(creds, _)| s.spawn(move || timed("AWS: find control planes", || aws::connected_planes(creds))));
+            let a: Vec<_> = aws.iter().map(|(creds, _)| s.spawn(move || timed("AWS: find control planes", || aws::connected_planes(creds)))).collect();
             let m = modal.as_ref().map(|session| s.spawn(move || -> Result<Vec<Plane>> {
                 let found = timed("Modal: find control planes", || modal::find_planes(session))?;
                 Ok(std::thread::scope(|s| {
@@ -1153,7 +1235,7 @@ impl Dashboard {
                 }))
             }));
             let join = |h: std::thread::ScopedJoinHandle<'_, _>| h.join().unwrap_or_else(|_| Err::<_, String>("a cloud's search stopped".into()));
-            (c.map(join), a.map(|h| h.join().unwrap_or_else(|_| Err("AWS's search stopped".into()))), m.map(|h| h.join().unwrap_or_else(|_| Err("Modal's search stopped".into()))))
+            (c.map(join), a.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("AWS's search stopped".into()))).collect::<Vec<_>>(), m.map(|h| h.join().unwrap_or_else(|_| Err("Modal's search stopped".into()))))
         });
         // Where the kept control plane was looked for, and what was found there.
         let (mut looked, mut there): (Vec<String>, Vec<String>) = (vec![], vec![]);
@@ -1167,7 +1249,7 @@ impl Dashboard {
             }
             self.looked_cf = true;
         }
-        if let (Some(found), Some((_, account_id))) = (aws_found, aws) {
+        for (found, (_, account_id)) in aws_found.into_iter().zip(aws) {
             looked.push(format!("aws:{account_id}"));
             for f in found? {
                 if !f.url.starts_with("https://") { continue }
@@ -1193,24 +1275,22 @@ impl Dashboard {
             }
             self.looked_modal = true;
         }
-        // The control plane kept from the last run: looked for where it lives and not there any more, it is gone.
-        if let Some(i) = self.preloaded.as_ref().and_then(|id| self.planes.iter().position(|p| p.plane_id() == id)) {
-            let home = match &self.planes[i] {
-                Plane::Cloudflare { account_id, .. } => format!("cloudflare:{account_id}"),
-                Plane::Aws { account_id, .. } => format!("aws:{account_id}"),
-                Plane::Modal { workspace, .. } => format!("modal:{workspace}"),
-                Plane::Seen { .. } => String::new(),
-            };
-            if looked.contains(&home) {
-                if !there.iter().any(|id| id == self.planes[i].plane_id()) {
-                    self.planes.remove(i);
-                    self.kept_plane = None;
-                    self.selected = 0;
-                    self.views = None;
-                }
-                self.preloaded = None;
-            }
+        // A control plane kept from the last run: looked for where it lives and not there any more, it is gone.
+        let home = |p: &Plane| match p {
+            Plane::Cloudflare { account_id, .. } => format!("cloudflare:{account_id}"),
+            Plane::Aws { account_id, .. } => format!("aws:{account_id}"),
+            Plane::Modal { workspace, .. } => format!("modal:{workspace}"),
+            Plane::Seen { .. } => String::new(),
+        };
+        let gone: Vec<String> = self.planes.iter().filter(|p| looked.contains(&home(p)) && !there.iter().any(|id| id == p.plane_id())).map(|p| p.plane_id().to_string()).collect();
+        if !gone.is_empty() {
+            let shown = self.planes.get(self.selected).map(|p| p.plane_id().to_string());
+            self.planes.retain(|p| !gone.iter().any(|g| g == p.plane_id()));
+            if self.kept_plane.as_ref().is_some_and(|k| gone.iter().any(|g| g == k.plane_id())) { self.kept_plane = None }
+            self.selected = shown.and_then(|id| self.planes.iter().position(|p| p.plane_id() == id)).unwrap_or(0);
+            self.views = None;
         }
+        if self.preloaded.as_ref().is_some_and(|id| self.planes.iter().find(|p| p.plane_id() == id).is_none_or(|p| looked.contains(&home(p)))) { self.preloaded = None }
         self.key_planes();
         Ok(())
     }
@@ -1273,6 +1353,7 @@ impl Dashboard {
         if let Some(Deploy { result: Some(Ok(p)), .. }) = finished {
             self.selected = match self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { Some(i) => i, None => { self.planes.push(p); self.planes.len() - 1 } };
             self.show_setup = false;
+            *lock(&self.deployed_to) = self.planes.get(self.selected).map(|p| p.plane_id().to_string());
             *lock(&self.deployed) = true;
         }
     }
@@ -1351,7 +1432,7 @@ impl Dashboard {
             ("POST", "/runners/aws-own") => {
                 let plane = self.plane()?;
                 let Plane::Aws { account_id, .. } = &plane else { return Ok(message(400, "Not a control plane in AWS", "")) };
-                if self.aws.as_ref().is_none_or(|a| &a.account_id != account_id) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {}.", esc(account_id)))) }
+                if !self.hold_account(account_id) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {}.", esc(account_id)))) }
                 let creds = self.aws_creds()?;
                 // With its runners off its status lists no regions: its own, then (its network is made in each).
                 let Plane::Aws { region, .. } = &plane else { unreachable!() };
@@ -1386,7 +1467,7 @@ impl Dashboard {
                 // Signed in where its part is, before anything changes.
                 if !only {
                     let signed_in = match cloud.as_str() {
-                        "aws" => self.aws.as_ref().is_some_and(|a| Some(&a.account_id) == account.as_ref()),
+                        "aws" => account.as_ref().is_some_and(|a| self.hold_account(a)),
                         _ if own_containers => true,
                         "modal" => self.modal.is_some(),
                         _ => self.cf.is_some(),
@@ -1523,10 +1604,9 @@ impl Dashboard {
             ("GET", "/oauth/callback") if self.aws_pending.as_ref().is_some_and(|p| safe_eq(q("state").as_bytes(), p.state.as_bytes())) => {
                 let pending = self.aws_pending.take().unwrap();
                 if !q("error").is_empty() { return Ok(message(400, "AWS sign-in was not completed", &esc(q("error")))) }
-                self.aws = Some(aws::exchange(pending, q("code"))?);
-                self.aws_ended = false;
-                println!("Signed in to AWS.");
-                self.looked_aws = false;
+                let session = aws::exchange(pending, q("code"))?;
+                println!("Signed in to AWS account {}.", session.account_id);
+                self.add_account(session);
                 Ok(back_to("Signed in with AWS", "Looking for SuperCI in your account…", &format!("{}/{}", self.base, self.return_to)))
             }
             ("GET", "/oauth/callback") => {
@@ -1584,6 +1664,8 @@ impl Dashboard {
                 if self.deploy_running() { return Ok(Response::redirect("/?p=plane")) }
                 let region = field("region");
                 if !REGIONS.contains(&region.as_str()) { return Ok(message(400, "Choose a region from the list", "")) }
+                // In the account named (one of those signed in to), else the one in hand.
+                if !field("account").is_empty() && !self.hold_account(&field("account")) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {}.", esc(&field("account"))))) }
                 let account_id = self.aws.as_ref().ok_or("Sign in with AWS first.")?.account_id.clone();
                 let label = "superci".to_string();
                 // Trying again after a stop reuses what the first try created (same id, same names).
@@ -1712,7 +1794,7 @@ impl Dashboard {
                 let which = field("plane");
                 // Updating another one does not make it the one that later pages and commands act on.
                 let was = self.selected;
-                if let Some(i) = self.planes.iter().position(|p| p.plane_id() == which).or_else(|| which.parse::<usize>().ok().filter(|i| *i < self.planes.len())) { self.selected = i }
+                if let Some(i) = self.planes.iter().position(|p| p.plane_id() == which).or_else(|| which.parse::<usize>().ok().filter(|i| *i < self.planes.len())) { self.select(i) }
                 let plane = self.plane();
                 self.selected = was;
                 let plane = plane?;
@@ -1739,6 +1821,7 @@ impl Dashboard {
                 let cf_agent = status["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare"));
                 // Signed in to the AWS account its machines run in: the update also gives its runner role what this
                 // version asks for (an AWS control plane's own update does that already).
+                if let (Some(account), false) = (status["aws"]["account_id"].as_str(), matches!(plane, Plane::Aws { .. })) { self.hold_account(account); }
                 let aws_give = match (&self.aws, status["aws"]["account_id"].as_str()) {
                     (Some(a), Some(account)) if a.account_id == account && !matches!(plane, Plane::Aws { .. }) && status["aws"]["connected"] == true => Some((self.aws_creds()?, account.to_string())),
                     _ => None,
@@ -1798,6 +1881,7 @@ impl Dashboard {
                 manifest["setup_url"] = format!("{}/github/installed", self.base).into();
                 let target = manifest_target(host.as_deref(), &owner, &state);
                 self.manifest_state = Some((state, owner, host));
+                self.github_for = Some(plane.plane_id().to_string());
                 Ok(manifest_form(&target, &manifest))
             }
             ("GET", "/github/callback") => {
@@ -1805,6 +1889,8 @@ impl Dashboard {
                 if !fresh { return Ok(message(400, "This App creation has expired", "Start again from the dashboard.")) }
                 let host = self.manifest_state.as_ref().and_then(|(_, _, h)| h.clone());
                 let app = convert_manifest_code(&github::api_base(host.as_deref()), host.as_deref(), q("code"))?;
+                // For the control plane it was started for, whatever another tab shows meanwhile.
+                if let Some(i) = self.github_for.as_ref().and_then(|id| self.planes.iter().position(|p| p.plane_id() == id)) { self.select(i) }
                 // The App's key goes straight into the control plane's encrypted secrets; this machine does not keep it.
                 let plane = self.plane()?;
                 // A further organization (the control plane has an App of another account already): beside the first,
@@ -1832,7 +1918,11 @@ impl Dashboard {
                 if let Some(Task::GitHub { done, .. }) = self.task.as_mut() { *done = true }
                 self.views = None;
                 self.github_expected.get_or_insert(now_ms() + 120_000);
-                Ok(back("Installed on GitHub", "Back to your dashboard…"))
+                // Back to that control plane's pages (with several control planes, a page says which one it shows).
+                match self.github_for.take().filter(|_| self.planes.len() > 1) {
+                    Some(id) => Ok(back_to("Installed on GitHub", "Back to your dashboard…", &format!("{}/?p=repos&c={id}", self.base))),
+                    None => Ok(back("Installed on GitHub", "Back to your dashboard…")),
+                }
             }
             // An organization removed (not the first one): its App is uninstalled there, then forgotten here. Its jobs
             // then wait for runners that never come: workflows there go back to GitHub's runners first.
@@ -1998,7 +2088,7 @@ impl Dashboard {
                 let plane = self.planes.iter().find(|p| p.plane_id() == id).cloned().ok_or("Which control plane?")?;
                 let status = status_soon(plane.url(), &self.status_key).ok_or("The control plane did not answer: try again in a few seconds")?;
                 let account = match &plane { Plane::Aws { account_id, .. } => account_id.clone(), _ => status["aws"]["account_id"].as_str().unwrap_or_default().to_string() };
-                if self.aws.as_ref().is_none_or(|a| a.account_id != account) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {} to give its role these permissions.", esc(&account)))) }
+                if !self.hold_account(&account) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {} to give its role these permissions.", esc(&account)))) }
                 let creds = self.aws_creds()?;
                 aws::give_runner_role(&creds, &account, &id, &status_regions(&status))?;
                 let _ = cloudflare::plane_post(plane.url(), &self.status_key, "/permissions/given", &serde_json::json!({ "cloud": "aws" }));
@@ -2078,7 +2168,7 @@ impl Dashboard {
                             let want = serde_json::to_value(&networks).map_err(|e| e.to_string())?;
                             if st["aws_networks"] != want && !(networks.is_empty() && st["aws_networks"].as_object().is_none_or(|n| n.is_empty())) {
                                 let account = match &plane { Plane::Aws { account_id, .. } => Some(account_id.clone()), _ => st["aws"]["account_id"].as_str().map(str::to_string) };
-                                if self.aws.as_ref().is_some_and(|a| Some(&a.account_id) == account.as_ref()) {
+                                if account.as_ref().is_some_and(|a| self.hold_account(a)) {
                                     let creds = self.aws_creds()?;
                                     let http = aws::Blocking::new();
                                     for (region, n) in &networks {
@@ -2105,7 +2195,7 @@ impl Dashboard {
                                 let account = cloudflare::status(plane.url(), &self.status_key).and_then(|s| s["aws"]["account_id"].as_str().map(str::to_string));
                                 let given = cloudflare::status(plane.url(), &self.status_key).map(|s| s["aws_networks"].clone()).unwrap_or_default();
                                 let own: Vec<String> = regions.iter().filter(|r| given.get(r.as_str()).is_none()).cloned().collect();
-                                if self.aws.as_ref().is_some_and(|a| Some(&a.account_id) == account.as_ref()) { aws::make_networks(&self.aws_creds()?, plane.plane_id(), &own)?; }
+                                if account.as_ref().is_some_and(|a| self.hold_account(a)) { aws::make_networks(&self.aws_creds()?, plane.plane_id(), &own)?; }
                                 self.put_secret(&plane, "AWS_REGIONS", &want.to_string())?;
                                 self.shown(&plane, |s| s["aws_regions"] == want)?;
                             }
@@ -2159,17 +2249,20 @@ impl Dashboard {
         // page stays as it is (a thin bar at the top) until the next one is ready, so nothing flashes in between.
         let script = r#"<script>(function(){var main=document.getElementById('live'),timer;
 var sections={plane:'planes',settings:'planes','add-runners':'runners',gitlab:'repos'};
+function cc(){return new URLSearchParams(location.search).get('c')||''}
+function keep(u){if(!u.searchParams.has('c')){if(cc())u.searchParams.set('c',cc())}else if(!u.searchParams.get('c'))u.searchParams.delete('c');return u}
+function mark(){document.querySelectorAll('a[href^="/?"],a[href="/"]').forEach(function(a){if(a.target)return;var u=keep(new URL(a.getAttribute('href'),location.href));a.setAttribute('href',u.pathname+u.search+u.hash)});var all=document.getElementById('side-all'),list=!!main.querySelector('[data-list]');if(all){all.hidden=!main.querySelector('[data-many]');if(list)all.setAttribute('aria-current','true')}document.body.classList.toggle('listing',list)}
 function frag(){var q=location.search;return '/'+(q?q+'&fragment=1':'?fragment=1')}
 function current(){var p=new URLSearchParams(location.search).get('p')||'overview';p=sections[p]||p;document.querySelectorAll('.side .nav a').forEach(function(a){a.setAttribute('aria-current',String(new URL(a.href).searchParams.get('p')===p))})}
 var shown='';
-function show(h){var to=h.match(/data-go="([^"]+)"/);if(to){go(to[1]);return}document.body.classList.remove('busy');clearTimeout(timer);var ld=h.match(/data-loading="([^"]+)"/),cur=main.querySelector('[data-loading]'),again=h.match(/data-refresh="(\d+)"/);if(h===shown||(ld&&cur&&cur.getAttribute('data-loading')===ld[1])){if(again)timer=setTimeout(load,again[1]*1000);return}shown=h;main.innerHTML=h;main.querySelectorAll('form.picker').forEach(superciPick);if(location.hash){var hd=document.getElementById(location.hash.slice(1));if(hd){if(hd.tagName==='DETAILS')hd.open=true;hd.scrollIntoView({block:'center'})}}document.body.classList.toggle('gated',!!main.querySelector('[data-gated]'));var cl=main.querySelector('[data-called]');if(cl){var cn=cl.getAttribute('data-called'),cb=document.querySelector('.brand span');if(cb.textContent!==cn)cb.textContent=cn;if(document.title!==cn)document.title=cn}var u=main.querySelector('[data-side]'),su=document.getElementById('side-update'),nx=u?u.innerHTML:'';if(u)u.remove();if(su.innerHTML!==nx)su.innerHTML=nx;document.querySelectorAll('input[name=next]').forEach(function(i){i.value=location.search+(i.dataset.open&&location.search?'&open='+i.dataset.open:'')});var op=new URLSearchParams(location.search).get('open');if(op){var od=document.getElementById(op);if(od&&od.showModal)od.showModal();if(od||!main.querySelector('[data-refresh]')){var ou=new URL(location.href);ou.searchParams.delete('open');history.replaceState(null,'',ou.pathname+ou.search+ou.hash)}}clearTimeout(timer);var t=main.querySelector('[data-refresh]');if(t)timer=setTimeout(load,t.getAttribute('data-refresh')*1000)}
+function show(h){var to=h.match(/data-go="([^"]+)"/);if(to){go(to[1]);return}document.body.classList.remove('busy');clearTimeout(timer);var ld=h.match(/data-loading="([^"]+)"/),cur=main.querySelector('[data-loading]'),again=h.match(/data-refresh="(\d+)"/);if(h===shown||(ld&&cur&&cur.getAttribute('data-loading')===ld[1])){if(again)timer=setTimeout(load,again[1]*1000);return}shown=h;main.innerHTML=h;mark();main.querySelectorAll('form.picker').forEach(superciPick);if(location.hash){var hd=document.getElementById(location.hash.slice(1));if(hd){if(hd.tagName==='DETAILS')hd.open=true;hd.scrollIntoView({block:'center'})}}document.body.classList.toggle('gated',!!main.querySelector('[data-gated]'));var cl=main.querySelector('[data-called]');if(cl){var cn=cl.getAttribute('data-called'),cb=document.querySelector('.brand span');if(cb.textContent!==cn)cb.textContent=cn;if(document.title!==cn)document.title=cn}var u=main.querySelector('[data-side]'),su=document.getElementById('side-update'),nx=u?u.innerHTML:'';if(u)u.remove();if(su.innerHTML!==nx)su.innerHTML=nx;document.querySelectorAll('input[name=next]').forEach(function(i){i.value=location.search+(i.dataset.open&&location.search?'&open='+i.dataset.open:'')});var op=new URLSearchParams(location.search).get('open');if(op){var od=document.getElementById(op);if(od&&od.showModal)od.showModal();if(od||!main.querySelector('[data-refresh]')){var ou=new URL(location.href);ou.searchParams.delete('open');history.replaceState(null,'',ou.pathname+ou.search+ou.hash)}}clearTimeout(timer);var t=main.querySelector('[data-refresh]');if(t)timer=setTimeout(load,t.getAttribute('data-refresh')*1000)}
 function load(){fetch(frag(),{credentials:'same-origin'}).then(function(r){return r.text()}).then(show).catch(function(){document.body.classList.remove('busy');main.innerHTML='<div class="empty">The dashboard stopped. Run superci dashboard again.</div>'})}
-function go(url){var u=new URL(url,location.href);history.pushState(null,'',u.pathname+u.search+u.hash);current();clearTimeout(timer);document.body.classList.add('busy');window.scrollTo(0,0);load()}
+function go(url){var u=keep(new URL(url,location.href));history.pushState(null,'',u.pathname+u.search+u.hash);current();clearTimeout(timer);document.body.classList.add('busy');window.scrollTo(0,0);load()}
 document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a||a.target||e.defaultPrevented||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;var u=new URL(a.href,location.href);if(u.origin!==location.origin||u.pathname!=='/'||u.searchParams.has('k')||(u.search===location.search&&u.hash))return;e.preventDefault();go(u.href)});
-document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute('action')||'';if(e.defaultPrevented||(f.getAttribute('method')||'').toLowerCase()!=='post'||act.charAt(0)!=='/'||/signin$|^\/github\/start/.test(act))return;e.preventDefault();var d=f.closest('dialog');document.body.classList.add('busy');var b=e.submitter||f.querySelector('button:not([type=button])');if(b&&!b.disabled){b.disabled=true;b.innerHTML='<span class="mini-spin"></span>'+(b.classList.contains('danger')?'Working…':'Saving…');b.classList.add('working')}fetch(act,{method:'POST',body:new URLSearchParams(new FormData(f,e.submitter)),credentials:'same-origin'}).then(function(r){if(d&&d.open)d.close();var u=new URL(r.url);if(r.redirected&&u.origin===location.origin){go(u.href);return}if(r.redirected){location.href=r.url;return}return r.text().then(function(t){document.open();document.write(t);document.close()})}).catch(function(){f.submit()})});
+document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute('action')||'';if(e.defaultPrevented||(f.getAttribute('method')||'').toLowerCase()!=='post'||act.charAt(0)!=='/')return;if(/signin$|^\/github\/start/.test(act)){if(cc()&&!f.querySelector('[name=c]')){var ci=document.createElement('input');ci.type='hidden';ci.name='c';ci.value=cc();f.appendChild(ci)}return}e.preventDefault();var d=f.closest('dialog');document.body.classList.add('busy');var b=e.submitter||f.querySelector('button:not([type=button])');if(b&&!b.disabled){b.disabled=true;b.innerHTML='<span class="mini-spin"></span>'+(b.classList.contains('danger')?'Working…':'Saving…');b.classList.add('working')}fetch(act+(cc()?(act.indexOf('?')<0?'?':'&')+'c='+encodeURIComponent(cc()):''),{method:'POST',body:new URLSearchParams(new FormData(f,e.submitter)),credentials:'same-origin'}).then(function(r){if(d&&d.open)d.close();var u=new URL(r.url);if(r.redirected&&u.origin===location.origin){go(u.href);return}if(r.redirected){location.href=r.url;return}return r.text().then(function(t){document.open();document.write(t);document.close()})}).catch(function(){f.submit()})});
 window.addEventListener('popstate',function(){current();document.body.classList.add('busy');load()});
 window.addEventListener('pageshow',function(e){if(e.persisted)load()});
-load()})();</script>"#;
+mark();load()})();</script>"#;
         document(200, &called_now(), &format!(r#"<div class="layout">{}<main class="main" id="live">{skeleton}</main></div>{PAGE_JS}{script}"#, Self::sidebar(section)), None)
     }
 
@@ -2263,7 +2356,7 @@ load()})();</script>"#;
         Dashboard::measure(shared, &mut d);
         d.check_permissions();
         // The page shows, and changes, the control plane in use.
-        if let Some(i) = views.get(view::in_use(&views)).and_then(|v| d.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { d.selected = i }
+        if let Some(i) = views.get(view::in_use(&views)).and_then(|v| d.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { d.select(i) }
         if let Some((_, account)) = quota_creds { d.quotas = quotas; d.quotas_for = Some((account, now_ms())); }
         if let Some(Ok(Some(session))) = modal { d.modal = Some(session); d.modal_pending = None; d.looked_modal = false; }
         // The App is installed (or the wait is over): nothing more to wait for.
@@ -2302,6 +2395,12 @@ load()})();</script>"#;
             // Back from Modal's sign-in: the page looks again until it is approved.
             let gate = self.gate(section, last);
             return if self.modal_pending.is_some() { format!(r#"<div data-refresh="3"></div>{gate}"#) } else { gate }
+        }
+        // Several control planes live and this page names none: the list of them, to open one. (Setting a new one
+        // up belongs to none of them.) A page that names one shows that one.
+        if section == "all" || (view::several(views).is_some() && section != "plane") {
+            lock(side()).clear();
+            return format!(r#"{}<div data-many data-list hidden></div><div data-called="SuperCI" hidden></div>"#, self.all_page(views));
         }
         let current = views.get(view::in_use(views));
         // A control plane that has not picked up this session's key yet: look again in a moment.
@@ -2355,6 +2454,8 @@ load()})();</script>"#;
         let name = current.map(|v| v.name()).unwrap_or_else(|| "SuperCI".to_string());
         *lock(called()) = name.clone();
         let html = format!(r#"{html}<div data-called="{}" hidden></div>"#, esc(&name));
+        // With more than one control plane known, the sidebar offers the list of them.
+        let html = if views.iter().filter(|v| !matches!(v.plane, Plane::Seen { .. })).count() > 1 { format!("{html}<div data-many hidden></div>") } else { html };
         let html = if card.is_empty() { html } else { format!(r#"{html}<div data-side hidden>{card}</div>"#) };
         if waiting || settling { format!(r#"<div data-refresh="{}"></div>{html}"#, if settling { 2 } else { 5 }) } else { html }
     }
@@ -2366,7 +2467,8 @@ load()})();</script>"#;
             link("workflows", "Workflows", ICON_WORKFLOWS), link("jobs", "Jobs", ICON_JOBS));
         // At the bottom: an update for the control plane, when it needs one (filled in by the page's live part), the
         // control plane itself, its settings (and signing SuperCI out on this computer), and what is new.
-        let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("settings", "Settings", ICON_SETTINGS), link("changes", "Changelog", ICON_NEWS));
+        let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("settings", "Settings", ICON_SETTINGS), link("changes", "Changelog", ICON_NEWS))
+            .replacen(r#"<nav class="nav">"#, &format!(r#"<nav class="nav"><a id="side-all" hidden href="/?p=all&c=" aria-current="false">{ICON_OVERVIEW}<span>All control planes</span></a>"#), 1);
         format!(r#"<aside class="side"><div class="brand">{MARK}<span>{}</span>{THEME_TOGGLE}</div>{nav}{foot}</aside>"#, esc(&called_now()))
     }
 
@@ -2374,7 +2476,10 @@ load()})();</script>"#;
     /// its one action (connect, then deploy), the ones not available yet folded under "More clouds".
     fn plane_page(&self) -> String {
         // A deploy has this page to itself while it runs (or once it stopped); when it finished, on to Overview.
-        if std::mem::take(&mut *lock(&self.deployed)) { return r#"<div data-go="/"></div>"#.to_string() }
+        if std::mem::take(&mut *lock(&self.deployed)) {
+            // On to its pages; with other control planes beside it, named in the address.
+            return match lock(&self.deployed_to).take().filter(|_| self.planes.len() > 1) { Some(id) => format!(r#"<div data-go="/?c={id}"></div>"#), None => r#"<div data-go="/"></div>"#.to_string() }
+        }
         if let Some(progress) = self.deploy_progress() {
             return format!(r#"<div class="bar"><h1 class="page-title">Setting up your control plane</h1></div><div class="cards">{progress}</div>"#)
         }
@@ -2405,10 +2510,16 @@ load()})();</script>"#;
             }
             None => Some(connect_action("cloudflare")),
         };
-        let aws = match &self.aws {
-            Some(a) if planes.iter().any(|p| matches!(p, Plane::Aws { account_id, .. } if *account_id == a.account_id)) => None,
-            Some(_) => Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add"><details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Set up</button></form>"#, region_options())),
-            None => Some(connect_action("aws")),
+        // AWS: the accounts signed in to that have none (set one up there); when each has one, another account
+        // can be signed in to beside them.
+        let aws_free: Vec<String> = self.aws_accounts().into_iter().map(|a| a.account_id).filter(|id| !planes.iter().any(|p| matches!(p, Plane::Aws { account_id, .. } if account_id == id))).collect();
+        let aws = match (self.aws_accounts().is_empty(), aws_free.as_slice()) {
+            (true, _) => Some(connect_action("aws")),
+            (_, []) => Some(r#"<form method="post" action="/aws/signin"><input type="hidden" name="next"><button class="button secondary sm">Another AWS account</button></form>"#.to_string()),
+            (_, free) => {
+                let account = match free { [id] => format!(r#"<input type="hidden" name="account" value="{}">"#, esc(id)), list => format!(r#"<select name="account" aria-label="Account">{}</select>"#, list.iter().map(|id| format!(r#"<option value="{0}">account {0}</option>"#, esc(id))).collect::<String>()) };
+                Some(format!(r#"<form method="post" action="/plane/aws" class="aws-add">{account}<details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Set up</button></form>"#, region_options()))
+            }
         };
         let modal = match &self.modal {
             Some(m) if planes.iter().any(|p| matches!(p, Plane::Modal { workspace, .. } if *workspace == m.workspace)) => None,
@@ -2417,7 +2528,7 @@ load()})();</script>"#;
         };
         vec![
             ("cloudflare", format!("A Worker with its own storage{}", signed(self.cf.as_ref().map(|_| cf_free.iter().map(|a| a.1.as_str()).collect::<Vec<_>>().join(", ")).filter(|s| !s.is_empty()))), cloudflare),
-            ("aws", format!("A Lambda function with a table{}", signed(self.aws.as_ref().map(|a| format!("account {} · US East (N. Virginia)", a.account_id)))), aws),
+            ("aws", format!("A Lambda function with a table{}", signed(aws_free.first().cloned().or_else(|| self.aws.as_ref().map(|a| a.account_id.clone())).map(|a| format!("account {a} · US East (N. Virginia)")))), aws),
             ("modal", format!("A web endpoint with a Dict{}", signed(self.modal.as_ref().map(|m| format!("workspace {}", m.workspace)))), modal),
         ]
     }
@@ -2583,7 +2694,7 @@ load()})();</script>"#;
         } else {
             // Signed in where each provider's part is (removing it deletes that part).
             let account = aws_account(v);
-            let signed_in: Vec<&str> = [("aws", self.aws.as_ref().is_some_and(|a| Some(&a.account_id) == account.as_ref())), ("modal", self.modal.is_some()), ("cloudflare", self.cf.is_some())]
+            let signed_in: Vec<&str> = [("aws", self.aws.iter().chain(&self.aws_others).any(|a| Some(&a.account_id) == account.as_ref())), ("modal", self.modal.is_some()), ("cloudflare", self.cf.is_some())]
                 .into_iter().filter(|(_, yes)| *yes).map(|(c, _)| c).collect();
             pools_card(v, &self.quotas, self.cf_month, self.modal_month.as_ref(), &signed_in)
         };
@@ -2734,6 +2845,49 @@ load()})();</script>"#;
             (false, false) => format!(r#"<section class="card">{}</section>"#, empty_state(&icon("play"), "Connect GitHub or GitLab first", "Then this page shows how its workflows use your runners.", r#"<a class="button primary" href="/?p=repos">Repositories</a>"#)),
         };
         format!(r#"{bar}<div class="cards">{default_card}{usage}</div>{picker}{prompt}"#)
+    }
+
+    /// Every control plane known here, each with what it is called, where it lives, what it serves and whether its
+    /// own account is signed in to, and one button to its pages. Above them, adding an organization: on one of them,
+    /// or on a new control plane.
+    fn all_page(&self, views: &[PlaneView]) -> String {
+        let own = self.own();
+        let signed_in = |v: &PlaneView| own.check(&v.plane).is_ok() && match v.plane { Plane::Cloudflare { .. } => self.cf.is_some(), Plane::Aws { account_id: ref a, .. } => self.aws.iter().chain(&self.aws_others).any(|s| &s.account_id == a), Plane::Modal { .. } => self.modal.is_some(), Plane::Seen { .. } => false };
+        // AWS: signed in to its account, whichever account is in hand.
+        let signed_in = |v: &PlaneView| match &v.plane { Plane::Aws { account_id, .. } => self.aws.iter().chain(&self.aws_others).any(|s| &s.account_id == account_id), _ => signed_in(v) };
+        let serves = |v: &PlaneView| -> String {
+            let st = v.status.clone().unwrap_or_default();
+            let mut what: Vec<String> = status_apps(&st).iter().filter_map(|a| a["owner"].as_str().map(|o| format!("GitHub: {o}"))).collect();
+            what.extend(v.gitlabs().into_iter().map(|(_, url, _)| format!("GitLab: {}", url.trim_start_matches("https://"))));
+            if what.is_empty() && v.github { what.push("GitHub".into()) }
+            if what.is_empty() && v.gitlab { what.push("GitLab".into()) }
+            what.join(", ")
+        };
+        let open = |v: &PlaneView, label: &str| format!(r#"<a class="button secondary sm" href="/?c={}">{label}</a>"#, esc(v.plane.plane_id()));
+        let mut rows = String::new();
+        let mut places = String::new();
+        for v in views.iter().filter(|v| !matches!(v.plane, Plane::Seen { .. })) {
+            let place = esc(&v.plane.place());
+            let (title, sub, end) = if !v.online {
+                (place.clone(), "Not answering".to_string(), format!("{}{}", pill("bad", "not answering"), open(v, "Open")))
+            } else if let Some(to) = v.moved_to.as_ref() {
+                (place.clone(), format!("Moved to {}", esc(to.trim_start_matches("https://"))), open(v, "Open"))
+            } else if v.serves_its_own() {
+                let state = if signed_in(v) { pill("good", "Signed in") } else { format!("{}{}", pill("open", "Not signed in"), signin_button(v.plane.cloud(), "Sign in", false)) };
+                (esc(&v.name()), format!("{place} · {}", esc(&serves(v))), format!("{state}{}", open(v, "Open")))
+            } else {
+                (place.clone(), "Serves nothing yet: a place to move to, or to connect a code host".to_string(), open(v, "Open"))
+            };
+            rows.push_str(&format!(r#"<div class="pick act">{}<span><strong>{title}</strong><small>{sub}</small></span><span class="pick-end">{end}</span></div>"#, logo(v.plane.cloud(), 36)));
+            if v.online && v.moved_to.is_none() {
+                let on = if v.serves_its_own() { format!("On {}", esc(&v.name())) } else { "On the one that serves nothing yet".to_string() };
+                places.push_str(&format!(r#"<a class="pick act" href="/?p=repos&c={}">{}<span><strong>{on}</strong><small>{place}{}</small></span><span class="pick-end">›</span></a>"#,
+                    esc(v.plane.plane_id()), logo(v.plane.cloud(), 36), if serves(v).is_empty() { String::new() } else { format!(" · beside {}", esc(&serves(v))) }));
+            }
+        }
+        // Adding an organization: where its jobs should run. Each choice leads to the page that does it.
+        let dialog = format!(r#"<dialog class="dlg" id="add-org" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_ORG}</span><span><strong>Add an organization</strong><small>Where should its jobs run?</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div class="picks">{places}<a class="pick act" href="/?p=plane&c="><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_PLUS}</span><span><strong>On a new control plane</strong><small>In another cloud account: sign in there, set it up, connect the organization</small></span><span class="pick-end">›</span></a></div></div></dialog>"#);
+        format!(r#"<div class="bar"><h1 class="page-title">Control planes</h1><button type="button" class="button primary sm" onclick="document.getElementById('add-org').showModal()">Add an organization</button></div><div class="cards"><section class="card"><div class="picks">{rows}</div></section></div>{dialog}"#)
     }
 
     /// Settings: what the control plane is called and answers to, its limits, and SuperCI's sign-ins on this computer.
@@ -3599,7 +3753,7 @@ fn empty_state(icon_svg: &str, title: &str, text: &str, action: &str) -> String 
 
 fn section_name(section: &str) -> &str {
     match section {
-        s if ["plane", "planes", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "repos", "gitlab"].contains(&s) => s,
+        s if ["plane", "planes", "all", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "repos", "gitlab"].contains(&s) => s,
         _ => "overview",
     }
 }
@@ -3607,7 +3761,7 @@ fn section_name(section: &str) -> &str {
 fn section_title(section: &str) -> &'static str {
     match section {
         "plane" => "Set up a control plane", "planes" => "Control plane", "changes" => "Changelog", "add-runners" => "Add a provider", "runners" => "Runners",
-        "workflows" => "Workflows", "settings" => "Settings", "jobs" => "Jobs", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
+        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" => "Jobs", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
     }
 }
 
@@ -3948,6 +4102,8 @@ fn called_card(v: &PlaneView) -> String {
     format!(r#"<section class="card dm-card">{name_row}{label_row}{label_dialog}{name_dialog}</section>"#)
 }
 
+const ICON_ORG: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V7l7-3v16M11 10l9 3v7M2.5 20h19M7.5 9v.01M7.5 12.5v.01M7.5 16v.01M15.5 15v.01M15.5 17.5v.01"/></svg>"#;
+const ICON_PLUS: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg>"#;
 const ICON_SIGNOUT: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h9"/></svg>"#;
 const ICON_NAME: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7V5.5h14V7M12 5.5v13M9.5 18.5h5"/></svg>"#;
@@ -4196,6 +4352,9 @@ fn safe_return(next: &str) -> String {
 /// dashboard's state, and everything else handled with it.
 fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
     let q = |n: &str| req.query.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str()).unwrap_or("");
+    // The control plane this request names: in its address (`c`), or in its form.
+    let c = Some(q("c").to_string()).filter(|c| !c.is_empty()).or_else(|| url::form_urlencoded::parse(&req.body).find(|(k, _)| k == "c").map(|(_, v)| v.into_owned()));
+    view::name(c.as_deref().filter(|c| c.len() <= 24 && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())));
     // The first visit carries the key; later ones its cookie. SameSite=Lax: other sites' requests and form posts never carry it,
     // but coming back from a sign-in does (AWS's returns to 127.0.0.1, which is another site to a browser than localhost).
     if req.path == "/" && safe_eq(q("k").as_bytes(), key.as_bytes()) {
@@ -4234,6 +4393,21 @@ fn respond(shared: &Arc<Mutex<Dashboard>>, key: &str, req: &Req) -> Response {
         return Dashboard::page(q("p"));
     }
     let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
+    // Which control plane this is for: the one its page names; else the only one. With several live and none
+    // named, only what belongs to no control plane goes on (a sign-in, setting a new one up, deleting a named one).
+    match view::named() {
+        Some(id) => match d.planes.iter().position(|p| p.plane_id() == id) {
+            Some(i) => d.select(i),
+            None => return message(404, "That control plane is not known here", "Open the dashboard again and pick one from the list. Nothing has changed."),
+        },
+        None => {
+            let apart = ["/signout", "/aws/signin", "/cloudflare/signin", "/modal/", "/plane/aws", "/plane/cloudflare", "/plane/modal", "/plane/delete", "/connect/", "/oauth/", "/github/callback", "/github/installed"];
+            if !apart.iter().any(|a| req.path.starts_with(a)) && d.planes.len() > 1 {
+                let views = d.views.clone().map(|(v, _)| v).unwrap_or_else(|| d.planes.iter().map(|p| view::plane_view(p, None)).collect());
+                if view::several(&views).is_some() { return message(409, "Which control plane?", "Several control planes are live here. Open one from the list and do this on its pages. Nothing has changed.") }
+            }
+        }
+    }
     d.views = None;
     // Actions and sign-ins are told in the terminal too (never their codes or tokens).
     d.take_in();
@@ -4618,9 +4792,22 @@ mod tests {
         // Another one that serves a code host of its own (another team's): shown, with no Move here and no Delete.
         let mut theirs = other.clone();
         (theirs.github, theirs.installed) = (true, true);
-        let beside = d.render("planes", &[view.clone(), theirs], None);
+        // Two that are live and a page that names neither: the list of them, each with one button to its pages, and
+        // adding an organization on either or on a new one. Nothing picks one of them.
+        let list = d.render("planes", &[view.clone(), theirs.clone()], None);
+        preview("all", &list);
+        assert!(list.contains(r#"<h1 class="page-title">Control planes</h1>"#) && list.contains(&format!(r#"href="/?c={}">Open</a>"#, view.plane.plane_id())) && list.contains(r#"href="/?c=xyz000000001">Open</a>"#), "{}", &list[..400.min(list.len())]);
+        assert!(list.contains("Add an organization</button>") && list.contains(r#"href="/?p=repos&c=xyz000000001""#) && list.contains("On a new control plane") && list.contains(r#"href="/?p=plane&c=""#) && list.contains("data-many"));
+        assert!(!list.contains("Move here") && !list.contains(r#"action="/plane/"#) && d.render("jobs", &[view.clone(), theirs.clone()], None).contains("Control planes</h1>"), "every page is the list until one is named");
+        // A page that names one shows that one, and offers nothing of the other.
+        view::name(Some(view.plane.plane_id()));
+        let beside = d.render("planes", &[view.clone(), theirs.clone()], None);
         preview("planes-two-teams", &beside);
-        assert!(beside.contains("Serves a code host of its own") && !beside.contains("Move here</button>") && !beside.contains(r#"action="/plane/delete""#), "nothing of another team's is offered");
+        assert!(beside.contains("pick act current") && beside.contains("Serves a code host of its own") && !beside.contains("Move here</button>") && !beside.contains(r#"action="/plane/delete""#) && beside.contains("data-many"), "nothing of another team's is offered");
+        view::name(Some("xyz000000001"));
+        assert_eq!(view::in_use(&[view.clone(), theirs.clone()]), 1, "the one named, not the first that answers");
+        view::name(None);
+        assert!(view::several(&[view.clone(), theirs]).is_some() && view::several(&[view.clone(), other.clone()]).is_none(), "one live beside an empty one is as before");
         // Move here's confirmation says what comes along; the other one can be deleted.
         assert!(html.contains(r#"<dialog class="dlg" id="move-0""#) && html.contains("Your GitHub App and its installations") && html.contains(r#"<input type="hidden" name="plane" value="xyz000000001"><button class="button primary sm">Move</button>"#));
         assert!(html.contains(r#"<form method="post" action="/plane/delete""#) && html.contains("Delete Modal · acme?") && html.contains(r#"document.getElementById('delete-0').showModal()">Delete…</button>"#));
@@ -5062,6 +5249,45 @@ mod tests {
         assert!(cost_text(&j(None, "cloudflare"), 0.0123).contains("Estimated until Cloudflare&#39;s metering has it") || cost_text(&j(None, "cloudflare"), 0.0123).contains("Estimated until Cloudflare's metering has it"));
         assert!(cost_text(&j(Some("measured"), "cloudflare"), 0.0123).contains(r#"title="As Cloudflare metered it">$0.0123<"#));
         assert!(cost_text(&j(Some("prices"), "aws"), 0.5).contains(">$0.50<") && !cost_text(&j(Some("prices"), "aws"), 0.5).contains('≈'));
+    }
+
+    #[test]
+    fn several_aws_accounts_are_kept_and_each_control_plane_is_acted_on_with_its_own() {
+        let dir = std::env::temp_dir().join(format!("superci-accounts-{}", random_token(6)));
+        let store = Store::at(&dir);
+        let aws = |id: &str, account: &str| Plane::Aws { account_id: account.into(), region: "us-east-1".into(), url: format!("https://{id}.lambda-url.us-east-1.on.aws"), plane_id: id.into(), label: "superci".into() };
+        let mut d = Dashboard::new();
+        d.store = Some(store.clone());
+        // A sign-in to AWS adds an account beside the one there; the same account again is renewed, not doubled.
+        d.add_account(aws::Session::for_test("111111111111"));
+        d.add_account(aws::Session::for_test("222222222222"));
+        d.add_account(aws::Session::for_test("222222222222"));
+        assert_eq!(d.aws_accounts().iter().map(|a| a.account_id.as_str()).collect::<Vec<_>>(), ["111111111111", "222222222222"]);
+        assert_eq!(d.signed_in_as().as_deref(), Some("AWS account 111111111111, AWS account 222222222222"));
+        assert!(d.aws_came && d.aws.as_ref().unwrap().account_id == "222222222222", "the one just signed in to is in hand");
+        // Selecting a control plane takes its own account's sign-in in hand: what is written is written with that one.
+        d.planes = vec![aws("aaaaaaaaaaaa", "111111111111"), aws("bbbbbbbbbbbb", "222222222222")];
+        d.select(0);
+        assert!(d.aws.as_ref().unwrap().account_id == "111111111111" && d.own().check(&d.planes[0]).is_ok() && d.own().check(&d.planes[1]).is_err());
+        d.select(1);
+        assert!(d.aws.as_ref().unwrap().account_id == "222222222222" && d.own().check(&d.planes[1]).is_ok());
+        assert!(d.hold_account("111111111111") && !d.hold_account("333333333333") && d.aws_accounts().len() == 2);
+        // Kept in one order whichever is in hand, with every control plane known; and loaded again with the kept
+        // control plane's own account in hand.
+        d.select(1);
+        d.keep();
+        let kept = store.read();
+        assert_eq!((kept.aws.as_ref().map(|a| a.account_id.as_str()), kept.aws_more.len(), kept.plane.as_ref().map(|p| p.plane_id()), kept.planes_more.len()), (Some("111111111111"), 1, Some("bbbbbbbbbbbb"), 1));
+        let again = Dashboard::signed_in(Some(store.clone()));
+        assert!(again.aws.as_ref().unwrap().account_id == "222222222222" && again.aws_others.len() == 1 && again.planes.len() == 2);
+        // The set-up page: each account has a control plane, so another account can be signed in to beside them.
+        let actions = again.setup_actions(&again.planes);
+        assert!(actions.iter().any(|(cloud, _, action)| *cloud == "aws" && action.as_ref().is_some_and(|a| a.contains("Another AWS account"))));
+        // An account with none is offered for setting one up, named in the form.
+        let mut third = Dashboard::signed_in(Some(store.clone()));
+        third.add_account(aws::Session::for_test("333333333333"));
+        assert!(third.setup_actions(&third.planes).iter().any(|(cloud, what, action)| *cloud == "aws" && what.contains("account 333333333333") && action.as_ref().is_some_and(|a| a.contains(r#"name="account" value="333333333333""#))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

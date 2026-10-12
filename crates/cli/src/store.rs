@@ -19,12 +19,18 @@ pub struct Kept {
     pub cloudflare: Option<cloudflare::Session>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws: Option<aws::Session>,
+    /// Further AWS accounts signed in to (a second sign-in to AWS adds an account; it replaces none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aws_more: Vec<aws::Session>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modal: Option<modal::Session>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<Key>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plane: Option<Plane>,
+    /// The other control planes known, so that each is listed at once, also one whose account's sign-in has ended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planes_more: Vec<Plane>,
     /// The AWS sign-in kept here was ended by AWS (it ends one after twelve hours at most) and has not been made
     /// again: said where it matters, and the key and the control plane stay, so looking goes on working.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -35,7 +41,7 @@ pub struct Kept {
 pub struct Key { pub name: String, pub value: String, pub planes: Vec<String> }
 
 impl Kept {
-    pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || self.modal.is_some() }
+    pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || !self.aws_more.is_empty() || self.modal.is_some() }
     /// Worth keeping: a sign-in, or what is left of one AWS ended (the control plane and the key it is read with).
     pub fn worth_keeping(&self) -> bool { self.signed_in() || (self.aws_ended && self.key.is_some() && self.plane.is_some()) }
 }

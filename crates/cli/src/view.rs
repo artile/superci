@@ -135,9 +135,41 @@ impl PlaneView {
 /// The first version that can move to another control plane.
 pub const MOVE_VERSION: &str = "0.9.3";
 
+thread_local! {
+    /// The control plane this request or command names (its id, or its address): a page opened for one, `--plane=ID`,
+    /// `SUPERCI_PLANE`. Each request and each command runs on a thread of its own.
+    static NAMED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Names the control plane for what this thread does next (none: the only one, see `in_use` and `several`).
+pub fn name(named: Option<&str>) { NAMED.with(|n| *n.borrow_mut() = named.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)) }
+
+pub fn named() -> Option<String> { NAMED.with(|n| n.borrow().clone()) }
+
+/// Whether a control plane is the one a name says: by its id, or by its address.
+pub fn is(plane: &Plane, named: &str) -> bool { plane.plane_id() == named || plane.url().trim_end_matches('/') == named.trim_end_matches('/') }
+
+/// The control planes that serve a code host of their own, when there are several and none is named: nothing picks
+/// among them (no "first that answers", no last used); whoever asked has to say which.
+pub fn several(views: &[PlaneView]) -> Option<Vec<&PlaneView>> {
+    if named().is_some_and(|n| views.iter().any(|v| is(&v.plane, &n))) { return None }
+    let live: Vec<&PlaneView> = views.iter().filter(|v| v.serves_its_own()).collect();
+    (live.len() > 1).then_some(live)
+}
+
+/// What is said to a command when several control planes are live and it named none.
+pub fn name_one(live: &[&PlaneView]) -> String {
+    let rows: Vec<String> = live.iter().map(|v| format!("  {}  {}", v.plane.plane_id(), v.plane.place())).collect();
+    format!("{} control planes are live here. Name one: --plane=ID (or SUPERCI_PLANE=ID). Nothing was done.\n{}", live.len(), rows.join("\n"))
+}
+
 /// The control plane in use: of those that have not moved away, the one GitHub or GitLab sends jobs to (else the
 /// first). Only one is in use at a time; the others are places to move to.
 pub fn in_use(views: &[PlaneView]) -> usize {
+    // The one named for this request or command (see `name`), when it is among them.
+    if let Some(named) = named() {
+        if let Some(i) = views.iter().position(|v| is(&v.plane, &named)) { return i }
+    }
     let staying: Vec<usize> = (0..views.len()).filter(|i| views[*i].moved_to.is_none()).collect();
     let active: Vec<usize> = staying.iter().copied().filter(|i| !views[*i].standby).collect();
     active.iter().copied().find(|i| views[*i].online && (views[*i].github || views[*i].gitlab))

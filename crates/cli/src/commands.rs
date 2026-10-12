@@ -18,14 +18,14 @@ const HELP: &[(&str, &str, &str)] = &[
     ("dashboard", "  superci dashboard                 Opens your dashboard in the browser (on this machine only, while it runs).",
         "Set up or find SuperCI in your cloud, connect repositories and runner providers, and see your jobs. It opens signed in\nonce you have signed in before. Ctrl-C stops it; your runners keep working without it.\n\n  --no-browser    Prints its link without opening it."),
     ("login", "  superci login [CLOUD]             Signs in with a cloud in the browser (aws, cloudflare, modal), and ends.",
-        "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci) and commands use it from then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again.\n\n  --no-browser    Prints the link without opening it."),
+        "A person signs in once; SuperCI keeps that sign-in in its own folder (~/.superci) and commands use it from then on.\nWithout a cloud, the first screen asks which. AWS ends a sign-in after twelve hours at most: looking still works\nafter that, and a change in AWS asks for `superci login aws` again. A sign-in adds an account beside the others:\n`superci login aws --add` signs in to one more AWS account.\n\n  --no-browser    Prints the link without opening it.\n  --add           One more AWS account, beside those signed in to."),
     ("logout", "  superci logout                    Removes SuperCI's sign-ins from this machine.",
         "It also asks Cloudflare to end its sign-in, and the control plane to forget this machine's key. Your control plane\nand runners keep working."),
     ("status", "  superci status                    The control plane in use: where, its version, whether jobs can run.",
         "With --json: the control plane, and under \"status\" everything it says of itself (repositories, runner providers,\nlimits, the latest jobs)."),
     ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N]",
         "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job, with the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, a million at most). GitHub keeps a job's log once the job has ended."),
-    ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
+    ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
     ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
         "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's limits: jobs at once, dollars a month (`none` lifts one). --enabled: aws-on-demand only.\n          --regions and --networks are AWS's (a network of your own per region; give --networks once per region),\n          --location and --image Cloudflare's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal. A job goes to the first that can run it and is\n          within its limits; when one cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
@@ -121,7 +121,7 @@ fn usage<T>(say: impl Into<String>) -> Result<T> { Err(Fail::Usage(say.into())) 
 pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
-const SWITCHES: [&str; 9] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version"];
+const SWITCHES: [&str; 10] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add"];
 const VALUES: [&str; 24] = ["enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
@@ -187,7 +187,8 @@ fn in_use(d: &Dashboard) -> Result<Plane> { Ok(d.plane_in_use().ok_or(NO_PLANE)?
 
 thread_local! {
     /// The control plane a command was told to act on (`--plane=ID`, or `SUPERCI_PLANE` with no key), and where that
-    /// was said. A check: a command acts on the control plane in use, and stops when that is another one.
+    /// was said. It is the one the command acts on (`view::name`); checked again where the command is about to act,
+    /// so that a name that matches nothing stops it and never falls through to another control plane.
     static NAMED: std::cell::RefCell<Option<(String, &'static str)>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -200,6 +201,7 @@ fn name_plane(args: &Args) {
         None if var("SUPERCI_KEY").is_none() => var("SUPERCI_PLANE").map(|p| (p, "SUPERCI_PLANE")),
         None => None,
     };
+    crate::view::name(named.as_ref().map(|(p, _)| p.as_str()));
     NAMED.with(|n| *n.borrow_mut() = named);
 }
 
@@ -207,7 +209,7 @@ fn name_plane(args: &Args) {
 fn named_is(id: &str, url: &str, place: &str) -> Result<()> {
     let Some((named, by)) = NAMED.with(|n| n.borrow().clone()) else { return Ok(()) };
     if named == id || named.trim_end_matches('/') == url.trim_end_matches('/') { return Ok(()) }
-    Err(Fail::Failed(format!("{by} names the control plane {named}, and the one in use here is {id} ({place}). Nothing was done. `superci planes list` lists them.")))
+    Err(Fail::Failed(format!("{by} names the control plane {named}, which is not among the control planes here (this would have acted on {id}, {place}). Nothing was done. `superci planes list` lists them.")))
 }
 
 fn named_is_in_use(d: &Dashboard) -> Result<()> {
@@ -374,7 +376,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let region = match (cloud, args.get("region")) { ("aws", None) => return usage("Say where: --region=us-east-1 (any AWS region the dashboard's Control plane page lists)."), (_, r) => r.unwrap_or_default().to_string() };
             let mut d = ready()?;
             let (fields, place) = match cloud {
-                "aws" => (vec![field("region", region.clone())], format!("AWS, in {region}")),
+                "aws" => (std::iter::once(field("region", region.clone())).chain(args.get("account").map(|a| field("account", a))).collect(), format!("AWS, in {region}")),
                 "cloudflare" => {
                     let accounts = d.cloudflare_accounts();
                     let account = match (args.get("account"), accounts) {
@@ -416,9 +418,10 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             Ok(Done::said(apply!(d, args, would, "/plane/delete", &[field("plane", w(2))])))
         }
         ("leave", "") => {
-            // Here `--plane=ID` says which one is stopped (the others go on); without it, the one in use.
+            // `--plane=ID` says which one is stopped (the others go on). What deletes takes its control plane from
+            // the command itself, never from SUPERCI_PLANE: without the flag it is the only live one, or it stops.
             let named = args.get("plane").map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
-            if named.is_some() { NAMED.with(|n| n.borrow_mut().take()); }
+            if named.is_none() { NAMED.with(|n| n.borrow_mut().take()); crate::view::name(None) }
             let would = match &named {
                 Some(id) => format!("stop the control plane {id}: GitHub and GitLab stop sending it jobs, and it is deleted with what was made for it"),
                 None => "stop SuperCI: GitHub and GitLab stop sending jobs, and the control plane is deleted with what was made for it, with the ones that serve nothing".to_string(),
@@ -635,9 +638,15 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
                 "" => None,
                 c => match CLOUDS.iter().find(|k| **k == c) { Some(k) => Some(*k), None => return Some(usage("Say which: `superci login aws`, `cloudflare` or `modal`.")) },
             };
-            let d = signed_in();
+            let mut d = signed_in();
+            // `--add`: one more AWS account beside those signed in to (a sign-in adds an account; it replaces none).
+            let add = args.has("add") && cloud == Some("aws");
             let there = match cloud { Some(c) => d.signed_in_as().is_some_and(|s| s.to_lowercase().contains(c)), None => d.signed_in_as().is_some() };
-            if there { println!("SuperCI is signed in on this computer: {}. `superci logout` removes it.", d.signed_in_as().unwrap_or_default()); return Some(Ok(())) }
+            if there && !add {
+                println!("SuperCI is signed in on this computer: {}. `superci logout` removes it.{}", d.signed_in_as().unwrap_or_default(), if cloud == Some("aws") { " `superci login aws --add` signs in to another AWS account beside it." } else { "" });
+                return Some(Ok(()))
+            }
+            d.adding = add;
             Some(d.for_task(Task::Login(cloud)).serve(open).map_err(Fail::from))
         }
         ("github", "create") => Some((|| {
@@ -724,8 +733,10 @@ fn gitlab() -> Result<Done> {
 
 fn planes() -> Result<Done> {
     let (views, used): (Vec<PlaneView>, usize) = signed_in().all()?;
-    let list: Vec<Value> = views.iter().enumerate().map(|(i, v)| { let mut p = plane_json(v); p["in_use"] = (i == used).into(); p }).collect();
-    let mut said: Vec<String> = list.iter().map(|p| format!("{}  {:<44} {}{}", p["id"].as_str().unwrap_or_default(), p["where"].as_str().unwrap_or_default(), p["version"].as_str().unwrap_or("not answering"), if p["in_use"] == true { "  in use" } else { "" })).collect();
+    // One live: it is the one in use. Several: each is live, and none is "the" one (commands name theirs).
+    let several = views.iter().filter(|v| v.serves_its_own()).count() > 1;
+    let list: Vec<Value> = views.iter().enumerate().map(|(i, v)| { let mut p = plane_json(v); p["in_use"] = (!several && i == used).into(); p["live"] = v.serves_its_own().into(); p }).collect();
+    let mut said: Vec<String> = list.iter().map(|p| format!("{}  {:<44} {}{}", p["id"].as_str().unwrap_or_default(), p["where"].as_str().unwrap_or_default(), p["version"].as_str().unwrap_or("not answering"), if p["in_use"] == true { "  in use" } else if several && p["live"] == true { "  live" } else { "" })).collect();
     if said.is_empty() { said.push(format!("No control plane in the clouds signed in to. {}", NO_PLANE.trim_start_matches("There is no control plane yet. "))) }
     Ok(Done { said, data: json!({ "control_planes": list }) })
 }
@@ -737,7 +748,7 @@ mod tests {
     fn args(line: &str) -> Args { Args::parse(&line.split_whitespace().map(str::to_string).collect::<Vec<_>>()).unwrap() }
 
     #[test]
-    fn a_named_control_plane_that_is_not_the_one_in_use_stops_the_command() {
+    fn a_name_that_is_none_of_the_control_planes_here_stops_the_command() {
         let (id, url, place) = ("aaaaaaaaaaaa", "https://a.lambda-url.us-east-1.on.aws", "AWS · 111111111111 · us-east-1");
         // Nothing named: as before.
         name_plane(&args("status"));
@@ -749,7 +760,7 @@ mod tests {
         assert!(named_is(id, url, place).is_ok());
         name_plane(&args("runners update aws --max-jobs=5 --plane=bbbbbbbbbbbb"));
         let Err(Fail::Failed(said)) = named_is(id, url, place) else { panic!("another control plane named") };
-        assert_eq!(said, "--plane names the control plane bbbbbbbbbbbb, and the one in use here is aaaaaaaaaaaa (AWS · 111111111111 · us-east-1). Nothing was done. `superci planes list` lists them.");
+        assert_eq!(said, "--plane names the control plane bbbbbbbbbbbb, which is not among the control planes here (this would have acted on aaaaaaaaaaaa, AWS · 111111111111 · us-east-1). Nothing was done. `superci planes list` lists them.");
         name_plane(&args("status"));
     }
 

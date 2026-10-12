@@ -2,6 +2,14 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.14.0 — unreleased
+- Several control planes from one computer: two companies, staging beside production, a consultant's clients. With one control plane nothing changes.
+- A sign-in to AWS adds an account beside the ones signed in to; it replaces none. In the dashboard, the set-up page offers "Another AWS account"; in a terminal, `superci login aws --add`. Each control plane is changed with the sign-in of its own account, whichever others are kept.
+- With several control planes that each serve a code host, the dashboard opens on the list of them: what each is called, where it lives, what it serves, whether its account is signed in to, and one button to its pages. A control plane's pages carry it in their address, so two tabs can show two control planes and a link points at one. "All control planes" in the sidebar leads back to the list.
+- Add an organization, on the list: on one of the control planes there, or on a new one in another cloud account.
+- Commands name their control plane when several are live: `--plane=ID`, or `SUPERCI_PLANE=ID` for a whole shell. A command that names none stops, with nothing done, and lists them; nothing picks one for you. `superci planes list` always lists all, and says which are live. What deletes (`superci leave`) takes the control plane from the command itself, never from the variable.
+- `superci planes create aws --region=… --account=ID` sets a control plane up in a named account of those signed in to.
+
 ## 0.13.2 — 2026-10-12
 - A job that AWS refuses because your account's limit of running CPUs is in use by your own jobs now waits for one of them to end, as it would on GitHub's own runners, and starts at the next sweep after. Before, it was tried three times in forty seconds and then failed. When nothing of yours runs there (the limit is below what the job asks, or something else in the account uses it), it still fails after three tries, and now says so plainly: how many CPUs it asked for, and the two limits to raise in Service Quotas, with their links.
 - The runner that fails a job on GitHub with the reason is asked for as a spot machine and then as an on-demand one, in each of your regions (before: spot only, in the first region). So the reason is delivered even when the spot limit is the reason. Not when on-demand is turned off in your order.
