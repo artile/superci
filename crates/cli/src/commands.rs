@@ -630,8 +630,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 let would = fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
                 apply!(d, args, format!("give `runs-on: superci` this machine: {would}"), "/machine", &fields);
             }
-            let machine = view(&mut d)?.machine();
-            Ok(Done { said: vec![format!("`runs-on: superci` gets: {}.", machine_words(&serde_json::to_value(&machine).unwrap_or_default()))], data: json!({ "ok": true, "machine": machine }) })
+            let seen = view(&mut d)?;
+            let (machine, label) = (seen.machine(), seen.label());
+            Ok(Done { said: vec![format!("`runs-on: {label}` gets: {}.", machine_words(&serde_json::to_value(&machine).unwrap_or_default()))], data: json!({ "ok": true, "machine": machine }) })
         }
         ("limits", operation @ ("retrieve" | "update")) => {
             let mut d = signed_in();
@@ -922,7 +923,8 @@ fn runners_of(d: &mut Dashboard) -> Result<Done> {
         p["max_jobs"].as_u64().map(|n| format!("up to {n} jobs at once  ")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()).trim_end().to_string()).collect();
     if said.is_empty() { said.push("No runner provider yet: `superci runners create aws` (or cloudflare, or modal).".into()) }
     let machine = serde_json::to_value(view.machine()).unwrap_or_default();
-    said.push(format!("`runs-on: superci` gets: {}.", machine_words(&machine)));
+    // (By the label workflows name here: the first of the control plane's.)
+    said.push(format!("`runs-on: {}` gets: {}.", view.label(), machine_words(&machine)));
     Ok(Done { said, data: json!({ "ok": true, "order": order, "machine": machine, "aws_regions": view.aws_regions(), "aws_networks": st["aws_networks"], "cloudflare_location": st["cloudflare_location"], "cloudflare_image": st["cloudflare_image"] }) })
 }
 
