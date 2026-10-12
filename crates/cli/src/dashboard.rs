@@ -59,6 +59,7 @@ pub struct Dashboard {
     /// asked for its organization's picture.
     about: crate::store::About,
     picture_asked_ms: u64,
+    picture_owner: String,
     kept_as: String,
     kept_plane: Option<Plane>,
     keep_failed: bool,
@@ -242,16 +243,16 @@ thread_local! {
     static HERE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
-/// A workspace's own two notes for its pages' frame (see `side` and `called`).
+/// A workspace's own notes for its pages' frame (see `side`, `called` and `pictured`).
 #[cfg(not(test))]
 fn frame(which: usize) -> &'static Mutex<String> {
-    type Notes = [&'static Mutex<String>; 2];
+    type Notes = [&'static Mutex<String>; 3];
     static ALL: Mutex<Vec<(String, Notes)>> = Mutex::new(Vec::new());
     let name = HERE.with(|h| h.borrow().clone());
     let mut all = lock(&ALL);
     if let Some((_, notes)) = all.iter().find(|(n, _)| *n == name) { return notes[which] }
     let note = || -> &'static Mutex<String> { Box::leak(Box::new(Mutex::new(String::new()))) };
-    let notes = [note(), note()];
+    let notes = [note(), note(), note()];
     all.push((name, notes));
     notes[which]
 }
@@ -269,6 +270,11 @@ fn side() -> &'static Mutex<String> { thread_local!(static SIDE: &'static Mutex<
 fn called() -> &'static Mutex<String> { frame(1) }
 #[cfg(test)]
 fn called() -> &'static Mutex<String> { thread_local!(static CALLED: &'static Mutex<String> = Box::leak(Box::new(Mutex::new(String::new())))); CALLED.with(|s| *s) }
+/// The workspace's picture (its GitHub organization's), as last known: the frame's mark at the top of the sidebar.
+#[cfg(not(test))]
+fn pictured() -> &'static Mutex<String> { frame(2) }
+#[cfg(test)]
+fn pictured() -> &'static Mutex<String> { thread_local!(static PICTURED: &'static Mutex<String> = Box::leak(Box::new(Mutex::new(String::new())))); PICTURED.with(|s| *s) }
 fn called_now() -> String { let c = lock(called()); if c.is_empty() { "SuperCI".to_string() } else { c.clone() } }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
@@ -659,7 +665,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -985,6 +991,7 @@ impl Dashboard {
         let mut about = self.about.clone();
         (about.hosts, about.picture, about.picture_of) = (vec![], String::new(), String::new());
         self.set_about(about);
+        (self.picture_owner, self.picture_asked_ms) = (String::new(), 0);
         (self.aws_ended, self.looked_cf, self.looked_aws, self.looked_modal) = (false, false, false, false);
         (self.planes, self.selected, self.kept_plane, self.preloaded, self.views) = (vec![], 0, None, None, None);
         self.cf_accounts.clear();
@@ -1024,14 +1031,21 @@ impl Dashboard {
         // A control plane that has not been named says "SuperCI": the name the workspace was given stands until
         // the control plane has it (see `adopt_deploy`).
         if v.name() != "SuperCI" || about.name.is_empty() { about.name = v.name() }
-        // The picture of the first organization on github.com, asked for once (and again when it is another one).
-        let owner = apps.iter().find(|a| a["host"].as_str().is_none_or(str::is_empty)).and_then(|a| a["owner"].as_str()).unwrap_or_default().to_string();
-        if owner.is_empty() { (about.picture, about.picture_of) = (String::new(), String::new()) }
-        else if about.picture_of != owner && now_ms() > self.picture_asked_ms + 600_000 {
-            self.picture_asked_ms = now_ms();
-            if let Some(picture) = github_picture(&owner) { (about.picture, about.picture_of) = (picture, owner) }
-        }
+        // Whose picture it shows: the first organization on github.com (see `picture_due`). Another one's goes.
+        self.picture_owner = apps.iter().find(|a| a["host"].as_str().is_none_or(str::is_empty)).and_then(|a| a["owner"].as_str()).unwrap_or_default().to_string();
+        if about.picture_of != self.picture_owner { (about.picture, about.picture_of) = (String::new(), String::new()) }
         self.set_about(about);
+    }
+
+    /// The organization whose picture GitHub is to be asked for now: when the dashboard starts, and once a day while
+    /// it runs, so that a logo set on GitHub later shows here by itself (after a try that gave none and with none
+    /// kept: ten minutes later). The picture kept stands until a new one comes.
+    fn picture_due(&mut self) -> Option<String> {
+        if self.picture_owner.is_empty() { return None }
+        let wait = if self.about.picture.is_empty() { 600_000 } else { 24 * 3_600_000 };
+        if self.picture_asked_ms != 0 && now_ms() < self.picture_asked_ms + wait { return None }
+        self.picture_asked_ms = now_ms();
+        Some(self.picture_owner.clone())
     }
 
     /// Keeps what the workspace is called and looks like, when it changed.
@@ -2362,7 +2376,7 @@ function qp(n){return new URLSearchParams(location.search).get(n)||''}
 function cc(){return qp('c')}
 function keep(u){['w','c'].forEach(function(n){if(!u.searchParams.has(n)){if(qp(n))u.searchParams.set(n,qp(n))}else if(!u.searchParams.get(n))u.searchParams.delete(n)});return u}
 (function(){var u=new URL(location.href);if(u.searchParams.has('c')&&!u.searchParams.get('c')){u.searchParams.delete('c');history.replaceState(null,'',u.pathname+u.search+u.hash)}})();
-function mark(){var sw=main.querySelector('[data-switch]'),ss=document.getElementById('side-switch');if(sw&&ss){if(ss.innerHTML!==sw.innerHTML)ss.innerHTML=sw.innerHTML;sw.remove()}if(ss)ss.parentNode.classList.toggle('has',!!ss.innerHTML);document.querySelectorAll('a[href^="/"]').forEach(function(a){if(a.target)return;var u=new URL(a.getAttribute('href'),location.href);if(u.pathname==='/workspaces')return;if(!u.searchParams.has('w')&&qp('w'))u.searchParams.set('w',qp('w'));if(!u.searchParams.has('c')&&cc())u.searchParams.set('c',cc());a.setAttribute('href',u.pathname+u.search+u.hash)});document.body.classList.toggle('listing',!!main.querySelector('[data-list]'))}
+function mark(){var sw=main.querySelector('[data-switch]'),ss=document.getElementById('side-switch');if(sw&&ss){if(ss.innerHTML!==sw.innerHTML)ss.innerHTML=sw.innerHTML;sw.remove()}if(ss){ss.parentNode.classList.toggle('has',!!ss.innerHTML);var bs=ss.parentNode.querySelector('summary'),pic=ss.querySelector('a[aria-current=true]>img.logo'),bi=bs.querySelector('img.mark'),bv=bs.querySelector('svg.mark');if(pic){if(!bi){bi=document.createElement('img');bi.className='mark';bi.alt='';bs.insertBefore(bi,bv)}if(bi.getAttribute('src')!==pic.getAttribute('src'))bi.setAttribute('src',pic.getAttribute('src'));bv.setAttribute('hidden','')}else if(sw||ss.innerHTML){if(bi)bi.remove();bv.removeAttribute('hidden')}}document.querySelectorAll('a[href^="/"]').forEach(function(a){if(a.target)return;var u=new URL(a.getAttribute('href'),location.href);if(u.pathname==='/workspaces')return;if(!u.searchParams.has('w')&&qp('w'))u.searchParams.set('w',qp('w'));if(!u.searchParams.has('c')&&cc())u.searchParams.set('c',cc());a.setAttribute('href',u.pathname+u.search+u.hash)});document.body.classList.toggle('listing',!!main.querySelector('[data-list]'))}
 function frag(){var q=location.search;return '/'+(q?q+'&fragment=1':'?fragment=1')}
 function current(){var p=new URLSearchParams(location.search).get('p')||'overview';p=sections[p]||p;document.querySelectorAll('.side .nav a').forEach(function(a){a.setAttribute('aria-current',String(new URL(a.href).searchParams.get('p')===p))})}
 var shown='';
@@ -2464,6 +2478,21 @@ mark();load()})();</script>"#;
         let complete = views.iter().all(|v| !v.online || v.status.is_some() || !d.keyed.contains(v.plane.plane_id()));
         let views = d.remember(views);
         d.note_seen(&views);
+        // Its organization's picture is asked for beside the page, never in its way. With none to show yet, the
+        // page looks again in a moment and has it.
+        if let Some(owner) = d.picture_due() {
+            if d.about.picture.is_empty() { look_again = true }
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let Some(picture) = github_picture(&owner) else { return };
+                let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
+                // (Still that organization's workspace: it may have been signed out meanwhile.)
+                if d.picture_owner != owner { return }
+                let mut about = d.about.clone();
+                (about.picture, about.picture_of) = (picture, owner);
+                d.set_about(about);
+            });
+        }
         d.views = if complete { Some((views.clone(), now_ms())) } else { None };
         Dashboard::measure(shared, &mut d);
         d.check_permissions();
@@ -2501,6 +2530,7 @@ mark();load()})();</script>"#;
 
     /// A page's live part, with the workspace switcher's rows (see `workspaces_menu`).
     fn render(&self, section: &str, views: &[PlaneView], last: Option<&str>) -> String {
+        lock(pictured()).clone_from(&self.about.picture);
         format!("{}{}", self.render_page(section, views, last), self.workspaces_menu(views))
     }
 
@@ -2609,7 +2639,7 @@ mark();load()})();</script>"#;
         let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("settings", "Settings", ICON_SETTINGS), link("changes", "Changelog", ICON_NEWS));
         // The name at the top is the switcher between workspaces (its rows come with each page's live part, see
         // `workspaces_menu`).
-        format!(r#"<aside class="side"><details class="menu brand brand-menu"><summary>{MARK}<span>{}</span><svg class="chev" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></svg></summary><div class="menu-pop" id="side-switch"></div></details>{nav}{foot}</aside>{}"#, esc(&called_now()), new_workspace_dialog())
+        format!(r#"<aside class="side"><details class="menu brand brand-menu"><summary>{}<span>{}</span><svg class="chev" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></svg></summary><div class="menu-pop" id="side-switch"></div></details>{nav}{foot}</aside>{}"#, brand_mark(&lock(pictured())), esc(&called_now()), new_workspace_dialog())
     }
 
     /// Where a control plane runs: reachable from Settings to add another. The connect screen's list: a row per cloud with
@@ -4622,12 +4652,22 @@ fn github_picture(owner: &str) -> Option<String> {
     Some(format!("data:{kind};base64,{}", superci_core::crypto::b64(&bytes)))
 }
 
+/// The mark at the top of the sidebar: the workspace's picture when it has one, SuperCI's own otherwise (which stays
+/// in the page, for when the picture goes).
+fn brand_mark(picture: &str) -> String {
+    if safe_picture(picture) { format!(r#"<img class="mark" src="{picture}" alt="">{}"#, MARK.replacen("<svg ", r#"<svg hidden "#, 1)) } else { MARK.to_string() }
+}
+
+/// Whether a kept picture is one this program fetched and encoded itself (a `data:` address of letters, digits and
+/// base64's marks), and so can go into a page as it is.
+fn safe_picture(picture: &str) -> bool {
+    picture.strip_prefix("data:image/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b";,+/=".contains(&b)))
+}
+
 /// A workspace's mark in a list: its GitHub organization's picture, else its code host's logo once one is connected,
 /// and its initial until then.
 fn workspace_logo(l: &crate::store::Listed, size: u32) -> String {
-    // (Only a picture this program fetched and encoded itself: letters, digits and base64's marks.)
-    let safe = l.picture.strip_prefix("data:image/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b";,+/=".contains(&b)));
-    if safe { return format!(r#"<img class="logo" src="{}" width="{size}" height="{size}" alt="">"#, l.picture) }
+    if safe_picture(&l.picture) { return format!(r#"<img class="logo" src="{}" width="{size}" height="{size}" alt="">"#, l.picture) }
     match l.hosts.first() {
         Some((kind, _)) => logo(kind, size),
         None => format!(r#"<span class="logo initial" style="width:{size}px;height:{size}px;font-size:{}px">{}</span>"#, size * 45 / 100, esc(&l.title().chars().take(1).collect::<String>().to_uppercase())),
@@ -4642,9 +4682,14 @@ fn workspace_sub(l: &crate::store::Listed) -> String {
     parts.join(" · ")
 }
 
-/// The dialog that makes a workspace: its name, and nothing else.
+/// The dialog that makes a workspace, in the look of the other step dialogs: its name, and nothing else. It is as
+/// new each time it opens.
 fn new_workspace_dialog() -> String {
-    format!(r#"<dialog class="dlg" id="new-workspace" onclick="if(event.target===this)this.close()" onclose="this.querySelector('form').reset()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_WORKSPACE}</span><span><strong>New workspace</strong><small>Separate sign-ins, control plane and runners.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><form method="post" action="/workspaces" class="limit-do"><input name="name" placeholder="AcmeCI" aria-label="Its name" autofocus pattern="[A-Za-z][A-Za-z0-9 \-]{{1,23}}" title="2 to 24 letters, digits, spaces and dashes" required spellcheck="false" autocomplete="off"><button class="button primary sm">Create</button></form></div></dialog>"#)
+    let body = r#"<form method="post" action="/workspaces">
+<section class="prompt-modal-step prompt-modal-step-first"><div class="prompt-modal-step-head"><span>1</span><h2>Name your workspace</h2></div><div class="perm-field"><input type="text" name="name" placeholder="AcmeCI" required autofocus pattern="[A-Za-z][A-Za-z0-9 \-]{1,23}" title="2 to 24 letters, digits, spaces and dashes" autocomplete="off" spellcheck="false" aria-label="The workspace's name"><small>What its CI is called, here and on GitHub.</small></div></section>
+<section class="prompt-modal-step"><div class="prompt-modal-step-head"><span>2</span><h2>Create it</h2></div><p class="prompt-modal-instruction">It gets separate sign-ins, control plane and runners. Nothing is made in any cloud yet.</p><div class="perm-action"><button class="prompt-modal-copy">Create workspace</button></div></section>
+</form>"#;
+    step_dialog("new-workspace", "New workspace", body).replacen(r#"onclick="if(event.target===this)this.close()""#, r#"onclick="if(event.target===this)this.close()" onclose="this.querySelector('form').reset()""#, 1)
 }
 
 const ICON_REMOVE: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14M10 7V5h4v2M7 7l.8 12h8.4L17 7M10.5 11v5M13.5 11v5"/></svg>"#;
@@ -4732,7 +4777,7 @@ fn respond(hub: &Hub, req: &Req) -> Response {
     let shared = hub.board(&name);
     HERE.with(|h| h.borrow_mut().clone_from(&name));
     // (A page's frame says what the workspace is called before its control plane was asked.)
-    if lock(called()).is_empty() { if let Ok(d) = shared.try_lock() { lock(called()).clone_from(&d.about.name) } }
+    if lock(called()).is_empty() { if let Ok(d) = shared.try_lock() { lock(called()).clone_from(&d.about.name); lock(pictured()).clone_from(&d.about.picture) } }
     let answer = respond_in(&shared, req);
     // Where it sends the page on within the dashboard, the workspace goes along.
     if !several { return answer }
@@ -5080,7 +5125,7 @@ mod tests {
         assert!(page.contains(r#"<a class="space" href="/?w=globex&c=" aria-current="true"><span class="logo initial""#) && page.contains(">G</span><span>globex</span><small>Nothing set up yet</small></a>"), "{page}");
         assert!(page.contains("<span>New workspace…</span>") && !page.contains("acme-team") && !page.contains("Add an organization"));
         // Its frame has the dialog that makes one.
-        assert!(ask("GET", "/", &[("w", "globex")], "").2.contains(r#"<dialog class="dlg" id="new-workspace" onclick="if(event.target===this)this.close()" onclose="this.querySelector('form').reset()">"#));
+        assert!(ask("GET", "/", &[("w", "globex")], "").2.contains(r#"id="new-workspace" aria-label="New workspace" onclick="if(event.target===this)this.close()" onclose="this.querySelector('form').reset()">"#));
         // What changes something says which workspace it is for, or stops: nothing picks one.
         let (status, _, said) = ask("POST", "/routing", &[], "action=max_cpu&max_cpu=8");
         assert!(status == 409 && said.contains("Which workspace?") && said.contains("Nothing has changed."), "{status} {said}");
@@ -5148,6 +5193,25 @@ mod tests {
         let menu = lock(&hub.board("acme")).render("overview", &[], None);
         assert!(menu.contains(r#"href="/?w=default&c=" aria-current="false""#) && menu.contains(r#"href="/?w=acme&c=" aria-current="true""#), "{menu}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_organizations_picture_is_asked_for_at_the_start_and_once_a_day() {
+        let mut d = Dashboard::new();
+        assert!(d.picture_due().is_none(), "nothing connected on github.com: nothing to ask for");
+        d.picture_owner = "acme".into();
+        assert_eq!(d.picture_due().as_deref(), Some("acme"));
+        assert!(d.picture_due().is_none(), "asked a moment ago");
+        // None came: again ten minutes later. One is kept: again a day later, and it stands meanwhile.
+        d.picture_asked_ms = now_ms() - 11 * 60_000;
+        assert_eq!(d.picture_due().as_deref(), Some("acme"));
+        (d.about.picture, d.about.picture_of, d.picture_asked_ms) = ("data:image/png;base64,iVBORw0KGgo=".into(), "acme".into(), now_ms() - 11 * 60_000);
+        assert!(d.picture_due().is_none());
+        d.picture_asked_ms = now_ms() - 25 * 3_600_000;
+        assert_eq!(d.picture_due().as_deref(), Some("acme"));
+        // The mark at the top of the sidebar is that picture, and SuperCI's own without one or with one not made here.
+        assert!(brand_mark(&d.about.picture).starts_with(r#"<img class="mark" src="data:image/png;base64,iVBORw0KGgo=" alt=""><svg hidden class="mark""#));
+        assert!(brand_mark("").starts_with(r#"<svg class="mark""#) && brand_mark(r#"data:image/png;base64,x" onerror="alert(1)"#).starts_with(r#"<svg class="mark""#) && brand_mark("https://example.com/x.png").starts_with("<svg"));
     }
 
     #[test]
