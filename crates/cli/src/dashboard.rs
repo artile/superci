@@ -3300,7 +3300,7 @@ mark();load()})();</script>"#;
                 else if updating_it { String::new() }
                 // A CI of its own (another team's, reached with the same sign-ins): no place to move to, and not
                 // deleted from here.
-                else if o.serves_its_own() { r#"<span class="note">Serves a code host of its own</span>"#.to_string() }
+                else if o.serves_its_own() { format!(r#"<span class="note">Serves a code host of its own</span><a class="button secondary sm" href="/?c={}">Open</a>"#, esc(o.plane.plane_id())) }
                 else if view::older(o.version.as_deref(), view::MOVE_VERSION) { upd.clone() }
                 else if view::older(v.version.as_deref(), view::MOVE_VERSION) { r#"<span class="note">Update the one in use first</span>"#.to_string() }
                 else if !signed_in(o) { sign_in(o.plane.cloud()) }
