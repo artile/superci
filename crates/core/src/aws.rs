@@ -616,6 +616,11 @@ pub fn budget_name(plane_id: &str) -> String { format!("superci-{plane_id}") }
 pub fn stop_policy_name(plane_id: &str) -> String { format!("superci-stop-{plane_id}") }
 pub fn budget_role_name(plane_id: &str) -> String { format!("superci-budget-{plane_id}") }
 
+/// The one kind of machine the budget's rule lets through: the small one that takes a refused job at GitHub and
+/// fails it with the reason (see `plane::ControlPlane::fail_fast`), so that nobody waits for a runner that will not
+/// come. No job's own machine is ever one of these.
+pub const SAYS_WHY_TYPES: [&str; 2] = ["t3a.small", "t3.small"];
+
 /// Service Quotas' code for "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances": the vCPUs of
 /// on-demand machines an account may run at once in a region.
 pub const ON_DEMAND_CPU_QUOTA: &str = "L-1216C47A";

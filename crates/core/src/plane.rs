@@ -1944,7 +1944,8 @@ impl<'a> ControlPlane<'a> {
             }
             // A place was picked and starting the machine failed (Cloudflare "temporarily unavailable", a spot shortage):
             // tried again, twice; GitHub would otherwise keep the job queued for a day. No place for it: failed at once.
-            if !job.cloud.is_empty() && job.retries < 2 {
+            // (Not what AWS's budget stopped: trying again changes nothing until the rule is lifted. Said at once.)
+            if !job.cloud.is_empty() && job.retries < 2 && !e.contains(BUDGET_STOPPED) {
                 job.retries += 1;
                 job.state = "waiting".into();
                 job.error = Some(format!("waiting: starting its machine failed, trying again ({})", e.chars().take(200).collect::<String>()));
@@ -1993,7 +1994,7 @@ impl<'a> ControlPlane<'a> {
         let called = self.config.name();
         let line = if mac { format!("::error title={called} could not run this job::{called} runs no macOS jobs yet. Use runs-on: macos-latest for GitHub's own.") }
             // A limit for the month: what to do is raising it or waiting (the whole CI's says so itself).
-            else if why.contains(" reached its ") { format!("::error title={called} could not run this job::{}.{}", why.replace(['\r', '\n'], " ").trim_end_matches('.'), if why.contains("until the limit is raised") { String::new() } else { format!(" Raise that limit on Runners in the {called} dashboard, or wait for {}.", if why.contains(" a day") { "tomorrow" } else { "next month" }) }) }
+            else if why.contains(" reached its ") { format!("::error title={called} could not run this job::{}.{}", why.replace(['\r', '\n'], " ").trim_end_matches('.'), if why.contains("until the limit is raised") || why.contains(BUDGET_STOPPED) { String::new() } else { format!(" Raise that limit on Runners in the {called} dashboard, or wait for {}.", if why.contains(" a day") { "tomorrow" } else { "next month" }) }) }
             else { format!("::error title={called} could not run this job::{}. Change its runs-on, or add a place that can run it in the {called} dashboard.", why.replace(['\r', '\n'], " ").trim_end_matches('.')) };
         let work = Work::Fail { jit, why: crate::crypto::b64(line.as_bytes()) };
         let size = Size { cpu: 1, ram_gb: 4, disk_gb: 8, gpu: None };
@@ -2010,7 +2011,8 @@ impl<'a> ControlPlane<'a> {
                     Place::Aws(a) => {
                         let creds = self.aws_creds(plane_url, &a).await?;
                         let tags = vec![("Name".to_string(), machine_name_in_aws(self.config.name(), &job.repo, job.job_id)), ("superci-plane".into(), self.config.plane_id.clone()), ("superci-job".into(), job.job_id.to_string())];
-                        let types = ["t3a.small".to_string(), "t3.small".into(), "m7a.large".into()];
+                        // (The first two are the kind an AWS budget's rule lets through: see `aws::SAYS_WHY_TYPES`.)
+                        let types = [aws::SAYS_WHY_TYPES[0].to_string(), aws::SAYS_WHY_TYPES[1].to_string(), "m7a.large".into()];
                         let user_data = aws::runner_user_data(&work, 10)?;
                         // A spot machine in the first region that has one; where spot is refused (its limit may be
                         // the very reason the job fails), an on-demand one, unless on-demand is turned off in the order.

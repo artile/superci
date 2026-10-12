@@ -592,7 +592,8 @@ impl ByBudget {
 impl Http for ByBudget {
     async fn send(&self, r: Request) -> io::Result<Response> {
         let body = String::from_utf8_lossy(&r.body).to_string();
-        if self.on.get() && body.contains("Action=RunInstances") {
+        // (The rule lets one kind of machine through: the small one that fails a refused job at GitHub with why.)
+        if self.on.get() && body.contains("Action=RunInstances") && !superci_core::aws::SAYS_WHY_TYPES.iter().any(|t| body.contains(&format!("InstanceType={t}&"))) {
             self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body));
             return Ok(Response::new(403, "text/xml", self.refusal.clone()));
         }
@@ -619,6 +620,10 @@ fn a_machine_refused_by_the_accounts_own_budget_is_said_as_that_and_is_no_missin
         assert!(said.contains("AWS's budget for this account reached its limit and stopped new machines there: raise the account's limit on Runners in the SuperCI dashboard (that lifts it), or wait for next month"), "named {named}: {j}");
         assert!(block_on(store.get("denied:aws:LaunchOnlyTaggedMachines")).unwrap().is_none(), "named {named}");
         assert!(status()["aws_budget_stopped_ms"].as_u64().is_some());
+        // And it fails at GitHub with that, not waiting there for a runner that never comes: the rule lets the one
+        // small machine through that takes the job and says why.
+        let small = launches(&clouds.clouds).into_iter().filter(|l| field(l, "InstanceType") == "t3a.small").count();
+        assert!(j["failed_fast"] == true && small == 1, "named {named}: {small} small machines; {j}");
         // Lifted: the next job's machine starts, and the note goes.
         clouds.on.set(false);
         block_on(plane.handle(job_event("queued", 8, "acme/app", None)));

@@ -44,9 +44,13 @@ fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 /// A dollar amount as AWS Budgets takes it.
 fn amount_text(usd: f64) -> String { if usd.fract() == 0.0 { format!("{usd:.0}") } else { format!("{usd:.2}") } }
 
-/// The rule AWS puts on the control plane's role at the limit: no new machine, by any way of asking for one.
+/// The rule AWS puts on the control plane's role at the limit: no new machine, by any way of asking for one. But
+/// for the one small kind that takes a refused job at GitHub and fails it with the reason (`aws::SAYS_WHY_TYPES`):
+/// without it a refused job would wait at GitHub for a runner that never comes, saying nothing.
 pub fn stop_policy() -> Value {
-    json!({ "Version": "2012-10-17", "Statement": [{ "Sid": "NoNewMachines", "Effect": "Deny", "Action": ["ec2:RunInstances", "ec2:CreateFleet", "ec2:RequestSpotInstances", "ec2:RequestSpotFleet"], "Resource": "*" }] })
+    json!({ "Version": "2012-10-17", "Statement": [
+        { "Sid": "NoNewMachinesButTheOneThatSaysWhy", "Effect": "Deny", "Action": "ec2:RunInstances", "Resource": "arn:aws:ec2:*:*:instance/*", "Condition": { "StringNotEquals": { "ec2:InstanceType": aws::SAYS_WHY_TYPES } } },
+        { "Sid": "NoOtherWayToStartOne", "Effect": "Deny", "Action": ["ec2:CreateFleet", "ec2:RequestSpotInstances", "ec2:RequestSpotFleet"], "Resource": "*" }] })
 }
 
 impl Budgets<'_> {
@@ -247,10 +251,13 @@ pub mod tests {
     }
 
     #[test]
-    fn the_rule_refuses_every_way_of_starting_a_machine_and_nothing_else() {
+    fn the_rule_refuses_every_way_of_starting_a_machine_but_the_small_one_that_says_why() {
         let p = stop_policy();
-        assert_eq!(p["Statement"].as_array().unwrap().len(), 1);
-        assert_eq!((p["Statement"][0]["Effect"].as_str(), p["Statement"][0]["Resource"].as_str()), (Some("Deny"), Some("*")));
-        assert_eq!(p["Statement"][0]["Action"], json!(["ec2:RunInstances", "ec2:CreateFleet", "ec2:RequestSpotInstances", "ec2:RequestSpotFleet"]));
+        let statements = p["Statement"].as_array().unwrap();
+        assert!(statements.len() == 2 && statements.iter().all(|s| s["Effect"] == "Deny"));
+        // A machine of any kind but the two small ones is refused; those are what the runner that fails a refused
+        // job at GitHub asks for first, and no job's own machine is ever one.
+        assert_eq!((&statements[0]["Action"], &statements[0]["Condition"]), (&json!("ec2:RunInstances"), &json!({ "StringNotEquals": { "ec2:InstanceType": ["t3a.small", "t3.small"] } })));
+        assert_eq!((&statements[1]["Action"], &statements[1]["Resource"]), (&json!(["ec2:CreateFleet", "ec2:RequestSpotInstances", "ec2:RequestSpotFleet"]), &json!("*")));
     }
 }
