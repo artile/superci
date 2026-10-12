@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.13.1 — unreleased
+## 0.13.1 — 2026-10-12
 - A Settings page, below Control plane in the sidebar: the name, the labels and the limits (largest machine, longest job, public repositories) moved there from Workflows, and so did signing out, which was under More. Workflows keeps the default machine and how to use your label.
 
 ## 0.13.0 — 2026-10-12
