@@ -4004,6 +4004,7 @@ fn change_html(text: &str) -> String {
 /// The page's own behaviour, for every fragment it shows: the machine picker (its label and which pools can run it) and
 /// dragging runner pools into a new order (saved when dropped).
 const PAGE_JS: &str = r#"<script>document.addEventListener('click',function(e){document.querySelectorAll('details.menu[open]').forEach(function(d){if(!d.contains(e.target))d.open=false})});
+(function(){var sm=HTMLDialogElement.prototype.showModal;HTMLDialogElement.prototype.showModal=function(){sm.call(this);if(!this.querySelector('[autofocus]')){this.setAttribute('tabindex','-1');this.focus()}}})();
 
 function superciFit(k,c,r,d,arch,os,gpu){var cpu=c||k.std_cpu,ram=r||(c?Math.min(c*k.ram_per_cpu,k.max_ram_gb):k.std_ram_gb);ram=Math.max(ram,cpu*k.min_ram_per_cpu);var disk=d||k.std_disk_gb,gs=k.gpus||[];
 var ok=cpu<=k.max_cpu&&ram<=k.max_ram_gb&&disk<=k.max_disk_gb&&k.arch.indexOf(arch)>=0&&k.os.indexOf(os)>=0&&!(os==='windows'&&arch!=='x64');
@@ -4280,7 +4281,7 @@ fn called_card(v: &PlaneView) -> String {
         logo(ICON_TAG), labels.iter().map(|l| format!(r#"<span class="lim">{}</span>"#, esc(l))).collect::<String>());
     // Its name: what it is called in the dashboard and on GitHub.
     let name = esc(&v.name());
-    let name_dialog = format!(r#"<dialog class="dlg" id="name" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Name</strong><small>Shown in the dashboard and on GitHub.</small></span>{close}</div><form method="post" action="/name" class="limit-do"><input name="name" value="{name}" aria-label="Name" pattern="[A-Za-z][A-Za-z0-9 \-]{{1,23}}" required spellcheck="false" autocomplete="off"><button class="button primary sm">Save</button></form></div></dialog>"#, logo(ICON_NAME));
+    let name_dialog = format!(r#"<dialog class="dlg" id="name" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Name</strong><small>Shown in the dashboard and on GitHub.</small></span>{close}</div><form method="post" action="/name" class="limit-do"><input name="name" value="{name}" aria-label="Name" autofocus onfocus="this.select()" pattern="[A-Za-z][A-Za-z0-9 \-]{{1,23}}" required spellcheck="false" autocomplete="off"><button class="button primary sm">Save</button></form></div></dialog>"#, logo(ICON_NAME));
     let name_row = format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Name</strong><small>What your CI is called.</small></span><span class="dm-spec"><span class="lim">{name}</span></span><button type="button" class="button secondary sm" onclick="document.getElementById('name').showModal()">Change</button></div>"#, logo(ICON_NAME));
     format!(r#"<section class="card dm-card">{name_row}{label_row}{label_dialog}{name_dialog}</section>"#)
 }
