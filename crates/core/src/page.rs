@@ -104,7 +104,7 @@ tr.soon td{color:var(--faint)}tr.soon .logo{filter:grayscale(1);opacity:.55}
 :root[data-theme=dark] .gate-panel{box-shadow:0 1px 2px rgba(0,0,0,.4),0 28px 70px rgba(0,0,0,.55)}
 .gate-panel h2{font-size:22px;letter-spacing:-.035em}.gate-panel .lede{margin-top:7px;color:var(--muted);font-size:13.5px}
 .gate-back{justify-self:start;font-size:13px;font-weight:550;margin-bottom:-4px}.gate-foot{padding-top:14px;border-top:1px solid var(--rule-soft);color:var(--faint);font-size:12.5px}
-.gated .side .nav a{opacity:.4;pointer-events:none}.listing .side>.nav{visibility:hidden}
+.gated .side .nav a{opacity:.4;pointer-events:none}.listing .side>.nav{visibility:hidden}.side .nav a[hidden]{display:none}
 .side-foot{display:grid;gap:12px;margin-top:auto;padding-top:20px}.side-foot .nav{margin-top:0}#side-update:empty{display:none}
 .side-update{display:grid;gap:6px;padding:12px;border:1px solid var(--rule-soft);border-radius:12px;background:var(--card);box-shadow:var(--shadow)}
 .side-update strong{display:flex;align-items:center;gap:8px;font-size:12.5px;letter-spacing:-.01em}.side-update small{color:var(--muted);font-size:11.5px;line-height:1.45}
