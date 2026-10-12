@@ -1818,8 +1818,9 @@ fn a_job_github_never_told_of_is_found_by_asking_and_gets_its_machine() {
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    // A repository that had a job here an hour ago, and one whose last was two days ago (not asked about).
-    for (id, repo, ago_ms) in [(7u64, "acme/app", 3_600_000u64), (3, "acme/old", 2 * 86_400_000)] {
+    // A repository that had a job here an hour ago, one whose last was two days ago (a quiet one: asked about too,
+    // or the first push after a weekend would rest on one event alone), and one whose last was three weeks ago (not).
+    for (id, repo, ago_ms) in [(7u64, "acme/app", 3_600_000u64), (3, "acme/old", 2 * 86_400_000), (2, "acme/gone", 21 * 86_400_000)] {
         store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": repo, "state": "done", "at_ms": 1_790_000_000_000u64 - ago_ms, "ended_ms": 1_790_000_000_000u64 - ago_ms + 60_000,
             "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
     }
@@ -1830,7 +1831,7 @@ fn a_job_github_never_told_of_is_found_by_asking_and_gets_its_machine() {
     assert_eq!(job(&store, 9)["label"], "superci");
     assert_eq!(launches(&clouds.0).len(), 1);
     for id in [10, 11, 12, 13] { assert!(!store.0.borrow().contains_key(&format!("job:{id}")), "{id}") }
-    assert_eq!((asked("acme/app/actions/runs?status=queued"), asked("acme/app/actions/runs?status=in_progress"), asked("acme/old")), (1, 0, 0));
+    assert_eq!((asked("acme/app/actions/runs?status=queued"), asked("acme/app/actions/runs?status=in_progress"), asked("acme/old/actions/runs?status=queued"), asked("acme/gone")), (1, 0, 1, 0));
     // Not asked again within five minutes; asked again after.
     block_on(plane.alarm()).unwrap();
     assert_eq!(asked("acme/app/actions/runs?status=queued"), 1);
@@ -2051,4 +2052,56 @@ fn a_machine_nobody_waits_for_is_ended_at_the_first_sweep_after_it_had_time_to_c
     let (before, started) = (stops(), starts());
     sweep_after(61_000);
     assert_eq!((job(&store, 48)["state"].as_str(), job(&store, 47)["began"].as_bool(), stops(), starts()), (Some("swept"), Some(true), before + 1, started));
+}
+
+#[test]
+fn at_the_aws_accounts_limit_a_job_waits_for_one_of_its_own_to_end_and_fails_plainly_when_it_can_never_fit() {
+    // While `full`, AWS refuses every launch for the account's limits: spot for its spot limit, on-demand for its own.
+    let full = std::cell::Cell::new(true);
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| (full.get() && body.contains("Action=RunInstances")).then(|| aws_refuses(if body.contains("MarketType=spot") { "MaxSpotInstanceCountExceeded" } else { "VcpuLimitExceeded" })));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let sweep_after = |ms: u64| { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap() };
+    let runner = |job: u64| format!("superci-{PLANE_ID}-{job}");
+
+    // Nothing of this control plane's own runs there: the limit is below what the job asks, or something else in the
+    // account uses it. Tried again twice like any start that failed, then it fails saying which limits to raise.
+    run(job_event("queued", 7, "acme/app", None));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["retries"].as_u64()), (Some("waiting"), Some(1)));
+    assert!(j["error"].as_str().unwrap().starts_with("waiting: starting its machine failed, trying again (Your AWS account's limits do not let this machine start"), "{}", j["error"]);
+    sweep_after(20_000);
+    sweep_after(20_000);
+    let j = job(&store, 7);
+    let why = j["error"].as_str().unwrap();
+    assert_eq!(j["state"], "failed");
+    assert!(why.starts_with("Your AWS account's limits do not let this machine start: it asks for 4 CPUs (us-east-1: MaxSpotInstanceCountExceeded; us-east-1 on-demand: VcpuLimitExceeded). Ask AWS for more in Service Quotas"), "{why}");
+    assert!(why.contains("quotas/L-34B43A08") && why.contains("quotas/L-1216C47A"), "{why}");
+    // The runner that says so on GitHub is asked for as a spot machine, then as an on-demand one (the spot limit may
+    // be the very reason): a small machine either way.
+    let failing: Vec<_> = launches(&clouds.0).into_iter().filter(|l| field(l, "InstanceType") == "t3a.small").collect();
+    assert!(failing.iter().any(|l| field(l, "InstanceMarketOptions.MarketType") == "spot") && failing.iter().any(|l| field(l, "InstanceMarketOptions.MarketType").is_empty()), "{}", failing.len());
+
+    // A job of its own is running there: the next one waits for it to end, as it would on GitHub's own runners. It
+    // is not counted as a failed start, however long it waits.
+    full.set(false);
+    run(job_event("queued", 8, "acme/app", None));
+    run(job_event("in_progress", 8, "acme/app", Some(&runner(8))));
+    assert_eq!(job(&store, 8)["state"], "running");
+    full.set(true);
+    run(job_event("queued", 9, "acme/app", None));
+    for _ in 0..4 { sweep_after(60_000); }
+    let j = job(&store, 9);
+    assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), 0));
+    assert!(j["error"].as_str().unwrap().starts_with("waiting: your AWS account's limit of running CPUs is in use by 1 of your job there; it starts when one ends (us-east-1: MaxSpotInstanceCountExceeded"), "{}", j["error"]);
+    // The first ends and AWS has room again: the next sweep starts the one that waited.
+    run(concluded(8, &runner(8), "success"));
+    full.set(false);
+    sweep_after(60_000);
+    assert_eq!((job(&store, 9)["state"].as_str(), job(&store, 9)["machine_id"].as_str()), (Some("launched"), Some("i-0abc")));
 }

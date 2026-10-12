@@ -2639,7 +2639,7 @@ load()})();</script>"#;
         let opens = |id: &str, label: &str, primary: bool| format!(r#"<button type="button" class="button {} sm" onclick="document.getElementById('{id}').showModal()">{label}</button>"#, if primary { "primary" } else { "secondary" });
         let row = |title: &str, what: &str, end: &str| format!(r#"<div class="pick act">{}<span><strong>{}</strong><small>{}</small></span><span class="pick-end">{end}</span></div>"#, logo("github", 36), esc(title), esc(what));
         let github = if !v.github {
-            format!("{}{}", row("GitHub", "A private App in your organization: it registers runners and reads job events, never your code", &opens("gh-add", "Connect", true)), github_dialog(false))
+            format!("{}{}", row("GitHub", "A private App in your organization: it registers runners and reads job events, never your code", &opens("gh-add", "Connect", true)), github_dialog(false, &v.plane.place()))
         } else if apps.is_empty() {
             // Its details not read yet (or an older control plane): the one App, as its public state says.
             if v.installed { row("GitHub", &format!("Jobs from {}", v.app_owner().unwrap_or_default()), &pill("good", "connected")) }
@@ -2665,7 +2665,7 @@ load()})();</script>"#;
             let old = view::older(v.version.as_deref(), "0.9.31");
             let add = row("Another organization", if old { "Update the control plane first: several organizations need 0.9.31 or newer" } else { "Its own private App, on this control plane: its jobs run on the same runners" },
                 &if old { String::new() } else { opens("gh-add", "Add", false) });
-            format!("{rows}{add}{}", if old { String::new() } else { github_dialog(true) })
+            format!("{rows}{add}{}", if old { String::new() } else { github_dialog(true, &v.plane.place()) })
         };
         // GitLab: a row for each connection (its projects and the connection are its own page), and one more to
         // add (another GitLab, or another account's token); none yet: Connect.
@@ -3283,13 +3283,24 @@ fn where_choices(name: &str, public: (&str, &str), own: (&str, &str), field: &st
 <div class="perm-field" data-own hidden>{field}</div>"#, public.0, public.1, own.0, own.1)
 }
 
+/// What to send an owner of an organization one does not own: GitHub shows the page that creates the organization's
+/// App to its owners only (anyone else gets its 404), so they have to do that one step, or lend the right for it.
+/// The permissions are the App's own list, so the two never differ.
+pub fn owner_note(org: &str, place: &str) -> String {
+    let needs = superci_core::permissions::github(true).into_iter().map(|(_, _, need)| need.what.to_lowercase()).collect::<Vec<_>>().join(", ");
+    format!("We are setting up our CI to run on our own cloud account with SuperCI (superci.dev). It needs a private GitHub App owned by {org}, with these permissions: {needs}. It registers runners and reads job events, never code. Only an owner of {org} can create it. Could you either make me an owner for a few minutes, or run `npx @superci/cli dashboard`, sign in where our control plane is ({place}), and under Repositories connect {org} and install the App on our repositories?")
+}
+
 /// Connecting GitHub (the first organization, or another): where it is, whose jobs, then GitHub makes the App.
-fn github_dialog(another: bool) -> String {
+fn github_dialog(another: bool, place: &str) -> String {
+    // "Not an owner?": copies the note with the name typed (or "our organization"), and says so.
+    let note = esc(&owner_note("{org}", place));
+    let copy = format!(r##" Not an owner? <a href="#" data-note="{note}" onclick="var o=this.closest('form').querySelector('[name=login]').value.trim()||'our organization';navigator.clipboard.writeText(this.dataset.note.split('{{org}}').join(o));this.textContent='Copied: send it to an owner';return false">Copy a note for one</a>"##);
     let wher = where_choices("gh-where", ("GitHub.com", "github.com"), ("GitHub Enterprise", "Your own server, or yours.ghe.com"),
         r#"<input type="text" name="host" placeholder="github.example.com" autocomplete="off" spellcheck="false" aria-label="Your GitHub's address"><small>Its address, without https://. It has to be reachable from your control plane.</small>"#);
     let body = format!(r#"<form method="post" action="/github/start">
 <section class="prompt-modal-step prompt-modal-step-first"><div class="prompt-modal-step-head"><span>1</span><h2>Where is your GitHub?</h2></div>{wher}</section>
-<section class="prompt-modal-step"><div class="prompt-modal-step-head"><span>2</span><h2>Whose jobs?</h2></div><div class="perm-field"><input type="text" name="login" placeholder="your-organization" required pattern="[A-Za-z0-9][A-Za-z0-9-]{{0,38}}" autocomplete="off" spellcheck="false" aria-label="GitHub organization or user"><small>An organization you own, or your own username.</small></div></section>
+<section class="prompt-modal-step"><div class="prompt-modal-step-head"><span>2</span><h2>Whose jobs?</h2></div><div class="perm-field"><input type="text" name="login" placeholder="your-organization" required pattern="[A-Za-z0-9][A-Za-z0-9-]{{0,38}}" autocomplete="off" spellcheck="false" aria-label="GitHub organization or user"><small>An organization you own, or your own username.{copy}</small></div></section>
 <section class="prompt-modal-step"><div class="prompt-modal-step-head"><span>3</span><h2>Create its App</h2></div><p class="prompt-modal-instruction">GitHub makes a private App there, then asks where to install it. It registers runners and reads job events, never your code.</p><div class="perm-action"><button class="prompt-modal-copy">Continue on GitHub</button></div></section>
 </form>"#);
     step_dialog("gh-add", if another { "Add an organization" } else { "Connect GitHub" }, &body)
@@ -5238,6 +5249,11 @@ mod tests {
         assert_eq!((safe_id("gcorp"), safe_id("g/../x; rm"), safe_id("")), ("gcorp".to_string(), "gxrm".to_string(), String::new()));
         // Another GitHub organization: the same three steps (where GitHub is, whose jobs, then GitHub makes the App).
         let gh = dialog(&html, "gh-add");
+        // Not an owner of the organization: a note to send one, with the App's own permissions and where the
+        // control plane is.
+        let note = owner_note("acme", "AWS · 123456789012 · us-east-1");
+        assert!(note.contains("a private GitHub App owned by acme, with these permissions: self-hosted runners (write), actions (write)") && note.contains("Only an owner of acme can create it") && note.contains("(AWS · 123456789012 · us-east-1)"), "{note}");
+        assert!(gh.contains("Not an owner? <a href=") && gh.contains("Copy a note for one</a>") && gh.contains("owned by {org}"));
         assert!(gh.contains(r#"aria-label="Add an organization""#) && gh.contains("<h2>Where is your GitHub?</h2>") && gh.contains("GitHub Enterprise") && gh.contains(r#"<div class="perm-field" data-own hidden><input type="text" name="host""#)
             && gh.contains(r#"name="login" placeholder="your-organization" required"#) && gh.contains(">Continue on GitHub</button>"));
         // Not connected yet: the same dialog, as connecting.

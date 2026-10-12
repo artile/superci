@@ -354,6 +354,11 @@ fn refuses_alike(e: &str) -> bool { e.starts_with(NO_GPU_QUOTA) || e.contains(" 
 /// each region said): the job waits, and is tried again, rather than failing.
 const WAIT_FOR_SPOT: &str = "waiting: AWS has no spot machine for it now, and nothing else in the order can run it (";
 
+/// How a try ends when every place AWS was asked refused for the account's own limits of running CPUs (followed by
+/// what each said): the job waits while machines of this control plane's own are using them, as it would for a place
+/// that is full; with none of its own running it is tried again and then fails, saying which limits to raise.
+const AT_LIMIT: &str = "at the AWS account's limits: ";
+
 /// How a job fails when AWS lets the account run no GPU machines (followed by the quota to raise).
 const NO_GPU_QUOTA: &str = "AWS lets this account run no GPU machines yet: ask AWS for more in Service Quotas, ";
 
@@ -1301,6 +1306,13 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Whether other jobs' GPU machines are up in AWS now (then a quota refusal means it is full, not that it is 0).
+    /// How many other jobs of this control plane have a machine in AWS now, or had one until two minutes ago.
+    async fn aws_machines_up(&self, job_id: u64) -> usize {
+        let now = self.clock.now_ms();
+        let jobs: Vec<Job> = self.store.list("job:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
+        jobs.iter().filter(|j| j.job_id != job_id && j.cloud == "aws" && j.machine_id.is_some() && (active(j) || j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000))).count()
+    }
+
     async fn gpu_machines_up(&self, job_id: u64) -> bool {
         let jobs: Vec<Job> = self.store.list("job:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
         jobs.iter().any(|j| j.job_id != job_id && j.cloud == "aws" && active(j) && self.config.parse(&j.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some()))
@@ -1708,6 +1720,9 @@ impl<'a> ControlPlane<'a> {
                         failures.push(("aws".into(), why));
                         answers.clear();
                     }
+                    // Every refusal was for the account's limits (spot's, and on-demand's where it was asked), for a
+                    // machine that is no GPU one (those are said above).
+                    if failures.is_empty() && !out_of_time && quota_only && !answers.is_empty() && spec.gpu.is_none() { return Err(format!("{AT_LIMIT}{}", answers.join("; "))) }
                     return Err(match failures.len() {
                         0 if out_of_time => last,
                         // Only spot machines were asked for, no region has one, and nothing else in the order can run
@@ -1739,6 +1754,25 @@ impl<'a> ControlPlane<'a> {
         if let Err(e) = result {
             self.withdraw_runner(job).await;
             job.runner_id = None;
+            // The account's limits of running CPUs. While machines of this control plane's own are up there (or
+            // ended a moment ago: AWS counts one a little longer than it runs), the job waits for one to end, as on
+            // GitHub's own runners, and the sweep tries it again. With none of its own, the limit is below what the
+            // job asks or used by something else in the account: tried again twice like any failed start, then it
+            // fails saying which limits to raise.
+            let e = match e.strip_prefix(AT_LIMIT) {
+                None => e,
+                Some(said) => {
+                    let ours = self.aws_machines_up(job.job_id).await;
+                    if ours > 0 {
+                        job.state = "waiting".into();
+                        job.error = Some(format!("waiting: your AWS account's limit of running CPUs is in use by {ours} of your job{} there; it starts when one ends ({})", if ours == 1 { "" } else { "s" }, said.chars().take(160).collect::<String>()));
+                        put_json(self.store, &key, &*job).await?;
+                        return self.timer.wake_in(20_000).await;
+                    }
+                    format!("Your AWS account's limits do not let this machine start: it asks for {} CPUs ({said}). Ask AWS for more in Service Quotas: “All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests” (https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/{}) or “Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances” (https://console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-1216C47A).",
+                        job.cpu.unwrap_or(4), aws::SPOT_CPU_QUOTA)
+                }
+            };
             // No GPU machines allowed in the AWS account, or a runner agent refusing what was asked (Modal: no GPUs
             // without a payment method): every job asking for it fails alike, at once.
             if !e.starts_with(SEVERAL) && refuses_alike(&e) { intrinsic = true; job.cloud = String::new() }
@@ -1759,7 +1793,7 @@ impl<'a> ControlPlane<'a> {
                 return self.timer.wake_in(20_000).await;
             }
             job.state = "failed".into();
-            job.error = Some(e.chars().take(300).collect());
+            job.error = Some(e.chars().take(700).collect());
             job.ended_ms.get_or_insert(self.clock.now_ms());
             put_json(self.store, &key, &*job).await?;
             // It fails now at GitHub too, saying why, instead of waiting there a day: what its label asks that nothing
@@ -1814,12 +1848,22 @@ impl<'a> ControlPlane<'a> {
                     }
                     Place::Aws(a) => {
                         let creds = self.aws_creds(plane_url, &a).await?;
-                        let region = self.aws_regions(&a).into_iter().next().ok_or("no AWS region")?;
-                        let (image, image_gb) = self.image(&region, &Spec::default(), &creds, self.clock.now_ms()).await?;
                         let tags = vec![("Name".to_string(), name.clone()), ("superci-plane".into(), self.config.plane_id.clone()), ("superci-job".into(), job.job_id.to_string())];
                         let types = ["t3a.small".to_string(), "t3.small".into(), "m7a.large".into()];
-                        let network = self.network(&region, &creds, self.clock.now_ms()).await?;
-                        aws::run_instance(self.http, &creds, &Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &aws::runner_user_data(&work, 10)?, disk_gb: image_gb.max(30), tags: &tags, spot: true, os: "linux" }, self.clock.now_ms()).await.map(|_| ())
+                        let user_data = aws::runner_user_data(&work, 10)?;
+                        // A spot machine in the first region that has one; where spot is refused (its limit may be
+                        // the very reason the job fails), an on-demand one, unless on-demand is turned off in the order.
+                        let markets: &[bool] = if self.config.routing.pool(AWS_ON_DEMAND).is_some_and(|p| p.off) { &[true] } else { &[true, false] };
+                        let mut started: Result<()> = Err("no AWS region".into());
+                        'regions: for region in self.aws_regions(&a) {
+                            let (image, image_gb) = match self.image(&region, &Spec::default(), &creds, self.clock.now_ms()).await { Ok(i) => i, Err(e) => { started = Err(e); continue } };
+                            let network = match self.network(&region, &creds, self.clock.now_ms()).await { Ok(n) => n, Err(e) => { started = Err(e); continue } };
+                            for spot in markets {
+                                started = aws::run_instance(self.http, &creds, &Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), tags: &tags, spot: *spot, os: "linux" }, self.clock.now_ms()).await.map(|_| ());
+                                if started.is_ok() { break 'regions }
+                            }
+                        }
+                        started
                     }
                 }
             }.await;
@@ -2232,7 +2276,8 @@ impl<'a> ControlPlane<'a> {
     /// Jobs that wait for a runner of this control plane and that GitHub never told it of: found by asking, and given
     /// a machine as if the event had come. GitHub sends each event once; one it loses (seen when its App's address
     /// changes in a move) is in no list of failed deliveries, so nothing else would ever start that job. Asked for
-    /// the repositories that had a job here in the last day (ten at most), every five minutes; in the quarter of an
+    /// the repositories that had a job here in the last day (ten at most) and, in turns, for those of the last two
+    /// weeks (five at a time), every five minutes; in the quarter of an
     /// hour after a move here, at every sweep, and also for runs of which another job has started. Whether a move
     /// was that lately.
     async fn untold(&self, plane_url: &str, now: u64) -> bool {
@@ -2241,10 +2286,17 @@ impl<'a> ControlPlane<'a> {
         if !moved_lately && get_json::<u64>(self.store, "untold_at").await.ok().flatten().is_some_and(|at| now.saturating_sub(at) < 5 * 60_000 - 5_000) { return false }
         let _ = put_json(self.store, "untold_at", &now).await;
         let Ok(kept) = self.store.list("job:").await else { return moved_lately };
-        let mut jobs: Vec<Job> = kept.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.provider.is_empty() && now.saturating_sub(j.at_ms) < 86_400_000).collect();
+        let mut jobs: Vec<Job> = kept.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.provider.is_empty() && now.saturating_sub(j.at_ms) < 14 * 86_400_000).collect();
         jobs.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
-        let mut repos: Vec<&Job> = vec![];
-        for j in &jobs { if repos.len() < 10 && !repos.iter().any(|r| r.repo == j.repo) { repos.push(j) } }
+        // The repositories that had a job in the last day (ten at most), and five of the quieter ones of the last
+        // two weeks, a different five each time: the first push after a weekend must not rest on one event alone.
+        let (mut repos, mut quiet): (Vec<&Job>, Vec<&Job>) = (vec![], vec![]);
+        for j in &jobs {
+            if repos.iter().chain(&quiet).any(|r| r.repo == j.repo) { continue }
+            if now.saturating_sub(j.at_ms) < 86_400_000 && repos.len() < 10 { repos.push(j) } else { quiet.push(j) }
+        }
+        let turn = (now / 300_000) as usize;
+        for i in 0..quiet.len().min(5) { repos.push(quiet[(turn * 5 + i) % quiet.len()]) }
         for known in repos {
             let (Some(app), Some(token)) = (self.app_of(known), self.installation_token_for(known).await) else { continue };
             let Ok(waiting) = github::waiting_jobs(self.http, &app.api(), &token, &known.repo, moved_lately).await else { continue };

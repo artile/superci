@@ -644,8 +644,11 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
             let owner = args.word(2);
             if owner.is_empty() { return usage("Say whose repositories: `superci github create OWNER` (an organization, or your own GitHub name).") }
             let d = ready()?;
-            in_use(&d)?;
-            if args.has("dry-run") { println!("Would open GitHub in the browser, for a person to create the App for {owner} and choose its repositories. Nothing was changed."); return Ok(()) }
+            let plane = in_use(&d)?;
+            // GitHub shows the page that creates an organization's App to its owners only: what to send one.
+            let note = crate::dashboard::owner_note(owner, &plane.place());
+            if args.has("dry-run") { println!("Would open GitHub in the browser, for a person to create the App for {owner} and choose its repositories. Nothing was changed.\nOnly an owner of {owner} can create it. A note to send one:\n\n{note}"); return Ok(()) }
+            println!("Only an owner of {owner} can create its App (GitHub shows anyone else a 404). Not an owner? `superci github create {owner} --dry-run` prints a note to send one.");
             Ok(d.for_task(Task::GitHub { login: owner.to_string(), host: args.get("host").unwrap_or_default().to_string(), started: false, done: false }).serve(open)?)
         })()),
         _ => None,
