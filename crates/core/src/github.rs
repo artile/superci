@@ -275,8 +275,25 @@ pub async fn rerun_failed_jobs(http: &dyn Http, api: &str, token: &str, repo: &s
 
 /// A job's status at GitHub ("queued", "in_progress", "completed", …).
 pub async fn job_status(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<String> {
+    job_state(http, api, token, repo, job_id).await.map(|(status, _)| status)
+}
+
+/// A job's status ("queued", "in_progress", "completed") and the runner it began on, if it has begun.
+pub async fn job_state(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<(String, Option<String>)> {
     let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/jobs/{job_id}"), Some(token), None).await?;
-    v["status"].as_str().map(str::to_string).ok_or_else(|| "no job status".into())
+    let status = v["status"].as_str().ok_or("no job status")?.to_string();
+    Ok((status, v["runner_name"].as_str().filter(|n| !n.is_empty()).map(str::to_string)))
+}
+
+/// Whether a runner is running a job now. One GitHub no longer knows (it removes a just-in-time runner once its job
+/// has ended) is not.
+pub async fn runner_busy(http: &dyn Http, api: &str, token: &str, owner: &Owner, repo: &str, runner_id: u64) -> Result<bool> {
+    let path = if owner.org { format!("/orgs/{}/actions/runners/{runner_id}", owner.login) } else { format!("/repos/{repo}/actions/runners/{runner_id}") };
+    match gh(http, api, "GET", &path, Some(token), None).await {
+        Ok(v) => Ok(v["busy"].as_bool().unwrap_or(false)),
+        Err(e) if e.contains(": 404 ") => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn delete_runner(http: &dyn Http, api: &str, token: &str, owner: &Owner, repo: &str, runner_id: u64) -> Result<()> {

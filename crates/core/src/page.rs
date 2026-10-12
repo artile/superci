@@ -76,7 +76,7 @@ a.item:hover{color:var(--ink);background:var(--card)}.item[aria-current=true]{co
 .done-mark>.logo{border-radius:12px}.done-mark>.mark{width:40px;height:40px}
 .done-check{position:absolute;right:-9px;bottom:-9px;display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:var(--good-fill);color:#fff;border:3px solid var(--bg);animation:done-in .4s .25s cubic-bezier(.2,.9,.3,1.4) both}
 .done-check svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:3.2;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:22;stroke-dashoffset:22;animation:done-draw .35s .45s ease-out forwards}
-.done h1{font-size:28px;letter-spacing:-.035em;margin-bottom:10px}.done p{max-width:32ch;color:var(--muted);font-size:15.5px;line-height:1.5}.done .done-foot{margin-top:30px;color:var(--faint);font:500 12px/1.4 var(--mono)}
+.done h1{font-size:28px;letter-spacing:-.035em;margin-bottom:10px}.done p{max-width:32ch;color:var(--muted);font-size:15.5px;line-height:1.5}.done .done-foot{margin-top:30px;color:var(--faint);font:500 12px/1.4 var(--mono)}.done-go{display:grid;gap:10px;justify-items:center;margin-top:26px}
 @keyframes done-in{from{opacity:0;transform:scale(.8)}}@keyframes done-draw{to{stroke-dashoffset:0}}
 @media (prefers-reduced-motion:reduce){.done-mark,.done-check{animation:none}.done-check svg{animation:none;stroke-dashoffset:0}}
 .spinner{width:26px;height:26px;margin:22px auto 0;border:3px solid var(--rule);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media (prefers-reduced-motion:reduce){.spinner{animation:none}}

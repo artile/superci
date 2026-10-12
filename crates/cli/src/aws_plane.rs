@@ -46,7 +46,7 @@ pub struct Deployed { pub url: String }
 const MEMORY_MB: u32 = 1024;
 
 /// What a new control plane's deploy does, in order, as the dashboard shows it (the last step is the dashboard's own wait).
-pub const DEPLOY_STEPS: [&str; 6] = ["Creating its permissions (an IAM role)", "Creating its storage (a DynamoDB table)", "Uploading it (a Lambda function)", "Giving it its address", "Scheduling its check for waiting jobs and leftover machines, every 2 minutes", "Waiting for it to answer"];
+pub const DEPLOY_STEPS: [&str; 6] = ["Creating its permissions (an IAM role)", "Creating its storage (a DynamoDB table)", "Uploading it (a Lambda function)", "Giving it its address", "Scheduling its check for waiting jobs and leftover machines, every minute", "Waiting for it to answer"];
 
 /// Sets up (or updates) the control plane `plane_id` in `region`. Safe to repeat.
 /// The same, telling `step` which of [`DEPLOY_STEPS`] it has started (0 to 4).
@@ -122,10 +122,10 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     ok_if(a.lambda("POST", &format!("/2015-03-31/functions/{name}/policy"), Some(json!({ "StatementId": "url", "Action": "lambda:InvokeFunctionUrl", "Principal": "*", "FunctionUrlAuthType": "NONE" }))), &["ResourceConflictException"])?;
     ok_if(a.lambda("POST", &format!("/2015-03-31/functions/{name}/policy"), Some(json!({ "StatementId": "url-invoke", "Action": "lambda:InvokeFunction", "Principal": "*", "InvokedViaFunctionUrl": true }))), &["ResourceConflictException", "InvalidParameterValueException", "ValidationException"])?;
 
-    // The sweep, every two minutes.
+    // The sweep, every minute (the shortest AWS schedules): jobs waiting for room, machines left idle.
     step(4);
     let events = |op: &str, body: Value| a.target("events", &format!("events.{region}.amazonaws.com"), &format!("AWSEvents.{op}"), "1.1", body);
-    let rule_arn = events("PutRule", json!({ "Name": name, "ScheduleExpression": "rate(2 minutes)", "State": "ENABLED", "Description": "SuperCI control plane sweep" }))?["RuleArn"].as_str().unwrap_or_default().to_string();
+    let rule_arn = events("PutRule", json!({ "Name": name, "ScheduleExpression": "rate(1 minute)", "State": "ENABLED", "Description": "SuperCI control plane sweep" }))?["RuleArn"].as_str().unwrap_or_default().to_string();
     events("PutTargets", json!({ "Rule": name, "Targets": [{ "Id": "plane", "Arn": format!("arn:aws:lambda:{region}:{account_id}:function:{name}"), "Input": json!({ "superci": "sweep" }).to_string() }] }))?;
     ok_if(a.lambda("POST", &format!("/2015-03-31/functions/{name}/policy"), Some(json!({ "StatementId": "sweep", "Action": "lambda:InvokeFunction", "Principal": "events.amazonaws.com", "SourceArn": rule_arn }))), &["ResourceConflictException"])?;
 

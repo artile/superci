@@ -244,6 +244,8 @@ pub struct Job {
     /// The job its machine is for now, when its own job went to another job's runner: that other job, still queued
     /// with its runner taken. If this machine never comes up, a new one is started while that job still waits.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub for_job: Option<u64>,
+    /// Its own job began on a runner (its own or another job's), or ended: GitHub no longer has it queued.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub began: bool,
     /// Why it failed, while a failing runner (see `fail_fast`) is still to be started for it.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub fail_pending: Option<String>,
     /// The GitHub App its event came through (one per organization); none: the first.
@@ -272,6 +274,9 @@ pub struct Rerun { pub job_id: u64, pub run_id: u64, pub repo: String, pub name:
 
 /// How long one request may go on trying AWS's regions for a machine before the rest is left for the job's next try.
 const LAUNCH_BUDGET_MS: u64 = 15_000;
+/// How often and for how long a launch that AWS refused for its request rate is asked again in place.
+const THROTTLED_TRIES: u64 = 6;
+const THROTTLED_FOR_MS: u64 = 7_000;
 
 /// Spot is paused for half an hour once AWS took back two machines within a quarter of an hour.
 const SPOT_PAUSE: (usize, u64, u64) = (2, 15 * 60_000, 30 * 60_000);
@@ -991,6 +996,11 @@ impl<'a> ControlPlane<'a> {
         match j.app_id { Some(id) => self.config.apps().find(|a| a.id == id), None => self.config.app.as_ref() }
     }
 
+    /// Which runners can take a GitHub job: those with its label, in its organization (in its repository, for a person's).
+    fn runners_of(&self, j: &Job) -> String {
+        format!("{}|{}|{}", j.installation_id, j.label, if self.app_of(j).is_some_and(|a| a.owner_is_org) { "" } else { j.repo.as_str() })
+    }
+
     fn owner_of(app: &App) -> Owner { Owner { org: app.owner_is_org, login: app.owner.clone() } }
 
     /// An installation token for a job's repository (None without the App, or if GitHub would not give one).
@@ -1604,7 +1614,17 @@ impl<'a> ControlPlane<'a> {
                             // Never smaller than its image's disk (Windows' is 100 GB).
                             disk_gb = disk_gb.max(image_gb);
                             let network = self.network(region, &creds, now).await?;
-                            let machine = aws::run_instance(self.http, &creds, &Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, tags: &tags, spot: !on_demand, os: spec.os() }, now).await;
+                            let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, tags: &tags, spot: !on_demand, os: spec.os() };
+                            let mut machine = aws::run_instance(self.http, &creds, &launch, now).await;
+                            // Many jobs queued at once: AWS lets a few launches through and refuses the rest for a
+                            // moment ("RequestLimitExceeded"; it refills by the second). Asked again here, each job
+                            // after a wait of its own, while GitHub still waits for this event's answer (ten seconds).
+                            let mut asked = 0u64;
+                            while asked < THROTTLED_TRIES && machine.as_ref().is_err_and(|e| e.starts_with("RequestLimitExceeded")) && self.clock.now_ms().saturating_sub(began) < THROTTLED_FOR_MS {
+                                asked += 1;
+                                self.timer.pause(300 + (job.job_id % 8) * 120 + asked * 250).await;
+                                machine = aws::run_instance(self.http, &creds, &launch, self.clock.now_ms()).await;
+                            }
                             self.note_permission("aws", "LaunchOnlyTaggedMachines", &machine).await;
                             match machine {
                                 Ok(m) => { launched = Some((region.clone(), m, network.is_some_and(|n| n.private))); break }
@@ -1869,6 +1889,9 @@ impl<'a> ControlPlane<'a> {
                 if let Some(mut other) = get_json::<Job>(self.store, &format!("job:{job_id}")).await? {
                     if !["launching", "launched", "running"].contains(&other.state.as_str()) {
                         let now = self.clock.now_ms();
+                        // What that job's record holds of a machine that has ended (it ran another job's work and
+                        // was ended with it, while this job still waited): kept below, not written over.
+                        let ended = (other.machine_id.is_some() && other.ended_ms.is_some()).then(|| other.clone());
                         other.runner = j.runner.clone();
                         other.runner_id = j.runner_id;
                         other.machine_id = j.machine_id.clone();
@@ -1881,9 +1904,10 @@ impl<'a> ControlPlane<'a> {
                         // takes it back.
                         (other.zone, other.disk_gb, other.waiting_usd_per_hour, other.launched_ms) = (j.zone.take(), j.disk_gb.take(), j.waiting_usd_per_hour.take(), j.launched_ms);
                         (other.on_demand, other.notice, other.interrupted, other.private, other.for_job) = (j.on_demand, j.notice.take(), j.interrupted, j.private, None);
+                        other.spot_refused = j.spot_refused.take();
                         (other.cost_usd, other.cost_from, other.sent_gb, other.fail_pending, other.failed_fast) = (None, None, None, None, false);
                         other.state = "running".into();
-                        other.seen_in_progress = true;
+                        (other.seen_in_progress, other.began) = (true, true);
                         other.error = None;
                         other.started_ms = Some(now);
                         other.ended_ms = None;
@@ -1892,15 +1916,24 @@ impl<'a> ControlPlane<'a> {
                         // The job this runner was for: a machine of its own, again.
                         let key = job_key(&j);
                         (j.runner, j.runner_id, j.machine_id, j.machine_type) = (None, None, None, None);
-                        (j.interrupted, j.for_job) = (false, None);
+                        j.interrupted = false;
                         j.cloud = String::new();
                         // A job that is over (cancelled before a runner took it, or failed by another's failing
-                        // runner) needs no machine again.
-                        if j.state == "orphan" || j.failed_fast || j.over {
+                        // runner) needs no machine again. Nor does one whose own job began on another job's runner
+                        // (`for_job`: its machine was for that other job) once that other job has got this machine.
+                        if j.state == "orphan" || j.failed_fast || j.over || j.for_job == Some(job_id) {
                             j.state = if j.state == "orphan" { "cancelled" } else if j.failed_fast { "failed" } else { "done" }.into();
+                            j.for_job = None;
                             j.ended_ms.get_or_insert(now);
+                            // The machine that ended with another job's work stays in the books, here.
+                            if let Some(e) = ended.filter(|_| j.state == "done") {
+                                (j.cloud, j.machine_id, j.machine_type, j.region, j.zone, j.disk_gb, j.cpu) = (e.cloud, e.machine_id, e.machine_type, e.region, e.zone, e.disk_gb, e.cpu);
+                                (j.usd_per_hour, j.waiting_usd_per_hour, j.launched_ms, j.started_ms, j.ended_ms) = (e.usd_per_hour, e.waiting_usd_per_hour, e.launched_ms, e.started_ms, e.ended_ms);
+                                (j.cost_usd, j.cost_from, j.sent_gb, j.on_demand, j.private, j.seen_in_progress) = (e.cost_usd, e.cost_from, e.sent_gb, e.on_demand, e.private, true);
+                            }
                             return put_json(self.store, &key, &j).await;
                         }
+                        // (Kept for another job, `for_job`, it stays so: the new machine is for that job.)
                         j.state = "launching".into();
                         j.error = None;
                         j.launched_ms = Some(now);
@@ -1915,10 +1948,16 @@ impl<'a> ControlPlane<'a> {
             // It began another job than its own, whose machine is still coming: that machine is for this runner's
             // job now (or for whichever job this machine was for).
             if j.job_id != job_id {
-                if let Some(mut other) = get_json::<Job>(self.store, &format!("job:{job_id}")).await?.filter(|o| active(o) && !o.seen_in_progress) {
-                    other.for_job = Some(j.for_job.unwrap_or(j.job_id));
-                    put_json(self.store, &format!("job:{job_id}"), &other).await?;
+                if let Some(mut other) = get_json::<Job>(self.store, &format!("job:{job_id}")).await? {
+                    let coming = active(&other) && !other.seen_in_progress;
+                    if coming { other.for_job = Some(j.for_job.unwrap_or(j.job_id)) }
+                    if coming || !other.began {
+                        other.began = true;
+                        put_json(self.store, &format!("job:{job_id}"), &other).await?;
+                    }
                 }
+            } else {
+                j.began = true;
             }
             j.for_job = None;
             j.seen_in_progress = true;
@@ -1926,6 +1965,10 @@ impl<'a> ControlPlane<'a> {
             if j.state == "launched" || j.state == "orphan" { j.state = "running".into(); }
             j.started_ms.get_or_insert(self.clock.now_ms());
             put_json(self.store, &format!("job:{}", j.job_id), &j).await?;
+        } else if let Some(mut own) = get_json::<Job>(self.store, &format!("job:{job_id}")).await?.filter(|o| !o.began) {
+            // It began on a runner that is none of this control plane's.
+            own.began = true;
+            put_json(self.store, &format!("job:{job_id}"), &own).await?;
         }
         Ok(())
     }
@@ -1941,6 +1984,7 @@ impl<'a> ControlPlane<'a> {
             self.stop_machine(plane_url, &j).await;
             if let Some(name) = runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
             j.state = "done".into();
+            if j.job_id == job_id { j.began = true }
             j.ended_ms.get_or_insert(self.clock.now_ms());
             // AWS took its spot machine back: the job it was running is run again once its run has finished (GitHub
             // runs nothing again before), on an on-demand machine. Not one that passed anyway (the notice came as
@@ -1959,6 +2003,7 @@ impl<'a> ControlPlane<'a> {
             // Cancelled while waiting for room: nothing was started.
             if own.state == "waiting" {
                 own.state = "cancelled".into();
+                own.began = true;
                 own.ended_ms = Some(self.clock.now_ms());
                 put_json(self.store, &format!("job:{job_id}"), &own).await?;
                 return Ok(());
@@ -1972,8 +2017,13 @@ impl<'a> ControlPlane<'a> {
                     None if own.over => {}
                     None => own.state = "orphan".into(),
                 }
+                own.began = true;
                 put_json(self.store, &format!("job:{job_id}"), &own).await?;
                 self.timer.wake_in(60_000).await?;
+            } else if !own.began {
+                // Its record holds a machine busy with another job's work: its own job is over all the same.
+                own.began = true;
+                put_json(self.store, &format!("job:{job_id}"), &own).await?;
             }
         }
         Ok(())
@@ -1985,7 +2035,18 @@ impl<'a> ControlPlane<'a> {
         let now = self.clock.now_ms();
         let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
         let (mut active, mut waiting) = (0, 0);
-        for (key, v) in self.store.list("job:").await? {
+        let kept = self.store.list("job:").await?;
+        // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
+        // that machines still coming are for.
+        let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);
+        for (_, v) in &kept {
+            let Ok(j) = serde_json::from_str::<Job>(v) else { continue };
+            if !j.provider.is_empty() { continue }
+            if ["launching", "launched"].contains(&j.state.as_str()) && !j.seen_in_progress { aimed.push(j.for_job.unwrap_or(j.job_id)) }
+            let waits = !(j.began || j.over || j.failed_fast) && j.fail_pending.is_none() && j.rerun.is_none() && now.saturating_sub(j.at_ms) < 86_400_000;
+            if waits && ["launching", "launched", "running", "done"].contains(&j.state.as_str()) { queued.push((self.runners_of(&j), j.job_id, j.repo.clone())) }
+        }
+        for (key, v) in kept {
             let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
             // History is kept two months (this month's spend and the last's).
             if !["launching", "launched", "running", "waiting"].contains(&j.state.as_str()) && now.saturating_sub(j.ended_ms.unwrap_or(j.at_ms)) > 62 * 86_400_000 {
@@ -2040,40 +2101,107 @@ impl<'a> ControlPlane<'a> {
             // A machine that never began its job (a container that did not start, a spot machine that did not boot):
             // placed again, twice at most, then the job fails with why (GitHub would otherwise keep it queued for a day).
             if j.state == "launched" && !j.seen_in_progress {
-                let wait = if j.cloud == "aws" { 8 * 60_000 } else { 3 * 60_000 };
-                if now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms)) > wait {
+                let age = now.saturating_sub(j.launched_ms.unwrap_or(j.at_ms));
+                let (wait, up_by) = if j.cloud == "aws" { (8 * 60_000, 90_000) } else { (3 * 60_000, 60_000) };
+                let late = age > wait;
+                // Once it has had time to come up and has begun nothing, GitHub is asked at every sweep whether the
+                // job it is for still waits (one request): a machine nobody waits for is ended then, not minutes later.
+                if late || (age > up_by && j.provider.is_empty()) {
                     let place = cloud_name(&j.cloud).to_string();
-                    self.stop_machine(&plane_url, &j).await;
-                    // Only while GitHub still has the job queued (another runner may have taken it, or it was
-                    // cancelled, and the event never came).
                     // The job its machine is for: its own, or the one whose runner took its own (still queued, then, with
                     // no machine coming but this one).
                     let wanted = j.for_job.unwrap_or(j.job_id);
-                    let gone = ((j.failed_fast || j.over) && j.for_job.is_none()) || if j.provider == "gitlab" {
-                        match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(p)) => gitlab::job(self.http, gl, p, wanted).await.is_ok_and(|(_, s)| s != "pending"), _ => false }
-                    } else {
-                        match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(t)) => github::job_status(self.http, &app.api(), &t, &j.repo, wanted).await.is_ok_and(|s| s != "queued"), _ => false }
-                    };
+                    // Its own job ran on another job's runner, or is over: nothing of it failed here.
+                    let elsewhere = j.over || j.for_job.is_some() || j.began;
+                    // Only while GitHub still has the job queued (another runner may have taken it, or it was
+                    // cancelled, and the event never came).
+                    let (mut gone, mut on_runner) = ((j.failed_fast || j.over) && j.for_job.is_none(), None);
+                    if !gone && j.provider == "gitlab" {
+                        gone = match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(p)) => gitlab::job(self.http, gl, p, wanted).await.is_ok_and(|(_, s)| s != "pending"), _ => false };
+                    } else if !gone {
+                        if let (Some(app), Some(t)) = (self.app_of(&j), self.installation_token_for(&j).await) {
+                            if let Ok((status, runner)) = github::job_state(self.http, &app.api(), &t, &j.repo, wanted).await { (gone, on_runner) = (status != "queued", runner) }
+                        }
+                    }
+                    if gone && j.provider.is_empty() {
+                        // GitHub has that job on this very machine (the event that said so never came): begun, as if told.
+                        if on_runner.is_some() && on_runner == j.runner {
+                            self.started(&plane_url, wanted, j.runner.as_deref()).await?;
+                            active += 1;
+                            continue;
+                        }
+                        // Its runner is busy all the same (what said so was lost): the machine is running a job.
+                        let busy = match (self.app_of(&j), self.installation_token_for(&j).await, j.runner_id) {
+                            (Some(app), Some(t), Some(id)) => github::runner_busy(self.http, &app.api(), &t, &Self::owner_of(app), &j.repo, id).await,
+                            _ => Ok(false),
+                        };
+                        if busy.is_err() && !late { active += 1; continue }
+                        if busy == Ok(true) {
+                            (j.seen_in_progress, j.for_job) = (true, None);
+                            j.state = "running".into();
+                            j.started_ms.get_or_insert(now);
+                            put_json(self.store, &key, &j).await?;
+                            active += 1;
+                            continue;
+                        }
+                        // The job it was for waits no more. Another that still waits with no machine coming for it
+                        // (GitHub gives a job to any runner with its label, and three jobs can pass theirs around)
+                        // gets this one.
+                        queued.retain(|(_, id, _)| *id != wanted);
+                        if wanted == j.job_id { j.began = true }
+                        let mine = self.runners_of(&j);
+                        // The newest first, and GitHub is asked of each (three at most): what was told can be stale.
+                        let mut others: Vec<(u64, String)> = queued.iter().filter(|(runners, id, _)| *runners == mine && !aimed.contains(id)).map(|(_, id, repo)| (*id, repo.clone())).collect();
+                        others.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                        let mut next = None;
+                        for (id, repo) in others.into_iter().take(3) {
+                            let (Some(app), Some(t)) = (self.app_of(&j), self.installation_token_for(&j).await) else { break };
+                            match github::job_status(self.http, &app.api(), &t, &repo, id).await {
+                                Ok(status) if status == "queued" => { next = Some(id); break }
+                                Ok(_) => {
+                                    queued.retain(|(_, q, _)| *q != id);
+                                    if let Some(mut other) = get_json::<Job>(self.store, &format!("job:{id}")).await? { other.began = true; put_json(self.store, &format!("job:{id}"), &other).await? }
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        if let Some(next) = next {
+                            aimed.push(next);
+                            j.for_job = Some(next).filter(|n| *n != j.job_id);
+                            gone = false;
+                            if !late {
+                                put_json(self.store, &key, &j).await?;
+                                active += 1;
+                                continue;
+                            }
+                        }
+                    }
                     if gone {
+                        self.stop_machine(&plane_url, &j).await;
                         self.withdraw_runner(&j).await;
-                        j.state = "swept".into();
+                        // Else its machine began nothing and its job waits no more (taken elsewhere or cancelled, untold).
+                        j.state = if elsewhere { "done" } else { "swept" }.into();
+                        j.for_job = None;
                         j.ended_ms.get_or_insert(now);
                         self.settle(&plane_url, &mut j).await;
                         put_json(self.store, &key, &j).await?;
                         continue;
                     }
-                    if j.retries >= 2 {
-                        self.withdraw_runner(&j).await;
-                        j.state = "failed".into();
-                        j.error = Some(format!("{place} did not start a machine for it, three times"));
-                        j.ended_ms.get_or_insert(now);
-                        put_json(self.store, &key, &j).await?;
-                    } else {
-                        j.retries += 1;
-                        self.again(&plane_url, &key, &mut j, &format!("{place} did not start its machine; trying again")).await?;
-                        if j.state == "waiting" { waiting += 1 } else { active += 1 }
+                    if late {
+                        self.stop_machine(&plane_url, &j).await;
+                        if j.retries >= 2 {
+                            self.withdraw_runner(&j).await;
+                            j.state = "failed".into();
+                            j.error = Some(format!("{place} did not start a machine for it, three times"));
+                            j.ended_ms.get_or_insert(now);
+                            put_json(self.store, &key, &j).await?;
+                        } else {
+                            j.retries += 1;
+                            self.again(&plane_url, &key, &mut j, &format!("{place} did not start its machine; trying again")).await?;
+                            if j.state == "waiting" { waiting += 1 } else { active += 1 }
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
             // Its machine's age (a job may have waited long for room before it got one).

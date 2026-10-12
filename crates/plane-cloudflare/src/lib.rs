@@ -193,6 +193,7 @@ impl Timer for DoTimer<'_> {
         if let Ok(Some(at)) = storage.get_alarm().await { if (at as u64) <= due { return Ok(()); } }
         storage.set_alarm(std::time::Duration::from_millis(ms)).await.map_err(|e| e.to_string())
     }
+    async fn pause(&self, ms: u64) { worker::Delay::from(std::time::Duration::from_millis(ms)).await }
 }
 
 impl PlaneObject {

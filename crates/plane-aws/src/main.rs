@@ -86,10 +86,14 @@ impl Store for Dynamo<'_> {
 struct SystemClock;
 impl Clock for SystemClock { fn now_ms(&self) -> u64 { now_ms() } }
 
-/// The schedule calls the sweep every two minutes whatever is asked, so a wake-up needs nothing here.
+/// The schedule calls the sweep every minute whatever is asked, so a wake-up needs nothing here.
 struct Scheduled;
 #[async_trait(?Send)]
-impl Timer for Scheduled { async fn wake_in(&self, _ms: u64) -> io::Result<()> { Ok(()) } }
+impl Timer for Scheduled {
+    async fn wake_in(&self, _ms: u64) -> io::Result<()> { Ok(()) }
+    /// A Lambda answers one request at a time: it simply waits.
+    async fn pause(&self, ms: u64) { std::thread::sleep(Duration::from_millis(ms)) }
+}
 
 /// The secrets under /superci/<id>/, read at most every 15 seconds.
 struct Secrets { at: Option<Instant>, values: Vec<(String, String)> }

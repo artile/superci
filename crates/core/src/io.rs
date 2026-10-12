@@ -129,6 +129,8 @@ pub trait Clock {
 pub trait Timer {
     /// Calls the control plane's `alarm` at the latest after `ms` (an earlier pending wake-up stays).
     async fn wake_in(&self, ms: u64) -> Result<()>;
+    /// Waits `ms` in place, the request being answered waiting with it, where the runtime can; at once where not.
+    async fn pause(&self, _ms: u64) {}
 }
 
 /// Typed JSON values in a `Store`.

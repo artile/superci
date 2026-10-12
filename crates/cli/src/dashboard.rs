@@ -294,7 +294,7 @@ pub enum Background { Deploy, Update, Move }
 pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
     let state = match j["state"].as_str().unwrap_or_default() { "done" => "done", "failed" | "orphan" | "swept" => "failed", "cancelled" => "cancelled", "running" => "running", "waiting" => "waiting", _ => "starting" };
     let (title, sub) = job_names(j);
-    let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { String::new() };
+    let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { off_spot(j).map(|(why, _)| why).unwrap_or_default() };
     serde_json::json!({ "id": j["job_id"], "state": state, "job": title, "in": sub, "runner": runner_text(j).1, "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
 }
 
@@ -500,7 +500,8 @@ fn job_table(jobs: &[serde_json::Value]) -> String {
         let runner = if runner.is_empty() { r#"<span class="faint">—</span>"#.to_string() } else { format!("{}<span>{}</span>", logo(&runner_logo, 16), esc(&runner)) };
         let took = duration(j);
         let cost = job_cost(j).filter(|c| *c > 0.0).map(|c| cost_text(j, c)).unwrap_or_default();
-        let why = if kind == "bad" || state == "waiting" { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&plain_reason(j))) } else { String::new() };
+        let why = if kind == "bad" || state == "waiting" { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&plain_reason(j))) }
+            else { off_spot(j).map(|(why, _)| format!(r#"<small class="jt-why open">{}</small>"#, esc(&why))).unwrap_or_default() };
         format!(r#"<a class="jt-row" href="{}" target="_blank" rel="noopener"><span class="jt-job"><strong>{}</strong><small>{host}{}</small>{why}</span><span class="jt-runner">{runner}</span><span class="jt-num">{took}</span><span class="jt-num">{cost}</span><span class="jt-state {kind}"><i></i>{word}</span><span class="jt-when">{}</span></a>"#,
             esc(&job_link(j)), esc(&title), esc(&sub), ago(j["at_ms"].as_u64().unwrap_or_default()))
     }).collect::<String>();
@@ -534,6 +535,28 @@ fn runner_text(j: &serde_json::Value) -> (String, String) {
             (cloud.to_string(), size.unwrap_or_else(|| cloud_name(cloud).to_string()))
         }
     }
+}
+
+/// Why a job that asked for a spot machine ran on an on-demand one (which costs about twice as much): what AWS said
+/// of spot, in plain words, and the region where the account's spot limit was reached, if that was it.
+fn off_spot(j: &serde_json::Value) -> Option<(String, Option<String>)> {
+    if j["on_demand"] != true || j["cloud"] != "aws" { return None }
+    let said = j["spot_refused"].as_str()?;
+    let limited = said.split("; ").find(|a| a.contains("MaxSpotInstanceCountExceeded")).and_then(|a| a.split(':').next());
+    Some(match limited {
+        Some(region) => (format!("On-demand: your AWS spot limit in {} was reached", region_short(region)), Some(region.to_string())),
+        None => ("On-demand: AWS had no spot machine for it".into(), None),
+    })
+}
+
+/// One line above the jobs when some of the last day's ran on on-demand machines because the account's spot limit
+/// was reached: how many, and where to ask AWS for more.
+fn spot_limit_notice(jobs: &[serde_json::Value]) -> String {
+    let since = now_ms().saturating_sub(86_400_000);
+    let hit: Vec<String> = jobs.iter().filter(|j| j["at_ms"].as_u64().is_some_and(|at| at > since)).filter_map(|j| off_spot(j)?.1).collect();
+    let Some(region) = hit.first() else { return String::new() };
+    format!(r#"<div class="notice warn"><span>{} in the last day ran on on-demand machines, at about twice the price: your AWS account's spot limit in {} was reached. <a href="{}" target="_blank" rel="noopener">Request more from AWS ↗</a></span></div>"#,
+        jobs_word(hit.len() as u32), esc(&region_short(region)), esc(&superci_core::aws::spot_quota_link(region)))
 }
 
 /// Why a job did not run (or waits), in plain words: what the control plane recorded, without its machinery.
@@ -627,6 +650,16 @@ impl Dashboard {
         document(200, "SuperCI", &format!(r#"<div class="done"><div><span class="done-mark">{mark}<span class="done-check"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.2 4.2L19 7"/></svg></span></span><h1>{}</h1><p>{}</p><p class="done-foot">You can close this tab.</p></div></div>"#, esc(&heading), esc(&text)), None)
     }
 
+    /// `superci login aws`, before AWS: one button to it. Back here with the sign-in unfinished: signed out of AWS
+    /// first, or the same again. (Shown again from the browser's kept copy, it asks anew which of the two it is.)
+    fn aws_login_page(&self) -> Response {
+        let stuck = !self.aws_stuck().is_empty();
+        let (heading, text) = if stuck { ("Your AWS sign-in is not finished", "If AWS said “400 Bad Request”, an old AWS sign-in in this browser is in the way.") } else { ("Sign in with AWS", "You come straight back here.") };
+        let go = |fresh: bool, class: &str, label: &str| format!(r#"<form method="post" action="/aws/signin"><input type="hidden" name="next">{}<button class="{class}">{label}</button></form>"#, if fresh { r#"<input type="hidden" name="fresh" value="on">"# } else { "" });
+        let buttons = if stuck { format!("{}{}", go(true, "button", "Sign out of AWS and try again"), go(false, "button secondary", "Try again")) } else { go(false, "button", "Continue to AWS") };
+        document(200, "SuperCI", &format!(r#"<div class="done"><div><span class="done-mark">{}</span><h1>{}</h1><p>{}</p><div class="done-go">{buttons}</div></div></div><script>addEventListener('pageshow',function(e){{if(e.persisted)location.reload()}})</script>"#, logo("aws", 44), esc(heading), esc(text)), None)
+    }
+
     /// What the task's tab shows at the dashboard's address, in the dashboard's place.
     fn task_page(&mut self) -> Option<Response> {
         if self.task_done().is_some() { return Some(self.done_page()) }
@@ -640,8 +673,12 @@ impl Dashboard {
                 return Some(back_to("Approve it in Modal's tab", "This tab goes on by itself once you have.", &format!("{}/", self.base)))
             }
         }
+        // AWS's sign-in can end on AWS's own "400 Bad Request" (see `aws_stuck`), and Back from there has to find a
+        // page here: so its sign-in starts from one with a button (a page that goes on by itself is one a browser's
+        // Back skips), and that page says the way on once a sign-in was started and has not come back.
+        if matches!(self.task, Some(Task::Login(Some("aws")))) { return Some(self.aws_login_page()) }
         match self.task.as_mut()? {
-            // A sign-in with one cloud goes straight to it; with any, the dashboard's own first screen asks which.
+            // A sign-in with Cloudflare or Modal goes straight to it; with any, the dashboard's own first screen asks which.
             Task::Login(Some(cloud)) => Some(Response::redirect(&format!("/connect/{cloud}"))),
             Task::Login(None) => None,
             // Back here before GitHub was finished: the page waits, and looks again by itself.
@@ -3862,7 +3899,7 @@ fn jobs_card(v: Option<&PlaneView>, limit: usize) -> String {
         Some(v) if v.status.is_none() && v.online => SK_ROWS.repeat(3),
         Some(v) if v.status.is_none() => empty_state(&icon("jobs"), "Jobs are out of reach", "Sign in where the control plane runs to see its jobs.", ""),
         Some(_) if rows.is_empty() => empty_state(&icon("play"), "No jobs yet", "They show up here as soon as a workflow uses your label:", &snippet),
-        Some(_) => format!("{rows}{more}"),
+        Some(_) => format!("{}{rows}{more}", spot_limit_notice(&jobs)),
         None => empty_state(&icon("play"), "No jobs yet", "Once setup is done, every job with this label shows up here, with the machine it ran on:", &snippet),
     };
     format!(r#"<section class="card"><div class="card-head"><h2>Recent jobs</h2></div>{body}</section>"#)
@@ -4402,6 +4439,16 @@ mod tests {
             && html.contains("up to 32 spot CPUs at once there (8 jobs of 4 CPU)") && !html.contains("Ask AWS for more"));
         assert!(html.contains(r#"<summary class="button secondary sm">Change region</summary>"#) && html.contains("Europe (Ireland) · eu-west-1 · up to 5 CPUs") && html.contains(r#"<option value="us-east-1" selected>"#));
         assert!(quota_text("eu-west-1", 5).contains("5 spot CPUs at once there (1 job of 4 CPU)") && quota_text("eu-west-1", 5).contains("eu-west-1.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-34B43A08"));
+        // A job the order sent on to an on-demand machine says why, in its row and in a line above the jobs.
+        let ran = |refused: Option<&str>| serde_json::json!({ "job_id": 1, "state": "done", "cloud": "aws", "on_demand": true, "machine_type": "c8a.xlarge", "cpu": 4, "spot_refused": refused, "at_ms": now_ms() });
+        let limited = ran(Some("us-east-1: MaxSpotInstanceCountExceeded"));
+        assert_eq!(job_words(&limited)["why"], "On-demand: your AWS spot limit in N. Virginia was reached");
+        assert_eq!(job_words(&ran(Some("us-east-1: InsufficientInstanceCapacity; us-east-2: InsufficientInstanceCapacity")))["why"], "On-demand: AWS had no spot machine for it");
+        assert_eq!(job_words(&ran(None))["why"], "", "a job whose label asked for on-demand");
+        assert!(job_table(&[limited.clone()]).contains(r#"<small class="jt-why open">On-demand: your AWS spot limit in N. Virginia was reached</small>"#));
+        let notice = spot_limit_notice(&[limited.clone(), limited, ran(None)]);
+        assert!(notice.contains("2 jobs in the last day ran on on-demand machines") && notice.contains("us-east-1.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-34B43A08"), "{notice}");
+        assert_eq!(spot_limit_notice(&[ran(None), ran(Some("us-east-1: InsufficientInstanceCapacity"))]), "");
     }
 
     #[test]
@@ -5144,8 +5191,20 @@ mod tests {
     #[test]
     fn what_a_person_does_in_the_browser() {
         // A sign-in with one cloud goes straight to it, and is done once that cloud is signed in to.
+        let mut cf = Dashboard::new().for_task(Task::Login(Some("cloudflare")));
+        assert_eq!(cf.task_page().unwrap().headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.as_str()), Some("/connect/cloudflare"));
+        // AWS's starts from a page with one button, so that Back from AWS's "400 Bad Request" finds a page here.
         let mut d = Dashboard::new().for_task(Task::Login(Some("aws")));
-        assert_eq!(d.task_page().unwrap().headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.as_str()), Some("/connect/aws"));
+        let first = String::from_utf8(d.task_page().unwrap().body).unwrap();
+        if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { std::fs::write(format!("{dir}/login-aws.html"), &first).unwrap() }
+        assert!(first.contains("<h1>Sign in with AWS</h1>") && first.contains(r#"action="/aws/signin""#) && first.contains("Continue to AWS") && !first.contains(r#"name="fresh""#), "one button, to AWS");
+        // Started and not back (AWS said "400 Bad Request", and the person pressed Back): signed out of AWS first, or again.
+        let (_, pending) = aws::authorize("us-east-1", "http://127.0.0.1:8976/oauth/callback");
+        (d.aws_pending, d.aws_asked_ms) = (Some(pending), now_ms());
+        let back = String::from_utf8(d.task_page().unwrap().body).unwrap();
+        if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { std::fs::write(format!("{dir}/login-aws-back.html"), &back).unwrap() }
+        assert!(back.contains("<h1>Your AWS sign-in is not finished</h1>") && back.contains("400 Bad Request") && back.contains(r#"name="fresh" value="on"><button class="button">Sign out of AWS and try again"#) && back.contains(">Try again<"));
+        (d.aws_pending, d.aws_asked_ms) = (None, 0);
         d.modal = Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() });
         assert!(d.task_done().is_none(), "another cloud's sign-in is not this one");
         d.aws = Some(aws::Session::for_test("123456789012"));
