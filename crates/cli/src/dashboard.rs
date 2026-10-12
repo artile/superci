@@ -4321,7 +4321,14 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
     for (i, p) in order.iter().enumerate() {
         let (logo_key, name, what) = pool_text(v, &p.cloud);
         let on_demand = p.cloud == AWS_ON_DEMAND;
-        let state = if p.off { pill("open", "off") } else { pill("good", "ready") };
+        // AWS's spot machines in an account that may start none (its organization's rule, or its sign-in's): said
+        // on the row and in its settings, in "ready"'s place. Its jobs go on down the order.
+        let no_spot = match look.and_then(|l| l.spot.as_ref()).filter(|_| p.cloud == "aws") {
+            Some(aws::Answer::Refused(r)) => Some(if matches!(r.by, superci_core::aws::By::Organization | superci_core::aws::By::OrganizationResources) { "your AWS organization" } else { "the role or user signed in as" }),
+            _ => None,
+        };
+        let what = match no_spot { Some(whose) => format!("Spot machines are not allowed by {whose}: its jobs go to the next provider in the order"), None => what };
+        let state = if p.off { pill("open", "off") } else if no_spot.is_some() { pill("open", "not allowed") } else { pill("good", "ready") };
         let spent = v.spend(&p.cloud);
         let mut limits = vec![];
         if let Some(n) = p.max_jobs { limits.push(format!("{n} at once")) }
@@ -5917,8 +5924,16 @@ mod tests {
         // This month as the clouds bill it: Cloudflare's account within its included usage, Modal's after credits.
         d.cf_month = Some((0.9, 0.0));
         d.modal_month = Some(modal::Month { metered: 3.0, billed: 1.0, superci: 1.5 });
+        // In an AWS account whose organization allows no spot machines (as a project of AWS's new sign-up answered),
+        // the spot provider says so in "ready"'s place.
+        d.aws = Some(aws::Session::for_test("111111111111"));
+        d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-paid/look.jsonl"))));
+        let no_spot = d.render("runners", &[view.clone()], None);
+        assert!(no_spot.contains("<small>Spot machines are not allowed by your AWS organization: its jobs go to the next provider in the order</small>") && no_spot.contains(r#"<span class="pill open"><i></i>Not allowed</span>"#) && !no_spot.contains("Spot machines of any size"), "{no_spot}");
+        (d.aws, d.aws_looks) = (None, HashMap::new());
         let html = d.render("runners", &[view.clone()], None);
         preview("runners", &html);
+        assert!(html.contains("Spot machines of any size") && !html.contains("not allowed"), "an account that allows them says nothing of it");
         assert!(html.contains(">$0.82 this month · included<"), "cf");
         assert!(html.contains(">$1.50 this month · $0.50 billed<"), "modal");
         assert!(!html.contains(">$12.40 this month<"), "a budget already says the spend");
