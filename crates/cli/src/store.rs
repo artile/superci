@@ -1,7 +1,8 @@
 //! What SuperCI keeps on this computer: its own sign-ins to your clouds, in a folder of its own (`~/.superci`, or
 //! `SUPERCI_HOME`), so that the dashboard opens signed in and commands run without a browser. They are kept by
-//! workspace (`workspaces/<name>/sign-ins.json`): each workspace is a world of its own (one company's sign-ins,
-//! and through them its control plane and everything of it), and nothing of one is seen from another. Nothing of another
+//! workspace (`workspaces/<id>/sign-ins.json`): each workspace is a world of its own (its sign-ins, and through
+//! them its control plane and everything of it), and nothing of one is seen from another. Beside them, what the
+//! workspace is called and looks like in a list (`workspace.json`: nothing secret). Nothing of another
 //! tool's is read (no AWS profile, no wrangler or Modal login) and nothing is written anywhere else. `superci logout`
 //! removes it.
 //!
@@ -37,17 +38,23 @@ pub struct Kept {
     /// again: said where it matters, and the key and the control plane stay, so looking goes on working.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub aws_ended: bool,
-    /// What the workspace's CI was last seen to be called and whose jobs it runs: what a list of workspaces says of
-    /// each without asking its control plane (and without using its sign-ins from another workspace's page).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seen: Option<Seen>,
 }
 
+/// What a workspace is called and looks like: what a list of workspaces says of each without asking its control
+/// plane (and without using its sign-ins from another workspace's page). Kept beside the sign-ins, and not one.
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
-pub struct Seen {
-    pub called: String,
+pub struct About {
+    /// Its name: given when it was made, and from then on what its CI is called (AcmeCI). None: it has none yet.
+    #[serde(default)]
+    pub name: String,
     /// Each code host connected: its kind (`github`, `gitlab`) and its name (an organization, a GitLab's address).
+    #[serde(default)]
     pub hosts: Vec<(String, String)>,
+    /// The first GitHub organization's picture, as GitHub serves it (a `data:` address), and whose it is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub picture: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub picture_of: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -71,42 +78,60 @@ pub fn root() -> Option<PathBuf> {
     var("SUPERCI_HOME").or_else(|| var("HOME").or_else(|| var("USERPROFILE")).map(|h| h.join(".superci")))
 }
 
-/// Whether a workspace can be called this: 2 to 24 lowercase letters, digits and dashes, starting with a letter (it
+/// Whether this can be a workspace's id: 2 to 24 lowercase letters, digits and dashes, starting with a letter (it
 /// is a folder's name, and what `--workspace` takes).
-pub fn valid_name(name: &str) -> crate::Result<()> {
-    let ok = (2..=24).contains(&name.len()) && name.starts_with(|c: char| c.is_ascii_lowercase()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if ok { Ok(()) } else { Err("A workspace's name is 2 to 24 lowercase letters, digits and dashes, starting with a letter (acme, acme-staging).".into()) }
+pub fn valid_id(id: &str) -> crate::Result<()> {
+    let ok = (2..=24).contains(&id.len()) && id.starts_with(|c: char| c.is_ascii_lowercase()) && !id.ends_with('-') && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok { Ok(()) } else { Err("A workspace's id is 2 to 24 lowercase letters, digits and dashes, starting with a letter (acme, acme-staging).".into()) }
+}
+
+/// The id a workspace gets from its name: its letters and digits in lowercase, a dash for whatever is between them
+/// (Acme CI: acme-ci).
+pub fn id_from(name: &str) -> crate::Result<String> {
+    let mut id = String::new();
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() { id.push(c.to_ascii_lowercase()) } else if !id.is_empty() && !id.ends_with('-') { id.push('-') }
+    }
+    let id: String = id.trim_start_matches(|c: char| !c.is_ascii_lowercase()).chars().take(24).collect();
+    let id = id.trim_end_matches('-').to_string();
+    valid_id(&id).map_err(|_| "A workspace's name needs two letters or more (AcmeCI, Build Farm).".to_string())?;
+    Ok(id)
 }
 
 /// The workspaces kept under a folder, by name, in order.
 pub fn workspaces_in(root: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(root.join("workspaces")).into_iter().flatten().flatten()
-        .filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).filter(|n| valid_name(n).is_ok()).collect();
+        .filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).filter(|n| valid_id(n).is_ok()).collect();
     names.sort();
     names
 }
 
 /// A workspace in a line of a list: read from what it keeps, nothing asked of any cloud.
-pub struct Listed { pub name: String, pub called: String, pub hosts: Vec<(String, String)>, pub place: String, pub signed_in: bool }
+pub struct Listed { pub id: String, pub name: String, pub hosts: Vec<(String, String)>, pub picture: String, pub place: String, pub signed_in: bool }
+
+impl Listed {
+    /// What it is called where people read it: its name, or its id until it has one.
+    pub fn title(&self) -> &str { if self.name.is_empty() { &self.id } else { &self.name } }
+}
 
 /// The workspaces kept under a folder, with `also` among them (the one a page is of, which has no folder until it
 /// keeps something).
 pub fn listed(root: &std::path::Path, also: Option<&str>) -> Vec<Listed> {
     let mut names = workspaces_in(root);
     if let Some(a) = also.filter(|a| !names.iter().any(|n| n == a)) { names.push(a.to_string()); names.sort() }
-    names.into_iter().map(|name| {
-        let kept = Store::under(root, &name).read();
-        let seen = kept.seen.clone().unwrap_or_default();
-        Listed { called: seen.called, hosts: seen.hosts, place: kept.plane.as_ref().map(|p| p.place()).unwrap_or_default(), signed_in: kept.signed_in(), name }
+    names.into_iter().map(|id| {
+        let store = Store::under(root, &id);
+        let (kept, about) = (store.read(), store.about());
+        Listed { name: about.name, hosts: about.hosts, picture: about.picture, place: kept.plane.as_ref().map(|p| p.place()).unwrap_or_default(), signed_in: kept.signed_in(), id }
     }).collect()
 }
 
-/// A workspace under a new name: its folder is renamed. The new name must be free.
+/// A workspace under a new id: its folder is renamed. The new id must be free.
 pub fn rename(root: &std::path::Path, from: &str, to: &str) -> crate::Result<()> {
-    valid_name(to)?;
+    valid_id(to)?;
     if from == to { return Ok(()) }
     let (old, new) = (root.join("workspaces").join(from), root.join("workspaces").join(to));
-    if new.exists() { return Err(format!("There is a workspace named {to} already.")) }
+    if new.exists() { return Err(format!("There is a workspace with the id {to} already.")) }
     if !old.is_dir() { return Store::under(root, to).make() }
     std::fs::rename(&old, &new).map_err(|e| format!("could not rename {}: {e}", old.display()))
 }
@@ -134,7 +159,18 @@ impl Store {
 
     pub fn under(root: &std::path::Path, workspace: &str) -> Store { Store { dir: root.join("workspaces").join(workspace) } }
 
-    /// The workspace's name: its folder's.
+    /// What the workspace is called and looks like in a list (nothing, when it has not been said yet).
+    pub fn about(&self) -> About {
+        std::fs::read(self.dir.join("workspace.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    pub fn set_about(&self, about: &About) -> crate::Result<()> {
+        self.make()?;
+        let text = serde_json::to_vec_pretty(about).map_err(|e| e.to_string())?;
+        write_private(&self.dir.join("workspace.json"), &text).map_err(|e| format!("could not write in {}: {e}", self.dir.display()))
+    }
+
+    /// The workspace's id: its folder's name.
     pub fn workspace(&self) -> String { self.dir.file_name().and_then(|n| n.to_str()).unwrap_or(FIRST).to_string() }
 
     /// Makes the workspace's folder (a new workspace is listed before anything is signed in to).
@@ -261,8 +297,8 @@ mod tests {
         assert_eq!(which(&root, Some(" Globex ")), Ok("globex".into()));
         // Two: nothing picks.
         let globex = Store::under(&root, "globex");
-        globex.write(&Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "globex-team".into() }),
-            seen: Some(Seen { called: "GlobexCI".into(), hosts: vec![("github".into(), "globex".into())] }), ..Default::default() }).unwrap();
+        globex.write(&Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "globex-team".into() }), ..Default::default() }).unwrap();
+        globex.set_about(&About { name: "GlobexCI".into(), hosts: vec![("github".into(), "globex".into())], ..Default::default() }).unwrap();
         assert_eq!(which(&root, None), Err(vec!["acme".to_string(), "globex".to_string()]));
         assert_eq!(globex.workspace(), "globex");
         #[cfg(unix)]
@@ -275,17 +311,24 @@ mod tests {
         // Each one's sign-ins are its own: nothing of one is in another.
         assert!(!Store::under(&root, "acme").read().signed_in() && globex.read().signed_in());
         let all = listed(&root, Some("default"));
-        assert_eq!(all.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["acme", "default", "globex"]);
-        assert!(all[2].signed_in && all[2].called == "GlobexCI" && all[2].hosts == [("github".to_string(), "globex".to_string())] && !all[0].signed_in);
+        assert_eq!(all.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), ["acme", "default", "globex"]);
+        assert!(all[2].signed_in && all[2].name == "GlobexCI" && all[2].hosts == [("github".to_string(), "globex".to_string())] && !all[0].signed_in);
+        assert_eq!((all[2].title(), all[0].title()), ("GlobexCI", "acme"));
+        // Signing out removes the sign-ins and leaves what it is called.
+        assert!(globex.remove().unwrap() && globex.about().name == "GlobexCI");
+        globex.write(&Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "globex-team".into() }), ..Default::default() }).unwrap();
         // A new name: the folder moves, with what it keeps; a taken name and one that is no name are refused.
-        assert_eq!(rename(&root, "globex", "acme").unwrap_err(), "There is a workspace named acme already.");
-        assert!(rename(&root, "globex", "Globex Inc").unwrap_err().starts_with("A workspace's name is 2 to 24 lowercase letters"));
+        assert_eq!(rename(&root, "globex", "acme").unwrap_err(), "There is a workspace with the id acme already.");
+        assert!(rename(&root, "globex", "Globex Inc").unwrap_err().starts_with("A workspace's id is 2 to 24 lowercase letters"));
         rename(&root, "globex", "initech").unwrap();
-        assert!(Store::under(&root, "initech").read().signed_in() && workspaces_in(&root) == ["acme", "initech"]);
+        assert!(Store::under(&root, "initech").read().signed_in() && Store::under(&root, "initech").about().name == "GlobexCI" && workspaces_in(&root) == ["acme", "initech"]);
         // Forgotten: its folder goes; the other stays.
         Store::under(&root, "initech").forget().unwrap();
         assert_eq!(workspaces_in(&root), ["acme"]);
-        for no in ["a", "Acme", "9lives", "acme corp", "acme_corp", "../acme", "a-name-that-is-much-too-long"] { assert!(valid_name(no).is_err(), "{no}") }
+        for no in ["a", "Acme", "9lives", "acme corp", "acme_corp", "../acme", "acme-", "a-name-that-is-much-too-long"] { assert!(valid_id(no).is_err(), "{no}") }
+        // An id from a name.
+        for (name, id) in [("MyCI", "myci"), ("Acme CI", "acme-ci"), (" Build  Farm 2 ", "build-farm-2"), ("9 Lives", "lives"), ("A name that is much too long for it", "a-name-that-is-much-too")] { assert_eq!(id_from(name).unwrap(), id, "{name}") }
+        assert_eq!(id_from("7").unwrap_err(), "A workspace's name needs two letters or more (AcmeCI, Build Farm).");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

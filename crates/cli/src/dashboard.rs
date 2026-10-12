@@ -55,8 +55,10 @@ pub struct Dashboard {
     store: Option<Store>,
     /// The workspace's name as this dashboard's addresses carry it (`w`). Empty: the one pages without it are of.
     w: String,
-    /// What the workspace's CI was last seen to be called and whose jobs it runs (kept, for the list of workspaces).
-    last_seen: Option<crate::store::Seen>,
+    /// What the workspace is called and looks like in a list (kept beside its sign-ins), and when GitHub was last
+    /// asked for its organization's picture.
+    about: crate::store::About,
+    picture_asked_ms: u64,
     kept_as: String,
     kept_plane: Option<Plane>,
     keep_failed: bool,
@@ -657,7 +659,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), last_seen: None, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -687,7 +689,7 @@ impl Dashboard {
         if let Some(p) = &kept.plane { d.planes.push(p.clone()); d.preloaded = Some(p.plane_id().to_string()) }
         for p in kept.planes_more { if !d.planes.iter().any(|x| x.plane_id() == p.plane_id()) { d.planes.push(p) } }
         d.kept_plane = kept.plane;
-        d.last_seen = kept.seen;
+        d.about = store.about();
         d.store = Some(store);
         d.kept_as = serde_json::to_string(&d.kept()).unwrap_or_default();
         d
@@ -979,7 +981,10 @@ impl Dashboard {
         if !self.modal_given { self.modal = None }
         self.aws = None;
         self.aws_others.clear();
-        self.last_seen = None;
+        // (Signed out, the workspace is still called what it was; whose jobs it ran is not known any more.)
+        let mut about = self.about.clone();
+        (about.hosts, about.picture, about.picture_of) = (vec![], String::new(), String::new());
+        self.set_about(about);
         (self.aws_ended, self.looked_cf, self.looked_aws, self.looked_modal) = (false, false, false, false);
         (self.planes, self.selected, self.kept_plane, self.preloaded, self.views) = (vec![], 0, None, None, None);
         self.cf_accounts.clear();
@@ -1003,21 +1008,50 @@ impl Dashboard {
             plane: self.planes.get(self.selected).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
             planes_more: self.planes.iter().enumerate().filter(|(i, p)| *i != self.selected && !matches!(p, Plane::Seen { .. })).map(|(_, p)| p.clone()).collect(),
             aws_ended: self.aws_ended && self.aws.is_none() && self.aws_others.is_empty(),
-            seen: self.last_seen.clone(),
         }
     }
 
-    /// Notes what the control plane in use is called and whose jobs it runs, once it has said: kept, so that a list of
-    /// workspaces can say it of this one without asking its control plane.
+    /// Notes what the control plane in use is called and whose jobs it runs, once it has said, with the first GitHub
+    /// organization's picture: kept beside the sign-ins, so that a list of workspaces can show this one without asking
+    /// its control plane.
     fn note_seen(&mut self, views: &[PlaneView]) {
         let Some(v) = views.get(view::in_use(views)).filter(|v| v.status.is_some() && !matches!(v.plane, Plane::Seen { .. })) else { return };
         let st = v.status.clone().unwrap_or_default();
-        let mut hosts: Vec<(String, String)> = status_apps(&st).iter().filter_map(|a| a["owner"].as_str().map(|o| ("github".to_string(), o.to_string()))).collect();
-        hosts.extend(v.gitlabs().into_iter().map(|(_, url, _)| ("gitlab".to_string(), url.trim_start_matches("https://").to_string())));
-        self.last_seen = Some(crate::store::Seen { called: v.name(), hosts });
+        let apps = status_apps(&st);
+        let mut about = self.about.clone();
+        about.hosts = apps.iter().filter_map(|a| a["owner"].as_str().map(|o| ("github".to_string(), o.to_string()))).collect();
+        about.hosts.extend(v.gitlabs().into_iter().map(|(_, url, _)| ("gitlab".to_string(), url.trim_start_matches("https://").to_string())));
+        // A control plane that has not been named says "SuperCI": the name the workspace was given stands until
+        // the control plane has it (see `adopt_deploy`).
+        if v.name() != "SuperCI" || about.name.is_empty() { about.name = v.name() }
+        // The picture of the first organization on github.com, asked for once (and again when it is another one).
+        let owner = apps.iter().find(|a| a["host"].as_str().is_none_or(str::is_empty)).and_then(|a| a["owner"].as_str()).unwrap_or_default().to_string();
+        if owner.is_empty() { (about.picture, about.picture_of) = (String::new(), String::new()) }
+        else if about.picture_of != owner && now_ms() > self.picture_asked_ms + 600_000 {
+            self.picture_asked_ms = now_ms();
+            if let Some(picture) = github_picture(&owner) { (about.picture, about.picture_of) = (picture, owner) }
+        }
+        self.set_about(about);
     }
 
-    /// This workspace's name: its folder's.
+    /// Keeps what the workspace is called and looks like, when it changed.
+    fn set_about(&mut self, about: crate::store::About) {
+        if about == self.about { return }
+        self.about = about;
+        if let Some(store) = &self.store { if let Err(e) = store.set_about(&self.about) { if !self.keep_failed { eprintln!("{e}"); self.keep_failed = true } } }
+    }
+
+    /// What this workspace's CI is called on its pages: the control plane's name; the workspace's own until the
+    /// control plane has one, or there is one.
+    fn called_as(&self, current: Option<&PlaneView>) -> String {
+        match current.map(|v| v.name()) {
+            Some(name) if name != "SuperCI" || self.about.name.is_empty() => name,
+            _ if !self.about.name.is_empty() => self.about.name.clone(),
+            _ => "SuperCI".to_string(),
+        }
+    }
+
+    /// This workspace's id: its folder's name.
     fn workspace(&self) -> String { self.store.as_ref().map(|s| s.workspace()).unwrap_or_else(|| crate::store::FIRST.to_string()) }
 
     /// An address of this dashboard to come back to (`query`: nothing, or `?p=…`), naming this workspace where its
@@ -1418,6 +1452,13 @@ impl Dashboard {
         if let Some(Deploy { result: Some(Ok(p)), .. }) = finished {
             self.selected = match self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { Some(i) => i, None => { self.planes.push(p); self.planes.len() - 1 } };
             self.show_setup = false;
+            // The workspace's first control plane is called what the workspace was named (another one gets its
+            // name with a move). Not done: it is named in Settings.
+            if self.planes.len() == 1 && !self.about.name.is_empty() && self.about.name != "SuperCI" {
+                let (plane, name) = (self.planes[0].clone(), self.about.name.clone());
+                if let Plane::Aws { account_id, .. } = &plane { self.hold_account(account_id); }
+                let _ = self.put_secret(&plane, "NAME", &name);
+            }
             *lock(&self.deployed_to) = self.planes.get(self.selected).map(|p| p.plane_id().to_string());
             *lock(&self.deployed) = true;
         }
@@ -2133,6 +2174,9 @@ impl Dashboard {
                 if let Err(e) = superci_core::spec::valid_name(&name) { return Ok(message(400, "That cannot be its name", &esc(&e))) }
                 self.put_secret(&plane, "NAME", &name)?;
                 self.shown(&plane, |s| s["name"] == name.as_str())?;
+                let mut about = self.about.clone();
+                about.name.clone_from(&name);
+                self.set_about(about);
                 Ok(Response::redirect("/?p=settings"))
             }
             // The default machine: what `runs-on: superci` alone gets.
@@ -2326,7 +2370,7 @@ function show(h){var to=h.match(/data-go="([^"]+)"/);if(to){go(to[1]);return}doc
 function load(){fetch(frag(),{credentials:'same-origin'}).then(function(r){return r.text()}).then(show).catch(function(){document.body.classList.remove('busy');main.innerHTML='<div class="empty">The dashboard stopped. Run superci dashboard again.</div>'})}
 function go(url){document.querySelectorAll('details.menu[open]').forEach(function(d){d.open=false});var u=keep(new URL(url,location.href));history.pushState(null,'',u.pathname+u.search+u.hash);current();clearTimeout(timer);document.body.classList.add('busy');window.scrollTo(0,0);load()}
 document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');if(!a||a.target||e.defaultPrevented||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;var u=new URL(a.href,location.href);if(u.origin!==location.origin||u.pathname!=='/'||u.searchParams.has('k')||(u.search===location.search&&u.hash))return;e.preventDefault();go(u.href)});
-document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute('action')||'';if(e.defaultPrevented||(f.getAttribute('method')||'').toLowerCase()!=='post'||act.charAt(0)!=='/')return;if(/signin$|^\/github\/start/.test(act)){['c','w'].forEach(function(n){if(qp(n)&&!f.querySelector('[name='+n+']')){var ci=document.createElement('input');ci.type='hidden';ci.name=n;ci.value=qp(n);f.appendChild(ci)}});return}e.preventDefault();var d=f.closest('dialog');document.body.classList.add('busy');var b=e.submitter||f.querySelector('button:not([type=button])');if(b&&!b.disabled){b.disabled=true;b.innerHTML='<span class="mini-spin"></span>'+(b.classList.contains('danger')?'Working…':'Saving…');b.classList.add('working')}var qs=['w','c'].filter(qp).map(function(n){return n+'='+encodeURIComponent(qp(n))}).join('&');fetch(act+(qs?(act.indexOf('?')<0?'?':'&')+qs:''),{method:'POST',body:new URLSearchParams(new FormData(f,e.submitter)),credentials:'same-origin'}).then(function(r){if(d&&d.open)d.close();var u=new URL(r.url);if(r.redirected&&u.origin===location.origin&&u.pathname==='/'){go(u.href);return}if(r.redirected){location.href=r.url;return}return r.text().then(function(t){document.open();document.write(t);document.close()})}).catch(function(){f.submit()})});
+document.addEventListener('submit',function(e){var f=e.target,act=f.getAttribute('action')||'';if(e.defaultPrevented||(f.getAttribute('method')||'').toLowerCase()!=='post'||act.charAt(0)!=='/')return;if(/signin$|^\/github\/start/.test(act)){['c','w'].forEach(function(n){if(qp(n)&&!f.querySelector('[name='+n+']')){var ci=document.createElement('input');ci.type='hidden';ci.name=n;ci.value=qp(n);f.appendChild(ci)}});return}e.preventDefault();var d=f.closest('dialog');document.body.classList.add('busy');var b=e.submitter||f.querySelector('button:not([type=button])');var was=b&&b.innerHTML;if(b&&!b.disabled){b.disabled=true;b.innerHTML='<span class="mini-spin"></span>'+(b.classList.contains('danger')?'Working…':'Saving…');b.classList.add('working')}var qs=['w','c'].filter(qp).map(function(n){return n+'='+encodeURIComponent(qp(n))}).join('&');fetch(act+(qs?(act.indexOf('?')<0?'?':'&')+qs:''),{method:'POST',body:new URLSearchParams(new FormData(f,e.submitter)),credentials:'same-origin'}).then(function(r){if(d&&d.open)d.close();if(!main.contains(f)){f.reset();if(b){b.disabled=false;b.innerHTML=was;b.classList.remove('working')}}var u=new URL(r.url);if(r.redirected&&u.origin===location.origin&&u.pathname==='/'){go(u.href);return}if(r.redirected){location.href=r.url;return}return r.text().then(function(t){document.open();document.write(t);document.close()})}).catch(function(){f.submit()})});
 window.addEventListener('popstate',function(){current();document.body.classList.add('busy');load()});
 window.addEventListener('pageshow',function(e){if(e.persisted)load()});
 mark();load()})();</script>"#;
@@ -2467,14 +2511,15 @@ mark();load()})();</script>"#;
         let Some(root) = self.store.as_ref().and_then(|s| s.root()) else { return String::new() };
         let me = self.workspace();
         let rows = crate::store::listed(&root, Some(&me)).into_iter().map(|mut l| {
-            let current = l.name == me;
-            // This one as it is now (what it keeps is written after the page is drawn).
+            let current = l.id == me;
+            // This one as it is now.
             if current {
-                let seen = self.last_seen.clone().unwrap_or_default();
-                (l.called, l.hosts, l.signed_in) = (seen.called, seen.hosts, self.signed_in_as().is_some());
+                // (One whose CI has not been named goes by its id.)
+                let name = Some(self.called_as(views.get(view::in_use(views)))).filter(|n| n != "SuperCI").unwrap_or_default();
+                (l.name, l.hosts, l.picture, l.signed_in) = (name, self.about.hosts.clone(), self.about.picture.clone(), self.signed_in_as().is_some());
                 l.place = views.get(view::in_use(views)).map(|v| v.plane.place()).unwrap_or_default();
             }
-            format!(r#"<a class="space" href="/?w={}&c=" aria-current="{current}">{}<span>{}</span><small>{}</small></a>"#, esc(&l.name), workspace_logo(&l, 28), esc(&l.name), esc(&workspace_sub(&l)))
+            format!(r#"<a class="space" href="/?w={}&c=" aria-current="{current}">{}<span>{}</span><small>{}</small></a>"#, esc(&l.id), workspace_logo(&l, 28), esc(l.title()), esc(&workspace_sub(&l)))
         }).collect::<String>();
         format!(r##"<div data-switch hidden>{rows}<hr><a href="#" onclick="this.closest('details').open=false;document.getElementById('new-workspace').showModal();return false"><span>New workspace…</span></a></div>"##)
     }
@@ -2484,10 +2529,12 @@ mark();load()})();</script>"#;
         // No cloud signed in to: whether (and where) SuperCI runs is not known yet.
         if self.cf.is_none() && self.aws.is_none() && self.modal.is_none() && views.is_empty() {
             lock(side()).clear();
-            // Settings is there before anything is set up: the workspace's name, and removing it.
-            if section == "settings" { return format!(r#"{}<div data-called="SuperCI" hidden></div>"#, self.settings_page(None)) }
+            lock(called()).clone_from(&self.called_as(None));
+            let says = format!(r#"<div data-called="{}" hidden></div>"#, esc(&self.called_as(None)));
+            // Settings is there before anything is set up: the workspace's id, and removing it.
+            if section == "settings" { return format!("{}{says}", self.settings_page(None)) }
             // Back from Modal's sign-in: the page looks again until it is approved.
-            let gate = self.gate(section, last);
+            let gate = format!("{}{says}", self.gate(section, last));
             return if self.modal_pending.is_some() { format!(r#"<div data-refresh="3"></div>{gate}"#) } else { gate }
         }
         // Several control planes live and this page names none: the list of them, to open one. (Setting a new one
@@ -2545,7 +2592,7 @@ mark();load()})();</script>"#;
         let waiting = waiting || updating.as_ref().is_some_and(|u| u.result.is_none()) || self.modal_pending.is_some() || self.github_expected.is_some_and(|until| now_ms() < until);
         drop(updating);
         *lock(side()) = card.clone();
-        let name = current.map(|v| v.name()).unwrap_or_else(|| "SuperCI".to_string());
+        let name = self.called_as(current);
         *lock(called()) = name.clone();
         let html = format!(r#"{html}<div data-called="{}" hidden></div>"#, esc(&name));
         let html = if card.is_empty() { html } else { format!(r#"{html}<div data-side hidden>{card}</div>"#) };
@@ -2979,16 +3026,17 @@ mark();load()})();</script>"#;
         // The workspace: a folder of SuperCI's on this computer (none: nothing is kept here, and there is no other).
         let root = self.store.as_ref().and_then(|s| s.root());
         let name = esc(&self.workspace());
+        let called = esc(&match self.called_as(v) { n if n == "SuperCI" => self.workspace(), n => n });
         if root.is_some() {
-            rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Workspace</strong><small>One company's SuperCI on this computer: its own sign-ins, control plane and runners.</small></span><span class="dm-spec"><span class="lim">{name}</span></span><button type="button" class="button secondary sm" onclick="document.getElementById('rename-workspace').showModal()">Rename</button></div>"#, logo(ICON_WORKSPACE)));
-            dialogs.push_str(&format!(r#"<dialog class="dlg" id="rename-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Workspace</strong><small>Its name here, and what <code>--workspace</code> takes.</small></span>{close}</div><form method="post" action="/workspaces/rename" class="limit-do"><input type="hidden" name="w" value="{name}"><input name="name" value="{name}" aria-label="Its name" autofocus onfocus="this.select()" pattern="[a-z][a-z0-9\-]{{1,23}}" title="2 to 24 lowercase letters, digits and dashes" required spellcheck="false" autocomplete="off" autocapitalize="none"><button class="button primary sm">Save</button></form></div></dialog>"#, logo(ICON_WORKSPACE)));
+            rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Workspace</strong><small>Its id: what <code>--workspace</code> takes in commands.</small></span><span class="dm-spec"><span class="lim">{name}</span></span><button type="button" class="button secondary sm" onclick="document.getElementById('rename-workspace').showModal()">Change</button></div>"#, logo(ICON_WORKSPACE)));
+            dialogs.push_str(&format!(r#"<dialog class="dlg" id="rename-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Workspace id</strong><small>What <code>--workspace</code> takes in commands.</small></span>{close}</div><form method="post" action="/workspaces/rename" class="limit-do"><input type="hidden" name="w" value="{name}"><input name="id" value="{name}" aria-label="Its id" autofocus onfocus="this.select()" pattern="[a-z][a-z0-9\-]{{1,23}}" title="2 to 24 lowercase letters, digits and dashes" required spellcheck="false" autocomplete="off" autocapitalize="none"><button class="button primary sm">Save</button></form></div></dialog>"#, logo(ICON_WORKSPACE)));
         }
         // (Nothing to sign out of in a workspace that is signed in nowhere.)
         if self.signed_in_as().is_some() || self.aws_ended { rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>This computer</strong><small>{who} Signing out removes this workspace's sign-ins from it; your runners keep working.</small></span><form method="post" action="/signout"><button class="button secondary sm">Sign out</button></form></div>"#, logo(ICON_SIGNOUT))) }
         // With other workspaces beside it, this one can be forgotten here.
         if root.is_some_and(|r| crate::store::listed(&r, Some(&self.workspace())).len() > 1) {
-            rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Remove this workspace</strong><small>Forgets {name} on this computer. Nothing in its clouds is deleted.</small></span><button type="button" class="button danger sm" onclick="document.getElementById('remove-workspace').showModal()">Remove</button></div>"#, logo(ICON_REMOVE)));
-            dialogs.push_str(&format!(r#"<dialog class="dlg" id="remove-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Remove {name}?</strong><small>Its sign-ins are forgotten on this computer. Its control plane and runners keep working: nothing in its clouds is deleted.</small></span>{close}</div><form method="post" action="/workspaces/remove" class="limit-do"><input type="hidden" name="w" value="{name}"><button class="button danger sm">Remove from this computer</button></form></div></dialog>"#, logo(ICON_REMOVE)));
+            rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Remove this workspace</strong><small>Forgets {called} on this computer. Nothing in its clouds is deleted.</small></span><button type="button" class="button danger sm" onclick="document.getElementById('remove-workspace').showModal()">Remove</button></div>"#, logo(ICON_REMOVE)));
+            dialogs.push_str(&format!(r#"<dialog class="dlg" id="remove-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Remove {called}?</strong><small>Its sign-ins are forgotten on this computer. Its control plane and runners keep working: nothing in its clouds is deleted.</small></span>{close}</div><form method="post" action="/workspaces/remove" class="limit-do"><input type="hidden" name="w" value="{name}"><button class="button danger sm">Remove from this computer</button></form></div></dialog>"#, logo(ICON_REMOVE)));
         }
         let here = format!(r#"<section class="card dm-card">{}</section>{dialogs}"#, rows.concat());
         let Some(v) = v else { return format!(r#"{bar}<div class="cards">{here}</div>"#) };
@@ -4501,30 +4549,31 @@ impl Hub {
     /// was started with several and none named.
     fn list_page(&self) -> Response {
         let rows = self.root.as_ref().map(|r| crate::store::listed(r, self.first().as_deref())).unwrap_or_default().iter().map(|l|
-            format!(r#"<a class="pick" href="/?w={}&c=">{}<span><strong>{}</strong><small>{}</small></span><span class="pick-end">{}</span></a>"#, esc(&l.name), workspace_logo(l, 36), esc(&l.name), esc(&workspace_sub(l)), icon("arrow"))).collect::<String>();
-        document(200, "SuperCI", &format!(r#"<div class="spaces"><div>{MARK}<h1>Workspaces</h1><p>Each is one company's SuperCI on this computer, with sign-ins, a control plane and runners of its own.</p><div class="picks">{rows}</div><button type="button" class="button secondary" onclick="document.getElementById('new-workspace').showModal()">New workspace</button></div></div>{}"#, new_workspace_dialog()), None)
+            format!(r#"<a class="pick" href="/?w={}&c=">{}<span><strong>{}</strong><small>{}</small></span><span class="pick-end">{}</span></a>"#, esc(&l.id), workspace_logo(l, 36), esc(l.title()), esc(&workspace_sub(l)), icon("arrow"))).collect::<String>();
+        document(200, "SuperCI", &format!(r#"<div class="spaces"><div>{MARK}<h1>Workspaces</h1><p>Each has its own sign-ins, control plane and runners.</p><div class="picks">{rows}</div><button type="button" class="button secondary" onclick="document.getElementById('new-workspace').showModal()">New workspace</button></div></div>{}"#, new_workspace_dialog()), None)
     }
 
-    /// A new, empty workspace. Its name.
+    /// A new, empty workspace, called `name`. Its id, made from the name.
     fn create(&self, name: &str) -> Result<String> {
         let root = self.root.as_ref().ok_or("SuperCI keeps nothing on this machine (it has no home folder), so there is the one workspace.")?;
-        let name = name.trim().to_lowercase();
-        crate::store::valid_name(&name)?;
-        if self.has(&name) { return Err(format!("There is a workspace named {name} already.")) }
+        let name = name.trim().to_string();
+        superci_core::spec::valid_name(&name)?;
+        let id = crate::store::id_from(&name)?;
+        if self.has(&id) { return Err(format!("There is a workspace with the id {id} already. Give this one another name.")) }
         // The one this was started in has no folder until it keeps something: it gets one now, so that it stays
         // listed beside the new one.
         if let Some(first) = self.first() { Store::under(root, &first).make()? }
-        Store::under(root, &name).make()?;
-        Ok(name)
+        Store::under(root, &id).set_about(&crate::store::About { name, ..Default::default() })?;
+        Ok(id)
     }
 
-    /// A workspace under a new name: its folder is renamed, and its dashboard goes on under it.
+    /// A workspace under a new id: its folder is renamed, and its dashboard goes on under it.
     fn rename(&self, from: &str, to: &str) -> Result<String> {
         let root = self.root.as_ref().ok_or("SuperCI keeps nothing on this machine (it has no home folder).")?;
         let to = to.trim().to_lowercase();
-        crate::store::valid_name(&to)?;
+        crate::store::valid_id(&to)?;
         if to == from { return Ok(to) }
-        if self.has(&to) { return Err(format!("There is a workspace named {to} already.")) }
+        if self.has(&to) { return Err(format!("There is a workspace with the id {to} already.")) }
         let board = lock(&self.boards).remove(from);
         if let Some(b) = &board { lock(b).keep() }
         if let Err(e) = crate::store::rename(root, from, &to) {
@@ -4560,19 +4609,34 @@ impl Hub {
     }
 }
 
-/// A workspace's mark in a list: its code host's logo once one is connected, its initial until then.
+/// A GitHub organization's (or person's) picture, as github.com serves it to anyone: small, and as a `data:` address,
+/// so that a page shows it without asking any other site. None: GitHub did not give one now.
+fn github_picture(owner: &str) -> Option<String> {
+    if !github::valid_login(owner) { return None }
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(4))).build().into();
+    let mut answer = agent.get(&format!("https://github.com/{owner}.png?size=96")).call().ok()?;
+    if answer.status().as_u16() != 200 { return None }
+    let kind = answer.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().split(';').next().unwrap_or_default().trim().to_string();
+    if !["image/png", "image/jpeg", "image/gif", "image/webp"].contains(&kind.as_str()) { return None }
+    let bytes = answer.body_mut().with_config().limit(300_000).read_to_vec().ok()?;
+    Some(format!("data:{kind};base64,{}", superci_core::crypto::b64(&bytes)))
+}
+
+/// A workspace's mark in a list: its GitHub organization's picture, else its code host's logo once one is connected,
+/// and its initial until then.
 fn workspace_logo(l: &crate::store::Listed, size: u32) -> String {
+    // (Only a picture this program fetched and encoded itself: letters, digits and base64's marks.)
+    let safe = l.picture.strip_prefix("data:image/").is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b";,+/=".contains(&b)));
+    if safe { return format!(r#"<img class="logo" src="{}" width="{size}" height="{size}" alt="">"#, l.picture) }
     match l.hosts.first() {
         Some((kind, _)) => logo(kind, size),
-        None => format!(r#"<span class="logo initial" style="width:{size}px;height:{size}px;font-size:{}px">{}</span>"#, size * 45 / 100, esc(&l.name.chars().take(1).collect::<String>().to_uppercase())),
+        None => format!(r#"<span class="logo initial" style="width:{size}px;height:{size}px;font-size:{}px">{}</span>"#, size * 45 / 100, esc(&l.title().chars().take(1).collect::<String>().to_uppercase())),
     }
 }
 
-/// A workspace in a few words: what its CI is called (when it was named) and whose jobs it runs; before that, where
-/// its control plane is, or that nothing is set up.
+/// A workspace in a few words: whose jobs it runs; before that, where its control plane is, or that nothing is set up.
 fn workspace_sub(l: &crate::store::Listed) -> String {
-    let mut parts: Vec<String> = if l.called.is_empty() || l.called == "SuperCI" { vec![] } else { vec![l.called.clone()] };
-    parts.extend(l.hosts.iter().map(|(_, name)| name.clone()));
+    let mut parts: Vec<String> = l.hosts.iter().map(|(_, name)| name.clone()).collect();
     if parts.is_empty() && !l.place.is_empty() { parts.push(l.place.clone()) }
     if parts.is_empty() { parts.push(if l.signed_in { "No control plane yet" } else { "Nothing set up yet" }.to_string()) }
     parts.join(" · ")
@@ -4580,7 +4644,7 @@ fn workspace_sub(l: &crate::store::Listed) -> String {
 
 /// The dialog that makes a workspace: its name, and nothing else.
 fn new_workspace_dialog() -> String {
-    format!(r#"<dialog class="dlg" id="new-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_WORKSPACE}</span><span><strong>New workspace</strong><small>Another company's SuperCI on this computer, with sign-ins of its own.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><form method="post" action="/workspaces" class="limit-do"><input name="name" placeholder="acme" aria-label="Its name" autofocus pattern="[a-z][a-z0-9\-]{{1,23}}" title="2 to 24 lowercase letters, digits and dashes" required spellcheck="false" autocomplete="off" autocapitalize="none"><button class="button primary sm">Create</button></form></div></dialog>"#)
+    format!(r#"<dialog class="dlg" id="new-workspace" onclick="if(event.target===this)this.close()" onclose="this.querySelector('form').reset()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_WORKSPACE}</span><span><strong>New workspace</strong><small>Separate sign-ins, control plane and runners.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><form method="post" action="/workspaces" class="limit-do"><input name="name" placeholder="AcmeCI" aria-label="Its name" autofocus pattern="[A-Za-z][A-Za-z0-9 \-]{{1,23}}" title="2 to 24 letters, digits, spaces and dashes" required spellcheck="false" autocomplete="off"><button class="button primary sm">Create</button></form></div></dialog>"#)
 }
 
 const ICON_REMOVE: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14M10 7V5h4v2M7 7l.8 12h8.4L17 7M10.5 11v5M13.5 11v5"/></svg>"#;
@@ -4635,7 +4699,7 @@ fn respond(hub: &Hub, req: &Req) -> Response {
         ("POST", "/workspaces") => return said(hub.create(&field("name")).map(|name| { println!("POST /workspaces → {name}"); Response::redirect(&format!("/?w={name}&c=")) })),
         ("POST", "/workspaces/rename") => {
             let Some(from) = named.clone().or_else(|| hub.first()).filter(|w| hub.has(w)) else { return message(409, "Which workspace?", "Open one from the list of workspaces and rename it from its Settings. Nothing has changed.") };
-            return said(hub.rename(&from, &field("name")).map(|to| { println!("POST /workspaces/rename → {to}"); Response::redirect(&format!("/?p=settings&w={to}")) }))
+            return said(hub.rename(&from, &field("id")).map(|to| { println!("POST /workspaces/rename → {to}"); Response::redirect(&format!("/?p=settings&w={to}")) }))
         }
         ("POST", "/workspaces/remove") => {
             // Only the one its own page names: nothing picks a workspace to forget.
@@ -4667,6 +4731,8 @@ fn respond(hub: &Hub, req: &Req) -> Response {
     };
     let shared = hub.board(&name);
     HERE.with(|h| h.borrow_mut().clone_from(&name));
+    // (A page's frame says what the workspace is called before its control plane was asked.)
+    if lock(called()).is_empty() { if let Ok(d) = shared.try_lock() { lock(called()).clone_from(&d.about.name) } }
     let answer = respond_in(&shared, req);
     // Where it sends the page on within the dashboard, the workspace goes along.
     if !several { return answer }
@@ -4989,8 +5055,9 @@ mod tests {
     #[test]
     fn workspaces_are_worlds_of_their_own() {
         let root = std::env::temp_dir().join(format!("superci-hub-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
-        Store::under(&root, "acme").write(&Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme-team".into() }),
-            seen: Some(crate::store::Seen { called: "AcmeCI".into(), hosts: vec![("github".into(), "acme".into())] }), ..Default::default() }).unwrap();
+        Store::under(&root, "acme").write(&Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme-team".into() }), ..Default::default() }).unwrap();
+        // (Its organization's picture as GitHub gave it once: shown as it is, with nothing asked of any site.)
+        Store::under(&root, "acme").set_about(&crate::store::About { name: "AcmeCI".into(), hosts: vec![("github".into(), "acme-inc".into())], picture: "data:image/png;base64,iVBORw0KGgo=".into(), picture_of: "acme-inc".into() }).unwrap();
         Store::under(&root, "globex").make().unwrap();
         let key = "k".repeat(32);
         let hub = Hub { root: Some(root.clone()), key: key.clone(), base: "http://localhost:8976".into(), first: Mutex::new(Some("acme".into())), boards: Mutex::new(HashMap::new()) };
@@ -5006,14 +5073,14 @@ mod tests {
         assert_eq!(lock(&hub.board("acme")).signed_in_as().as_deref(), Some("Modal workspace acme-team"));
         assert!(lock(&hub.board("globex")).signed_in_as().is_none() && lock(&hub.board("globex")).w == "globex" && lock(&hub.board("acme")).w.is_empty());
         // Globex's page is the first screen of a new SuperCI, with the switcher's rows: both workspaces, this one
-        // marked, acme with its code host's logo and what it was last seen as, and making a new one.
+        // marked, acme by its name with its organization's picture, and making a new one.
         let (status, _, page) = ask("GET", "/", &[("w", "globex"), ("fragment", "1")], "");
         assert!(status == 200 && page.contains("data-gated") && page.contains("Where is your control plane?"), "{page}");
-        assert!(page.contains(r#"<a class="space" href="/?w=acme&c=" aria-current="false"><span class="logo""#) && page.contains("<span>acme</span><small>AcmeCI · acme</small></a>"), "{page}");
+        assert!(page.contains(r#"<a class="space" href="/?w=acme&c=" aria-current="false"><img class="logo" src="data:image/png;base64,iVBORw0KGgo=" width="28" height="28" alt=""><span>AcmeCI</span><small>acme-inc</small></a>"#), "{page}");
         assert!(page.contains(r#"<a class="space" href="/?w=globex&c=" aria-current="true"><span class="logo initial""#) && page.contains(">G</span><span>globex</span><small>Nothing set up yet</small></a>"), "{page}");
         assert!(page.contains("<span>New workspace…</span>") && !page.contains("acme-team") && !page.contains("Add an organization"));
         // Its frame has the dialog that makes one.
-        assert!(ask("GET", "/", &[("w", "globex")], "").2.contains(r#"<dialog class="dlg" id="new-workspace""#));
+        assert!(ask("GET", "/", &[("w", "globex")], "").2.contains(r#"<dialog class="dlg" id="new-workspace" onclick="if(event.target===this)this.close()" onclose="this.querySelector('form').reset()">"#));
         // What changes something says which workspace it is for, or stops: nothing picks one.
         let (status, _, said) = ask("POST", "/routing", &[], "action=max_cpu&max_cpu=8");
         assert!(status == 409 && said.contains("Which workspace?") && said.contains("Nothing has changed."), "{status} {said}");
@@ -5032,20 +5099,27 @@ mod tests {
         // The list of them.
         let (_, _, list) = ask("GET", "/workspaces", &[], "");
         assert!(list.contains("<h1>Workspaces</h1>") && list.contains(r#"<a class="pick" href="/?w=acme&c=">"#) && list.contains(r#"<a class="pick" href="/?w=globex&c=">"#) && list.contains(">New workspace</button>"), "{list}");
-        // A new one: a name, and nothing else. It opens on its own pages, with no control plane named.
-        assert_eq!(ask("POST", "/workspaces", &[("w", "acme")], "name=Initech").1, "/?w=initech&c=");
-        assert!(lock(&hub.board("initech")).render("overview", &[], None).contains(r#"href="/?w=acme&c=" aria-current="false""#), "the others are in its switcher");
+        // A new one: a name, and nothing else; its id is made from the name. It opens on its own pages, with no
+        // control plane named, and is called its name there before anything is set up.
+        assert_eq!(ask("POST", "/workspaces", &[("w", "acme")], "name=Initech+CI").1, "/?w=initech-ci&c=");
+        assert_eq!(Store::under(&root, "initech-ci").about().name, "Initech CI");
+        let (_, _, page) = ask("GET", "/", &[("w", "initech-ci"), ("fragment", "1")], "");
+        assert!(page.contains(r#"<div data-called="Initech CI" hidden></div>"#) && page.contains(r#"aria-current="true"><span class="logo initial" style="width:28px;height:28px;font-size:12px">I</span><span>Initech CI</span><small>Nothing set up yet</small></a>"#), "{page}");
+        assert!(String::from_utf8_lossy(&ask("GET", "/", &[("w", "initech-ci")], "").2.as_bytes()[..400]).contains("<title>Initech CI</title>"), "its frame is called it at once");
+        assert_eq!(ask("POST", "/workspaces/rename", &[("w", "initech-ci")], "id=initech").1, "/?p=settings&w=initech");
+        assert!(lock(&hub.board("initech-ci")).render("overview", &[], None).contains(r#"href="/?w=acme&c=" aria-current="false""#), "the others are in its switcher");
         assert_eq!(crate::store::workspaces_in(&root), ["acme", "globex", "initech"]);
-        let (status, _, said) = ask("POST", "/workspaces", &[], "name=initech");
-        assert!(status == 400 && said.contains("There is a workspace named initech already."));
-        assert!(ask("POST", "/workspaces", &[], "name=two+words").2.contains("A workspace&#39;s name is 2 to 24 lowercase letters") || ask("POST", "/workspaces", &[], "name=two+words").2.contains("A workspace's name is 2 to 24 lowercase letters"));
-        // A new name for one: its folder is renamed and its pages go on under it.
-        assert_eq!(ask("POST", "/workspaces/rename", &[("w", "initech")], "name=umbrella").1, "/?p=settings&w=umbrella");
+        let (status, _, said) = ask("POST", "/workspaces", &[], "name=Initech");
+        assert!(status == 400 && said.contains("There is a workspace with the id initech already. Give this one another name."));
+        assert!(ask("POST", "/workspaces", &[], "name=9").2.contains("A name is 2 to 24 letters"));
+        // A new id for one: its folder is renamed and its pages go on under it, called what they were.
+        assert_eq!(ask("POST", "/workspaces/rename", &[("w", "initech")], "id=umbrella").1, "/?p=settings&w=umbrella");
         assert_eq!(crate::store::workspaces_in(&root), ["acme", "globex", "umbrella"]);
-        assert!(ask("POST", "/workspaces/rename", &[("w", "umbrella")], "name=acme").2.contains("There is a workspace named acme already."));
+        assert_eq!(Store::under(&root, "umbrella").about().name, "Initech CI");
+        assert!(ask("POST", "/workspaces/rename", &[("w", "umbrella")], "id=acme").2.contains("There is a workspace with the id acme already."));
         // Settings of one among several: its name with Rename, signing out of it, and removing it from this computer.
         let settings = lock(&hub.board("umbrella")).settings_page(None);
-        assert!(settings.contains(r#"<span class="lim">umbrella</span>"#) && settings.contains(r#"action="/workspaces/rename""#) && !settings.contains("Sign out") && settings.contains(r#"action="/workspaces/remove" class="limit-do"><input type="hidden" name="w" value="umbrella">"#), "{settings}");
+        assert!(settings.contains(r#"<span class="lim">umbrella</span>"#) && settings.contains(r#"action="/workspaces/rename""#) && !settings.contains("Sign out") && settings.contains(r#"action="/workspaces/remove" class="limit-do"><input type="hidden" name="w" value="umbrella">"#) && settings.contains("<strong>Remove Initech CI?</strong>"), "{settings}");
         // (Settings is there in a workspace with nothing set up: that is where it is renamed or removed.)
         let (_, _, page) = ask("GET", "/", &[("w", "umbrella"), ("p", "settings"), ("fragment", "1")], "");
         assert!(page.contains(r#"<h1 class="page-title">Settings</h1>"#) && page.contains("Remove this workspace") && !page.contains("data-gated"), "{page}");
@@ -5069,7 +5143,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("superci-hub-first-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
         let hub = Hub { root: Some(root.clone()), key: "k".repeat(32), base: "http://localhost:8976".into(), first: Mutex::new(Some("default".into())), boards: Mutex::new(HashMap::new()) };
         assert_eq!(hub.names(), ["default"]);
-        assert_eq!(hub.create("acme").unwrap(), "acme");
+        assert_eq!(hub.create("Acme").unwrap(), "acme");
         assert_eq!(crate::store::workspaces_in(&root), ["acme", "default"]);
         let menu = lock(&hub.board("acme")).render("overview", &[], None);
         assert!(menu.contains(r#"href="/?w=default&c=" aria-current="false""#) && menu.contains(r#"href="/?w=acme&c=" aria-current="true""#), "{menu}");
