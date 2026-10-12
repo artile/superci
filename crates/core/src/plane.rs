@@ -1493,7 +1493,7 @@ impl<'a> ControlPlane<'a> {
         // repository, and never for a run from outside it (a fork's pull request, pull_request_target). In doubt, not.
         if ev.public {
             let refused = if !self.config.routing.allows_public(&ev.repo) {
-                Some("a public repository: allow it in the dashboard (Workflows) for its jobs to run on your clouds".to_string())
+                Some("a public repository: allow it in the dashboard (Settings) for its jobs to run on your clouds".to_string())
             } else {
                 let outside = match self.installation_token(app, ev.installation_id).await {
                     Ok(token) => github::run_from_outside(self.http, &app.api(), &token, &ev.repo, ev.run_id).await,

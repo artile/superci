@@ -39,7 +39,7 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
 - **Runner agents** (Cloudflare, Modal) accept only tokens signed by the one control plane they were set up for. The
   token must be for the agent's own address and must not have expired.
 - **Machines** run one job each and end when it ends. A machine also has its own time limit: six hours unless you
-  set another (Workflows → Limits → Longest job; up to five days on AWS, a day on Modal, six hours on Cloudflare),
+  set another (Settings → Limits → Longest job; up to five days on AWS, a day on Modal, six hours on Cloudflare),
   enforced by
   the machine itself (AWS: a timer plus a scheduled shutdown, and the machine terminates on power-off) or by the cloud
   (Cloudflare: the runner's alarm; Modal: the sandbox timeout). This works even if the control plane is gone. The
@@ -57,7 +57,7 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
   yours to set, in those security groups. A network that cannot be found stops jobs there; they do not fall back
   to another network.
 
-- **Public repositories:** their jobs are refused unless the repository is allowed in the dashboard (Workflows →
+- **Public repositories:** their jobs are refused unless the repository is allowed in the dashboard (Settings →
   Limits). Even then, runs from a fork's pull request and `pull_request_target` runs are refused. On organizations,
   GitHub's default runner group also keeps runners away from public repositories.
 - **Machine size:** a label asking for more than 32 CPUs (or 8 GB of memory per allowed CPU) is refused. The limit

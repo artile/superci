@@ -1799,7 +1799,7 @@ impl Dashboard {
                 wait_for(plane.url(), &self.status_key, |s| s["labels"] == want);
                 if let Some(p) = self.planes.get_mut(self.selected) { p.set_label(&labels[0]) }
                 self.views = None;
-                Ok(Response::redirect("/?p=workflows"))
+                Ok(Response::redirect("/?p=settings"))
             }
             // What it is called where people read it: the dashboard's header, the App's name for further
             // organizations, what it says on a job it could not run. SuperCI again by naming it that.
@@ -1811,7 +1811,7 @@ impl Dashboard {
                 self.put_secret(&plane, "NAME", &name)?;
                 wait_for(plane.url(), &self.status_key, |s| s["name"] == name.as_str());
                 self.views = None;
-                Ok(Response::redirect("/?p=workflows"))
+                Ok(Response::redirect("/?p=settings"))
             }
             // The default machine: what `runs-on: superci` alone gets.
             ("POST", "/machine") => {
@@ -1975,7 +1975,7 @@ impl Dashboard {
                 let want = serde_json::to_value(&routing).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "ROUTING", &want.to_string())?;
                 wait_for(plane.url(), &self.status_key, |s| s["routing"] == want);
-                Ok(Response::redirect(if field("action").starts_with("public") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=workflows" } else { "/?p=runners" }))
+                Ok(Response::redirect(if field("action").starts_with("public") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
             }
 
             _ => Ok(message(404, "Not found", "")),
@@ -2169,6 +2169,7 @@ load()})();</script>"#;
             "planes" => (self.planes_page(views), self.deploy_running()),
             "changes" => (changes_page(views, &views.get(view::in_use(views)).map(|v| self.aws_lacks(v)).unwrap_or_default()), false),
             "workflows" => (self.workflows_page(current), false),
+            "settings" => (self.settings_page(current), false),
             "repos" => (self.repos_page(current), false),
             "gitlab" => (self.gitlab_page(current), false),
             _ => self.overview_page(current),
@@ -2197,10 +2198,8 @@ load()})();</script>"#;
         let nav = format!(r#"<nav class="nav">{}{}{}{}{}</nav>"#, link("overview", "Overview", ICON_OVERVIEW), link("repos", "Repositories", ICON_REPOS), link("runners", "Runners", ICON_RUNNERS),
             link("workflows", "Workflows", ICON_WORKFLOWS), link("jobs", "Jobs", ICON_JOBS));
         // At the bottom: an update for the control plane, when it needs one (filled in by the page's live part), the
-        // control plane itself, and what is new.
-        // Last, More: what is about this computer and not the control plane (signing SuperCI out here).
-        let more = format!(r#"<details class="menu side-more"><summary>{ICON_MORE}<span>More</span></summary><div class="menu-pop"><form method="post" action="/signout"><button>Sign out</button></form></div></details>"#);
-        let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{more}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("changes", "Changelog", ICON_NEWS));
+        // control plane itself, its settings (and signing SuperCI out on this computer), and what is new.
+        let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("settings", "Settings", ICON_SETTINGS), link("changes", "Changelog", ICON_NEWS));
         format!(r#"<aside class="side"><div class="brand">{MARK}<span>{}</span>{THEME_TOGGLE}</div>{nav}{foot}</aside>"#, esc(&called_now()))
     }
 
@@ -2567,9 +2566,19 @@ load()})();</script>"#;
             (false, true) => format!(r#"<section class="card"><div class="card-head"><h2>{} In GitLab CI</h2>{switch}</div><ol class="use-steps gl only">{gl_steps}</ol><p class="note">Using GitHub too? <a href="/?p=repos">Connect it on Repositories</a>.</p></section>"#, logo("gitlab", 18)),
             (false, false) => format!(r#"<section class="card">{}</section>"#, empty_state(&icon("play"), "Connect GitHub or GitLab first", "Then this page shows how its workflows use your runners.", r#"<a class="button primary" href="/?p=repos">Repositories</a>"#)),
         };
+        format!(r#"{bar}<div class="cards">{default_card}{usage}</div>{picker}{prompt}"#)
+    }
+
+    /// Settings: what the control plane is called and answers to, its limits, and SuperCI's sign-ins on this computer.
+    fn settings_page(&self, v: Option<&PlaneView>) -> String {
+        let bar = r#"<div class="bar"><h1 class="page-title">Settings</h1></div>"#;
+        let logo = |icon: &str| format!(r#"<span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{icon}</span>"#);
+        let who = self.signed_in_as().map(|w| format!("Signed in: {}.", esc(&w))).unwrap_or_else(|| "Not signed in to any cloud.".into());
+        let here = format!(r#"<section class="card dm-card"><div class="default-machine">{}<span class="dm-main"><strong>This computer</strong><small>{who} Signing out removes SuperCI's sign-ins from it; your runners keep working.</small></span><form method="post" action="/signout"><button class="button secondary sm">Sign out</button></form></div></section>"#, logo(ICON_SIGNOUT));
+        let Some(v) = v else { return format!(r#"{bar}<div class="cards">{here}</div>"#) };
         // The public repositories GitHub's App is installed on (none when GitHub is not connected).
         let public = if v.github { cloudflare::plane_get(v.plane.url(), &self.status_key, "/github/public-repos").ok().and_then(|r| r["repos"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())) } else { Some(vec![]) };
-        format!(r#"{bar}<div class="cards">{default_card}{usage}{}</div>{picker}{prompt}"#, limits_card(v, public))
+        format!(r#"{bar}<div class="cards">{}{}{here}</div>"#, called_card(v), limits_card(v, public))
     }
 
     /// GitLab's settings: the projects whose jobs run here (each turned on or off, or all at once), and the connection.
@@ -3381,6 +3390,9 @@ fn skeleton(section: &str, title: &str) -> String {
         "workflows" => format!(r#"<div class="cards"><section class="card dm-card"><div class="default-machine">{}</div></section>{}</div>"#,
             r#"<span class="sk logo-sk"></span><span class="dm-main"><span class="sk w30"></span><span class="sk w60 thin"></span></span><span class="sk pillish"></span><span></span>"#,
             card("In your workflows", true, r#"<span class="sk w60"></span><span class="sk block"></span><span class="sk w70 thin"></span>"#.to_string())),
+        "settings" => format!(r#"<div class="cards"><section class="card dm-card">{}</section>{}</div>"#,
+            r#"<div class="default-machine"><span class="sk logo-sk"></span><span class="dm-main"><span class="sk w30"></span><span class="sk w60 thin"></span></span><span class="sk pillish"></span><span></span></div>"#.repeat(2),
+            card("Limits", true, r#"<span class="sk w60"></span><span class="sk w70 thin"></span><span class="sk w60"></span><span class="sk w70 thin"></span>"#.to_string())),
         "jobs" => format!(r#"<div class="cards">{}</div>"#, card("Recent jobs", true, format!(r#"<div class="rows">{}</div>"#, SK_ROWS.repeat(6)))),
         "planes" => format!(r#"<div class="cards">{}</div>"#,
             card("Your control plane", true, format!(r#"<span class="sk w70 thin"></span><div class="picks">{SK_PICK}</div><span class="sk w70 thin"></span>"#))),
@@ -3401,9 +3413,7 @@ fn empty_state(icon_svg: &str, title: &str, text: &str, action: &str) -> String 
 
 fn section_name(section: &str) -> &str {
     match section {
-        // Settings from before: its control planes are their own page now (and Changelog another).
-        "settings" => "planes",
-        s if ["plane", "planes", "changes", "runners", "add-runners", "workflows", "jobs", "repos", "gitlab"].contains(&s) => s,
+        s if ["plane", "planes", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "repos", "gitlab"].contains(&s) => s,
         _ => "overview",
     }
 }
@@ -3411,7 +3421,7 @@ fn section_name(section: &str) -> &str {
 fn section_title(section: &str) -> &'static str {
     match section {
         "plane" => "Set up a control plane", "planes" => "Control plane", "changes" => "Changelog", "add-runners" => "Add a provider", "runners" => "Runners",
-        "workflows" => "Workflows", "jobs" => "Jobs", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
+        "workflows" => "Workflows", "settings" => "Settings", "jobs" => "Jobs", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
     }
 }
 
@@ -3730,6 +3740,11 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         select("cpu", "CPU", "Default", &CPUS, None), select("ram", "Memory", "Default", &RAMS, None), select("disk", "Disk", "Default", &DISKS, None),
         choice("arch", "Architecture", "Default", &[("x64", "x64"), ("arm64", "arm64")], None), choice("os", "System", "Default", &[("linux", "Linux"), ("windows", "Windows")], None),
         choice("gpu", "GPU", "None", &[("gpu", "Any (least costly)"), ("t4", "T4"), ("l4", "L4"), ("a10g", "A10G"), ("l40s", "L40S"), ("a100", "A100"), ("h100", "H100"), ("h200", "H200"), ("b200", "B200")], None), pools());
+    (format!(r#"<section class="card dm-card">{default_row}{dialog}</section>"#), picker)
+}
+
+/// What a control plane is called and the labels it answers to: a row each, changed in its dialog.
+fn called_card(v: &PlaneView) -> String {
     // The labels: the list of them, and its dialog (add one; each stays until removed, the last one always).
     let labels = v.labels();
     let close = r#"<button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>"#;
@@ -3744,9 +3759,11 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     let name = esc(&v.name());
     let name_dialog = format!(r#"<dialog class="dlg" id="name" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Name</strong><small>Shown in the dashboard and on GitHub.</small></span>{close}</div><form method="post" action="/name" class="limit-do"><input name="name" value="{name}" aria-label="Name" pattern="[A-Za-z][A-Za-z0-9 \-]{{1,23}}" required spellcheck="false" autocomplete="off"><button class="button primary sm">Save</button></form></div></dialog>"#, logo(ICON_NAME));
     let name_row = format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Name</strong><small>What your CI is called.</small></span><span class="dm-spec"><span class="lim">{name}</span></span><button type="button" class="button secondary sm" onclick="document.getElementById('name').showModal()">Change</button></div>"#, logo(ICON_NAME));
-    (format!(r#"<section class="card dm-card">{name_row}{label_row}{default_row}{dialog}{label_dialog}{name_dialog}</section>"#), picker)
+    format!(r#"<section class="card dm-card">{name_row}{label_row}{label_dialog}{name_dialog}</section>"#)
 }
 
+const ICON_SETTINGS: &str = r#"<svg viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg>"#;
+const ICON_SIGNOUT: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h9"/></svg>"#;
 const ICON_NAME: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7V5.5h14V7M12 5.5v13M9.5 18.5h5"/></svg>"#;
 const ICON_TAG: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 11.6V5a1.5 1.5 0 0 1 1.5-1.5h6.6a1.5 1.5 0 0 1 1.06.44l7.4 7.4a1.5 1.5 0 0 1 0 2.12l-6.1 6.1a1.5 1.5 0 0 1-2.12 0l-7.4-7.4a1.5 1.5 0 0 1-.44-1.06Z"/><circle cx="8" cy="8" r="1.4"/></svg>"#;
 const ICON_CHIP: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>"#;
@@ -4383,8 +4400,8 @@ mod tests {
         *lock(&d.updating) = None;
         d.render("jobs", &[old.clone()], None);
         assert!(lock(side()).contains(&format!("Update to {DASHBOARD_VERSION}")) && String::from_utf8(Dashboard::page("jobs").body).unwrap().contains("Update available"), "drawn with the next page at once");
-        // Settings from before is the control plane's page; what is new has its own.
-        assert_eq!(section_name("settings"), "planes");
+        // Settings is a page of its own, as what is new is.
+        assert_eq!(section_name("settings"), "settings");
         let html = d.render("planes", &[old.clone()], None);
         preview("planes-old", &html);
         assert!(html.contains(&format!("Update to {DASHBOARD_VERSION}")) && html.contains(r#"<span class="pill accent"><i></i>In use</span>"#) && !html.contains("Changelog</h2>"));
@@ -4680,21 +4697,24 @@ mod tests {
         assert!(html.contains("us-east-1 · closest to GitHub</small>"));
         // Cloudflare: where GitHub's full image is published, if anywhere (empty: the small image).
         assert!(html.contains(r#"name="image" value="""#) && html.contains("GitHub&#39;s full image") || html.contains("GitHub's full image"));
-        let html = d.render("workflows", &[view.clone()], None);
-        preview("workflows", &html);
-        // Its name and its labels: a row each, changed in its dialog. The only label has no Remove.
+        // Settings: its name and its labels, a row each, changed in its dialog. The only label has no Remove.
+        let html = d.render("settings", &[view.clone()], None);
+        preview("settings", &html);
         assert!(html.contains("<strong>Name</strong>") && html.contains(r#"<span class="lim">SuperCI</span>"#) && html.contains(r#"data-called="SuperCI""#));
         assert!(html.contains("<strong>Labels</strong>") && html.contains(r#"<form method="post" action="/labels" class="kept-label">"#) && !html.contains(r#"<button class="button secondary sm">Remove</button>"#));
         // Named, with a label added: the page's frame says the name, and each label can go.
-        let mut named = view;
+        let mut named = view.clone();
         named.status.as_mut().unwrap()["name"] = "AcmeCI".into();
         named.status.as_mut().unwrap()["labels"] = serde_json::json!(["acmeci", "superci"]);
-        let renamed = d.render("workflows", &[named], None);
-        preview("workflows-named", &renamed);
+        let renamed = d.render("settings", &[named], None);
+        preview("settings-named", &renamed);
         assert!(renamed.contains(r#"data-called="AcmeCI""#) && renamed.contains(r#"name="name" value="AcmeCI""#) && renamed.matches(r#"<button class="button secondary sm">Remove</button>"#).count() == 2);
         assert!(renamed.contains(r#"<code>acmeci</code> <small class="faint">shown in examples</small>"#) && Dashboard::sidebar("workflows").contains("<span>AcmeCI</span>"));
         *lock(called()) = String::new();
-        // The default machine, in words, changed in its own dialog (which starts at it).
+        // Workflows: the default machine, in words, changed in its own dialog (which starts at it). Not what Settings has.
+        let html = d.render("workflows", &[view], None);
+        preview("workflows", &html);
+        assert!(!html.contains("<strong>Name</strong>") && !html.contains("<strong>Labels</strong>") && !html.contains("<h2>Limits</h2>"));
         assert!(html.contains(r#"<span class="lim">4 CPU</span><span class="lim">100 GB disk</span><span class="lim">x64</span><span class="lim">Linux</span><span class="lim">spot</span>"#));
         assert!(html.contains(r#"<dialog class="dlg" id="default-machine""#) && html.contains(r#"<option value="4" selected>4</option>"#) && html.contains(r#"<option value="100" selected>100 GB</option>"#));
         // The picker starts at Default for everything (the label is plain), each field naming only what is picked.
@@ -4951,11 +4971,13 @@ mod tests {
         assert!(d.render("jobs", &[view.clone()], None).contains(r#"href="https://gitlab.com/acme/app/-/jobs/1977""#));
         // Both connected: a switch between them.
         view.installed = true;
-        let workflows = d.render("workflows", &[view], None);
+        let workflows = d.render("workflows", &[view.clone()], None);
         preview("workflows-both", &workflows);
-        // Limits: the largest machine, and public repositories allowed (none yet).
-        assert!(workflows.contains("<strong>Longest job</strong>") && workflows.contains(r#"name="max_hours" min="1" max="120" value="6""#), "a job's machine lives six hours unless set");
-        assert!(workflows.contains("<h2>Limits</h2>") && workflows.contains(r#"name="max_cpu" min="1" max="192" value="32""#) && workflows.contains(r#"value="public_add""#) && !workflows.contains("tag-chips"));
+        // Limits, on Settings: the largest machine, the longest job, and public repositories allowed (none yet).
+        let settings = d.render("settings", &[view], None);
+        preview("settings-limits", &settings);
+        assert!(settings.contains("<strong>Longest job</strong>") && settings.contains(r#"name="max_hours" min="1" max="120" value="6""#), "a job's machine lives six hours unless set");
+        assert!(settings.contains("<h2>Limits</h2>") && settings.contains(r#"name="max_cpu" min="1" max="192" value="32""#) && settings.contains(r#"value="public_add""#) && !workflows.contains("tag-chips"));
         assert!(workflows.contains(r#"<input type="radio" name="host" id="use-gh" checked>"#) && workflows.contains("Turn the project on in") && workflows.contains("tags: [superci]"));
     }
 
@@ -4991,7 +5013,7 @@ mod tests {
         // Where they ran: a split only when there is more than one place.
         assert!(html.contains("Where they ran") && html.contains("2 jobs · ") && html.contains("1 job · ") && !html.contains("Where jobs ran"));
         // Every page waits in its own shape, the loader inside its first card.
-        for section in ["overview", "repos", "runners", "workflows", "jobs", "planes", "changes", "add-runners"] {
+        for section in ["overview", "repos", "runners", "workflows", "settings", "jobs", "planes", "changes", "add-runners"] {
             let page = skeleton(section, section_title(section));
             preview(&format!("skeleton-{section}"), &page);
             assert!(page.contains("Reading your control plane"), "{section}");
@@ -5234,8 +5256,12 @@ mod tests {
         d.modal = Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() });
         d.planes.push(plane.clone());
         d.keep();
-        // The sidebar's More menu signs out: nothing is left on this machine, and the page says so once.
-        assert!(Dashboard::sidebar("overview").contains(r#"<details class="menu side-more"><summary>"#) && Dashboard::sidebar("overview").contains(r#"<form method="post" action="/signout"><button>Sign out</button></form>"#));
+        // Settings, below the control plane in the sidebar, signs out: nothing is left on this machine, and the page
+        // says so once. (No More menu.)
+        let side = Dashboard::sidebar("settings");
+        assert!(side.contains(r#"<a href="/?p=settings" aria-current="true">"#) && !side.contains("More") && side.find("Control plane") < side.find("Settings") && side.find("Settings") < side.find("Changelog"));
+        let settings = d.render("settings", &[], None);
+        assert!(settings.contains("Signed in: Modal workspace acme.") && settings.contains(r#"<form method="post" action="/signout"><button class="button secondary sm">Sign out</button></form>"#), "{settings}");
         // The control plane kept from the last run is listed at once, before any cloud was asked.
         let mut next = Dashboard::signed_in(Some(store.clone()));
         assert_eq!(next.planes, vec![plane.clone()]);
