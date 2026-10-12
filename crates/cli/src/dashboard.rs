@@ -1203,7 +1203,9 @@ impl Dashboard {
         // Regions: where it may work, and whose rule keeps it from the others.
         let refused: Vec<&(String, aws::Answer)> = look.regions.iter().filter(|(_, a)| matches!(a, aws::Answer::Refused(_))).collect();
         rows.push(row("Regions", if allowed.is_empty() { "None of those SuperCI works in".to_string() } else if refused.is_empty() { format!("All {} SuperCI works in", allowed.len()) } else { esc(&names(&allowed)) },
-            match refused.first() { Some((_, a)) => esc(&format!("The other {} are refused. {}", refused.len(), whose(a))), None => String::new() }, String::new()));
+            match refused.first() { Some((_, a)) => esc(&format!("The other {} are refused. {}", refused.len(), whose(a))), None => String::new() },
+            // (Nothing has to be allowed for SuperCI to work: the guide is for whoever wants another region.)
+            if refused.iter().any(|(_, a)| a.by_organization().is_some()) { format!(r#"<a class="button secondary sm" href="{MORE_REGIONS_GUIDE}" target="_blank" rel="noopener">How to allow more ↗</a>"#) } else { String::new() }));
         // Spot and on-demand machines.
         let machines = |a: Option<&aws::Answer>, refused_means: &str| match a {
             Some(aws::Answer::Allowed) => ("Allowed".to_string(), String::new()),
@@ -4916,6 +4918,10 @@ fn workspace_sub(l: &crate::store::Listed) -> String {
     parts.join(" · ")
 }
 
+/// The guide on what an AWS account allows, where it says how an organization's region rule is changed (by its
+/// manager, in AWS's console: SuperCI changes no rule and needs none changed).
+const MORE_REGIONS_GUIDE: &str = "https://superci.dev/docs/aws-accounts";
+
 /// Shown in a Connect button's place just after coming back from GitHub, until the control plane says the App is
 /// there.
 const GITHUB_ON_ITS_WAY: &str = r#"<span class="waiting-for"><span class="mini-spin"></span>Connecting GitHub: a few seconds…</span>"#;
@@ -5536,11 +5542,11 @@ mod tests {
         let page = d.plane_page();
         preview("plane-aws-project-activated", &page);
         for said in [r#"<small>A project of AWS&#39;s new sign-up: it works in Stockholm only. Everything SuperCI does works there.</small></span><span class="pill good"><i></i>AWS project</span>"#,
-            "<dt>Regions</dt><dd>Stockholm<small>The other 11 are refused. By its AWS organization (policy p-example1).</small></dd></div>",
+            r#"<dt>Regions</dt><dd>Stockholm<small>The other 11 are refused. By its AWS organization (policy p-example1).</small></dd><a class="button secondary sm" href="https://superci.dev/docs/aws-accounts" target="_blank" rel="noopener">How to allow more ↗</a></div>"#,
             "<dt>Spot machines</dt><dd>Allowed</dd>", "<dt>Runner image</dt><dd>In Stockholm</dd>"] {
             assert!(page.contains(said), "{said}\n\n{page}");
         }
-        assert!(!page.contains("management account") && !page.contains("Open the rule"), "{page}");
+        assert!(!page.contains("management account"), "{page}");
         // An account of its own: its section says nothing is refused, with its limits, and the regions offered are
         // the ones the image is in.
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/classic/look.jsonl"))));
