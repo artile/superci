@@ -18,7 +18,7 @@ use superci_core::crypto::{random_token, safe_eq};
 use superci_core::github::{self, app_manifest, manifest_target, Owner};
 use superci_core::plane::AUDIENCE;
 use superci_core::io::Response;
-use superci_core::plane::{Pool, Routing, Rule, AWS_ON_DEMAND, MAX_CPU, MAX_JOB_MINUTES};
+use superci_core::plane::{AwsBudget, Pool, Routing, Rule, AWS_ON_DEMAND, MAX_CPU, MAX_JOB_MINUTES};
 use superci_core::spec::{Capacity, Spec};
 use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, REGIONS};
 
@@ -119,6 +119,9 @@ pub struct Dashboard {
     aws_looks: HashMap<String, (u64, aws::Look)>,
     /// The regions AWS is copying the image jobs run on into, by account (asked with the look).
     aws_copying: HashMap<String, Vec<String>>,
+    /// When the rule of an AWS account's budget was last taken off a control plane's role here (by its id): what
+    /// the control plane noted before that is no longer so.
+    budget_lifted: HashMap<String, u64>,
     /// Each control plane's last status read in this session: a slow answer (a Lambda starting) shows the last one
     /// rather than the page waiting again. Kept only while the dashboard runs.
     seen: HashMap<String, serde_json::Value>,
@@ -712,7 +715,7 @@ impl Dashboard {
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
             status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
-            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
+            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
     /// A dashboard that remembers: with SuperCI's own sign-ins from its folder, kept there again as they change. A
@@ -1754,6 +1757,8 @@ impl Dashboard {
                 routing.order.retain(|p| p.cloud != cloud && !(cloud == "aws" && p.cloud == AWS_ON_DEMAND));
                 routing.rules.retain(|r| r.cloud != cloud);
                 if routing.default.as_deref() == Some(cloud.as_str()) { routing.default = None }
+                // (AWS's own budget for the account goes with AWS: see below.)
+                let had_budget = cloud == "aws" && routing.aws_budget.take().is_some();
                 self.put_secret(&plane, "ROUTING", &serde_json::to_string(&routing).map_err(|e| e.to_string())?)?;
                 if cloud == "aws" {
                     if matches!(plane, Plane::Aws { .. }) { self.put_secret(&plane, "AWS_RUNNERS", "off")? } else { cloudflare::plane_post(plane.url(), &self.status_key, "/aws/forget", &serde_json::json!({}))?; }
@@ -1780,6 +1785,8 @@ impl Dashboard {
                             _ => aws::disconnect_runners(creds, account.as_deref().unwrap_or_default(), plane.url(), &id),
                         };
                         if let Err(e) = gone { left.push(format!("its role ({e})")) }
+                        // Its budget in AWS itself, with the rule and the role made for it, if there was one.
+                        if had_budget { if let Err(e) = crate::aws_budget::with(creds, account.as_deref().unwrap_or_default(), &id, |b| b.remove()) { left.push(format!("its budget in AWS ({e})")) } }
                         if let Err(e) = aws::delete_networks(creds, &id, &REGIONS).or_else(|_| aws::delete_networks(creds, &id, &REGIONS)) { left.push(format!("its machines' network ({e}); remove AWS again to delete it")) }
                     }
                     // A control plane that has not taken the change yet may still start a runner there: its part is
@@ -2412,18 +2419,53 @@ impl Dashboard {
                 let Some(mut routing) = status.as_ref().and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
-                // A dollar amount a month, or none (empty, `none`, zero).
-                let usd = || field("usd").parse::<f64>().ok().filter(|n| *n > 0.0 && n.is_finite());
-                if ["monthly_usd", "account_usd"].contains(&field("action").as_str()) && !status.as_ref().is_some_and(|s| s["account_limits"] == true) {
+                // A dollar amount, or none (empty, `none`, zero).
+                let money = |name: &str| field(name).parse::<f64>().ok().filter(|n| *n > 0.0 && n.is_finite());
+                let usd = || money("usd");
+                let limits = ["monthly_usd", "account_usd"].contains(&field("action").as_str());
+                if limits && !status.as_ref().is_some_and(|s| s["account_limits"] == true) {
                     return Ok(message(409, "Update the control plane first", "A limit for the whole CI or for a cloud account needs a newer control plane: update it on the Control plane page (or `superci planes update`), then set the limit."))
+                }
+                // (A limit for a day, and a budget in AWS itself, need a control plane that keeps them.)
+                let newer = status.as_ref().is_some_and(|s| s["daily_limits"] == true);
+                if limits && !newer && (money("daily").is_some() || !["", "none"].contains(&field("budget").as_str())) {
+                    return Ok(message(409, "Update the control plane first", "A limit for a day, and a budget in AWS itself, need a newer control plane: update it on the Control plane page (or `superci planes update`), then set them."))
                 }
                 match field("action").as_str() {
                     // The whole CI's limit for a month, and a cloud account's (its providers together).
-                    "monthly_usd" => routing.monthly_usd = usd(),
+                    "monthly_usd" => { routing.monthly_usd = usd(); if newer { routing.daily_usd = money("daily") } }
                     "account_usd" => {
                         let account = field("account");
                         if account != "aws" { return Ok(message(400, "Which account?", "An account's limit is for a cloud with several providers: aws (its spot and on-demand machines). Another provider's limit is its own: its settings on Runners.")) }
-                        match usd() { Some(n) => { routing.account_usd.insert(account, n); } None => { routing.account_usd.remove(&account); } }
+                        let (was, limit) = (routing.account_usd.get(&account).copied(), usd());
+                        match limit { Some(n) => { routing.account_usd.insert(account.clone(), n); } None => { routing.account_usd.remove(&account); } }
+                        if newer { match money("daily") { Some(n) => { routing.account_daily_usd.insert(account.clone(), n); } None => { routing.account_daily_usd.remove(&account); } } }
+                        // The account's own budget in AWS, for the same monthly limit: nothing, AWS's emails, or its
+                        // emails and the rule that stops new machines at the limit (`lift` takes that rule off the
+                        // role). Not said: as it is, kept in step with the limit. It is made, changed and removed
+                        // with the sign-in of whoever asks; the control plane is only told what there is.
+                        let had = routing.aws_budget.clone();
+                        let (asked, lift) = (field("budget"), field("budget") == "lift");
+                        let want = match asked.as_str() { "emails" => Some(AwsBudget { stop: false }), "stops" => Some(AwsBudget { stop: true }), "none" => None, "" | "lift" => had.clone(),
+                            _ => return Ok(message(400, "What AWS does at the limit is none, emails or stops", "")) };
+                        if lift && had.is_none() { return Ok(message(400, "There is no budget in AWS to lift", "")) }
+                        if want.is_some() && limit.is_none() { return Ok(message(400, "A budget in AWS needs the monthly limit", "AWS's budget is for the account's monthly limit. Set a limit, or choose nothing in AWS.")) }
+                        if want != had || lift || (want.is_some() && limit != was) {
+                            let id = match &plane { Plane::Aws { account_id, .. } => account_id.clone(), _ => status.as_ref().and_then(|s| s["aws"]["account_id"].as_str()).unwrap_or_default().to_string() };
+                            if !self.hold_account(&id) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {}: its budget in AWS is made and changed with your sign-in.", esc(&id)))) }
+                            let creds = self.aws_creds()?;
+                            let email = field("email").trim().to_string();
+                            if !email.is_empty() && !(email.contains('@') && !email.contains(char::is_whitespace)) { return Ok(message(400, "That is no email address", "")) }
+                            let done = crate::aws_budget::with(&creds, &id, plane.plane_id(), |b| match &want {
+                                Some(_) if lift => b.lift(false),
+                                Some(w) => b.set(limit.unwrap_or_default(), Some(email.as_str()).filter(|e| !e.is_empty()), w.stop),
+                                None => b.remove(),
+                            });
+                            if let Err(e) = done { return Ok(message(502, "AWS did not take the budget", &esc(&plain_refusal(&e).unwrap_or(e)))) }
+                            // (The rule is off the role now, whatever the control plane noted before.)
+                            self.budget_lifted.insert(plane.plane_id().to_string(), now_ms());
+                        }
+                        routing.aws_budget = want;
                     }
                     "default" => routing.default = Some(field("cloud")).filter(|c| !c.is_empty()),
                     "add" => {
@@ -3097,7 +3139,7 @@ mark();load()})();</script>"#;
             let account = aws_account(v);
             let signed_in: Vec<&str> = [("aws", self.aws.iter().chain(&self.aws_others).any(|a| Some(&a.account_id) == account.as_ref())), ("modal", self.modal.is_some()), ("cloudflare", self.cf.is_some())]
                 .into_iter().filter(|(_, yes)| *yes).map(|(c, _)| c).collect();
-            format!("{}{}", pools_card(v, &self.quotas, self.cf_month, self.modal_month.as_ref(), &signed_in, self.aws_look()), spending_card(v))
+            format!("{}{}", pools_card(v, &self.quotas, self.cf_month, self.modal_month.as_ref(), &signed_in, self.aws_look()), spending_card(v, self.budget_lifted.get(v.plane.plane_id()).copied().unwrap_or(0)))
         };
         let note = match &self.flash { Some(f) => format!(r#"<div class="notice">{}<span>{}</span></div>"#, icon("check"), esc(f)), None => String::new() };
         format!(r#"<div class="bar"><h1 class="page-title">Runners</h1>{add}</div>{note}<div class="cards">{body}</div>"#)
@@ -3461,8 +3503,10 @@ mark();load()})();</script>"#;
         let mut left = vec![];
         match plane {
             Plane::Cloudflare { account_id, script, .. } => self.cloudflare()?.delete_plane(account_id, script, plane.plane_id())?,
-            Plane::Aws { region, plane_id, .. } => {
+            Plane::Aws { region, plane_id, account_id, .. } => {
                 let creds = self.aws_creds()?;
+                // (Its budget in AWS itself first, if one was made: its rule comes off the role before the role goes.)
+                if !status["routing"]["aws_budget"].is_null() { if let Err(e) = crate::aws_budget::with(&creds, account_id, plane_id, |b| b.remove()) { left.push(format!("Its budget in AWS ({e}).")) } }
                 aws_plane::delete(&creds, region, plane_id)?;
                 if let Err(e) = aws::delete_networks(&creds, plane_id, &REGIONS) { left.push(format!("Its machines' network in AWS ({e}).")) }
             }
@@ -3481,6 +3525,7 @@ mark();load()})();</script>"#;
                 (Some(a), acc) if a.account_id == acc => {
                     let creds = a.credentials()?;
                     if let Err(e) = aws::delete_networks(&creds, plane.plane_id(), &REGIONS) { left.push(format!("Its machines' network in AWS account {acc} ({e}).")) }
+                    if !status["routing"]["aws_budget"].is_null() { if let Err(e) = crate::aws_budget::with(&creds, acc, plane.plane_id(), |b| b.remove()) { left.push(format!("Its budget in AWS account {acc} ({e}).")) } }
                     let _ = aws::disconnect_runners(&creds, acc, plane.url(), plane.plane_id());
                 }
                 _ => left.push(format!("Its role in AWS account {account} (sign in with AWS to remove it).")),
@@ -4434,29 +4479,58 @@ fn brand_logo(size: u32) -> String {
 /// What the CI may spend on machines in a month: all its providers together, and a cloud account with several
 /// providers (AWS: its spot and on-demand machines together). A provider's own budget is in its settings. Each is a
 /// row with what was spent this month and its limit, changed in its own dialog.
-fn spending_card(v: &PlaneView) -> String {
-    let head = r#"<section class="card" id="limits"><div class="card-head"><h2>Monthly limits</h2></div>"#;
+fn spending_card(v: &PlaneView, lifted_ms: u64) -> String {
+    let head = r#"<section class="card" id="limits"><div class="card-head"><h2>Limits</h2></div>"#;
     // A control plane from before these limits would drop them unsaid: said, in their place.
     if !v.account_limits() { return format!(r#"{head}<p class="note">A limit for everything, and for a cloud account, needs a newer control plane: <a href="/?p=planes">update it on the Control plane page</a>. A provider's own budget is in its settings above.</p></section>"#) }
     let routing = v.routing();
-    let estimate = "It counts the machines jobs ran on, as estimated here. A cloud's bill also has storage and small fees, and jobs already running finish.";
-    let mut rows = vec![("all".to_string(), "monthly_usd", String::new(), brand_logo(32), "Everything".to_string(), "All providers together. At the limit no job starts until next month.".to_string(), v.spend_total(), routing.monthly_usd,
-        "At the limit no job starts, until next month or a higher limit.")];
-    if let Some(account) = aws_account(v).filter(|_| v.order().iter().any(|p| p.cloud == "aws")) {
-        rows.push(("aws".to_string(), "account_usd", "aws".to_string(), logo("aws", 32), format!("AWS account {account}"), "Its spot and on-demand machines together. At the limit, jobs go to other providers.".to_string(), v.spend_account("aws"), routing.account_usd.get("aws").copied(),
-            "At the limit, jobs go to the providers of other accounts in the order; with none, they fail saying so."));
+    let daily = v.daily_limits();
+    let estimate = "Limits count the machines jobs ran on, as estimated here. A cloud's bill also has storage and small fees, and jobs already running finish.";
+    struct Row { id: &'static str, action: &'static str, account: &'static str, mark: String, name: String, what: &'static str, month: (f64, Option<f64>), day: (f64, Option<f64>), at_limit: &'static str }
+    let mut rows = vec![Row { id: "all", action: "monthly_usd", account: "", mark: brand_logo(32), name: "Everything".into(), what: "All providers together. At a limit no job starts until it is over.",
+        month: (v.spend_total(), routing.monthly_usd), day: (v.spend_today_total(), routing.daily_usd), at_limit: "At a limit no job starts, until the month (or the day, UTC) is over or the limit is raised." }];
+    let aws = aws_account(v).filter(|_| v.order().iter().any(|p| p.cloud == "aws"));
+    if let Some(account) = &aws {
+        rows.push(Row { id: "aws", action: "account_usd", account: "aws", mark: logo("aws", 32), name: format!("AWS account {account}"), what: "Its spot and on-demand machines together. At a limit, jobs go to other providers.",
+            month: (v.spend_account("aws"), routing.account_usd.get("aws").copied()), day: (v.spend_today_account("aws"), routing.account_daily_usd.get("aws").copied()),
+            at_limit: "At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so." });
     }
+    // AWS's own budget for the account (see `aws_budget`), and whether its rule is on the control plane's role now:
+    // the control plane noted a machine refused by it, later than it was last lifted here, within the day.
+    let budget = routing.aws_budget.clone();
+    let stopped = budget.as_ref().is_some_and(|b| b.stop) && v.budget_stopped_ms().is_some_and(|at| at > lifted_ms && now_ms().saturating_sub(at) < 86_400_000);
     let (mut list, mut dialogs) = (String::new(), String::new());
-    for (id, action, account, mark, name, what, spent, cap, at_limit) in rows {
-        let now = match cap {
-            Some(cap) => format!(r#"<span class="lim">{} of {}</span>{}"#, usd(spent), usd(cap), if spent >= cap { pill("bad", "at its limit") } else { String::new() }),
-            None => format!(r#"<span class="lim">{} this month</span><span class="lim">No limit</span>"#, usd(spent)),
+    for r in rows {
+        let chip = |(spent, cap): (f64, Option<f64>), when: &str| match cap {
+            Some(cap) => format!(r#"<span class="lim">{} of {}{when}</span>{}"#, usd(spent), usd(cap), if spent >= cap { pill("bad", "at its limit") } else { String::new() }),
+            None => String::new(),
         };
-        list.push_str(&format!(r#"<li class="pool still"><span></span>{mark}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{now}</span><button type="button" class="icon-btn" aria-label="{} limit" onclick="document.getElementById('limit-{id}').showModal()">{ICON_GEAR}</button></li>"#, esc(&name), esc(&what), esc(&name)));
-        dialogs.push_str(&format!(r#"<dialog class="dlg" id="limit-{id}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="{action}"><input type="hidden" name="account" value="{account}"><div class="dlg-head">{mark}<span><strong>{}</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><label class="field"><span>Monthly limit</span><span class="money">$<input type="number" name="usd" min="1" step="1" placeholder="No limit"{} autofocus></span><small>{} this month. {at_limit} {estimate}</small></label><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
-            esc(&name), esc(&what), cap.map(|n| format!(r#" value="{n:.0}""#)).unwrap_or_default(), usd(spent)));
+        let mut now = format!("{}{}", chip(r.month, ""), chip(r.day, " today"));
+        if r.month.1.is_none() { now = format!(r#"<span class="lim">{} this month</span>{now}"#, usd(r.month.0)) }
+        if r.month.1.is_none() && r.day.1.is_none() { now.push_str(r#"<span class="lim">No limit</span>"#) }
+        let fields = |month: Option<f64>, day: Option<f64>| format!(r#"<input type="hidden" name="action" value="{}"><input type="hidden" name="account" value="{}">{}{}"#, r.action, r.account,
+            month.map(|n| format!(r#"<input type="hidden" name="usd" value="{n}">"#)).unwrap_or_default(), day.map(|n| format!(r#"<input type="hidden" name="daily" value="{n}">"#)).unwrap_or_default());
+        // The AWS account's row says what AWS itself does at the limit; with its rule on the role, that, and Lift.
+        let mut in_aws = String::new();
+        if r.id == "aws" {
+            now.push_str(&match (&budget, stopped) {
+                (Some(_), true) => format!(r#"{}<form method="post" action="/routing">{}<input type="hidden" name="budget" value="lift"><button class="button secondary sm" title="Takes AWS's rule off the control plane's role: machines start again, and AWS leaves them be until next month">Lift</button></form>"#, pill("bad", "stopped by AWS's budget"), fields(r.month.1, r.day.1)),
+                (Some(b), false) => pill("good", if b.stop { "AWS stops at the limit" } else { "AWS emails" }),
+                (None, _) => String::new(),
+            });
+            let option = |value: &str, text: &str| format!(r#"<option value="{value}"{}>{text}</option>"#, if value == match &budget { None => "none", Some(b) if b.stop => "stops", Some(_) => "emails" } { " selected" } else { "" });
+            in_aws = if daily {
+                format!(r#"<label class="field"><span>In AWS itself</span><select name="budget">{}{}{}</select><small>A budget in the account for the monthly limit. AWS counts the account's real bill, all of it and hours late. At 100% it can also refuse new machines to the control plane, until the next month or until you lift it. It is made with your sign-in; the control plane gets no permission for it.</small></label><label class="field"><span>AWS's emails go to</span><input type="email" name="email" placeholder="{}" autocomplete="email"></label>"#,
+                    option("none", "Nothing"), option("emails", "AWS emails me at 80% and 100%"), option("stops", "AWS emails me, and stops new machines at 100%"), if budget.is_some() { "As it is" } else { "you@example.com" })
+            } else { String::new() };
+        }
+        let value = |n: Option<f64>| n.map(|n| format!(r#" value="{}""#, if n.fract() == 0.0 { format!("{n:.0}") } else { format!("{n:.2}") })).unwrap_or_default();
+        let day_field = if daily { format!(r#"<label class="field"><span>Daily limit</span><span class="money">$<input type="number" name="daily" min="0.01" step="any" placeholder="No limit"{}></span><small>{} today (UTC). A day that runs away stops that day.</small></label>"#, value(r.day.1), usd(r.day.0)) } else { String::new() };
+        list.push_str(&format!(r#"<li class="pool still"><span></span>{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{now}</span><button type="button" class="icon-btn" aria-label="{} limits" onclick="document.getElementById('limit-{}').showModal()">{ICON_GEAR}</button></li>"#, r.mark, esc(&r.name), esc(r.what), esc(&r.name), r.id));
+        dialogs.push_str(&format!(r#"<dialog class="dlg" id="limit-{}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="{}"><input type="hidden" name="account" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><label class="field"><span>Monthly limit</span><span class="money">$<input type="number" name="usd" min="0.01" step="any" placeholder="No limit"{} autofocus></span><small>{} this month. {} {estimate}</small></label>{day_field}{in_aws}<div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
+            r.id, r.action, r.account, r.mark, esc(&r.name), esc(r.what), value(r.month.1), usd(r.month.0), r.at_limit));
     }
-    format!(r#"{head}<p class="note">The most {} may spend on machines in a month. A provider's own budget is in its settings above.</p><ol class="pools">{list}</ol>{dialogs}</section>"#, esc(&v.name()))
+    format!(r#"{head}<p class="note">The most {} may spend on machines in a month and in a day. A provider's own budget is in its settings above.</p><ol class="pools">{list}</ol>{dialogs}</section>"#, esc(&v.name()))
 }
 
 /// Machines: the default machine (what plain `runs-on: superci` gets, and any part a label leaves out), changed in
@@ -5204,7 +5278,12 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     };
     let out = call(from, &out_token, "/move/export", serde_json::json!({}))?;
     for (name, k) in [("GITHUB_APP", "app"), ("GITLAB", "gitlab"), ("ROUTING", "routing"), ("MACHINE", "machine")] {
-        if !out[k].is_null() { w.put(to, name, &out[k].to_string())? }
+        if out[k].is_null() { continue }
+        // (A budget in AWS itself is for the old control plane's role: not carried. The new one says there is none,
+        // until it is made again; the old one's goes when the old control plane is deleted.)
+        let mut carried = out[k].clone();
+        if k == "routing" { if let Some(routing) = carried.as_object_mut() { routing.remove("aws_budget"); } }
+        w.put(to, name, &carried.to_string())?
     }
     // Further organizations' Apps, each a secret of its own. One the new control plane has from an earlier move and
     // the old one no longer has (its organization was removed since) goes.
@@ -6057,16 +6136,44 @@ mod tests {
         // each with what was spent this month, its limit, and a dialog of its own to change it.
         let mut newer = view.clone();
         { let st = newer.status.as_mut().unwrap(); st["account_limits"] = true.into(); st["routing"]["monthly_usd"] = 100.0.into(); st["routing"]["account_usd"] = serde_json::json!({ "aws": 12.0 }); st["spend"]["aws-on-demand"] = 1.0.into(); }
-        let limits = d.render("runners", &[newer], None);
-        preview("runners-limits", &limits);
-        for said in [r#"<strong>Everything</strong><small>All providers together. At the limit no job starts until next month.</small></span><span class="pool-now"><span class="lim">$14.22 of $100.00</span></span>"#,
-            r#"<strong>AWS account 123456789012</strong><small>Its spot and on-demand machines together. At the limit, jobs go to other providers.</small></span><span class="pool-now"><span class="lim">$13.40 of $12.00</span><span class="pill bad"><i></i>At its limit</span></span>"#,
+        let limits = d.render("runners", &[newer.clone()], None);
+        for said in [r#"<strong>Everything</strong><small>All providers together. At a limit no job starts until it is over.</small></span><span class="pool-now"><span class="lim">$14.22 of $100.00</span></span>"#,
+            r#"<strong>AWS account 123456789012</strong><small>Its spot and on-demand machines together. At a limit, jobs go to other providers.</small></span><span class="pool-now"><span class="lim">$13.40 of $12.00</span><span class="pill bad"><i></i>At its limit</span></span>"#,
             r#"<dialog class="dlg" id="limit-all" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="monthly_usd">"#,
             r#"<input type="hidden" name="action" value="account_usd"><input type="hidden" name="account" value="aws">"#,
-            r#"<input type="number" name="usd" min="1" step="1" placeholder="No limit" value="12" autofocus>"#,
-            "$13.40 this month. At the limit, jobs go to the providers of other accounts in the order; with none, they fail saying so."] {
+            r#"<input type="number" name="usd" min="0.01" step="any" placeholder="No limit" value="12" autofocus>"#,
+            "$13.40 this month. At a limit, jobs go to the providers of other accounts in the order; with none, they fail saying so."] {
             assert!(limits.contains(said), "{said}\n\n{limits}");
         }
+        // (It keeps no limit for a day and no budget in AWS yet: neither is offered.)
+        assert!(!limits.contains(r#"name="daily""#) && !limits.contains(r#"name="budget""#), "{limits}");
+        // One that does: a limit for a day beside the month's, each with what was spent; and for the AWS account,
+        // what AWS itself does at the monthly limit, with where its emails go.
+        { let st = newer.status.as_mut().unwrap(); st["daily_limits"] = true.into(); st["routing"]["daily_usd"] = 5.0.into(); st["routing"]["account_daily_usd"] = serde_json::json!({ "aws": 2.5 }); st["spend_today"] = serde_json::json!({ "aws": 0.4, "cloudflare": 0.1 }); }
+        let limits = d.render("runners", &[newer.clone()], None);
+        preview("runners-limits", &limits);
+        for said in [r#"<span class="lim">$14.22 of $100.00</span><span class="lim">$0.50 of $5.00 today</span></span>"#,
+            r#"<span class="lim">$0.40 of $2.50 today</span></span>"#,
+            r#"<label class="field"><span>Daily limit</span><span class="money">$<input type="number" name="daily" min="0.01" step="any" placeholder="No limit" value="2.50"></span><small>$0.40 today (UTC). A day that runs away stops that day.</small></label>"#,
+            r#"<select name="budget"><option value="none" selected>Nothing</option><option value="emails">AWS emails me at 80% and 100%</option><option value="stops">AWS emails me, and stops new machines at 100%</option></select>"#,
+            r#"<input type="email" name="email" placeholder="you@example.com" autocomplete="email">"#] {
+            assert!(limits.contains(said), "{said}\n\n{limits}");
+        }
+        assert_eq!(limits.matches(r#"name="budget""#).count(), 1, "only the AWS account has a budget in AWS");
+        // With a budget that stops machines: the row says so. Once the control plane was refused a machine by it,
+        // the row says that, with Lift (which keeps the limits as they are); lifted here since, it is as before.
+        newer.status.as_mut().unwrap()["routing"]["aws_budget"] = serde_json::json!({ "stop": true });
+        let armed = d.render("runners", &[newer.clone()], None);
+        assert!(armed.contains(r#"<span class="pill good"><i></i>AWS stops at the limit</span>"#) && armed.contains(r#"<option value="stops" selected>"#) && armed.contains(r#"placeholder="As it is""#) && !armed.contains("Lift"), "{armed}");
+        newer.status.as_mut().unwrap()["aws_budget_stopped_ms"] = (now_ms() - 60_000).into();
+        let stopped = d.render("runners", &[newer.clone()], None);
+        assert!(stopped.contains(r#"<span class="pill bad"><i></i>Stopped by AWS&#39;s budget</span><form method="post" action="/routing"><input type="hidden" name="action" value="account_usd"><input type="hidden" name="account" value="aws"><input type="hidden" name="usd" value="12"><input type="hidden" name="daily" value="2.5"><input type="hidden" name="budget" value="lift">"#), "{stopped}");
+        d.budget_lifted.insert("p1".into(), now_ms());
+        assert!(d.render("runners", &[newer.clone()], None).contains("AWS stops at the limit"));
+        d.budget_lifted.clear();
+        // With emails only, that is what the row says.
+        newer.status.as_mut().unwrap()["routing"]["aws_budget"] = serde_json::json!({});
+        assert!(d.render("runners", &[newer], None).contains(r#"<span class="pill good"><i></i>AWS emails</span>"#));
         assert!(!html.contains(">$12.40 this month<"), "a budget already says the spend");
         // The pools as ordered; ones added since (Modal) after them.
         let at = |s: &str| html.find(s).unwrap_or_else(|| panic!("{s}"));

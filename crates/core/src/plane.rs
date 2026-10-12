@@ -1793,7 +1793,12 @@ impl<'a> ControlPlane<'a> {
                             }
                             self.note_permission("aws", "LaunchOnlyTaggedMachines", &machine).await;
                             match machine {
-                                Ok(m) => { launched = Some((region.clone(), m, network.is_some_and(|n| n.private))); break }
+                                Ok(m) => {
+                                    // (A machine started: the budget's rule, if it was on the role, is off it.)
+                                    if self.config.routing.aws_budget.is_some() && self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().is_some() { let _ = self.store.delete(BUDGET_STOPPED_KEY).await; }
+                                    launched = Some((region.clone(), m, network.is_some_and(|n| n.private)));
+                                    break
+                                }
                                 Err(e) if aws::out_of_room(&e) => {
                                     let quota = ["VcpuLimitExceeded", "MaxSpotInstanceCountExceeded"].iter().any(|c| e.starts_with(c));
                                     quota_only &= quota;

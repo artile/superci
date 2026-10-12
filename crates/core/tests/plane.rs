@@ -574,6 +574,68 @@ impl Http for NoSpot {
     }
 }
 
+/// The fake clouds, in an account whose own budget in AWS reached its limit and put its rule on the control
+/// plane's role: every launch is refused. The refusal is the recorded one above with what AWS says of a role's own
+/// policy in the organization's place ("identity-based policy", and the rule's name when `named`); that the rule's
+/// name is in what AWS says was seen live on 13 October 2026.
+struct ByBudget { clouds: FakeClouds, refusal: String, on: std::cell::Cell<bool> }
+impl ByBudget {
+    fn new(named: bool) -> ByBudget {
+        let org = NoSpot::new().refusal;
+        let policy = org.split("service control policy: ").nth(1).and_then(|rest| rest.split(|c: char| c.is_whitespace() || c == '<').next()).expect("the policy AWS named").to_string();
+        let refusal = org.replace(&format!("in a service control policy: {policy}"), &if named { format!("in an identity-based policy: arn:aws:iam::111111111111:policy/superci-stop-{PLANE_ID}") } else { "in an identity-based policy".to_string() });
+        assert!(refusal.contains("with an explicit deny in an identity-based policy") && !refusal.contains("service control policy"), "{refusal}");
+        ByBudget { clouds: FakeClouds::default(), refusal, on: std::cell::Cell::new(true) }
+    }
+}
+#[async_trait(?Send)]
+impl Http for ByBudget {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        if self.on.get() && body.contains("Action=RunInstances") {
+            self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body));
+            return Ok(Response::new(403, "text/xml", self.refusal.clone()));
+        }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn a_machine_refused_by_the_accounts_own_budget_is_said_as_that_and_is_no_missing_permission() {
+    for named in [true, false] {
+        let (store, clouds, wakes, cache) = (Mem::default(), ByBudget::new(named), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+        config.routing.aws_budget = Some(superci_core::plane::AwsBudget { stop: true });
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        let status = || json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
+        block_on(plane.handle(webhook("queued", None)));
+        // The job says what stopped it and what to do; nothing is noted as a permission the role lacks; the status
+        // says when, for the dashboard's row.
+        let j = job(&store, 7);
+        let said = format!("{} {}", j["error"].as_str().unwrap_or_default(), j["why"].as_str().unwrap_or_default());
+        assert!(said.contains("AWS's budget for this account reached its limit and stopped new machines there: raise the account's limit on Runners in the SuperCI dashboard (that lifts it), or wait for next month"), "named {named}: {j}");
+        assert!(block_on(store.get("denied:aws:LaunchOnlyTaggedMachines")).unwrap().is_none(), "named {named}");
+        assert!(status()["aws_budget_stopped_ms"].as_u64().is_some());
+        // Lifted: the next job's machine starts, and the note goes.
+        clouds.on.set(false);
+        block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
+        assert_eq!(job(&store, 8)["state"], "launched", "{}", job(&store, 8));
+        assert!(status()["aws_budget_stopped_ms"].is_null());
+    }
+    // With no such budget, and AWS not naming the rule, a refusal by the role's own policy is what it was before: a
+    // permission the role lacks.
+    let (store, clouds, wakes, cache) = (Mem::default(), ByBudget::new(false), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    assert!(block_on(store.get("denied:aws:LaunchOnlyTaggedMachines")).unwrap().is_some() && !job(&store, 7).to_string().contains("AWS's budget"), "{}", job(&store, 7));
+}
+
 #[test]
 fn an_organization_that_allows_no_spot_sends_the_job_on_demand_and_is_no_missing_permission() {
     let (store, clouds, wakes, cache) = (Mem::default(), NoSpot::new(), Wakes::default(), Cache::default());
