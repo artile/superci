@@ -640,10 +640,74 @@ pub async fn could_run(http: &dyn Http, region: &str, creds: &Credentials, image
     }
 }
 
-/// Where to ask AWS for a higher spot quota in a region.
-pub fn spot_quota_link(region: &str) -> String {
-    format!("https://{region}.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/{SPOT_CPU_QUOTA}")
+/// Where to ask AWS for more vCPUs of a kind (a quota's code) in a region.
+pub fn quota_link(region: &str, code: &str) -> String {
+    format!("https://{region}.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/{code}")
 }
+
+/// The kind of image a name pattern asks for, as its maker lists it: `ubuntu24-full-x64` of
+/// `runs-on-v2.2-ubuntu24-full-x64-*`.
+pub fn image_flavor(pattern: &str) -> &str {
+    let rest = pattern.trim_end_matches('*').trim_end_matches('-');
+    match rest.find("-ubuntu").or_else(|| rest.find("-windows")) { Some(at) => &rest[at + 1..], None => rest }
+}
+
+/// An image's id in each region its maker publishes it in, read from the maker's own list of a build (the notes of
+/// a release of `runs-on/runner-images-for-aws`: a heading for each kind of image, then a table of regions and ids).
+/// This is how a copy learns its source where no other region can be asked.
+pub fn published_images(release_notes: &str, flavor: &str) -> Vec<(String, String)> {
+    let heading = format!("### `{flavor}`");
+    let Some(at) = release_notes.find(&heading) else { return vec![] };
+    release_notes[at + heading.len()..].lines().skip_while(|l| !l.trim_start().starts_with('|')).take_while(|l| l.trim_start().starts_with('|')).filter_map(|row| {
+        let mut cells = row.split('|').map(|c| c.trim().trim_matches('`')).filter(|c| !c.is_empty());
+        let (region, id) = (cells.next()?, cells.next()?);
+        (aws_id(id, "ami-") && region.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')).then(|| (region.to_string(), id.to_string()))
+    }).collect()
+}
+
+/// The region to copy an image from, of those it is published in: one on the same continent as where it goes (by
+/// the region's first letters), else the first listed.
+pub fn copy_source<'a>(published: &'a [(String, String)], to: &str) -> Option<&'a (String, String)> {
+    let continent = to.split('-').next().unwrap_or_default();
+    published.iter().find(|(r, _)| r != to && r.split('-').next() == Some(continent)).or_else(|| published.iter().find(|(r, _)| r != to))
+}
+
+/// What marks an image as a copy SuperCI made (its tag), so that it is found and removed again.
+pub const IMAGE_TAG: (&str, &str) = ("superci", "runner-image");
+
+/// Starts copying an image into a region from another (AWS does the copying, in about ten minutes; the copy is the
+/// account's own, kept in its storage there). The copy's id.
+pub async fn copy_image(http: &dyn Http, region: &str, creds: &Credentials, from_region: &str, from_image: &str, name: &str, now_ms: u64) -> Result<String> {
+    let xml = ec2(http, region, creds, "CopyImage", serde_json::json!({ "SourceRegion": from_region, "SourceImageId": from_image, "Name": name,
+        "Description": format!("The image SuperCI's jobs run on, copied from {from_region} ({from_image})"),
+        "TagSpecification": [{ "ResourceType": "image", "Tag": [{ "Key": IMAGE_TAG.0, "Value": IMAGE_TAG.1 }] }] }), now_ms).await?;
+    xml_tag(&xml, "imageId").map(str::to_string).ok_or_else(|| "CopyImage without an imageId".into())
+}
+
+/// The account's own copies of an image in a region (see `copy_image`): each one's id, name, state (`pending` while
+/// AWS copies, then `available`) and the snapshots that hold it.
+pub async fn copied_images(http: &dyn Http, region: &str, creds: &Credentials, now_ms: u64) -> Result<Vec<CopiedImage>> {
+    let xml = ec2(http, region, creds, "DescribeImages", serde_json::json!({ "Owner": ["self"], "Filter": [{ "Name": format!("tag:{}", IMAGE_TAG.0), "Value": [IMAGE_TAG.1] }] }), now_ms).await?;
+    Ok(xml.split("<imageId>").skip(1).map(|chunk| CopiedImage {
+        id: chunk.split('<').next().unwrap_or_default().to_string(),
+        name: xml_tag(chunk, "name").unwrap_or_default().to_string(),
+        state: xml_tag(chunk, "imageState").unwrap_or_default().to_string(),
+        snapshots: chunk.split("<snapshotId>").skip(1).filter_map(|s| s.split('<').next()).filter(|s| aws_id(s, "snap-")).map(str::to_string).collect(),
+    }).filter(|i| aws_id(&i.id, "ami-")).collect())
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CopiedImage { pub id: String, pub name: String, pub state: String, pub snapshots: Vec<String> }
+
+/// Removes a copy of an image with the snapshots that hold it.
+pub async fn delete_copied_image(http: &dyn Http, region: &str, creds: &Credentials, image: &CopiedImage, now_ms: u64) -> Result<()> {
+    ec2(http, region, creds, "DeregisterImage", serde_json::json!({ "ImageId": image.id }), now_ms).await?;
+    for snapshot in &image.snapshots { ec2(http, region, creds, "DeleteSnapshot", serde_json::json!({ "SnapshotId": snapshot }), now_ms).await?; }
+    Ok(())
+}
+
+/// Where to ask AWS for a higher spot quota in a region.
+pub fn spot_quota_link(region: &str) -> String { quota_link(region, SPOT_CPU_QUOTA) }
 
 pub async fn terminate_instance(http: &dyn Http, region: &str, creds: &Credentials, instance_id: &str, now_ms: u64) -> Result<()> {
     ec2(http, region, creds, "TerminateInstances", serde_json::json!({ "InstanceId": [instance_id] }), now_ms).await.map(|_| ())
@@ -770,6 +834,25 @@ poweroff
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The image maker's list of a build, as it publishes it (the shape of its release notes on 6 October 2026).
+    #[test]
+    fn a_copy_learns_its_source_from_the_makers_list() {
+        let notes = "## Available images\n\n### `ubuntu22-full-arm64`\n\n| Region | AMI ID |\n| --- | --- |\n| us-east-1 | `ami-0c440955e5d86ed34` |\n| eu-west-1 | `ami-02e5d5a4bf1be6d80` |\n\n### `ubuntu24-full-x64`\n\n| Region | AMI ID |\n| --- | --- |\n| us-east-1 | `ami-04e964d6e3d2f3f4a` |\n| us-east-2 | `ami-0aaaaaaaaaaaaaaaa` |\n| eu-west-1 | `ami-0b8d70b1c8eb9af4a` |\n| ap-southeast-2 | `ami-0cccccccccccccccc` |\n\n### `ubuntu26-full-x64`\n\n| Region | AMI ID |\n| --- | --- |\n| us-east-1 | `ami-0dddddddddddddddd` |\n";
+        assert_eq!(image_flavor("runs-on-v2.2-ubuntu24-full-x64-*"), "ubuntu24-full-x64");
+        assert_eq!((image_flavor("runs-on-v2.2-windows25-full-x64-*"), image_flavor("runs-on-v2.2-ubuntu24-gpu-x64-*")), ("windows25-full-x64", "ubuntu24-gpu-x64"));
+        let published = published_images(notes, "ubuntu24-full-x64");
+        assert_eq!(published.len(), 4);
+        assert_eq!(published[2], ("eu-west-1".to_string(), "ami-0b8d70b1c8eb9af4a".to_string()));
+        // From the same continent when it is published there, else from the first region listed.
+        assert_eq!(copy_source(&published, "eu-north-1").map(|(r, _)| r.as_str()), Some("eu-west-1"));
+        assert_eq!(copy_source(&published, "ca-central-1").map(|(r, _)| r.as_str()), Some("us-east-1"));
+        assert_eq!(copy_source(&published, "us-east-1").map(|(r, _)| r.as_str()), Some("us-east-2"), "never from the region itself");
+        // A kind that is not in the list, and a list that is something else, give nothing: nothing is guessed.
+        assert!(published_images(notes, "ubuntu24-full-arm64").is_empty() && published_images("No images this time.", "ubuntu24-full-x64").is_empty());
+        assert!(published_images("### `ubuntu24-full-x64`\n\n| Region | AMI ID |\n| --- | --- |\n| us-east-1 | not-an-id |\n", "ubuntu24-full-x64").is_empty());
+        assert_eq!(quota_link("eu-north-1", ON_DEMAND_CPU_QUOTA), "https://eu-north-1.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-1216C47A");
+    }
 
     /// AWS's refusals as it words them (the first two as a project of its new sign-up answered on 12 October 2026,
     /// with stand-in ids; the others as its documentation gives them).

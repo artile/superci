@@ -304,6 +304,15 @@ impl Look {
             .or_else(|| self.regions.iter().filter_map(|(_, a)| a.by_organization()).chain(self.spot.iter().filter_map(|a| a.by_organization())).next())
     }
 
+    /// The account's limit of vCPUs at once where it holds jobs back (fewer than 32: a new account's), with where to
+    /// ask AWS for more: the limit of what its jobs run on (spot, or on-demand where spot is refused).
+    pub fn low_limit(&self) -> Option<(u32, String)> {
+        let region = self.asked_in.as_deref()?;
+        let spot_refused = matches!(self.spot, Some(Answer::Refused(_)));
+        let (cpus, code) = if spot_refused { (self.on_demand_cpus?, aws::ON_DEMAND_CPU_QUOTA) } else { (self.spot_cpus?, aws::SPOT_CPU_QUOTA) };
+        (cpus < 32).then(|| (cpus, aws::quota_link(region, code)))
+    }
+
     pub fn kind(&self) -> Kind {
         let allowed = self.allowed_regions();
         let refused = |region: &str| self.regions.iter().any(|(r, a)| r == region && a.by_organization().is_some());
@@ -382,6 +391,67 @@ pub fn region_ready(creds: &Credentials, region: &str) -> Result<()> {
         _ => Ok(()),
     }
 }
+
+/// Where the image's maker lists each build's images, by region (public, read with no sign-in).
+pub const IMAGE_LIST: &str = "https://api.github.com/repos/runs-on/runner-images-for-aws/releases?per_page=12";
+
+/// The newest build of the kind of image jobs run on, as its maker lists it: the build's stamp, and the image's id
+/// in each region it is published in. This is how a copy learns its source from an account that can ask no other
+/// region.
+pub fn published_image<H: Http>(http: &H) -> Result<(String, Vec<(String, String)>)> {
+    let config = superci_core::plane::Config::new(String::new());
+    let flavor = aws::image_flavor(&config.image_name).to_string();
+    let request = Request::new("GET", IMAGE_LIST).with_header("user-agent", "superci").with_header("accept", "application/vnd.github+json");
+    let answer = futures::executor::block_on(http.send(request)).map_err(|e| format!("The list of runner images could not be read from GitHub: {e}"))?;
+    if answer.status != 200 { return Err(format!("The list of runner images could not be read from GitHub (it answered {}).", answer.status)) }
+    let releases: serde_json::Value = serde_json::from_slice(&answer.body).map_err(|e| format!("The list of runner images from GitHub could not be read: {e}"))?;
+    releases.as_array().into_iter().flatten().find_map(|r| {
+        let published = aws::published_images(r["body"].as_str()?, &flavor);
+        let stamp = r["tag_name"].as_str()?.rsplit('-').next()?.to_string();
+        (!published.is_empty() && stamp.len() >= 8 && stamp.bytes().all(|b| b.is_ascii_digit())).then_some((stamp, published))
+    }).ok_or_else(|| format!("The maker's list of runner images has no {flavor} image now. Name one yourself: --from=REGION:ami-…"))
+}
+
+/// The name a copy of the image gets: the name its maker's images have, with the build's stamp, so that it is found
+/// as theirs are.
+pub fn copy_name(stamp: &str) -> String {
+    let config = superci_core::plane::Config::new(String::new());
+    format!("{}{stamp}", config.image_name.trim_end_matches('*'))
+}
+
+/// The account's own copies of the image in a region (see `aws::copied_images`).
+pub fn copied_images(creds: &Credentials, region: &str) -> Result<Vec<aws::CopiedImage>> {
+    futures::executor::block_on(aws::copied_images(&Blocking::new(), region, creds, now_ms())).map_err(|e| format!("{region}: {e}"))
+}
+
+/// Where a copy of the image into a region would come from: the build's stamp, the region and the image there.
+/// From its maker's list, or (`from`) a region and an image named instead. Nothing is changed by asking.
+pub fn copy_source_for(region: &str, from: Option<(&str, &str)>) -> Result<(String, String, String)> {
+    match from {
+        Some((r, i)) => Ok((amz_stamp(), r.to_string(), i.to_string())),
+        None => {
+            let (stamp, published) = published_image(&Blocking::new())?;
+            let (r, i) = aws::copy_source(&published, region).ok_or("The image is published in no other region to copy it from.")?.clone();
+            Ok((stamp, r, i))
+        }
+    }
+}
+
+/// Starts copying the image jobs run on into a region, from a source `copy_source_for` gave. The copy's id.
+pub fn copy_image_into(creds: &Credentials, region: &str, (stamp, from_region, from_image): &(String, String, String)) -> Result<String> {
+    futures::executor::block_on(aws::copy_image(&Blocking::new(), region, creds, from_region, from_image, &copy_name(stamp), now_ms())).map_err(|e| format!("{region}: {e}"))
+}
+
+/// Removes the account's own copies of the image in a region, with their snapshots. How many.
+pub fn delete_copied_images(creds: &Credentials, region: &str) -> Result<usize> {
+    let http = Blocking::new();
+    let copies = futures::executor::block_on(aws::copied_images(&http, region, creds, now_ms())).map_err(|e| format!("{region}: {e}"))?;
+    for copy in &copies { futures::executor::block_on(aws::delete_copied_image(&http, region, creds, copy, now_ms())).map_err(|e| format!("{region}: {e}"))?; }
+    Ok(copies.len())
+}
+
+/// A stamp of now, as the maker's builds have them (20261006080949).
+fn amz_stamp() -> String { aws::amz_date(now_ms()).chars().filter(|c| c.is_ascii_digit()).take(14).collect() }
 
 /// The policy in an IAM GetRolePolicy answer (URL-encoded JSON in XML).
 fn policy_document(xml: &str) -> Option<serde_json::Value> {
@@ -586,6 +656,7 @@ mod look_tests {
             "Spot          refused by your AWS organization's policy p-example2 (management account 222222222222) (asked in eu-north-1)",
             "On-demand     allowed (asked in eu-north-1)",
             "At once       spot 5 vCPUs · on-demand 5 vCPUs",
+            "              5 vCPUs is one job of the default size at a time. Ask AWS for more: https://eu-north-1.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-1216C47A",
             "Runner image  not in eu-north-1: jobs cannot start there until it is copied in",
             "Organization  o-example001, managed from account 222222222222: its policies are not this account's to read or change",
         ]);
@@ -612,6 +683,23 @@ mod look_tests {
             "At once       spot 96 vCPUs · on-demand 64 vCPUs",
             "Runner image  not in ca-central-1, eu-north-1: jobs cannot start there until it is copied in",
         ]);
+    }
+
+    /// The image maker's public list as GitHub served it on 12 October 2026: the newest build of the image jobs run
+    /// on, with its id in each of the eleven regions it is published in.
+    #[test]
+    fn the_image_to_copy_is_read_from_its_makers_public_list() {
+        let github = Replay::of(include_str!("../fixtures/aws/public/image-list.jsonl"));
+        let (stamp, published) = published_image(&github).unwrap();
+        assert_eq!(stamp, "20261006080844");
+        assert_eq!(published.len(), 11);
+        assert!(published.contains(&("eu-west-1".to_string(), "ami-0b8d70b1c8eb9af4a".to_string())) && !published.iter().any(|(r, _)| r == "eu-north-1" || r == "ca-central-1"));
+        // Stockholm's copy comes from Ireland, Canada's from N. Virginia; the copy is named as the maker's are.
+        assert_eq!(aws::copy_source(&published, "eu-north-1"), Some(&("eu-west-1".to_string(), "ami-0b8d70b1c8eb9af4a".to_string())));
+        assert_eq!(aws::copy_source(&published, "ca-central-1").map(|(r, _)| r.as_str()), Some("us-east-1"));
+        assert_eq!(copy_name(&stamp), "runs-on-v2.2-ubuntu24-full-x64-20261006080844");
+        // GitHub not answering, or answering something else, is said; nothing is guessed.
+        assert!(published_image(&Replay::of("")).unwrap_err().starts_with("The list of runner images could not be read from GitHub (it answered 599)"));
     }
 
     /// What the project answered to further questions, each as AWS worded it.
@@ -650,7 +738,8 @@ mod look_tests {
 /// when the fixture was made, and this holds every fixture to it.
 #[cfg(test)]
 mod fixture_tests {
-    const FIXTURES: [(&str, &str); 3] = [
+    const FIXTURES: [(&str, &str); 4] = [
+        ("public/image-list", include_str!("../fixtures/aws/public/image-list.jsonl")),
         ("project-paid/look", include_str!("../fixtures/aws/project-paid/look.jsonl")),
         ("project-paid/more", include_str!("../fixtures/aws/project-paid/more.jsonl")),
         ("classic/look", include_str!("../fixtures/aws/classic/look.jsonl")),

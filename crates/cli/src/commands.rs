@@ -51,6 +51,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
+    ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
+        "The image AWS machines start from (GitHub's own runner image, published for AWS by RunsOn in most regions).\n\nlist      Each region the AWS account can use: whether the image is published there, or your own copy is.\ncreate    Copies the image into a region it is not published in, so that jobs can start there. Where to copy\n          from is read from its maker's public list; --from names a region and an image instead. AWS takes about\n          ten minutes. The copy is kept in your account's storage there (about $1.50 a month).\ndelete    Removes your copy from a region, with its storage."),
     ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces delete ID --confirm",
         "A workspace has its own sign-ins to its clouds, and through them its own control plane, runners and repositories.\nNothing of one is seen from another. There is one (`default`) until you make more. With several, a command says\nwhich, by its id: --workspace=ID, or SUPERCI_WORKSPACE=ID for a whole terminal. A command that names none stops\nand lists them.\n\ncreate    Makes an empty one called NAME (AcmeCI, Build Farm), which its CI is called too. Its id is made from the\n          name (acmeci, build-farm). Then `superci login --workspace=ID`.\nupdate    Gives one another id. What it is called is `superci name update`.\ndelete    Signs it out and forgets it on this machine. Nothing in its clouds is deleted: its control plane and\n          runners keep working (`superci leave --workspace=ID --confirm` stops them first)."),
     ("leave", "  superci leave --confirm           Stops using SuperCI: what it made in your clouds is deleted.",
@@ -102,7 +104,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "accounts", "labels", "name", "machine", "limits"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits"]),
                 group(&["connections", "deliveries", "projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -130,7 +132,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 10] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add"];
-const VALUES: [&str; 26] = ["workspace", "id", "enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 27] = ["workspace", "id", "from", "enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -429,6 +431,52 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut d = signed_in();
             let (account, who, look) = d.look_at_aws(args.get("account").unwrap_or_default())?;
             Ok(Done { said: aws_look_lines(&account, &who, &look), data: json!({ "cloud": "aws", "id": account, "signed_in_as": who, "kind": look.kind(), "allowed_regions": look.allowed_regions(), "organization": look.organization().map(|r| json!({ "management_account": r.management_account(), "policy": r.policy_id() })), "allows": look }) })
+        }
+        ("images", "list") => {
+            let mut d = signed_in();
+            let (account, _, look) = d.look_at_aws(args.get("account").unwrap_or_default())?;
+            let (_, creds) = d.aws_account(&account)?;
+            let mut rows = vec![];
+            for (region, there) in &look.images {
+                let copies = crate::aws::copied_images(&creds, region).unwrap_or_default();
+                let state = match (copies.first(), there) {
+                    (Some(c), _) if c.state == "available" => format!("your copy {} ({})", c.id, c.name),
+                    (Some(c), _) => format!("your copy {} is being made ({})", c.id, c.state),
+                    (None, Some(true)) => "published".to_string(),
+                    (None, Some(false)) => format!("none: `superci images create {region}` copies it in"),
+                    (None, None) => "not known".to_string(),
+                };
+                rows.push(json!({ "region": region, "published": copies.is_empty() && *there == Some(true), "copies": copies, "said": state }));
+            }
+            let said = if rows.is_empty() { vec!["This account can use none of the regions SuperCI works in.".to_string()] } else { rows.iter().map(|r| format!("{:<15} {}", r["region"].as_str().unwrap_or_default(), r["said"].as_str().unwrap_or_default())).collect() };
+            Ok(Done { said, data: json!({ "account": account, "images": rows }) })
+        }
+        ("images", "create") => {
+            let region = w(2);
+            if !superci_core::page::REGIONS.contains(&region) { return usage("Say where: `superci images create REGION` (a region the image jobs run on is not in: `superci images list`).") }
+            let from = match args.get("from").map(|f| f.split_once(':')) { None => None, Some(Some((r, i))) if superci_core::aws::aws_id(i, "ami-") => Some((r, i)), Some(_) => return usage("--from is a region and an image: --from=eu-west-1:ami-0123456789abcdef0.") };
+            let mut d = signed_in();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            // One copy is enough: a second would only be paid for.
+            if let Some(copy) = crate::aws::copied_images(&creds, region)?.first() { return Err(format!("{region} has your copy of the image already: {} ({}). `superci images delete {region} --confirm` removes it.", copy.id, copy.state).into()) }
+            // Where it would come from is read first (the maker's public list): a dry run says it too.
+            let source = crate::aws::copy_source_for(region, from)?;
+            let (from_region, from_image) = (source.1.clone(), source.2.clone());
+            if let Some(done) = dry(args, &format!("copy the image jobs run on into {region}, from {from_region} ({from_image})"), "images", &[]) { return Ok(done) }
+            let id = crate::aws::copy_image_into(&creds, region, &source)?;
+            Ok(Done { said: vec![format!("Copying the image jobs run on into {region}, from {from_region} ({from_image}): {id}."), "AWS takes about ten minutes; `superci images list` shows when it is there.".to_string(),
+                format!("It is kept in your account's storage there (about $1.50 a month). `superci images delete {region} --confirm` removes it.")], data: json!({ "ok": true, "region": region, "image": id, "from": { "region": from_region, "image": from_image } }) })
+        }
+        ("images", "delete") => {
+            let region = w(2);
+            if !superci_core::page::REGIONS.contains(&region) { return usage("Say where: `superci images delete REGION --confirm`.") }
+            let would = format!("remove your copy of the image jobs run on from {region}: no job can start there after");
+            confirmed(args, &would)?;
+            let mut d = signed_in();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            if let Some(done) = dry(args, &would, "images", &[]) { return Ok(done) }
+            let removed = crate::aws::delete_copied_images(&creds, region)?;
+            Ok(Done::said(if removed == 0 { format!("There was no copy of yours in {region}.") } else { format!("Removed your copy of the image from {region}, with its storage.") }))
         }
         ("runners", "list") => runners_of(&mut signed_in()),
         ("connections", "list") => connections(),
@@ -793,6 +841,8 @@ pub fn aws_look_lines(account: &str, who: &str, look: &crate::aws::Look) -> Vec<
     if let Some(on_demand) = &look.on_demand { out.push(format!("On-demand     {}{at}", whose(on_demand))) }
     let cpus = |n: Option<u32>| n.map(|n| format!("{n} vCPUs")).unwrap_or_else(|| "not known".into());
     if look.asked_in.is_some() { out.push(format!("At once       spot {} · on-demand {}", cpus(look.spot_cpus), cpus(look.on_demand_cpus))) }
+    // Few enough to hold jobs back (a new account's): where to ask AWS for more.
+    if let Some((cpus, link)) = look.low_limit() { out.push(format!("              {cpus} vCPUs is {} of the default size at a time. Ask AWS for more: {link}", if cpus < 8 { "one job".to_string() } else { format!("{} jobs", cpus / 4) })) }
     let without = look.regions_without_image();
     if !without.is_empty() { out.push(format!("Runner image  not in {}: jobs cannot start there until it is copied in", without.join(", "))) }
     if let Some(org) = &look.organization_id {
