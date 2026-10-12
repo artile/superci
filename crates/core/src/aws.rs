@@ -610,6 +610,12 @@ pub fn refusal(e: &str) -> Option<Refusal> {
     Some(Refusal { action: word("not authorized to perform: ").unwrap_or_default(), by, policy: word("policy: ").filter(|p| p.starts_with("arn:")).unwrap_or_default() })
 }
 
+/// What is made in an AWS account for its budget (see `plane::AwsBudget`), named by the control plane it is for: the
+/// budget, the rule that refuses starting machines, and the role AWS Budgets puts that rule on with.
+pub fn budget_name(plane_id: &str) -> String { format!("superci-{plane_id}") }
+pub fn stop_policy_name(plane_id: &str) -> String { format!("superci-stop-{plane_id}") }
+pub fn budget_role_name(plane_id: &str) -> String { format!("superci-budget-{plane_id}") }
+
 /// Service Quotas' code for "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances": the vCPUs of
 /// on-demand machines an account may run at once in a region.
 pub const ON_DEMAND_CPU_QUOTA: &str = "L-1216C47A";

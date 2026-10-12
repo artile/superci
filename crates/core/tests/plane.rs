@@ -788,6 +788,29 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(job_event("queued", 57, "acme/app", None)));
     assert_eq!(job(&store, 57)["state"], "launched", "{}", job(&store, 57));
+    // The same for a day (UTC): those three dollars were spent today. The whole CI's limit for a day stops every
+    // job until tomorrow; the AWS account's sends jobs to other accounts' providers, and with none they fail.
+    config.routing.daily_usd = Some(3.0);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 58, "acme/app", None)));
+    let e = job(&store, 58)["error"].as_str().unwrap().to_string();
+    assert!(job(&store, 58)["state"] == "failed" && e.contains("SuperCI reached its limit of $3 a day ($3.") && e.contains("no job starts until tomorrow (UTC)"), "{e}");
+    (config.routing.daily_usd, config.routing.monthly_usd) = (Some(3.5), None);
+    config.routing.account_daily_usd.insert("aws".into(), 2.5);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 59, "acme/app", None)));
+    let e = job(&store, 59)["error"].as_str().unwrap().to_string();
+    assert!(job(&store, 59)["state"] == "failed" && e.matches("the AWS account reached its $2.50 a day").count() == 1, "{e}");
+    // What was spent on an earlier day of the month counts for the month, not for today.
+    store.0.borrow_mut().insert("job:60".into(), serde_json::json!({ "job_id": 60, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_900_000_000u64, "launched_ms": 1_789_900_000_000u64, "ended_ms": 1_789_903_600_000u64,
+        "installation_id": 42, "cloud": "aws", "usd_per_hour": 50.0, "seen_in_progress": true }).to_string());
+    config.routing.account_daily_usd.insert("aws".into(), 4.0);
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(job_event("queued", 61, "acme/app", None)));
+    assert_eq!(job(&store, 61)["state"], "launched", "{}", job(&store, 61));
+    let status = json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    assert!(status["daily_limits"] == true && status["spend_today"]["aws"].as_f64().is_some_and(|t| t < 4.0) && status["spend"]["aws"].as_f64().is_some_and(|m| m > 50.0), "{}", status["spend_today"]);
 }
 
 struct MovingClock(std::cell::Cell<u64>);

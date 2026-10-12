@@ -405,6 +405,23 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         // `superci debug json REGION SERVICE TARGET '{…}'`. A SERVICE
         // with a dot in it is the whole host (budgets.amazonaws.com), a TARGET that starts with a slash is a path
         // (/listRegions), and one that ends in @1.0 is asked in that JSON version.
+        // (And the AWS account's own budget, each step by itself: `superci debug budget found|set USD EMAIL [stop]|lift|remove`.)
+        #[cfg(debug_assertions)]
+        ("debug", "budget") => {
+            let mut d = signed_in();
+            let plane_id = view(&mut d)?.plane.plane_id().to_string();
+            let (account, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            let http = crate::aws::Blocking::new();
+            let b = crate::aws_budget::Budgets { http: &http, creds: &creds, account: &account, plane_id: &plane_id, pause: &|ms| std::thread::sleep(std::time::Duration::from_millis(ms)) };
+            let said = match w(2) {
+                "set" => b.set(w(3).parse().map_err(|_| "set USD EMAIL [stop]")?, Some(w(4)).filter(|e| !e.is_empty()), w(5) == "stop").map(|_| "set".to_string()),
+                "lift" => b.lift(w(3) == "again").map(|_| "lifted".to_string()),
+                "remove" => b.remove().map(|_| "removed".to_string()),
+                _ => b.found().map(|f| format!("{f:?}")),
+            };
+            let said = match said { Ok(s) => s, Err(e) => format!("refused or failed: {e}") };
+            Ok(Done { data: json!({ "answer": said }), said: vec![said] })
+        }
         #[cfg(debug_assertions)]
         ("debug", kind @ ("ec2" | "json" | "iam")) => {
             let mut d = signed_in();

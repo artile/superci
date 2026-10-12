@@ -601,10 +601,15 @@ pub mod replay {
     use super::*;
 
     #[derive(Clone)]
-    pub struct Replay(std::sync::Arc<Vec<serde_json::Value>>);
+    pub struct Replay(std::sync::Arc<Vec<serde_json::Value>>, Option<std::sync::Arc<std::sync::Mutex<Vec<bool>>>>);
 
     impl Replay {
-        pub fn of(recording: &str) -> Replay { Replay(std::sync::Arc::new(recording.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).expect("a recording is a JSON object a line")).collect())) }
+        /// The same, each recorded answer given once and in the order it was recorded: for a series of steps that
+        /// ask the same thing before and after a change.
+        pub fn in_order(recording: &str) -> Replay { let r = Replay::of(recording); let used = vec![false; r.0.len()]; Replay(r.0, Some(std::sync::Arc::new(std::sync::Mutex::new(used)))) }
+        /// How many recorded answers were not asked for (in order: all of them should be).
+        pub fn left(&self) -> usize { self.1.as_ref().map(|u| u.lock().unwrap().iter().filter(|u| !**u).count()).unwrap_or(0) }
+        pub fn of(recording: &str) -> Replay { Replay(std::sync::Arc::new(recording.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).expect("a recording is a JSON object a line")).collect()), None) }
     }
 
     #[async_trait::async_trait(?Send)]
@@ -612,7 +617,10 @@ pub mod replay {
         async fn send(&self, r: Request) -> io::Result<Response> {
             let target = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-amz-target")).map(|(_, v)| v.as_str()).unwrap_or_default();
             let asked = String::from_utf8_lossy(&r.body);
-            let found = self.0.iter().find(|x| x["method"] == r.method.as_str() && x["url"] == r.url.as_str() && x["target"] == target && x["asked"] == asked.as_ref());
+            let mut used = self.1.as_ref().map(|u| u.lock().unwrap());
+            let at = self.0.iter().enumerate().position(|(i, x)| used.as_ref().is_none_or(|u| !u[i]) && x["method"] == r.method.as_str() && x["url"] == r.url.as_str() && x["target"] == target && x["asked"] == asked.as_ref());
+            if let (Some(u), Some(i)) = (used.as_mut(), at) { u[i] = true }
+            let found = at.map(|i| &self.0[i]);
             Ok(match found {
                 Some(x) => Response { status: x["status"].as_u64().unwrap_or(0) as u16, headers: vec![], body: x["answer"].as_str().unwrap_or_default().as_bytes().to_vec() },
                 None => Response { status: 599, headers: vec![], body: format!("<Response><Errors><Error><Code>NotRecorded</Code><Message>{} {} {target} {asked}</Message></Error></Errors></Response>", r.method, r.url).into_bytes() },
@@ -763,7 +771,8 @@ mod look_tests {
 /// when the fixture was made, and this holds every fixture to it.
 #[cfg(test)]
 mod fixture_tests {
-    const FIXTURES: [(&str, &str); 5] = [
+    const FIXTURES: [(&str, &str); 6] = [
+        ("budget", crate::aws_budget::tests::RECORDED),
         ("project-activated/look", include_str!("../fixtures/aws/project-activated/look.jsonl")),
         ("public/image-list", include_str!("../fixtures/aws/public/image-list.jsonl")),
         ("project-paid/look", include_str!("../fixtures/aws/project-paid/look.jsonl")),
@@ -801,7 +810,10 @@ mod fixture_tests {
             for sealed in text.split("Encoded authorization failure message: ").skip(1) { assert!(sealed.starts_with("(removed)"), "{name}: a sealed message was kept") }
             for (_, uuid) in runs(text, 36, |b| b.is_ascii_hexdigit() || b == b'-').into_iter().filter(|(_, u)| u.len() == 36 && u.as_bytes()[8] == b'-') { assert!(uuid.starts_with("00000000-0000-4000-8000-"), "{name}: {uuid}") }
             // No long opaque token is left (a key, a sealed message under another name).
-            for (_, token) in runs(text, 80, |b| b.is_ascii_alphanumeric() || b"+/_=-".contains(&b)) { assert!(token.contains("ami-amazon-linux") || token.contains("AccountFullAccessRole"), "{name}: {}…", &token[..30]) }
+            for (_, token) in runs(text, 80, |b| b.is_ascii_alphanumeric() || b"+/_=-".contains(&b)) {
+                // (Words of a form's text, joined by its pluses, are no token.)
+                assert!(token.contains("ami-amazon-linux") || token.contains("AccountFullAccessRole") || token.matches('+').count() >= 5, "{name}: {}…", &token[..30])
+            }
         }
     }
 }

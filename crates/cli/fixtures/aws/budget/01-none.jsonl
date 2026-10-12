@@ -1,0 +1,1 @@
+{"answer":"{\"__type\":\"NotFoundException\",\"Message\":\"Unable to get budget: superci-abcdefghijkl - the budget doesn't exist.\"}","asked":"{\"AccountId\":\"111111111111\",\"BudgetName\":\"superci-abcdefghijkl\"}","method":"POST","status":400,"target":"AWSBudgetServiceGateway.DescribeBudget","url":"https://budgets.amazonaws.com/"}

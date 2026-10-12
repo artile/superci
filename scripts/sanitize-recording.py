@@ -24,10 +24,14 @@ def stand_ins():
 
 def sanitize(text, of):
     text = re.sub(r"(?<![0-9.])\d{12}(?![0-9])", lambda m: m.group(0) if m.group(0) in KEEP_ACCOUNTS else of("account", m.group(0), lambda n: str(n) * 12), text)
+    # (The same inside URL-encoded text, where a quote or a colon before it is written with digits: %22, %3A.)
+    text = re.sub(r"(?<=%22|%3A|%2F)\d{12}(?![0-9])", lambda m: m.group(0) if m.group(0) in KEEP_ACCOUNTS or len(set(m.group(0))) == 1 else of("account", m.group(0), lambda n: str(n) * 12), text)
     text = re.sub(r"\bo-[a-z0-9]{10,32}\b", lambda m: of("org", m.group(0), lambda n: f"o-example{n:03d}"), text)
     text = re.sub(r"\bp-[a-z0-9]{8}\b", lambda m: of("policy", m.group(0), lambda n: f"p-example{n}"), text)
     text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", lambda m: of("uuid", m.group(0), lambda n: f"00000000-0000-4000-8000-{n:012d}"), text)
     text = re.sub(r"\b((?:vpc-cidr-assoc|vpc|subnet|sg|rtb|igw|acl|dopt|eni|eipalloc|i|vol|snap|lt)-)([0-9a-f]{8,17})\b", lambda m: m.group(1) + of(m.group(1), m.group(2), lambda n: f"{n:017x}"), text)
+    # (IAM's own ids of a role, a policy, a user or a key.)
+    text = re.sub(r"\b(AROA|ANPA|AIDA|AGPA|AKIA|ASIA)[A-Z0-9]{12,}\b", lambda m: m.group(1) + of("iam-" + m.group(1), m.group(0), lambda n: f"EXAMPLE{n:09d}"), text)
     text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "someone@example.com", text)
     # (AWS's sealed account of a refusal: only the account itself can open it, and it is the account's.)
     text = re.sub(r"(Encoded authorization failure message: )[A-Za-z0-9_+/=-]+", r"\1(removed)", text)

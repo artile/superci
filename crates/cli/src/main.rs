@@ -8,6 +8,7 @@
 //! this binary.
 mod agents;
 mod aws;
+mod aws_budget;
 mod aws_plane;
 mod cloudflare;
 mod commands;

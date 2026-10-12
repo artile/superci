@@ -446,7 +446,34 @@ pub struct Routing {
     /// AWS's spot and on-demand machines). At it, jobs go to the providers of other accounts in the order.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub account_usd: std::collections::BTreeMap<String, f64>,
+    /// The same two for a day (UTC): a runaway day stops that day, not at the month's limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub account_daily_usd: std::collections::BTreeMap<String, f64>,
+    /// A budget in the AWS account itself for its monthly limit, made by the dashboard with its owner's sign-in (the
+    /// control plane has no part in it and no permission for it): AWS emails at 80% and at 100% of the account's
+    /// real bill. Kept here so the pages say it without asking AWS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aws_budget: Option<AwsBudget>,
 }
+
+/// What the AWS account's own budget does beside its emails.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct AwsBudget {
+    /// At 100% AWS puts a rule on this control plane's role that refuses starting machines (see
+    /// `aws::stop_policy_name`), and takes it off when the next month begins.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub stop: bool,
+}
+
+/// What a job is told when AWS's budget has put its rule on this control plane's role.
+pub const BUDGET_STOPPED: &str = "AWS's budget for this account reached its limit and stopped new machines there";
+
+/// Where the control plane notes when AWS last refused a machine by the budget's rule (the dashboard says so).
+const BUDGET_STOPPED_KEY: &str = "aws:budget-stopped";
+
+/// The day (UTC) a moment is in, as the moment it began.
+pub fn day_start_ms(now_ms: u64) -> u64 { now_ms - now_ms % 86_400_000 }
 
 /// The cloud account a place in the order spends in: AWS's on-demand machines are the same account's as its spot ones.
 pub fn account_of(cloud: &str) -> &str { if cloud == AWS_ON_DEMAND { "aws" } else { cloud } }
@@ -965,6 +992,10 @@ impl<'a> ControlPlane<'a> {
             "spend": self.month_spend(&jobs_all).await,
             // (It keeps the CI's and a cloud account's limit for the month: one from before would drop them unsaid.)
             "account_limits": true,
+            // (And for a day; and what the AWS account's own budget does.)
+            "daily_limits": true,
+            "spend_today": self.day_spend(&jobs_all),
+            "aws_budget_stopped_ms": self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()),
             // Machines up now in each cloud, over every job (`jobs` is the newest fifty).
             "active": jobs_all.iter().filter(|j| active(j) && !j.cloud.is_empty()).fold(HashMap::<String, u32>::new(), |mut m, j| { *m.entry(place_of(j).to_string()).or_default() += 1; m }),
             // What the clouds and code hosts allow it (see permissions.rs): what the App asks for (each installation's
@@ -1026,6 +1057,23 @@ impl<'a> ControlPlane<'a> {
     async fn month_spend(&self, jobs: &[Job]) -> HashMap<String, f64> {
         let now = self.clock.now_ms();
         let since = month_start_ms(now);
+        let mut spend = HashMap::new();
+        for j in jobs.iter().filter(|j| j.at_ms >= since) { *spend.entry(place_of(j).to_string()).or_insert(0.0) += job_usd(j, now) }
+        spend
+    }
+
+    /// Whether AWS refused a machine by the rule its budget puts on this control plane's role: the refusal names
+    /// that rule, or (AWS does not always name the policy) it is an explicit deny of the role's own policies while
+    /// such a budget is on.
+    fn stopped_by_budget(&self, e: &str) -> bool {
+        e.contains(&aws::stop_policy_name(&self.config.plane_id))
+            || (self.config.routing.aws_budget.as_ref().is_some_and(|b| b.stop) && e.contains("explicit deny") && aws::refusal(e).is_some_and(|r| r.by == aws::By::Identity))
+    }
+
+    /// Spend today (UTC) per place in the order, as `month_spend` counts a month.
+    fn day_spend(&self, jobs: &[Job]) -> HashMap<String, f64> {
+        let now = self.clock.now_ms();
+        let since = day_start_ms(now);
         let mut spend = HashMap::new();
         for j in jobs.iter().filter(|j| j.at_ms >= since) { *spend.entry(place_of(j).to_string()).or_insert(0.0) += job_usd(j, now) }
         spend
@@ -1429,6 +1477,12 @@ impl<'a> ControlPlane<'a> {
             let spent: f64 = spend.values().sum();
             if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of {} a month (${spent:.2} spent on machines): no job starts until next month, or until the limit is raised (Runners in the dashboard, or `superci limits update --monthly-usd=N`)", self.config.name(), dollars(cap)))) }
         }
+        // And for the day.
+        let today = self.day_spend(&jobs);
+        if let Some(cap) = routing.daily_usd {
+            let spent: f64 = today.values().sum();
+            if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of {} a day (${spent:.2} spent on machines today): no job starts until tomorrow (UTC), or until the limit is raised (Runners in the dashboard, or `superci limits update --daily-usd=N`)", self.config.name(), dollars(cap)))) }
+        }
         let (mut later, mut never, mut places) = (vec![], vec![], vec![]);
         for cloud in &candidates {
             let name = cloud_name(cloud);
@@ -1444,6 +1498,13 @@ impl<'a> ControlPlane<'a> {
             if let Some(cap) = routing.account_usd.get(account_of(cloud)) {
                 if account_spend(&spend, account_of(cloud)) >= *cap {
                     let said = format!("the {} account reached its {} a month", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap));
+                    if !never.contains(&said) { never.push(said) }
+                    continue
+                }
+            }
+            if let Some(cap) = routing.account_daily_usd.get(account_of(cloud)) {
+                if account_spend(&today, account_of(cloud)) >= *cap {
+                    let said = format!("the {} account reached its {} a day", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap));
                     if !never.contains(&said) { never.push(said) }
                     continue
                 }
@@ -1723,6 +1784,13 @@ impl<'a> ControlPlane<'a> {
                                 last = said(machine.as_ref().err().map(String::as_str).unwrap_or_default());
                                 break
                             }
+                            // AWS's budget for the account reached its limit and put its rule on this control plane's
+                            // role (a budget its owner asked for: see `Routing::aws_budget`). No permission is
+                            // missing and no other region or kind of machine would start: the job says what it is.
+                            if machine.as_ref().is_err_and(|e| self.stopped_by_budget(e)) {
+                                let _ = self.store.put(BUDGET_STOPPED_KEY, now.to_string()).await;
+                                return Err(format!("{BUDGET_STOPPED}: raise the account's limit on Runners in the {} dashboard (that lifts it), or wait for next month", self.config.name()))
+                            }
                             self.note_permission("aws", "LaunchOnlyTaggedMachines", &machine).await;
                             match machine {
                                 Ok(m) => { launched = Some((region.clone(), m, network.is_some_and(|n| n.private))); break }
@@ -1920,7 +1988,7 @@ impl<'a> ControlPlane<'a> {
         let called = self.config.name();
         let line = if mac { format!("::error title={called} could not run this job::{called} runs no macOS jobs yet. Use runs-on: macos-latest for GitHub's own.") }
             // A limit for the month: what to do is raising it or waiting (the whole CI's says so itself).
-            else if why.contains(" reached its ") { format!("::error title={called} could not run this job::{}.{}", why.replace(['\r', '\n'], " ").trim_end_matches('.'), if why.contains("until the limit is raised") { String::new() } else { format!(" Raise that limit on Runners in the {called} dashboard, or wait for next month.") }) }
+            else if why.contains(" reached its ") { format!("::error title={called} could not run this job::{}.{}", why.replace(['\r', '\n'], " ").trim_end_matches('.'), if why.contains("until the limit is raised") { String::new() } else { format!(" Raise that limit on Runners in the {called} dashboard, or wait for {}.", if why.contains(" a day") { "tomorrow" } else { "next month" }) }) }
             else { format!("::error title={called} could not run this job::{}. Change its runs-on, or add a place that can run it in the {called} dashboard.", why.replace(['\r', '\n'], " ").trim_end_matches('.')) };
         let work = Work::Fail { jit, why: crate::crypto::b64(line.as_bytes()) };
         let size = Size { cpu: 1, ram_gb: 4, disk_gb: 8, gpu: None };
