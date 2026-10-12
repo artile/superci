@@ -2847,25 +2847,15 @@ mark();load()})();</script>"#;
         format!(r#"{bar}<div class="cards">{default_card}{usage}</div>{picker}{prompt}"#)
     }
 
-    /// Every control plane known here, each with what it is called, where it lives, what it serves and whether its
-    /// own account is signed in to, and one button to its pages. Above them, adding an organization: on one of them,
-    /// or on a new control plane.
+    /// Every control plane known here, each with what it is called, the organizations it serves, where it lives and
+    /// whether its own account is signed in to, and one button to its pages. Above them, setting up a new one.
     fn all_page(&self, views: &[PlaneView]) -> String {
         let own = self.own();
         let signed_in = |v: &PlaneView| own.check(&v.plane).is_ok() && match v.plane { Plane::Cloudflare { .. } => self.cf.is_some(), Plane::Aws { account_id: ref a, .. } => self.aws.iter().chain(&self.aws_others).any(|s| &s.account_id == a), Plane::Modal { .. } => self.modal.is_some(), Plane::Seen { .. } => false };
         // AWS: signed in to its account, whichever account is in hand.
         let signed_in = |v: &PlaneView| match &v.plane { Plane::Aws { account_id, .. } => self.aws.iter().chain(&self.aws_others).any(|s| &s.account_id == account_id), _ => signed_in(v) };
-        let serves = |v: &PlaneView| -> String {
-            let st = v.status.clone().unwrap_or_default();
-            let mut what: Vec<String> = status_apps(&st).iter().filter_map(|a| a["owner"].as_str().map(|o| format!("GitHub: {o}"))).collect();
-            what.extend(v.gitlabs().into_iter().map(|(_, url, _)| format!("GitLab: {}", url.trim_start_matches("https://"))));
-            if what.is_empty() && v.github { what.push("GitHub".into()) }
-            if what.is_empty() && v.gitlab { what.push("GitLab".into()) }
-            what.join(", ")
-        };
         let open = |v: &PlaneView, label: &str| format!(r#"<a class="button secondary sm" href="/?c={}">{label}</a>"#, esc(v.plane.plane_id()));
         let mut rows = String::new();
-        let mut places = String::new();
         for v in views.iter().filter(|v| !matches!(v.plane, Plane::Seen { .. })) {
             let place = esc(&v.plane.place());
             let (title, sub, end) = if !v.online {
@@ -2874,20 +2864,14 @@ mark();load()})();</script>"#;
                 (place.clone(), format!("Moved to {}", esc(to.trim_start_matches("https://"))), open(v, "Open"))
             } else if v.serves_its_own() {
                 let state = if signed_in(v) { pill("good", "Signed in") } else { format!("{}{}", pill("open", "Not signed in"), signin_button(v.plane.cloud(), "Sign in", false)) };
-                (esc(&v.name()), format!("{place} · {}", esc(&serves(v))), format!("{state}{}", open(v, "Open")))
+                (esc(&v.name()), format!("{} · {place}", esc(&serves(v))), format!("{state}{}", open(v, "Open")))
             } else {
-                (place.clone(), "Serves nothing yet: a place to move to, or to connect a code host".to_string(), open(v, "Open"))
+                ("A new control plane".to_string(), format!("Serves nothing yet · {place}"), open(v, "Open"))
             };
             rows.push_str(&format!(r#"<div class="pick act">{}<span><strong>{title}</strong><small>{sub}</small></span><span class="pick-end">{end}</span></div>"#, logo(v.plane.cloud(), 36)));
-            if v.online && v.moved_to.is_none() {
-                let on = if v.serves_its_own() { format!("On {}", esc(&v.name())) } else { "On the one that serves nothing yet".to_string() };
-                places.push_str(&format!(r#"<a class="pick act" href="/?p=repos&c={}">{}<span><strong>{on}</strong><small>{place}{}</small></span><span class="pick-end">›</span></a>"#,
-                    esc(v.plane.plane_id()), logo(v.plane.cloud(), 36), if serves(v).is_empty() { String::new() } else { format!(" · beside {}", esc(&serves(v))) }));
-            }
         }
-        // Adding an organization: where its jobs should run. Each choice leads to the page that does it.
-        let dialog = format!(r#"<dialog class="dlg" id="add-org" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_ORG}</span><span><strong>Add an organization</strong><small>Where should its jobs run?</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div class="picks">{places}<a class="pick act" href="/?p=plane&c="><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_PLUS}</span><span><strong>On a new control plane</strong><small>In another cloud account: sign in there, set it up, connect the organization</small></span><span class="pick-end">›</span></a></div></div></dialog>"#);
-        format!(r#"<div class="bar"><h1 class="page-title">Control planes</h1><button type="button" class="button primary sm" onclick="document.getElementById('add-org').showModal()">Add an organization</button></div><div class="cards"><section class="card"><div class="picks">{rows}</div></section></div>{dialog}"#)
+        // One sentence says what the two words mean; organizations are added on a control plane's own Repositories page.
+        format!(r#"<div class="bar"><h1 class="page-title">Control planes</h1><a class="button primary sm" href="/?p=plane&c=">New control plane</a></div><p class="note" style="margin:-4px 0 18px">A control plane is one CI: its own cloud account, name, runners and limits. Each runs the jobs of one or more organizations; add an organization on its Repositories page.</p><div class="cards"><section class="card"><div class="picks">{rows}</div></section></div>"#)
     }
 
     /// Settings: what the control plane is called and answers to, its limits, and SuperCI's sign-ins on this computer.
@@ -3445,14 +3429,30 @@ fn where_choices(name: &str, public: (&str, &str), own: (&str, &str), field: &st
 <div class="perm-field" data-own hidden>{field}</div>"#, public.0, public.1, own.0, own.1)
 }
 
-/// The rows of the switcher under the name in the sidebar: each control plane known here (the one a page shows
-/// marked), the list of them, and adding an organization.
+/// The organizations (and GitLabs) whose jobs a control plane runs, in words: "GitHub: acme, GitLab: gitlab.com".
+fn serves(v: &PlaneView) -> String {
+    let st = v.status.clone().unwrap_or_default();
+    let mut what: Vec<String> = status_apps(&st).iter().filter_map(|a| a["owner"].as_str().map(|o| format!("GitHub: {o}"))).collect();
+    what.extend(v.gitlabs().into_iter().map(|(_, url, _)| format!("GitLab: {}", url.trim_start_matches("https://"))));
+    if what.is_empty() && v.github { what.push("GitHub".into()) }
+    if what.is_empty() && v.gitlab { what.push("GitLab".into()) }
+    what.join(", ")
+}
+
+/// The switcher under the name in the sidebar. Two things, kept apart in words: a control plane (one CI: its name,
+/// its cloud account, its runners and limits) and the organizations whose jobs it runs. Its rows are the control
+/// planes known here, each by its name with what it serves; under them, adding an organization to the one shown,
+/// setting up a new control plane, and (with several) the list of them.
 fn switcher(views: &[PlaneView], current: Option<&PlaneView>) -> String {
-    let rows = views.iter().filter(|v| !matches!(v.plane, Plane::Seen { .. }) && v.moved_to.is_none()).map(|v| {
-        let name = if v.serves_its_own() || views.len() == 1 { v.name() } else { "Serves nothing yet".to_string() };
-        format!(r#"<a href="/?c={}" aria-current="{}"><span>{}</span><small>{}</small></a>"#, esc(v.plane.plane_id()), current.is_some_and(|c| c.plane.plane_id() == v.plane.plane_id()), esc(&name), esc(&v.plane.place()))
+    let known: Vec<&PlaneView> = views.iter().filter(|v| !matches!(v.plane, Plane::Seen { .. }) && v.moved_to.is_none()).collect();
+    let rows = known.iter().map(|v| {
+        let (name, what) = if v.serves_its_own() || known.len() == 1 { (v.name(), serves(v)) } else { ("A new control plane".to_string(), "Serves nothing yet".to_string()) };
+        let sub = [what, v.plane.place()].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" · ");
+        format!(r#"<a href="/?c={}" aria-current="{}"><span>{}</span><small>{}</small></a>"#, esc(v.plane.plane_id()), current.is_some_and(|c| c.plane.plane_id() == v.plane.plane_id()), esc(&name), esc(&sub))
     }).collect::<String>();
-    format!(r#"<div data-switch hidden>{rows}<hr><a href="/?p=all&c="><span>All control planes</span></a><a href="/?p=all&c=&open=add-org"><span>Add an organization…</span></a></div>"#)
+    let add = current.filter(|c| !matches!(c.plane, Plane::Seen { .. })).map(|c| format!(r#"<a href="/?p=repos&c={}&open=gh-add"><span>Add an organization to {}…</span></a>"#, esc(c.plane.plane_id()), esc(&c.name()))).unwrap_or_default();
+    let all = if known.len() > 1 { r#"<a href="/?p=all&c="><span>All control planes</span></a>"# } else { "" };
+    format!(r#"<div data-switch hidden>{rows}<hr>{add}<a href="/?p=plane&c="><span>New control plane…</span></a>{all}</div>"#)
 }
 
 /// What to send an owner of an organization one does not own: GitHub shows the page that creates the organization's
@@ -4114,8 +4114,6 @@ fn called_card(v: &PlaneView) -> String {
     format!(r#"<section class="card dm-card">{name_row}{label_row}{label_dialog}{name_dialog}</section>"#)
 }
 
-const ICON_ORG: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V7l7-3v16M11 10l9 3v7M2.5 20h19M7.5 9v.01M7.5 12.5v.01M7.5 16v.01M15.5 15v.01M15.5 17.5v.01"/></svg>"#;
-const ICON_PLUS: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>"#;
 const ICON_SETTINGS: &str = r#"<svg viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg>"#;
 const ICON_SIGNOUT: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h9"/></svg>"#;
 const ICON_NAME: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7V5.5h14V7M12 5.5v13M9.5 18.5h5"/></svg>"#;
@@ -4805,13 +4803,14 @@ mod tests {
         let mut theirs = other.clone();
         (theirs.github, theirs.installed) = (true, true);
         // Two that are live and a page that names neither: the list of them, each with one button to its pages, and
-        // adding an organization on either or on a new one. Nothing picks one of them.
+        // setting up a new one. Nothing picks one of them.
         let list = d.render("planes", &[view.clone(), theirs.clone()], None);
         preview("all", &list);
         assert!(list.contains(r#"<h1 class="page-title">Control planes</h1>"#) && list.contains(&format!(r#"href="/?c={}">Open</a>"#, view.plane.plane_id())) && list.contains(r#"href="/?c=xyz000000001">Open</a>"#), "{}", &list[..400.min(list.len())]);
-        assert!(list.contains("Add an organization</button>") && list.contains(r#"href="/?p=repos&c=xyz000000001""#) && list.contains("On a new control plane") && list.contains(r#"href="/?p=plane&c=""#) && list.contains("data-list"));
-        // The switcher under the name in the sidebar comes with every page: each control plane, the list, adding one.
-        assert!(list.contains(r#"<div data-switch hidden><a href="/?c="#) && list.contains(r#"<a href="/?c=xyz000000001" aria-current="false">"#) && list.contains(r#"<a href="/?p=all&c="><span>All control planes</span></a><a href="/?p=all&c=&open=add-org"><span>Add an organization…</span></a>"#));
+        assert!(list.contains(r#"<a class="button primary sm" href="/?p=plane&c=">New control plane</a>"#) && list.contains("A control plane is one CI") && list.contains("data-list") && !list.contains("Add an organization"));
+        // The switcher under the name in the sidebar comes with every page: the control planes, a new one, the list.
+        // The two words are kept apart: its rows are control planes; an organization is added to the one shown.
+        assert!(list.contains(r#"<div data-switch hidden><a href="/?c="#) && list.contains(r#"<a href="/?c=xyz000000001" aria-current="false">"#) && list.contains(r#"<hr><a href="/?p=plane&c="><span>New control plane…</span></a><a href="/?p=all&c="><span>All control planes</span></a>"#));
         assert!(!list.contains("Move here") && !list.contains(r#"action="/plane/"#) && d.render("jobs", &[view.clone(), theirs.clone()], None).contains("Control planes</h1>"), "every page is the list until one is named");
         // A page that names one shows that one, and offers nothing of the other.
         view::name(Some(view.plane.plane_id()));
@@ -4819,6 +4818,9 @@ mod tests {
         preview("planes-two-teams", &beside);
         assert!(beside.contains("pick act current") && beside.contains("Serves a code host of its own") && !beside.contains("Move here</button>") && !beside.contains(r#"action="/plane/delete""#), "nothing of another team's is offered");
         assert!(beside.contains(&format!(r#"<a href="/?c={}" aria-current="true">"#, view.plane.plane_id())), "the one shown is marked in the switcher");
+        assert!(beside.contains(&format!(r#"<a href="/?p=repos&c={}&open=gh-add"><span>Add an organization to SuperCI…</span></a>"#, view.plane.plane_id())));
+        // With one control plane the switcher has no list to offer.
+        assert!(!d.render("jobs", &[view.clone()], None).contains("All control planes"));
         view::name(Some("xyz000000001"));
         assert_eq!(view::in_use(&[view.clone(), theirs.clone()]), 1, "the one named, not the first that answers");
         view::name(None);
