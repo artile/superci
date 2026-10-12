@@ -1359,7 +1359,7 @@ impl Dashboard {
         let for_task = self.task.is_some();
         let name = self.workspace();
         let hub = Arc::new(Hub { root: self.store.as_ref().and_then(|s| s.root()).or_else(crate::store::root), key: self.key.clone(), base: self.base.clone(),
-            first: Mutex::new((!several).then(|| name.clone())), boards: Mutex::new(HashMap::new()) });
+            first: Mutex::new((!several).then(|| name.clone())), boards: Mutex::new(HashMap::new()), opened: Mutex::new(None) });
         let shared = Arc::new(Mutex::new(self));
         if !several { lock(&hub.boards).insert(name, shared.clone()); }
         if for_task {
@@ -4773,6 +4773,8 @@ struct Hub {
     /// with several and none named, and such a page is the list of them.
     first: Mutex<Option<String>>,
     boards: Mutex<HashMap<String, Arc<Mutex<Dashboard>>>>,
+    /// The workspace whose page was opened last (noted in SuperCI's folder when it changes, see `store::last_opened`).
+    opened: Mutex<Option<String>>,
 }
 
 impl Hub {
@@ -4995,6 +4997,15 @@ fn respond(hub: &Hub, req: &Req) -> Response {
         else { message(409, heading, text) }
     };
     let several = hub.names().len() > 1;
+    // Started with several workspaces and none named, a page that names none opens on the one shown last (else the
+    // first): the switcher at the top leads to the others. Only pages: a change still says which workspace it is for.
+    if named.is_none() && page && q("fragment") != "1" && hub.first().is_none() {
+        let to = hub.root.as_ref().and_then(|r| crate::store::last_opened(r)).or_else(|| hub.names().into_iter().next());
+        if let Some(to) = to {
+            let rest: String = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(req.query.iter().map(|(k, v)| (k.as_str(), v.as_str()))).finish();
+            return Response::redirect(&format!("/?{}{}w={to}", rest, if rest.is_empty() { "" } else { "&" }))
+        }
+    }
     let name = match named {
         Some(w) if hub.has(&w) => w,
         Some(_) => return gone("That workspace is not kept on this computer", "Open one from the list of workspaces. Nothing has changed."),
@@ -5009,6 +5020,11 @@ fn respond(hub: &Hub, req: &Req) -> Response {
             _ => return gone("Which workspace?", "Several workspaces are kept on this computer, and this page does not say which it is for. Open it again from the dashboard. Nothing has changed."),
         },
     };
+    // A workspace's page is opened: noted, for where the dashboard opens next time.
+    if page && q("fragment") != "1" && several {
+        let mut opened = lock(&hub.opened);
+        if opened.as_deref() != Some(name.as_str()) { if let Some(root) = &hub.root { crate::store::note_opened(root, &name) } *opened = Some(name.clone()); }
+    }
     let shared = hub.board(&name);
     HERE.with(|h| h.borrow_mut().clone_from(&name));
     // (A page's frame says what the workspace is called before its control plane was asked.)
@@ -5327,7 +5343,7 @@ mod tests {
     fn hub_of(d: Dashboard, key: &str) -> Hub {
         let mut d = d;
         d.key = key.to_string();
-        Hub { root: None, key: key.to_string(), base: d.base.clone(), first: Mutex::new(Some("default".into())), boards: Mutex::new(HashMap::from([("default".to_string(), Arc::new(Mutex::new(d)))])) }
+        Hub { root: None, key: key.to_string(), base: d.base.clone(), first: Mutex::new(Some("default".into())), boards: Mutex::new(HashMap::from([("default".to_string(), Arc::new(Mutex::new(d)))])), opened: Mutex::new(None) }
     }
 
     /// Two companies on one computer: each workspace has its own sign-ins and its own pages, a page's address says
@@ -5340,7 +5356,7 @@ mod tests {
         Store::under(&root, "acme").set_about(&crate::store::About { name: "AcmeCI".into(), hosts: vec![("github".into(), "acme-inc".into())], picture: "data:image/png;base64,iVBORw0KGgo=".into(), picture_of: "acme-inc".into() }).unwrap();
         Store::under(&root, "globex").make().unwrap();
         let key = "k".repeat(32);
-        let hub = Hub { root: Some(root.clone()), key: key.clone(), base: "http://localhost:8976".into(), first: Mutex::new(Some("acme".into())), boards: Mutex::new(HashMap::new()) };
+        let hub = Hub { root: Some(root.clone()), key: key.clone(), base: "http://localhost:8976".into(), first: Mutex::new(Some("acme".into())), boards: Mutex::new(HashMap::new()), opened: Mutex::new(None) };
         let ask = |method: &str, path: &str, query: &[(&str, &str)], body: &str| {
             let r = respond(&hub, &Req { method: method.into(), path: path.into(), query: query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), cookie: Some(key.clone()), last: None, body: body.as_bytes().to_vec(),
                 host: "localhost:8976".into(), origin: None, fetch_site: Some("same-origin".into()) });
@@ -5417,11 +5433,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Started with several workspaces and none named, the dashboard opens on the one it showed last (the first until
+    /// then), and a change that names no workspace is still refused.
+    #[test]
+    fn the_dashboard_opens_on_the_workspace_shown_last() {
+        let root = std::env::temp_dir().join(format!("superci-hub-last-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        for name in ["acme", "globex"] { Store::under(&root, name).make().unwrap() }
+        let key = "k".repeat(32);
+        let hub = Hub { root: Some(root.clone()), key: key.clone(), base: "http://localhost:8976".into(), first: Mutex::new(None), boards: Mutex::new(HashMap::new()), opened: Mutex::new(None) };
+        let ask = |method: &str, path: &str, query: &[(&str, &str)]| {
+            let r = respond(&hub, &Req { method: method.into(), path: path.into(), query: query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), cookie: Some(key.clone()), last: None, body: vec![], host: "localhost:8976".into(), origin: None, fetch_site: Some("same-origin".into()) });
+            (r.status, r.headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.clone()).unwrap_or_default())
+        };
+        // Nothing shown yet: the first. The page asked for goes along.
+        assert_eq!(ask("GET", "/", &[]).1, "/?w=acme");
+        assert_eq!(ask("GET", "/", &[("p", "jobs")]).1, "/?p=jobs&w=acme");
+        // Globex's page is opened: from then on a page that names none opens there, also after a restart (the note is in the folder).
+        assert_eq!(ask("GET", "/", &[("w", "globex")]).0, 200);
+        assert_eq!(ask("GET", "/", &[]).1, "/?w=globex");
+        assert_eq!(crate::store::last_opened(&root).as_deref(), Some("globex"));
+        // A change that names no workspace is refused as before: the note opens pages, it picks nothing to act on.
+        assert_eq!(ask("POST", "/routing", &[]).0, 409);
+        // The one shown last is gone: the first again.
+        Store::under(&root, "globex").forget().unwrap();
+        Store::under(&root, "initech").make().unwrap();
+        assert_eq!(crate::store::last_opened(&root), None);
+        assert_eq!(ask("GET", "/", &[]).1, "/?w=acme");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The first workspace has no folder until it keeps something: making a second gives it one, so both are listed.
     #[test]
     fn the_first_workspace_stays_listed_when_a_second_is_made() {
         let root = std::env::temp_dir().join(format!("superci-hub-first-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
-        let hub = Hub { root: Some(root.clone()), key: "k".repeat(32), base: "http://localhost:8976".into(), first: Mutex::new(Some("default".into())), boards: Mutex::new(HashMap::new()) };
+        let hub = Hub { root: Some(root.clone()), key: "k".repeat(32), base: "http://localhost:8976".into(), first: Mutex::new(Some("default".into())), boards: Mutex::new(HashMap::new()), opened: Mutex::new(None) };
         assert_eq!(hub.names(), ["default"]);
         assert_eq!(hub.create("Acme").unwrap(), "acme");
         assert_eq!(crate::store::workspaces_in(&root), ["acme", "default"]);

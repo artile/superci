@@ -147,6 +147,19 @@ pub fn which(root: &std::path::Path, named: Option<&str>) -> std::result::Result
     }
 }
 
+/// The workspace the dashboard showed last (a note in SuperCI's folder), if it is still kept: where the dashboard
+/// opens when it is started with several and none named. It only says which pages open first: no command reads it,
+/// and nothing is ever done in a workspace because of it.
+pub fn last_opened(root: &std::path::Path) -> Option<String> {
+    let name = std::fs::read_to_string(root.join("last-workspace")).ok()?.trim().to_string();
+    workspaces_in(root).into_iter().find(|w| *w == name)
+}
+
+/// Notes the workspace the dashboard shows now (see `last_opened`).
+pub fn note_opened(root: &std::path::Path, name: &str) {
+    if valid_id(name).is_ok() { let _ = write_private(&root.join("last-workspace"), name.as_bytes()); }
+}
+
 /// Whether a workspace is kept under `root` (the first one is there before it keeps anything, when no other is).
 pub fn kept_here(root: &std::path::Path, name: &str) -> bool {
     let all = workspaces_in(root);
