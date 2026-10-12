@@ -831,7 +831,8 @@ pub fn aws_look_lines(account: &str, who: &str, look: &crate::aws::Look) -> Vec<
     let mut out = vec![format!("AWS account   {account}{}", if who.is_empty() { String::new() } else { format!(" · signed in as {who}") })];
     out.push(format!("Kind          {}", match look.kind() {
         Kind::Open => "open: nothing SuperCI does is refused".to_string(),
-        Kind::Project { region } => format!("an AWS project (AWS's new sign-up): it works in {region} only, and spot machines are refused"),
+        Kind::Project { region, activated: false } => format!("an AWS project (AWS's new sign-up): it works in {region} only, and spot machines are refused"),
+        Kind::Project { region, activated: true } => format!("an AWS project (AWS's new sign-up) with advanced features on: its organization keeps it to {region}, a rule its management account can change"),
         Kind::Restricted => "restricted: some regions or spot machines are refused".to_string(),
     }));
     let allowed = look.allowed_regions();

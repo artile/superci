@@ -1195,7 +1195,8 @@ impl Dashboard {
         // What kind of account it is, in a line.
         let (kind, tone, says) = match look.kind() {
             aws::Kind::Open => ("Nothing refused", "good", "Nothing SuperCI does there is refused.".to_string()),
-            aws::Kind::Project { region } => ("AWS project", "open", format!("A project of AWS's new sign-up: AWS keeps it to {} and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.", region_short(&region))),
+            aws::Kind::Project { region, activated: false } => ("AWS project", "open", format!("A project of AWS's new sign-up: AWS keeps it to {} and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.", region_short(&region))),
+            aws::Kind::Project { region, activated: true } => ("AWS project", "open", format!("A project of AWS's new sign-up with advanced features on: its organization keeps it to {}. That rule can be changed from the organization's management account.", region_short(&region))),
             aws::Kind::Restricted => ("Restricted", "open", "Some of what SuperCI does there is refused: see below.".to_string()),
         };
         let mut rows = vec![];

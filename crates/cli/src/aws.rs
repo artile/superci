@@ -255,8 +255,10 @@ impl Answer {
 pub enum Kind {
     /// Nothing SuperCI needs is refused.
     Open,
-    /// A project of AWS's new sign-up: AWS runs its organization, pins it to one region and refuses spot there.
-    Project { region: String },
+    /// A project of AWS's new sign-up: its organization pins it to one region. Until its owner activates AWS's
+    /// "advanced features", AWS runs that organization and refuses spot too; after (`activated`), spot is allowed and
+    /// the region rule is the owner's to change, from the organization's management account.
+    Project { region: String, activated: bool },
     /// Its organization's policies (or the sign-in's own permissions) refuse some regions, or spot.
     Restricted,
 }
@@ -317,10 +319,10 @@ impl Look {
         let allowed = self.allowed_regions();
         let refused = |region: &str| self.regions.iter().any(|(r, a)| r == region && a.by_organization().is_some());
         let spot_refused = self.spot.as_ref().is_some_and(|a| a.by_organization().is_some());
-        // The new sign-up's mark: us-east-1 refused for what is regional, one home region of its three allowed, and
-        // no spot, all by the organization's policies.
+        // The new sign-up's mark: us-east-1 refused for what is regional and one home region of its three allowed, by
+        // the organization's policy. No spot either, by another: not activated. (Activating takes that one away.)
         if let [only] = allowed.as_slice() {
-            if PROJECT_REGIONS.contains(only) && refused("us-east-1") && spot_refused { return Kind::Project { region: only.to_string() } }
+            if PROJECT_REGIONS.contains(only) && refused("us-east-1") && (spot_refused || self.spot == Some(Answer::Allowed)) { return Kind::Project { region: only.to_string(), activated: !spot_refused } }
         }
         // (An account that manages its own organization, or is in none, with nothing refused, is open.)
         let any_refused = self.regions.iter().any(|(_, a)| matches!(a, Answer::Refused(_))) || matches!(self.spot, Some(Answer::Refused(_))) || matches!(self.on_demand, Some(Answer::Refused(_)));
@@ -628,13 +630,35 @@ mod look_tests {
 
     fn look(recording: &'static str) -> Look { let aws = Replay::of(recording); look_with(&|| aws.clone(), &creds()) }
 
+    /// The same project minutes after its owner activated AWS's advanced features, with no policy edited yet: the
+    /// spot rule is gone, the region rule is another policy than before, and from inside the organization still
+    /// cannot be read.
+    #[test]
+    fn an_activated_project_allows_spot_and_is_still_kept_to_its_region() {
+        let l = look(include_str!("../fixtures/aws/project-activated/look.jsonl"));
+        assert_eq!(l.allowed_regions(), ["eu-north-1"]);
+        assert_eq!(l.kind(), Kind::Project { region: "eu-north-1".into(), activated: true });
+        let refused: Vec<&aws::Refusal> = l.regions.iter().filter_map(|(_, a)| a.by_organization()).collect();
+        assert_eq!(refused.len(), 11);
+        assert!(refused.iter().all(|r| r.action == "ec2:DescribeVpcs" && r.policy_id() == Some("p-example1") && r.management_account() == Some("222222222222")), "{refused:?}");
+        assert_eq!((&l.spot, &l.on_demand), (&Some(Answer::Allowed), &Some(Answer::Allowed)));
+        assert_eq!((l.asked_in.as_deref(), l.spot_cpus, l.on_demand_cpus), (Some("eu-north-1"), Some(32), Some(16)));
+        // (The account's own copy of the runner image is there by now.)
+        assert_eq!(l.images, [("eu-north-1".to_string(), Some(true))]);
+        assert_eq!(l.usable_regions(), ["eu-north-1"]);
+        assert_eq!((l.organization_id.as_deref(), l.management_account.as_deref()), (Some("o-example001"), Some("222222222222")));
+        let lines = crate::commands::aws_look_lines("111111111111", "", &l);
+        assert_eq!(lines[1], "Kind          an AWS project (AWS's new sign-up) with advanced features on: its organization keeps it to eu-north-1, a rule its management account can change");
+        assert_eq!(lines[4], "Spot          allowed (asked in eu-north-1)");
+    }
+
     /// A project of AWS's new sign-up, on its paid plan, before its advanced features are activated (recorded on
     /// 12 October 2026 in a project AWS had put in Stockholm).
     #[test]
     fn a_project_of_the_new_sign_up_is_known_by_what_it_allows() {
         let l = look(include_str!("../fixtures/aws/project-paid/look.jsonl"));
         assert_eq!(l.allowed_regions(), ["eu-north-1"]);
-        assert_eq!(l.kind(), Kind::Project { region: "eu-north-1".into() });
+        assert_eq!(l.kind(), Kind::Project { region: "eu-north-1".into(), activated: false });
         // Every other region is refused by one policy of the organization, spot by another; on-demand is allowed.
         let refused: Vec<&aws::Refusal> = l.regions.iter().filter_map(|(_, a)| a.by_organization()).collect();
         assert_eq!(refused.len(), 11);
@@ -738,7 +762,8 @@ mod look_tests {
 /// when the fixture was made, and this holds every fixture to it.
 #[cfg(test)]
 mod fixture_tests {
-    const FIXTURES: [(&str, &str); 4] = [
+    const FIXTURES: [(&str, &str); 5] = [
+        ("project-activated/look", include_str!("../fixtures/aws/project-activated/look.jsonl")),
         ("public/image-list", include_str!("../fixtures/aws/public/image-list.jsonl")),
         ("project-paid/look", include_str!("../fixtures/aws/project-paid/look.jsonl")),
         ("project-paid/more", include_str!("../fixtures/aws/project-paid/more.jsonl")),
