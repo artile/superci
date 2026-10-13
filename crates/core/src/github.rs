@@ -67,13 +67,8 @@ pub fn valid_login(login: &str) -> bool {
 /// The App a control plane asks GitHub to create: private, webhook to the control plane, only the permissions runners need.
 /// The App's name starts with what the control plane is called (SuperCI, or its own name: AcmeCI acme …); the person
 /// can change it on GitHub's page before it is made.
-pub fn app_manifest(plane_url: &str, owner: &Owner, called: &str, label: &str, plane_id: &str) -> serde_json::Value {
-    let brand = if called.is_empty() { "SuperCI" } else { called };
-    // A long login is cut, with a mark of the whole of it (two organizations may begin alike).
-    let login = if owner.login.len() > 15 { format!("{}-{}", owner.login.chars().take(10).collect::<String>(), &crate::crypto::sha256_hex(owner.login.to_ascii_lowercase().as_bytes())[..4]) } else { owner.login.clone() };
-    let mut name: String = format!("{brand} {login}").chars().take(27).collect();
-    name.push(' ');
-    name.extend(plane_id.chars().take(6)); // names are unique across GitHub, at most 34 characters
+pub fn app_manifest(plane_url: &str, owner: &Owner, called: &str, label: &str) -> serde_json::Value {
+    let name = app_name(called, &owner.login);
     let permissions = if owner.org {
         serde_json::json!({ "organization_self_hosted_runners": "write", "actions": "write", "metadata": "read" })
     } else {
@@ -91,6 +86,19 @@ pub fn app_manifest(plane_url: &str, owner: &Owner, called: &str, label: &str, p
         "default_permissions": permissions,
         "default_events": ["workflow_job"],
     })
+}
+
+/// What the App is called on GitHub: the CI's name and whose jobs it is for ("AcmeCI acme"). It is what owners read
+/// in the organization's list of Apps, and what a job run again by SuperCI says ran it (`acmeci-acme[bot]`). Names
+/// are unique across all of GitHub and 34 characters at most. This one can only be taken by an App of the same CI
+/// for the same account (one from before, never deleted there): GitHub then says so on the page where the App is
+/// created, and another name typed there does as well (the App is known here by its id).
+pub fn app_name(called: &str, login: &str) -> String {
+    let brand = if called.is_empty() { "SuperCI" } else { called };
+    // A long login is cut, with a mark of the whole of it (two organizations may begin alike).
+    let login = if login.len() > 15 { format!("{}-{}", login.chars().take(10).collect::<String>(), &crate::crypto::sha256_hex(login.to_ascii_lowercase().as_bytes())[..4]) } else { login.to_string() };
+    let brand: String = brand.chars().take(33usize.saturating_sub(login.chars().count())).collect();
+    format!("{} {login}", brand.trim_end())
 }
 
 /// Where the manifest form is posted: the organization's or the user's own App settings.
@@ -378,14 +386,18 @@ mod tests {
 
     #[test]
     fn manifest_for_org_and_user() {
-        let org = app_manifest("https://h.example.workers.dev", &Owner { org: true, login: "acme-corp".into() }, "SuperCI", "superci", "abc123xyz");
+        let org = app_manifest("https://h.example.workers.dev", &Owner { org: true, login: "acme-corp".into() }, "SuperCI", "superci");
         assert_eq!(org["default_permissions"], serde_json::json!({ "organization_self_hosted_runners": "write", "actions": "write", "metadata": "read" }));
         assert_eq!(org["hook_attributes"]["url"], "https://h.example.workers.dev/webhook");
         assert_eq!(org["public"], false);
-        assert!(org["name"].as_str().unwrap().len() <= 34 && org["name"].as_str().unwrap().ends_with(" abc123"));
-        let user = app_manifest("https://h", &Owner { org: false, login: "a-very-long-user-name-that-goes-on-and-on".into() }, "Acme CI", "acme", "abc123");
+        // Named after the CI and whose jobs it is for, with nothing else: what owners read among their Apps.
+        assert_eq!(org["name"], "SuperCI acme-corp");
+        let user = app_manifest("https://h", &Owner { org: false, login: "a-very-long-user-name-that-goes-on-and-on".into() }, "Acme CI", "acme");
         assert_eq!(user["default_permissions"]["administration"], "write");
-        assert!(user["name"].as_str().unwrap().chars().count() <= 34);
+        // A long login is cut with a mark of the whole of it; the name is 34 characters at most, whatever the CI is called.
+        assert_eq!(user["name"], format!("Acme CI a-very-lon-{}", &crate::crypto::sha256_hex(b"a-very-long-user-name-that-goes-on-and-on")[..4]));
+        assert_eq!(app_name("A CI With A Very Long Name", "a-very-long-user-name-that-goes-on-and-on").chars().count(), 34);
+        assert_eq!((app_name("", "acme").as_str(), app_name("Acme CI", "acme").as_str()), ("SuperCI acme", "Acme CI acme"));
         assert_eq!(manifest_target(None, &Owner { org: true, login: "o".into() }, "s1"), "https://github.com/organizations/o/settings/apps/new?state=s1");
         assert_eq!(manifest_target(None, &Owner { org: false, login: "u".into() }, "s1"), "https://github.com/settings/apps/new?state=s1");
     }

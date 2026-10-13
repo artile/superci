@@ -2229,7 +2229,7 @@ impl Dashboard {
                     return Ok(message(409, "Update the control plane first", "Adding another organization needs control plane 0.9.31 or newer (Control plane → Update)."))
                 }
                 let state = random_token(18);
-                let mut manifest = app_manifest(plane.url(), &owner, &seen.name(), &seen.label(), plane.plane_id());
+                let mut manifest = app_manifest(plane.url(), &owner, &seen.name(), &seen.label());
                 // GitHub comes back to this machine, not to the control plane: the code is exchanged here.
                 manifest["redirect_url"] = format!("{}/github/callback", self.base).into();
                 manifest["setup_url"] = format!("{}/github/installed", self.base).into();
@@ -3981,7 +3981,7 @@ fn github_dialog(another: bool, place: &str) -> String {
     let body = format!(r#"<form method="post" action="/github/start">
 <section class="prompt-modal-step prompt-modal-step-first"><div class="prompt-modal-step-head"><span>1</span><h2>Where is your GitHub?</h2></div>{wher}</section>
 <section class="prompt-modal-step"><div class="prompt-modal-step-head"><span>2</span><h2>Whose jobs?</h2></div><div class="perm-field"><input type="text" name="login" placeholder="your-organization" required pattern="[A-Za-z0-9][A-Za-z0-9-]{{0,38}}" autocomplete="off" spellcheck="false" aria-label="GitHub organization or user"><small>An organization you own, or your own username.{copy}</small></div></section>
-<section class="prompt-modal-step"><div class="prompt-modal-step-head"><span>3</span><h2>Create its App</h2></div><p class="prompt-modal-instruction">GitHub makes a private App there, then asks where to install it. It registers runners and reads job events, never your code.</p><div class="perm-action"><button class="prompt-modal-copy">Continue on GitHub</button></div></section>
+<section class="prompt-modal-step"><div class="prompt-modal-step-head"><span>3</span><h2>Create its App</h2></div><p class="prompt-modal-instruction">GitHub makes a private App there, then asks where to install it. It registers runners and reads job events, never your code.</p><p class="prompt-modal-instruction">It is named after your CI and the organization. Should GitHub say that name is taken (an App of yours from before), type another on its page: any name works.</p><div class="perm-action"><button class="prompt-modal-copy">Continue on GitHub</button></div></section>
 </form>"#);
     step_dialog("gh-add", if another { "Add an organization" } else { "Connect GitHub" }, &body)
 }

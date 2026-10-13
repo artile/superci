@@ -2145,8 +2145,8 @@ fn a_control_plane_is_called_what_it_is_named_where_people_read_it() {
     run(labelled("queued", 31, "acme/app", None, "superci"));
     let why = job(&store, 31)["error"].as_str().unwrap_or_default().to_string();
     assert!(why.contains("the AcmeCI dashboard") && !why.contains("SuperCI"), "{why}");
-    let named = |called: &str| superci_core::github::app_manifest(PLANE_URL, &superci_core::github::Owner { org: true, login: "acme".into() }, called, "superci", PLANE_ID)["name"].as_str().unwrap().to_string();
-    assert!(named("AcmeCI").starts_with("AcmeCI acme ") && named("SuperCI").starts_with("SuperCI acme ") && named("").starts_with("SuperCI acme "));
+    let named = |called: &str| superci_core::github::app_manifest(PLANE_URL, &superci_core::github::Owner { org: true, login: "acme".into() }, called, "superci")["name"].as_str().unwrap().to_string();
+    assert_eq!((named("AcmeCI").as_str(), named("SuperCI").as_str(), named("").as_str()), ("AcmeCI acme", "SuperCI acme", "SuperCI acme"));
     config.set_name("SuperCI");
     assert!(config.name.is_none());
 
