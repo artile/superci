@@ -2099,7 +2099,7 @@ fn a_job_github_never_told_of_is_found_by_asking_and_gets_its_machine() {
     // The one for here that waits and was never told of gets a machine; one for other runners, one made a moment
     // ago (its event may be on its way), one known, and one that runs do not.
     assert_eq!(job(&store, 9)["label"], "superci");
-    assert_eq!(launches(&clouds.0).len(), 1);
+    assert_eq!(launches(&clouds.0).len(), 1, "{}", job(&store, 9));
     for id in [10, 11, 12, 13] { assert!(!store.0.borrow().contains_key(&format!("job:{id}")), "{id}") }
     assert_eq!((asked("acme/app/actions/runs?status=queued"), asked("acme/app/actions/runs?status=in_progress"), asked("acme/old/actions/runs?status=queued"), asked("acme/gone")), (1, 0, 1, 0));
     // Not asked again within five minutes; asked again after.
@@ -2408,6 +2408,44 @@ fn an_aws_machines_disk_is_as_fast_as_its_size_deserves_unless_said_and_a_label_
     assert_eq!(speed(&launches(&clouds).pop().unwrap()), s("125", "3000"));
     block_on(plane.handle(labelled("queued", 12, "acme/app", None, "superci-8cpu-500mbs")));
     assert_eq!(speed(&launches(&clouds).pop().unwrap()), s("500", "3000"), "a label says otherwise for its job");
+}
+
+#[test]
+fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself() {
+    // AWS has no spot machine of the first type in any zone; the second type starts.
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| (body.contains("Action=RunInstances") && body.contains("InstanceType=c8a.xlarge")).then(|| aws_refuses("InsufficientInstanceCapacity")));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    store.0.borrow_mut().insert("plane_url".into(), format!("\"{PLANE_URL}\""));
+    // GitHub made the job four seconds before this control plane heard of it.
+    let payload = serde_json::json!({ "action": "queued", "workflow_job": { "id": 7, "run_id": 3, "labels": ["superci"], "runner_name": null, "created_at": "2026-09-21T14:13:16Z" }, "repository": { "full_name": "acme/app", "private": true }, "installation": { "id": 42 } }).to_string();
+    let sig = format!("sha256={}", hex(&hmac_sha256(b"whsec", payload.as_bytes())));
+    run(Request::new("POST", &format!("{PLANE_URL}/webhook")).with_header("x-github-event", "workflow_job").with_header("x-hub-signature-256", &sig).with_body(payload));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["queued_ms"].as_u64(), j["machine_type"].as_str()), (Some("launched"), Some(1_789_999_996_000), Some("c7a.xlarge")), "{j}");
+    // Every request for its machine, in order, with what AWS said: the first type refused, the next started.
+    let asks: Vec<(String, String, bool)> = j["asks"].as_array().unwrap().iter().map(|a| (a["kind"].as_str().unwrap().to_string(), a["said"].as_str().unwrap().to_string(), a["spot"].as_bool().unwrap())).collect();
+    assert!(asks.len() >= 2 && asks[..asks.len() - 1].iter().all(|a| *a == ("c8a.xlarge".to_string(), "InsufficientInstanceCapacity".to_string(), true)) && asks[asks.len() - 1] == ("c7a.xlarge".to_string(), "started".to_string(), true), "{asks:?}");
+    // Its machine has a link of its own to say how its start went, in its start-up script.
+    let token = j["hello"].as_str().unwrap().to_string();
+    let script = user_data_of(&launches(&clouds.0).pop().unwrap());
+    assert!(script.contains(&format!(r#"curl -s -m 5 -X POST "{PLANE_URL}/hello?runner=superci-{PLANE_ID}-7&t={token}&boot=$superci_up&script=$superci_t0"#)), "{script}");
+    // Only with its link; and only times near now are taken.
+    let hello = |t: &str, more: &str| run(Request::new("POST", &format!("{PLANE_URL}/hello?runner=superci-{PLANE_ID}-7&t={t}{more}"))).status;
+    assert_eq!((hello("wrong-wrong-wrong-wrong", "&ready=1790000009000"), hello(&token, "&boot=6.61&script=1790000008000&read=1790000009000&ready=1790000009500")), (404, 200));
+    clock.0.set(1_790_000_012_000);
+    assert_eq!(hello(&token, "&listening=1790000011000&ready=5"), 200);
+    // The status gives it with the job (kept apart from the job's own record, which a machine never writes), and not the link.
+    let status = json(&run(Request::new("GET", &format!("{PLANE_URL}/status")).with_header("authorization", "Bearer dashboard-session-key-1")));
+    let seen = &status["jobs"][0];
+    assert_eq!(seen["machine"], serde_json::json!({ "boot_s": 6.61, "script_ms": 1_790_000_008_000u64, "read_ms": 1_790_000_009_000u64, "ready_ms": 1_790_000_009_500u64, "listening_ms": 1_790_000_011_000u64 }), "{seen}");
+    assert!(seen.get("hello").is_none() && seen["asks"].as_array().is_some_and(|a| a.len() == asks.len()) && job(&store, 7).get("machine").is_none());
 }
 
 #[test]

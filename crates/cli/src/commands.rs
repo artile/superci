@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use crate::dashboard::{day_of, job_words, plane_json, read_keys, run_words, runs_of, with_hosts, Background, Dashboard, Task, AWS_ENDED, NOT_SIGNED_IN};
+use crate::dashboard::{day_of, job_start_lines, job_words, plane_json, read_keys, run_words, runs_of, with_hosts, Background, Dashboard, Task, AWS_ENDED, NOT_SIGNED_IN};
 use crate::plane::Plane;
 use crate::view::{PlaneView, DASHBOARD_VERSION};
 use crate::store;
@@ -26,7 +26,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("status", "  superci status                    The control plane in use: where, its version, whether jobs can run.",
         "With --json: the control plane, and under \"status\" everything it says of itself (repositories, runner providers,\nlimits, the latest jobs)."),
     ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N]",
-        "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job, with the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, a million at most). GitHub keeps a job's log once the job has ended."),
+        "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job: how its start went step by step (what AWS was asked and answered, when its machine booted, when\n          its runner listened), and the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, a million at most). GitHub keeps a job's log once the job has ended."),
     ("runs", "  superci runs list\n  superci runs retrieve ID",
         "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again).\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
@@ -369,6 +369,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let got = crate::cloudflare::plane_get(v.plane.url(), &key, &path)
                 .map_err(|e| if e.contains("404") { "Reading a job's log needs control plane 0.11.0 or newer: `superci planes update`.".to_string() } else { e })?;
             let mut said = vec![job_line(&words), words["link"].as_str().unwrap_or_default().to_string()];
+            // How its start went: what AWS was asked, and what its machine said of its own part.
+            if let Some(choice) = words["choice"].as_str() { said.push(format!("{choice}.")) }
+            said.extend(job_start_lines(&j));
             match got["log"].as_str() {
                 Some(log) => { said.push(if got["truncated"] == true { format!("The end of its log ({} bytes in all):", got["bytes"]) } else { "Its log:".to_string() }); said.push(log.trim_end().to_string()) }
                 None => said.push(format!("No log: {}.", got["error"].as_str().unwrap_or("the control plane gave none").trim_end_matches('.'))),

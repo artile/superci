@@ -403,7 +403,7 @@ pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
     let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { off_spot(j).map(|(why, _)| why).unwrap_or_default() };
     // (How the job itself ended, where a machine ran it to its end: `passed`, `failed`, …; apart from `state`.)
     let ended = Some(job_ended(j).1.to_lowercase()).filter(|_| state == "done" && j["conclusion"].is_string());
-    serde_json::json!({ "id": j["job_id"], "state": state, "ended": ended, "job": title, "in": sub, "runner": runner_text(j).1, "disk": job_disk(j), "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
+    serde_json::json!({ "id": j["job_id"], "state": state, "ended": ended, "job": title, "in": sub, "runner": runner_text(j).1, "disk": job_disk(j), "choice": choice_said(j), "start": job_start(j), "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
 }
 
 /// A run as commands say it: how it stands, what it is, how many of its jobs ran here, how long it took (ms, from its
@@ -652,7 +652,9 @@ fn job_table(jobs: &[serde_json::Value]) -> String {
         let took = duration(j);
         let cost = job_cost(j).filter(|c| *c > 0.0).map(|c| cost_text(j, c)).unwrap_or_default();
         let why = if kind == "bad" || state == "waiting" { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&plain_reason(j))) }
-            else { off_spot(j).map(|(why, _)| format!(r#"<small class="jt-why open">{}</small>"#, esc(&why))).unwrap_or_default() };
+            else { off_spot(j).map(|(why, _)| format!(r#"<small class="jt-why open">{}</small>"#, esc(&why)))
+                // (Or that its machine was not the first choice: quietly, it is no fault.)
+                .or_else(|| choice_said(j).map(|said| format!(r#"<small class="jt-why held">{}</small>"#, esc(&said)))).unwrap_or_default() };
         format!(r#"<a class="jt-row" href="{}" target="_blank" rel="noopener"><span class="jt-job"><strong>{}</strong><small>{host}{}</small>{why}</span><span class="jt-runner">{runner}</span><span class="jt-num">{took}</span><span class="jt-num">{cost}</span><span class="jt-state {kind}"><i></i>{word}</span><span class="jt-when">{}</span></a>"#,
             esc(&job_link(j)), esc(&title), esc(&sub), ago(j["at_ms"].as_u64().unwrap_or_default()))
     }).collect::<String>();
@@ -747,6 +749,98 @@ fn job_names(j: &serde_json::Value) -> (String, String) {
     let workflow = j["workflow"].as_str().unwrap_or_default();
     if name.is_empty() { return (short, repo.split('/').next().unwrap_or_default().to_string()) }
     (name.to_string(), if workflow.is_empty() { short } else { format!("{short} · {workflow}") })
+}
+
+/// Seconds in words, for a start's steps: "0.4 s", "36 s", "1m 12s".
+fn secs(ms: u64) -> String { if ms < 9_950 { format!("{:.1} s", ms as f64 / 1000.0) } else if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { span(ms) } }
+
+/// What AWS was asked for a job's machine, in a few words: "no spot m8a.8xlarge in 6 zones; m7a.8xlarge in us-east-1a".
+fn asks_said(j: &serde_json::Value) -> String {
+    let asks = j["asks"].as_array().cloned().unwrap_or_default();
+    let mut said: Vec<String> = vec![];
+    let mut i = 0;
+    while i < asks.len() {
+        let a = &asks[i];
+        let (kind, spot, what) = (a["kind"].as_str().unwrap_or_default(), a["spot"] == true, a["said"].as_str().unwrap_or_default());
+        let market = if spot { "spot " } else { "on-demand " };
+        if what == "started" { said.push(format!("{}{kind}{}", if spot { "" } else { market }, a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default())); i += 1; continue }
+        // The same answer for the same type, zone after zone: said once.
+        let alike = asks[i..].iter().take_while(|b| b["kind"] == a["kind"] && b["spot"] == a["spot"] && b["said"] == a["said"]).count();
+        let why = match what { "InsufficientInstanceCapacity" => "no", "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" => "your account's limit refused", "RequestLimitExceeded" => "AWS took no more requests for", other => other };
+        said.push(format!("{why} {market}{kind}{}", if alike > 1 { format!(" in {alike} zones") } else { String::new() }));
+        i += alike;
+    }
+    said.join("; ")
+}
+
+/// The machine types AWS had no spot machine of before the one a job got, when it got another: its machine was not
+/// the first choice (an older or a larger type, which changes how long the job takes and what it costs).
+fn passed_over(j: &serde_json::Value) -> Vec<String> {
+    let got = j["machine_type"].as_str().unwrap_or_default();
+    let mut kinds: Vec<String> = vec![];
+    for a in j["asks"].as_array().into_iter().flatten() {
+        let kind = a["kind"].as_str().unwrap_or_default();
+        if a["spot"] == true && a["said"] == "InsufficientInstanceCapacity" && kind != got && !kinds.iter().any(|k| k == kind) { kinds.push(kind.to_string()) }
+    }
+    if got.is_empty() || j["on_demand"] == true { vec![] } else { kinds }
+}
+
+/// The same as a job's note: "Not the first choice: AWS had no spot m8a.8xlarge".
+fn choice_said(j: &serde_json::Value) -> Option<String> {
+    let kinds = passed_over(j);
+    let list = match kinds.as_slice() { [] => return None, [one] => one.clone(), [most @ .., last] => format!("{} or {last}", most.join(", ")) };
+    Some(format!("Not the first choice: AWS had no spot {list}"))
+}
+
+/// How a job's start went, step by step (see `Job::asks` and `MachineStart` in the control plane): from GitHub
+/// making the job to the job running, with how long each step took (ms). What the control plane kept is all that is
+/// said: a job from before, or a machine that could not say its part, has fewer steps.
+pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
+    let n = |v: &serde_json::Value| v.as_u64().filter(|t| *t > 0);
+    let (Some(heard), started) = (n(&j["at_ms"]), n(&j["started_ms"])) else { return serde_json::Value::Null };
+    let mut steps: Vec<(String, u64, String)> = vec![];
+    let mut step = |what: &str, from: u64, to: u64, more: String| if to >= from && to - from < 86_400_000 { steps.push((what.to_string(), to - from, more)) };
+    let queued = n(&j["queued_ms"]).filter(|q| *q <= heard);
+    if let Some(q) = queued { step("GitHub told SuperCI of the job", q, heard, String::new()) }
+    let Some(launched) = n(&j["launched_ms"]).filter(|_| j["machine_id"].is_string()) else {
+        return serde_json::json!({ "steps": steps.iter().map(|(what, ms, more)| serde_json::json!({ "what": what, "ms": ms, "more": more })).collect::<Vec<_>>(), "asked": asks_said(j) })
+    };
+    let asked = asks_said(j);
+    step(if j["cloud"] == "aws" { "AWS gave a machine" } else { "its machine was asked for" }, heard, launched, asked.clone());
+    let m = &j["machine"];
+    match (n(&m["script_ms"]), m["boot_s"].as_f64()) {
+        (Some(script), Some(boot)) => {
+            let kernel = script.saturating_sub((boot * 1000.0) as u64);
+            step("the machine was made and switched on", launched, kernel.max(launched), String::new());
+            step("it booted", kernel, script, String::new());
+            let (read, ready, listening) = (n(&m["read_ms"]), n(&m["ready_ms"]), n(&m["listening_ms"]));
+            if let Some(ready) = ready {
+                match read { Some(read) => { step("its disk and Docker were set up", script, read, String::new()); step("the runner's files were read from the image", read, ready, String::new()) }, None => step("its start-up script ran", script, ready, String::new()) }
+                match (listening, started) {
+                    (Some(l), Some(s)) => { step("the runner started and reached GitHub", ready, l, String::new()); step("GitHub gave it the job", l, s.max(l), String::new()) }
+                    (Some(l), None) => step("the runner started and reached GitHub", ready, l, String::new()),
+                    (None, Some(s)) => step("the runner started and took the job", ready, s.max(ready), String::new()),
+                    _ => {}
+                }
+            }
+        }
+        _ => if let Some(s) = started { step("its machine booted and its runner took the job", launched, s, String::new()) },
+    }
+    let total = started.map(|s| s.saturating_sub(queued.unwrap_or(heard)));
+    serde_json::json!({ "ms": total, "steps": steps.iter().map(|(what, ms, more)| serde_json::json!({ "what": what, "ms": ms, "more": more })).collect::<Vec<_>>(), "asked": asked })
+}
+
+/// The same for a person: a line for the whole, and one for each step.
+pub fn job_start_lines(j: &serde_json::Value) -> Vec<String> {
+    let start = job_start(j);
+    let steps = start["steps"].as_array().cloned().unwrap_or_default();
+    if steps.is_empty() { return vec![] }
+    let mut out = vec![match start["ms"].as_u64() { Some(ms) => format!("Its start: {} from queued to running", secs(ms)), None => "Its start, so far:".to_string() }];
+    for s in &steps {
+        let more = s["more"].as_str().filter(|m| !m.is_empty()).map(|m| format!(" ({m})")).unwrap_or_default();
+        out.push(format!("  {:>7}  {}{more}", secs(s["ms"].as_u64().unwrap_or_default()), s["what"].as_str().unwrap_or_default()));
+    }
+    out
 }
 
 /// A job's disk on AWS, for commands: its size, its speed (what AWS includes when none was kept: 125 MiB a second,
@@ -7113,6 +7207,42 @@ mod tests {
         let jobs_page = d.render("jobs", &[view], None);
         assert!(jobs_page.contains(r#"href="/?p=jobs" aria-selected="true">Jobs</a>"#) && jobs_page.contains("<h2>Recent jobs</h2>"));
         assert!(Dashboard::sidebar("runs").contains(r#"<a href="/?p=jobs" aria-current="true">"#));
+    }
+
+    #[test]
+    fn a_jobs_start_is_said_step_by_step_and_a_machine_that_was_not_the_first_choice_is_noted() {
+        let t = 1_790_000_000_000u64;
+        // GitHub made it 2 s before SuperCI heard; AWS had no spot machine of the first type in three zones (0.8 s
+        // each) nor of the second, and started the third; the machine's kernel started 6 s after it was asked for and
+        // took 6.6 s to reach the script; the runner's files took 37 s to read; the runner listened 2 s after.
+        let ask = |at: u64, kind: &str, zone: &str, said: &str| serde_json::json!({ "at": at, "kind": kind, "zone": zone, "spot": true, "said": said, "ms": 800 });
+        let j = serde_json::json!({ "job_id": 7, "run_id": 3, "repo": "acme/app", "state": "running", "cloud": "aws", "machine_id": "i-1", "machine_type": "m7a.8xlarge", "cpu": 32, "at_ms": t, "queued_ms": t - 2_000,
+            "launched_ms": t + 4_000, "started_ms": t + 4_000 + 6_000 + 6_600 + 1_000 + 37_000 + 2_000 + 1_500,
+            "asks": [ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), ask(800, "m8a.8xlarge", "us-east-1b", "InsufficientInstanceCapacity"), ask(1600, "m8a.8xlarge", "us-east-1c", "InsufficientInstanceCapacity"),
+                ask(2400, "r8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), ask(3200, "m7a.8xlarge", "us-east-1d", "started")],
+            "machine": { "boot_s": 6.6, "script_ms": t + 16_600, "read_ms": t + 17_600, "ready_ms": t + 54_600, "listening_ms": t + 56_600 } });
+        assert_eq!(job_start_lines(&j), vec![
+            "Its start: 1m from queued to running",
+            "    2.0 s  GitHub told SuperCI of the job",
+            "    4.0 s  AWS gave a machine (no spot m8a.8xlarge in 3 zones; no spot r8a.8xlarge; m7a.8xlarge in us-east-1d)",
+            "    6.0 s  the machine was made and switched on",
+            "    6.6 s  it booted",
+            "    1.0 s  its disk and Docker were set up",
+            "     37 s  the runner's files were read from the image",
+            "    2.0 s  the runner started and reached GitHub",
+            "    1.5 s  GitHub gave it the job"]);
+        let words = job_words(&j);
+        assert_eq!((words["start"]["ms"].as_u64(), words["start"]["steps"].as_array().map(|s| s.len()), words["start"]["steps"][5]["ms"].as_u64()), (Some(60_100), Some(8), Some(37_000)));
+        // Its row says, quietly, that its machine was not the first choice (no fault of anyone's; it changes the job's time and price).
+        assert_eq!(words["choice"], "Not the first choice: AWS had no spot m8a.8xlarge or r8a.8xlarge");
+        assert!(job_table(&[j.clone()]).contains(r#"<small class="jt-why held">Not the first choice: AWS had no spot m8a.8xlarge or r8a.8xlarge</small>"#));
+        // A job that got its first choice, and one from before any of this was kept, say what there is.
+        let mut first = j.clone();
+        first["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "started")]);
+        assert!(job_words(&first)["choice"].is_null() && !job_table(&[first]).contains("Not the first choice"));
+        let before = serde_json::json!({ "job_id": 8, "state": "done", "cloud": "aws", "machine_id": "i-2", "machine_type": "m8a.xlarge", "at_ms": t, "launched_ms": t + 3_400, "started_ms": t + 16_500 });
+        assert_eq!(job_start_lines(&before), vec!["Its start: 17 s from queued to running", "    3.4 s  AWS gave a machine", "     13 s  its machine booted and its runner took the job"]);
+        assert!(job_start_lines(&serde_json::json!({ "job_id": 9, "state": "waiting", "at_ms": t })).is_empty());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{b64, hex, hmac_sha256, sha256_hex};
-use crate::io::{Http, Request, Result};
+use crate::io::{Clock, Http, Request, Result};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Credentials {
@@ -204,6 +204,8 @@ pub struct Launch<'a> {
     pub types: &'a [String],
     pub user_data: &'a str,
     pub disk_gb: u32,
+    /// For how long each request takes (see `Told::asked`); none: not kept.
+    pub clock: Option<&'a dyn Clock>,
     /// The disk's speed: MiB a second and IOPS (see `spec::disk_speed`).
     pub disk_mibs: u32,
     pub disk_iops: u32,
@@ -223,7 +225,10 @@ pub struct Launch<'a> {
 /// What a launch was told on the way to its machine (or to none): each pool AWS had no room in (type, zone, AWS's
 /// word for it), and how often AWS refused for the rate of requests.
 #[derive(Default, Debug)]
-pub struct Told { pub refused: Vec<(String, String, String)>, pub throttled: u32 }
+pub struct Told { pub refused: Vec<(String, String, String)>, pub throttled: u32,
+    /// Every request for a machine, in order: the type, the zone, what AWS said ("started", or its word for no), and
+    /// how long the answer took (ms; with the waits, when AWS refused for the rate of requests). With `Launch::clock`.
+    pub asked: Vec<(String, String, String, u64)> }
 
 /// The lowest current spot price (USD per hour) for a machine type in a region, across its zones.
 /// The price now in one zone (`zone`), or the lowest across the region's zones.
@@ -294,9 +299,12 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
             let groups: Vec<&String> = std::iter::once(&n.security_group).chain(&n.more_groups).collect();
             params["NetworkInterface"] = serde_json::json!([{ "DeviceIndex": 0, "SubnetId": id, "SecurityGroupId": groups, "AssociatePublicIpAddress": if n.private { "false" } else { "true" }, "DeleteOnTermination": "true" }]);
         }
+        let began = l.clock.map(|c| c.now_ms());
+        let note = |told: &mut Told, said: &str| if let (Some(clock), Some(began)) = (l.clock, began) { told.asked.push((t.clone(), zone_of(place), said.split(':').next().unwrap_or_default().to_string(), clock.now_ms().saturating_sub(began))) };
         loop {
             match ec2(http, l.region, creds, "RunInstances", params.clone(), now_ms).await {
                 Ok(xml) => {
+                    note(told, "started");
                     let id = xml_tag(&xml, "instanceId").ok_or("RunInstances without an instanceId")?.to_string();
                     return Ok(Started { id, kind: t.clone(), zone: xml_tag(&xml, "availabilityZone").unwrap_or_default().to_string() });
                 }
@@ -310,10 +318,11 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
                 // No room for this type now, or a type this region does not have: the next one.
                 Err(e) if ["InsufficientInstanceCapacity", "Unsupported", "SpotMaxPriceTooLow", "InvalidParameterValue"].iter().any(|c| e.starts_with(c)) => {
                     told.refused.push((t.clone(), zone_of(place), e.split(':').next().unwrap_or_default().to_string()));
+                    note(told, &e);
                     last = e;
                     break
                 }
-                Err(e) => return Err(e),
+                Err(e) => { note(told, &e); return Err(e) }
             }
         }
     }
@@ -923,6 +932,27 @@ pub fn with_scratch(script: String, ramdisk: bool, nvme: bool) -> String {
     script.replacen(GROW_ROOT, &format!("{GROW_ROOT}{}", SCRATCH.replace("MOUNT_SCRATCH", &mount)), 1)
 }
 
+/// A Linux machine's start-up script that also tells the control plane how its start went (`url`: a link only this
+/// machine has): how long after its kernel started the script began, when the script began, when it began reading
+/// the runner's files, when it was ready to start the runner, and when the runner listened for a job. So a slow
+/// start can be seen for what it was: AWS, the boot, the disk, or the runner reaching GitHub. Sent in the
+/// background: nothing here waits for it or stops for it.
+pub fn with_hello(script: String, url: &str) -> Result<String> {
+    if !url.starts_with("https://") || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
+    const LOG: &str = "exec > >(tee /var/log/superci.log > /dev/console) 2>&1\n";
+    const READ: &str = "# First reads from a new volume are slow";
+    let runner = if script.contains("cd /home/runner && ") { "cd /home/runner && " } else if script.contains("export GL_URL=") { "export GL_URL=" } else { return Ok(script) };
+    if !script.contains(LOG) || !script.contains(GROW_ROOT) { return Ok(script) }
+    let said = format!(r#"# How the start went, said to the control plane (see where a slow one lost its time).
+( curl -s -m 5 -X POST "{url}&boot=$superci_up&script=$superci_t0&read=${{superci_t1:-0}}&ready=$(date +%s%3N)" > /dev/null 2>&1
+  for i in $(seq 360); do grep -qs "Listening for Jobs" /var/log/superci.log && break; sleep 0.5; done
+  grep -qs "Listening for Jobs" /var/log/superci.log && curl -s -m 5 -X POST "{url}&listening=$(date +%s%3N)" > /dev/null 2>&1 ) &
+"#);
+    let script = script.replacen(LOG, &format!("{LOG}superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)\n"), 1).replacen(READ, &format!("superci_t1=$(date +%s%3N)\n{READ}"), 1);
+    let (before, after) = script.split_once(runner).ok_or("no runner in the start-up script")?;
+    Ok(format!("{before}{said}{runner}{after}"))
+}
+
 pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<String> {
     let (jit_config, fail) = match work {
         crate::io::Work::GitHub { jit } => (jit.as_str(), None),
@@ -1121,6 +1151,12 @@ mod tests {
         assert!(with_scratch(gl.clone(), true, true).contains("tmpfs") && with_scratch(script.clone(), false, false) == script);
         let failing = runner_user_data(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10).unwrap();
         assert_eq!(with_scratch(failing.clone(), true, true), failing);
+        // A machine says how its start went, with a link of its own, in the background and before its runner starts.
+        let hello = with_hello(script.clone(), "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken").unwrap();
+        assert!(hello.contains("superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)") && hello.contains("superci_t1=$(date +%s%3N)\n# First reads") && hello.contains(r#"curl -s -m 5 -X POST "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$(date +%s%3N)""#), "{hello}");
+        assert!(hello.find("superci_t0=").unwrap() < hello.find("growpart").unwrap() && hello.find("&listening=").unwrap() < hello.find("./run.sh").unwrap());
+        assert!(with_hello(script.clone(), "https://x/'; reboot; '").is_err() && with_hello(failing.clone(), "https://plane.example/hello?t=a").unwrap() == failing);
+        assert!(with_hello(gl.clone(), "https://plane.example/hello?gl=g-1&t=tokentokentokentoken").unwrap().contains("&ready=$(date +%s%3N)"));
         // The disk's speed above what AWS includes is in the price of the hour: 1,000 MiB a second and 4,000 IOPS on
         // 60 GB, where a GB is $0.08 a month, add $0.055.
         let (plain, fast) = (extras_usd_per_hour(0.08, 60, 125, 3000, false), extras_usd_per_hour(0.08, 60, 1000, 4000, false));

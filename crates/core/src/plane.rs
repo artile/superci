@@ -234,6 +234,13 @@ pub struct Job {
     /// Its disk's speed, when above what AWS includes (MiB a second, IOPS): counted in its price.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
+    /// How its start went, to see where a slow one lost its time. When GitHub made the job (ms; `at_ms` is when this
+    /// control plane heard of it). Every request to AWS for its machine, in order (see `Ask`; the last two dozen). The
+    /// link its machine says its own part with (`hello`); what it said is kept apart from this record (see
+    /// `MachineStart`) and given with it in the status, as `machine`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub queued_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub asks: Vec<Ask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub hello: Option<String>,
     /// What it writes most is in memory, or on its machine's own disk (its label asked: `-ramdisk`, `-localdisk`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub local_disk: bool,
@@ -288,6 +295,23 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub conclusion: Option<String>,
     /// The job its interrupted machine was running, to be run again once its run has finished.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub rerun: Option<Rerun>,
+}
+
+/// One request to AWS for a job's machine: when (ms after the control plane heard of the job), for which machine type
+/// in which zone, spot or on-demand, what AWS said ("started", or its word for no), and how long the answer took (ms).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Ask { pub at: u64, pub kind: String, #[serde(default, skip_serializing_if = "String::is_empty")] pub zone: String, pub spot: bool, pub said: String, pub ms: u64 }
+
+/// What a machine said of its own start (see `aws::with_hello`), by its own clock: how long after its kernel started
+/// its start-up script began (seconds), when the script began, when it began reading the runner's files, when it was
+/// ready to start the runner, and when the runner listened for a job (ms). Kept under `hello:<job>`, apart from the
+/// job's record: a machine says so while its job's events arrive, and neither write may undo the other.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct MachineStart {
+    #[serde(default)] pub boot_s: f64, #[serde(default)] pub script_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub read_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub ready_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub listening_ms: Option<u64>,
 }
 
 /// Where a job is kept: GitLab's job ids have their own space.
@@ -707,6 +731,28 @@ impl<'a> ControlPlane<'a> {
                 }
                 Ok(Response::text(200, "ok"))
             }
+            // A machine saying how its own start went (see `MachineStart`): with its link, and only what it may say.
+            ("POST", "/hello") => {
+                let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+                let found = match q.get("gl") {
+                    Some(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') => get_json::<Job>(self.store, &format!("job:gl{id}")).await?,
+                    Some(_) => None,
+                    None => self.by_runner(q.get("runner").map(String::as_str)).await?,
+                };
+                let Some(j) = found else { return Ok(nothing_here()) };
+                if !j.hello.as_deref().is_some_and(|n| n.len() >= 16 && q.get("t").is_some_and(|t| safe_eq(t.as_bytes(), n.as_bytes()))) { return Ok(nothing_here()) }
+                // (Times near now only: a machine's clock is set by AWS before its script runs.)
+                let now = self.clock.now_ms();
+                let ms = |k: &str| q.get(k).and_then(|v| v.parse::<u64>().ok()).filter(|t| t.abs_diff(now) < 3_600_000);
+                let key = format!("hello:{}", job_key(&j).trim_start_matches("job:"));
+                let mut said = get_json::<MachineStart>(self.store, &key).await?.unwrap_or_default();
+                if let Some(script) = ms("script") { said.script_ms = script; said.boot_s = q.get("boot").and_then(|b| b.parse::<f64>().ok()).filter(|b| (0.0..3600.0).contains(b)).unwrap_or_default() }
+                said.read_ms = ms("read").or(said.read_ms);
+                said.ready_ms = ms("ready").or(said.ready_ms);
+                said.listening_ms = ms("listening").or(said.listening_ms);
+                put_json(self.store, &key, &said).await?;
+                Ok(Response::text(200, "ok"))
+            }
             // GitLab's projects, for the dashboard: which send their jobs here; switching one on or off; after the
             // connection changes, every webhook here gets the new secret.
             ("GET", "/job/log") if self.reader(&req) => self.job_log(&url).await,
@@ -1005,6 +1051,15 @@ impl<'a> ControlPlane<'a> {
         let mut jobs_all: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
         jobs_all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
         let jobs: Vec<Job> = jobs_all.iter().take(50).cloned().collect();
+        // Each with what its machine said of its own start, where one did (kept apart: see `MachineStart`).
+        let hellos: HashMap<String, serde_json::Value> = self.store.list("hello:").await.unwrap_or_default().into_iter().filter_map(|(k, v)| Some((k.strip_prefix("hello:")?.to_string(), serde_json::from_str(&v).ok()?))).collect();
+        let with_machines: Vec<serde_json::Value> = jobs.iter().map(|j| {
+            let mut v = serde_json::to_value(j).unwrap_or_default();
+            if let Some(m) = hellos.get(job_key(j).trim_start_matches("job:")) { v["machine"] = m.clone() }
+            // (Its link is the machine's alone.)
+            if let Some(o) = v.as_object_mut() { o.remove("hello"); }
+            v
+        }).collect();
         Ok(Response::json(&serde_json::json!({
             "plane": self.config.plane_id, "label": self.config.label, "labels": self.config.labels(), "name": self.config.name(),
             "app": self.config.app.as_ref().map(|a| serde_json::json!({ "id": a.id, "slug": self.app_slug(a), "owner": a.owner, "org": a.owner_is_org, "host": a.host })),
@@ -1040,7 +1095,7 @@ impl<'a> ControlPlane<'a> {
                 "gitlab_scopes": match &self.config.gitlab { Some(gl) => self.gitlab_scopes(gl).await, None => None },
                 "denied": self.store.list("denied:").await?.into_iter().filter_map(|(k, v)| Some((k.strip_prefix("denied:")?.to_string(), serde_json::from_str::<serde_json::Value>(&v).ok()?))).collect::<serde_json::Map<_, _>>(),
             },
-            "jobs": jobs,
+            "jobs": with_machines,
         })))
     }
 
@@ -1682,7 +1737,7 @@ impl<'a> ControlPlane<'a> {
     async fn launch(&self, plane_url: &str, ev: &github::JobEvent, app: &App) -> Result<()> {
         let key = format!("job:{}", ev.job_id);
         let mut job = Job { job_id: ev.job_id, run_id: ev.run_id, repo: ev.repo.clone(), state: "launching".into(), at_ms: self.clock.now_ms(), installation_id: ev.installation_id, label: ev.label.clone(),
-            name: ev.name.clone(), workflow: ev.workflow.clone(), app_id: Some(app.id), attempt: Some(ev.attempt).filter(|a| *a > 0), ..Default::default() };
+            name: ev.name.clone(), workflow: ev.workflow.clone(), app_id: Some(app.id), attempt: Some(ev.attempt).filter(|a| *a > 0), queued_ms: ev.created_ms, ..Default::default() };
         // Claimed once, however many deliveries of the event arrive at once. A claim that never got past launching (the
         // runtime restarted mid-way) is taken over by a later delivery.
         if !self.store.put_if_absent(&key, serde_json::to_string(&job).map_err(|e| e.to_string())?).await? {
@@ -1826,6 +1881,13 @@ impl<'a> ControlPlane<'a> {
                         let user_data = aws::runner_user_data_for(&work, self.machine_minutes("aws"), spec.os(), notice.as_deref())?;
                         // What a job writes most in memory, or on the machine's own NVMe disk, when its label asks.
                         let user_data = aws::with_scratch(user_data, spec.ramdisk, spec.nvme);
+                        // A Linux machine says how its own start went, with a link only it has.
+                        // (Never a reason for a machine not to start: without a link it can use, it starts as before.)
+                        let user_data = if spec.os() == "linux" && plane_url.starts_with("https://") {
+                            let token = job.hello.get_or_insert_with(|| crate::crypto::random_token(18)).clone();
+                            let link = if gitlab { format!("{plane_url}/hello?gl={}&t={token}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/hello?runner={name}&t={token}") };
+                            aws::with_hello(user_data.clone(), &link).unwrap_or(user_data)
+                        } else { user_data };
                         let mut launched = None;
                         // The regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         for region in &self.aws_regions(&a) {
@@ -1844,9 +1906,13 @@ impl<'a> ControlPlane<'a> {
                             // The disk's speed: by the machine's size unless the label or the default machine says.
                             (disk_mibs, disk_iops) = disk_speed(job.cpu.unwrap_or(4), disk_gb, &spec);
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
-                                avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120 };
+                                clock: Some(self.clock), avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120 };
                             let mut told = aws::Told::default();
                             let machine = aws::run_instance(self.http, &creds, &launch, now, &mut told).await;
+                            // Each request and its answer is kept with the job (the last two dozen).
+                            let mut at = self.clock.now_ms().saturating_sub(job.at_ms).saturating_sub(told.asked.iter().map(|a| a.3).sum());
+                            for (kind, zone, said, ms) in told.asked.drain(..) { job.asks.push(Ask { at, kind, zone, spot: !on_demand, said, ms }); at += ms }
+                            if job.asks.len() > 24 { let over = job.asks.len() - 24; job.asks.drain(..over); }
                             // A spot pool with no machine now is remembered, for the jobs that come next.
                             if !on_demand { for (kind, zone, said) in &told.refused { if said == "InsufficientInstanceCapacity" && !zone.is_empty() { let _ = self.store.put(&pool_key(region, kind, zone), now.to_string()).await; } } }
                             // Still refused for the rate of requests after its waits: for a spot machine that is no
@@ -2140,7 +2206,7 @@ impl<'a> ControlPlane<'a> {
                             let (image, image_gb) = match self.image(&region, &Spec::default(), &creds, self.clock.now_ms()).await { Ok(i) => i, Err(e) => { started = Err(e); continue } };
                             let network = match self.network(&region, &creds, self.clock.now_ms()).await { Ok(n) => n, Err(e) => { started = Err(e); continue } };
                             for spot in markets {
-                                started = aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, tags: &tags, spot: *spot, os: "linux",
+                                started = aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, clock: None, tags: &tags, spot: *spot, os: "linux",
                                     avoid: &[], timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120 }, self.clock.now_ms(), &mut aws::Told::default()).await.map(|_| ());
                                 if started.is_ok() { break 'regions }
                             }
@@ -2384,6 +2450,7 @@ impl<'a> ControlPlane<'a> {
             // History is kept two months (this month's spend and the last's).
             if !["launching", "launched", "running", "waiting"].contains(&j.state.as_str()) && now.saturating_sub(j.ended_ms.unwrap_or(j.at_ms)) > 62 * 86_400_000 {
                 self.store.delete(&key).await?;
+                let _ = self.store.delete(&format!("hello:{}", key.trim_start_matches("job:"))).await;
                 continue;
             }
             // Waiting for room: try again (GitHub keeps a job queued for up to a day).
