@@ -2534,6 +2534,11 @@ fn a_machine_for_a_job_cancelled_before_any_runner_took_it_is_ended_at_once() {
     let j = job(&store, 9);
     assert_eq!((j["state"].as_str(), j["began"].as_bool(), j["machine_id"].as_str(), ended()), (Some("cancelled"), Some(true), Some("i-0abc"), 2), "{j}");
     assert!(!store.0.borrow().contains_key("gone:9"));
+    // Cancelled while it waits (for room, or between two rounds of asking for a spot machine): cancelled, and noted,
+    // so that a sweep about to start it from what it listed a moment ago starts nothing.
+    store.0.borrow_mut().insert("job:11".into(), serde_json::json!({ "job_id": 11, "run_id": 3, "repo": "acme/app", "state": "waiting", "at_ms": 1_790_000_000_000u64, "installation_id": 42, "cloud": "aws", "seen_in_progress": false, "label": "superci" }).to_string());
+    run(job_event("completed", 11, "acme/app", None));
+    assert!(job(&store, 11)["state"] == "cancelled" && store.0.borrow().contains_key("gone:11"));
     // And one whose cancelling was known before anything was asked of AWS gets no machine at all.
     store.0.borrow_mut().insert("gone:10".into(), "1790000000000".into());
     let before = launches(&clouds.0).len();

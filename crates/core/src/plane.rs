@@ -2487,8 +2487,10 @@ impl<'a> ControlPlane<'a> {
             // How it ended is the job's own, whichever machine ran it.
             let said_before = own.conclusion.clone();
             own.conclusion = ev.conclusion.clone().or(said_before.clone());
-            // Cancelled while waiting for room: nothing was started.
+            // Cancelled while waiting for room: nothing was started. (Noted too, for a sweep that listed it a moment
+            // ago as waiting and is about to start it from that: it stops there, see `gone_key`.)
             if own.state == "waiting" {
+                if runner.is_none() && on_anothers.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
                 own.state = "cancelled".into();
                 own.began = true;
                 own.ended_ms = Some(self.clock.now_ms());
@@ -2548,8 +2550,10 @@ impl<'a> ControlPlane<'a> {
                 let _ = self.store.delete(&format!("hello:{}", key.trim_start_matches("job:"))).await;
                 continue;
             }
-            // Waiting for room: try again (GitHub keeps a job queued for up to a day).
+            // Waiting for room: try again (GitHub keeps a job queued for up to a day). As it stands now, not as it
+            // was listed a moment ago: it may have been cancelled, or started by another request, since.
             if j.state == "waiting" {
+                match get_json::<Job>(self.store, &key).await? { Some(fresh) if fresh.state == "waiting" => j = fresh, _ => continue }
                 if now.saturating_sub(j.at_ms) > 24 * 3_600_000 { j.state = "failed".into(); j.error = Some("waited a day for room".into()); put_json(self.store, &key, &j).await?; continue }
                 self.start(&plane_url, &mut j).await?;
                 if j.state == "waiting" { waiting += 1 }
