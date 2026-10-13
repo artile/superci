@@ -202,7 +202,7 @@ pub struct Job {
     /// Where it ran ("aws", "cloudflare", "modal"), the machine's id there, and its kind.
     pub cloud: String, pub machine_id: Option<String>, pub machine_type: Option<String>,
     pub error: Option<String>, pub seen_in_progress: bool,
-    /// The label it asked for (`superci`, `superci-8cpu-arm64`): what machine, and what its runner registers as.
+    /// The label it asked for (`superci`, `superci/cpu=8/arch=arm64`): what machine, and what its runner registers as.
     #[serde(default)] pub label: String,
     /// What its machine costs per hour (estimated from published prices; AWS: the spot price at launch), and when
     /// the job started running and when its machine ended (ms). The machine is paid from launch (`at_ms`) to end.
@@ -462,7 +462,7 @@ fn place_of(j: &Job) -> &str { if j.cloud == "aws" && j.on_demand { AWS_ON_DEMAN
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Agent { pub cloud: String, pub url: String }
 
-/// Where jobs run. A job naming a cloud in its label (`superci-aws`) runs only there; else the first rule whose
+/// Where jobs run. A job naming a cloud in its label (`superci/provider=aws`) runs only there; else the first rule whose
 /// repository pattern matches ("owner/repo", "owner/*" or "*") names its only cloud; else the places in `order` are tried
 /// top to bottom: the first that can run the job's machine and is within its limits takes it. Without an order: the
 /// default cloud, else every connected cloud (AWS, Cloudflare, agents).
@@ -1648,7 +1648,7 @@ impl<'a> ControlPlane<'a> {
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
             if let Some(why) = capacity.refuses(spec) { never.push(format!("{name} runs {why}")); continue }
             // Its label asks for an on-demand machine: not AWS's spot ones.
-            if cloud == "aws" && spec.on_demand { never.push("AWS spot machines are not on-demand".into()); continue }
+            if cloud == "aws" && spec.on_demand() { never.push("AWS spot machines are not asked for (spot=false)".into()); continue }
             places.push((cloud.clone(), runner));
         }
         // Spot is passed over only when something else can take the job: with nothing else, a spot machine it is.
@@ -1687,7 +1687,7 @@ impl<'a> ControlPlane<'a> {
         let hours = end.saturating_sub(from).max(60_000) as f64 / 3_600_000.0;
         let spec = self.config.parse(&j.label).and_then(|s| s.ok()).map(|s| s.or(&self.config.machine)).unwrap_or_default();
         let machine = match j.zone.as_deref() {
-            Some(zone) if !(spec.on_demand || j.on_demand) => aws::spot_cost(self.http, &region, zone, &creds, &kind, spec.os(), from, end, now).await,
+            Some(zone) if !(spec.on_demand() || j.on_demand) => aws::spot_cost(self.http, &region, zone, &creds, &kind, spec.os(), from, end, now).await,
             _ => { let p = aws::on_demand_price(self.http, &creds, &region, &kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.map(|p| p * hours) }
         };
         let disk = aws::disk_price(self.http, &creds, &region, now).await;
@@ -1879,8 +1879,9 @@ impl<'a> ControlPlane<'a> {
                         job.notice = (!on_demand).then(|| crate::crypto::random_token(18));
                         let notice = job.notice.as_ref().map(|t| if gitlab { format!("{plane_url}/interrupted?gl={}&t={t}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/interrupted?runner={name}&t={t}") });
                         let user_data = aws::runner_user_data_for(&work, self.machine_minutes("aws"), spec.os(), notice.as_deref())?;
-                        // What a job writes most in memory, or on the machine's own NVMe disk, when its label asks.
-                        let user_data = aws::with_scratch(user_data, spec.ramdisk, spec.nvme);
+                        // What a job writes most goes on the machine's own NVMe disk when it has one, or in memory
+                        // when its label asks (`scratch=ramdisk`).
+                        let user_data = aws::with_scratch(user_data, spec.ramdisk());
                         // A Linux machine says how its own start went, with a link only it has.
                         // (Never a reason for a machine not to start: without a link it can use, it starts as before.)
                         let user_data = if spec.os() == "linux" && plane_url.starts_with("https://") {
@@ -1982,7 +1983,9 @@ impl<'a> ControlPlane<'a> {
                         job.disk_gb = Some(disk_gb);
                         job.disk_mibs = Some(disk_mibs).filter(|m| *m > DISK_MIBS_INCLUDED);
                         job.disk_iops = Some(disk_iops).filter(|i| *i > DISK_IOPS_INCLUDED);
-                        (job.ramdisk, job.local_disk) = (spec.ramdisk && spec.os() == "linux", spec.nvme && spec.os() == "linux");
+                        // (In memory as its label asked, or on its machine's own disk: a machine type that has one uses it.)
+                        job.ramdisk = spec.ramdisk() && spec.os() == "linux";
+                        job.local_disk = !job.ramdisk && spec.os() == "linux" && machine.kind.split('.').next().is_some_and(|family| family.ends_with('d') && crate::spec::FAMILIES.iter().any(|(f, _)| *f == family));
                         Ok(Tried::Started(machine.id, machine.kind))
                     }.await,
                     Runner::Own => async {
@@ -2179,6 +2182,8 @@ impl<'a> ControlPlane<'a> {
         let line = if mac { format!("::error title={called} could not run this job::{called} runs no macOS jobs yet. Use runs-on: macos-latest for GitHub's own.") }
             // A limit for the month: what to do is raising it or waiting (the whole CI's says so itself).
             else if why.contains(" reached its ") { format!("::error title={called} could not run this job::{}.{}", why.replace(['\r', '\n'], " ").trim_end_matches('.'), if why.contains("until the limit is raised") || why.contains(BUDGET_STOPPED) { String::new() } else { format!(" Raise that limit on Runners in the {called} dashboard, or wait for {}.", if why.contains(" a day") { "tomorrow" } else { "next month" }) }) }
+            // A label that is not understood says itself what to write: nothing to add in the dashboard.
+            else if why.contains("runs-on: ") { format!("::error title={called} could not run this job::{}.", why.replace(['\r', '\n'], " ").trim_end_matches('.')) }
             else { format!("::error title={called} could not run this job::{}. Change its runs-on, or add a place that can run it in the {called} dashboard.", why.replace(['\r', '\n'], " ").trim_end_matches('.')) };
         let work = Work::Fail { jit, why: crate::crypto::b64(line.as_bytes()) };
         let size = Size { cpu: 1, ram_gb: 4, disk_gb: 8, gpu: None };

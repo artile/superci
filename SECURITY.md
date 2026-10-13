@@ -88,7 +88,7 @@ These are tracked and will change. Until then, keep them in mind:
 - **Spot machines** can be taken back by AWS mid-job. The job fails and is run again once its run has finished
   (GitHub cannot restart one job of a run that is still going), at the next provider in your order below AWS's spot
   machines: AWS on-demand, unless you moved it or turned it off. With no other provider that can run it, it runs on a
-  spot machine again. A job that must not run twice (a deploy) should say `-ondemand` in its label. The machine says
+  spot machine again. A job that must not run twice (a deploy) should say `spot=false` in its label. The machine says
   it was taken back with a link only it has, and a job runs as root on its machine, so a job can claim its own machine
   was taken back: it is then run once more, and two such claims in a quarter of an hour send new jobs past AWS's spot
   machines for half an hour. Nothing else follows from the link.
@@ -96,7 +96,7 @@ These are tracked and will change. Until then, keep them in mind:
   that can run it. By default that is AWS on-demand, at AWS's list price; each provider's monthly budget and jobs at
   once still apply. A job that lands on another provider runs in that provider's environment: from Cloudflare or
   Modal it does not reach a network of your own on AWS. To keep a job on one provider, name it in its label
-  (`superci-aws`).
+  (`superci/provider=aws`).
 - **GitHub Enterprise Server:** the control plane runs in your cloud account, not inside your network. Your server
   has to accept the control plane's API calls and be able to send it job events, and runners have to reach your
   server. A server that only your network can reach will not work with a control plane on Cloudflare or Modal.

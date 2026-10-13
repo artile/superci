@@ -49,10 +49,10 @@ impl Http for FakeClouds {
         if u.ends_with("/orgs/acme/actions/runners/generate-jitconfig") { return json(serde_json::json!({ "encoded_jit_config": "JITCONFIG+/=", "runner": { "id": 5 } })); }
         if u == "https://gitlab.example/api/v4/projects/380/jobs/1977" {
             assert_eq!(r.header("private-token"), Some("glpat-test"));
-            return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 1977, "status": "pending", "tag_list": ["superci-2cpu", "docker"] }).to_string()));
+            return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 1977, "status": "pending", "tag_list": ["superci/cpu=2", "docker"] }).to_string()));
         }
-        if u == "https://gitlab.example/api/v4/projects/380/jobs/1980" { return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 1980, "status": "pending", "tag_list": ["superci-2cpu"] }).to_string())); }
-        if u == "https://gitlab.example/api/v4/projects/380/jobs/1979" { return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 1979, "status": "pending", "tag_list": ["docker", "superci-2cpu"] }).to_string())); }
+        if u == "https://gitlab.example/api/v4/projects/380/jobs/1980" { return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 1980, "status": "pending", "tag_list": ["superci/cpu=2"] }).to_string())); }
+        if u == "https://gitlab.example/api/v4/projects/380/jobs/1979" { return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 1979, "status": "pending", "tag_list": ["docker", "superci/cpu=2"] }).to_string())); }
         if u.starts_with("https://gitlab.example/api/v4/runners/") { return Ok(Response::new(if r.method == "DELETE" { 204 } else { 200 }, "application/json", "{}")); }
         if u == "https://gitlab.example/api/v4/projects/380/jobs/1978" { return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 1978, "status": "pending", "tag_list": ["docker"] }).to_string())); }
         // Runners 55, 56, … in the order they are made.
@@ -445,7 +445,7 @@ fn a_cloudflare_control_plane_starts_containers_itself() {
     run(webhook("completed", Some(&name)));
     assert_eq!(own.0.borrow().last().cloned(), Some(format!("stop {name}")));
     // A label's size: 2 CPU gets 8 GB.
-    run(labelled("queued", 8, "acme/app", None, "superci-2cpu"));
+    run(labelled("queued", 8, "acme/app", None, "superci/cpu=2"));
     assert_eq!(own.0.borrow().last().cloned(), Some(format!("start superci-{PLANE_ID}-8 JITCONFIG+/= 2cpu 8gb 20disk")));
     // With no limit set, Cloudflare runs 20 at once: the 21st waits.
     for id in 9..29 { run(labelled("queued", id, "acme/app", None, "superci")); }
@@ -775,14 +775,14 @@ fn gpus_and_windows_get_their_own_images_types_and_prices() {
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     // A GPU: the image with NVIDIA's drivers, T4 machines first.
-    run(labelled("queued", 1, "acme/app", None, "superci-gpu"));
+    run(labelled("queued", 1, "acme/app", None, "superci/gpu=any"));
     assert_eq!(job(&store, 1)["state"], "launched");
     let l = &launches(&clouds.clouds)[0];
     assert_eq!(field(l, "InstanceType"), "g4dn.xlarge");
     assert!(clouds.clouds.calls.borrow().iter().any(|c| c.2.contains("Action=DescribeImages") && c.2.contains("ubuntu24-gpu-x64")));
     // Windows: Windows' image, its disk at least the image's, a PowerShell start-up, the runner's own work folder, and
     // Windows' spot prices.
-    run(labelled("queued", 2, "acme/app", None, "superci-windows"));
+    run(labelled("queued", 2, "acme/app", None, "superci/os=windows"));
     assert_eq!(job(&store, 2)["state"], "launched");
     let l = &launches(&clouds.clouds)[1];
     assert_eq!((field(l, "ImageId").as_str(), field(l, "BlockDeviceMapping.1.Ebs.VolumeSize").as_str()), ("ami-windows", "100"));
@@ -809,7 +809,7 @@ fn a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price() {
     config.agents = vec![Agent { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
     config.routing.order = vec![Pool { off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci-gpu")));
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=any")));
     let launch = clouds.calls.borrow().iter().find(|c| c.1 == "https://runners.acme.workers.dev/launch").cloned().expect("agent launch");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&launch.2).unwrap()["gpu"], "T4", "any GPU: the least costly");
     let price = job(&store, 1)["usd_per_hour"].as_f64().unwrap();
@@ -825,7 +825,7 @@ fn an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise(
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.routing.order = vec![Pool { off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None }, Pool { off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
-    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci-l4")));
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=l4")));
     let j = job(&store, 1);
     assert_eq!(j["state"], "failed", "not tried again: {j}");
     assert!(j["error"].as_str().unwrap().contains("L-3819A6DF"), "{}", j["error"]);
@@ -849,21 +849,21 @@ fn the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it() 
     run(labelled("queued", 1, "acme/app", None, "superci"));
     assert_eq!(job(&store, 1)["cloud"], "cloudflare");
     // 8 CPUs do not (2 at most there): AWS, a type with 8 CPUs and 32 GB; the runner registers under the job's own label.
-    run(labelled("queued", 2, "acme/app", None, "superci-8cpu"));
+    run(labelled("queued", 2, "acme/app", None, "superci/cpu=8"));
     assert_eq!(job(&store, 2)["cloud"], "aws");
     assert_eq!(field(&launches(&clouds)[0], "InstanceType"), "m8a.2xlarge");
     let jit = clouds.calls.borrow().iter().filter(|c| c.1.ends_with("/generate-jitconfig")).last().cloned().unwrap();
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&jit.2).unwrap()["labels"], serde_json::json!(["superci-8cpu"]));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&jit.2).unwrap()["labels"], serde_json::json!(["superci/cpu=8"]));
     // arm64, more memory per CPU, a bigger disk, on-demand: an arm64 image and type, no spot.
-    run(labelled("queued", 3, "acme/app", None, "superci-arm64-2cpu-16gb-200disk-ondemand"));
+    run(labelled("queued", 3, "acme/app", None, "superci/cpu=2/ram=16/disk=200/arch=arm64/spot=false"));
     let l = &launches(&clouds)[1];
     assert_eq!((field(l, "InstanceType").as_str(), field(l, "InstanceMarketOptions.MarketType").as_str(), field(l, "BlockDeviceMapping.1.Ebs.VolumeSize").as_str()), ("r8g.large", "", "200"));
     assert!(clouds.calls.borrow().iter().any(|c| c.2.contains("Action=DescribeImages") && c.2.contains("arm64")), "the arm64 image");
     // Pinned to a cloud by the label.
-    run(labelled("queued", 4, "acme/app", None, "superci-aws"));
+    run(labelled("queued", 4, "acme/app", None, "superci/provider=aws"));
     assert_eq!(job(&store, 4)["cloud"], "aws");
     // Nothing here runs macOS; a part that is not understood: each fails with why, nothing started.
-    run(labelled("queued", 5, "acme/app", None, "superci-macos"));
+    run(labelled("queued", 5, "acme/app", None, "superci/os=macos"));
     assert_eq!(job(&store, 5)["state"], "failed");
     assert!(job(&store, 5)["error"].as_str().unwrap().starts_with("nowhere to run macos"), "{}", job(&store, 5)["error"]);
     run(labelled("queued", 6, "acme/app", None, "superci-8cores"));
@@ -998,12 +998,12 @@ fn gitlab_jobs_with_the_label_in_their_tags_get_a_machine_and_a_project_runner_o
     assert_eq!(run(gitlab_event(1977, "pending", "wrong")).status, 401, "only with the hook's secret");
 
     // A runner from before each job had its own (one per tag set, its token kept): removed by the next sweep.
-    store.0.borrow_mut().insert("glrunner:380:docker,superci-2cpu".into(), serde_json::json!({ "id": 9, "token": "glrt-old" }).to_string());
-    // Pending, tagged superci-2cpu (and docker): a project runner for those tags, and a machine of that size.
+    store.0.borrow_mut().insert("glrunner:380:docker,superci/cpu=2".into(), serde_json::json!({ "id": 9, "token": "glrt-old" }).to_string());
+    // Pending, tagged superci/cpu=2 (and docker): a project runner for those tags, and a machine of that size.
     assert_eq!(run(gitlab_event(1977, "pending", "hook-secret-0123456789")).status, 200);
     let created = clouds.calls.borrow().iter().find(|c| c.1.ends_with("/user/runners")).cloned().unwrap();
     let form: Vec<(String, String)> = url::form_urlencoded::parse(created.2.as_bytes()).into_owned().collect();
-    assert!(form.contains(&("tag_list".into(), "docker,superci-2cpu".into())) && form.contains(&("project_id".into(), "380".into())) && form.contains(&("run_untagged".into(), "false".into())));
+    assert!(form.contains(&("tag_list".into(), "docker,superci/cpu=2".into())) && form.contains(&("project_id".into(), "380".into())) && form.contains(&("run_untagged".into(), "false".into())));
     assert_eq!(own.0.borrow().first().cloned(), Some(format!("start superci-{PLANE_ID}-gl1977 gitlab https://gitlab.example glrt-runner55 2cpu 8gb 20disk")));
     let job = |id: &str| serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("job:gl{id}")]).unwrap();
     assert_eq!((job("1977")["state"].as_str(), job("1977")["provider"].as_str(), job("1977")["repo"].as_str()), (Some("launched"), Some("gitlab"), Some("acme/app")));
@@ -1041,7 +1041,7 @@ fn gitlab_jobs_with_the_label_in_their_tags_get_a_machine_and_a_project_runner_o
     assert_eq!(job("1980")["state"], "orphan");
     // The sweep: the old per-tag runner goes; runner 55 (its machine's time not up) stays.
     block_on(plane.alarm()).unwrap();
-    assert!(clouds.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1 == "https://gitlab.example/api/v4/runners/9") && !store.0.borrow().contains_key("glrunner:380:docker,superci-2cpu"));
+    assert!(clouds.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1 == "https://gitlab.example/api/v4/runners/9") && !store.0.borrow().contains_key("glrunner:380:docker,superci/cpu=2"));
     assert!(store.0.borrow().contains_key("glrunner:55"));
     assert_eq!(job("1980")["state"], "swept");
     assert!(own.0.borrow().iter().any(|c| c == &format!("stop superci-{PLANE_ID}-gl1980")) && clouds.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1 == "https://gitlab.example/api/v4/runners/57"));
@@ -1068,7 +1068,7 @@ fn a_failing_runner_that_would_not_start_is_started_by_the_next_sweep() {
     config.containers = true;
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&flaky) };
     // macOS: nowhere to run it; its failing runner's container does not start the first time.
-    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci-macos")));
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/os=macos")));
     let j = job(&store, 1);
     assert_eq!((j["state"].as_str(), j["failed_fast"].as_bool()), (Some("failed"), None));
     assert!(j["fail_pending"].as_str().unwrap().starts_with("nowhere to run"));
@@ -1096,7 +1096,7 @@ fn a_machine_that_fails_to_start_is_tried_again_and_a_job_with_no_place_fails_at
     block_on(plane.alarm()).unwrap();
     assert_eq!((job(&store, 1)["state"].as_str(), flaky.starts.get()), (Some("launched"), 2));
     // Nowhere to run it (8 CPU; Cloudflare has 4 at most): failed at once, not tried again.
-    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci-8cpu")));
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/cpu=8")));
     assert_eq!(job(&store, 2)["state"], "failed");
 }
 
@@ -1137,7 +1137,7 @@ fn machines_larger_than_allowed_are_refused_and_on_demand_counts_toward_budgets(
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci-64cpu")));
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/cpu=64")));
     assert_eq!((job(&store, 1)["state"].as_str(), job(&store, 1)["error"].as_str()), (Some("failed"), Some("it asks for 64 CPUs; the most allowed is 32 (set in the dashboard)")));
     // It fails at once on GitHub: a small machine (AWS, the only place here) whose runner says why and fails the job.
     assert_eq!(job(&store, 1)["failed_fast"], true);
@@ -1145,7 +1145,7 @@ fn machines_larger_than_allowed_are_refused_and_on_demand_counts_toward_budgets(
     let user_data: String = url::form_urlencoded::parse(launch.2.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
     let script = String::from_utf8(STANDARD.decode(user_data).unwrap()).unwrap();
     assert!(script.contains("ACTIONS_RUNNER_HOOK_JOB_STARTED=/tmp/superci-fail.sh") && script.contains("( sleep 600; poweroff )"));
-    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci-8cpu-ondemand")));
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/cpu=8/spot=false")));
     assert_eq!(job(&store, 2)["state"], "launched");
     let price = job(&store, 2)["usd_per_hour"].as_f64().unwrap();
     assert!(price > 0.4 && price < 0.6, "{price}");
@@ -1204,15 +1204,24 @@ fn jobs_nothing_here_can_run_fail_at_once() {
     let run = |r: Request| block_on(plane.handle(r));
     let fails = || own.0.borrow().iter().filter(|c| c.contains(" fail ")).cloned().collect::<Vec<_>>();
     // macOS (nothing here runs it): a small container takes it and fails it, saying why (base64 of a GitHub ::error::).
-    run(labelled("queued", 1, "acme/app", None, "superci-macos"));
+    run(labelled("queued", 1, "acme/app", None, "superci/os=macos"));
     assert_eq!((job(&store, 1)["state"].as_str(), job(&store, 1)["failed_fast"].as_bool()), (Some("failed"), Some(true)));
     let f = fails();
     assert!(f.len() == 1 && f[0].starts_with(&format!("start superci-{PLANE_ID}-1-x fail JITCONFIG+/= ")) && f[0].ends_with(" 1cpu 4gb 8disk"), "{f:?}");
     let line = String::from_utf8(STANDARD.decode(f[0].split(' ').nth(4).unwrap()).unwrap()).unwrap();
     assert_eq!(line, "::error title=SuperCI could not run this job::SuperCI runs no macOS jobs yet. Use runs-on: macos-latest for GitHub's own.");
     // Refused for its repository (a public one): no failing runner (it could take another repository's job).
-    run(labelled("queued", 2, "acme/site-public", None, "superci-macos"));
+    run(labelled("queued", 2, "acme/site-public", None, "superci/os=macos"));
     assert_eq!((job(&store, 2)["state"].as_str(), fails().len()), (Some("failed"), 1));
+    // A label written as before 0.16.9 (dashes, not key=value): the job is told at once how it is written now.
+    run(labelled("queued", 3, "acme/app", None, "superci-8cpu-arm64-ondemand"));
+    assert_eq!((job(&store, 3)["state"].as_str(), job(&store, 3)["failed_fast"].as_bool()), (Some("failed"), Some(true)));
+    let f = fails();
+    let line = String::from_utf8(STANDARD.decode(f.last().unwrap().split(' ').nth(4).unwrap()).unwrap()).unwrap();
+    assert_eq!(line, "::error title=SuperCI could not run this job::runs-on: superci-8cpu-arm64-ondemand is written runs-on: superci/cpu=8/arch=arm64/spot=false since SuperCI 0.16.9.");
+    // And one that says something no label has, likewise, with the keys there are.
+    run(labelled("queued", 4, "acme/app", None, "superci/cores=8"));
+    assert!(job(&store, 4)["error"].as_str().unwrap().starts_with("“cores” is not a key a label has. A label says a machine as key=value pairs after its name"), "{}", job(&store, 4)["error"]);
 }
 
 
@@ -1276,14 +1285,14 @@ fn without_its_own_network_a_machine_still_tries_each_zone_and_a_full_region_is_
     config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     // Zone b first (cheaper), full for every type; then zone a.
-    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci-gpu")));
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=any")));
     let tried = launches(&clouds.0);
     assert_eq!((tried.first().map(|f| field(f, "Placement.AvailabilityZone").to_string()), tried.last().map(|f| field(f, "Placement.AvailabilityZone").to_string())), (Some("us-east-1b".to_string()), Some("us-east-1a".to_string())));
     assert!(tried.iter().take_while(|f| field(f, "Placement.AvailabilityZone") == "us-east-1b").count() >= 1 && field(&tried[0], "InstanceType") == "g4dn.xlarge");
     assert_eq!((job(&store, 1)["state"].as_str(), job(&store, 1)["zone"].as_str()), (Some("launched"), Some("us-east-1a")));
     // Virginia full in every zone, Ohio allowing none: said as it is, not as a quota of 0.
     clouds.0.calls.borrow_mut().push(("".into(), "".into(), "full-everywhere".into()));
-    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci-gpu")));
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci/gpu=any")));
     let e = job(&store, 2)["error"].as_str().unwrap_or_default().to_string();
     assert!(e.contains("us-east-1: InsufficientInstanceCapacity") && e.contains("us-east-2: MaxSpotInstanceCountExceeded") && !e.contains("Service Quotas"), "{e}");
 }
@@ -1574,7 +1583,7 @@ fn a_failing_runner_that_takes_another_job_is_said_on_it_and_that_jobs_machine_t
 fn a_gitlab_job_whose_spot_machine_is_taken_back_is_run_again_on_demand() {
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| {
         if r.url == "https://gitlab.example/api/v4/projects/380/jobs/1977/retry" { return Some(Response::new(201, "application/json", "{}")) }
-        (r.url == "https://gitlab.example/api/v4/projects/380/jobs/1981").then(|| Response::new(200, "application/json", serde_json::json!({ "id": 1981, "status": "pending", "tag_list": ["superci-2cpu", "docker"] }).to_string()))
+        (r.url == "https://gitlab.example/api/v4/projects/380/jobs/1981").then(|| Response::new(200, "application/json", serde_json::json!({ "id": 1981, "status": "pending", "tag_list": ["superci/cpu=2", "docker"] }).to_string()))
     });
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
@@ -1794,7 +1803,7 @@ fn several_gitlabs_are_kept_apart_each_with_its_own_token_and_secret() {
         assert_eq!(r.header("private-token"), Some("glpat-corp"), "asked with its own token");
         let json = |status: u16, v: serde_json::Value| Response::new(status, "application/json", v.to_string());
         Some(match (r.method.as_str(), path) {
-            ("GET", "/projects/7/jobs/1977") => json(200, serde_json::json!({ "id": 1977, "status": "pending", "tag_list": ["superci-2cpu"] })),
+            ("GET", "/projects/7/jobs/1977") => json(200, serde_json::json!({ "id": 1977, "status": "pending", "tag_list": ["superci/cpu=2"] })),
             ("POST", "/user/runners") => json(201, serde_json::json!({ "id": 55, "token": "glrt-corp55" })),
             ("PUT", "/runners/55") => json(200, serde_json::json!({})),
             ("DELETE", "/runners/55") => Response::new(204, "application/json", ""),
@@ -1860,7 +1869,7 @@ fn with_no_spot_machine_the_job_goes_to_the_next_place_in_the_order() {
     assert!(launches(&clouds.0).iter().all(|l| field(l, "InstanceMarketOptions.MarketType") == "spot"), "only spot machines were asked for");
     assert!(own.0.borrow().iter().any(|c| c.starts_with(&format!("start superci-{PLANE_ID}-7 "))));
     // A machine Cloudflare cannot be (16 CPUs) passes it by, down to AWS on-demand.
-    run(labelled("queued", 8, "acme/app", None, "superci-16cpu"));
+    run(labelled("queued", 8, "acme/app", None, "superci/cpu=16"));
     let j = job(&store, 8);
     assert_eq!((j["state"].as_str(), j["cloud"].as_str(), j["on_demand"].as_bool()), (Some("launched"), Some("aws"), Some(true)), "{j}");
     assert_eq!(field(launches(&clouds.0).last().unwrap(), "InstanceMarketOptions.MarketType"), "");
@@ -1899,7 +1908,7 @@ fn with_on_demand_turned_off_and_nothing_else_in_the_order_the_job_waits_for_a_s
     block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
     assert_eq!((job(&store, 8)["state"].as_str(), job(&store, 8).get("on_demand")), (Some("launched"), None), "{}", job(&store, 8));
     // A label that asks for on-demand, with on-demand off: refused, saying so.
-    block_on(plane.handle(labelled("queued", 9, "acme/app", None, "superci-ondemand")));
+    block_on(plane.handle(labelled("queued", 9, "acme/app", None, "superci/spot=false")));
     let e = job(&store, 9)["error"].as_str().unwrap().to_string();
     assert!(job(&store, 9)["state"] == "failed" && e.contains("AWS on-demand is turned off"), "{e}");
 }
@@ -1954,7 +1963,7 @@ fn a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fa
     config.agents = vec![Agent { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
     config.routing.order = ["modal", "aws", "aws-on-demand"].iter().map(|c| Pool { off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci-gpu")));
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/gpu=any")));
     let j = job(&store, 7);
     assert_eq!((j["state"].as_str(), j["cloud"].as_str()), (Some("launched"), Some("aws")), "{j}");
     assert!(clouds.0.calls.borrow().iter().any(|c| c.1 == "https://runners.acme.workers.dev/launch"), "Modal was asked first");
@@ -1965,7 +1974,7 @@ fn a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fa
     });
     let store = Mem::default();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci-gpu")));
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/gpu=any")));
     let j = job(&store, 7);
     let e = j["error"].as_str().unwrap().to_string();
     assert_eq!((j["state"].as_str(), j["retries"].as_u64().unwrap_or(0)), (Some("failed"), 0), "{j}");
@@ -1982,7 +1991,7 @@ fn no_gpu_allowance_is_said_at_once_even_when_spot_refuses_for_another_reason() 
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci-gpu")));
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/gpu=any")));
     let j = job(&store, 7);
     let e = j["error"].as_str().unwrap().to_string();
     assert_eq!((j["state"].as_str(), j["retries"].as_u64().unwrap_or(0)), (Some("failed"), 0), "at once, not after three tries: {j}");
@@ -2079,7 +2088,7 @@ impl Http for Untold {
             Some("?status=in_progress&per_page=10") => { self.0.calls.borrow_mut().push(("GET".into(), r.url.clone(), String::new())); ok(serde_json::json!({ "workflow_runs": [{ "id": 91, "repository": { "private": true } }] })) }
             Some("/90/jobs?per_page=50") => ok(serde_json::json!({ "jobs": [job(9, "superci", "2026-09-21T14:11:20Z"), job(10, "ubuntu-latest", "2026-09-21T14:11:20Z"), job(11, "superci", "2026-09-21T14:13:10Z"), job(7, "superci", "2026-09-21T13:00:00Z"),
                 { "id": 12, "run_id": 90, "status": "in_progress", "labels": ["superci"], "created_at": "2026-09-21T14:11:20Z" }] })),
-            Some("/91/jobs?per_page=50") => ok(serde_json::json!({ "jobs": [job(13, "superci-2cpu", "2026-09-21T14:11:20Z")] })),
+            Some("/91/jobs?per_page=50") => ok(serde_json::json!({ "jobs": [job(13, "superci/cpu=2", "2026-09-21T14:11:20Z")] })),
             _ => self.0.send(r).await,
         }
     }
@@ -2117,7 +2126,7 @@ fn a_job_github_never_told_of_is_found_by_asking_and_gets_its_machine() {
     store.0.borrow_mut().insert("claimed_at".into(), (1_790_000_000_000u64 - 60_000).to_string());
     block_on(plane.alarm()).unwrap();
     assert_eq!((asked("acme/app/actions/runs?status=queued"), asked("acme/app/actions/runs?status=in_progress")), (3, 1));
-    assert_eq!(job(&store, 13)["label"], "superci-2cpu");
+    assert_eq!(job(&store, 13)["label"], "superci/cpu=2");
     assert_eq!(wakes.0.borrow().last(), Some(&60_000));
 }
 
@@ -2125,17 +2134,17 @@ fn a_job_github_never_told_of_is_found_by_asking_and_gets_its_machine() {
 fn a_control_plane_answers_to_the_labels_set_for_it_the_new_one_and_the_ones_before() {
     use superci_core::spec::{valid_label, Spec};
     for ok in ["acmeci", "ci2", "acme"] { assert!(valid_label(ok).is_ok(), "{ok}") }
-    for no in ["", "a", "2ci", "my-ci", "CI", "ubuntu", "gpu", "aws", "t4", "averyveryverylongnameforalabel"] { assert!(valid_label(no).is_err(), "{no}") }
+    for no in ["", "a", "2ci", "my-ci", "CI", "ubuntu", "linux", "x64", "ci/big", "ci=2", "averyveryverylongnameforalabel"] { assert!(valid_label(no).is_err(), "{no}") }
     let mut config = Config::new(PLANE_ID.into());
     assert_eq!(config.labels(), ["superci"]);
     // As the dashboard sets them: the new one first, the one before kept.
     config.set_labels(r#"["acmeci","superci"]"#);
     assert_eq!((config.label.as_str(), config.labels()), ("acmeci", vec!["acmeci".to_string(), "superci".to_string()]));
-    assert_eq!(config.parse("acmeci-8cpu-arm64").unwrap().unwrap().cpu, Some(8));
-    assert!(config.parse("superci").is_some() && config.parse("SuperCI-arm64").is_some() && config.parse("acmeciplus").is_none() && config.parse("ubuntu-latest").is_none());
+    assert_eq!(config.parse("acmeci/cpu=8/arch=arm64").unwrap().unwrap().cpu, Some(8));
+    assert!(config.parse("superci").is_some() && config.parse("SuperCI/arch=arm64").is_some() && config.parse("acmeciplus").is_none() && config.parse("ubuntu-latest").is_none());
     // The longest label that fits is the one meant; what cannot be a label is left out; nothing usable leaves it as it was.
-    assert!(Spec::parse_among("cibig-2cpu", &["ci".into(), "cibig".into()]).unwrap().is_ok());
-    config.set_labels(r#"["my-ci","gpu"]"#);
+    assert!(Spec::parse_among("cibig/cpu=2", &["ci".into(), "cibig".into()]).unwrap().is_ok());
+    config.set_labels(r#"["my-ci","linux"]"#);
     assert_eq!(config.labels(), ["acmeci", "superci"]);
     config.set_labels(r#"["superci"]"#);
     assert_eq!(config.labels(), ["superci"]);
@@ -2150,10 +2159,10 @@ fn a_control_plane_answers_to_the_labels_set_for_it_the_new_one_and_the_ones_bef
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     assert_eq!(json(&run(get("/health")))["label"], "acmeci");
-    run(labelled("queued", 21, "acme/app", None, "acmeci-2cpu"));
+    run(labelled("queued", 21, "acme/app", None, "acmeci/cpu=2"));
     run(labelled("queued", 22, "acme/app", None, "superci"));
     run(labelled("queued", 23, "acme/app", None, "otherci"));
-    assert_eq!((job(&store, 21)["label"].as_str(), job(&store, 22)["label"].as_str(), launches(&clouds).len()), (Some("acmeci-2cpu"), Some("superci"), 2));
+    assert_eq!((job(&store, 21)["label"].as_str(), job(&store, 22)["label"].as_str(), launches(&clouds).len()), (Some("acmeci/cpu=2"), Some("superci"), 2));
     assert!(!store.0.borrow().contains_key("job:23"));
     let status = json(&run(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")));
     assert_eq!((status["label"].as_str(), status["labels"].clone()), (Some("acmeci"), serde_json::json!(["acmeci", "superci"])));
@@ -2381,36 +2390,41 @@ fn an_aws_machines_disk_is_as_fast_as_its_size_deserves_unless_said_and_a_label_
     let s = |a: &str, b: &str| (a.to_string(), b.to_string());
     // By the machine's size: 31.25 MiB a second for each CPU, from what AWS includes (the standard machine's) up to
     // 1,000; IOPS as the speed needs.
-    assert_eq!(speed(&run(1, "superci-8cpu")), s("250", "3000"));
+    assert_eq!(speed(&run(1, "superci/cpu=8")), s("250", "3000"));
     assert_eq!(speed(&run(2, "superci")), s("125", "3000"));
-    assert_eq!(speed(&run(3, "superci-16cpu")), s("500", "3000"));
-    assert_eq!(speed(&run(4, "superci-32cpu")), s("1000", "4000"));
+    assert_eq!(speed(&run(3, "superci/cpu=16")), s("500", "3000"));
+    assert_eq!(speed(&run(4, "superci/cpu=32")), s("1000", "4000"));
     // It is kept with the job when above what AWS includes, and is in the job's price: 250 MiB a second adds the
     // price of 62.5 GB of disk.
     assert_eq!((job(&store, 1)["disk_mibs"].as_u64(), job(&store, 1).get("disk_iops"), job(&store, 2).get("disk_mibs"), job(&store, 4)["disk_iops"].as_u64()), (Some(250), None, None, Some(4000)));
     let fast = job(&store, 1)["usd_per_hour"].as_f64().unwrap();
     // As a label says, within what a volume takes.
-    assert_eq!(speed(&run(5, "superci-8cpu-125mbs")), s("125", "3000"));
+    assert_eq!(speed(&run(5, "superci/cpu=8/disk-speed=125")), s("125", "3000"));
     let plain = job(&store, 5)["usd_per_hour"].as_f64().unwrap();
     assert!((fast - plain - 125.0 / 2.0 * 0.08 / 730.0).abs() < 1e-6, "{fast} {plain}");
-    assert_eq!(speed(&run(6, "superci-2000mbs-20000iops-200disk")), s("2000", "20000"));
-    assert_eq!(speed(&run(7, "superci-750mbs")), s("750", "3000"));
+    assert_eq!(speed(&run(6, "superci/disk=200/disk-speed=2000/disk-iops=20000")), s("2000", "20000"));
+    assert_eq!(speed(&run(7, "superci/disk-speed=750")), s("750", "3000"));
     // A job's files in memory, or on a machine's own NVMe disk (a machine type that has one), when its label asks.
-    let ram = run(8, "superci-8cpu-ramdisk");
+    let ram = run(8, "superci/cpu=8/scratch=ramdisk");
     assert!(user_data_of(&ram).contains("mount -t tmpfs -o size=75% tmpfs") && field(&ram, "InstanceType") == "m8a.2xlarge");
     // (Its disk keeps what AWS includes: the job's writes go to memory. A speed said in the label is still given.)
     assert_eq!((speed(&ram), job(&store, 8)["ramdisk"].as_bool(), job(&store, 8).get("disk_mibs"), job(&store, 3).get("ramdisk")), (s("125", "3000"), Some(true), None, None));
-    assert_eq!(speed(&run(13, "superci-8cpu-ramdisk-500mbs")), s("500", "3000"));
-    let local = run(9, "superci-8cpu-localdisk");
+    assert_eq!(speed(&run(13, "superci/cpu=8/disk-speed=500/scratch=ramdisk")), s("500", "3000"));
+    let local = run(9, "superci/cpu=8/scratch=localdisk");
     assert!(user_data_of(&local).contains("/Instance Storage/") && !user_data_of(&local).contains("tmpfs") && field(&local, "InstanceType") == "m8id.2xlarge", "{}", field(&local, "InstanceType"));
     assert_eq!((speed(&local), job(&store, 9)["local_disk"].as_bool()), (s("125", "3000"), Some(true)));
-    assert!(!user_data_of(&run(10, "superci-8cpu")).contains("/mnt/superci"));
+    // A machine type that has a disk of its own uses it without being asked (a label naming such a family), and its
+    // job says so; on a machine without one the same lines find none, and nothing is mounted.
+    let pinned = run(10, "superci/cpu=8/family=m8id");
+    assert!(field(&pinned, "InstanceType") == "m8id.2xlarge" && user_data_of(&pinned).contains("/Instance Storage/") && job(&store, 10)["local_disk"] == true);
+    let plain = run(14, "superci/cpu=8");
+    assert!(user_data_of(&plain).contains("/Instance Storage/") && !user_data_of(&plain).contains("tmpfs") && job(&store, 14).get("local_disk").is_none());
     // The default machine can say the speed for every job: what AWS includes, at no extra price.
     config.machine = superci_core::spec::Spec { disk_mibs: Some(125), ..Default::default() };
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    block_on(plane.handle(labelled("queued", 11, "acme/app", None, "superci-8cpu")));
+    block_on(plane.handle(labelled("queued", 11, "acme/app", None, "superci/cpu=8")));
     assert_eq!(speed(&launches(&clouds).pop().unwrap()), s("125", "3000"));
-    block_on(plane.handle(labelled("queued", 12, "acme/app", None, "superci-8cpu-500mbs")));
+    block_on(plane.handle(labelled("queued", 12, "acme/app", None, "superci/cpu=8/disk-speed=500")));
     assert_eq!(speed(&launches(&clouds).pop().unwrap()), s("500", "3000"), "a label says otherwise for its job");
 }
 
@@ -2436,7 +2450,7 @@ fn a_spot_machine_is_asked_for_where_it_costs_least_for_its_speed_and_never_wher
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.routing.max_cpu = Some(64);
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci-32cpu")));
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/cpu=32")));
     let asked: Vec<(String, String)> = launches(&clouds.0).iter().filter(|l| field(l, "InstanceMarketOptions.MarketType") == "spot").map(|l| (field(l, "InstanceType").to_string(), field(l, "NetworkInterface.1.SubnetId").to_string())).collect();
     // By the price for the speed: the newest at $0.60 is as $0.50 of the older; then the older ones by their price;
     // the newest in its dearer zone ($0.80, as $0.667) before the older standard one at $0.70. Nothing in zone e.

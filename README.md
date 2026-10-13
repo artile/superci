@@ -16,7 +16,7 @@ jobs:
     runs-on: superci
 ```
 
-Each job gets a machine of its own, of the size its label asks for (`superci-16cpu`, `superci-arm64`, `superci-gpu`, `superci-windows`), and the machine is gone when the job ends. You pay your cloud's prices; there is no service of ours in between.
+Each job gets a machine of its own, of the size its label asks for (`superci/cpu=16`, `superci/arch=arm64`, `superci/gpu=any`, `superci/os=windows`), and the machine is gone when the job ends. You pay your cloud's prices; there is no service of ours in between.
 
 Without Node, the same program installs as `superci`:
 

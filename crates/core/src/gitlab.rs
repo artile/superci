@@ -1,5 +1,5 @@
 //! GitLab CI (gitlab.com or your own GitLab), next to GitHub. A project's webhook sends job events here; a job whose tags
-//! name this control plane's label (`tags: [superci-8cpu]`) gets a machine, as a GitHub job does. GitLab has no
+//! name this control plane's label (`tags: [superci/cpu=8]`) gets a machine, as a GitHub job does. GitLab has no
 //! runner registered for one job: a project runner per set of tags is created once (its token kept in the control
 //! plane's state) and each machine runs `gitlab-runner run-single --max-builds 1` with it, takes the next job with those
 //! tags, and ends. Jobs run in Docker (their `image:`), as on GitLab's own runners; a Mac runs macOS jobs on itself.

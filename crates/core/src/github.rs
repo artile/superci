@@ -332,7 +332,7 @@ pub struct JobEvent {
     /// The job's name and its workflow's, as the workflow file names them.
     pub name: String,
     pub workflow: String,
-    /// The job's own label (`superci` or `superci-8cpu-…`, as written): its runner registers under it.
+    /// The job's own label (`superci` or `superci/cpu=8-…`, as written): its runner registers under it.
     pub label: String,
     /// The machine that label asks for, or why it is not understood.
     pub spec: std::result::Result<Spec, String>,
@@ -341,7 +341,7 @@ pub struct JobEvent {
 }
 
 /// A `workflow_job` event this control plane should act on: in a repository of the App's owner, labelled with the control
-/// plane's label or a machine of it (`superci-8cpu-arm64`; see spec.rs), plus only GitHub's own self-hosted, system and
+/// plane's label or a machine of it (`superci/cpu=8/arch=arm64`; see spec.rs), plus only GitHub's own self-hosted, system and
 /// architecture labels, which a job may also list.
 pub fn our_job(payload: &serde_json::Value, base: &str, owner_login: &str) -> Option<JobEvent> { our_job_among(payload, &[base.to_string()], owner_login) }
 
@@ -433,11 +433,11 @@ mod tests {
         assert!(our_job(&event(serde_json::json!(["self-hosted", "SuperCI"]), "acme/app"), "superci", "acme").is_some());
         assert!(our_job(&event(serde_json::json!(["ubuntu-latest"]), "acme/app"), "superci", "acme").is_none());
         assert!(our_job(&event(serde_json::json!(["superci", "gpu"]), "acme/app"), "superci", "acme").is_none());
-        let sized = our_job(&event(serde_json::json!(["self-hosted", "SuperCI-8cpu-arm64"]), "acme/app"), "superci", "acme").unwrap();
-        assert_eq!(sized.label, "SuperCI-8cpu-arm64");
+        let sized = our_job(&event(serde_json::json!(["self-hosted", "SuperCI/cpu=8/arch=arm64"]), "acme/app"), "superci", "acme").unwrap();
+        assert_eq!(sized.label, "SuperCI/cpu=8/arch=arm64");
         assert_eq!(sized.spec.as_ref().unwrap().cpu, Some(8));
         assert!(our_job(&event(serde_json::json!(["superci-8cores"]), "acme/app"), "superci", "acme").unwrap().spec.is_err());
-        assert!(our_job(&event(serde_json::json!(["superci", "superci-8cpu"]), "acme/app"), "superci", "acme").is_none());
+        assert!(our_job(&event(serde_json::json!(["superci", "superci/cpu=8"]), "acme/app"), "superci", "acme").is_none());
         assert!(our_job(&event(serde_json::json!(["superci"]), "other/app"), "superci", "acme").is_none());
         assert!(valid_login("acme-corp") && !valid_login("-x") && !valid_login("a b") && !valid_login(""));
     }

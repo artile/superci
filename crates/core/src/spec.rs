@@ -1,9 +1,9 @@
-//! What a job asks for. Workflows say `runs-on: superci` for the default machine (set in the dashboard), or name
-//! the machine in the label itself, in any order: `superci-8cpu`, `superci-8cpu-32gb`, `superci-arm64`,
-//! `superci-100disk`, `superci-windows`, `superci-gpu` (or a GPU by name: `superci-l4`),
-//! `superci-aws`, `superci-ondemand`; and of its disk on AWS: `superci-500mbs`, `superci-6000iops`,
-//! `superci-ramdisk`, `superci-localdisk`. Nothing has to be created first;
-//! the machine registers with GitHub under the exact label the job used, so only jobs asking for the same can take it.
+//! What a job asks for. Workflows say `runs-on: superci` for the default machine (set in the dashboard), or say the
+//! machine in the label itself, as `key=value` pairs after its name, in any order: `superci/cpu=8`,
+//! `superci/cpu=8/ram=32/arch=arm64`, `superci/os=windows`, `superci/gpu=l4`, `superci/provider=aws/spot=false`,
+//! `superci/disk=200/disk-speed=500/scratch=ramdisk`, `superci/family=m8a+r8a`. One way to say each thing, and the
+//! same keys as `superci machine update` takes. Nothing has to be created first; the machine registers with GitHub
+//! under the exact label the job used, so only jobs asking for the same can take it.
 use serde::{Deserialize, Serialize};
 
 /// A machine as asked for. Unset parts are the default machine's, then each cloud's standard machine.
@@ -18,20 +18,28 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub os: Option<String>,
     /// One GPU: by name (one of `GPUS`), or "any" (each place's least costly).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub gpu: Option<String>,
-    /// Only this cloud ("aws", "cloudflare", "modal").
+    /// Only this provider ("aws", "cloudflare", "modal"): `provider=aws`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub cloud: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub on_demand: bool,
+    /// Whether it may run on a spot machine (one its cloud can take back): unset or `true`, it may; `false`, never
+    /// (`spot=false`: a deploy, a job that must not be run twice). A label's `spot=true` undoes a default of `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub spot: Option<bool>,
     /// Its disk's speed on AWS, when not left to the machine's size (see `disk_speed`): MiB a second, and IOPS.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
-    /// What a job writes most (Docker's files, its work folder, /tmp) in memory (`ramdisk`), or on a disk in the
-    /// machine itself (`localdisk`: a machine type with an NVMe disk of its own). AWS, Linux.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub nvme: bool,
-    /// Only these AWS machine families, when a label names any (`superci-32cpu-m8a`, `-m8a-r8a`): for a job that
+    /// Where what a job writes most (Docker's files, its work folder, /tmp) is kept, when not on the machine's disk:
+    /// "ramdisk" (in memory) or "localdisk" (a machine with an NVMe disk of its own, with them on it). One or the
+    /// other: `scratch=ramdisk`. AWS, Linux. (A machine that has a local disk uses it without being asked.)
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub scratch: Option<String>,
+    /// Only these AWS machine families, when a label names any (`family=m8a`, `family=m8a+r8a`): for a job that
     /// must have a certain kind of machine (the newest, say) and would sooner pay or wait than take another.
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub families: Vec<String>,
 }
+
+/// What a label can say: its keys, in the order they are written when a label is made from a machine.
+pub const KEYS: [&str; 12] = ["cpu", "ram", "disk", "disk-speed", "disk-iops", "arch", "os", "gpu", "family", "scratch", "provider", "spot"];
+
+/// How a label is written, for a job whose label is not understood.
+const HOW: &str = "A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, gpu, family, scratch, provider, spot";
 
 /// The AWS machine families a label may name: what a job's CPUs come from (compute, general, memory), AMD and arm64,
 /// and those with a local NVMe disk. Each with its memory for each CPU (GB).
@@ -50,7 +58,7 @@ pub const DISK_IOPS_INCLUDED: u32 = 3000;
 /// includes, unless a speed is said. As asked, when a label or the default machine says: within what a gp3 volume takes (125 to 2,000
 /// MiB a second, 3,000 to 80,000 IOPS, 4 IOPS for each MiB a second, 500 IOPS for each GB).
 pub fn disk_speed(cpu: u32, disk_gb: u32, s: &Spec) -> (u32, u32) {
-    let by_size = if s.ramdisk || s.nvme { DISK_MIBS_INCLUDED } else { (cpu * 125 / 4).clamp(DISK_MIBS_INCLUDED, 1000) };
+    let by_size = if s.scratch.is_some() { DISK_MIBS_INCLUDED } else { (cpu * 125 / 4).clamp(DISK_MIBS_INCLUDED, 1000) };
     let most_iops = (disk_gb.saturating_mul(500)).clamp(DISK_IOPS_INCLUDED, 80_000);
     let mibs = s.disk_mibs.unwrap_or(by_size).clamp(DISK_MIBS_INCLUDED, 2000).min(most_iops / 4);
     let iops = s.disk_iops.unwrap_or(DISK_IOPS_INCLUDED).clamp(DISK_IOPS_INCLUDED, 80_000).max(mibs * 4).min(most_iops);
@@ -63,14 +71,14 @@ pub const CLOUDS: [&str; 3] = ["aws", "cloudflare", "modal"];
 /// The GPUs a label may name, least costly first.
 pub const GPUS: [&str; 8] = ["t4", "l4", "a10g", "l40s", "a100", "h100", "h200", "b200"];
 
-/// Whether a word can be a control plane's label (what workflows name in `runs-on`, before any part): two to twenty-four
-/// lowercase letters and digits, a letter first, and not a word GitHub or a label's parts use (`ubuntu`, `gpu`…): a
-/// label is told from its parts by the dashes between them.
+/// Whether a word can be a control plane's label (what workflows name in `runs-on`, before any `/key=value`): two to
+/// twenty-four lowercase letters and digits, a letter first, and not a word GitHub's own runners use (`ubuntu`,
+/// `linux`…).
 pub fn valid_label(label: &str) -> Result<(), String> {
     let ok = (2..=24).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) && label.as_bytes()[0].is_ascii_lowercase();
     if !ok { return Err("A label is 2 to 24 lowercase letters and digits, starting with a letter (acmeci, ci2).".into()) }
-    const TAKEN: [&str; 25] = ["localdisk", "ubuntu", "windows", "macos", "linux", "self", "hosted", "selfhosted", "x64", "arm64", "arm", "amd64", "x86", "mac", "osx", "win", "gpu", "aws", "cloudflare", "modal", "ondemand", "spot", "latest", "ramdisk", "nvme"];
-    if TAKEN.contains(&label) || GPUS.contains(&label) || FAMILIES.iter().any(|(f, _)| *f == label) { return Err(format!("{label} means something else in a label already: choose another word.")) }
+    const TAKEN: [&str; 11] = ["ubuntu", "windows", "macos", "linux", "self", "hosted", "selfhosted", "x64", "arm64", "arm", "latest"];
+    if TAKEN.contains(&label) { return Err(format!("{label} is a word GitHub's own runners use: choose another.")) }
     Ok(())
 }
 
@@ -85,43 +93,116 @@ pub fn valid_name(name: &str) -> Result<(), String> {
 
 impl Spec {
     /// What a label asks for among several bases a control plane answers to: the longest that fits (so `ci` does not
-    /// take `cibig-8cpu`).
+    /// take `cibig/cpu=8`).
     pub fn parse_among(label: &str, bases: &[String]) -> Option<Result<Spec, String>> {
         let mut bases: Vec<&String> = bases.iter().collect();
         bases.sort_by_key(|b| std::cmp::Reverse(b.len()));
         bases.into_iter().find_map(|b| Spec::parse(label, b))
     }
 
-    /// What a label asks for: `base` alone is the default machine; `base-part-part…` names one. `None`: not ours;
-    /// `Some(Err)`: ours, but a part is not understood (the job is told why instead of waiting forever).
+    /// What a label asks for: `base` alone is the default machine; `base/key=value/…` says one. `None`: not ours;
+    /// `Some(Err)`: ours, but not understood (the job is told why instead of waiting forever).
     pub fn parse(label: &str, base: &str) -> Option<Result<Spec, String>> {
         let label = label.to_ascii_lowercase();
         let base = base.to_ascii_lowercase();
         if label == base { return Some(Ok(Spec::default())) }
-        let rest = label.strip_prefix(&base)?.strip_prefix('-')?;
+        let rest = label.strip_prefix(&base)?;
+        // The way a label was written before 0.16.9 (`superci-8cpu-arm64`): said as it is written now.
+        if let Some(parts) = rest.strip_prefix('-') {
+            return Some(Err(match Spec::before(parts) {
+                Some(s) => format!("runs-on: {label} is written runs-on: {} since SuperCI 0.16.9", s.label(&base)),
+                None => format!("runs-on: {label} is not understood. {HOW}"),
+            }))
+        }
+        let pairs = rest.strip_prefix('/')?;
         let mut s = Spec::default();
-        for part in rest.split('-') {
+        let mut said: Vec<&str> = vec![];
+        for pair in pairs.split('/') {
+            let Some((key, value)) = pair.split_once('=') else { return Some(Err(format!("“{pair}” in runs-on: {label} is not a key=value. {HOW}"))) };
+            if said.contains(&key) { return Some(Err(format!("{key} is said twice in runs-on: {label}"))) }
+            said.push(key);
+            if let Err(e) = s.set(key, value) { return Some(Err(format!("{e} (runs-on: {label})"))) }
+        }
+        Some(s.check().map(|_| s).map_err(|e| format!("{e} (runs-on: {label})")))
+    }
+
+    /// One key of a machine set to a value, as a label or `superci machine update` says it.
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let number = |what: &str, least: u32, most: u32| value.parse::<u32>().ok().filter(|n| (least..=most).contains(n)).ok_or_else(|| format!("{key} is {what} from {least} to {most}, not “{value}”"));
+        let one_of = |words: &[&str]| if words.contains(&value) { Ok(value.to_string()) } else { Err(format!("{key} is {}, not “{value}”", words.join(" or "))) };
+        match key {
+            "cpu" => self.cpu = Some(number("a number of CPUs", 1, 192)?),
+            "ram" => self.ram_gb = Some(number("GB of memory", 1, 1536)?),
+            "disk" => self.disk_gb = Some(number("GB of disk", 1, 16_000)?),
+            "disk-speed" => self.disk_mibs = Some(number("MiB a second", DISK_MIBS_INCLUDED, 2000)?),
+            "disk-iops" => self.disk_iops = Some(number("IOPS", DISK_IOPS_INCLUDED, 80_000)?),
+            "arch" => self.arch = Some(one_of(&["x64", "arm64"])?),
+            "os" => self.os = Some(one_of(&["linux", "windows", "macos"])?),
+            "gpu" => self.gpu = Some(if value == "any" { value.to_string() } else { one_of(&GPUS).map_err(|_| format!("gpu is any, or one of {}, not “{value}”", GPUS.join(", ")))? }),
+            "family" => {
+                let named: Vec<String> = value.split('+').map(str::to_string).collect();
+                if let Some(unknown) = named.iter().find(|f| !FAMILIES.iter().any(|(known, _)| known == f)) { return Err(format!("family is one or more AWS machine families joined by + (m8a, or m8a+r8a), and “{unknown}” is not one SuperCI knows")) }
+                if named.iter().enumerate().any(|(i, f)| named[..i].contains(f)) { return Err(format!("a family is said twice in family={value}")) }
+                self.families = named;
+            }
+            "scratch" => self.scratch = Some(one_of(&["ramdisk", "localdisk"])?),
+            "provider" => self.cloud = Some(one_of(&CLOUDS)?),
+            "spot" => self.spot = Some(one_of(&["true", "false"])? == "true"),
+            _ => return Err(format!("“{key}” is not a key a label has. {HOW}")),
+        }
+        Ok(())
+    }
+
+    /// What does not go together, whatever the provider: said before any machine is asked for.
+    pub fn check(&self) -> Result<(), String> {
+        let (arm, local) = (|f: &String| f.contains('g'), |f: &String| f.ends_with('d'));
+        if let (Some(a), Some(b)) = (self.families.iter().find(|f| arm(f)), self.families.iter().find(|f| !arm(f))) { return Err(format!("{a} machines are arm64 and {b} machines are x64: a job runs on one or the other")) }
+        if let (Some(f), Some(arch)) = (self.families.first(), self.arch.as_deref()) { if arm(f) != (arch == "arm64") { return Err(format!("{f} machines are {}, and the label says arch={arch}", if arm(f) { "arm64" } else { "x64" })) } }
+        if !self.families.is_empty() && self.gpu.is_some() { return Err("a GPU's machine family follows the GPU: say gpu or family, not both".into()) }
+        if self.scratch.as_deref() == Some("localdisk") { if let Some(f) = self.families.iter().find(|f| !local(f)) { return Err(format!("{f} machines have no local disk: name a family that has one (m8id, c8id, r8id; m8gd on arm64), or leave family out")) } }
+        Ok(())
+    }
+
+    /// The label that says this machine: `base`, then each key that is set, in `KEYS`' order.
+    pub fn label(&self, base: &str) -> String {
+        let mut out = base.to_string();
+        for (key, value) in self.pairs() { out += &format!("/{key}={value}") }
+        out
+    }
+
+    /// Each key that is set, with its value as a label writes it.
+    pub fn pairs(&self) -> Vec<(&'static str, String)> {
+        let n = |v: Option<u32>| v.map(|n| n.to_string());
+        [("cpu", n(self.cpu)), ("ram", n(self.ram_gb)), ("disk", n(self.disk_gb)), ("disk-speed", n(self.disk_mibs)), ("disk-iops", n(self.disk_iops)), ("arch", self.arch.clone()), ("os", self.os.clone()),
+            ("gpu", self.gpu.clone()), ("family", Some(self.families.join("+")).filter(|f| !f.is_empty())), ("scratch", self.scratch.clone()), ("provider", self.cloud.clone()), ("spot", self.spot.map(|s| s.to_string()))]
+            .into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
+    }
+
+    /// A label of before 0.16.9 (its parts after the name, `8cpu-arm64-ondemand`) as the machine it asked for; none
+    /// when a part is not one of that time's. Only to tell a job how its label is written now.
+    fn before(parts: &str) -> Option<Spec> {
+        let mut s = Spec::default();
+        for part in parts.split('-') {
             let num = |suffix: &str| part.strip_suffix(suffix).and_then(|n| n.parse::<u32>().ok()).filter(|n| *n > 0);
-            if FAMILIES.iter().any(|(f, _)| *f == part) { if !s.families.iter().any(|f| f == part) { s.families.push(part.to_string()) } }
-            else if part == "ramdisk" { s.ramdisk = true }
-            else if part == "localdisk" { s.nvme = true }
-            else if let Some(n) = num("mbs") { if !(125..=2000).contains(&n) { return Some(Err(format!("a disk's speed is 125 to 2000 MiB a second, not {n}"))) } s.disk_mibs = Some(n) }
-            else if let Some(n) = num("iops") { if !(3000..=80_000).contains(&n) { return Some(Err(format!("a disk has 3000 to 80000 IOPS, not {n}"))) } s.disk_iops = Some(n) }
-            else if let Some(n) = num("cpu") { if n > 192 { return Some(Err(format!("{n} CPUs is more than any machine has"))) } s.cpu = Some(n) }
-            else if let Some(n) = num("disk") { if n > 16_000 { return Some(Err(format!("{n} GB of disk is too much"))) } s.disk_gb = Some(n) }
-            else if let Some(n) = num("gb") { if n > 1536 { return Some(Err(format!("{n} GB of memory is more than any machine has"))) } s.ram_gb = Some(n) }
+            if FAMILIES.iter().any(|(f, _)| *f == part) { s.families.push(part.to_string()) }
+            else if part == "ramdisk" || part == "localdisk" { s.scratch = Some(part.to_string()) }
+            else if let Some(n) = num("mbs") { s.disk_mibs = Some(n) }
+            else if let Some(n) = num("iops") { s.disk_iops = Some(n) }
+            else if let Some(n) = num("cpu") { s.cpu = Some(n) }
+            else if let Some(n) = num("disk") { s.disk_gb = Some(n) }
+            else if let Some(n) = num("gb") { s.ram_gb = Some(n) }
             else if ["arm64", "arm"].contains(&part) { s.arch = Some("arm64".into()) }
             else if ["x64", "amd64", "x86"].contains(&part) { s.arch = Some("x64".into()) }
             else if ["macos", "mac", "osx"].contains(&part) { s.os = Some("macos".into()) }
             else if ["windows", "win"].contains(&part) { s.os = Some("windows".into()) }
+            else if part == "linux" { s.os = Some("linux".into()) }
             else if part == "gpu" { s.gpu = Some("any".into()) }
             else if let Some(g) = GPUS.iter().find(|g| **g == part || (**g == "a10g" && part == "a10")) { s.gpu = Some(g.to_string()) }
-            else if part == "linux" { s.os = Some("linux".into()) }
-            else if part == "ondemand" { s.on_demand = true }
+            else if part == "ondemand" { s.spot = Some(false) }
             else if CLOUDS.contains(&part) { s.cloud = Some(part.into()) }
-            else { return Some(Err(format!("“{part}” in runs-on: {label} is not understood (sizes are like 8cpu, 32gb, 100disk; also arm64, windows, gpu or a GPU like l4, ondemand, a disk's speed like 500mbs, ramdisk, localdisk, an AWS machine family like m8a, or a cloud: aws, cloudflare, modal)"))) }
+            else { return None }
         }
-        Some(Ok(s))
+        Some(s)
     }
 
     /// This, with unset parts taken from `default`.
@@ -130,19 +211,25 @@ impl Spec {
             // CPU asked for without memory: memory follows the CPU (4 GB each), not the default's.
             cpu: self.cpu.or(default.cpu), ram_gb: self.ram_gb.or(if self.cpu.is_some() { None } else { default.ram_gb }), disk_gb: self.disk_gb.or(default.disk_gb),
             // A label that names another kind of machine (Windows, a GPU, arm64) does not take the default's
-            // architecture or system with it (a default of arm64 does not make `-windows` Windows on arm64).
+            // architecture or system with it (a default of arm64 does not make `os=windows` Windows on arm64).
             arch: self.arch.clone().or_else(|| default.arch.clone().filter(|_| self.os.is_none() && self.gpu.is_none())),
             os: self.os.clone().or_else(|| default.os.clone().filter(|_| self.arch.is_none() && self.gpu.is_none())),
             gpu: self.gpu.clone().or_else(|| default.gpu.clone()),
-            cloud: self.cloud.clone().or_else(|| default.cloud.clone()), on_demand: self.on_demand || default.on_demand,
+            cloud: self.cloud.clone().or_else(|| default.cloud.clone()), spot: self.spot.or(default.spot),
             disk_mibs: self.disk_mibs.or(default.disk_mibs), disk_iops: self.disk_iops.or(default.disk_iops),
-            ramdisk: self.ramdisk || default.ramdisk, nvme: self.nvme || default.nvme,
+            scratch: self.scratch.clone().or_else(|| default.scratch.clone()),
             families: if self.families.is_empty() { default.families.clone() } else { self.families.clone() },
         }
     }
 
-    /// The architecture: as asked, else arm64 for macOS (Apple silicon, as GitHub's macos-latest) and x64 otherwise.
-    pub fn arch(&self) -> &str { self.arch.as_deref().unwrap_or(if self.os() == "macos" { "arm64" } else { "x64" }) }
+    /// The architecture: as asked, else its machine family's (`m8g` is arm64), else arm64 for macOS (Apple silicon,
+    /// as GitHub's macos-latest) and x64 otherwise.
+    pub fn arch(&self) -> &str { self.arch.as_deref().unwrap_or(if self.families.first().is_some_and(|f| f.contains('g')) || self.os() == "macos" { "arm64" } else { "x64" }) }
+    /// Never on a spot machine (`spot=false`).
+    pub fn on_demand(&self) -> bool { self.spot == Some(false) }
+    /// What it writes most in memory, or on a machine's own disk (`scratch`).
+    pub fn ramdisk(&self) -> bool { self.scratch.as_deref() == Some("ramdisk") }
+    pub fn localdisk(&self) -> bool { self.scratch.as_deref() == Some("localdisk") }
     pub fn os(&self) -> &str { self.os.as_deref().unwrap_or("linux") }
     /// Memory: as asked, else 4 GB per CPU.
     pub fn ram(&self) -> Option<u32> { self.ram_gb.or(self.cpu.map(|c| c * 4)) }
@@ -156,11 +243,11 @@ impl Spec {
         if self.arch.is_some() { parts.push(self.arch().to_string()) }
         if self.os.is_some() { parts.push(self.os().to_string()) }
         match self.gpu.as_deref() { Some("any") => parts.push("a GPU".into()), Some(g) => parts.push(format!("{} GPU", g.to_uppercase())), None => {} }
-        if self.on_demand { parts.push("on-demand".into()) }
+        if self.on_demand() { parts.push("no spot machines".into()) }
         match self.disk_mibs { Some(DISK_MIBS_INCLUDED) => parts.push("standard disk speed".into()), Some(m) => parts.push(format!("{m} MiB/s disk")), None => {} }
         if let Some(i) = self.disk_iops { parts.push(format!("{i} IOPS")) }
-        if self.ramdisk { parts.push("RAM disk".into()) }
-        if self.nvme { parts.push("local disk".into()) }
+        if self.ramdisk() { parts.push("RAM disk".into()) }
+        if self.localdisk() { parts.push("local disk".into()) }
         if !self.families.is_empty() { parts.push(format!("only {}", self.families.join(", "))) }
         if let Some(c) = &self.cloud { parts.push(format!("only {c}")) }
         if parts.is_empty() { "the default machine".into() } else { parts.join(", ") }
@@ -179,7 +266,8 @@ pub struct Capacity {
     pub min_ram_per_cpu: u32,
     /// The GPUs it has (one per machine), least costly first; none: no GPUs.
     #[serde(default)] pub gpus: Vec<String>,
-    /// Whether it can put a job's files in memory, or on a machine's own NVMe disk, when a label asks (AWS).
+    /// Whether it can put a job's files in memory or on a machine's own NVMe disk, and has machine families to
+    /// name, when a label asks (AWS).
     #[serde(default)] pub scratch: bool,
 }
 
@@ -204,18 +292,11 @@ impl Capacity {
         if disk > self.max_disk_gb { return Err(format!("at most {} GB disk", self.max_disk_gb)) }
         if !self.arch.iter().any(|a| a == s.arch()) { return Err(format!("{} only", self.arch.join(", "))) }
         if !self.os.iter().any(|o| o == s.os()) { return Err(format!("{} only", self.os.join(", "))) }
-        if s.on_demand && !self.on_demand { return Err("no on-demand machines".into()) }
-        if !s.families.is_empty() {
-            if !self.scratch { return Err("no AWS machine families".into()) }
-            // (A family is of one architecture, and with or without a local disk: what the label says elsewhere must agree.)
-            let arm = |f: &str| f.contains('g');
-            if let Some(f) = s.families.iter().find(|f| arm(f) != (s.arch() == "arm64")) { return Err(format!("{f} machines are {}", if arm(f) { "arm64 (say arm64 in the label too)" } else { "x64, not arm64" })) }
-            if s.gpu.is_some() { return Err("a GPU's machine family follows the GPU".into()) }
-        }
-        if s.ramdisk && !self.scratch { return Err("no RAM disk".into()) }
-        if s.nvme && !self.scratch { return Err("no machines with a local disk to ask for".into()) }
-        if (s.ramdisk || s.nvme) && s.os() != "linux" { return Err("a RAM disk or a local disk on Linux only".into()) }
-        if s.nvme && s.gpu.is_some() { return Err("no GPU machines with a local disk to ask for".into()) }
+        if s.on_demand() && !self.on_demand { return Err("spot machines only".into()) }
+        if !s.families.is_empty() && !self.scratch { return Err("no AWS machine families".into()) }
+        if s.scratch.is_some() && !self.scratch { return Err(format!("no {}", if s.ramdisk() { "RAM disk" } else { "machines with a local disk to ask for" })) }
+        if s.scratch.is_some() && s.os() != "linux" { return Err("a RAM disk or a local disk on Linux only".into()) }
+        if s.localdisk() && s.gpu.is_some() { return Err("no GPU machines with a local disk to ask for".into()) }
         if s.os() == "windows" && s.arch() != "x64" { return Err("Windows on x64 only".into()) }
         let gpu = match s.gpu.as_deref() {
             None => None,
@@ -265,7 +346,7 @@ pub fn aws_instance_types(s: &Spec) -> Vec<String> {
             Some(format!("{f}.{size}"))
         }).collect()
     }
-    let families = match (s.nvme, arm) {
+    let families = match (s.localdisk(), arm) {
         (false, false) => [(2, ["c8a", "c7a"]), (4, ["m8a", "m7a"]), (8, ["r8a", "r7a"])],
         (false, true) => [(2, ["c8g", "c7g"]), (4, ["m8g", "m7g"]), (8, ["r8g", "r7g"])],
         (true, false) => [(2, ["c8id", "c6id"]), (4, ["m8id", "m6id"]), (8, ["r8id", "r6id"])],
@@ -300,10 +381,10 @@ mod tests {
     fn a_label_naming_another_kind_of_machine_does_not_take_the_defaults_kind() {
         let parse = |l: &str| Spec::parse(l, "superci").unwrap().unwrap();
         let arm = Spec { arch: Some("arm64".into()), cpu: Some(8), ..Default::default() };
-        assert_eq!((parse("superci").or(&arm).arch(), parse("superci-windows").or(&arm).arch(), parse("superci-gpu").or(&arm).arch()), ("arm64", "x64", "x64"));
-        assert_eq!(parse("superci-windows").or(&arm).cpu, Some(8), "its size still comes along");
+        assert_eq!((parse("superci").or(&arm).arch(), parse("superci/os=windows").or(&arm).arch(), parse("superci/gpu=any").or(&arm).arch()), ("arm64", "x64", "x64"));
+        assert_eq!(parse("superci/os=windows").or(&arm).cpu, Some(8), "its size still comes along");
         let windows = Spec { os: Some("windows".into()), ..Default::default() };
-        assert_eq!((parse("superci").or(&windows).os(), parse("superci-arm64").or(&windows).os(), parse("superci-t4").or(&windows).os()), ("windows", "linux", "linux"));
+        assert_eq!((parse("superci").or(&windows).os(), parse("superci/arch=arm64").or(&windows).os(), parse("superci/gpu=t4").or(&windows).os()), ("windows", "linux", "linux"));
     }
 
     #[test]
@@ -311,39 +392,60 @@ mod tests {
         assert_eq!(Spec::parse("superci", "superci"), Some(Ok(Spec::default())));
         assert_eq!(Spec::parse("ubuntu-latest", "superci"), None);
         assert_eq!(Spec::parse("supercix", "superci"), None);
-        let s = Spec::parse("SuperCI-arm64-8cpu-32gb-100disk", "superci").unwrap().unwrap();
+        let s = Spec::parse("SuperCI/cpu=8/ram=32/disk=100/arch=arm64", "superci").unwrap().unwrap();
         assert_eq!((s.cpu, s.ram_gb, s.disk_gb, s.arch()), (Some(8), Some(32), Some(100), "arm64"));
-        assert_eq!(Spec::parse("superci-8cpu-arm64", "superci"), Spec::parse("superci-arm64-8cpu", "superci"));
-        let s = Spec::parse("superci-macos-aws-ondemand", "superci").unwrap().unwrap();
-        assert_eq!((s.os(), s.cloud.as_deref(), s.on_demand), ("macos", Some("aws"), true));
-        assert!(Spec::parse("superci-8cores", "superci").unwrap().unwrap_err().contains("8cores"));
-        assert!(Spec::parse("superci-500cpu", "superci").unwrap().is_err());
-        assert_eq!(Spec::parse("superci-8cpu", "superci").unwrap().unwrap().ram(), Some(32));
-        let s = Spec::parse("superci-windows-8cpu", "superci").unwrap().unwrap();
+        assert_eq!(Spec::parse("superci/cpu=8/arch=arm64", "superci"), Spec::parse("superci/cpu=8/arch=arm64", "superci"));
+        let s = Spec::parse("superci/os=macos/provider=aws/spot=false", "superci").unwrap().unwrap();
+        assert_eq!((s.os(), s.cloud.as_deref(), s.on_demand(), s.spot), ("macos", Some("aws"), true, Some(false)));
+        // What is not understood says so, with how a label is written: a key that is none, a value out of range or
+        // not one of its words, a pair with no "=", a key said twice.
+        let err = |label: &str| Spec::parse(label, "superci").unwrap().unwrap_err();
+        assert!(err("superci/cores=8").starts_with("“cores” is not a key a label has. A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, gpu, family, scratch, provider, spot"), "{}", err("superci/cores=8"));
+        assert_eq!(err("superci/cpu=500"), "cpu is a number of CPUs from 1 to 192, not “500” (runs-on: superci/cpu=500)");
+        assert_eq!(err("superci/arch=arm"), "arch is x64 or arm64, not “arm” (runs-on: superci/arch=arm)");
+        assert!(err("superci/cpu=8/ondemand").starts_with("“ondemand” in runs-on: superci/cpu=8/ondemand is not a key=value."));
+        assert_eq!(err("superci/cpu=8/cpu=16"), "cpu is said twice in runs-on: superci/cpu=8/cpu=16");
+        assert!(err("superci/spot=no").contains("spot is true or false") && err("superci/cpu=").contains("not “”"));
+        // A label written as before 0.16.9 is told how it is written now; one that never was a label, that it is not understood.
+        assert_eq!(err("superci-aws-32cpu-120disk-ramdisk"), "runs-on: superci-aws-32cpu-120disk-ramdisk is written runs-on: superci/cpu=32/disk=120/scratch=ramdisk/provider=aws since SuperCI 0.16.9");
+        assert_eq!(err("superci-8cpu-arm64-ondemand"), "runs-on: superci-8cpu-arm64-ondemand is written runs-on: superci/cpu=8/arch=arm64/spot=false since SuperCI 0.16.9");
+        assert!(err("superci-8cores").starts_with("runs-on: superci-8cores is not understood. A label says a machine as key=value pairs"));
+        // A machine written back as its label: each key that is set, in one order.
+        assert_eq!(Spec::parse("superci/spot=false/arch=arm64/cpu=8", "superci").unwrap().unwrap().label("superci"), "superci/cpu=8/arch=arm64/spot=false");
+        assert_eq!((Spec::default().label("acmeci"), Spec::parse("superci/spot=true", "superci").unwrap().unwrap().spot), ("acmeci".to_string(), Some(true)));
+        assert_eq!(Spec::parse("superci/cpu=8", "superci").unwrap().unwrap().ram(), Some(32));
+        let s = Spec::parse("superci/cpu=8/os=windows", "superci").unwrap().unwrap();
         assert_eq!((s.os(), s.cpu, s.gpu.as_deref()), ("windows", Some(8), None));
-        assert_eq!(Spec::parse("superci-gpu", "superci").unwrap().unwrap().gpu.as_deref(), Some("any"));
-        assert_eq!(Spec::parse("superci-a10-16cpu", "superci").unwrap().unwrap().gpu.as_deref(), Some("a10g"));
-        assert_eq!(Spec::parse("superci-H100", "superci").unwrap().unwrap().describe(), "H100 GPU");
+        assert_eq!(Spec::parse("superci/gpu=any", "superci").unwrap().unwrap().gpu.as_deref(), Some("any"));
+        assert_eq!(Spec::parse("superci/cpu=16/gpu=a10g", "superci").unwrap().unwrap().gpu.as_deref(), Some("a10g"));
+        assert_eq!(Spec::parse("superci/gpu=h100", "superci").unwrap().unwrap().describe(), "H100 GPU");
         // A disk's speed, and where a job's files go.
-        let s = Spec::parse("superci-8cpu-500mbs-6000iops-ramdisk", "superci").unwrap().unwrap();
-        assert_eq!((s.disk_mibs, s.disk_iops, s.ramdisk, s.nvme, s.disk_gb), (Some(500), Some(6000), true, false, None));
+        let s = Spec::parse("superci/cpu=8/disk-speed=500/disk-iops=6000/scratch=ramdisk", "superci").unwrap().unwrap();
+        assert_eq!((s.disk_mibs, s.disk_iops, s.ramdisk(), s.localdisk(), s.disk_gb), (Some(500), Some(6000), true, false, None));
         assert_eq!(s.describe(), "8 CPU, 500 MiB/s disk, 6000 IOPS, RAM disk");
-        assert!(Spec::parse("superci-50mbs", "superci").unwrap().unwrap_err().contains("125 to 2000") && Spec::parse("superci-100iops", "superci").unwrap().is_err());
-        let nvme = Spec::parse("superci-16cpu-localdisk", "superci").unwrap().unwrap();
-        assert!(Spec::parse("superci-16cpu-nvme", "superci").unwrap().is_err() && Spec::parse("superci-tmpfs", "superci").unwrap().is_err(), "one word for each");
+        assert!(Spec::parse("superci/disk-speed=50", "superci").unwrap().unwrap_err().contains("from 125 to 2000") && Spec::parse("superci/disk-iops=100", "superci").unwrap().is_err());
+        let nvme = Spec::parse("superci/cpu=16/scratch=localdisk", "superci").unwrap().unwrap();
+        assert!(err("superci/scratch=nvme").contains("scratch is ramdisk or localdisk") && err("superci/scratch=ramdisk/scratch=localdisk").contains("said twice"), "one or the other");
         assert_eq!(nvme.describe(), "16 CPU, local disk");
         assert_eq!(aws_instance_types(&nvme)[..2], ["m8id.4xlarge".to_string(), "m6id.4xlarge".to_string()]);
         assert_eq!(aws_instance_types(&Spec { arch: Some("arm64".into()), ..nvme.clone() })[0], "m8gd.4xlarge");
         assert!(Capacity::cloudflare().refuses(&nvme).is_some() && Capacity::modal().refuses(&s).is_some() && Capacity::aws().refuses(&s).is_none());
-        assert!(Capacity::aws().refuses(&Spec::parse("superci-windows-ramdisk", "superci").unwrap().unwrap()).unwrap().contains("Linux only"));
+        assert!(Capacity::aws().refuses(&Spec::parse("superci/os=windows/scratch=ramdisk", "superci").unwrap().unwrap()).unwrap().contains("Linux only"));
         // A machine family, when a job must have it: only those named, in the label's order, at the size that fits.
-        let pinned = Spec::parse("superci-32cpu-m8a-r8a", "superci").unwrap().unwrap();
+        let pinned = Spec::parse("superci/cpu=32/family=m8a+r8a", "superci").unwrap().unwrap();
         assert_eq!((aws_instance_types(&pinned), pinned.describe()), (vec!["m8a.8xlarge".to_string(), "r8a.8xlarge".to_string()], "32 CPU, only m8a, r8a".to_string()));
-        assert_eq!(aws_instance_types(&Spec::parse("superci-16cpu-c8a", "superci").unwrap().unwrap()), ["c8a.4xlarge"], "the family's own memory, when none is asked for");
-        assert_eq!(aws_instance_types(&Spec::parse("superci-16cpu-64gb-c8a", "superci").unwrap().unwrap()), ["c8a.8xlarge"], "larger, for the memory asked");
+        assert_eq!(aws_instance_types(&Spec::parse("superci/cpu=16/family=c8a", "superci").unwrap().unwrap()), ["c8a.4xlarge"], "the family's own memory, when none is asked for");
+        assert_eq!(aws_instance_types(&Spec::parse("superci/cpu=16/ram=64/family=c8a", "superci").unwrap().unwrap()), ["c8a.8xlarge"], "larger, for the memory asked");
         assert!(Capacity::aws().refuses(&pinned).is_none() && Capacity::modal().refuses(&pinned).is_some());
-        assert!(Capacity::aws().refuses(&Spec::parse("superci-m8g", "superci").unwrap().unwrap()).unwrap().contains("arm64") && Capacity::aws().refuses(&Spec::parse("superci-arm64-m8g", "superci").unwrap().unwrap()).is_none());
-        assert!(valid_label("m8a").is_err());
+        // A family says its architecture; what does not go together is said at once.
+        let arm = Spec::parse("superci/family=m8g", "superci").unwrap().unwrap();
+        assert_eq!((arm.arch(), Capacity::aws().refuses(&arm), aws_instance_types(&arm)), ("arm64", None, vec!["m8g.xlarge".to_string()]));
+        assert_eq!(err("superci/arch=x64/family=m8g"), "m8g machines are arm64, and the label says arch=x64 (runs-on: superci/arch=x64/family=m8g)");
+        assert!(err("superci/family=m8a+m8g").contains("a job runs on one or the other") && err("superci/family=m9z").contains("“m9z” is not one SuperCI knows") && err("superci/family=m8a+m8a").contains("said twice"));
+        assert!(err("superci/gpu=l4/family=m8a").contains("say gpu or family, not both"));
+        assert!(err("superci/scratch=localdisk/family=m8a").starts_with("m8a machines have no local disk: name a family that has one"));
+        assert_eq!(aws_instance_types(&Spec::parse("superci/cpu=8/scratch=localdisk/family=m8id", "superci").unwrap().unwrap()), ["m8id.2xlarge"]);
+        assert!(valid_label("m8a").is_ok() && valid_label("gpu").is_ok() && valid_label("linux").is_err(), "only GitHub's own words are taken");
         // The disk's speed follows the machine's size unless said; what is said stays within what a gp3 volume takes.
         let d = Spec::default();
         assert_eq!([2, 4, 8, 16, 32, 96].map(|cpu| disk_speed(cpu, 60, &d)), [(125, 3000), (125, 3000), (250, 3000), (500, 3000), (1000, 4000), (1000, 4000)]);
@@ -352,8 +454,9 @@ mod tests {
         assert_eq!(disk_speed(8, 60, &Spec { disk_iops: Some(80_000), ..Default::default() }), (250, 30_000), "500 IOPS for each GB at most");
         assert_eq!(disk_speed(32, 8, &d), (1000, 4000));
         // With its files in memory or on a local disk, the disk is not what a job writes to: what AWS includes, unless said.
-        assert_eq!((disk_speed(32, 60, &Spec { ramdisk: true, ..Default::default() }), disk_speed(32, 60, &Spec { nvme: true, ..Default::default() })), ((125, 3000), (125, 3000)));
-        assert_eq!(disk_speed(32, 60, &Spec { ramdisk: true, disk_mibs: Some(500), ..Default::default() }), (500, 3000));
+        let scratch = |on: &str| Spec { scratch: Some(on.into()), ..Default::default() };
+        assert_eq!((disk_speed(32, 60, &scratch("ramdisk")), disk_speed(32, 60, &scratch("localdisk"))), ((125, 3000), (125, 3000)));
+        assert_eq!(disk_speed(32, 60, &Spec { disk_mibs: Some(500), ..scratch("ramdisk") }), (500, 3000));
     }
 
     #[test]
@@ -373,12 +476,12 @@ mod tests {
         let cf = Capacity::cloudflare();
         let size = |label: &str| cf.fit(&Spec::parse(label, "superci").unwrap().unwrap());
         assert_eq!(size("superci"), Ok(Size { cpu: 4, ram_gb: 12, disk_gb: 20, gpu: None }), "the standard is the largest");
-        assert_eq!(size("superci-4cpu"), Ok(Size { cpu: 4, ram_gb: 12, disk_gb: 20, gpu: None }), "4 GB per CPU, up to the most it has");
-        assert_eq!(size("superci-2cpu"), Ok(Size { cpu: 2, ram_gb: 8, disk_gb: 20, gpu: None }));
-        assert_eq!(size("superci-1cpu-2gb"), Ok(Size { cpu: 1, ram_gb: 3, disk_gb: 20, gpu: None }), "at least 3 GB per CPU");
-        assert!(size("superci-4cpu-16gb").unwrap_err().contains("12 GB"));
-        assert!(size("superci-8cpu").unwrap_err().contains("4 CPU"));
-        assert!(size("superci-40disk").unwrap_err().contains("20 GB disk"));
+        assert_eq!(size("superci/cpu=4"), Ok(Size { cpu: 4, ram_gb: 12, disk_gb: 20, gpu: None }), "4 GB per CPU, up to the most it has");
+        assert_eq!(size("superci/cpu=2"), Ok(Size { cpu: 2, ram_gb: 8, disk_gb: 20, gpu: None }));
+        assert_eq!(size("superci/cpu=1/ram=2"), Ok(Size { cpu: 1, ram_gb: 3, disk_gb: 20, gpu: None }), "at least 3 GB per CPU");
+        assert!(size("superci/cpu=4/ram=16").unwrap_err().contains("12 GB"));
+        assert!(size("superci/cpu=8").unwrap_err().contains("4 CPU"));
+        assert!(size("superci/disk=40").unwrap_err().contains("20 GB disk"));
         assert_eq!(Capacity::aws().fit(&Spec { cpu: Some(8), ..Default::default() }), Ok(Size { cpu: 8, ram_gb: 32, disk_gb: 60, gpu: None }));
     }
 
@@ -386,22 +489,22 @@ mod tests {
     fn gpus_and_windows_go_where_they_are() {
         let spec = |label: &str| Spec::parse(label, "superci").unwrap().unwrap();
         // Any GPU: each place's least costly; one by name only where it is.
-        assert_eq!(Capacity::modal().fit(&spec("superci-gpu")).unwrap().gpu, Some("t4"));
-        assert_eq!(Capacity::modal().fit(&spec("superci-h100")).unwrap().gpu, Some("h100"));
-        assert_eq!(Capacity::aws().fit(&spec("superci-l4")).unwrap().gpu, Some("l4"));
-        assert_eq!(Capacity::aws().refuses(&spec("superci-h100")), Some("GPUs T4, L4, A10G, L40S only".into()));
-        assert_eq!(Capacity::cloudflare().refuses(&spec("superci-gpu")), Some("no GPUs".into()));
-        assert_eq!(Capacity::aws().refuses(&spec("superci-gpu-arm64")), Some("GPUs on x64 only".into()));
+        assert_eq!(Capacity::modal().fit(&spec("superci/gpu=any")).unwrap().gpu, Some("t4"));
+        assert_eq!(Capacity::modal().fit(&spec("superci/gpu=h100")).unwrap().gpu, Some("h100"));
+        assert_eq!(Capacity::aws().fit(&spec("superci/gpu=l4")).unwrap().gpu, Some("l4"));
+        assert_eq!(Capacity::aws().refuses(&spec("superci/gpu=h100")), Some("GPUs T4, L4, A10G, L40S only".into()));
+        assert_eq!(Capacity::cloudflare().refuses(&spec("superci/gpu=any")), Some("no GPUs".into()));
+        assert_eq!(Capacity::aws().refuses(&spec("superci/arch=arm64/gpu=any")), Some("GPUs on x64 only".into()));
         // Windows: AWS only, x64, no GPUs.
-        assert_eq!(Capacity::aws().refuses(&spec("superci-windows")), None);
-        assert!(Capacity::cloudflare().refuses(&spec("superci-windows")).unwrap().contains("linux only"));
-        assert!(Capacity::modal().refuses(&spec("superci-windows")).is_some());
-        assert_eq!(Capacity::aws().refuses(&spec("superci-windows-arm64")), Some("Windows on x64 only".into()));
-        assert_eq!(Capacity::aws().refuses(&spec("superci-windows-gpu")), Some("no Windows machines with GPUs".into()));
+        assert_eq!(Capacity::aws().refuses(&spec("superci/os=windows")), None);
+        assert!(Capacity::cloudflare().refuses(&spec("superci/os=windows")).unwrap().contains("linux only"));
+        assert!(Capacity::modal().refuses(&spec("superci/os=windows")).is_some());
+        assert_eq!(Capacity::aws().refuses(&spec("superci/arch=arm64/os=windows")), Some("Windows on x64 only".into()));
+        assert_eq!(Capacity::aws().refuses(&spec("superci/os=windows/gpu=any")), Some("no Windows machines with GPUs".into()));
         // GPU machines on AWS: the smallest that fits, T4 first for any.
-        assert_eq!(aws_instance_types(&spec("superci-gpu")), ["g4dn.xlarge", "g6.xlarge", "g5.xlarge"]);
-        assert_eq!(aws_instance_types(&spec("superci-l40s-8cpu")), ["g6e.2xlarge"]);
-        assert_eq!(aws_instance_types(&spec("superci-t4-4cpu-32gb")), ["g4dn.2xlarge"]);
+        assert_eq!(aws_instance_types(&spec("superci/gpu=any")), ["g4dn.xlarge", "g6.xlarge", "g5.xlarge"]);
+        assert_eq!(aws_instance_types(&spec("superci/cpu=8/gpu=l40s")), ["g6e.2xlarge"]);
+        assert_eq!(aws_instance_types(&spec("superci/cpu=4/ram=32/gpu=t4")), ["g4dn.2xlarge"]);
     }
 
     #[test]
@@ -409,7 +512,7 @@ mod tests {
         assert_eq!(Capacity::cloudflare().refuses(&Spec::default()), None);
         assert!(Capacity::cloudflare().refuses(&Spec { cpu: Some(8), ..Default::default() }).unwrap().contains("4 CPU"));
         assert!(Capacity::cloudflare().refuses(&Spec { arch: Some("arm64".into()), ..Default::default() }).is_some());
-        assert_eq!(Capacity::aws().refuses(&Spec { cpu: Some(64), arch: Some("arm64".into()), on_demand: true, ..Default::default() }), None);
+        assert_eq!(Capacity::aws().refuses(&Spec { cpu: Some(64), arch: Some("arm64".into()), spot: Some(false), ..Default::default() }), None);
         assert!(Capacity::aws().refuses(&Spec { os: Some("macos".into()), ..Default::default() }).is_some());
     }
 

@@ -951,13 +951,13 @@ if [ -n "$dev" ] && mkfs.ext4 -q -F -E nodiscard,lazy_itable_init=1,lazy_journal
 /// quarter stays for what the job runs.
 const MOUNT_RAM: &str = r#"mount -t tmpfs -o size=75% tmpfs "$scratch""#;
 
-/// A Linux machine's start-up script with a fast place for a job's files (see `SCRATCH`): the machine's own NVMe
-/// disk, memory, or memory over the disk when both are asked for. Set up after the root filesystem is grown and
-/// before Docker and the runner start. (Not for the runner that only says why a job failed.)
-pub fn with_scratch(script: String, ramdisk: bool, nvme: bool) -> String {
-    if !(ramdisk || nvme) || !script.contains(GROW_ROOT) { return script }
-    let mount = [nvme.then_some(MOUNT_NVME), ramdisk.then_some(MOUNT_RAM)].into_iter().flatten().collect::<Vec<_>>().join("\n");
-    script.replacen(GROW_ROOT, &format!("{GROW_ROOT}{}", SCRATCH.replace("MOUNT_SCRATCH", &mount)), 1)
+/// A Linux machine's start-up script with a fast place for a job's files (see `SCRATCH`): memory when the job
+/// asked for it (`ramdisk`), else the machine's own NVMe disk when its type has one (nothing is mounted on a
+/// machine without, and the files stay on its disk as they were). One or the other. Set up after the root
+/// filesystem is grown and before Docker and the runner start. (Not for the runner that only says why a job failed.)
+pub fn with_scratch(script: String, ramdisk: bool) -> String {
+    if !script.contains(GROW_ROOT) { return script }
+    script.replacen(GROW_ROOT, &format!("{GROW_ROOT}{}", SCRATCH.replace("MOUNT_SCRATCH", if ramdisk { MOUNT_RAM } else { MOUNT_NVME })), 1)
 }
 
 /// A Linux machine's start-up script that also tells the control plane how its start went (`url`: a link only this
@@ -1171,14 +1171,15 @@ mod tests {
         assert!(!runner_user_data(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10).unwrap().contains("growpart"));
         // A fast place for a job's files, when its label asks: memory, or the machine's own NVMe disk, mounted before
         // Docker and the runner start, with Docker's files, the work folder and /tmp bound from it.
-        let ram = with_scratch(script.clone(), true, false);
+        let ram = with_scratch(script.clone(), true);
         assert!(ram.contains(r#"mount -t tmpfs -o size=75% tmpfs "$scratch""#) && !ram.contains("Instance Storage") && ram.contains("for d in /var/lib/docker /var/lib/containerd /home/runner/work /tmp;"), "{ram}");
         assert!(ram.find("growpart").unwrap() < ram.find("tmpfs").unwrap() && ram.find("mount --bind").unwrap() < ram.find("systemctl start docker").unwrap() && ram.find("mount --bind").unwrap() < ram.find("./run.sh").unwrap());
-        let local = with_scratch(script.clone(), false, true);
-        assert!(local.contains("/Instance Storage/") && local.contains("mkfs.ext4 -q -F") && !local.contains("tmpfs") && !local.contains("MOUNT_SCRATCH"), "{local}");
-        assert!(with_scratch(gl.clone(), true, true).contains("tmpfs") && with_scratch(script.clone(), false, false) == script);
+        // Without it, the machine's own NVMe disk when it has one: found, formatted and mounted; nothing on a machine without.
+        let local = with_scratch(script.clone(), false);
+        assert!(local.contains("/Instance Storage/") && local.contains("mkfs.ext4 -q -F") && !local.contains("tmpfs") && !local.contains("MOUNT_SCRATCH") && local.contains(r#"if mountpoint -q "$scratch"; then"#), "{local}");
+        assert!(with_scratch(gl.clone(), true).contains("tmpfs") && with_scratch(gl.clone(), false).contains("/Instance Storage/"));
         let failing = runner_user_data(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10).unwrap();
-        assert_eq!(with_scratch(failing.clone(), true, true), failing);
+        assert_eq!(with_scratch(failing.clone(), true), failing);
         // A machine says how its start went, with a link of its own, in the background and before its runner starts.
         let hello = with_hello(script.clone(), "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken").unwrap();
         assert!(hello.contains("superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)") && hello.contains("superci_t1=$(date +%s%3N)\n# First reads") && hello.contains(r#"curl -s -m 5 -X POST "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$(date +%s%3N)""#), "{hello}");

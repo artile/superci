@@ -2710,13 +2710,21 @@ impl Dashboard {
             // The default machine: what `runs-on: superci` alone gets.
             ("POST", "/machine") => {
                 let plane = self.plane()?;
-                let num = |n: &str, max: u32| field(n).parse::<u32>().ok().filter(|v| *v > 0 && *v <= max);
-                // The disk's speed on AWS: left to the machine's size (nothing), what AWS includes ("standard"), or MiB a second.
-                let speed = match field("speed").as_str() { "" | "auto" => None, "standard" => Some(superci_core::spec::DISK_MIBS_INCLUDED),
-                    n => Some(n.parse::<u32>().ok().filter(|n| (125..=2000).contains(n)).ok_or("A disk's speed is 125 to 2000 MiB a second, `standard` or `auto`")?) };
-                let spec = Spec { cpu: num("cpu", 192), ram_gb: num("ram", 1536), disk_gb: num("disk", 16_000), arch: Some(field("arch")).filter(|a| a == "arm64"),
-                    os: Some(field("os")).filter(|o| o == "windows"), gpu: None, cloud: None, on_demand: field("ondemand") == "on", disk_mibs: speed, ..Default::default() };
-                if spec.arch.is_some() && spec.os.is_some() { return Ok(message(400, "Windows machines are x64", "Choose x64 for Windows, or Linux for arm64.")) }
+                // Each key a label has, by the same name and the same rules (see `Spec::set`); one left out, or said
+                // as `default`, is left to each provider's standard. (The dialog's box for no spot machines too.)
+                let mut spec = Spec::default();
+                for key in superci_core::spec::KEYS {
+                    let value = field(key);
+                    if value.is_empty() || value == "default" { continue }
+                    if let Err(e) = spec.set(key, &value) { return Ok(message(400, "That machine is not understood", &esc(&e))) }
+                }
+                if field("nospot") == "on" { spec.spot = Some(false) }
+                // (What is the standard anyway is not kept.)
+                if spec.arch.as_deref() == Some("x64") { spec.arch = None }
+                if spec.os.as_deref() == Some("linux") { spec.os = None }
+                if spec.spot == Some(true) { spec.spot = None }
+                if spec.arch.is_some() && spec.os.as_deref() == Some("windows") { return Ok(message(400, "Windows machines are x64", "Choose x64 for Windows, or Linux for arm64.")) }
+                if let Err(e) = spec.check() { return Ok(message(400, "That machine does not go together", &esc(&e))) }
                 let want = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "MACHINE", &want.to_string())?;
                 self.shown(&plane, |s| s["machine"] == want)?;
@@ -3602,7 +3610,7 @@ mark();load()})();</script>"#;
         let gl_on = v.gitlab_url().is_some();
         let (default_card, picker) = machines_card(v);
         let step = |n: u8, body: String| format!(r#"<li><span class="tick">{n}</span><div>{body}</div></li>"#);
-        let sizes = |note: &str| format!(r#"Another machine: add it to the label, like <code>{label}-8cpu</code>, <code>{label}-arm64</code> or <code>{label}-16cpu-64gb</code>.{note}<div class="step-do"><button type="button" class="button secondary sm" onclick="document.getElementById('label-picker').showModal()">Choose a machine…</button></div>"#);
+        let sizes = |note: &str| format!(r#"Another machine: add it to the label, like <code>{label}/cpu=8</code>, <code>{label}/arch=arm64</code> or <code>{label}/cpu=16/ram=64</code>.{note}<div class="step-do"><button type="button" class="button secondary sm" onclick="document.getElementById('label-picker').showModal()">Choose a machine…</button></div>"#);
         let gh_steps = [
             step(1, format!(r#"Set <code>runs-on</code> to your label:<pre class="snippet labels">jobs:
   test:
@@ -4215,13 +4223,13 @@ fn switch_prompts(v: &PlaneView) -> Vec<(&'static str, &'static str, String, Str
     let l = &v.label();
     let gh = |task: &str| format!("Move this repository's GitHub Actions jobs to SuperCI runners (`runs-on: {l}`, a fresh self-hosted machine per job). {task}
 
-- Linux jobs: `{l}`, keeping their size (`{l}-8cpu`, `{l}-16cpu-64gb`, `{l}-arm64`). Windows: `{l}-windows`. GPU: `{l}-gpu`.
+- Linux jobs: `{l}`, keeping their size as key=value pairs after it (`{l}/cpu=8`, `{l}/cpu=16/ram=64`, `{l}/arch=arm64`). Windows: `{l}/os=windows`. GPU: `{l}/gpu=any`.
 - Keep on GitHub, with a `# stays on GitHub: <why>` comment: macOS, npm publishing with provenance, jobs needing KVM, and fork pull requests in public repositories (`${{{{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || '{l}' }}}}`).
 - Change matrix values rather than `runs-on: ${{{{ matrix.os }}}}`, and reusable workflows where they are defined. One label per job, not a list.
 - Open one pull request with a before → after table. If a job fails only on the new runner, move it back and say why.");
     let gl = |task: &str| format!("Move this project's GitLab CI jobs to SuperCI runners (tag `{l}`, a fresh machine per job, in Docker). {task}
 
-- Tag jobs on GitLab's hosted Linux runners `{l}` (replacing `saas-linux-*`, or once in `default: tags`), keeping their size: `{l}-4cpu` for medium, `{l}-8cpu` for large, `{l}-16cpu` for xlarge, `{l}-arm64` for arm64. Keep `image:` and `services:`.
+- Tag jobs on GitLab's hosted Linux runners `{l}` (replacing `saas-linux-*`, or once in `default: tags`), keeping their size: `{l}/cpu=4` for medium, `{l}/cpu=8` for large, `{l}/cpu=16` for xlarge, `{l}/arch=arm64` for arm64. Keep `image:` and `services:`.
 - Keep macOS and Windows jobs on GitLab, with a `# stays on GitLab: <why>` comment. Change jobs from included files where they are defined.
 - Open one merge request with a before → after table. If a job fails only on the new runner, move it back and say why.");
     vec![
@@ -4647,8 +4655,8 @@ document.addEventListener('input',function(e){if(e.target.name==='own_url')super
 document.addEventListener('click',function(e){var cp=e.target.closest&&e.target.closest('[data-copy]');if(!cp)return;var d=cp.closest('dialog'),t=d.superciText,er=d.querySelector('.prompt-copy-error');
 navigator.clipboard.writeText(t).then(function(){if(t!==d.superciText)return;cp.classList.add('is-copied');cp.querySelector('svg').outerHTML='<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 4 4 8-8"/></svg>';cp.querySelector('span').textContent='Copied'},function(){er.hidden=false;er.textContent='Copy failed. Select the prompt and copy it manually.'})});
 function superciPick(f){var d=JSON.parse(f.dataset.default),label=f.dataset.mode==='label',g=function(n){var e=f.elements[n];return !e?'':e.type==='checkbox'?(e.checked&&!e.disabled):e.value};
-var cpu=+g('cpu')||0,ram=+g('ram')||0,disk=+g('disk')||0,arch=g('arch'),os=g('os'),gpu=g('gpu'),od=g('ondemand');
-if(label){var parts=[];if(cpu)parts.push(cpu+'cpu');if(ram)parts.push(ram+'gb');if(disk)parts.push(disk+'disk');if(arch)parts.push(arch);if(os)parts.push(os);if(gpu)parts.push(gpu);if(od)parts.push('ondemand');f.querySelector('[data-label]').textContent=f.dataset.base+(parts.length?'-'+parts.join('-'):'');
+var cpu=+g('cpu')||0,ram=+g('ram')||0,disk=+g('disk')||0,arch=g('arch'),os=g('os'),gpu=g('gpu'),od=g('nospot');
+if(label){var parts=[];if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(od)parts.push('spot=false');f.querySelector('[data-label]').textContent=f.dataset.base+(parts.length?'/'+parts.join('/'):'');
 ram=ram||(cpu?0:d.ram);cpu=cpu||d.cpu;disk=disk||d.disk;arch=arch||d.arch;os=os||d.os}
 f.querySelectorAll('.fit').forEach(function(x){var got=null;JSON.parse(x.dataset.caps).some(function(k){got=superciFit(k,cpu,ram,disk,arch,os,gpu);return got});x.classList.toggle('no',!got);var s=x.querySelector('[data-size]');if(s)s.textContent=got?got.cpu+' CPU · '+got.ram+' GB'+(got.gpu?' · '+got.gpu.toUpperCase():''):''})}
 (function(){var dragged=null;
@@ -4815,7 +4823,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
             esc(&missing.iter().map(|c| cloud_name(c)).collect::<Vec<_>>().join(", ")), if missing.len() == 1 { "is" } else { "are" }, if missing.len() == 1 { "it" } else { "them" })
     };
     // Rules by repository from before (a workflow now picks a provider in its label): shown, so nothing steers jobs unseen.
-    let rules = v.routing().rules.iter().map(|r| format!(r#"<form method="post" action="/routing" class="rule"><input type="hidden" name="action" value="remove"><input type="hidden" name="repo" value="{}"><span class="note"><code>{}</code> only uses {} (a rule from before; a workflow can say <code>runs-on: {}-{}</code> instead)</span><button class="chip">Remove</button></form>"#,
+    let rules = v.routing().rules.iter().map(|r| format!(r#"<form method="post" action="/routing" class="rule"><input type="hidden" name="action" value="remove"><input type="hidden" name="repo" value="{}"><span class="note"><code>{}</code> only uses {} (a rule from before; a workflow can say <code>runs-on: {}/provider={}</code> instead)</span><button class="chip">Remove</button></form>"#,
         esc(&r.repo), esc(&r.repo), esc(cloud_name(&r.cloud)), esc(&v.label()), esc(&r.cloud))).collect::<String>();
     format!(r#"<section class="card"><div class="card-head"><h2>Runner providers</h2><span class="order-note" id="order-note" aria-live="polite"></span></div><p class="note">Each provider starts a fresh runner for every job. A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next. When all are full, it waits. Drag to reorder.</p>{waiting}<ol class="pools" data-order="{}">{rows}</ol>{rules}{dialogs}</section>"#, esc(&current))
 }
@@ -4904,9 +4912,9 @@ fn spending_card(v: &PlaneView, lifted_ms: u64) -> String {
     format!(r#"{head}<p class="note">The most {} may spend on machines in a month and in a day. A provider's own budget is in its settings above.</p><ol class="pools">{list}</ol>{dialogs}</section>"#, esc(&v.name()))
 }
 
-/// Machines: the default machine (what plain `runs-on: superci` gets, and any part a label leaves out), changed in
+/// Machines: the default machine (what plain `runs-on: superci` gets, and anything a label leaves out), changed in
 /// its own dialog; and a picker that gives the label for another machine, naming only what is picked.
-/// The default machine (what the plain label gets, and any part a label leaves out), changed in its own dialog; and
+/// The default machine (what the plain label gets, and anything a label leaves out), changed in its own dialog; and
 /// Limits that keep jobs from costing more than meant: the largest machine a label may ask for, and the public
 /// repositories allowed to run here (on a public repository anyone can open a pull request; forks' never run).
 fn limits_card(v: &PlaneView, public: Option<Vec<String>>) -> String {
@@ -4967,11 +4975,11 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     };
     let pools = || v.order().iter().filter(|p| p.cloud != AWS_ON_DEMAND).map(|p| { let (key, name, _) = pool_text(v, &p.cloud); format!(r#"<span class="fit" data-caps="{}">{}{}<small data-size></small></span>"#, esc(&pool_caps(&p.cloud).to_string()), logo(&key, 18), esc(&name)) }).collect::<String>();
     // The disk's speed on AWS: by the machine's size unless set (what AWS includes, at no extra price, or a number).
-    let speed = m.disk_mibs.map(|s| if s == superci_core::spec::DISK_MIBS_INCLUDED { "standard".to_string() } else { s.to_string() });
-    let custom = speed.clone().filter(|s| !["standard", "250", "500", "1000"].contains(&s.as_str())).map(|s| (s.clone(), format!("{s} MiB/s")));
-    let mut speeds: Vec<(&str, &str)> = vec![("standard", "Standard, 125 MiB/s"), ("250", "250 MiB/s"), ("500", "500 MiB/s"), ("1000", "1,000 MiB/s")];
+    let speed = m.disk_mibs.map(|s| s.to_string());
+    let custom = speed.clone().filter(|s| !["125", "250", "500", "1000"].contains(&s.as_str())).map(|s| (s.clone(), format!("{s} MiB/s")));
+    let mut speeds: Vec<(&str, &str)> = vec![("125", "Standard, 125 MiB/s"), ("250", "250 MiB/s"), ("500", "500 MiB/s"), ("1000", "1,000 MiB/s")];
     if let Some((val, text)) = &custom { speeds.push((val, text)) }
-    let default = serde_json::json!({ "cpu": m.cpu.unwrap_or(0), "ram": m.ram_gb.unwrap_or(0), "disk": m.disk_gb.unwrap_or(0), "arch": m.arch(), "os": m.os(), "ondemand": m.on_demand });
+    let default = serde_json::json!({ "cpu": m.cpu.unwrap_or(0), "ram": m.ram_gb.unwrap_or(0), "disk": m.disk_gb.unwrap_or(0), "arch": m.arch(), "os": m.os(), "ondemand": m.on_demand() });
     // The default: what it is, in words, and its dialog.
     let mut parts = vec![m.cpu.map(|c| format!("{c} CPU")).unwrap_or_else(|| "Each provider's standard size".into())];
     if let Some(r) = m.ram_gb { parts.push(format!("{r} GB")) }
@@ -4979,18 +4987,24 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     match m.disk_mibs { Some(superci_core::spec::DISK_MIBS_INCLUDED) => parts.push("standard disk speed".into()), Some(s) => parts.push(format!("{s} MiB/s disk")), None => {} }
     parts.push(m.arch().into());
     parts.push(match m.os() { "windows" => "Windows".into(), "macos" => "macOS".into(), _ => "Linux".into() });
-    parts.push(if m.on_demand { "on-demand".into() } else { "spot".into() });
-    let dialog = format!(r#"<dialog class="dlg" id="default-machine" onclick="if(event.target===this)this.close()"><form method="post" action="/machine" class="dlg-body picker" data-mode="default" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Default machine</strong><small>For <code>runs-on: {base}</code>, and any part a label leaves out.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div class="picker-fields">{}{}{}{}{}{}</div><label class="check"><input type="checkbox" name="ondemand"{}> On-demand only (no spot)</label><div class="fits"><span class="note">Runs on</span>{}</div><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
+    parts.push(if m.on_demand() { "no spot machines".into() } else { "spot".into() });
+    // (What only a command sets for every job: where its files are kept, its machine families, its provider.)
+    if let Some(scratch) = m.scratch.as_deref() { parts.push(if scratch == "ramdisk" { "RAM disk".into() } else { "local disk".into() }) }
+    if !m.families.is_empty() { parts.push(m.families.join(", ")) }
+    if let Some(provider) = &m.cloud { parts.push(format!("only {}", cloud_name(provider))) }
+    let dialog = format!(r#"<dialog class="dlg" id="default-machine" onclick="if(event.target===this)this.close()"><form method="post" action="/machine" class="dlg-body picker" data-mode="default" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Default machine</strong><small>For <code>runs-on: {base}</code>, and any part a label leaves out.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div class="picker-fields">{}{}{}{}{}{}</div>{}<label class="check"><input type="checkbox" name="nospot"{}> No spot machines</label><div class="fits"><span class="note">Runs on</span>{}</div><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
         esc(&default.to_string()),
         select("cpu", "CPU", "Provider's standard", &CPUS, m.cpu), select("ram", "Memory", "4 GB per CPU", &RAMS, m.ram_gb), select("disk", "Disk", "Provider's standard", &DISKS, m.disk_gb),
-        choice("speed", "Disk speed (AWS)", "By machine size", &speeds, speed.as_deref()),
+        choice("disk-speed", "Disk speed (AWS)", "By machine size", &speeds, speed.as_deref()),
         choice("arch", "Architecture", "", &[("x64", "x64"), ("arm64", "arm64")], Some(m.arch())), choice("os", "System", "", &[("linux", "Linux"), ("windows", "Windows")], Some(m.os())),
-        if m.on_demand { " checked" } else { "" }, pools());
-    let default_row = format!(r#"<div class="default-machine"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span class="dm-main"><strong>Default machine</strong><small>What <code>{base}</code> runs on, and any part a label leaves out.</small></span><span class="dm-spec">{}</span><button type="button" class="button secondary sm" onclick="document.getElementById('default-machine').showModal()">Change</button></div>"#,
+        // (What the dialog does not show is kept as it is.)
+        m.pairs().iter().filter(|(key, _)| ["disk-iops", "gpu", "family", "scratch", "provider"].contains(key)).map(|(key, value)| format!(r#"<input type="hidden" name="{key}" value="{}">"#, esc(value))).collect::<String>(),
+        if m.on_demand() { " checked" } else { "" }, pools());
+    let default_row = format!(r#"<div class="default-machine"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span class="dm-main"><strong>Default machine</strong><small>What <code>{base}</code> runs on, and anything a label leaves out.</small></span><span class="dm-spec">{}</span><button type="button" class="button secondary sm" onclick="document.getElementById('default-machine').showModal()">Change</button></div>"#,
         parts.iter().map(|p| format!(r#"<span class="lim">{}</span>"#, esc(p))).collect::<String>());
     // The picker: every field starts at the default; the label names only what is picked.
-    let od_default = if m.on_demand { r#" checked disabled title="The default machine is on-demand already""# } else { "" };
-    let picker = format!(r#"<dialog class="dlg wide" id="label-picker" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Choose a machine</strong><small>Pick what differs from the default; its label names only that.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><form class="picker" data-mode="label" data-base="{base}" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)" onsubmit="return false"><div class="picker-fields">{}{}{}{}{}{}<label class="check"><input type="checkbox" name="ondemand"{od_default}> On-demand only</label></div><div class="label-out"><code><span class="k">runs-on:</span> <span class="hl" data-label>{base}</span></code><button type="button" class="chip" onclick="var b=this;navigator.clipboard.writeText('runs-on: '+b.closest('form').querySelector('[data-label]').textContent).then(function(){{b.textContent='Copied'}},function(){{}})">Copy</button></div><div class="fits"><span class="note">Runs on</span>{}</div></form></div></dialog>"#,
+    let od_default = if m.on_demand() { r#" checked disabled title="The default machine has no spot machines already""# } else { "" };
+    let picker = format!(r#"<dialog class="dlg wide" id="label-picker" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Choose a machine</strong><small>Pick what differs from the default; its label names only that.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><form class="picker" data-mode="label" data-base="{base}" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)" onsubmit="return false"><div class="picker-fields">{}{}{}{}{}{}<label class="check"><input type="checkbox" name="nospot"{od_default}> No spot machines</label></div><div class="label-out"><code><span class="k">runs-on:</span> <span class="hl" data-label>{base}</span></code><button type="button" class="chip" onclick="var b=this;navigator.clipboard.writeText('runs-on: '+b.closest('form').querySelector('[data-label]').textContent).then(function(){{b.textContent='Copied'}},function(){{}})">Copy</button></div><div class="fits"><span class="note">Runs on</span>{}</div></form></div></dialog>"#,
         esc(&default.to_string()),
         select("cpu", "CPU", "Default", &CPUS, None), select("ram", "Memory", "Default", &RAMS, None), select("disk", "Disk", "Default", &DISKS, None),
         choice("arch", "Architecture", "Default", &[("x64", "x64"), ("arm64", "arm64")], None), choice("os", "System", "Default", &[("linux", "Linux"), ("windows", "Windows")], None),
@@ -6734,7 +6748,13 @@ mod tests {
         assert!(html.contains(r#"<span class="lim">4 CPU</span><span class="lim">100 GB disk</span><span class="lim">x64</span><span class="lim">Linux</span><span class="lim">spot</span>"#));
         assert!(html.contains(r#"<dialog class="dlg" id="default-machine""#) && html.contains(r#"<option value="4" selected>4</option>"#) && html.contains(r#"<option value="100" selected>100 GB</option>"#));
         // The disk's speed on AWS is by the machine's size unless the default machine says: what AWS includes, or a number.
-        assert!(html.contains(r#"<label class="field"><span>Disk speed (AWS)</span><select name="speed"><option value="">By machine size</option><option value="standard">Standard, 125 MiB/s</option><option value="250">250 MiB/s</option>"#), "{html}");
+        assert!(html.contains(r#"<label class="field"><span>Disk speed (AWS)</span><select name="disk-speed"><option value="">By machine size</option><option value="125">Standard, 125 MiB/s</option><option value="250">250 MiB/s</option>"#), "{html}");
+        // Spot machines unless said: one box, in the default's dialog and in the picker.
+        assert!(html.matches(r#"<label class="check"><input type="checkbox" name="nospot"> No spot machines</label>"#).count() == 2 && !html.contains("ondemand\"") && !html.contains("On-demand only"), "{html}");
+        // The picker writes a label as key=value pairs after its name.
+        let shell = String::from_utf8(Dashboard::page("workflows").body).unwrap();
+        assert!(shell.contains("if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(od)parts.push('spot=false');") && shell.contains("f.dataset.base+(parts.length?'/'+parts.join('/'):'')"), "the script");
+        assert!(html.contains("<code>superci/cpu=8</code>, <code>superci/arch=arm64</code> or <code>superci/cpu=16/ram=64</code>"));
         // The picker starts at Default for everything (the label is plain), each field naming only what is picked.
         assert!(html.contains(r#"data-mode="label""#) && html.contains(r#"<option value="">Default</option>"#) && html.contains(r#"<span class="hl" data-label>superci</span>"#));
         assert!(html.matches(r#"class="fit""#).count() == 6 && !html.contains("Use as default"));
