@@ -758,7 +758,9 @@ fn runner_text(j: &serde_json::Value) -> (String, String) {
         // From before computers were set aside (coming soon).
         "machine" => ("machine".into(), "Your computer".into()),
         // An on-demand machine says so (its label asked, or the order sent it there).
-        "aws" => ("aws".into(), format!("{}{}", match j["cpu"].as_u64() { Some(c) if !kind.is_empty() => format!("{c} CPU · {kind}"), _ => kind.to_string() }, if j["on_demand"] == true && !kind.is_empty() { " · on-demand" } else { "" })),
+        // (Its disk too, when it is not the standard 60 GB: what its label asked for.)
+        "aws" => ("aws".into(), format!("{}{}{}", match j["cpu"].as_u64() { Some(c) if !kind.is_empty() => format!("{c} CPU · {kind}"), _ => kind.to_string() },
+            match j["disk_gb"].as_u64() { Some(d) if d != 60 && !kind.is_empty() => format!(" · {d} GB disk"), _ => String::new() }, if j["on_demand"] == true && !kind.is_empty() { " · on-demand" } else { "" })),
         _ => {
             // "4cpu-12gb" as "4 CPU · 12 GB".
             let size = kind.split_once("cpu-").and_then(|(c, r)| Some(format!("{c} CPU · {} GB", r.strip_suffix("gb")?)));
@@ -770,7 +772,11 @@ fn runner_text(j: &serde_json::Value) -> (String, String) {
 /// Why a job that asked for a spot machine ran on an on-demand one (which costs about twice as much): what AWS said
 /// of spot, in plain words, and the region where the account's spot limit was reached, if that was it.
 fn off_spot(j: &serde_json::Value) -> Option<(String, Option<String>)> {
+    // (Or why one kept off spot machines is on one after all: its on-demand machine did not fit the account's limit.)
+    if j["spot_again"] == true && j["on_demand"] != true && (j["cloud"] == "aws" || j["cloud"] == "") { return Some(("On a spot machine again: an on-demand one does not fit your AWS account's on-demand limit".into(), None)) }
     if j["on_demand"] != true || j["cloud"] != "aws" { return None }
+    // Run again after AWS took its spot machine back: SuperCI's own choice, whatever spot machines there were.
+    if j["after_reclaim"] == true { return Some(("On-demand: run again after AWS took back its spot machine".into(), None)) }
     let said = j["spot_refused"].as_str()?;
     // The account's AWS organization allows no spot machines: no limit to raise, and nothing of AWS's to wait for.
     if said.contains(superci_core::plane::SPOT_NOT_ALLOWED) { return Some(("On-demand: your AWS organization does not allow spot machines".into(), None)) }
@@ -6256,6 +6262,18 @@ mod tests {
         let limited = ran(Some("us-east-1: MaxSpotInstanceCountExceeded"));
         assert_eq!(job_words(&limited)["why"], "On-demand: your AWS spot limit in N. Virginia was reached");
         assert_eq!(job_words(&ran(Some("us-east-1: InsufficientInstanceCapacity; us-east-2: InsufficientInstanceCapacity")))["why"], "On-demand: AWS had no spot machine for it");
+        // One run again after AWS took its spot machine back says that (AWS may well have had spot machines), and one
+        // that went back on a spot machine because its on-demand machine did not fit the account's limit says so.
+        let mut again = ran(Some("us-east-1 on-demand: VcpuLimitExceeded"));
+        again["after_reclaim"] = true.into();
+        assert_eq!(job_words(&again)["why"], "On-demand: run again after AWS took back its spot machine");
+        (again["on_demand"], again["spot_again"]) = (false.into(), true.into());
+        assert_eq!(job_words(&again)["why"], "On a spot machine again: an on-demand one does not fit your AWS account's on-demand limit");
+        // A disk that is not the standard one is in the job's row, beside its machine.
+        (again["disk_gb"], again["machine_type"], again["cpu"]) = (120.into(), "r8a.8xlarge".into(), 32.into());
+        assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge · 120 GB disk");
+        again["disk_gb"] = 60.into();
+        assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge");
         assert_eq!(job_words(&ran(None))["why"], "", "a job whose label asked for on-demand");
         assert!(job_table(&[limited.clone()]).contains(r#"<small class="jt-why open">On-demand: your AWS spot limit in N. Virginia was reached</small>"#));
         let notice = spot_limit_notice(&[limited.clone(), limited, ran(None)]);

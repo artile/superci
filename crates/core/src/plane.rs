@@ -261,6 +261,11 @@ pub struct Job {
     /// Not on a spot machine this time, if another place in the order can run it: run again after AWS took its spot
     /// machine back, or a try that ran out of time with every region refusing a spot machine.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub no_spot: bool,
+    /// Run again after AWS took its spot machine back (GitHub's new attempt of the job, or GitLab's retry).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub after_reclaim: bool,
+    /// Kept off spot machines, and the account's on-demand limit did not let its machine start: asked on a spot
+    /// machine again, whatever kept it off them (and kept there: it waits for one rather than for that limit).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub spot_again: bool,
     /// The places where starting its machine failed: its next try starts with the others (cleared once one starts).
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub failed_at: Vec<String>,
     /// What each region said when it had no spot machine for it, and the job went down the order (or waits).
@@ -368,6 +373,13 @@ const WAIT_FOR_SPOT: &str = "waiting: AWS has no spot machine for it now, and no
 /// what each said): the job waits while machines of this control plane's own are using them, as it would for a place
 /// that is full; with none of its own running it is tried again and then fails, saying which limits to raise.
 const AT_LIMIT: &str = "at the AWS account's limits: ";
+
+/// How a try ends for a job kept off spot machines whose on-demand machine the account's limit refused (followed by
+/// what each region said): it is asked on a spot machine again (see `Job::spot_again`).
+const BACK_ON_SPOT: &str = "back on spot: ";
+
+/// As `WAIT_FOR_SPOT`, when an on-demand machine was asked for too and refused only for the account's limit.
+const WAIT_FOR_SPOT_AT_LIMIT: &str = "waiting: AWS has no spot machine for it now, and your AWS account's on-demand limit does not let an on-demand one start (";
 
 /// What a job's machine is called in AWS's console (its Name tag): the CI's name, the repository and the job, so that
 /// a list of machines says whose each is. Nothing reads it: a machine is known by its `superci-plane` and
@@ -1246,6 +1258,7 @@ impl<'a> ControlPlane<'a> {
                 let again = rerun_key(&project, ev.pipeline_id, &ev.name);
                 if self.store.get(&again).await?.is_some() {
                     job.no_spot = true;
+                    job.after_reclaim = true;
                     self.store.delete(&again).await?;
                 }
                 self.start(plane_url, &mut job).await?;
@@ -1455,11 +1468,13 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Whether other jobs' GPU machines are up in AWS now (then a quota refusal means it is full, not that it is 0).
-    /// How many other jobs of this control plane have a machine in AWS now, or had one until two minutes ago.
-    async fn aws_machines_up(&self, job_id: u64) -> usize {
+    /// How many other jobs of this control plane have a machine in AWS now, and how many had one until two minutes
+    /// ago (AWS counts a machine against the account's limits a little longer than it runs).
+    async fn aws_machines_up(&self, job_id: u64) -> (usize, usize) {
         let now = self.clock.now_ms();
         let jobs: Vec<Job> = self.store.list("job:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
-        jobs.iter().filter(|j| j.job_id != job_id && j.cloud == "aws" && j.machine_id.is_some() && (active(j) || j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000))).count()
+        let theirs = |j: &&Job| j.job_id != job_id && j.cloud == "aws" && j.machine_id.is_some();
+        (jobs.iter().filter(theirs).filter(|j| active(j)).count(), jobs.iter().filter(theirs).filter(|j| !active(j) && j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000)).count())
     }
 
     async fn gpu_machines_up(&self, job_id: u64) -> bool {
@@ -1673,6 +1688,7 @@ impl<'a> ControlPlane<'a> {
         let again = rerun_key(&ev.repo, ev.run_id, &ev.name);
         if self.store.get(&again).await?.is_some() {
             job.no_spot = true;
+            job.after_reclaim = true;
             self.store.delete(&again).await?;
             put_json(self.store, &key, &job).await?;
         }
@@ -1723,7 +1739,7 @@ impl<'a> ControlPlane<'a> {
             let spec = match spec { Ok(s) => s, Err(e) => { intrinsic = true; return Err(e) } };
             if let Some(why) = self.config.routing.too_large(&spec) { intrinsic = true; return Err(why) }
             let now = self.clock.now_ms();
-            let places = match self.place(&job.repo, &spec, gitlab, job.no_spot || self.spot_paused(now).await, &job.failed_at).await? {
+            let places = match self.place(&job.repo, &spec, gitlab, !job.spot_again && (job.no_spot || self.spot_paused(now).await), &job.failed_at).await? {
                 Placement::Run(p) => p,
                 Placement::Wait(why) => {
                     job.state = "waiting".into();
@@ -1873,8 +1889,8 @@ impl<'a> ControlPlane<'a> {
                             }
                         }
                         let Some((region, machine, private)) = launched else {
-                            // No region has room: what the regions said goes with the job, down the order.
-                            if !answers.is_empty() { job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
+                            // No region has room: what the regions said of spot goes with the job, down the order.
+                            if !answers.is_empty() && tried_spot { job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
                             return Ok(Tried::NoRoom)
                         };
                         if !on_demand { job.spot_refused = None }
@@ -1924,7 +1940,7 @@ impl<'a> ControlPlane<'a> {
             }
             // Out of time with spot machines refused: the next try starts below them.
             if out_of_time {
-                if !answers.is_empty() { job.no_spot = true; job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
+                if !answers.is_empty() && !job.spot_again { job.no_spot = true; job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
                 last = format!("{last} (out of time for more tries)");
             }
             let (machine_id, machine_type) = match started {
@@ -1943,12 +1959,23 @@ impl<'a> ControlPlane<'a> {
                     }
                     // Every refusal was for the account's limits, on-demand's among them, for a machine that is no GPU
                     // one (those are said above). (With only spot asked, the job waits for a spot machine as before.)
-                    if failures.is_empty() && !out_of_time && quota_only && tried_on_demand && !answers.is_empty() && spec.gpu.is_none() { return Err(format!("{AT_LIMIT}{}", answers.join("; "))) }
+                    let at_limit = failures.is_empty() && !out_of_time && quota_only && tried_on_demand && !answers.is_empty() && spec.gpu.is_none();
+                    // Kept off spot machines (run again after AWS took one back, or spot paused), with on-demand's
+                    // limit not letting its machine start: a job larger than that limit would wait for room that
+                    // never comes, when the spot limit it ran under a moment ago is free. A spot machine is asked
+                    // for again (the pool that took one back is asked last, see `pools_to_avoid`).
+                    if at_limit && !tried_spot && !job.spot_again && matches!(self.place(&job.repo, &spec, gitlab, false, &job.failed_at).await, Ok(Placement::Run(p)) if p.iter().any(|(c, _)| c == "aws")) {
+                        return Err(format!("{BACK_ON_SPOT}{}", answers.join("; ")))
+                    }
+                    if at_limit { return Err(format!("{AT_LIMIT}{}", answers.join("; "))) }
                     return Err(match failures.len() {
                         0 if out_of_time => last,
                         // Only spot machines were asked for, no region has one, and nothing else in the order can run
                         // it: it waits for one (see `WAIT_FOR_SPOT`).
                         0 if tried_spot && !tried_on_demand && !answers.is_empty() => format!("{WAIT_FOR_SPOT}{}", answers.join("; ")),
+                        // No spot machine now, and on-demand refused only for the account's limit: it waits for a
+                        // spot machine likewise (an on-demand one is asked for each time too, should the limit have room).
+                        0 if tried_spot && on_demand_refused && on_demand_quota_only && !answers.is_empty() && spec.gpu.is_none() => format!("{WAIT_FOR_SPOT_AT_LIMIT}{}", answers.join("; ")),
                         0 if answers.len() > 1 => format!("AWS had no room for it: {}", answers.join("; ")),
                         0 => last,
                         // One place, and it failed: what it said, as it said it.
@@ -1980,13 +2007,28 @@ impl<'a> ControlPlane<'a> {
             // GitHub's own runners, and the sweep tries it again. With none of its own, the limit is below what the
             // job asks or used by something else in the account: tried again twice like any failed start, then it
             // fails saying which limits to raise.
+            if let Some(said) = e.strip_prefix(BACK_ON_SPOT) {
+                job.no_spot = false;
+                job.spot_again = true;
+                job.state = "waiting".into();
+                job.error = Some(format!("waiting: an on-demand machine for it does not fit your AWS account's on-demand limit; asking for a spot machine again ({})", said.chars().take(160).collect::<String>()));
+                put_json(self.store, &key, &*job).await?;
+                return self.timer.wake_in(2_000).await;
+            }
             let e = match e.strip_prefix(AT_LIMIT) {
                 None => e,
                 Some(said) => {
-                    let ours = self.aws_machines_up(job.job_id).await;
+                    let (ours, ended) = self.aws_machines_up(job.job_id).await;
                     if ours > 0 {
                         job.state = "waiting".into();
                         job.error = Some(format!("waiting: your AWS account's limit of running CPUs is in use by {ours} of your job{} there; it starts when one ends ({})", if ours == 1 { "" } else { "s" }, said.chars().take(160).collect::<String>()));
+                        put_json(self.store, &key, &*job).await?;
+                        return self.timer.wake_in(20_000).await;
+                    }
+                    // None running, one ended a moment ago: AWS counts it a little longer. Nothing is waited for but that.
+                    if ended > 0 {
+                        job.state = "waiting".into();
+                        job.error = Some(format!("waiting: AWS still counts a machine of yours that ended a moment ago against your account's limit of running CPUs; trying again ({})", said.chars().take(160).collect::<String>()));
                         put_json(self.store, &key, &*job).await?;
                         return self.timer.wake_in(20_000).await;
                     }
@@ -1998,7 +2040,7 @@ impl<'a> ControlPlane<'a> {
             // without a payment method): every job asking for it fails alike, at once.
             if !e.starts_with(SEVERAL) && refuses_alike(&e) { intrinsic = true; job.cloud = String::new() }
             // No spot machine anywhere and no other place for it: it waits for one, however long (as for a place that is full).
-            if e.starts_with(WAIT_FOR_SPOT) {
+            if e.starts_with(WAIT_FOR_SPOT) || e.starts_with(WAIT_FOR_SPOT_AT_LIMIT) {
                 job.state = "waiting".into();
                 job.error = Some(format!("{})", e.chars().take(280).collect::<String>()));
                 put_json(self.store, &key, &*job).await?;

@@ -2366,6 +2366,67 @@ fn a_machine_nobody_waits_for_is_ended_at_the_first_sweep_after_it_had_time_to_c
 }
 
 #[test]
+fn a_job_run_again_after_a_reclaim_goes_back_on_spot_when_the_on_demand_limit_cannot_take_it() {
+    // An account whose on-demand limit is below what the job asks (AWS refuses every on-demand machine for it), with
+    // spot machines to be had unless `short`; while `full`, the spot limit is used up too.
+    let (short, full) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| {
+        if !body.contains("Action=RunInstances") { return None }
+        if !body.contains("MarketType=spot") { return Some(aws_refuses("VcpuLimitExceeded")) }
+        if full.get() { return Some(aws_refuses("MaxSpotInstanceCountExceeded")) }
+        short.get().then(|| aws_refuses("InsufficientInstanceCapacity"))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let sweep_after = |ms: u64| { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap() };
+    let runner = |job: u64| format!("superci-{PLANE_ID}-{job}");
+    let market = |n: usize| field(&launches(&clouds.0)[n], "InstanceMarketOptions.MarketType").to_string();
+
+    // The new attempt of a job whose spot machine AWS took back is kept off spot machines. Its on-demand machine is
+    // refused for the account's limit: it is asked on a spot machine again, at once, and says so.
+    store.0.borrow_mut().insert("rerun:acme/app:3:".into(), "1".into());
+    run(job_event("queued", 8, "acme/app", None));
+    let j = job(&store, 8);
+    assert_eq!((j["state"].as_str(), j["after_reclaim"].as_bool(), j["spot_again"].as_bool(), j.get("no_spot"), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), Some(true), Some(true), None, 0), "{j}");
+    assert!(j["error"].as_str().unwrap().starts_with("waiting: an on-demand machine for it does not fit your AWS account's on-demand limit; asking for a spot machine again (us-east-1 on-demand: VcpuLimitExceeded"), "{}", j["error"]);
+    assert_eq!((launches(&clouds.0).len(), market(0).as_str()), (1, ""), "only an on-demand machine was asked for");
+    assert!(wakes.0.borrow().contains(&2_000), "tried again within seconds: {:?}", wakes.0.borrow());
+    sweep_after(2_000);
+    let j = job(&store, 8);
+    assert_eq!((j["state"].as_str(), j["machine_id"].as_str(), j.get("on_demand"), market(1).as_str()), (Some("launched"), Some("i-0abc"), None, "spot"), "{j}");
+    assert!(j.get("spot_refused").is_none(), "what on-demand said is not kept as spot's refusal: {j}");
+
+    // A job with no spot machine to be had now, whose on-demand machine the limit refuses: it waits for a spot
+    // machine, however long, and is not counted as a start that failed.
+    short.set(true);
+    run(job_event("queued", 9, "acme/app", None));
+    for _ in 0..4 { sweep_after(30_000); }
+    let j = job(&store, 9);
+    assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), 0), "{j}");
+    assert!(j["error"].as_str().unwrap().starts_with("waiting: AWS has no spot machine for it now, and your AWS account's on-demand limit does not let an on-demand one start (us-east-1: InsufficientInstanceCapacity"), "{}", j["error"]);
+    short.set(false);
+    sweep_after(30_000);
+    assert_eq!((job(&store, 9)["state"].as_str(), job(&store, 9).get("on_demand")), (Some("launched"), None));
+
+    // Both limits used up, and the only machines of its own ended a moment ago: AWS counts one a little longer than
+    // it runs. That is what is said (nothing is promised to start "when one ends"), and it is tried again.
+    for id in [8, 9] { run(job_event("in_progress", id, "acme/app", Some(&runner(id)))); run(concluded(id, &runner(id), "success")); }
+    full.set(true);
+    run(job_event("queued", 10, "acme/app", None));
+    let j = job(&store, 10);
+    assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), 0), "{j}");
+    assert!(j["error"].as_str().unwrap().starts_with("waiting: AWS still counts a machine of yours that ended a moment ago against your account's limit of running CPUs; trying again (us-east-1: MaxSpotInstanceCountExceeded"), "{}", j["error"]);
+    // Two minutes on, nothing of its own counts any more: the limits themselves are what refuses it.
+    sweep_after(130_000);
+    assert!(job(&store, 10)["error"].as_str().unwrap().starts_with("waiting: starting its machine failed, trying again (Your AWS account's limits do not let this machine start"), "{}", job(&store, 10)["error"]);
+}
+
+#[test]
 fn at_the_aws_accounts_limit_a_job_waits_for_one_of_its_own_to_end_and_fails_plainly_when_it_can_never_fit() {
     // While `full`, AWS refuses every launch for the account's limits: spot for its spot limit, on-demand for its own.
     let full = std::cell::Cell::new(true);
