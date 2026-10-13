@@ -308,8 +308,11 @@ fn machines_start_in_the_control_planes_own_network_cheapest_zone_first_else_the
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(webhook("queued", None)));
     let tried = launches(&clouds.0);
-    // Zone b first (cheaper), out of room; then zone a. Each with its subnet, the group that lets nothing in, and a public address.
-    assert_eq!(tried.iter().map(|f| field(f, "NetworkInterface.1.SubnetId")).take(2).collect::<Vec<_>>(), ["subnet-b", "subnet-a"]);
+    // Where a machine costs least for its speed first: the newest type in zone b (the cheaper zone), then the older
+    // types there (still less than the newest in zone a), all out of room; then the newest in zone a. Each with its
+    // subnet, the group that lets nothing in, and a public address.
+    assert_eq!(tried.iter().map(|f| (field(f, "InstanceType").to_string(), field(f, "NetworkInterface.1.SubnetId").to_string())).collect::<Vec<_>>(),
+        [("c8a.xlarge", "subnet-b"), ("c7a.xlarge", "subnet-b"), ("m7a.xlarge", "subnet-b"), ("c8a.xlarge", "subnet-a")].map(|(t, s)| (t.to_string(), s.to_string())));
     assert!(tried.iter().all(|f| field(f, "NetworkInterface.1.SecurityGroupId.1") == "sg-1" && field(f, "NetworkInterface.1.AssociatePublicIpAddress") == "true"));
     assert_eq!(job(&store, 7)["state"], "launched");
     assert!(!store.0.borrow().keys().any(|k| k.starts_with("denied:")));
@@ -1272,10 +1275,11 @@ fn without_its_own_network_a_machine_still_tries_each_zone_and_a_full_region_is_
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
-    // Zone b first (cheaper), full; then zone a.
+    // Zone b first (cheaper), full for every type; then zone a.
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci-gpu")));
     let tried = launches(&clouds.0);
-    assert_eq!(tried.iter().map(|f| field(f, "Placement.AvailabilityZone")).take(2).collect::<Vec<_>>(), ["us-east-1b", "us-east-1a"]);
+    assert_eq!((tried.first().map(|f| field(f, "Placement.AvailabilityZone").to_string()), tried.last().map(|f| field(f, "Placement.AvailabilityZone").to_string())), (Some("us-east-1b".to_string()), Some("us-east-1a".to_string())));
+    assert!(tried.iter().take_while(|f| field(f, "Placement.AvailabilityZone") == "us-east-1b").count() >= 1 && field(&tried[0], "InstanceType") == "g4dn.xlarge");
     assert_eq!((job(&store, 1)["state"].as_str(), job(&store, 1)["zone"].as_str()), (Some("launched"), Some("us-east-1a")));
     // Virginia full in every zone, Ohio allowing none: said as it is, not as a quota of 0.
     clouds.0.calls.borrow_mut().push(("".into(), "".into(), "full-everywhere".into()));
@@ -2408,6 +2412,38 @@ fn an_aws_machines_disk_is_as_fast_as_its_size_deserves_unless_said_and_a_label_
     assert_eq!(speed(&launches(&clouds).pop().unwrap()), s("125", "3000"));
     block_on(plane.handle(labelled("queued", 12, "acme/app", None, "superci-8cpu-500mbs")));
     assert_eq!(speed(&launches(&clouds).pop().unwrap()), s("500", "3000"), "a label says otherwise for its job");
+}
+
+#[test]
+fn a_spot_machine_is_asked_for_where_it_costs_least_for_its_speed_and_never_where_its_type_is_not_offered() {
+    // A day's real picture, 32 CPUs: the newest type is the cheapest and has no machine anywhere; the older
+    // memory-heavy type is cheaper than the older standard one; no type is offered in zone e. Every request is refused.
+    let prices = [("m8a.8xlarge", "us-east-1a", 0.60), ("m8a.8xlarge", "us-east-1b", 0.80), ("m7a.8xlarge", "us-east-1a", 0.70), ("m7a.8xlarge", "us-east-1b", 1.10),
+        ("r8a.8xlarge", "us-east-1a", 0.85), ("r7a.8xlarge", "us-east-1a", 0.64), ("r7a.8xlarge", "us-east-1b", 0.66)];
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| {
+        let xml = |s: String| Some(Response::new(200, "text/xml", s));
+        if body.contains("Action=DescribeVpcs") { return xml("<vpcSet><item><vpcId>vpc-1</vpcId></item></vpcSet>".into()) }
+        if body.contains("Action=DescribeSubnets") { return xml(format!("<subnetSet>{}</subnetSet>", ["a", "b", "e"].map(|z| format!("<item><subnetId>subnet-{z}</subnetId><availabilityZone>us-east-1{z}</availabilityZone></item>")).concat())) }
+        if body.contains("Action=DescribeSecurityGroups") { return xml("<securityGroupInfo><item><groupId>sg-1</groupId></item></securityGroupInfo>".into()) }
+        if body.contains("Action=DescribeSpotPriceHistory") && !body.contains("AvailabilityZone=") {
+            return xml(format!("<spotPriceHistorySet>{}</spotPriceHistorySet>", prices.iter().map(|(t, z, p)| format!("<item><instanceType>{t}</instanceType><availabilityZone>{z}</availabilityZone><spotPrice>{p}</spotPrice></item>")).collect::<String>()))
+        }
+        (body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| aws_refuses("InsufficientInstanceCapacity"))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.max_cpu = Some(64);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci-32cpu")));
+    let asked: Vec<(String, String)> = launches(&clouds.0).iter().filter(|l| field(l, "InstanceMarketOptions.MarketType") == "spot").map(|l| (field(l, "InstanceType").to_string(), field(l, "NetworkInterface.1.SubnetId").to_string())).collect();
+    // By the price for the speed: the newest at $0.60 is as $0.50 of the older; then the older ones by their price;
+    // the newest in its dearer zone ($0.80, as $0.667) before the older standard one at $0.70. Nothing in zone e.
+    assert_eq!(asked[..7], [("m8a.8xlarge", "subnet-a"), ("r7a.8xlarge", "subnet-a"), ("r7a.8xlarge", "subnet-b"), ("m8a.8xlarge", "subnet-b"), ("m7a.8xlarge", "subnet-a"), ("r8a.8xlarge", "subnet-a"), ("m7a.8xlarge", "subnet-b")]
+        .map(|(t, s)| (t.to_string(), s.to_string())), "{asked:?}");
+    // (After them, the larger types that would also fit, of which no price was known: in their own order.)
+    assert!(asked.iter().all(|(t, subnet)| subnet != "subnet-e" || !prices.iter().any(|(p, ..)| p == t)), "{asked:?}");
 }
 
 #[test]

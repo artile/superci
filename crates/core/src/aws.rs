@@ -263,16 +263,18 @@ pub const MAX_WAITS: u32 = 7;
 
 pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, now_ms: u64, told: &mut Told) -> Result<Started> {
     let mut last = String::from("no instance type given");
-    // Each zone in turn, cheapest spot price first (for the first type), the next when one has no room: in its own
-    // network, by its subnet there; in the default network, by naming the zone. On-demand: wherever AWS puts it.
-    let prices = match (l.spot, l.types.first()) { (true, Some(first)) => zone_prices(http, l.region, creds, first, l.os, now_ms).await.unwrap_or_default(), _ => Default::default() };
-    let price = |z: &str| prices.get(z).copied().unwrap_or(f64::MAX);
+    // Every type's spot price now in every zone: a spot machine is asked for where it costs least for the speed it
+    // gives (see `speed`), the next pool when one has no room. In its own network a zone is its subnet there; in the
+    // default network it is named. On-demand: the types in their order, wherever AWS puts them.
+    let prices = if l.spot { spot_prices(http, l.region, creds, l.types, l.os, now_ms).await.unwrap_or_default() } else { Default::default() };
+    let mut zones: Vec<String> = prices.keys().map(|(_, z)| z.clone()).collect();
+    zones.sort(); zones.dedup();
     let mut places: Vec<(Option<&(String, String)>, Option<String>)> = match l.network {
         Some(n) if !n.subnets.is_empty() => n.subnets.iter().map(|s| (Some(s), None)).collect(),
-        _ if !prices.is_empty() => prices.keys().map(|z| (None, Some(z.clone()))).collect(),
+        _ if !zones.is_empty() => zones.iter().map(|z| (None, Some(z.clone()))).collect(),
         _ => vec![(None, None)],
     };
-    places.sort_by(|a, b| { let z = |p: &(Option<&(String, String)>, Option<String>)| p.0.map(|(z, _)| z.clone()).or(p.1.clone()).unwrap_or_default(); price(&z(a)).total_cmp(&price(&z(b))).then(z(a).cmp(&z(b))) });
+    places.sort_by_key(|p| p.0.map(|(z, _)| z.clone()).or(p.1.clone()).unwrap_or_default());
     // So many tries at most (types by zones can be many, and a runtime's time for one request is short): the rest
     // is left for the next try of the job.
     // Every type in every place, in that order; but a spot pool that had no machine a moment ago, or took one back,
@@ -280,7 +282,16 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
     // machine, or gives one that is soon taken back).
     let zone_of = |p: &(Option<&(String, String)>, Option<String>)| p.0.map(|(z, _)| z.clone()).or(p.1.clone()).unwrap_or_default();
     let mut pools: Vec<(&String, &(Option<&(String, String)>, Option<String>))> = l.types.iter().flat_map(|t| places.iter().map(move |p| (t, p))).collect();
-    if l.spot { pools.sort_by_key(|(t, p)| { let z = zone_of(p); l.avoid.iter().any(|(at, az)| at == *t && *az == z) }) }
+    if l.spot {
+        // A zone where a type has no spot price, when it has one elsewhere, is a zone AWS does not offer it in: not asked.
+        let priced = |t: &String| prices.keys().any(|(pt, _)| pt == t);
+        pools.retain(|(t, p)| !priced(t) || prices.contains_key(&((*t).clone(), zone_of(p))));
+        // The least price for the speed first (a type with no price known: after those with one, in the types' order).
+        let worth = |t: &String, z: &str| prices.get(&(t.clone(), z.to_string())).map(|p| p / speed(t)).unwrap_or(f64::MAX);
+        let order = |t: &String| l.types.iter().position(|x| x == t).unwrap_or(usize::MAX);
+        pools.sort_by(|(at, ap), (bt, bp)| worth(at, &zone_of(ap)).total_cmp(&worth(bt, &zone_of(bp))).then(order(at).cmp(&order(bt))).then(zone_of(ap).cmp(&zone_of(bp))));
+        pools.sort_by_key(|(t, p)| { let z = zone_of(p); l.avoid.iter().any(|(at, az)| at == *t && *az == z) });
+    }
     let mut tries = 0;
     for (t, place) in pools {
         let (subnet, zone) = place;
@@ -336,12 +347,29 @@ pub async fn offered_types(http: &dyn Http, region: &str, creds: &Credentials, t
     Ok(types.iter().filter(|t| have.contains(&t.as_str())).cloned().collect())
 }
 
-/// A machine type's spot price now in each of a region's zones.
-async fn zone_prices(http: &dyn Http, region: &str, creds: &Credentials, instance_type: &str, os: &str, now_ms: u64) -> Result<std::collections::HashMap<String, f64>> {
-    let xml = ec2(http, region, creds, "DescribeSpotPriceHistory", serde_json::json!({ "InstanceType": [instance_type], "ProductDescription": [product(os)], "StartTime": amz_iso(now_ms) }), now_ms).await?;
+/// How fast a machine type is beside one of the generation before, for choosing among spot pools by what a job
+/// costs, not what an hour costs: a job on a faster machine is over sooner. Each generation of a family is taken
+/// as a fifth faster than the last (AWS says "up to 30%" of M8a over M7a, and of Graviton4 over Graviton3; a job is
+/// rarely all CPU). By the number in the family's name: `m8a` 8, `c7g` 7, `m6id` 6. Only among the families a
+/// job's CPUs come from (c, m, r): a GPU family's number says which GPU it has, not how new it is.
+pub fn speed(kind: &str) -> f64 {
+    if !kind.starts_with(['c', 'm', 'r']) { return 1.0 }
+    let generation = kind.chars().find(|c| c.is_ascii_digit()).and_then(|c| c.to_digit(10)).unwrap_or(7) as i32;
+    1.2f64.powi(generation - 7)
+}
+
+/// The spot price now of each of these machine types in each of a region's zones, by (type, zone). One request.
+async fn spot_prices(http: &dyn Http, region: &str, creds: &Credentials, types: &[String], os: &str, now_ms: u64) -> Result<std::collections::HashMap<(String, String), f64>> {
+    if types.is_empty() { return Ok(Default::default()) }
+    let xml = ec2(http, region, creds, "DescribeSpotPriceHistory", serde_json::json!({ "InstanceType": types, "ProductDescription": [product(os)], "StartTime": amz_iso(now_ms) }), now_ms).await?;
     let mut prices = std::collections::HashMap::new();
     for item in xml.split("<item>").skip(1) {
-        if let (Some(z), Some(p)) = (xml_tag(item, "availabilityZone"), xml_tag(item, "spotPrice").and_then(|p| p.parse::<f64>().ok())) { prices.entry(z.to_string()).or_insert(p); }
+        let (Some(z), Some(p)) = (xml_tag(item, "availabilityZone"), xml_tag(item, "spotPrice").and_then(|p| p.parse::<f64>().ok())) else { continue };
+        // (The newest price of a pool comes first. An answer that names no type is of every type asked for.)
+        match xml_tag(item, "instanceType") {
+            Some(t) => { prices.entry((t.to_string(), z.to_string())).or_insert(p); }
+            None => for t in types { prices.entry((t.clone(), z.to_string())).or_insert(p); },
+        }
     }
     Ok(prices)
 }

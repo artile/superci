@@ -28,7 +28,15 @@ pub struct Spec {
     /// machine itself (`localdisk`: a machine type with an NVMe disk of its own). AWS, Linux.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub nvme: bool,
+    /// Only these AWS machine families, when a label names any (`superci-32cpu-m8a`, `-m8a-r8a`): for a job that
+    /// must have a certain kind of machine (the newest, say) and would sooner pay or wait than take another.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub families: Vec<String>,
 }
+
+/// The AWS machine families a label may name: what a job's CPUs come from (compute, general, memory), AMD and arm64,
+/// and those with a local NVMe disk. Each with its memory for each CPU (GB).
+pub const FAMILIES: [(&str, u32); 24] = [("c8a", 2), ("c7a", 2), ("m8a", 4), ("m7a", 4), ("r8a", 8), ("r7a", 8), ("c8g", 2), ("c7g", 2), ("m8g", 4), ("m7g", 4), ("r8g", 8), ("r7g", 8),
+    ("c8id", 2), ("c6id", 2), ("m8id", 4), ("m6id", 4), ("r8id", 8), ("r6id", 8), ("c8gd", 2), ("c7gd", 2), ("m8gd", 4), ("m7gd", 4), ("r8gd", 8), ("r7gd", 8)];
 
 /// What AWS includes with a disk at no extra price: MiB a second, and IOPS.
 pub const DISK_MIBS_INCLUDED: u32 = 125;
@@ -62,7 +70,7 @@ pub fn valid_label(label: &str) -> Result<(), String> {
     let ok = (2..=24).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) && label.as_bytes()[0].is_ascii_lowercase();
     if !ok { return Err("A label is 2 to 24 lowercase letters and digits, starting with a letter (acmeci, ci2).".into()) }
     const TAKEN: [&str; 25] = ["localdisk", "ubuntu", "windows", "macos", "linux", "self", "hosted", "selfhosted", "x64", "arm64", "arm", "amd64", "x86", "mac", "osx", "win", "gpu", "aws", "cloudflare", "modal", "ondemand", "spot", "latest", "ramdisk", "nvme"];
-    if TAKEN.contains(&label) || GPUS.contains(&label) { return Err(format!("{label} means something else in a label already: choose another word.")) }
+    if TAKEN.contains(&label) || GPUS.contains(&label) || FAMILIES.iter().any(|(f, _)| *f == label) { return Err(format!("{label} means something else in a label already: choose another word.")) }
     Ok(())
 }
 
@@ -94,7 +102,8 @@ impl Spec {
         let mut s = Spec::default();
         for part in rest.split('-') {
             let num = |suffix: &str| part.strip_suffix(suffix).and_then(|n| n.parse::<u32>().ok()).filter(|n| *n > 0);
-            if part == "ramdisk" { s.ramdisk = true }
+            if FAMILIES.iter().any(|(f, _)| *f == part) { if !s.families.iter().any(|f| f == part) { s.families.push(part.to_string()) } }
+            else if part == "ramdisk" { s.ramdisk = true }
             else if part == "localdisk" { s.nvme = true }
             else if let Some(n) = num("mbs") { if !(125..=2000).contains(&n) { return Some(Err(format!("a disk's speed is 125 to 2000 MiB a second, not {n}"))) } s.disk_mibs = Some(n) }
             else if let Some(n) = num("iops") { if !(3000..=80_000).contains(&n) { return Some(Err(format!("a disk has 3000 to 80000 IOPS, not {n}"))) } s.disk_iops = Some(n) }
@@ -110,7 +119,7 @@ impl Spec {
             else if part == "linux" { s.os = Some("linux".into()) }
             else if part == "ondemand" { s.on_demand = true }
             else if CLOUDS.contains(&part) { s.cloud = Some(part.into()) }
-            else { return Some(Err(format!("“{part}” in runs-on: {label} is not understood (sizes are like 8cpu, 32gb, 100disk; also arm64, windows, gpu or a GPU like l4, ondemand, a disk's speed like 500mbs, ramdisk, localdisk, or a cloud: aws, cloudflare, modal)"))) }
+            else { return Some(Err(format!("“{part}” in runs-on: {label} is not understood (sizes are like 8cpu, 32gb, 100disk; also arm64, windows, gpu or a GPU like l4, ondemand, a disk's speed like 500mbs, ramdisk, localdisk, an AWS machine family like m8a, or a cloud: aws, cloudflare, modal)"))) }
         }
         Some(Ok(s))
     }
@@ -128,6 +137,7 @@ impl Spec {
             cloud: self.cloud.clone().or_else(|| default.cloud.clone()), on_demand: self.on_demand || default.on_demand,
             disk_mibs: self.disk_mibs.or(default.disk_mibs), disk_iops: self.disk_iops.or(default.disk_iops),
             ramdisk: self.ramdisk || default.ramdisk, nvme: self.nvme || default.nvme,
+            families: if self.families.is_empty() { default.families.clone() } else { self.families.clone() },
         }
     }
 
@@ -151,6 +161,7 @@ impl Spec {
         if let Some(i) = self.disk_iops { parts.push(format!("{i} IOPS")) }
         if self.ramdisk { parts.push("RAM disk".into()) }
         if self.nvme { parts.push("local disk".into()) }
+        if !self.families.is_empty() { parts.push(format!("only {}", self.families.join(", "))) }
         if let Some(c) = &self.cloud { parts.push(format!("only {c}")) }
         if parts.is_empty() { "the default machine".into() } else { parts.join(", ") }
     }
@@ -194,6 +205,13 @@ impl Capacity {
         if !self.arch.iter().any(|a| a == s.arch()) { return Err(format!("{} only", self.arch.join(", "))) }
         if !self.os.iter().any(|o| o == s.os()) { return Err(format!("{} only", self.os.join(", "))) }
         if s.on_demand && !self.on_demand { return Err("no on-demand machines".into()) }
+        if !s.families.is_empty() {
+            if !self.scratch { return Err("no AWS machine families".into()) }
+            // (A family is of one architecture, and with or without a local disk: what the label says elsewhere must agree.)
+            let arm = |f: &str| f.contains('g');
+            if let Some(f) = s.families.iter().find(|f| arm(f) != (s.arch() == "arm64")) { return Err(format!("{f} machines are {}", if arm(f) { "arm64 (say arm64 in the label too)" } else { "x64, not arm64" })) }
+            if s.gpu.is_some() { return Err("a GPU's machine family follows the GPU".into()) }
+        }
         if s.ramdisk && !self.scratch { return Err("no RAM disk".into()) }
         if s.nvme && !self.scratch { return Err("no machines with a local disk to ask for".into()) }
         if (s.ramdisk || s.nvme) && s.os() != "linux" { return Err("a RAM disk or a local disk on Linux only".into()) }
@@ -238,6 +256,15 @@ pub fn aws_instance_types(s: &Spec) -> Vec<String> {
     let ram = s.ram().unwrap_or(if s.cpu.is_none() { 8 } else { cpu * 4 });
     let mut out = vec![];
     // (With a local NVMe disk, when asked for: the families that have one.)
+    // Only the families a label names, when it names any: each at the smallest size with the CPUs asked for, and
+    // the memory asked for or what the family gives (a compute family has half a general one's).
+    if !s.families.is_empty() {
+        return s.families.iter().filter_map(|f| {
+            let per_cpu = FAMILIES.iter().find(|(name, _)| name == f)?.1;
+            let (_, size) = SIZES.iter().find(|(c, _)| *c >= cpu && s.ram_gb.is_none_or(|r| c * per_cpu >= r))?;
+            Some(format!("{f}.{size}"))
+        }).collect()
+    }
     let families = match (s.nvme, arm) {
         (false, false) => [(2, ["c8a", "c7a"]), (4, ["m8a", "m7a"]), (8, ["r8a", "r7a"])],
         (false, true) => [(2, ["c8g", "c7g"]), (4, ["m8g", "m7g"]), (8, ["r8g", "r7g"])],
@@ -309,6 +336,14 @@ mod tests {
         assert_eq!(aws_instance_types(&Spec { arch: Some("arm64".into()), ..nvme.clone() })[0], "m8gd.4xlarge");
         assert!(Capacity::cloudflare().refuses(&nvme).is_some() && Capacity::modal().refuses(&s).is_some() && Capacity::aws().refuses(&s).is_none());
         assert!(Capacity::aws().refuses(&Spec::parse("superci-windows-ramdisk", "superci").unwrap().unwrap()).unwrap().contains("Linux only"));
+        // A machine family, when a job must have it: only those named, in the label's order, at the size that fits.
+        let pinned = Spec::parse("superci-32cpu-m8a-r8a", "superci").unwrap().unwrap();
+        assert_eq!((aws_instance_types(&pinned), pinned.describe()), (vec!["m8a.8xlarge".to_string(), "r8a.8xlarge".to_string()], "32 CPU, only m8a, r8a".to_string()));
+        assert_eq!(aws_instance_types(&Spec::parse("superci-16cpu-c8a", "superci").unwrap().unwrap()), ["c8a.4xlarge"], "the family's own memory, when none is asked for");
+        assert_eq!(aws_instance_types(&Spec::parse("superci-16cpu-64gb-c8a", "superci").unwrap().unwrap()), ["c8a.8xlarge"], "larger, for the memory asked");
+        assert!(Capacity::aws().refuses(&pinned).is_none() && Capacity::modal().refuses(&pinned).is_some());
+        assert!(Capacity::aws().refuses(&Spec::parse("superci-m8g", "superci").unwrap().unwrap()).unwrap().contains("arm64") && Capacity::aws().refuses(&Spec::parse("superci-arm64-m8g", "superci").unwrap().unwrap()).is_none());
+        assert!(valid_label("m8a").is_err());
         // The disk's speed follows the machine's size unless said; what is said stays within what a gp3 volume takes.
         let d = Spec::default();
         assert_eq!([2, 4, 8, 16, 32, 96].map(|cpu| disk_speed(cpu, 60, &d)), [(125, 3000), (125, 3000), (250, 3000), (500, 3000), (1000, 4000), (1000, 4000)]);
