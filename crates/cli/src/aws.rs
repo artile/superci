@@ -145,7 +145,17 @@ pub fn exchange(p: Pending, code: &str) -> Result<Session> {
     session_from(&p.region, p.key, &v, None)
 }
 
+/// Whether AWS refused a call because the credentials it was made with are over. A sign-in lives as long as the
+/// AWS console session it was made from (twelve hours from when that one began, which may be most of them ago), and
+/// AWS can end its credentials before they say they end.
+pub fn expired(e: &str) -> bool {
+    ["ExpiredToken", "RequestExpired"].iter().any(|code| e.starts_with(code) || e.contains(&format!(": {code}")) || e.contains(&format!("{code}:"))) || e.contains("security token included in the request is expired")
+}
+
 impl Session {
+    /// The credentials in hand are taken as over (AWS said so): the next use renews them, or finds the sign-in ended.
+    pub fn expire(&mut self) { self.creds.expires_at_ms = 0 }
+
     /// Credentials good for at least two more minutes, renewing them when needed.
     pub fn credentials(&mut self) -> Result<Credentials> {
         if self.creds.expires_at_ms < now_ms() + 120_000 {
@@ -265,6 +275,8 @@ impl Answer {
 pub enum Kind {
     /// Nothing SuperCI needs is refused.
     Open,
+    /// AWS said nothing of any region (it did not answer, or the sign-in was over): not known.
+    Unanswered,
     /// A project of AWS's new sign-up: its organization pins it to one region. Until its owner activates AWS's
     /// "advanced features", AWS refuses spot there too; after (`activated`), spot is allowed. SuperCI works with
     /// what such an account allows as it is: it asks for no rule to be changed.
@@ -325,7 +337,15 @@ impl Look {
         (cpus < 32).then(|| (cpus, aws::quota_link(region, code)))
     }
 
+    /// What AWS said in place of an answer, when it said of no region whether the account may work there (the
+    /// sign-in was over, or AWS did not answer): nothing is known of the account then.
+    pub fn unanswered(&self) -> Option<&str> {
+        if self.regions.is_empty() || self.regions.iter().any(|(_, a)| !matches!(a, Answer::Unknown(_))) { return None }
+        self.regions.iter().find_map(|(_, a)| match a { Answer::Unknown(e) => Some(e.as_str()), _ => None })
+    }
+
     pub fn kind(&self) -> Kind {
+        if self.unanswered().is_some() { return Kind::Unanswered }
         let allowed = self.allowed_regions();
         let refused = |region: &str| self.regions.iter().any(|(r, a)| r == region && a.by_organization().is_some());
         let spot_refused = self.spot.as_ref().is_some_and(|a| a.by_organization().is_some());
@@ -684,6 +704,20 @@ mod look_tests {
     use super::*;
 
     fn creds() -> Credentials { Credentials { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "secret".into(), session_token: Some("token".into()), expires_at_ms: 0 } }
+
+    #[test]
+    fn a_look_aws_did_not_answer_is_not_taken_for_an_account_with_nothing_refused() {
+        // As AWS answered every region once the sign-in's credentials were over (13 October 2026).
+        let said = "RequestExpired: Request has expired.";
+        let look = Look { regions: superci_core::page::REGIONS.iter().map(|r| (r.to_string(), Answer::Unknown(said.into()))).collect(), asked_in: None, spot: None, on_demand: None, spot_cpus: None, on_demand_cpus: None, images: vec![], organization_id: None, management_account: None };
+        assert_eq!((look.kind(), look.unanswered()), (Kind::Unanswered, Some(said)));
+        assert!(look.allowed_regions().is_empty());
+        // That answer, and the one other services give, mean the credentials are over; a refusal does not.
+        for over in [said, "ExpiredToken: The security token included in the request is expired", "us-east-1: RequestExpired: Request has expired."] { assert!(expired(over), "{over}") }
+        for other in ["UnauthorizedOperation: You are not authorized to perform this operation.", "AWS did not answer in time", ""] { assert!(!expired(other), "{other}") }
+        let lines = crate::commands::aws_look_lines("111111111111", "", &look);
+        assert_eq!(lines[1], "Kind          not known: AWS did not answer (RequestExpired: Request has expired.)");
+    }
 
     #[test]
     fn a_copy_of_an_older_build_is_known_as_behind() {

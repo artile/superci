@@ -170,7 +170,7 @@ impl Done {
 pub fn needs(error: &str) -> Option<&'static str> {
     if error == NOT_SIGNED_IN { return Some("superci login") }
     let has = |words: &[&str]| words.iter().any(|w| error.contains(w));
-    if error == AWS_ENDED || has(&["Sign in with AWS", "Your AWS sign-in has ended"]) { return Some("superci login aws") }
+    if error == AWS_ENDED || has(&["Sign in with AWS", "Your AWS sign-in has ended", "ExpiredToken", "RequestExpired"]) { return Some("superci login aws") }
     if has(&["Sign in with Cloudflare", "Cloudflare sign-in expired"]) { return Some("superci login cloudflare") }
     if has(&["Sign in with Modal"]) { return Some("superci login modal") }
     if has(&["Sign in where this control plane runs", "sign in where it runs", "needs SuperCI's own sign-in"]) { return Some("superci login") }
@@ -941,6 +941,7 @@ pub fn aws_look_lines(account: &str, who: &str, look: &crate::aws::Look) -> Vec<
     let mut out = vec![format!("AWS account   {account}{}", if who.is_empty() { String::new() } else { format!(" · signed in as {who}") })];
     out.push(format!("Kind          {}", match look.kind() {
         Kind::Open => "open: nothing SuperCI does is refused".to_string(),
+        Kind::Unanswered => format!("not known: AWS did not answer ({})", look.unanswered().unwrap_or_default().chars().take(140).collect::<String>()),
         Kind::Project { region, activated: false } => format!("an AWS project (AWS's new sign-up): it works in {region} only, and spot machines are refused"),
         Kind::Project { region, activated: true } => format!("an AWS project (AWS's new sign-up): it works in {region} only, with spot machines"),
         Kind::Restricted => "restricted: some regions or spot machines are refused".to_string(),

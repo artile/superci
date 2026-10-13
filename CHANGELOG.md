@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.16.3 — unreleased
+- An AWS sign-in that AWS ended early is seen as that. A sign-in lasts as long as the AWS session it was made from, twelve hours from when that session began; one made from a session eleven hours old has an hour. AWS then answered "expired" to ordinary calls before SuperCI went to renew, and the pages showed that as it came ("Not read: ExpiredToken…") and the AWS account section read "Nothing refused" with nothing known. Now the sign-in is renewed or, when it is over, the pages say so with Sign in again; and a look AWS did not answer is said as "Not known", never as an account with nothing refused. The page before AWS's sign-in says which session to choose.
 - The GitHub App made for an organization is named after your CI and the organization, and nothing else: "AcmeCI acme" in place of "AcmeCI acme x1y2z3". It is what owners read among their Apps, and what a job run again by your CI says ran it. Should GitHub say the name is taken (an App of yours from before, never deleted there), another name typed on GitHub's page does as well. Apps made before keep their names.
 - A GitHub App renamed on GitHub keeps working in the dashboard: the control plane asks GitHub for the App's address as it is now, and the links to the App (install it, its settings, its permissions) follow within ten minutes. Before, they went to the address the App was made with.
 

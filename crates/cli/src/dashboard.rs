@@ -794,7 +794,7 @@ impl Dashboard {
     /// first, or the same again. (Shown again from the browser's kept copy, it asks anew which of the two it is.)
     fn aws_login_page(&self) -> Response {
         let stuck = !self.aws_stuck().is_empty();
-        let (heading, text) = if stuck { ("Your AWS sign-in is not finished", "If AWS said “400 Bad Request”, an old AWS sign-in in this browser is in the way.") } else { ("Sign in with AWS", "You come straight back here.") };
+        let (heading, text) = if stuck { ("Your AWS sign-in is not finished", "If AWS said “400 Bad Request”, an old AWS sign-in in this browser is in the way.") } else { ("Sign in with AWS", "Where AWS lists sessions, choose the account your CI runs in, not an organization's management account. The sign-in lasts as long as that session: twelve hours from when it began.") };
         let go = |fresh: bool, class: &str, label: &str| format!(r#"<form method="post" action="/aws/signin"><input type="hidden" name="next">{}<button class="{class}">{label}</button></form>"#, if fresh { r#"<input type="hidden" name="fresh" value="on">"# } else { "" });
         let buttons = if stuck { format!("{}{}", go(true, "button", "Sign out of AWS and try again"), go(false, "button secondary", "Try again")) } else { go(false, "button", "Continue to AWS") };
         document(200, "SuperCI", &format!(r#"<div class="done"><div><span class="done-mark">{}</span><h1>{}</h1><p>{}</p><div class="done-go">{buttons}</div></div></div><script>addEventListener('pageshow',function(e){{if(e.persisted)location.reload()}})</script>"#, logo("aws", 44), esc(heading), esc(text)), None)
@@ -1163,7 +1163,15 @@ impl Dashboard {
     pub fn look_at_aws(&mut self, account: &str) -> Result<(String, String, aws::Look)> {
         let (account, creds) = self.aws_account(account)?;
         let who = self.aws.as_ref().map(|a| a.who.clone()).unwrap_or_default();
-        Ok((account, who, aws::look_at(&creds)))
+        let look = aws::look_at(&creds);
+        // AWS had ended the credentials before they said so: renewed and looked at again, or the sign-in is over.
+        if look.unanswered().is_some_and(aws::expired) {
+            self.aws_cut_short();
+            if self.aws.is_none() && self.aws_ended { return Err(AWS_ENDED.into()) }
+            let (account, creds) = self.aws_account(&account)?;
+            return Ok((account, who, aws::look_at(&creds)))
+        }
+        Ok((account, who, look))
     }
 
     /// An AWS account signed in to (the one named, or the only one), taken in hand, with its credentials.
@@ -1203,6 +1211,7 @@ impl Dashboard {
         // What kind of account it is, in a line.
         let (kind, tone, says) = match look.kind() {
             aws::Kind::Open => ("Nothing refused", "good", "Nothing SuperCI does there is refused.".to_string()),
+            aws::Kind::Unanswered => ("Not known", "open", format!("AWS did not answer when asked what this account allows ({}). Refresh asks again.", look.unanswered().unwrap_or_default().chars().take(120).collect::<String>())),
             aws::Kind::Project { region, activated: false } => ("AWS project", "open", format!("A project of AWS's new sign-up: AWS keeps it to {} and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.", region_short(&region))),
             aws::Kind::Project { region, activated: true } => ("AWS project", "good", format!("A project of AWS's new sign-up: it works in {} only. Everything SuperCI does works there.", region_short(&region))),
             aws::Kind::Restricted => ("Restricted", "open", "Some of what SuperCI does there is refused: see below.".to_string()),
@@ -1467,9 +1476,29 @@ impl Dashboard {
     fn aws_creds(&mut self) -> Result<superci_core::aws::Credentials> {
         match self.aws.as_mut().ok_or("Sign in with AWS first.")?.credentials() {
             // Over on AWS's side (they last twelve hours at most): forgotten here, so the pages ask for it again.
-            Err(e) if e.starts_with(aws::ENDED) => { self.aws = None; self.views = None; Err(format!("{}. Sign in with AWS again.", aws::ENDED)) }
+            Err(e) if e.starts_with(aws::ENDED) => { self.aws = None; self.aws_ended = true; self.views = None; Err(format!("{}. Sign in with AWS again.", aws::ENDED)) }
             r => r,
         }
+    }
+
+    /// AWS answered a call with "your credentials are over" before they said they were (see `aws::expired`): they
+    /// are renewed now, or the sign-in is found ended, which the pages then say with Sign in again.
+    fn aws_cut_short(&mut self) {
+        if let Some(a) = self.aws.as_mut() { a.expire() }
+        let _ = self.aws_creds();
+    }
+
+    /// A look at an AWS account is kept for its pages. Not one AWS did not answer: with the credentials over, the
+    /// sign-in is seen to (above); otherwise the look before it stands, and AWS is asked again in a moment. Only
+    /// with none before is it kept, to say that AWS did not answer.
+    fn take_look(&mut self, account: String, look: aws::Look, copying: Vec<String>, behind: Vec<(String, String, String, bool)>) {
+        if let Some(said) = look.unanswered().map(str::to_string) {
+            if aws::expired(&said) { self.aws_looks.remove(&account); return self.aws_cut_short() }
+            if let Some((at, _)) = self.aws_looks.get_mut(&account) { *at = now_ms(); return }
+        }
+        self.aws_copying.insert(account.clone(), copying);
+        self.aws_behind.insert(account.clone(), behind);
+        self.aws_looks.insert(account, (now_ms(), look));
     }
 
     /// Looks for control planes in the clouds you signed in to (once per sign-in), and lets the ones in Cloudflare accept this
@@ -2711,10 +2740,8 @@ mark();load()})();</script>"#;
                     std::thread::spawn(move || {
                         let (look, copying, behind) = look_all(&creds);
                         let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
-                        d.aws_copying.insert(account.clone(), copying);
-                        d.aws_behind.insert(account.clone(), behind);
-                        d.aws_looks.insert(account.clone(), (now_ms(), look));
                         d.aws_looking.remove(&account);
+                        d.take_look(account, look, copying, behind);
                     });
                 }
             }
@@ -2806,7 +2833,7 @@ mark();load()})();</script>"#;
         // The page shows, and changes, the control plane in use.
         if let Some(i) = views.get(view::in_use(&views)).and_then(|v| d.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { d.select(i) }
         if let Some((_, account)) = quota_creds { d.quotas = quotas; d.quotas_for = Some((account, now_ms())); }
-        if let (Some((_, account)), Some((look, copying, behind))) = (look_creds, looked) { d.aws_copying.insert(account.clone(), copying); d.aws_behind.insert(account.clone(), behind); d.aws_looks.insert(account, (now_ms(), look)); }
+        if let (Some((_, account)), Some((look, copying, behind))) = (look_creds, looked) { d.take_look(account, look, copying, behind) }
         if let Some(Ok(Some(session))) = modal { d.modal = Some(session); d.modal_pending = None; d.looked_modal = false; }
         // The App is installed (or the wait is over): nothing more to wait for.
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
@@ -3460,6 +3487,11 @@ mark();load()})();</script>"#;
         let Some((views, _)) = self.views.as_ref() else { return };
         let now = now_ms();
         let known = lock(&self.aws_missing).clone();
+        // Read with credentials AWS had ended: the sign-in is seen to, and the reading is not shown as what was read.
+        if known.values().any(|(read, _)| read.as_ref().is_err_and(|e| aws::expired(e))) {
+            lock(&self.aws_missing).retain(|_, (read, _)| !read.as_ref().is_err_and(|e| aws::expired(e)));
+            return self.aws_cut_short()
+        }
         let due: Vec<(String, Vec<String>)> = views.iter().filter(|v| aws_account(v).as_deref() == Some(account.as_str()))
             .map(|v| (v.plane.plane_id().to_string(), v.status.as_ref().map(status_regions).unwrap_or_else(|| v.aws_regions()))).filter(|(id, _)| known.get(id).is_none_or(|(_, at)| now > at + 300_000)).collect();
         if due.is_empty() { return }
@@ -5760,6 +5792,17 @@ mod tests {
         let coming = d.plane_page();
         assert!(coming.contains("The build of 20 October 2026 is being copied into Stockholm: about ten minutes. Jobs start from your older copy until it is there.") && !coming.contains("Copy the new one in"), "{coming}");
         d.aws_behind.clear();
+        // A look AWS did not answer (it was out of reach) does not take the place of the one before it: what was
+        // known stands, and AWS is asked again in a moment. With none before, the section says that AWS did not
+        // answer, and never "nothing refused".
+        let silent = || aws::Look { regions: REGIONS.iter().map(|r| (r.to_string(), aws::Answer::Unknown("AWS did not answer in time".into()))).collect(), ..looked("") };
+        d.take_look("111111111111".into(), silent(), vec![], vec![]);
+        assert!(d.aws_account_section().contains("it works in Stockholm only"), "the look before stands");
+        d.aws_looks.clear();
+        d.take_look("111111111111".into(), silent(), vec![], vec![]);
+        let unknown = d.aws_account_section();
+        assert!(unknown.contains(r#"<small>AWS did not answer when asked what this account allows (AWS did not answer in time). Refresh asks again.</small></span><span class="acct-do"><span class="pill open"><i></i>Not known</span>"#) && !unknown.contains("Nothing refused"), "{unknown}");
+        d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-activated/look.jsonl"))));
         // Refresh asks AWS again (the look is marked old; the next page starts one beside it). While it is on its
         // way the section says so in the button's place, and the page looks again by itself until it is in.
         assert!(coming.contains(r#"<button class="button secondary sm" title="Asks AWS again what this account allows">Refresh</button>"#) && !coming.contains("Asking AWS…"), "{coming}");
