@@ -119,6 +119,8 @@ pub struct Dashboard {
     aws_looks: HashMap<String, (u64, aws::Look)>,
     /// The regions AWS is copying the image jobs run on into, by account (asked with the look).
     aws_copying: HashMap<String, Vec<String>>,
+    /// The AWS accounts being looked at again beside the pages just now (see `look_all`).
+    aws_looking: std::collections::HashSet<String>,
     /// Where an AWS account's own copy of the runner image is of an older build than its maker's newest, by account:
     /// the region, the build held, the newest, and whether the newest is being copied in.
     aws_behind: HashMap<String, Vec<(String, String, String, bool)>>,
@@ -718,7 +720,7 @@ impl Dashboard {
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
             status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
-            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
+            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
     /// A dashboard that remembers: with SuperCI's own sign-ins from its folder, kept there again as they change. A
@@ -1249,8 +1251,13 @@ impl Dashboard {
         if let (Some(org), Some(managed)) = (&look.organization_id, look.management_account.as_deref().filter(|m| *m != account)) {
             rows.push(row("Organization", esc(org), esc(&format!("Managed from account {managed}: its policies are not this account's to read or change.")), String::new()));
         }
-        format!(r#"<h2 class="list-title" id="aws-account">AWS account</h2><div class="picks page"><div class="acct"><div class="acct-head">{}<span><strong>{}</strong><small>{}</small></span>{}</div><dl class="acct-facts">{}</dl></div></div>"#,
-            logo("aws", 32), esc(&account), esc(&says), pill(tone, kind), rows.concat())
+        // Looked at again each time the page is opened (when the last look is older than twenty seconds), and at a
+        // press: said while it is on its way, and the page looks again until it is in.
+        let looking = self.aws_looking.contains(&account);
+        let again = if looking { r#"<span class="waiting-for"><span class="mini-spin"></span>Asking AWS…</span>"#.to_string() }
+            else { r#"<form method="post" action="/aws/look"><input type="hidden" name="next"><button class="button secondary sm" title="Asks AWS again what this account allows">Refresh</button></form>"#.to_string() };
+        format!(r#"{}<h2 class="list-title" id="aws-account">AWS account</h2><div class="picks page"><div class="acct"><div class="acct-head">{}<span><strong>{}</strong><small>{}</small></span><span class="acct-do">{}{again}</span></div><dl class="acct-facts">{}</dl></div></div>"#,
+            if looking { r#"<div data-refresh="2"></div>"# } else { "" }, logo("aws", 32), esc(&account), esc(&says), pill(tone, kind), rows.concat())
     }
 
     /// Every AWS account signed in to, in one order (by account) whichever is in hand.
@@ -2005,6 +2012,11 @@ impl Dashboard {
                 if let Some((at, _)) = self.aws_looks.get_mut(&account) { *at = 0 }
                 Ok(Response::redirect("/?p=plane"))
             }
+            // Refresh, in an AWS account's section: it is looked at again now (beside the page it is on).
+            ("POST", "/aws/look") => {
+                if let Some(account) = self.aws.as_ref().map(|a| a.account_id.clone()) { if let Some((at, _)) = self.aws_looks.get_mut(&account) { *at = 1 } }
+                Ok(Response::redirect(&format!("/{}", safe_return(&field("next")))))
+            }
             // A deploy that stopped is let go of: back to choosing where. What it had made in AWS is removed (its
             // role at the least: nothing is left behind in a place that will not be used); said if it could not be.
             ("POST", "/plane/start-over") => {
@@ -2686,8 +2698,27 @@ mark();load()})();</script>"#;
             let stale = account.as_ref().is_some_and(|a| d.quotas_for.as_ref().is_none_or(|(b, at)| b != a || now_ms() > at + 600_000));
             let quota_creds = if stale && ["add-runners", "runners"].contains(&section) { d.aws_creds().ok().zip(account.clone()) } else { None };
             // Where a control plane or runners are set up: what the account in hand allows (its regions, spot).
-            let unlooked = account.as_ref().is_some_and(|a| { let copying = d.aws_copying.get(a).is_some_and(|c| !c.is_empty()) || d.aws_behind.get(a).is_some_and(|b| b.iter().any(|b| b.3)); d.aws_looks.get(a).is_none_or(|(at, _)| now_ms() > at + if copying { 15_000 } else { 600_000 }) });
-            let look_creds = if unlooked && ["plane", "planes", "add-runners", "runners"].contains(&section_name(section)) { d.aws_creds().ok().zip(account) } else { None };
+            // Not looked at yet: the page waits for the look (there is nothing to show of the account before it).
+            // Looked at more than twenty seconds ago: looked at again beside the page, each time such a page is
+            // opened. The page shows what it has and looks again in a moment, so a change made in AWS shows within
+            // seconds, and no page waits the three seconds a look takes.
+            let on_page = ["plane", "planes", "add-runners", "runners"].contains(&section_name(section));
+            let unlooked = account.as_ref().is_some_and(|a| !d.aws_looks.contains_key(a));
+            if let Some(a) = account.as_ref().filter(|a| on_page && !d.aws_looking.contains(*a) && d.aws_looks.get(*a).is_some_and(|(at, _)| now_ms() > at + 20_000)) {
+                if let Ok(creds) = d.aws_creds() {
+                    d.aws_looking.insert(a.clone());
+                    let (shared, account) = (shared.clone(), a.clone());
+                    std::thread::spawn(move || {
+                        let (look, copying, behind) = look_all(&creds);
+                        let mut d = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        d.aws_copying.insert(account.clone(), copying);
+                        d.aws_behind.insert(account.clone(), behind);
+                        d.aws_looks.insert(account.clone(), (now_ms(), look));
+                        d.aws_looking.remove(&account);
+                    });
+                }
+            }
+            let look_creds = if unlooked && on_page { d.aws_creds().ok().zip(account) } else { None };
             (d.planes.iter().map(|p| (p.clone(), d.keyed.contains(p.plane_id()))).collect::<Vec<_>>(), d.status_key.clone(), d.modal_pending.clone(), quota_creds, look_creds)
         };
         // Read a moment ago, and nothing changed since: shown at once, read again in the background. A page shown from
@@ -2727,22 +2758,7 @@ mark();load()})();</script>"#;
         let (views, modal, quotas, looked) = match cached { Some(v) => (v, None, HashMap::new(), None), None => std::thread::scope(|s| {
             let handles: Vec<_> = planes.iter().map(|(p, keyed)| { let key = key.clone(); s.spawn(move || view::plane_view(p, keyed.then_some(key.as_str()))) }).collect();
             let looking = look_creds.as_ref().map(|(creds, _)| s.spawn(move || {
-                let look = aws::look_at(creds);
-                // Where the image is missing: whether a copy of it is on its way there.
-                let copying: Vec<String> = look.regions_without_image().into_iter().filter(|r| aws::copied_images(creds, r).is_ok_and(|copies| copies.iter().any(|c| c.state == "pending"))).map(str::to_string).collect();
-                // Where the account's own copy is what jobs start from: whether its maker has a newer build out (a
-                // copy stays the build it was made of), and whether that one is on its way in. A copy that a newer
-                // one replaced goes, once the newer one is there.
-                let mut behind = vec![];
-                for region in look.usable_regions() {
-                    let _ = aws::tidy_copies(creds, region);
-                    let Ok(copies) = aws::copied_images(creds, region) else { continue };
-                    if copies.is_empty() { continue }
-                    let Some(newest) = aws::newest_build() else { break };
-                    let have = copies.iter().filter(|c| c.state == "available").map(|c| aws::build_of(&c.name)).max().unwrap_or_default().to_string();
-                    if !have.is_empty() && have < newest { behind.push((region.to_string(), have, newest.clone(), aws::behind(&copies, &newest).is_none())) }
-                }
-                (look, copying, behind)
+                look_all(creds)
             }));
             let quotas: Vec<_> = quota_creds.iter().flat_map(|(creds, _)| REGIONS.iter().map(move |r| s.spawn(move || {
                 let http = aws::Blocking::new();
@@ -4512,6 +4528,28 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
     format!(r#"<section class="card"><div class="card-head"><h2>Runner providers</h2><span class="order-note" id="order-note" aria-live="polite"></span></div><p class="note">Each provider starts a fresh runner for every job. A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next. When all are full, it waits. Drag to reorder.</p>{waiting}<ol class="pools" data-order="{}">{rows}</ol>{rules}{dialogs}</section>"#, esc(&current))
 }
 
+/// A look at an AWS account with all the pages say of it: what it allows (`aws::look_at`), where a copy of the
+/// runner image is on its way, and where the account's own copy is of an older build than its maker's newest.
+/// About three seconds of asking AWS.
+fn look_all(creds: &superci_core::aws::Credentials) -> (aws::Look, Vec<String>, Vec<(String, String, String, bool)>) {
+    let look = aws::look_at(creds);
+    // Where the image is missing: whether a copy of it is on its way there.
+    let copying: Vec<String> = look.regions_without_image().into_iter().filter(|r| aws::copied_images(creds, r).is_ok_and(|copies| copies.iter().any(|c| c.state == "pending"))).map(str::to_string).collect();
+    // Where the account's own copy is what jobs start from: whether its maker has a newer build out (a
+    // copy stays the build it was made of), and whether that one is on its way in. A copy that a newer
+    // one replaced goes, once the newer one is there.
+    let mut behind = vec![];
+    for region in look.usable_regions() {
+        let _ = aws::tidy_copies(creds, region);
+        let Ok(copies) = aws::copied_images(creds, region) else { continue };
+        if copies.is_empty() { continue }
+        let Some(newest) = aws::newest_build() else { break };
+        let have = copies.iter().filter(|c| c.state == "available").map(|c| aws::build_of(&c.name)).max().unwrap_or_default().to_string();
+        if !have.is_empty() && have < newest { behind.push((region.to_string(), have, newest.clone(), aws::behind(&copies, &newest).is_none())) }
+    }
+    (look, copying, behind)
+}
+
 /// SuperCI's own mark on a tile, as a provider's logo is (for a row that is about all of them).
 fn brand_logo(size: u32) -> String {
     format!(r#"<span class="logo" style="width:{size}px;height:{size}px;background:color-mix(in srgb,var(--ink) 10%,var(--card))">{}</span>"#, MARK.replacen(r#"class="mark""#, &format!(r#"width="{0}" height="{0}""#, size * 58 / 100), 1))
@@ -5675,7 +5713,7 @@ mod tests {
         preview("plane-aws-project", &page);
         // Its section says what it is and what it allows, each with whose rule it is, and where AWS raises its limit.
         assert!(!page.contains(r#"class="notice"#) && page.contains(r#"<h2 class="list-title" id="aws-account">AWS account</h2>"#), "{page}");
-        for said in [r#"<strong>111111111111</strong><small>A project of AWS&#39;s new sign-up: AWS keeps it to Stockholm and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.</small></span><span class="pill open"><i></i>AWS project</span>"#,
+        for said in [r#"<strong>111111111111</strong><small>A project of AWS&#39;s new sign-up: AWS keeps it to Stockholm and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.</small></span><span class="acct-do"><span class="pill open"><i></i>AWS project</span><form method="post" action="/aws/look">"#,
             "<dt>Regions</dt><dd>Stockholm<small>The other 11 are refused. By its AWS organization (policy p-example1).</small></dd>",
             "<dt>Spot machines</dt><dd>Not allowed<small>By its AWS organization (policy p-example2). Jobs run on on-demand machines, at about twice the price.</small></dd>",
             "<dt>On-demand machines</dt><dd>Allowed</dd>",
@@ -5707,7 +5745,7 @@ mod tests {
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-activated/look.jsonl"))));
         let page = d.plane_page();
         preview("plane-aws-project-activated", &page);
-        for said in [r#"<small>A project of AWS&#39;s new sign-up: it works in Stockholm only. Everything SuperCI does works there.</small></span><span class="pill good"><i></i>AWS project</span>"#,
+        for said in [r#"<small>A project of AWS&#39;s new sign-up: it works in Stockholm only. Everything SuperCI does works there.</small></span><span class="acct-do"><span class="pill good"><i></i>AWS project</span><form method="post" action="/aws/look">"#,
             r#"<dt>Regions</dt><dd>Stockholm<small>The other 11 are refused. By its AWS organization (policy p-example1).</small></dd><a class="button secondary sm" href="https://superci.dev/docs/aws-accounts" target="_blank" rel="noopener">How to allow more ↗</a></div>"#,
             "<dt>Spot machines</dt><dd>Allowed</dd>", "<dt>Runner image</dt><dd>In Stockholm</dd>"] {
             assert!(page.contains(said), "{said}\n\n{page}");
@@ -5722,6 +5760,15 @@ mod tests {
         let coming = d.plane_page();
         assert!(coming.contains("The build of 20 October 2026 is being copied into Stockholm: about ten minutes. Jobs start from your older copy until it is there.") && !coming.contains("Copy the new one in"), "{coming}");
         d.aws_behind.clear();
+        // Refresh asks AWS again (the look is marked old; the next page starts one beside it). While it is on its
+        // way the section says so in the button's place, and the page looks again by itself until it is in.
+        assert!(coming.contains(r#"<button class="button secondary sm" title="Asks AWS again what this account allows">Refresh</button>"#) && !coming.contains("Asking AWS…"), "{coming}");
+        let r = d.handle(&Req { method: "POST".into(), path: "/aws/look".into(), query: vec![], cookie: None, last: None, body: b"next=%3Fp%3Dplanes".to_vec(), host: String::new(), origin: None, fetch_site: None }).unwrap();
+        assert!(r.status == 303 && d.aws_looks["111111111111"].0 == 1, "the look is taken as old");
+        d.aws_looking.insert("111111111111".into());
+        let asking = d.aws_account_section();
+        assert!(asking.starts_with(r#"<div data-refresh="2"></div>"#) && asking.contains("Asking AWS…") && !asking.contains(">Refresh<"), "{asking}");
+        d.aws_looking.clear();
         // An account of its own: its section says nothing is refused, with its limits, and the regions offered are
         // the ones the image is in.
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/classic/look.jsonl"))));

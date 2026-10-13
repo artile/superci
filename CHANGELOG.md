@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.16.2 — unreleased
+- What an AWS account allows is asked again each time a page that shows it is opened (when the last look is older than twenty seconds), beside the page: a change made in AWS shows within seconds. Before, it showed up to ten minutes later. The AWS account section also has Refresh.
+
 ## 0.16.1 — 2026-10-13
 - Removing SuperCI from an AWS account whose organization keeps it to some regions no longer reports "its machines' network" as left behind for the regions it may not use (nothing could be made there), with AWS's refusal in full.
 - A control plane deleted from AWS no longer leaves its log behind: the function's last lines could make the log anew after it was deleted.
