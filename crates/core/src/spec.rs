@@ -106,15 +106,7 @@ impl Spec {
         let label = label.to_ascii_lowercase();
         let base = base.to_ascii_lowercase();
         if label == base { return Some(Ok(Spec::default())) }
-        let rest = label.strip_prefix(&base)?;
-        // The way a label was written before 0.16.9 (`superci-8cpu-arm64`): said as it is written now.
-        if let Some(parts) = rest.strip_prefix('-') {
-            return Some(Err(match Spec::before(parts) {
-                Some(s) => format!("runs-on: {label} is written runs-on: {} since SuperCI 0.16.9", s.label(&base)),
-                None => format!("runs-on: {label} is not understood. {HOW}"),
-            }))
-        }
-        let pairs = rest.strip_prefix('/')?;
+        let pairs = label.strip_prefix(&base)?.strip_prefix('/')?;
         let mut s = Spec::default();
         let mut said: Vec<&str> = vec![];
         for pair in pairs.split('/') {
@@ -176,33 +168,6 @@ impl Spec {
         [("cpu", n(self.cpu)), ("ram", n(self.ram_gb)), ("disk", n(self.disk_gb)), ("disk-speed", n(self.disk_mibs)), ("disk-iops", n(self.disk_iops)), ("arch", self.arch.clone()), ("os", self.os.clone()),
             ("gpu", self.gpu.clone()), ("family", Some(self.families.join("+")).filter(|f| !f.is_empty())), ("scratch", self.scratch.clone()), ("provider", self.cloud.clone()), ("spot", self.spot.map(|s| s.to_string()))]
             .into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
-    }
-
-    /// A label of before 0.16.9 (its parts after the name, `8cpu-arm64-ondemand`) as the machine it asked for; none
-    /// when a part is not one of that time's. Only to tell a job how its label is written now.
-    fn before(parts: &str) -> Option<Spec> {
-        let mut s = Spec::default();
-        for part in parts.split('-') {
-            let num = |suffix: &str| part.strip_suffix(suffix).and_then(|n| n.parse::<u32>().ok()).filter(|n| *n > 0);
-            if FAMILIES.iter().any(|(f, _)| *f == part) { s.families.push(part.to_string()) }
-            else if part == "ramdisk" || part == "localdisk" { s.scratch = Some(part.to_string()) }
-            else if let Some(n) = num("mbs") { s.disk_mibs = Some(n) }
-            else if let Some(n) = num("iops") { s.disk_iops = Some(n) }
-            else if let Some(n) = num("cpu") { s.cpu = Some(n) }
-            else if let Some(n) = num("disk") { s.disk_gb = Some(n) }
-            else if let Some(n) = num("gb") { s.ram_gb = Some(n) }
-            else if ["arm64", "arm"].contains(&part) { s.arch = Some("arm64".into()) }
-            else if ["x64", "amd64", "x86"].contains(&part) { s.arch = Some("x64".into()) }
-            else if ["macos", "mac", "osx"].contains(&part) { s.os = Some("macos".into()) }
-            else if ["windows", "win"].contains(&part) { s.os = Some("windows".into()) }
-            else if part == "linux" { s.os = Some("linux".into()) }
-            else if part == "gpu" { s.gpu = Some("any".into()) }
-            else if let Some(g) = GPUS.iter().find(|g| **g == part || (**g == "a10g" && part == "a10")) { s.gpu = Some(g.to_string()) }
-            else if part == "ondemand" { s.spot = Some(false) }
-            else if CLOUDS.contains(&part) { s.cloud = Some(part.into()) }
-            else { return None }
-        }
-        Some(s)
     }
 
     /// This, with unset parts taken from `default`.
@@ -406,10 +371,8 @@ mod tests {
         assert!(err("superci/cpu=8/ondemand").starts_with("“ondemand” in runs-on: superci/cpu=8/ondemand is not a key=value."));
         assert_eq!(err("superci/cpu=8/cpu=16"), "cpu is said twice in runs-on: superci/cpu=8/cpu=16");
         assert!(err("superci/spot=no").contains("spot is true or false") && err("superci/cpu=").contains("not “”"));
-        // A label written as before 0.16.9 is told how it is written now; one that never was a label, that it is not understood.
-        assert_eq!(err("superci-aws-32cpu-120disk-ramdisk"), "runs-on: superci-aws-32cpu-120disk-ramdisk is written runs-on: superci/cpu=32/disk=120/scratch=ramdisk/provider=aws since SuperCI 0.16.9");
-        assert_eq!(err("superci-8cpu-arm64-ondemand"), "runs-on: superci-8cpu-arm64-ondemand is written runs-on: superci/cpu=8/arch=arm64/spot=false since SuperCI 0.16.9");
-        assert!(err("superci-8cores").starts_with("runs-on: superci-8cores is not understood. A label says a machine as key=value pairs"));
+        // Only the name alone, or the name and a slash, is this control plane's label.
+        assert_eq!((Spec::parse("superci-8cpu", "superci"), Spec::parse("superci8", "superci"), Spec::parse("superci/", "superci").map(|r| r.is_err())), (None, None, Some(true)));
         // A machine written back as its label: each key that is set, in one order.
         assert_eq!(Spec::parse("superci/spot=false/arch=arm64/cpu=8", "superci").unwrap().unwrap().label("superci"), "superci/cpu=8/arch=arm64/spot=false");
         assert_eq!((Spec::default().label("acmeci"), Spec::parse("superci/spot=true", "superci").unwrap().unwrap().spot), ("acmeci".to_string(), Some(true)));

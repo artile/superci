@@ -866,8 +866,8 @@ fn the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it() 
     run(labelled("queued", 5, "acme/app", None, "superci/os=macos"));
     assert_eq!(job(&store, 5)["state"], "failed");
     assert!(job(&store, 5)["error"].as_str().unwrap().starts_with("nowhere to run macos"), "{}", job(&store, 5)["error"]);
-    run(labelled("queued", 6, "acme/app", None, "superci-8cores"));
-    assert!(job(&store, 6)["error"].as_str().unwrap().contains("8cores"));
+    run(labelled("queued", 6, "acme/app", None, "superci/cores=8"));
+    assert!(job(&store, 6)["error"].as_str().unwrap().contains("“cores” is not a key a label has"));
     assert_eq!(launches(&clouds).len(), 3);
 }
 
@@ -1213,15 +1213,11 @@ fn jobs_nothing_here_can_run_fail_at_once() {
     // Refused for its repository (a public one): no failing runner (it could take another repository's job).
     run(labelled("queued", 2, "acme/site-public", None, "superci/os=macos"));
     assert_eq!((job(&store, 2)["state"].as_str(), fails().len()), (Some("failed"), 1));
-    // A label written as before 0.16.9 (dashes, not key=value): the job is told at once how it is written now.
-    run(labelled("queued", 3, "acme/app", None, "superci-8cpu-arm64-ondemand"));
-    assert_eq!((job(&store, 3)["state"].as_str(), job(&store, 3)["failed_fast"].as_bool()), (Some("failed"), Some(true)));
-    let f = fails();
-    let line = String::from_utf8(STANDARD.decode(f.last().unwrap().split(' ').nth(4).unwrap()).unwrap()).unwrap();
-    assert_eq!(line, "::error title=SuperCI could not run this job::runs-on: superci-8cpu-arm64-ondemand is written runs-on: superci/cpu=8/arch=arm64/spot=false since SuperCI 0.16.9.");
-    // And one that says something no label has, likewise, with the keys there are.
+    // A label that says something no label has: the job is told at once, with the keys there are, and what to change is its runs-on alone.
     run(labelled("queued", 4, "acme/app", None, "superci/cores=8"));
     assert!(job(&store, 4)["error"].as_str().unwrap().starts_with("“cores” is not a key a label has. A label says a machine as key=value pairs after its name"), "{}", job(&store, 4)["error"]);
+    let line = String::from_utf8(STANDARD.decode(fails().last().unwrap().split(' ').nth(4).unwrap()).unwrap()).unwrap();
+    assert!(line.starts_with("::error title=SuperCI could not run this job::“cores” is not a key a label has.") && line.ends_with("(runs-on: superci/cores=8).") && !line.contains("add a place"), "{line}");
 }
 
 

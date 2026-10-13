@@ -436,7 +436,8 @@ mod tests {
         let sized = our_job(&event(serde_json::json!(["self-hosted", "SuperCI/cpu=8/arch=arm64"]), "acme/app"), "superci", "acme").unwrap();
         assert_eq!(sized.label, "SuperCI/cpu=8/arch=arm64");
         assert_eq!(sized.spec.as_ref().unwrap().cpu, Some(8));
-        assert!(our_job(&event(serde_json::json!(["superci-8cores"]), "acme/app"), "superci", "acme").unwrap().spec.is_err());
+        assert!(our_job(&event(serde_json::json!(["superci/cores=8"]), "acme/app"), "superci", "acme").unwrap().spec.is_err());
+        assert!(our_job(&event(serde_json::json!(["superci-8"]), "acme/app"), "superci", "acme").is_none(), "another label that begins alike is not this one");
         assert!(our_job(&event(serde_json::json!(["superci", "superci/cpu=8"]), "acme/app"), "superci", "acme").is_none());
         assert!(our_job(&event(serde_json::json!(["superci"]), "other/app"), "superci", "acme").is_none());
         assert!(valid_login("acme-corp") && !valid_login("-x") && !valid_login("a b") && !valid_login(""));
