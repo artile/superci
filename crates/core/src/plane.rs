@@ -266,6 +266,9 @@ pub struct Job {
     /// What its spot machine says its notice with (see `aws::runner_user_data_for`), and whether AWS took it back.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub notice: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub interrupted: bool,
+    /// How the job itself ended, as GitHub said when it was over (`success`, `failure`, `cancelled`, …): whether its
+    /// own steps passed. Apart from `state`, which is whether a machine ran it.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub conclusion: Option<String>,
     /// The job its interrupted machine was running, to be run again once its run has finished.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub rerun: Option<Rerun>,
 }
@@ -2219,7 +2222,7 @@ impl<'a> ControlPlane<'a> {
             self.stop_machine(plane_url, &j).await;
             if let Some(name) = runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
             j.state = "done".into();
-            if j.job_id == job_id { j.began = true }
+            if j.job_id == job_id { j.began = true; j.conclusion = ev.conclusion.clone() }
             j.ended_ms.get_or_insert(self.clock.now_ms());
             // AWS took its spot machine back: the job it was running is run again once its run has finished (GitHub
             // runs nothing again before), on an on-demand machine. Not one that passed anyway (the notice came as
@@ -2235,6 +2238,9 @@ impl<'a> ControlPlane<'a> {
             if j.job_id == job_id { return Ok(()); }
         }
         if let Some(mut own) = get_json::<Job>(self.store, &format!("job:{job_id}")).await? {
+            // How it ended is the job's own, whichever machine ran it.
+            let said_before = own.conclusion.clone();
+            own.conclusion = ev.conclusion.clone().or(said_before.clone());
             // Cancelled while waiting for room: nothing was started.
             if own.state == "waiting" {
                 own.state = "cancelled".into();
@@ -2258,6 +2264,8 @@ impl<'a> ControlPlane<'a> {
             } else if !own.began {
                 // Its record holds a machine busy with another job's work: its own job is over all the same.
                 own.began = true;
+                put_json(self.store, &format!("job:{job_id}"), &own).await?;
+            } else if own.conclusion != said_before {
                 put_json(self.store, &format!("job:{job_id}"), &own).await?;
             }
         }

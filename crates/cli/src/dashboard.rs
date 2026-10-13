@@ -377,13 +377,33 @@ pub fn day_of(unix: u64) -> String { day(unix) }
 #[derive(Clone, Copy)]
 pub enum Background { Deploy, Update, Move }
 
+/// How a job stands, as its row says it (a pill's tone and word). One a machine ran to its end is said by how the
+/// job itself ended, as its code host said: Passed, or Failed when its own steps failed. Done, when that was not
+/// said (a job from before it was kept). Failed is also a job SuperCI could not run or finish; its row says why.
+fn job_ended(j: &serde_json::Value) -> (&'static str, &'static str) {
+    match (j["state"].as_str().unwrap_or_default(), j["conclusion"].as_str()) {
+        ("done", Some("success")) => ("good", "Passed"),
+        ("done", Some("failure" | "timed_out" | "startup_failure")) => ("bad", "Failed"),
+        ("done", Some("cancelled")) => ("", "Cancelled"),
+        ("done", Some("skipped" | "neutral")) => ("", "Skipped"),
+        ("done", _) => ("good", "Done"),
+        ("failed" | "orphan" | "swept", _) => ("bad", "Failed"),
+        ("cancelled", _) => ("", "Cancelled"),
+        ("running", _) => ("accent", "Running"),
+        ("waiting", _) => ("open", "Waiting"),
+        _ => ("open", "Starting"),
+    }
+}
+
 /// A job as commands say it: how it stands, what it is (its name, repository and workflow), the runner it got, how
 /// long it ran, what it cost, and why (when it failed or waits): the words the Jobs page has.
 pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
     let state = match j["state"].as_str().unwrap_or_default() { "done" => "done", "failed" | "orphan" | "swept" => "failed", "cancelled" => "cancelled", "running" => "running", "waiting" => "waiting", _ => "starting" };
     let (title, sub) = job_names(j);
     let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { off_spot(j).map(|(why, _)| why).unwrap_or_default() };
-    serde_json::json!({ "id": j["job_id"], "state": state, "job": title, "in": sub, "runner": runner_text(j).1, "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
+    // (How the job itself ended, where a machine ran it to its end: `passed`, `failed`, …; apart from `state`.)
+    let ended = Some(job_ended(j).1.to_lowercase()).filter(|_| state == "done" && j["conclusion"].is_string());
+    serde_json::json!({ "id": j["job_id"], "state": state, "ended": ended, "job": title, "in": sub, "runner": runner_text(j).1, "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
 }
 
 /// A control plane as commands say it.
@@ -616,10 +636,7 @@ fn job_table(jobs: &[serde_json::Value]) -> String {
     let rows = jobs.iter().map(|j| {
         let s = |k: &str| j[k].as_str().unwrap_or_default().to_string();
         let state = s("state");
-        let (kind, word) = match state.as_str() {
-            "done" => ("good", "Done"), "failed" | "orphan" | "swept" => ("bad", "Failed"), "cancelled" => ("", "Cancelled"), "running" => ("accent", "Running"),
-            "waiting" => ("open", "Waiting"), _ => ("open", "Starting"),
-        };
+        let (kind, word) = job_ended(j);
         let (title, sub) = job_names(j);
         let host = if j["provider"] == "gitlab" { logo("gitlab", 14) } else { logo("github", 14) };
         let (runner_logo, runner) = runner_text(j);
@@ -6285,6 +6302,22 @@ mod tests {
         d.modal = Some(modal::Session { token_id: "ak-test".into(), token_secret: "as-test".into(), workspace: "acme".into() });
         let html = d.render("runners", &[view], None);
         assert!(html.contains(r#"<button class="button danger sm">Stop 1 and remove</button>"#));
+    }
+
+    #[test]
+    fn a_finished_job_is_said_by_how_the_job_itself_ended() {
+        let job = |state: &str, conclusion: Option<&str>| serde_json::json!({ "job_id": 7, "state": state, "conclusion": conclusion, "repo": "acme/app", "cloud": "aws" });
+        // A machine ran each to its end; what the row says is whether the job's own steps passed.
+        assert_eq!((job_ended(&job("done", Some("success"))), job_ended(&job("done", Some("failure"))), job_ended(&job("done", Some("timed_out")))), (("good", "Passed"), ("bad", "Failed"), ("bad", "Failed")));
+        assert_eq!((job_ended(&job("done", Some("cancelled"))), job_ended(&job("done", Some("skipped")))), (("", "Cancelled"), ("", "Skipped")));
+        // One from before its ending was kept: done, as it was said then. One SuperCI could not run: failed.
+        assert_eq!((job_ended(&job("done", None)), job_ended(&job("failed", None)), job_ended(&job("running", None))), (("good", "Done"), ("bad", "Failed"), ("accent", "Running")));
+        let table = job_table(&[job("done", Some("failure"))]);
+        assert!(table.contains("Failed") && !table.contains("Done"), "{table}");
+        // Commands say the same in a job's line, and keep `state` as it was beside it.
+        let words = job_words(&job("done", Some("failure")));
+        assert_eq!((words["state"].as_str(), words["ended"].as_str()), (Some("done"), Some("failed")));
+        assert!(job_words(&job("done", None))["ended"].is_null() && job_words(&job("failed", None))["ended"].is_null());
     }
 
     #[test]

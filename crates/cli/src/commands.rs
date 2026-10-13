@@ -1072,7 +1072,9 @@ fn jobs() -> Result<Done> {
 fn job_line(j: &Value) -> String {
     let s = |k: &str| j[k].as_str().unwrap_or_default().to_string();
     let tail: Vec<String> = [s("runner"), s("took"), j["usd"].as_f64().map(|c| format!("${c:.3}")).unwrap_or_default(), s("why")].into_iter().filter(|t| !t.is_empty()).collect();
-    format!("{:<12} {:<9} {} · {}{}", j["id"].as_u64().unwrap_or_default(), s("state"), s("job"), s("in"), if tail.is_empty() { String::new() } else { format!("  ({})", tail.join(" · ")) })
+    // (A job a machine ran to its end is said by how the job itself ended, when that is known: passed, failed.)
+    let stands = Some(s("ended")).filter(|e| !e.is_empty()).unwrap_or_else(|| s("state"));
+    format!("{:<12} {:<9} {} · {}{}", j["id"].as_u64().unwrap_or_default(), stands, s("job"), s("in"), if tail.is_empty() { String::new() } else { format!("  ({})", tail.join(" · ")) })
 }
 
 fn machine_words(m: &Value) -> String {

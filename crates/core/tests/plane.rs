@@ -574,6 +574,32 @@ impl Http for NoSpot {
     }
 }
 
+#[test]
+fn how_a_job_itself_ended_is_kept_apart_from_whether_a_machine_ran_it() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let (seven, eight) = (format!("superci-{PLANE_ID}-7"), format!("superci-{PLANE_ID}-8"));
+    // A job whose tests failed: a machine ran it to its end (done), and the job itself failed.
+    block_on(plane.handle(webhook("queued", None)));
+    block_on(plane.handle(webhook("in_progress", Some(&seven))));
+    block_on(plane.handle(concluded(7, &seven, "failure")));
+    assert_eq!((job(&store, 7)["state"].as_str(), job(&store, 7)["conclusion"].as_str()), (Some("done"), Some("failure")), "{}", job(&store, 7));
+    // Two jobs that ran on each other's machines (GitHub gives a waiting job to any runner with its label): each
+    // job's ending is its own, whichever machine it ran on.
+    block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
+    block_on(plane.handle(job_event("queued", 9, "acme/app", None)));
+    let nine = format!("superci-{PLANE_ID}-9");
+    block_on(plane.handle(job_event("in_progress", 9, "acme/app", Some(&eight))));
+    block_on(plane.handle(job_event("in_progress", 8, "acme/app", Some(&nine))));
+    block_on(plane.handle(concluded(9, &eight, "success")));
+    block_on(plane.handle(concluded(8, &nine, "failure")));
+    assert_eq!((job(&store, 8)["conclusion"].as_str(), job(&store, 9)["conclusion"].as_str()), (Some("failure"), Some("success")), "{} {}", job(&store, 8), job(&store, 9));
+    assert_eq!((job(&store, 8)["state"].as_str(), job(&store, 9)["state"].as_str()), (Some("done"), Some("done")));
+}
+
 /// The fake clouds, with the App renamed on GitHub since it was made: GitHub says its address as it is now.
 struct Renamed { clouds: FakeClouds }
 #[async_trait(?Send)]
