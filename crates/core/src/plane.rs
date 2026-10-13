@@ -240,6 +240,9 @@ pub struct Job {
     /// `MachineStart`) and given with it in the status, as `machine`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub queued_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub asks: Vec<Ask>,
+    /// How many times its start stopped with spot pools still to ask and went on with them a moment later (see
+    /// `MORE_SPOT`); back to none once it has a machine.
+    #[serde(default, skip_serializing_if = "is_zero")] pub spot_rounds: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub hello: Option<String>,
     /// What it writes most is in memory, or on its machine's own disk (its label asked: `-ramdisk`, `-localdisk`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
@@ -322,6 +325,20 @@ pub struct Rerun { pub job_id: u64, pub run_id: u64, pub repo: String, pub name:
 
 /// How long one request may go on trying AWS's regions for a machine before the rest is left for the job's next try.
 const LAUNCH_BUDGET_MS: u64 = 15_000;
+
+/// How a try ends when one request's worth of spot pools was asked and others are left: the job waits a moment and
+/// goes on with those (the ones just refused are not asked again), before it goes on down the order to an on-demand
+/// machine. Three rounds at most.
+const MORE_SPOT: &str = "more spot pools to ask";
+
+/// Where it is noted that a job ended at its code host before any runner took it, while its machine was still being
+/// asked for (`gone:<job>`): the start under way stops there, or ends the machine it has just been given.
+fn gone_key(j: &Job) -> String { format!("gone:{}", job_key(j).trim_start_matches("job:")) }
+
+/// Where it is noted that AWS does not offer a machine type in a zone (it said "Unsupported"): not asked again for a day.
+fn unoffered_key(region: &str, kind: &str, zone: &str) -> String { format!("aws:unoffered:{region}:{kind}:{zone}") }
+
+fn is_zero(n: &u32) -> bool { *n == 0 }
 
 /// Spot is paused for half an hour once AWS took back two machines within a quarter of an hour.
 const SPOT_PAUSE: (usize, u64, u64) = (2, 15 * 60_000, 30 * 60_000);
@@ -1471,6 +1488,19 @@ impl<'a> ControlPlane<'a> {
 
     /// The spot pools of a region (a type in a zone) noted in the last quarter of an hour as having no machine, or as
     /// having taken one back (see `pool_key`). Older notes are dropped.
+    /// Pools not to ask at all now: a spot pool that had no machine, or took one back, within the last minute (the
+    /// answer would be the same: said to this job a round ago, or to another queued with it), and a zone AWS does
+    /// not offer a type in (noted for a day).
+    async fn pools_to_skip(&self, region: &str, spot: bool, now: u64) -> Vec<(String, String)> {
+        let mut pools = vec![];
+        let pool = |key: &str| { let mut parts = key.rsplitn(3, ':'); match (parts.next(), parts.next()) { (Some(zone), Some(kind)) => Some((kind.to_string(), zone.to_string())), _ => None } };
+        if spot { for (key, at) in self.store.list(&format!("aws:pool:{region}:")).await.unwrap_or_default() { if at.parse::<u64>().is_ok_and(|at| now < at + 60_000) { pools.extend(pool(&key)) } } }
+        for (key, at) in self.store.list(&format!("aws:unoffered:{region}:")).await.unwrap_or_default() {
+            if at.parse::<u64>().is_ok_and(|at| now < at + 86_400_000) { pools.extend(pool(&key)) } else { let _ = self.store.delete(&key).await; }
+        }
+        pools
+    }
+
     async fn pools_to_avoid(&self, region: &str, now: u64) -> Vec<(String, String)> {
         let mut pools = vec![];
         for (key, at) in self.store.list(&format!("aws:pool:{region}:")).await.unwrap_or_default() {
@@ -1837,7 +1867,7 @@ impl<'a> ControlPlane<'a> {
             };
             // The places that can run it, in order. The job goes to the next when this one cannot start its machine now:
             // AWS has no spot machine for it, or starting it failed (a provider's hiccup, or its refusal).
-            enum Tried { Started(String, String), NoRoom, OutOfTime }
+            enum Tried { Started(String, String), NoRoom, OutOfTime, MoreSpot }
             let (mut started, began) = (None, self.clock.now_ms());
             // What each region said when it had no room, and whether only for the account's limits (quota).
             let (mut last, mut quota_only, mut answers) = (String::from("no AWS region"), true, Vec::<String>::new());
@@ -1846,7 +1876,10 @@ impl<'a> ControlPlane<'a> {
             let (mut on_demand_refused, mut on_demand_quota_only) = (false, true);
             // What each place said where starting the machine failed.
             let mut failures: Vec<(String, String)> = vec![];
+            let (mut more_spot, mut gone) = (false, false);
             for (at, (place, runner)) in places.into_iter().enumerate() {
+                // Its job ended at its code host meanwhile, before any runner took it (cancelled): nothing more is asked for.
+                if job.provider.is_empty() && self.store.get(&gone_key(job)).await.ok().flatten().is_some() { gone = true; break }
                 job.cloud = cloud_of(&runner);
                 job.on_demand = place == AWS_ON_DEMAND;
                 // What only the place before had (a spot machine's notice, Cloudflare's price while waiting).
@@ -1906,14 +1939,20 @@ impl<'a> ControlPlane<'a> {
                             // after a wait of its own (see `aws::run_instance`).
                             // The disk's speed: by the machine's size unless the label or the default machine says.
                             (disk_mibs, disk_iops) = disk_speed(job.cpu.unwrap_or(4), disk_gb, &spec);
+                            let skip = self.pools_to_skip(region, !on_demand, self.clock.now_ms()).await;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
-                                clock: Some(self.clock), avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120 };
+                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120 };
                             let mut told = aws::Told::default();
                             let machine = aws::run_instance(self.http, &creds, &launch, now, &mut told).await;
                             // Each request and its answer is kept with the job (the last two dozen).
                             let mut at = self.clock.now_ms().saturating_sub(job.at_ms).saturating_sub(told.asked.iter().map(|a| a.3).sum());
                             for (kind, zone, said, ms) in told.asked.drain(..) { job.asks.push(Ask { at, kind, zone, spot: !on_demand, said, ms }); at += ms }
                             if job.asks.len() > 24 { let over = job.asks.len() - 24; job.asks.drain(..over); }
+                            // A zone AWS does not offer a type in is not asked for it again (for a day).
+                            for (kind, zone, said) in &told.refused { if said == "Unsupported" && !zone.is_empty() { let _ = self.store.put(&unoffered_key(region, kind, zone), now.to_string()).await; } }
+                            // One request's worth of spot pools asked, none with a machine, and others left: the job
+                            // goes on with those in a moment (see `MORE_SPOT`), before any on-demand machine.
+                            let more = told.more && !on_demand && machine.as_ref().is_err_and(|e| aws::out_of_room(e)) && job.spot_rounds < 2;
                             // A spot pool with no machine now is remembered, for the jobs that come next.
                             if !on_demand { for (kind, zone, said) in &told.refused { if said == "InsufficientInstanceCapacity" && !zone.is_empty() { let _ = self.store.put(&pool_key(region, kind, zone), now.to_string()).await; } } }
                             // Still refused for the rate of requests after its waits: for a spot machine that is no
@@ -1951,6 +1990,7 @@ impl<'a> ControlPlane<'a> {
                                     break
                                 }
                                 Err(e) if aws::out_of_room(&e) => {
+                                    if more { return Ok(Tried::MoreSpot) }
                                     let quota = ["VcpuLimitExceeded", "MaxSpotInstanceCountExceeded"].iter().any(|c| e.starts_with(c));
                                     quota_only &= quota;
                                     if on_demand { on_demand_refused = true; on_demand_quota_only &= quota }
@@ -2013,6 +2053,7 @@ impl<'a> ControlPlane<'a> {
                     Ok(Tried::Started(id, kind)) => { started = Some((id, kind)); break }
                     Ok(Tried::NoRoom) => {}
                     Ok(Tried::OutOfTime) => { out_of_time = true; break }
+                    Ok(Tried::MoreSpot) => { more_spot = true; break }
                     // Remembered with the job: its next try starts with the places that have not failed it.
                     Err(e) => {
                         if !job.failed_at.contains(&place) { job.failed_at.push(place.clone()) }
@@ -2021,13 +2062,23 @@ impl<'a> ControlPlane<'a> {
                     }
                 }
             }
+            if gone {
+                // (Its runner goes with it; its record says cancelled, with no machine and no cost.)
+                self.withdraw_runner(job).await;
+                let _ = self.store.delete(&gone_key(job)).await;
+                (job.state, job.began, job.runner_id, job.error) = ("cancelled".into(), true, None, None);
+                job.ended_ms.get_or_insert(self.clock.now_ms());
+                put_json(self.store, &key, &*job).await?;
+                return Ok(())
+            }
+            if more_spot && started.is_none() { job.spot_rounds += 1; return Err(MORE_SPOT.into()) }
             // Out of time with spot machines refused: the next try starts below them.
             if out_of_time {
                 if !answers.is_empty() && !job.spot_again { job.no_spot = true; job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
                 last = format!("{last} (out of time for more tries)");
             }
             let (machine_id, machine_type) = match started {
-                Some(m) => { job.failed_at.clear(); m }
+                Some(m) => { job.failed_at.clear(); job.spot_rounds = 0; m }
                 None => {
                     // An account allowed no GPU machines (AWS's quota for them starts at 0): no use waiting. Seen when
                     // every refusal was for the account's limits, or every on-demand one was (spot may have said
@@ -2079,12 +2130,30 @@ impl<'a> ControlPlane<'a> {
             job.launched_ms = Some(self.clock.now_ms());
             job.machine_id = Some(machine_id);
             job.machine_type = Some(machine_type);
+            // Its job ended at its code host while the machine was being asked for (cancelled before any runner took
+            // it): the machine it has just been given is ended at once, not left for a sweep to find idle.
+            if job.provider.is_empty() && self.store.get(&gone_key(job)).await.ok().flatten().is_some() {
+                self.stop_machine(plane_url, job).await;
+                self.withdraw_runner(job).await;
+                let _ = self.store.delete(&gone_key(job)).await;
+                (job.state, job.began, job.runner_id) = ("cancelled".into(), true, None);
+                job.ended_ms = Some(self.clock.now_ms());
+                self.settle(plane_url, job).await;
+                return put_json(self.store, &key, &*job).await
+            }
             put_json(self.store, &key, &*job).await?;
             self.timer.wake_in(60_000).await
         }.await;
         if let Err(e) = result {
             self.withdraw_runner(job).await;
             job.runner_id = None;
+            // Spot pools left to ask: gone on with in a moment, and not counted as a start that failed.
+            if e == MORE_SPOT {
+                job.state = "waiting".into();
+                job.error = Some("waiting: asking AWS's other spot pools for a machine".into());
+                put_json(self.store, &key, &*job).await?;
+                return self.timer.wake_in(1_000).await;
+            }
             // The account's limits of running CPUs. While machines of this control plane's own are up there (or
             // ended a moment ago: AWS counts one a little longer than it runs), the job waits for one to end, as on
             // GitHub's own runners, and the sweep tries it again. With none of its own, the limit is below what the
@@ -2211,7 +2280,7 @@ impl<'a> ControlPlane<'a> {
                             let (image, image_gb) = match self.image(&region, &Spec::default(), &creds, self.clock.now_ms()).await { Ok(i) => i, Err(e) => { started = Err(e); continue } };
                             let network = match self.network(&region, &creds, self.clock.now_ms()).await { Ok(n) => n, Err(e) => { started = Err(e); continue } };
                             for spot in markets {
-                                started = aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, clock: None, tags: &tags, spot: *spot, os: "linux",
+                                started = aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, clock: None, skip: &[], tags: &tags, spot: *spot, os: "linux",
                                     avoid: &[], timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120 }, self.clock.now_ms(), &mut aws::Told::default()).await.map(|_| ());
                                 if started.is_ok() { break 'regions }
                             }
@@ -2372,6 +2441,22 @@ impl<'a> ControlPlane<'a> {
         Ok(())
     }
 
+    /// A machine nobody waits for any more (its job was cancelled before any runner took it), ended at once: its
+    /// runner is taken back from GitHub first, which GitHub refuses while the runner is running a job (it may have
+    /// been given another one a moment ago, the event still on its way). Only then is the machine stopped. Whether it was.
+    async fn take_back(&self, plane_url: &str, j: &mut Job) -> bool {
+        let (Some(app), Some(runner_id)) = (self.app_of(j), j.runner_id) else { return false };
+        if !j.provider.is_empty() { return false }
+        let Ok(token) = self.installation_token(app, j.installation_id).await else { return false };
+        if github::delete_runner(self.http, &app.api(), &token, &Self::owner_of(app), &j.repo, runner_id).await.is_err() { return false }
+        if let Some(name) = &j.runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
+        self.stop_machine(plane_url, j).await;
+        (j.state, j.runner_id) = ("cancelled".into(), None);
+        j.ended_ms.get_or_insert(self.clock.now_ms());
+        self.settle(plane_url, j).await;
+        true
+    }
+
     /// A finished job ends the machine that ran it, found by the runner's name (GitHub may hand a job to any idle runner
     /// with the label). A job cancelled before any runner took it leaves its own machine idle: marked for the sweep.
     async fn completed(&self, plane_url: &str, ev: &github::JobEvent) -> Result<()> {
@@ -2410,13 +2495,18 @@ impl<'a> ControlPlane<'a> {
                 put_json(self.store, &format!("job:{job_id}"), &own).await?;
                 return Ok(());
             }
+            // Ended before any runner took it (cancelled), with its machine still being asked for: noted for the start
+            // that is under way, which stops there or ends the machine it has just been given (see `gone_key`).
+            if own.state == "launching" && runner.is_none() && on_anothers.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
             if own.state == "launched" && !own.seen_in_progress {
                 // It ran on another job's runner: that job, still queued, is what its own machine is for now. It
-                // ran nowhere (cancelled before a runner took it): its machine is ended by the sweep.
+                // ran nowhere (cancelled before a runner took it): its machine is ended now if its runner can be
+                // taken back from GitHub (which refuses while a runner is running a job), else by the sweep.
                 // (The same event delivered again finds the runner's name forgotten: what was noted stays.)
                 match on_anothers {
                     Some(waiting) => { own.over = true; own.for_job.get_or_insert(waiting); }
                     None if own.over => {}
+                    None if self.take_back(plane_url, &mut own).await => {}
                     None => own.state = "orphan".into(),
                 }
                 own.began = true;
@@ -2511,7 +2601,9 @@ impl<'a> ControlPlane<'a> {
                 let late = age > wait;
                 // Once it has had time to come up and has begun nothing, GitHub is asked at every sweep whether the
                 // job it is for still waits (one request): a machine nobody waits for is ended then, not minutes later.
-                if late || (age > up_by && j.provider.is_empty()) {
+                // (At once, when its job is known to have ended before any runner took it and the start missed the note.)
+                let told_gone = j.provider.is_empty() && self.store.get(&gone_key(&j)).await.ok().flatten().is_some();
+                if late || told_gone || (age > up_by && j.provider.is_empty()) {
                     let place = cloud_name(&j.cloud).to_string();
                     // The job its machine is for: its own, or the one whose runner took its own (still queued, then, with
                     // no machine coming but this one).
@@ -2623,7 +2715,7 @@ impl<'a> ControlPlane<'a> {
         self.sweep_gitlab_runners(now).await?;
         // Notes that only matter for a while: spot interruptions (counted for the pause), jobs asked to run again and
         // not arrived.
-        for (prefix, keep) in [("spot:interrupted:", SPOT_PAUSE.1 + SPOT_PAUSE.2), ("rerun:", 86_400_000), ("rerun-asked:", 7 * 86_400_000)] {
+        for (prefix, keep) in [("spot:interrupted:", SPOT_PAUSE.1 + SPOT_PAUSE.2), ("rerun:", 86_400_000), ("rerun-asked:", 7 * 86_400_000), ("gone:", 3_600_000)] {
             for (k, v) in self.store.list(prefix).await? { if v.trim_matches('"').parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > keep) { self.store.delete(&k).await? } }
         }
         self.redeliver_failed().await;

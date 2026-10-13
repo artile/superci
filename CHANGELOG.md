@@ -2,6 +2,11 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.16.10 — unreleased
+- Every spot pool is asked before an on-demand machine. One request to the control plane asks twelve pools (a machine type in a zone) at most; a job with more to ask, three families in five zones, went on to an on-demand machine with three pools never asked. It now goes on with the rest a second later, and only then on down your order. A pool that had no machine within the last minute is not asked again, by that job or by another queued beside it: two jobs queued together no longer ask the same ten pools each.
+- A zone AWS does not offer a machine type in is asked once, then not again for a day (each such request took most of a second, and came before the zone that had the machine).
+- A machine for a job cancelled before any runner took it is ended at once. Its runner is taken back from GitHub first, which GitHub refuses while a runner is running a job, so a machine that was handed another job a moment before is left alone. Before, it waited for a sweep, up to two minutes on. A job cancelled while its machine is still being asked for gets none, or has the one AWS has just given ended in the same breath: a 64-CPU machine started that way had cost eight cents for nothing. Update your control plane for these.
+
 ## 0.16.9 — 2026-10-14
 - Labels are written as key=value pairs. `runs-on: superci` is the default machine. A label that says a machine says it after its name, one `key=value` for each thing, in any order: `runs-on: superci/cpu=8/arch=arm64`. The keys: `cpu`, `ram`, `disk`, `disk-speed`, `disk-iops`, `arch`, `os`, `gpu`, `family`, `scratch`, `provider`, `spot`. Numbers have no units (`ram=32` is 32 GB). Each thing has one way to be said.
 - The same keys everywhere. `superci machine update` takes each of them as a flag (`--cpu=8`, `--spot=false`, `--scratch=ramdisk`, `--family=m8a+r8a`; `--KEY=default` leaves one to each provider's standard again), and the label picker on Workflows writes them. The default machine's box reads "No spot machines". `--disk-speed` takes a number (125 is what AWS includes).

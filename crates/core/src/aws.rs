@@ -206,6 +206,9 @@ pub struct Launch<'a> {
     pub disk_gb: u32,
     /// For how long each request takes (see `Told::asked`); none: not kept.
     pub clock: Option<&'a dyn Clock>,
+    /// Pools (a machine type in a zone) not to ask at all: a spot pool that had no machine a moment ago (asked by
+    /// this job or another: the answer would be the same), a zone AWS does not offer the type in.
+    pub skip: &'a [(String, String)],
     /// The disk's speed: MiB a second and IOPS (see `spec::disk_speed`).
     pub disk_mibs: u32,
     pub disk_iops: u32,
@@ -228,7 +231,9 @@ pub struct Launch<'a> {
 pub struct Told { pub refused: Vec<(String, String, String)>, pub throttled: u32,
     /// Every request for a machine, in order: the type, the zone, what AWS said ("started", or its word for no), and
     /// how long the answer took (ms; with the waits, when AWS refused for the rate of requests). With `Launch::clock`.
-    pub asked: Vec<(String, String, String, u64)> }
+    pub asked: Vec<(String, String, String, u64)>,
+    /// It stopped at `MAX_TRIES` with pools left to ask: the job goes on with those, not on down the order.
+    pub more: bool }
 
 /// The lowest current spot price (USD per hour) for a machine type in a region, across its zones.
 /// The price now in one zone (`zone`), or the lowest across the region's zones.
@@ -292,11 +297,15 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         pools.sort_by(|(at, ap), (bt, bp)| worth(at, &zone_of(ap)).total_cmp(&worth(bt, &zone_of(bp))).then(order(at).cmp(&order(bt))).then(zone_of(ap).cmp(&zone_of(bp))));
         pools.sort_by_key(|(t, p)| { let z = zone_of(p); l.avoid.iter().any(|(at, az)| at == *t && *az == z) });
     }
+    // Not the pools that are not to be asked (see `Launch::skip`); with none left, that is no room, said as AWS says it.
+    let all = pools.len();
+    pools.retain(|(t, p)| { let z = zone_of(p); !l.skip.iter().any(|(st, sz)| st == *t && *sz == z) });
+    if pools.is_empty() && all > 0 { return Err("InsufficientInstanceCapacity: AWS had no machine of these types a moment ago".into()) }
     let mut tries = 0;
     for (t, place) in pools {
         let (subnet, zone) = place;
         tries += 1;
-        if tries > MAX_TRIES { return Err(last) }
+        if tries > MAX_TRIES { told.more = true; return Err(last) }
         let mut params = serde_json::json!({
             "ImageId": l.image, "InstanceType": t, "MinCount": 1, "MaxCount": 1, "UserData": b64(l.user_data.as_bytes()),
             "InstanceInitiatedShutdownBehavior": "terminate",

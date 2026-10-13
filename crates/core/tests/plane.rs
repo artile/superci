@@ -2457,6 +2457,91 @@ fn a_spot_machine_is_asked_for_where_it_costs_least_for_its_speed_and_never_wher
 }
 
 #[test]
+fn every_spot_pool_is_asked_before_an_on_demand_machine_and_none_twice_in_a_minute() {
+    // Three families in five zones: fifteen spot pools, and only the fourteenth asked has a machine. One request to
+    // the control plane asks twelve (a runtime's time is short).
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| {
+        let xml = |s: String| Some(Response::new(200, "text/xml", s));
+        if body.contains("Action=DescribeVpcs") { return xml("<vpcSet><item><vpcId>vpc-1</vpcId></item></vpcSet>".into()) }
+        if body.contains("Action=DescribeSubnets") { return xml(format!("<subnetSet>{}</subnetSet>", ["a", "b", "c", "d", "e"].map(|z| format!("<item><subnetId>subnet-{z}</subnetId><availabilityZone>us-east-1{z}</availabilityZone></item>")).concat())) }
+        if body.contains("Action=DescribeSecurityGroups") { return xml("<securityGroupInfo><item><groupId>sg-1</groupId></item></securityGroupInfo>".into()) }
+        if body.contains("Action=DescribeSpotPriceHistory") && !body.contains("AvailabilityZone=") { return xml("<spotPriceHistorySet/>".into()) }
+        let has = body.contains("InstanceType=m7a.8xlarge") && body.contains("SubnetId=subnet-d");
+        (body.contains("Action=RunInstances") && body.contains("MarketType=spot") && !has).then(|| aws_refuses("InsufficientInstanceCapacity"))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/cpu=32/family=m8a+r8a+m7a")));
+    let asked = || launches(&clouds.0).iter().map(|l| (field(l, "InstanceType").to_string(), field(l, "NetworkInterface.1.SubnetId").to_string(), field(l, "InstanceMarketOptions.MarketType").to_string())).collect::<Vec<_>>();
+    // Twelve asked, all on spot, none with a machine; three are left. No on-demand machine yet: the job goes on with
+    // the rest in a second, and that is no start that failed.
+    let first = asked();
+    assert!(first.len() == 12 && first.iter().all(|(_, _, market)| market == "spot"), "{first:?}");
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["error"].as_str(), j["spot_rounds"].as_u64(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), Some("waiting: asking AWS's other spot pools for a machine"), Some(1), 0), "{j}");
+    assert!(wakes.0.borrow().contains(&1_000));
+    // The rest: the three not asked yet and no other (those that had none a moment ago are not asked again). The
+    // second of them has a machine, on spot.
+    block_on(plane.alarm()).unwrap();
+    let all = asked();
+    assert_eq!(all[12..], [("m7a.8xlarge", "subnet-c", "spot"), ("m7a.8xlarge", "subnet-d", "spot")].map(|(t, s, m)| (t.to_string(), s.to_string(), m.to_string())), "{all:?}");
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["machine_type"].as_str(), j.get("on_demand"), j.get("spot_rounds")), (Some("launched"), Some("m7a.8xlarge"), None, None), "{j}");
+    // Another job queued beside it asks none of the pools that had no machine a moment ago: it starts with the one that has.
+    block_on(plane.handle(labelled("queued", 8, "acme/app", None, "superci/cpu=32/family=m8a+r8a+m7a")));
+    let all = asked();
+    assert_eq!((all.len(), all[14].0.as_str(), all[14].1.as_str()), (15, "m7a.8xlarge", "subnet-d"), "{all:?}");
+}
+
+#[test]
+fn a_machine_for_a_job_cancelled_before_any_runner_took_it_is_ended_at_once() {
+    // GitHub lets a runner be taken back unless it is running a job (`busy`).
+    let busy = std::cell::Cell::new(false);
+    let store = Mem::default();
+    // (While job 9's machine is being asked for, its job is cancelled: the event arrives in another request.)
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
+        if r.method == "DELETE" && r.url.contains("/actions/runners/") { return Some(if busy.get() { Response::new(422, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string()) } else { Response::new(204, "application/json", String::new()) }) }
+        if body.contains("Action=RunInstances") && store.0.borrow().get("job:9").is_some_and(|j| j.contains(r#""state":"launching""#)) { store.0.borrow_mut().insert("gone:9".into(), "1790000000000".into()); }
+        None
+    });
+    let (wakes, cache) = (Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let ended = || clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=TerminateInstances")).count();
+    let withdrawn = || clouds.0.calls.borrow().iter().filter(|c| c.0 == "DELETE" && c.1.contains("/actions/runners/")).count();
+
+    // Its machine is up and idle when the job is cancelled: the runner is taken back from GitHub and the machine
+    // ended in the same breath, not at a sweep a minute or two on.
+    run(job_event("queued", 7, "acme/app", None));
+    assert_eq!((job(&store, 7)["state"].as_str(), ended()), (Some("launched"), 0));
+    run(job_event("completed", 7, "acme/app", None));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["began"].as_bool(), ended(), withdrawn(), j["ended_ms"].is_u64()), (Some("cancelled"), Some(true), 1, 1, true), "{j}");
+    // GitHub will not give the runner back (it was handed another job a moment ago): the machine stays, as before.
+    busy.set(true);
+    run(job_event("queued", 8, "acme/app", None));
+    run(job_event("completed", 8, "acme/app", None));
+    assert_eq!((job(&store, 8)["state"].as_str(), ended()), (Some("orphan"), 1));
+    busy.set(false);
+    // Cancelled while its machine was still being asked for: the machine AWS has just given is ended at once.
+    run(job_event("queued", 9, "acme/app", None));
+    let j = job(&store, 9);
+    assert_eq!((j["state"].as_str(), j["began"].as_bool(), j["machine_id"].as_str(), ended()), (Some("cancelled"), Some(true), Some("i-0abc"), 2), "{j}");
+    assert!(!store.0.borrow().contains_key("gone:9"));
+    // And one whose cancelling was known before anything was asked of AWS gets no machine at all.
+    store.0.borrow_mut().insert("gone:10".into(), "1790000000000".into());
+    let before = launches(&clouds.0).len();
+    run(job_event("queued", 10, "acme/app", None));
+    assert_eq!((job(&store, 10)["state"].as_str(), job(&store, 10).get("machine_id").filter(|m| !m.is_null()), launches(&clouds.0).len()), (Some("cancelled"), None, before));
+}
+
+#[test]
 fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself() {
     // AWS has no spot machine of the first type in any zone; the second type starts.
     let clouds = With(FakeClouds::default(), |_: &Request, body: &str| (body.contains("Action=RunInstances") && body.contains("InstanceType=c8a.xlarge")).then(|| aws_refuses("InsufficientInstanceCapacity")));

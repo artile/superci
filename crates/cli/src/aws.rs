@@ -623,7 +623,7 @@ mod live_network {
             let user_data = "#!/bin/bash\necho \"superci-internet: $(curl -s -o /dev/null -w '%{http_code}' https://api.github.com)\" > /dev/console\nshutdown -h +5\n";
             let types = ["c7a.large".to_string(), "m7a.large".into(), "c7i.large".into()];
             let tags = [("superci-plane".to_string(), plane.clone()), ("Name".to_string(), "SuperCI live network test".to_string())];
-            let started = futures::executor::block_on(aws::run_instance(&http, &c, &aws::Launch { region, network: Some(&n), image: &image, types: &types, user_data, disk_gb: 8, disk_mibs: 125, disk_iops: 3000, clock: None, tags: &tags, spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0 }, super::now_ms(), &mut superci_core::aws::Told::default())).unwrap();
+            let started = futures::executor::block_on(aws::run_instance(&http, &c, &aws::Launch { region, network: Some(&n), image: &image, types: &types, user_data, disk_gb: 8, disk_mibs: 125, disk_iops: 3000, clock: None, skip: &[], tags: &tags, spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0 }, super::now_ms(), &mut superci_core::aws::Told::default())).unwrap();
             eprintln!("started {} ({}) in {}", started.id, started.kind, started.zone);
             assert!(n.subnets.iter().any(|(z, _)| *z == started.zone));
             let described = futures::executor::block_on(aws::ec2(&http, region, &c, "DescribeInstances", serde_json::json!({ "InstanceId": [started.id] }), super::now_ms())).unwrap();
