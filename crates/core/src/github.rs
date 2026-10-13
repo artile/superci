@@ -161,7 +161,13 @@ pub async fn public_repositories(http: &dyn Http, api: &str, token: &str) -> Res
 
 /// The permissions the App asks for (as set in its settings; each installation accepts them).
 pub async fn app_permissions(http: &dyn Http, app: &App, now_ms: u64) -> Result<serde_json::Value> {
-    Ok(gh(http, &app.api(), "GET", "/app", Some(&app_jwt(app, now_ms)?), None).await?["permissions"].clone())
+    Ok(app_now(http, app, now_ms).await?["permissions"].clone())
+}
+
+/// The App as GitHub has it now: what it asks for, and its name and address (`slug`), which its owner can change on
+/// GitHub at any time.
+pub async fn app_now(http: &dyn Http, app: &App, now_ms: u64) -> Result<serde_json::Value> {
+    gh(http, &app.api(), "GET", "/app", Some(&app_jwt(app, now_ms)?), None).await
 }
 
 pub async fn installation_token(http: &dyn Http, app: &App, installation_id: u64, now_ms: u64) -> Result<String> {

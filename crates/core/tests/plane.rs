@@ -574,6 +574,31 @@ impl Http for NoSpot {
     }
 }
 
+/// The fake clouds, with the App renamed on GitHub since it was made: GitHub says its address as it is now.
+struct Renamed { clouds: FakeClouds }
+#[async_trait(?Send)]
+impl Http for Renamed {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        if r.method == "GET" && r.url == "https://api.github.com/app" {
+            return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 99, "slug": "acme-ci", "name": "Acme CI", "permissions": { "organization_self_hosted_runners": "write", "actions": "write", "metadata": "read" } }).to_string()));
+        }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn an_app_renamed_on_github_is_known_by_its_new_address() {
+    let (store, clouds, wakes, cache) = (Mem::default(), Renamed { clouds: FakeClouds::default() }, Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    assert_eq!(app().slug, "superci-acme-abc123");
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let status = json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    // What the pages make their links to the App from is the address GitHub says now, not the one it was made with.
+    assert_eq!((status["apps"][0]["slug"].as_str(), status["app"]["slug"].as_str(), status["apps"][0]["id"].as_u64()), (Some("acme-ci"), Some("acme-ci"), Some(99)));
+}
+
 /// The fake clouds, in a region that has none of the newest machines (as Stockholm had none of c8a in October 2026).
 struct OlderRegion { clouds: FakeClouds }
 #[async_trait(?Send)]

@@ -180,6 +180,8 @@ pub struct Cache {
     types: RefCell<HashMap<String, (Vec<String>, u64)>>,
     /// What the GitHub App asks for and the GitLab token's scopes, and until when they are taken as current.
     app_permissions: RefCell<HashMap<u64, (serde_json::Value, u64)>>,
+    /// Each App's address on GitHub as GitHub last said it (its owner may rename the App there).
+    app_slugs: RefCell<HashMap<u64, String>>,
     gitlab_scopes: RefCell<HashMap<String, (Vec<String>, u64)>>,
     /// The public repositories the App is installed on, and until when they are taken as current.
     public_repos: RefCell<Option<(Vec<String>, u64)>>,
@@ -965,7 +967,8 @@ impl<'a> ControlPlane<'a> {
         // Each App (one per organization), with what it asks GitHub for.
         let mut apps = vec![];
         for app in self.config.apps() {
-            apps.push(serde_json::json!({ "id": app.id, "slug": app.slug, "owner": app.owner, "org": app.owner_is_org, "host": app.host, "permissions": self.app_permissions(app).await }));
+            let permissions = self.app_permissions(app).await;
+            apps.push(serde_json::json!({ "id": app.id, "slug": self.app_slug(app), "owner": app.owner, "org": app.owner_is_org, "host": app.host, "permissions": permissions }));
         }
         let mut gitlabs = vec![];
         for gl in self.config.gitlabs() { gitlabs.push(serde_json::json!({ "id": gl.id, "url": gl.url, "scopes": self.gitlab_scopes(gl).await })) }
@@ -974,7 +977,7 @@ impl<'a> ControlPlane<'a> {
         let jobs: Vec<Job> = jobs_all.iter().take(50).cloned().collect();
         Ok(Response::json(&serde_json::json!({
             "plane": self.config.plane_id, "label": self.config.label, "labels": self.config.labels(), "name": self.config.name(),
-            "app": self.config.app.as_ref().map(|a| serde_json::json!({ "id": a.id, "slug": a.slug, "owner": a.owner, "org": a.owner_is_org, "host": a.host })),
+            "app": self.config.app.as_ref().map(|a| serde_json::json!({ "id": a.id, "slug": self.app_slug(a), "owner": a.owner, "org": a.owner_is_org, "host": a.host })),
             "apps": apps,
             "installations": installations,
             "aws": self.aws_connection().await?,
@@ -1015,10 +1018,16 @@ impl<'a> ControlPlane<'a> {
     async fn app_permissions(&self, app: &App) -> Option<serde_json::Value> {
         let now = self.clock.now_ms();
         if let Some((p, until)) = self.cache.app_permissions.borrow().get(&app.id).cloned() { if now < until { return Some(p) } }
-        let p = github::app_permissions(self.http, app, now).await.ok()?;
+        let said = github::app_now(self.http, app, now).await.ok()?;
+        let p = said["permissions"].clone();
         self.cache.app_permissions.borrow_mut().insert(app.id, (p.clone(), now + 600_000));
+        if let Some(slug) = said["slug"].as_str().filter(|s| !s.is_empty()) { self.cache.app_slugs.borrow_mut().insert(app.id, slug.to_string()); }
         Some(p)
     }
+
+    /// The App's address on GitHub: as GitHub last said it (see `app_permissions`), else as it was when the App was
+    /// made. An App renamed on GitHub has another address, and the links the pages make to it follow.
+    fn app_slug(&self, app: &App) -> String { self.cache.app_slugs.borrow().get(&app.id).cloned().unwrap_or_else(|| app.slug.clone()) }
 
     /// The GitLab token's scopes (asked again after ten minutes).
     async fn gitlab_scopes(&self, gl: &GitLab) -> Option<Vec<String>> {

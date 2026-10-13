@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.16.3 — unreleased
+- A GitHub App renamed on GitHub keeps working in the dashboard: the control plane asks GitHub for the App's address as it is now, and the links to the App (install it, its settings, its permissions) follow within ten minutes. Before, they went to the address the App was made with.
+
 ## 0.16.2 — 2026-10-13
 - What an AWS account allows is asked again each time a page that shows it is opened (when the last look is older than twenty seconds), beside the page: a change made in AWS shows within seconds. Before, it showed up to ten minutes later. The AWS account section also has Refresh.
 
