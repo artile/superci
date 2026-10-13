@@ -856,6 +856,8 @@ pub fn runner_user_data_for(work: &crate::io::Work, max_minutes: u32, os: &str, 
 Start-Transcript -Path C:\superci.log -Append
 shutdown.exe /s /f /t {secs} /c "superci: time bound"
 $ProgressPreference = 'SilentlyContinue'
+# The C: drive as large as the disk the machine was given (the image's is 100 GB).
+try {{ $max = (Get-PartitionSupportedSize -DriveLetter C).SizeMax; if ((Get-Partition -DriveLetter C).Size -lt ($max - 1GB)) {{ Resize-Partition -DriveLetter C -Size $max }} }} catch {{ }}
 $dir = 'C:\actions-runner'
 if (-not (Test-Path "$dir\run.cmd")) {{
   $v = (Invoke-RestMethod -UseBasicParsing -Headers @{{ 'User-Agent' = 'superci' }} https://api.github.com/repos/actions/runner/releases/latest).tag_name.TrimStart('v')
@@ -871,6 +873,15 @@ shutdown.exe /s /f /t 0
 "#, secs = max_minutes * 60, jit = jit, watch = watch))
 }
 
+/// The root filesystem as large as the disk the machine was given. The volume has the size asked for; the image's
+/// partition and filesystem keep the image's own (29 GB of Ubuntu's, 18 of them used) unless they are grown, which
+/// the image does not do by itself. Under two seconds on a mounted root; nothing here stops the job (`growpart`
+/// ends with an error when there is nothing to grow).
+const GROW_ROOT: &str = r#"root="$(findmnt -n -o SOURCE /)"; disk="$(lsblk -n -o PKNAME "$root" 2>/dev/null | head -n 1)"; part="$(echo "$root" | grep -o '[0-9]*$')"
+if [ -n "$disk" ] && [ -n "$part" ]; then growpart "/dev/$disk" "$part" || true; resize2fs "$root" 2>/dev/null || xfs_growfs / 2>/dev/null || true; fi
+df -h / | tail -n 1
+"#;
+
 pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<String> {
     let (jit_config, fail) = match work {
         crate::io::Work::GitHub { jit } => (jit.as_str(), None),
@@ -878,8 +889,8 @@ pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<Stri
         crate::io::Work::GitLab { url, token } => {
             let safe = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b));
             if !safe(url) || !safe(token) { return Err("invalid GitLab runner settings".into()) }
-            return Ok(format!(concat!("#!/bin/bash\nexec > >(tee /var/log/superci.log > /dev/console) 2>&1\n", bound!(), "\nexport GL_URL={url} GL_TOKEN={token} GL_RUNNER_FLAGS=--docker-privileged\nbash -c '{script}' || true\npoweroff\n"),
-                url = url, token = token, secs = max_minutes * 60, minutes = max_minutes + 1, script = crate::gitlab::RUNNER_SCRIPT.replace('\'', "'\\''")))
+            return Ok(format!(concat!("#!/bin/bash\nexec > >(tee /var/log/superci.log > /dev/console) 2>&1\n", bound!(), "\n{grow}export GL_URL={url} GL_TOKEN={token} GL_RUNNER_FLAGS=--docker-privileged\nbash -c '{script}' || true\npoweroff\n"),
+                grow = GROW_ROOT, url = url, token = token, secs = max_minutes * 60, minutes = max_minutes + 1, script = crate::gitlab::RUNNER_SCRIPT.replace('\'', "'\\''")))
         }
     };
     let base64 = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b));
@@ -892,7 +903,7 @@ pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<Stri
     Ok(format!(concat!(r#"#!/bin/bash
 exec > >(tee /var/log/superci.log > /dev/console) 2>&1
 "#, bound!(), r#"
-# As GitHub's Ubuntu runners: unprivileged user namespaces (Chromium's sandbox).
+{grow}# As GitHub's Ubuntu runners: unprivileged user namespaces (Chromium's sandbox).
 sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 # Docker as on GitHub's runners: the runner's user may use it (the image leaves it to root), and it starts now,
 # beside the runner, not at a job's first use of it (services, container jobs, docker steps).
@@ -902,7 +913,9 @@ usermod -aG docker runner 2>/dev/null || true
 find /home/runner/bin -type f -print0 2>/dev/null | xargs -0 -r -P 64 -n 16 cat > /dev/null 2>&1
 {hook}cd /home/runner && sudo -u runner -H {run} --jitconfig {jit_config}
 poweroff
-"#), jit_config = jit_config, hook = hook, run = run, secs = max_minutes * 60, minutes = max_minutes + 1))
+"#), jit_config = jit_config, hook = hook, run = run, secs = max_minutes * 60, minutes = max_minutes + 1,
+        // (Not for the runner that only says why a job failed: it uses no disk.)
+        grow = if fail.is_some() { "" } else { GROW_ROOT }))
 }
 
 #[cfg(test)]
@@ -1048,6 +1061,15 @@ mod tests {
         let gl = runner_user_data(&crate::io::Work::GitLab { url: "https://gitlab.com".into(), token: "glrt-abc_123".into() }, 70).unwrap();
         assert!(gl.contains("GL_URL=https://gitlab.com GL_TOKEN=glrt-abc_123") && gl.contains("run-single"));
         assert!(runner_user_data(&crate::io::Work::GitLab { url: "https://x".into(), token: "t; rm -rf /".into() }, 70).is_err());
+        // The root filesystem is grown to the disk's size before the runner starts (the image's stays 29 GB by
+        // itself, whatever disk was asked for), on GitHub's and GitLab's machines alike; and C: on Windows.
+        let grow = r#"growpart "/dev/$disk" "$part" || true; resize2fs "$root" 2>/dev/null || xfs_growfs / 2>/dev/null || true"#;
+        assert!(script.contains(grow) && script.find("growpart").unwrap() < script.find("./run.sh").unwrap(), "{script}");
+        assert!(gl.contains(grow) && gl.find("growpart").unwrap() < gl.find("export GL_URL=").unwrap(), "{gl}");
+        let win = runner_user_data_for(&gh("abc"), 70, "windows", None).unwrap();
+        assert!(win.contains("Resize-Partition -DriveLetter C -Size $max") && win.find("Resize-Partition").unwrap() < win.find("run.cmd --jitconfig").unwrap(), "{win}");
+        // (The runner that only says why a job failed uses no disk.)
+        assert!(!runner_user_data(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10).unwrap().contains("growpart"));
     }
 
     #[test]
