@@ -34,13 +34,14 @@ pub struct Spec {
 pub const DISK_MIBS_INCLUDED: u32 = 125;
 pub const DISK_IOPS_INCLUDED: u32 = 3000;
 
-/// How fast a machine's disk is on AWS (MiB a second, IOPS). Left to the machine's size: 62.5 MiB a second for each
-/// CPU, no less than what AWS includes and no more than 1,000 (the extra is then about a tenth of a spot machine's
-/// price at every size; a machine of any size can use it, for its first half hour). IOPS: what AWS includes, or what
+/// How fast a machine's disk is on AWS (MiB a second, IOPS). Left to the machine's size: 31.25 MiB a second for each
+/// CPU, no less than what AWS includes and no more than 1,000. So the standard 4-CPU machine has what AWS includes,
+/// at no extra price, and the extra on a larger one is a twentieth to a tenth of a spot machine's price (a machine of
+/// any size could use more, for its first half hour: its size sets what is worth paying for, not what it can do). IOPS: what AWS includes, or what
 /// the speed needs. As asked, when a label or the default machine says: within what a gp3 volume takes (125 to 2,000
 /// MiB a second, 3,000 to 80,000 IOPS, 4 IOPS for each MiB a second, 500 IOPS for each GB).
 pub fn disk_speed(cpu: u32, disk_gb: u32, s: &Spec) -> (u32, u32) {
-    let by_size = (cpu * 125 / 2).clamp(DISK_MIBS_INCLUDED, 1000);
+    let by_size = (cpu * 125 / 4).clamp(DISK_MIBS_INCLUDED, 1000);
     let most_iops = (disk_gb.saturating_mul(500)).clamp(DISK_IOPS_INCLUDED, 80_000);
     let mibs = s.disk_mibs.unwrap_or(by_size).clamp(DISK_MIBS_INCLUDED, 2000).min(most_iops / 4);
     let iops = s.disk_iops.unwrap_or(DISK_IOPS_INCLUDED).clamp(DISK_IOPS_INCLUDED, 80_000).max(mibs * 4).min(most_iops);
@@ -59,7 +60,7 @@ pub const GPUS: [&str; 8] = ["t4", "l4", "a10g", "l40s", "a100", "h100", "h200",
 pub fn valid_label(label: &str) -> Result<(), String> {
     let ok = (2..=24).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) && label.as_bytes()[0].is_ascii_lowercase();
     if !ok { return Err("A label is 2 to 24 lowercase letters and digits, starting with a letter (acmeci, ci2).".into()) }
-    const TAKEN: [&str; 26] = ["tmpfs", "localdisk", "ubuntu", "windows", "macos", "linux", "self", "hosted", "selfhosted", "x64", "arm64", "arm", "amd64", "x86", "mac", "osx", "win", "gpu", "aws", "cloudflare", "modal", "ondemand", "spot", "latest", "ramdisk", "nvme"];
+    const TAKEN: [&str; 25] = ["localdisk", "ubuntu", "windows", "macos", "linux", "self", "hosted", "selfhosted", "x64", "arm64", "arm", "amd64", "x86", "mac", "osx", "win", "gpu", "aws", "cloudflare", "modal", "ondemand", "spot", "latest", "ramdisk", "nvme"];
     if TAKEN.contains(&label) || GPUS.contains(&label) { return Err(format!("{label} means something else in a label already: choose another word.")) }
     Ok(())
 }
@@ -92,9 +93,8 @@ impl Spec {
         let mut s = Spec::default();
         for part in rest.split('-') {
             let num = |suffix: &str| part.strip_suffix(suffix).and_then(|n| n.parse::<u32>().ok()).filter(|n| *n > 0);
-            // (Said in plain words; the words others use for the same are understood too.)
-            if ["ramdisk", "tmpfs"].contains(&part) { s.ramdisk = true }
-            else if ["localdisk", "nvme"].contains(&part) { s.nvme = true }
+            if part == "ramdisk" { s.ramdisk = true }
+            else if part == "localdisk" { s.nvme = true }
             else if let Some(n) = num("mbs") { if !(125..=2000).contains(&n) { return Some(Err(format!("a disk's speed is 125 to 2000 MiB a second, not {n}"))) } s.disk_mibs = Some(n) }
             else if let Some(n) = num("iops") { if !(3000..=80_000).contains(&n) { return Some(Err(format!("a disk has 3000 to 80000 IOPS, not {n}"))) } s.disk_iops = Some(n) }
             else if let Some(n) = num("cpu") { if n > 192 { return Some(Err(format!("{n} CPUs is more than any machine has"))) } s.cpu = Some(n) }
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(s.describe(), "8 CPU, 500 MiB/s disk, 6000 IOPS, RAM disk");
         assert!(Spec::parse("superci-50mbs", "superci").unwrap().unwrap_err().contains("125 to 2000") && Spec::parse("superci-100iops", "superci").unwrap().is_err());
         let nvme = Spec::parse("superci-16cpu-localdisk", "superci").unwrap().unwrap();
-        assert_eq!((Spec::parse("superci-16cpu-nvme", "superci"), Spec::parse("superci-tmpfs", "superci")), (Some(Ok(nvme.clone())), Spec::parse("superci-ramdisk", "superci")), "the words others use for the same");
+        assert!(Spec::parse("superci-16cpu-nvme", "superci").unwrap().is_err() && Spec::parse("superci-tmpfs", "superci").unwrap().is_err(), "one word for each");
         assert_eq!(nvme.describe(), "16 CPU, local disk");
         assert_eq!(aws_instance_types(&nvme)[..2], ["m8id.4xlarge".to_string(), "m6id.4xlarge".to_string()]);
         assert_eq!(aws_instance_types(&Spec { arch: Some("arm64".into()), ..nvme.clone() })[0], "m8gd.4xlarge");
@@ -310,10 +310,10 @@ mod tests {
         assert!(Capacity::aws().refuses(&Spec::parse("superci-windows-ramdisk", "superci").unwrap().unwrap()).unwrap().contains("Linux only"));
         // The disk's speed follows the machine's size unless said; what is said stays within what a gp3 volume takes.
         let d = Spec::default();
-        assert_eq!([2, 4, 8, 16, 32, 96].map(|cpu| disk_speed(cpu, 60, &d)), [(125, 3000), (250, 3000), (500, 3000), (1000, 4000), (1000, 4000), (1000, 4000)]);
+        assert_eq!([2, 4, 8, 16, 32, 96].map(|cpu| disk_speed(cpu, 60, &d)), [(125, 3000), (125, 3000), (250, 3000), (500, 3000), (1000, 4000), (1000, 4000)]);
         assert_eq!(disk_speed(4, 60, &Spec { disk_mibs: Some(125), ..Default::default() }), (125, 3000), "the standard speed, when the default machine says so");
         assert_eq!(disk_speed(4, 60, &Spec { disk_mibs: Some(2000), ..Default::default() }), (2000, 8000));
-        assert_eq!(disk_speed(4, 60, &Spec { disk_iops: Some(80_000), ..Default::default() }), (250, 30_000), "500 IOPS for each GB at most");
+        assert_eq!(disk_speed(8, 60, &Spec { disk_iops: Some(80_000), ..Default::default() }), (250, 30_000), "500 IOPS for each GB at most");
         assert_eq!(disk_speed(32, 8, &d), (1000, 4000));
     }
 

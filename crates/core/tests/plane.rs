@@ -204,7 +204,7 @@ fn aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines() {
     let job: serde_json::Value = serde_json::from_str(&store.0.borrow()["job:7"]).unwrap();
     assert_eq!(job["state"], "done");
     let price = job["usd_per_hour"].as_f64().unwrap();
-    let extras = superci_core::aws::extras_usd_per_hour(0.08, 60, 250, 3000, true);
+    let extras = superci_core::aws::extras_usd_per_hour(0.08, 60, 125, 3000, true);
     assert!((price - (0.065 + extras)).abs() < 1e-9, "its zone's spot price at launch, plus its disk and address: {price}");
     // Settled when it ended, at the prices AWS bills: a minute at least.
     let cost = job["cost_usd"].as_f64().unwrap();
@@ -1621,7 +1621,7 @@ fn a_network_of_the_accounts_own_takes_the_machines_and_nothing_else_does_when_i
     let j = job(&store, 7);
     assert_eq!((j["state"].as_str(), j["private"].as_bool()), (Some("launched"), Some(true)));
     // No public address in its price: the spot price in its zone and its disk only.
-    assert!((j["usd_per_hour"].as_f64().unwrap() - (0.065 + superci_core::aws::extras_usd_per_hour(0.096, 60, 250, 3000, false))).abs() < 0.02 && superci_core::aws::extras_usd_per_hour(0.08, 60, 125, 3000, true) - superci_core::aws::extras_usd_per_hour(0.08, 60, 125, 3000, false) == 0.005);
+    assert!((j["usd_per_hour"].as_f64().unwrap() - (0.065 + superci_core::aws::extras_usd_per_hour(0.096, 60, 125, 3000, false))).abs() < 0.02 && superci_core::aws::extras_usd_per_hour(0.08, 60, 125, 3000, true) - superci_core::aws::extras_usd_per_hour(0.08, 60, 125, 3000, false) == 0.005);
 
     // The setting changed in the dashboard: used by the next job at once (what was looked up before is not kept for it).
     let before = config.aws_networks.insert("us-east-1".into(), superci_core::aws::GivenNetwork { subnets: vec!["subnet-0aaaaaaaa".into()], security_groups: vec!["sg-0cccccccc".into()], private: false }).unwrap();
@@ -2375,17 +2375,18 @@ fn an_aws_machines_disk_is_as_fast_as_its_size_deserves_unless_said_and_a_label_
     let run = |id: u64, label: &str| { block_on(plane.handle(labelled("queued", id, "acme/app", None, label))); launches(&clouds).pop().unwrap() };
     let speed = |l: &[(String, String)]| (field(l, "BlockDeviceMapping.1.Ebs.Throughput").to_string(), field(l, "BlockDeviceMapping.1.Ebs.Iops").to_string());
     let s = |a: &str, b: &str| (a.to_string(), b.to_string());
-    // By the machine's size: 62.5 MiB a second for each CPU, from what AWS includes up to 1,000; IOPS as the speed needs.
-    assert_eq!(speed(&run(1, "superci")), s("250", "3000"));
-    assert_eq!(speed(&run(2, "superci-2cpu")), s("125", "3000"));
-    assert_eq!(speed(&run(3, "superci-8cpu")), s("500", "3000"));
+    // By the machine's size: 31.25 MiB a second for each CPU, from what AWS includes (the standard machine's) up to
+    // 1,000; IOPS as the speed needs.
+    assert_eq!(speed(&run(1, "superci-8cpu")), s("250", "3000"));
+    assert_eq!(speed(&run(2, "superci")), s("125", "3000"));
+    assert_eq!(speed(&run(3, "superci-16cpu")), s("500", "3000"));
     assert_eq!(speed(&run(4, "superci-32cpu")), s("1000", "4000"));
     // It is kept with the job when above what AWS includes, and is in the job's price: 250 MiB a second adds the
     // price of 62.5 GB of disk.
     assert_eq!((job(&store, 1)["disk_mibs"].as_u64(), job(&store, 1).get("disk_iops"), job(&store, 2).get("disk_mibs"), job(&store, 4)["disk_iops"].as_u64()), (Some(250), None, None, Some(4000)));
     let fast = job(&store, 1)["usd_per_hour"].as_f64().unwrap();
     // As a label says, within what a volume takes.
-    assert_eq!(speed(&run(5, "superci-125mbs")), s("125", "3000"));
+    assert_eq!(speed(&run(5, "superci-8cpu-125mbs")), s("125", "3000"));
     let plain = job(&store, 5)["usd_per_hour"].as_f64().unwrap();
     assert!((fast - plain - 125.0 / 2.0 * 0.08 / 730.0).abs() < 1e-6, "{fast} {plain}");
     assert_eq!(speed(&run(6, "superci-2000mbs-20000iops-200disk")), s("2000", "20000"));
