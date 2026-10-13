@@ -772,17 +772,33 @@ pub async fn terminate_instance(http: &dyn Http, region: &str, creds: &Credentia
 macro_rules! bound { () => { "( sleep {secs}; poweroff ) > /dev/null 2>&1 &\nshutdown -P +{minutes} > /dev/null 2>&1 || true" } }
 
 /// What a spot machine does when AWS gives its two minutes' notice (instance metadata's `spot/instance-action`): it
-/// tells the control plane (`NOTICE_URL`, a link only this machine has) and stops the runner, so its job fails at
-/// once, not when GitHub gives up on a runner it no longer hears from.
-const SPOT_WATCH: &str = r#"# AWS takes spot machines back with two minutes' notice: said to the control plane, and the runner stopped.
-# (A file /tmp/superci-interrupted counts as the notice, to rehearse it.)
+/// tells the control plane (`NOTICE_URL`, a link only this machine has), and lets the job go on for what is left of
+/// the two minutes: one that ends by itself in that time passes, and is not run again. Twenty seconds before the
+/// machine goes the runner is stopped, so a job still going fails at once, not when GitHub gives up on a runner it
+/// no longer hears from.
+const SPOT_WATCH: &str = r#"# AWS takes spot machines back with two minutes' notice: said to the control plane; the job has until twenty seconds
+# before the machine goes, and its runner is stopped then if it is still going.
+# (A file /tmp/superci-interrupted counts as the notice, to rehearse it: with the seconds left in it, or none.)
 ( while sleep 5; do
-    if [ ! -e /tmp/superci-interrupted ]; then
+    END=$(date +%s)
+    if [ -e /tmp/superci-interrupted ]; then
+      LEFT=$(tr -cd 0-9 < /tmp/superci-interrupted | head -c 4)
+      [ -n "$LEFT" ] && END=$(( END + LEFT - 20 ))
+    else
       T=$(curl -s -m 2 -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60') || continue
       [ "$(curl -s -m 2 -o /dev/null -w '%{http_code}' -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action)" = 200 ] || continue
+      # When AWS says the machine goes; ninety-five seconds from now if it does not say.
+      WHEN=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/spot/instance-action | sed -n 's/.*"time" *: *"\([^"]*\)".*/\1/p')
+      AT=$(date -d "$WHEN" +%s 2>/dev/null) || AT=
+      if [ -n "$WHEN" ] && [ -n "$AT" ]; then END=$(( AT - 20 )); else END=$(( END + 95 )); fi
     fi
-    echo "superci: AWS is taking this spot machine back; stopping the runner"
+    echo "superci: AWS is taking this spot machine back; its job has $(( END - $(date +%s) )) seconds to end by itself"
     curl -s -f -m 5 --retry 4 --retry-all-errors -X POST 'NOTICE_URL' > /dev/null 2>&1
+    SEEN=
+    while [ "$(date +%s)" -lt "$END" ]; do
+      if pgrep -f 'RUNNER_PROCESS' > /dev/null; then SEEN=1; elif [ -n "$SEEN" ]; then break; fi
+      sleep 2
+    done
     STOP_RUNNER
     break
   done ) &
@@ -800,6 +816,13 @@ const SPOT_WATCH_WINDOWS: &str = r#"Start-Job -ScriptBlock {
       } catch { continue }
     }
     foreach ($i in 1..4) { try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Method Post 'NOTICE_URL' | Out-Null; break } catch { Start-Sleep 2 } }
+    # The job has until forty seconds before the machine goes to end by itself (as on Linux; ending it here takes longer).
+    $end = (Get-Date).ToUniversalTime()
+    if (-not (Test-Path 'C:\superci-interrupted')) {
+      $end = $end.AddSeconds(75)
+      try { $when = (Invoke-RestMethod -TimeoutSec 2 -Headers @{ 'X-aws-ec2-metadata-token' = $t } http://169.254.169.254/latest/meta-data/spot/instance-action).time; if ($when) { $end = ([datetime]$when).ToUniversalTime().AddSeconds(-40) } } catch {}
+    }
+    while ((Get-Date).ToUniversalTime() -lt $end -and (Get-Process -Name Runner.Worker -ErrorAction SilentlyContinue)) { Start-Sleep 2 }
     if (Get-Process -Name Runner.Worker -ErrorAction SilentlyContinue) { Stop-Process -Name Runner.Worker -Force -ErrorAction SilentlyContinue; Start-Sleep 20 }
     Stop-Process -Name Runner.Listener -Force -ErrorAction SilentlyContinue
     break
@@ -815,14 +838,14 @@ pub fn runner_user_data_for(work: &crate::io::Work, max_minutes: u32, os: &str, 
         let script = runner_user_data(work, max_minutes)?;
         // Before the runner starts. GitHub's runner stops its job on an interrupt; GitLab's on being ended (the job
         // fails at once either way, not when the machine is gone).
-        let (at, stop) = match work {
-            crate::io::Work::GitHub { .. } => ("cd /home/runner && ", "pkill -INT -f Runner.Listener"),
-            crate::io::Work::GitLab { .. } => ("export GL_URL=", "pkill -TERM -f /tmp/gitlab-runner"),
+        let (at, stop, process) = match work {
+            crate::io::Work::GitHub { .. } => ("cd /home/runner && ", "pkill -INT -f Runner.Listener", "Runner.Listener"),
+            crate::io::Work::GitLab { .. } => ("export GL_URL=", "pkill -TERM -f /tmp/gitlab-runner", "/tmp/gitlab-runner"),
             crate::io::Work::Fail { .. } => return Ok(script),
         };
         let Some(url) = notice else { return Ok(script) };
         let (before, after) = script.split_once(at).ok_or("no runner in the start-up script")?;
-        return Ok(format!("{before}{}{at}{after}", SPOT_WATCH.replace("NOTICE_URL", url).replace("STOP_RUNNER", stop)));
+        return Ok(format!("{before}{}{at}{after}", SPOT_WATCH.replace("NOTICE_URL", url).replace("STOP_RUNNER", stop).replace("RUNNER_PROCESS", process)));
     }
     let crate::io::Work::GitHub { jit } = work else { return Err("Windows machines run GitHub jobs only".into()) };
     if !jit.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)) { return Err("invalid runner config".into()); }
@@ -1044,8 +1067,13 @@ mod tests {
         // Linux: GitHub's runner is interrupted, GitLab's ended; a failing runner watches nothing.
         let linux = runner_user_data_for(&gh, 70, "linux", Some(link)).unwrap();
         assert!(linux.contains(&format!("-X POST '{link}'")) && linux.contains("--retry 4") && linux.contains("pkill -INT -f Runner.Listener"));
+        // The job has what is left of AWS's two minutes, less twenty seconds, to end by itself: the runner is watched
+        // until then (by when AWS says the machine goes), and stopped only if it is still going.
+        let (told, waits, stops) = (linux.find("-X POST 'https://plane").unwrap(), linux.find("while [ \"$(date +%s)\" -lt \"$END\" ]").unwrap(), linux.find("pkill -INT -f Runner.Listener").unwrap());
+        assert!(told < waits && waits < stops && linux.contains("END=$(( AT - 20 ))") && linux.contains("pgrep -f 'Runner.Listener'") && !linux.contains("RUNNER_PROCESS"), "{linux}");
+        assert!(win.contains("AddSeconds(-40)") && win.find("AddSeconds(-40)").unwrap() < win.find("Stop-Process -Name Runner.Worker -Force").unwrap());
         let gl = runner_user_data_for(&crate::io::Work::GitLab { url: "https://gitlab.com".into(), token: "glrt-a".into() }, 70, "linux", Some(link)).unwrap();
-        assert!(gl.contains("pkill -TERM -f /tmp/gitlab-runner") && !gl.contains("STOP_RUNNER") && !gl.contains("NOTICE_URL"));
+        assert!(gl.contains("pkill -TERM -f /tmp/gitlab-runner") && gl.contains("pgrep -f '/tmp/gitlab-runner'") && !gl.contains("STOP_RUNNER") && !gl.contains("NOTICE_URL") && !gl.contains("RUNNER_PROCESS"));
         assert!(!runner_user_data_for(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10, "linux", Some(link)).unwrap().contains("instance-action"));
         // A link is only ever what a shell reads as one word.
         assert!(runner_user_data_for(&gh, 70, "linux", Some("https://x/'; reboot; '")).is_err() && runner_user_data_for(&gh, 70, "windows", Some("http://x/y")).is_err());
