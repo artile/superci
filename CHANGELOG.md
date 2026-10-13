@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.16.9 — unreleased
+## 0.16.9 — 2026-10-14
 - Labels are written as key=value pairs. `runs-on: superci` is the default machine. A label that says a machine says it after its name, one `key=value` for each thing, in any order: `runs-on: superci/cpu=8/arch=arm64`. The keys: `cpu`, `ram`, `disk`, `disk-speed`, `disk-iops`, `arch`, `os`, `gpu`, `family`, `scratch`, `provider`, `spot`. Numbers have no units (`ram=32` is 32 GB). Each thing has one way to be said.
 - The same keys everywhere. `superci machine update` takes each of them as a flag (`--cpu=8`, `--spot=false`, `--scratch=ramdisk`, `--family=m8a+r8a`; `--KEY=default` leaves one to each provider's standard again), and the label picker on Workflows writes them. The default machine's box reads "No spot machines". `--disk-speed` takes a number (125 is what AWS includes).
 - `spot` is one key: `spot=false` for a job that must never be on a spot machine, and `spot=true` in a label undoes a default machine that says never.
