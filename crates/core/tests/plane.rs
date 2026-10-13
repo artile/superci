@@ -574,6 +574,39 @@ impl Http for NoSpot {
     }
 }
 
+/// The fake clouds, in a region that has none of the newest machines (as Stockholm had none of c8a in October 2026).
+struct OlderRegion { clouds: FakeClouds }
+#[async_trait(?Send)]
+impl Http for OlderRegion {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        if body.contains("Action=DescribeInstanceTypeOfferings") {
+            self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body.clone()));
+            let item = |t: &str| format!("<item><instanceType>{t}</instanceType><locationType>region</locationType><location>us-east-1</location></item>");
+            let have: String = ["m7a.xlarge", "c7a.xlarge"].iter().filter(|t| body.contains(&format!("={t}"))).map(|t| item(t)).collect();
+            return Ok(Response::new(200, "text/xml", format!("<DescribeInstanceTypeOfferingsResponse><instanceTypeOfferingSet>{have}</instanceTypeOfferingSet></DescribeInstanceTypeOfferingsResponse>")));
+        }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn a_machine_type_the_region_does_not_have_is_not_asked_for_with_every_job() {
+    let (store, clouds, wakes, cache) = (Mem::default(), OlderRegion { clouds: FakeClouds::default() }, Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    assert_eq!(config.instance_types, ["c8a.xlarge", "c7a.xlarge", "m7a.xlarge"]);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
+    // Each job's machine is asked for as the first type the region has (in the order they are preferred), and the
+    // region is asked what it has once, not with each job.
+    assert_eq!(launches(&clouds.clouds).iter().map(|l| field(l, "InstanceType")).collect::<Vec<_>>(), ["c7a.xlarge", "c7a.xlarge"]);
+    assert_eq!(clouds.clouds.calls.borrow().iter().filter(|(_, _, body)| body.contains("Action=DescribeInstanceTypeOfferings")).count(), 1);
+    assert_eq!((job(&store, 7)["machine_type"].as_str(), job(&store, 8)["state"].as_str()), (Some("c7a.xlarge"), Some("launched")));
+}
+
 /// The fake clouds, in an account whose own budget in AWS reached its limit and put its rule on the control
 /// plane's role: every launch is refused. The refusal is the recorded one above with what AWS says of a role's own
 /// policy in the organization's place ("identity-based policy", and the rule's name when `named`); that the rule's

@@ -137,6 +137,24 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
 /// Deletes the control plane `plane_id` from `region`: its schedule, function, table, parameters, logs and role. Safe
 /// to repeat (what is gone already is skipped). Machines it started end by themselves.
 pub fn delete(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
+    delete_in_region(creds, region, plane_id)?;
+    delete_role(creds, region, plane_id)
+}
+
+/// What a deploy that stopped partway made, removed when its place is given up for another: its parts in the
+/// region, its machines' network there, and its role (made first, and in no region: what a deploy refused by its
+/// region left behind before the region was asked first). A region the account may not use refuses the asking too:
+/// nothing was made there. Returns what could not be removed, in words.
+pub fn abandon(creds: &Credentials, region: &str, plane_id: &str) -> Vec<String> {
+    let mut left = vec![];
+    let refused = |e: &str| aws::refusal(e).is_some();
+    if let Err(e) = delete_in_region(creds, region, plane_id) { if !refused(&e) { left.push(format!("what the deploy made in {region} ({e})")) } }
+    if let Err(e) = crate::aws::delete_networks(creds, plane_id, &[region]) { if !refused(&e) { left.push(format!("its machines' network in {region} ({e})")) } }
+    if let Err(e) = delete_role(creds, region, plane_id) { left.push(format!("the role {} ({e})", name(plane_id))) }
+    left
+}
+
+fn delete_in_region(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
     let a = api(creds, region);
     let name = name(plane_id);
     let gone = ["ResourceNotFoundException", "NoSuchEntity", "ParameterNotFound"];
@@ -150,7 +168,13 @@ pub fn delete(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
         if names.is_empty() { break }
         a.ssm("DeleteParameters", json!({ "Names": names }))?;
     }
-    ok_if(a.target("logs", &format!("logs.{region}.amazonaws.com"), "Logs_20140328.DeleteLogGroup", "1.1", json!({ "logGroupName": format!("/aws/lambda/{name}") })), &gone)?;
+    ok_if(a.target("logs", &format!("logs.{region}.amazonaws.com"), "Logs_20140328.DeleteLogGroup", "1.1", json!({ "logGroupName": format!("/aws/lambda/{name}") })), &gone).map(|_| ())
+}
+
+fn delete_role(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
+    let a = api(creds, region);
+    let name = name(plane_id);
+    let gone = ["ResourceNotFoundException", "NoSuchEntity", "ParameterNotFound"];
     for policy in ["control-plane", "runner-machines"] { ok_if(a.iam("DeleteRolePolicy", json!({ "RoleName": name, "PolicyName": policy })), &gone)?; }
     ok_if(a.iam("DeleteRole", json!({ "RoleName": name })), &gone)
 }

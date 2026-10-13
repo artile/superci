@@ -119,6 +119,9 @@ pub struct Dashboard {
     aws_looks: HashMap<String, (u64, aws::Look)>,
     /// The regions AWS is copying the image jobs run on into, by account (asked with the look).
     aws_copying: HashMap<String, Vec<String>>,
+    /// Where an AWS account's own copy of the runner image is of an older build than its maker's newest, by account:
+    /// the region, the build held, the newest, and whether the newest is being copied in.
+    aws_behind: HashMap<String, Vec<(String, String, String, bool)>>,
     /// When the rule of an AWS account's budget was last taken off a control plane's role here (by its id): what
     /// the control plane noted before that is no longer so.
     budget_lifted: HashMap<String, u64>,
@@ -715,7 +718,7 @@ impl Dashboard {
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
             status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
-            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
+            manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
     /// A dashboard that remembers: with SuperCI's own sign-ins from its folder, kept there again as they change. A
@@ -1231,9 +1234,17 @@ impl Dashboard {
         let (usable, without) = (look.usable_regions(), look.regions_without_image());
         if !usable.is_empty() || !without.is_empty() {
             let copying = self.aws_copying.get(&account).cloned().unwrap_or_default();
-            rows.push(row("Runner image", if without.is_empty() { if usable.len() == allowed.len() && usable.len() > 1 { "In every region it may use".to_string() } else { format!("In {}", esc(&names(&usable))) } } else { format!("Not in {}", esc(&names(&without))) },
-                if without.is_empty() { String::new() } else if without.iter().any(|r| copying.iter().any(|c| c == r)) { "It is being copied in: about ten minutes.".to_string() }
-                    else { esc("No job can start there until it is copied in: about ten minutes, and about $1.50 a month for the copy's storage in your account.") }, String::new()));
+            // The account's own copy, of an older build than its maker's newest: said, with copying the new one in.
+            let behind = self.aws_behind.get(&account).and_then(|b| b.first()).cloned();
+            let (more, end) = match (&behind, without.is_empty()) {
+                (_, false) if without.iter().any(|r| copying.iter().any(|c| c == r)) => ("It is being copied in: about ten minutes.".to_string(), String::new()),
+                (_, false) => (esc("No job can start there until it is copied in: about ten minutes, and about $1.50 a month for the copy's storage in your account."), String::new()),
+                (Some((region, _, newest, true)), _) => (esc(&format!("The build of {} is being copied into {}: about ten minutes. Jobs start from your older copy until it is there.", aws::build_day(newest), region_short(region))), String::new()),
+                (Some((region, have, newest, false)), _) => (esc(&format!("Your copy in {} is the build of {}. Its maker has one of {} out.", region_short(region), aws::build_day(have), aws::build_day(newest))),
+                    format!(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="{}"><input type="hidden" name="region" value="{}"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#, esc(&account), esc(region))),
+                (None, true) => (String::new(), String::new()),
+            };
+            rows.push(row("Runner image", if without.is_empty() { if usable.len() == allowed.len() && usable.len() > 1 { "In every region it may use".to_string() } else { format!("In {}", esc(&names(&usable))) } } else { format!("Not in {}", esc(&names(&without))) }, more, end));
         }
         if let (Some(org), Some(managed)) = (&look.organization_id, look.management_account.as_deref().filter(|m| *m != account)) {
             rows.push(row("Organization", esc(org), esc(&format!("Managed from account {managed}: its policies are not this account's to read or change.")), String::new()));
@@ -1975,10 +1986,18 @@ impl Dashboard {
                 if !field("account").is_empty() && !self.hold_account(&field("account")) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {}.", esc(&field("account"))))) }
                 let account = self.aws.as_ref().ok_or("Sign in with AWS first.")?.account_id.clone();
                 let creds = self.aws_creds()?;
-                // (One copy is enough: with one there or on its way, nothing more is asked for.)
-                if aws::copied_images(&creds, &region)?.is_empty() {
+                // (One copy is enough: with one there or on its way, nothing more is asked for. But for a newer
+                // build, asked for where the copy is of an older one: copied in beside it, which then goes.)
+                let copies = aws::copied_images(&creds, &region)?;
+                let newer = field("newer") == "1" && !copies.iter().any(|c| c.state == "pending") && aws::newest_build().is_some_and(|newest| aws::behind(&copies, &newest).is_some());
+                if copies.is_empty() || newer {
                     let source = aws::copy_source_for(&region, None)?;
                     aws::copy_image_into(&creds, &region, &source)?;
+                }
+                if field("newer") == "1" {
+                    if let Some(b) = self.aws_behind.get_mut(&account).and_then(|b| b.iter_mut().find(|b| b.0 == region)) { b.3 = true }
+                    if let Some((at, _)) = self.aws_looks.get_mut(&account) { *at = 0 }
+                    return Ok(Response::redirect("/?p=planes#aws-account"))
                 }
                 let copying = self.aws_copying.entry(account.clone()).or_default();
                 if !copying.contains(&region) { copying.push(region) }
@@ -1986,11 +2005,21 @@ impl Dashboard {
                 if let Some((at, _)) = self.aws_looks.get_mut(&account) { *at = 0 }
                 Ok(Response::redirect("/?p=plane"))
             }
-            // A deploy that stopped is let go of: back to choosing where (what it made stays, and is reused or found
-            // by a later try).
+            // A deploy that stopped is let go of: back to choosing where. What it had made in AWS is removed (its
+            // role at the least: nothing is left behind in a place that will not be used); said if it could not be.
             ("POST", "/plane/start-over") => {
-                let mut deploying = lock(&self.deploying);
-                if deploying.as_ref().is_some_and(|d| matches!(d.result, Some(Err(_)))) { *deploying = None }
+                let stopped = { let mut deploying = lock(&self.deploying); if deploying.as_ref().is_some_and(|d| matches!(d.result, Some(Err(_)))) { deploying.take() } else { None } };
+                if let Some(d) = stopped.filter(|d| d.cloud == "aws") {
+                    let value = |name: &str| d.form.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone()).unwrap_or_default();
+                    let (region, plane, account) = (value("region"), value("plane"), d.place.strip_prefix("account ").and_then(|p| p.split(' ').next()).unwrap_or_default().to_string());
+                    if !plane.is_empty() && !region.is_empty() && self.hold_account(&account) {
+                        if let Ok(creds) = self.aws_creds() {
+                            let left = aws_plane::abandon(&creds, &region, &plane);
+                            println!("POST /plane/start-over → what the stopped deploy made in AWS account {account} is removed{}", if left.is_empty() { String::new() } else { format!(", but for {}", left.join("; ")) });
+                            if !left.is_empty() { return Ok(message(200, "Something of the stopped deploy is still in AWS", &esc(&format!("Left in account {account}: {}. It costs nothing; setting up there again reuses it.", left.join("; "))))) }
+                        }
+                    }
+                }
                 Ok(Response::redirect("/?p=plane"))
             }
             // Moving to another control plane: the one in use hands over its settings (with a one-time token set
@@ -2657,7 +2686,7 @@ mark();load()})();</script>"#;
             let stale = account.as_ref().is_some_and(|a| d.quotas_for.as_ref().is_none_or(|(b, at)| b != a || now_ms() > at + 600_000));
             let quota_creds = if stale && ["add-runners", "runners"].contains(&section) { d.aws_creds().ok().zip(account.clone()) } else { None };
             // Where a control plane or runners are set up: what the account in hand allows (its regions, spot).
-            let unlooked = account.as_ref().is_some_and(|a| { let copying = d.aws_copying.get(a).is_some_and(|c| !c.is_empty()); d.aws_looks.get(a).is_none_or(|(at, _)| now_ms() > at + if copying { 15_000 } else { 600_000 }) });
+            let unlooked = account.as_ref().is_some_and(|a| { let copying = d.aws_copying.get(a).is_some_and(|c| !c.is_empty()) || d.aws_behind.get(a).is_some_and(|b| b.iter().any(|b| b.3)); d.aws_looks.get(a).is_none_or(|(at, _)| now_ms() > at + if copying { 15_000 } else { 600_000 }) });
             let look_creds = if unlooked && ["plane", "planes", "add-runners", "runners"].contains(&section_name(section)) { d.aws_creds().ok().zip(account) } else { None };
             (d.planes.iter().map(|p| (p.clone(), d.keyed.contains(p.plane_id()))).collect::<Vec<_>>(), d.status_key.clone(), d.modal_pending.clone(), quota_creds, look_creds)
         };
@@ -2701,7 +2730,19 @@ mark();load()})();</script>"#;
                 let look = aws::look_at(creds);
                 // Where the image is missing: whether a copy of it is on its way there.
                 let copying: Vec<String> = look.regions_without_image().into_iter().filter(|r| aws::copied_images(creds, r).is_ok_and(|copies| copies.iter().any(|c| c.state == "pending"))).map(str::to_string).collect();
-                (look, copying)
+                // Where the account's own copy is what jobs start from: whether its maker has a newer build out (a
+                // copy stays the build it was made of), and whether that one is on its way in. A copy that a newer
+                // one replaced goes, once the newer one is there.
+                let mut behind = vec![];
+                for region in look.usable_regions() {
+                    let _ = aws::tidy_copies(creds, region);
+                    let Ok(copies) = aws::copied_images(creds, region) else { continue };
+                    if copies.is_empty() { continue }
+                    let Some(newest) = aws::newest_build() else { break };
+                    let have = copies.iter().filter(|c| c.state == "available").map(|c| aws::build_of(&c.name)).max().unwrap_or_default().to_string();
+                    if !have.is_empty() && have < newest { behind.push((region.to_string(), have, newest.clone(), aws::behind(&copies, &newest).is_none())) }
+                }
+                (look, copying, behind)
             }));
             let quotas: Vec<_> = quota_creds.iter().flat_map(|(creds, _)| REGIONS.iter().map(move |r| s.spawn(move || {
                 let http = aws::Blocking::new();
@@ -2749,7 +2790,7 @@ mark();load()})();</script>"#;
         // The page shows, and changes, the control plane in use.
         if let Some(i) = views.get(view::in_use(&views)).and_then(|v| d.planes.iter().position(|p| p.plane_id() == v.plane.plane_id())) { d.select(i) }
         if let Some((_, account)) = quota_creds { d.quotas = quotas; d.quotas_for = Some((account, now_ms())); }
-        if let (Some((_, account)), Some((look, copying))) = (look_creds, looked) { d.aws_copying.insert(account.clone(), copying); d.aws_looks.insert(account, (now_ms(), look)); }
+        if let (Some((_, account)), Some((look, copying, behind))) = (look_creds, looked) { d.aws_copying.insert(account.clone(), copying); d.aws_behind.insert(account.clone(), behind); d.aws_looks.insert(account, (now_ms(), look)); }
         if let Some(Ok(Some(session))) = modal { d.modal = Some(session); d.modal_pending = None; d.looked_modal = false; }
         // The App is installed (or the wait is over): nothing more to wait for.
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
@@ -5672,6 +5713,15 @@ mod tests {
             assert!(page.contains(said), "{said}\n\n{page}");
         }
         assert!(!page.contains("management account"), "{page}");
+        // Its copy of the image is of an older build than its maker's newest: said, with copying the new one in;
+        // and while that one is on its way.
+        d.aws_behind.insert("111111111111".into(), vec![("eu-north-1".into(), "20261006080949".into(), "20261020070000".into(), false)]);
+        let behind = d.plane_page();
+        assert!(behind.contains(r#"<dt>Runner image</dt><dd>In Stockholm<small>Your copy in Stockholm is the build of 6 October 2026. Its maker has one of 20 October 2026 out.</small></dd><form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#), "{behind}");
+        d.aws_behind.get_mut("111111111111").unwrap()[0].3 = true;
+        let coming = d.plane_page();
+        assert!(coming.contains("The build of 20 October 2026 is being copied into Stockholm: about ten minutes. Jobs start from your older copy until it is there.") && !coming.contains("Copy the new one in"), "{coming}");
+        d.aws_behind.clear();
         // An account of its own: its section says nothing is refused, with its limits, and the regions offered are
         // the ones the image is in.
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/classic/look.jsonl"))));

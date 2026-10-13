@@ -452,6 +452,45 @@ pub fn delete_copied_images(creds: &Credentials, region: &str) -> Result<usize> 
     Ok(copies.len())
 }
 
+/// The build an image is of, from the end of its name (`…-x64-20261006080949`); empty when it has none.
+pub fn build_of(name: &str) -> &str { name.rsplit('-').next().filter(|s| s.len() == 14 && s.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default() }
+
+/// The build the account's copies hold, when its maker has a newer one out (the image is rebuilt every week or two,
+/// and a copy stays what it was): the newest build among the copies.
+pub fn behind<'a>(copies: &'a [aws::CopiedImage], newest: &str) -> Option<&'a str> {
+    let have = copies.iter().map(|c| build_of(&c.name)).filter(|b| !b.is_empty()).max()?;
+    (!newest.is_empty() && have < newest).then_some(have)
+}
+
+/// A build's day, as people say it: 20261006080949 is 6 October 2026.
+pub fn build_day(stamp: &str) -> String {
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    match (stamp.get(0..4), stamp.get(4..6).and_then(|m| m.parse::<usize>().ok()).filter(|m| (1..=12).contains(m)), stamp.get(6..8).and_then(|d| d.parse::<u32>().ok())) {
+        (Some(year), Some(month), Some(day)) => format!("{day} {} {year}", MONTHS[month - 1]),
+        _ => stamp.to_string(),
+    }
+}
+
+/// The newest build its maker lists (asked at most every six hours: the list is GitHub's, read with no sign-in).
+pub fn newest_build() -> Option<String> {
+    static KNOWN: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, stamp)) = known.as_ref().filter(|(at, _)| now_ms() < at + 6 * 3_600_000) { let _ = at; return Some(stamp.clone()) }
+    let stamp = published_image(&Blocking::new()).ok()?.0;
+    *known = Some((now_ms(), stamp.clone()));
+    Some(stamp)
+}
+
+/// Removes the account's older copies in a region once a newer one is there (a copy that replaced them). How many.
+pub fn tidy_copies(creds: &Credentials, region: &str) -> Result<usize> {
+    let http = Blocking::new();
+    let copies = futures::executor::block_on(aws::copied_images(&http, region, creds, now_ms())).map_err(|e| format!("{region}: {e}"))?;
+    let Some(newest) = copies.iter().filter(|c| c.state == "available").map(|c| build_of(&c.name)).max().filter(|b| !b.is_empty()) else { return Ok(0) };
+    let older: Vec<&aws::CopiedImage> = copies.iter().filter(|c| { let b = build_of(&c.name); !b.is_empty() && b < newest }).collect();
+    for copy in &older { futures::executor::block_on(aws::delete_copied_image(&http, region, creds, copy, now_ms())).map_err(|e| format!("{region}: {e}"))?; }
+    Ok(older.len())
+}
+
 /// A stamp of now, as the maker's builds have them (20261006080949).
 fn amz_stamp() -> String { aws::amz_date(now_ms()).chars().filter(|c| c.is_ascii_digit()).take(14).collect() }
 
@@ -635,6 +674,18 @@ mod look_tests {
     use super::*;
 
     fn creds() -> Credentials { Credentials { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "secret".into(), session_token: Some("token".into()), expires_at_ms: 0 } }
+
+    #[test]
+    fn a_copy_of_an_older_build_is_known_as_behind() {
+        let copy = |name: &str, state: &str| aws::CopiedImage { id: "ami-00000000000000001".into(), name: name.into(), state: state.into(), snapshots: vec![] };
+        assert_eq!((build_of("runs-on-v2.2-ubuntu24-full-x64-20261006080949"), build_of("runs-on-v2.2-ubuntu24-full-x64"), build_of("")), ("20261006080949", "", ""));
+        let copies = [copy("runs-on-v2.2-ubuntu24-full-x64-20261006080949", "available")];
+        // A newer build is out: the copy is behind, by the build it holds. The same build, or none known: it is not.
+        assert_eq!((behind(&copies, "20261013070000"), behind(&copies, "20261006080949"), behind(&copies, ""), behind(&[], "20261013070000")), (Some("20261006080949"), None, None, None));
+        // With the newer one already being copied in, the account holds that build.
+        assert_eq!(behind(&[copies[0].clone(), copy("runs-on-v2.2-ubuntu24-full-x64-20261013070000", "pending")], "20261013070000"), None);
+        assert_eq!((build_day("20261006080949"), build_day("20261113"), build_day("soon")), ("6 October 2026".to_string(), "13 November 2026".to_string(), "soon".to_string()));
+    }
 
     fn look(recording: &'static str) -> Look { let aws = Replay::of(recording); look_with(&|| aws.clone(), &creds()) }
 

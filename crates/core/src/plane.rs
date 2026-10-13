@@ -176,6 +176,8 @@ pub struct Cache {
     tokens: RefCell<HashMap<u64, (String, u64)>>,
     /// The machine image per region and architecture, and until when it is taken as current.
     image: RefCell<HashMap<String, (String, u64)>>,
+    /// Which of a set of machine types a region has, and until when that is taken as current.
+    types: RefCell<HashMap<String, (Vec<String>, u64)>>,
     /// What the GitHub App asks for and the GitLab token's scopes, and until when they are taken as current.
     app_permissions: RefCell<HashMap<u64, (serde_json::Value, u64)>>,
     gitlab_scopes: RefCell<HashMap<String, (Vec<String>, u64)>>,
@@ -1361,6 +1363,17 @@ impl<'a> ControlPlane<'a> {
         Ok((id, gb))
     }
 
+    /// The types among these that a region has, in their order (asked at most every six hours). One a region does
+    /// not have is then not asked for first with every job: AWS refuses it each time, and a spot machine's zones are
+    /// chosen by the prices of the first type. Not known (AWS did not say): all of them, as given.
+    async fn offered(&self, region: &str, types: &[String], creds: &Credentials, now: u64) -> Vec<String> {
+        let key = format!("{region}/{}", types.join(","));
+        if let Some((have, _)) = self.cache.types.borrow().get(&key).filter(|(_, until)| *until > now) { return have.clone() }
+        let have = match aws::offered_types(self.http, region, creds, types, now).await { Ok(have) if !have.is_empty() => have, _ => types.to_vec() };
+        self.cache.types.borrow_mut().insert(key, (have.clone(), now + 6 * 3_600_000));
+        have
+    }
+
     /// Whether spot is paused now: AWS took back two machines within a quarter of an hour, less than half an hour ago.
     async fn spot_paused(&self, now: u64) -> bool {
         let mut times: Vec<u64> = self.store.list("spot:interrupted:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| v.parse().ok()).collect();
@@ -1763,6 +1776,7 @@ impl<'a> ControlPlane<'a> {
                             // Never smaller than its image's disk (Windows' is 100 GB).
                             disk_gb = disk_gb.max(image_gb);
                             let network = self.network(region, &creds, now).await?;
+                            let types = self.offered(region, &types, &creds, now).await;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, tags: &tags, spot: !on_demand, os: spec.os() };
                             let mut machine = aws::run_instance(self.http, &creds, &launch, now).await;
                             // Many jobs queued at once: AWS lets a few launches through and refuses the rest for a
@@ -1807,7 +1821,12 @@ impl<'a> ControlPlane<'a> {
                                     last = said(&e);
                                 }
                                 // A network that is no longer there (removed, made again): looked up anew next try.
-                                Err(e) => { if e.starts_with("InvalidSubnet") || e.starts_with("InvalidGroup") || e.starts_with("InvalidSecurityGroup") { self.cache.network.borrow_mut().clear(); } return Err(e) }
+                                Err(e) => {
+                                    if e.starts_with("InvalidSubnet") || e.starts_with("InvalidGroup") || e.starts_with("InvalidSecurityGroup") { self.cache.network.borrow_mut().clear(); }
+                                    // An image that is no longer there (the account's copy was replaced by a newer build): looked up anew next try.
+                                    if e.starts_with("InvalidAMIID") { self.cache.image.borrow_mut().clear(); }
+                                    return Err(e)
+                                }
                             }
                         }
                         let Some((region, machine, private)) = launched else {

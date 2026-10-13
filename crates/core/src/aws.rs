@@ -284,6 +284,13 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
     Err(last)
 }
 
+/// Which of these machine types a region has at all, in their order.
+pub async fn offered_types(http: &dyn Http, region: &str, creds: &Credentials, types: &[String], now_ms: u64) -> Result<Vec<String>> {
+    let xml = ec2(http, region, creds, "DescribeInstanceTypeOfferings", serde_json::json!({ "LocationType": "region", "Filter": [{ "Name": "instance-type", "Value": types }] }), now_ms).await?;
+    let have: Vec<&str> = xml.split("<item>").skip(1).filter_map(|item| xml_tag(item, "instanceType")).collect();
+    Ok(types.iter().filter(|t| have.contains(&t.as_str())).cloned().collect())
+}
+
 /// A machine type's spot price now in each of a region's zones.
 async fn zone_prices(http: &dyn Http, region: &str, creds: &Credentials, instance_type: &str, os: &str, now_ms: u64) -> Result<std::collections::HashMap<String, f64>> {
     let xml = ec2(http, region, creds, "DescribeSpotPriceHistory", serde_json::json!({ "InstanceType": [instance_type], "ProductDescription": [product(os)], "StartTime": amz_iso(now_ms) }), now_ms).await?;

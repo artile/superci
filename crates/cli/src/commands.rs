@@ -51,8 +51,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most the AWS account may spend on machines in a month and in a day (UTC), its spot and on-demand\n          machines together (`none` lifts one). At a limit, jobs go to the providers of other accounts in the\n          order. The whole CI's limits are `superci limits update`.\n          --aws-budget: a budget in the AWS account itself for the monthly limit, made with your sign-in (the\n          control plane gets no permission for it). AWS counts the account's real bill, all of it and hours late.\n          emails: AWS writes to --email at 80% and at 100%. stops: that, and at 100% AWS refuses new machines to\n          the control plane until the next month. lift: takes that refusal off now. none: removes all of it.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\ndelete    Ends one at once."),
-    ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
-        "The image AWS machines start from (GitHub's own runner image, published for AWS by RunsOn in most regions).\n\nlist      Each region the AWS account can use: whether the image is published there, or your own copy is.\ncreate    Copies the image into a region it is not published in, so that jobs can start there. Where to copy\n          from is read from its maker's public list; --from names a region and an image instead. AWS takes about\n          ten minutes. The copy is kept in your account's storage there (about $1.50 a month).\ndelete    Removes your copy from a region, with its storage."),
+    ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images update REGION [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
+        "The image AWS machines start from (GitHub's own runner image, published for AWS by RunsOn in most regions).\n\nlist      Each region the AWS account can use: whether the image is published there, or your own copy is.\ncreate    Copies the image into a region it is not published in, so that jobs can start there. Where to copy\n          from is read from its maker's public list; --from names a region and an image instead. AWS takes about\n          ten minutes. The copy is kept in your account's storage there (about $1.50 a month).\nupdate    Copies the newest build in, where your copy is of an older one (its maker builds the image anew every\n          week or two; `list` says when one is out). Jobs start from the older copy until the new one is\n          there; the older one is then removed.\ndelete    Removes your copy from a region, with its storage."),
     ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces delete ID --confirm",
         "A workspace has its own sign-ins to its clouds, and through them its own control plane, runners and repositories.\nNothing of one is seen from another. There is one (`default`) until you make more. With several, a command says\nwhich, by its id: --workspace=ID, or SUPERCI_WORKSPACE=ID for a whole terminal. A command that names none stops\nand lists them.\n\ncreate    Makes an empty one called NAME (AcmeCI, Build Farm), which its CI is called too. Its id is made from the\n          name (acmeci, build-farm). Then `superci login --workspace=ID`.\nupdate    Gives one another id. What it is called is `superci name update`.\ndelete    Signs it out and forgets it on this machine. Nothing in its clouds is deleted: its control plane and\n          runners keep working (`superci leave --workspace=ID --confirm` stops them first)."),
     ("leave", "  superci leave --confirm           Stops using SuperCI: what it made in your clouds is deleted.",
@@ -405,6 +405,14 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         // `superci debug json REGION SERVICE TARGET '{…}'`. A SERVICE
         // with a dot in it is the whole host (budgets.amazonaws.com), a TARGET that starts with a slash is a path
         // (/listRegions), and one that ends in @1.0 is asked in that JSON version.
+        // (What a stopped deploy made, removed as "Choose another place" removes it: `superci debug abandon REGION PLANE`.)
+        #[cfg(debug_assertions)]
+        ("debug", "abandon") => {
+            let mut d = signed_in();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            let left = crate::aws_plane::abandon(&creds, w(2), w(3));
+            Ok(Done::said(if left.is_empty() { "nothing left".to_string() } else { format!("left: {}", left.join("; ")) }))
+        }
         // (And the AWS account's own budget, each step by itself: `superci debug budget found|set USD EMAIL [stop]|lift|remove`.)
         #[cfg(debug_assertions)]
         ("debug", "budget") => {
@@ -487,15 +495,22 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let (_, creds) = d.aws_account(&account)?;
             let mut rows = vec![];
             for (region, there) in &look.images {
-                let copies = crate::aws::copied_images(&creds, region).unwrap_or_default();
+                // (A copy that a newer one replaced goes, now that the newer one is there.)
+                let tidied = crate::aws::tidy_copies(&creds, region).unwrap_or(0);
+                let mut copies = crate::aws::copied_images(&creds, region).unwrap_or_default();
+                copies.sort_by(|a, b| crate::aws::build_of(&b.name).cmp(crate::aws::build_of(&a.name)));
+                // Its maker builds the image anew every week or two; a copy stays the build it was made of.
+                let behind = if copies.is_empty() { None } else { crate::aws::newest_build().and_then(|newest| crate::aws::behind(&copies, &newest).map(|have| (have.to_string(), newest))) };
                 let state = match (copies.first(), there) {
-                    (Some(c), _) if c.state == "available" => format!("your copy {} ({})", c.id, c.name),
+                    (Some(c), _) if c.state == "available" => format!("your copy {} ({}){}{}", c.id, c.name,
+                        match &behind { Some((have, newest)) => format!(": the build of {}; one of {} is out, `superci images update {region}` copies it in", crate::aws::build_day(have), crate::aws::build_day(newest)), None => String::new() },
+                        if tidied > 0 { format!(" (the copy before it is removed)") } else { String::new() }),
                     (Some(c), _) => format!("your copy {} is being made ({})", c.id, c.state),
                     (None, Some(true)) => "published".to_string(),
                     (None, Some(false)) => format!("none: `superci images create {region}` copies it in"),
                     (None, None) => "not known".to_string(),
                 };
-                rows.push(json!({ "region": region, "published": copies.is_empty() && *there == Some(true), "copies": copies, "said": state }));
+                rows.push(json!({ "region": region, "published": copies.is_empty() && *there == Some(true), "copies": copies, "newer_build": behind.as_ref().map(|(_, newest)| newest), "said": state }));
             }
             let said = if rows.is_empty() { vec!["This account can use none of the regions SuperCI works in.".to_string()] } else { rows.iter().map(|r| format!("{:<15} {}", r["region"].as_str().unwrap_or_default(), r["said"].as_str().unwrap_or_default())).collect() };
             Ok(Done { said, data: json!({ "account": account, "images": rows }) })
@@ -515,6 +530,25 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let id = crate::aws::copy_image_into(&creds, region, &source)?;
             Ok(Done { said: vec![format!("Copying the image jobs run on into {region}, from {from_region} ({from_image}): {id}."), "AWS takes about ten minutes; `superci images list` shows when it is there.".to_string(),
                 format!("It is kept in your account's storage there (about $1.50 a month). `superci images delete {region} --confirm` removes it.")], data: json!({ "ok": true, "region": region, "image": id, "from": { "region": from_region, "image": from_image } }) })
+        }
+        // A newer build of the image, copied in where the account holds a copy of an older one.
+        ("images", "update") => {
+            let region = w(2);
+            if !superci_core::page::REGIONS.contains(&region) { return usage("Say where: `superci images update REGION` (a region your copy of the image is in: `superci images list`).") }
+            let mut d = signed_in();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            let copies = crate::aws::copied_images(&creds, region)?;
+            if copies.is_empty() { return Err(format!("{region} has no copy of yours. `superci images create {region}` copies the image in, where it is not published.").into()) }
+            if let Some(coming) = copies.iter().find(|c| c.state == "pending") { return Err(format!("A copy is on its way into {region} already: {} ({}).", coming.id, coming.name).into()) }
+            let newest = crate::aws::newest_build().ok_or("The list of runner images could not be read from GitHub.")?;
+            let Some(have) = crate::aws::behind(&copies, &newest).map(str::to_string) else { return Ok(Done { said: vec![format!("Your copy in {region} is of the newest build ({}).", crate::aws::build_day(&newest))], data: json!({ "ok": true, "region": region, "newest": true }) }) };
+            let source = crate::aws::copy_source_for(region, None)?;
+            let (from_region, from_image) = (source.1.clone(), source.2.clone());
+            if let Some(done) = dry(args, &format!("copy the build of {} into {region}, from {from_region} ({from_image}), in place of your copy of {}", crate::aws::build_day(&newest), crate::aws::build_day(&have)), "images", &[]) { return Ok(done) }
+            let id = crate::aws::copy_image_into(&creds, region, &source)?;
+            Ok(Done { said: vec![format!("Copying the build of {} into {region}, from {from_region} ({from_image}): {id}.", crate::aws::build_day(&newest)),
+                "AWS takes about ten minutes. Jobs start from your older copy until it is there; then from the new one.".to_string(),
+                "The older copy is removed once the new one is there: at the next `superci images list`, or by the dashboard.".to_string()], data: json!({ "ok": true, "region": region, "image": id, "from": { "region": from_region, "image": from_image } }) })
         }
         ("images", "delete") => {
             let region = w(2);
