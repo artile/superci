@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.16.2 — unreleased
+## 0.16.2 — 2026-10-13
 - What an AWS account allows is asked again each time a page that shows it is opened (when the last look is older than twenty seconds), beside the page: a change made in AWS shows within seconds. Before, it showed up to ten minutes later. The AWS account section also has Refresh.
 
 ## 0.16.1 — 2026-10-13
