@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.16.5 — unreleased
+## 0.16.5 — 2026-10-13
 - A job on a spot machine AWS is taking back has what is left of AWS's two minutes to end by itself. Its runner is stopped twenty seconds before the machine goes (forty on Windows), and only if the job is still going. Before, the runner was stopped the moment the notice came: a job a minute from its end failed and was run again, where it now passes. A job with longer to go fails as before, and is run again once its run has finished.
 - Several jobs queued at once, in an AWS account that AWS lets ask for few machines in a moment (a new one): four of five went to on-demand machines, at about twice the price, with nothing said of why. A spot request AWS refuses for its rate is now asked again for the same pool after a wait, in place of the whole launch starting over (which spent more requests and was refused again). One still refused after its waits goes on-demand as before, and the job says so: "On-demand: AWS refused the spot request for its rate (many machines asked for at once)".
 - A spot pool (a machine type in a zone) that had no machine, or took one back, is asked last for a quarter of an hour. Each job of a burst no longer spends a request on it, and the job run again after an interruption is not followed by the next job into the same pool.
