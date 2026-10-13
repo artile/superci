@@ -65,6 +65,14 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
 - **Jobs at once:** 20 per provider unless set otherwise. Monthly budgets per provider count estimated spend,
   including the time a runner waits for its job. AWS's on-demand machines are a provider of their own in the order,
   with their own limits.
+- **Limits for a month and for a day**, for everything and for the AWS account (its spot and on-demand machines
+  together), are checked before each job's machine starts, on the same estimate. Jobs already running finish.
+- **A budget in the AWS account itself** (off unless you turn it on) is made with your own sign-in; the control
+  plane gets no permission for it. AWS counts the account's real bill, all of it and hours late, and emails at 80%
+  and at 100% of the monthly limit. Asked to, at 100% AWS also puts a rule on the control plane's role that refuses
+  every new machine but one small kind (`t3a.small`, `t3.small`: the runner that fails a refused job on GitHub with
+  the reason; no job's own machine is that kind), and takes it off when the next month begins. For that, a role is
+  made that only AWS Budgets can use, for that one budget, to put that one rule on that one role.
 
 ## Known limits
 
