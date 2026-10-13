@@ -217,16 +217,26 @@ pub fn make_networks(creds: &Credentials, plane_id: &str, regions: &[String]) ->
     made.into_iter().collect()
 }
 
-/// Removes the control plane's machines and networks in these regions (all SuperCI offers, when it is deleted).
+/// Removes the control plane's machines and networks in these regions (all SuperCI offers, when it is deleted). A
+/// region the account's organization keeps it out of has nothing of the control plane's (nothing could be made
+/// there), and is no network left behind.
 pub fn delete_networks(creds: &Credentials, plane_id: &str, regions: &[&str]) -> Result<()> {
     let sleep = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
     let done: Vec<Result<()>> = std::thread::scope(|s| {
         let each: Vec<_> = regions.iter().map(|r| s.spawn(move || {
-            futures::executor::block_on(aws::delete_network(&Blocking::new(), r, creds, plane_id, &now_ms, &sleep)).map_err(|e| format!("{r}: {e}"))
+            match futures::executor::block_on(aws::delete_network(&Blocking::new(), r, creds, plane_id, &now_ms, &sleep)) {
+                Err(e) if kept_out_by_organization(&e) => Ok(()),
+                done => done.map_err(|e| format!("{r}: {e}")),
+            }
         })).collect();
         each.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("removing a network stopped".into()))).collect()
     });
     done.into_iter().collect()
+}
+
+/// Whether AWS refused something by a rule of the account's organization (and so for the whole account there).
+pub fn kept_out_by_organization(e: &str) -> bool {
+    aws::refusal(e).is_some_and(|r| matches!(r.by, aws::By::Organization | aws::By::OrganizationResources))
 }
 
 /// What AWS answered when asked whether something may be done in an account.
@@ -787,6 +797,18 @@ mod look_tests {
     }
 
     /// What the project answered to further questions, each as AWS worded it.
+    #[test]
+    fn a_region_the_organization_keeps_the_account_out_of_holds_nothing_to_remove() {
+        // As the project answered a read in a region its organization refuses (the recording): no leftover there.
+        let recording = include_str!("../fixtures/aws/project-paid/look.jsonl");
+        let refused = recording.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|x| x["status"] == 403 && x["url"].as_str().is_some_and(|u| u.contains("us-east-1"))).expect("a refused region in the recording");
+        let said = format!("UnauthorizedOperation: {}", aws::xml_tag(refused["answer"].as_str().unwrap(), "Message").unwrap());
+        assert!(kept_out_by_organization(&said), "{said}");
+        // What a role's own permissions refuse, or anything else AWS says, is still an error to report.
+        assert!(!kept_out_by_organization("UnauthorizedOperation: User: arn:aws:sts::111111111111:assumed-role/dev/me is not authorized to perform: ec2:DeleteVpc because no identity-based policy allows the ec2:DeleteVpc action"));
+        assert!(!kept_out_by_organization("DependencyViolation: The vpc has dependencies and cannot be deleted."));
+    }
+
     #[test]
     fn what_a_project_refuses_is_read_as_aws_says_it() {
         let aws = Replay::of(include_str!("../fixtures/aws/project-paid/more.jsonl"));

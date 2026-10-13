@@ -138,7 +138,11 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
 /// to repeat (what is gone already is skipped). Machines it started end by themselves.
 pub fn delete(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
     delete_in_region(creds, region, plane_id)?;
-    delete_role(creds, region, plane_id)
+    delete_role(creds, region, plane_id)?;
+    // The function's last lines can reach its log after the log was deleted, which makes the log anew (seen: a
+    // log group left in an otherwise empty account). Deleted once more, a moment later.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    ok_if(api(creds, region).target("logs", &format!("logs.{region}.amazonaws.com"), "Logs_20140328.DeleteLogGroup", "1.1", json!({ "logGroupName": format!("/aws/lambda/{}", name(plane_id)) })), &["ResourceNotFoundException"]).map(|_| ())
 }
 
 /// What a deploy that stopped partway made, removed when its place is given up for another: its parts in the

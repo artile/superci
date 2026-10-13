@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.16.1 — unreleased
+- Removing SuperCI from an AWS account whose organization keeps it to some regions no longer reports "its machines' network" as left behind for the regions it may not use (nothing could be made there), with AWS's refusal in full.
+- A control plane deleted from AWS no longer leaves its log behind: the function's last lines could make the log anew after it was deleted.
+
 ## 0.16.0 — 2026-10-13
 - Daily limits, beside the monthly ones on Runners (the card is now called Limits): for everything, and for the AWS account. A day that runs away stops that day (UTC). In a terminal: `superci limits update --daily-usd=N` and `superci accounts update aws --daily-usd=N` (`none` lifts one).
 - A budget in the AWS account itself, for the account's monthly limit: in the AWS account's limit dialog, "In AWS itself" is nothing, "AWS emails me at 80% and 100%", or "AWS emails me, and stops new machines at 100%". AWS counts the account's real bill, all of it and hours late, so it covers what SuperCI's estimate misses. In a terminal: `superci accounts update aws --aws-budget=emails|stops|none --email=ADDRESS`. It is made, changed and removed with your sign-in; the control plane gets no permission for it, and a budget of your own is never touched. Changing the limit changes the budget with it; removing AWS runners or the control plane removes it.
