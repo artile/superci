@@ -313,6 +313,10 @@ fn machines_start_in_the_control_planes_own_network_cheapest_zone_first_else_the
     assert!(tried.iter().all(|f| field(f, "NetworkInterface.1.SecurityGroupId.1") == "sg-1" && field(f, "NetworkInterface.1.AssociatePublicIpAddress") == "true"));
     assert_eq!(job(&store, 7)["state"], "launched");
     assert!(!store.0.borrow().keys().any(|k| k.starts_with("denied:")));
+    // The pool that had no room is remembered: the next job asks the other zone first, and wastes no request on it.
+    block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
+    let next: Vec<String> = launches(&clouds.0).iter().skip(tried.len()).map(|f| field(f, "NetworkInterface.1.SubnetId")).collect();
+    assert_eq!((next.as_slice(), job(&store, 8)["state"].as_str()), (["subnet-a".to_string()].as_slice(), Some("launched")), "{next:?}");
 
     // A role that cannot read networks: the region's default network, and what was refused noted for the dashboard.
     let (store, clouds, cache) = (Mem::default(), Networked(FakeClouds::default()), Cache::default());
@@ -594,6 +598,8 @@ fn how_a_job_itself_ended_is_kept_apart_from_whether_a_machine_ran_it() {
     let nine = format!("superci-{PLANE_ID}-9");
     block_on(plane.handle(job_event("in_progress", 9, "acme/app", Some(&eight))));
     block_on(plane.handle(job_event("in_progress", 8, "acme/app", Some(&nine))));
+    // (Each machine's record says which job it took, for the list to name its row by.)
+    assert_eq!((job(&store, 8)["ran"].as_u64(), job(&store, 9)["ran"].as_u64(), job(&store, 7).get("ran")), (Some(9), Some(8), None));
     block_on(plane.handle(concluded(9, &eight, "success")));
     block_on(plane.handle(concluded(8, &nine, "failure")));
     assert_eq!((job(&store, 8)["conclusion"].as_str(), job(&store, 9)["conclusion"].as_str()), (Some("failure"), Some("success")), "{} {}", job(&store, 8), job(&store, 9));
@@ -2194,6 +2200,28 @@ fn a_control_plane_is_called_what_it_is_named_where_people_read_it() {
     assert_eq!(job(&store, 42)["runner"], format!("globex-{PLANE_ID}-42"));
     block_on(plane.handle(job_event("in_progress", 41, "acme/app", Some(&format!("acme-ci-{PLANE_ID}-41")))));
     assert_eq!(job(&store, 41)["state"], "running", "{}", job(&store, 41));
+}
+
+#[test]
+fn a_spot_request_refused_for_its_rate_to_the_end_goes_on_demand_and_says_why() {
+    // Five jobs queued at once in an account AWS lets ask for few machines in a moment (seen on 13 October 2026):
+    // the spot request is refused for its rate however often it is asked again.
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| (body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| aws_refuses("RequestLimitExceeded")));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    // Asked for the same pool again after each wait (not from the first pool anew), then no more: the job goes on
+    // down the order to an on-demand machine, and keeps why it is not on a spot one.
+    let tried = launches(&clouds.0);
+    let spot: Vec<_> = tried.iter().filter(|l| field(l, "InstanceMarketOptions.MarketType") == "spot").collect();
+    assert!(spot.len() == 1 + superci_core::aws::MAX_WAITS as usize && spot.iter().all(|l| l == &spot[0]), "{} spot requests", spot.len());
+    assert_eq!(wakes.1.borrow().len(), superci_core::aws::MAX_WAITS as usize);
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["on_demand"].as_bool()), (Some("launched"), Some(true)), "{j}");
+    assert!(j["spot_refused"].as_str().is_some_and(|s| s.contains("RequestLimitExceeded")), "{j}");
 }
 
 #[test]

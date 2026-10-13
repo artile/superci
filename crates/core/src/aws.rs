@@ -209,7 +209,18 @@ pub struct Launch<'a> {
     pub spot: bool,
     /// "linux" or "windows" (spot prices differ).
     pub os: &'a str,
+    /// Spot pools (a type in a zone) to ask after the others: a moment ago they had no machine, or took one back.
+    pub avoid: &'a [(String, String)],
+    /// What waits in place when AWS refuses a request for its rate, and a little of this launch's own to add to each
+    /// wait (so that launches asked at once do not ask again at once).
+    pub timer: Option<&'a dyn crate::io::Timer>,
+    pub jitter_ms: u64,
 }
+
+/// What a launch was told on the way to its machine (or to none): each pool AWS had no room in (type, zone, AWS's
+/// word for it), and how often AWS refused for the rate of requests.
+#[derive(Default, Debug)]
+pub struct Told { pub refused: Vec<(String, String, String)>, pub throttled: u32 }
 
 /// The lowest current spot price (USD per hour) for a machine type in a region, across its zones.
 /// The price now in one zone (`zone`), or the lowest across the region's zones.
@@ -239,8 +250,10 @@ pub struct Started { pub id: String, pub kind: String, pub zone: String }
 
 /// How many places (a machine type in a zone) one launch tries.
 pub const MAX_TRIES: usize = 12;
+/// How often one launch waits and asks again when AWS refuses for the rate of requests (about ten seconds in all).
+pub const MAX_WAITS: u32 = 7;
 
-pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, now_ms: u64) -> Result<Started> {
+pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, now_ms: u64, told: &mut Told) -> Result<Started> {
     let mut last = String::from("no instance type given");
     // Each zone in turn, cheapest spot price first (for the first type), the next when one has no room: in its own
     // network, by its subnet there; in the default network, by naming the zone. On-demand: wherever AWS puts it.
@@ -254,8 +267,15 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
     places.sort_by(|a, b| { let z = |p: &(Option<&(String, String)>, Option<String>)| p.0.map(|(z, _)| z.clone()).or(p.1.clone()).unwrap_or_default(); price(&z(a)).total_cmp(&price(&z(b))).then(z(a).cmp(&z(b))) });
     // So many tries at most (types by zones can be many, and a runtime's time for one request is short): the rest
     // is left for the next try of the job.
+    // Every type in every place, in that order; but a spot pool that had no machine a moment ago, or took one back,
+    // comes after the rest (asked first by every job of a burst, it costs each of them a request and gives none a
+    // machine, or gives one that is soon taken back).
+    let zone_of = |p: &(Option<&(String, String)>, Option<String>)| p.0.map(|(z, _)| z.clone()).or(p.1.clone()).unwrap_or_default();
+    let mut pools: Vec<(&String, &(Option<&(String, String)>, Option<String>))> = l.types.iter().flat_map(|t| places.iter().map(move |p| (t, p))).collect();
+    if l.spot { pools.sort_by_key(|(t, p)| { let z = zone_of(p); l.avoid.iter().any(|(at, az)| at == *t && *az == z) }) }
     let mut tries = 0;
-    for t in l.types { for (subnet, zone) in &places {
+    for (t, place) in pools {
+        let (subnet, zone) = place;
         tries += 1;
         if tries > MAX_TRIES { return Err(last) }
         let mut params = serde_json::json!({
@@ -271,16 +291,29 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
             let groups: Vec<&String> = std::iter::once(&n.security_group).chain(&n.more_groups).collect();
             params["NetworkInterface"] = serde_json::json!([{ "DeviceIndex": 0, "SubnetId": id, "SecurityGroupId": groups, "AssociatePublicIpAddress": if n.private { "false" } else { "true" }, "DeleteOnTermination": "true" }]);
         }
-        match ec2(http, l.region, creds, "RunInstances", params, now_ms).await {
-            Ok(xml) => {
-                let id = xml_tag(&xml, "instanceId").ok_or("RunInstances without an instanceId")?.to_string();
-                return Ok(Started { id, kind: t.clone(), zone: xml_tag(&xml, "availabilityZone").unwrap_or_default().to_string() });
+        loop {
+            match ec2(http, l.region, creds, "RunInstances", params.clone(), now_ms).await {
+                Ok(xml) => {
+                    let id = xml_tag(&xml, "instanceId").ok_or("RunInstances without an instanceId")?.to_string();
+                    return Ok(Started { id, kind: t.clone(), zone: xml_tag(&xml, "availabilityZone").unwrap_or_default().to_string() });
+                }
+                // AWS takes only so many requests in a moment from an account (few, from a new one), and refuses the
+                // rest: "RequestLimitExceeded". Asked again for the same pool after a wait, longer each time; what
+                // was already learnt of the other pools is not asked again.
+                Err(e) if e.starts_with("RequestLimitExceeded") && told.throttled < MAX_WAITS && l.timer.is_some() => {
+                    told.throttled += 1;
+                    if let Some(timer) = l.timer { timer.pause(300 + l.jitter_ms + told.throttled as u64 * 250).await }
+                }
+                // No room for this type now, or a type this region does not have: the next one.
+                Err(e) if ["InsufficientInstanceCapacity", "Unsupported", "SpotMaxPriceTooLow", "InvalidParameterValue"].iter().any(|c| e.starts_with(c)) => {
+                    told.refused.push((t.clone(), zone_of(place), e.split(':').next().unwrap_or_default().to_string()));
+                    last = e;
+                    break
+                }
+                Err(e) => return Err(e),
             }
-            // No room for this type now, or a type this region does not have: the next one.
-            Err(e) if ["InsufficientInstanceCapacity", "Unsupported", "SpotMaxPriceTooLow", "InvalidParameterValue"].iter().any(|c| e.starts_with(c)) => last = e,
-            Err(e) => return Err(e),
         }
-    } }
+    }
     Err(last)
 }
 

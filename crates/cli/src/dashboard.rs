@@ -687,6 +687,8 @@ fn off_spot(j: &serde_json::Value) -> Option<(String, Option<String>)> {
     let said = j["spot_refused"].as_str()?;
     // The account's AWS organization allows no spot machines: no limit to raise, and nothing of AWS's to wait for.
     if said.contains(superci_core::plane::SPOT_NOT_ALLOWED) { return Some(("On-demand: your AWS organization does not allow spot machines".into(), None)) }
+    // AWS took no more requests for machines just then (many asked for at once, in an account AWS lets ask for few).
+    if said.contains("RequestLimitExceeded") { return Some(("On-demand: AWS refused the spot request for its rate (many machines asked for at once)".into(), None)) }
     let limited = said.split("; ").find(|a| a.contains("MaxSpotInstanceCountExceeded")).and_then(|a| a.split(':').next());
     Some(match limited {
         Some(region) => (format!("On-demand: your AWS spot limit in {} was reached", region_short(region)), Some(region.to_string())),
@@ -6314,6 +6316,17 @@ mod tests {
         assert_eq!((job_ended(&job("done", None)), job_ended(&job("failed", None)), job_ended(&job("running", None))), (("good", "Done"), ("bad", "Failed"), ("accent", "Running")));
         let table = job_table(&[job("done", Some("failure"))]);
         assert!(table.contains("Failed") && !table.contains("Done"), "{table}");
+        // Two jobs queued together that ran on each other's machines: each machine's row is the job it ran. The
+        // machine AWS took back was started for "E2E (2/2)" and ran "E2E (1/2)": that one is what failed, as on GitHub.
+        let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
+        let swapped = PlaneView { plane, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: None, status: Some(serde_json::json!({ "jobs": [
+            { "job_id": 12, "run_id": 5, "repo": "acme/app", "name": "E2E (2/2)", "workflow": "Tests", "state": "failed", "error": "AWS took back its spot machine; the job is run again, off spot machines once its run has finished", "cloud": "aws", "ran": 11 },
+            { "job_id": 11, "run_id": 5, "repo": "acme/app", "name": "E2E (1/2)", "workflow": "Tests", "state": "done", "cloud": "aws", "ran": 12, "conclusion": "failure" },
+            { "job_id": 12, "run_id": 5, "repo": "acme/app", "name": "E2E (2/2)", "workflow": "Tests", "state": "ignored" } ] })) };
+        let listed = swapped.jobs();
+        assert_eq!((listed[0]["name"].as_str(), listed[0]["job_id"].as_u64(), listed[0]["state"].as_str(), listed[0]["started_for"].as_u64()), (Some("E2E (1/2)"), Some(11), Some("failed"), Some(12)));
+        assert_eq!((listed[1]["name"].as_str(), listed[1]["job_id"].as_u64(), listed[1]["conclusion"].as_str()), (Some("E2E (2/2)"), Some(12), None));
+        assert!(job_link(&listed[0]).ends_with("/acme/app/actions/runs/5/job/11"));
         // Commands say the same in a job's line, and keep `state` as it was beside it.
         let words = job_words(&job("done", Some("failure")));
         assert_eq!((words["state"].as_str(), words["ended"].as_str()), (Some("done"), Some("failed")));

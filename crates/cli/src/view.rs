@@ -52,7 +52,19 @@ impl PlaneView {
     pub fn label(&self) -> String { self.labels().into_iter().next().unwrap_or_else(|| "superci".into()) }
     /// What it is called (SuperCI, unless named; one from before it could be named: SuperCI).
     pub fn name(&self) -> String { self.status.as_ref().and_then(|s| s["name"].as_str()).filter(|n| !n.is_empty()).unwrap_or("SuperCI").to_string() }
-    pub fn jobs(&self) -> Vec<Value> { self.status.as_ref().and_then(|s| s["jobs"].as_array().cloned()).unwrap_or_default() }
+    /// The latest jobs, each a machine's row. A machine that took another job's work than the one it was started
+    /// for (GitHub gives a waiting job to any runner with its label, so jobs queued together run on each other's
+    /// machines) is listed as the job it ran: that job's name, its page and how it ended, as GitHub shows them.
+    pub fn jobs(&self) -> Vec<Value> {
+        let mut jobs = self.status.as_ref().and_then(|s| s["jobs"].as_array().cloned()).unwrap_or_default();
+        let own: std::collections::HashMap<u64, Value> = jobs.iter().filter_map(|j| Some((j["job_id"].as_u64()?, j.clone()))).collect();
+        for j in jobs.iter_mut() {
+            let Some(ran) = j["ran"].as_u64().and_then(|id| own.get(&id)) else { continue };
+            j["started_for"] = j["job_id"].clone();
+            for field in ["job_id", "name", "workflow", "run_id", "repo", "conclusion"] { j[field] = ran[field].clone() }
+        }
+        jobs
+    }
     pub fn app_slug(&self) -> Option<String> { self.status.as_ref().and_then(|s| s["app"]["slug"].as_str().map(str::to_string)) }
     /// Where the first App's GitHub is, when not github.com.
     pub fn app_host(&self) -> Option<String> { self.status.as_ref().and_then(|s| s["app"]["host"].as_str().map(str::to_string)) }

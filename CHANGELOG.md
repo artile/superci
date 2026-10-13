@@ -3,6 +3,9 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.16.5 — unreleased
+- Several jobs queued at once, in an AWS account that AWS lets ask for few machines in a moment (a new one): four of five went to on-demand machines, at about twice the price, with nothing said of why. A spot request AWS refuses for its rate is now asked again for the same pool after a wait, in place of the whole launch starting over (which spent more requests and was refused again). One still refused after its waits goes on-demand as before, and the job says so: "On-demand: AWS refused the spot request for its rate (many machines asked for at once)".
+- A spot pool (a machine type in a zone) that had no machine, or took one back, is asked last for a quarter of an hour. Each job of a burst no longer spends a request on it, and the job run again after an interruption is not followed by the next job into the same pool.
+- The job list names each machine's row by the job it ran. GitHub gives a waiting job to any idle runner with its label, so jobs queued together run on each other's machines; a row was named by the job its machine was started for, and showed "E2E (2/2)" failed when it was "E2E (1/2)" on GitHub. The row's link and `superci jobs retrieve` go to that job too.
 - The rows of the Limits card on Runners begin at the card's edge (they kept an empty place for a handle they do not have).
 - A finished job is said by how the job itself ended: Passed, or Failed when its own steps failed (a test, a build), as GitHub said. Before, every job a machine had run to its end read "Done", in green, whether its tests passed or not. Jobs from before the update keep "Done": how they ended was not kept. In `superci jobs list` the same (`passed`, `failed`), and `--json` has it as `ended` beside `state`. Update your control plane for it.
 
