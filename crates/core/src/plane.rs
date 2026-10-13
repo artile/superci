@@ -17,7 +17,7 @@ use crate::crypto::{safe_eq, sha256_hex, verify_hub_signature, SigningKeyStore};
 use crate::github::{self, App, Owner};
 use crate::gitlab::{self, GitLab};
 use crate::io::{Containers, get_json, put_json, Clock, Http, Request, Response, Result, Store, Timer, Work};
-use crate::spec::{aws_instance_types, Capacity, Size, Spec};
+use crate::spec::{aws_instance_types, disk_speed, Capacity, Size, Spec, DISK_IOPS_INCLUDED, DISK_MIBS_INCLUDED};
 
 pub const AUDIENCE: &str = "superci";
 /// How long a job's machine lives in a cloud, in minutes: the longest a job may run as set (six hours unless set),
@@ -231,6 +231,9 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub zone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_gb: Option<u32>,
+    /// Its disk's speed, when above what AWS includes (MiB a second, IOPS): counted in its price.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
     /// Its machine has no public address (a private subnet of the account's own: none is billed).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub private: bool,
     /// What its machine cost, settled once it ended: at the prices the cloud billed for its time ("prices"), or as the
@@ -1633,7 +1636,7 @@ impl<'a> ControlPlane<'a> {
         self.note_permission("aws", "Prices", &disk).await;
         let gb_month = disk.unwrap_or_else(|_| aws::disk_gb_month(&region));
         if let Ok(machine) = machine {
-            j.cost_usd = Some(machine + aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), !j.private) * hours);
+            j.cost_usd = Some(machine + aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) * hours);
             j.cost_from = Some("prices".into());
         }
     }
@@ -1812,11 +1815,14 @@ impl<'a> ControlPlane<'a> {
                         // The standard machine keeps the configured types; a sized one gets the types that fit it.
                         let types = if spec.cpu.is_none() && spec.ram_gb.is_none() && spec.arch() == "x64" && spec.gpu.is_none() { self.config.instance_types.clone() } else { aws_instance_types(&spec) };
                         let mut disk_gb = spec.disk_gb.unwrap_or(60);
+                        let (mut disk_mibs, mut disk_iops) = (DISK_MIBS_INCLUDED, DISK_IOPS_INCLUDED);
                         job.cpu = Some(Capacity::aws().fit(&spec).map(|s| s.cpu).unwrap_or(4));
                         // A spot machine says when AWS takes it back, with a link only it has.
                         job.notice = (!on_demand).then(|| crate::crypto::random_token(18));
                         let notice = job.notice.as_ref().map(|t| if gitlab { format!("{plane_url}/interrupted?gl={}&t={t}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/interrupted?runner={name}&t={t}") });
                         let user_data = aws::runner_user_data_for(&work, self.machine_minutes("aws"), spec.os(), notice.as_deref())?;
+                        // What a job writes most in memory, or on the machine's own NVMe disk, when its label asks.
+                        let user_data = aws::with_scratch(user_data, spec.ramdisk, spec.nvme);
                         let mut launched = None;
                         // The regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         for region in &self.aws_regions(&a) {
@@ -1832,7 +1838,9 @@ impl<'a> ControlPlane<'a> {
                             // Many jobs queued at once: AWS lets a few requests through and refuses the rest for a
                             // moment ("RequestLimitExceeded"). The launch waits and asks again by itself, each job
                             // after a wait of its own (see `aws::run_instance`).
-                            let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, tags: &tags, spot: !on_demand, os: spec.os(),
+                            // The disk's speed: by the machine's size unless the label or the default machine says.
+                            (disk_mibs, disk_iops) = disk_speed(job.cpu.unwrap_or(4), disk_gb, &spec);
+                            let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
                                 avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120 };
                             let mut told = aws::Told::default();
                             let machine = aws::run_instance(self.http, &creds, &launch, now, &mut told).await;
@@ -1899,10 +1907,12 @@ impl<'a> ControlPlane<'a> {
                         let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.ok() }
                             else { aws::spot_price(self.http, &region, Some(&machine.zone), &creds, &machine.kind, spec.os(), now).await.ok() };
                         let cpu = job.cpu.unwrap_or(4);
-                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, !private));
+                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private));
                         job.region = Some(region);
                         job.zone = Some(machine.zone).filter(|z| !z.is_empty());
                         job.disk_gb = Some(disk_gb);
+                        job.disk_mibs = Some(disk_mibs).filter(|m| *m > DISK_MIBS_INCLUDED);
+                        job.disk_iops = Some(disk_iops).filter(|i| *i > DISK_IOPS_INCLUDED);
                         Ok(Tried::Started(machine.id, machine.kind))
                     }.await,
                     Runner::Own => async {
@@ -2126,7 +2136,7 @@ impl<'a> ControlPlane<'a> {
                             let (image, image_gb) = match self.image(&region, &Spec::default(), &creds, self.clock.now_ms()).await { Ok(i) => i, Err(e) => { started = Err(e); continue } };
                             let network = match self.network(&region, &creds, self.clock.now_ms()).await { Ok(n) => n, Err(e) => { started = Err(e); continue } };
                             for spot in markets {
-                                started = aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), tags: &tags, spot: *spot, os: "linux",
+                                started = aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, tags: &tags, spot: *spot, os: "linux",
                                     avoid: &[], timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120 }, self.clock.now_ms(), &mut aws::Told::default()).await.map(|_| ());
                                 if started.is_ok() { break 'regions }
                             }

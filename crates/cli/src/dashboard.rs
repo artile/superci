@@ -749,6 +749,16 @@ fn job_names(j: &serde_json::Value) -> (String, String) {
     (name.to_string(), if workflow.is_empty() { short } else { format!("{short} · {workflow}") })
 }
 
+/// A job's disk speed on AWS (MiB a second), when it is not what its machine's size gives by itself: a label or the
+/// default machine said it.
+fn disk_speed_said(j: &serde_json::Value) -> Option<u64> {
+    let (cpu, gb) = (j["cpu"].as_u64()? as u32, j["disk_gb"].as_u64()? as u32);
+    let has = j["disk_mibs"].as_u64().unwrap_or(superci_core::spec::DISK_MIBS_INCLUDED as u64);
+    // (Jobs from before the disk's speed was set have no speed kept and ran at what AWS includes: nothing to say.)
+    if j["disk_mibs"].is_null() && j["disk_iops"].is_null() { return None }
+    Some(has).filter(|h| *h != superci_core::spec::disk_speed(cpu, gb, &Spec::default()).0 as u64)
+}
+
 /// The runner a job got, in words: its provider's logo and its size ("4 CPU · 12 GB"), or the AWS machine's type.
 fn runner_text(j: &serde_json::Value) -> (String, String) {
     let cloud = j["cloud"].as_str().unwrap_or_default();
@@ -760,7 +770,7 @@ fn runner_text(j: &serde_json::Value) -> (String, String) {
         // An on-demand machine says so (its label asked, or the order sent it there).
         // (Its disk too, when it is not the standard 60 GB: what its label asked for.)
         "aws" => ("aws".into(), format!("{}{}{}", match j["cpu"].as_u64() { Some(c) if !kind.is_empty() => format!("{c} CPU · {kind}"), _ => kind.to_string() },
-            match j["disk_gb"].as_u64() { Some(d) if d != 60 && !kind.is_empty() => format!(" · {d} GB disk"), _ => String::new() }, if j["on_demand"] == true && !kind.is_empty() { " · on-demand" } else { "" })),
+            match (j["disk_gb"].as_u64(), disk_speed_said(j)) { _ if kind.is_empty() => String::new(), (Some(d), Some(s)) => format!(" · {d} GB disk at {s} MiB/s"), (Some(d), None) if d != 60 => format!(" · {d} GB disk"), _ => String::new() }, if j["on_demand"] == true && !kind.is_empty() { " · on-demand" } else { "" })),
         _ => {
             // "4cpu-12gb" as "4 CPU · 12 GB".
             let size = kind.split_once("cpu-").and_then(|(c, r)| Some(format!("{c} CPU · {} GB", r.strip_suffix("gb")?)));
@@ -2604,8 +2614,11 @@ impl Dashboard {
             ("POST", "/machine") => {
                 let plane = self.plane()?;
                 let num = |n: &str, max: u32| field(n).parse::<u32>().ok().filter(|v| *v > 0 && *v <= max);
+                // The disk's speed on AWS: left to the machine's size (nothing), what AWS includes ("standard"), or MiB a second.
+                let speed = match field("speed").as_str() { "" | "auto" => None, "standard" => Some(superci_core::spec::DISK_MIBS_INCLUDED),
+                    n => Some(n.parse::<u32>().ok().filter(|n| (125..=2000).contains(n)).ok_or("A disk's speed is 125 to 2000 MiB a second, `standard` or `auto`")?) };
                 let spec = Spec { cpu: num("cpu", 192), ram_gb: num("ram", 1536), disk_gb: num("disk", 16_000), arch: Some(field("arch")).filter(|a| a == "arm64"),
-                    os: Some(field("os")).filter(|o| o == "windows"), gpu: None, cloud: None, on_demand: field("ondemand") == "on" };
+                    os: Some(field("os")).filter(|o| o == "windows"), gpu: None, cloud: None, on_demand: field("ondemand") == "on", disk_mibs: speed, ..Default::default() };
                 if spec.arch.is_some() && spec.os.is_some() { return Ok(message(400, "Windows machines are x64", "Choose x64 for Windows, or Linux for arm64.")) }
                 let want = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "MACHINE", &want.to_string())?;
@@ -4856,17 +4869,24 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         format!(r#"<label class="field"><span>{label}</span><select name="{name}">{}{opts}</select></label>"#, if first.is_empty() { String::new() } else { format!(r#"<option value="">{first}</option>"#) })
     };
     let pools = || v.order().iter().filter(|p| p.cloud != AWS_ON_DEMAND).map(|p| { let (key, name, _) = pool_text(v, &p.cloud); format!(r#"<span class="fit" data-caps="{}">{}{}<small data-size></small></span>"#, esc(&pool_caps(&p.cloud).to_string()), logo(&key, 18), esc(&name)) }).collect::<String>();
+    // The disk's speed on AWS: by the machine's size unless set (what AWS includes, at no extra price, or a number).
+    let speed = m.disk_mibs.map(|s| if s == superci_core::spec::DISK_MIBS_INCLUDED { "standard".to_string() } else { s.to_string() });
+    let custom = speed.clone().filter(|s| !["standard", "250", "500", "1000"].contains(&s.as_str())).map(|s| (s.clone(), format!("{s} MiB/s")));
+    let mut speeds: Vec<(&str, &str)> = vec![("standard", "Standard, 125 MiB/s"), ("250", "250 MiB/s"), ("500", "500 MiB/s"), ("1000", "1,000 MiB/s")];
+    if let Some((val, text)) = &custom { speeds.push((val, text)) }
     let default = serde_json::json!({ "cpu": m.cpu.unwrap_or(0), "ram": m.ram_gb.unwrap_or(0), "disk": m.disk_gb.unwrap_or(0), "arch": m.arch(), "os": m.os(), "ondemand": m.on_demand });
     // The default: what it is, in words, and its dialog.
     let mut parts = vec![m.cpu.map(|c| format!("{c} CPU")).unwrap_or_else(|| "Each provider's standard size".into())];
     if let Some(r) = m.ram_gb { parts.push(format!("{r} GB")) }
     if let Some(d) = m.disk_gb { parts.push(format!("{d} GB disk")) }
+    match m.disk_mibs { Some(superci_core::spec::DISK_MIBS_INCLUDED) => parts.push("standard disk speed".into()), Some(s) => parts.push(format!("{s} MiB/s disk")), None => {} }
     parts.push(m.arch().into());
     parts.push(match m.os() { "windows" => "Windows".into(), "macos" => "macOS".into(), _ => "Linux".into() });
     parts.push(if m.on_demand { "on-demand".into() } else { "spot".into() });
-    let dialog = format!(r#"<dialog class="dlg" id="default-machine" onclick="if(event.target===this)this.close()"><form method="post" action="/machine" class="dlg-body picker" data-mode="default" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Default machine</strong><small>For <code>runs-on: {base}</code>, and any part a label leaves out.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div class="picker-fields">{}{}{}{}{}</div><label class="check"><input type="checkbox" name="ondemand"{}> On-demand only (no spot)</label><div class="fits"><span class="note">Runs on</span>{}</div><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
+    let dialog = format!(r#"<dialog class="dlg" id="default-machine" onclick="if(event.target===this)this.close()"><form method="post" action="/machine" class="dlg-body picker" data-mode="default" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Default machine</strong><small>For <code>runs-on: {base}</code>, and any part a label leaves out.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div class="picker-fields">{}{}{}{}{}{}</div><label class="check"><input type="checkbox" name="ondemand"{}> On-demand only (no spot)</label><div class="fits"><span class="note">Runs on</span>{}</div><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
         esc(&default.to_string()),
         select("cpu", "CPU", "Provider's standard", &CPUS, m.cpu), select("ram", "Memory", "4 GB per CPU", &RAMS, m.ram_gb), select("disk", "Disk", "Provider's standard", &DISKS, m.disk_gb),
+        choice("speed", "Disk speed (AWS)", "By machine size", &speeds, speed.as_deref()),
         choice("arch", "Architecture", "", &[("x64", "x64"), ("arm64", "arm64")], Some(m.arch())), choice("os", "System", "", &[("linux", "Linux"), ("windows", "Windows")], Some(m.os())),
         if m.on_demand { " checked" } else { "" }, pools());
     let default_row = format!(r#"<div class="default-machine"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span class="dm-main"><strong>Default machine</strong><small>What <code>{base}</code> runs on, and any part a label leaves out.</small></span><span class="dm-spec">{}</span><button type="button" class="button secondary sm" onclick="document.getElementById('default-machine').showModal()">Change</button></div>"#,
@@ -6274,6 +6294,11 @@ mod tests {
         assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge · 120 GB disk");
         again["disk_gb"] = 60.into();
         assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge");
+        // Its disk's speed too, when a label or the default machine set it (by the machine's size it is 1,000 here).
+        again["disk_mibs"] = 1000.into();
+        assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge");
+        again["disk_mibs"] = 2000.into();
+        assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge · 60 GB disk at 2000 MiB/s");
         assert_eq!(job_words(&ran(None))["why"], "", "a job whose label asked for on-demand");
         assert!(job_table(&[limited.clone()]).contains(r#"<small class="jt-why open">On-demand: your AWS spot limit in N. Virginia was reached</small>"#));
         let notice = spot_limit_notice(&[limited.clone(), limited, ran(None)]);
@@ -6609,6 +6634,8 @@ mod tests {
         assert!(!html.contains("<strong>Name</strong>") && !html.contains("<strong>Labels</strong>") && !html.contains("<h2>Limits</h2>"));
         assert!(html.contains(r#"<span class="lim">4 CPU</span><span class="lim">100 GB disk</span><span class="lim">x64</span><span class="lim">Linux</span><span class="lim">spot</span>"#));
         assert!(html.contains(r#"<dialog class="dlg" id="default-machine""#) && html.contains(r#"<option value="4" selected>4</option>"#) && html.contains(r#"<option value="100" selected>100 GB</option>"#));
+        // The disk's speed on AWS is by the machine's size unless the default machine says: what AWS includes, or a number.
+        assert!(html.contains(r#"<label class="field"><span>Disk speed (AWS)</span><select name="speed"><option value="">By machine size</option><option value="standard">Standard, 125 MiB/s</option><option value="250">250 MiB/s</option>"#), "{html}");
         // The picker starts at Default for everything (the label is plain), each field naming only what is picked.
         assert!(html.contains(r#"data-mode="label""#) && html.contains(r#"<option value="">Default</option>"#) && html.contains(r#"<span class="hl" data-label>superci</span>"#));
         assert!(html.matches(r#"class="fit""#).count() == 6 && !html.contains("Use as default"));

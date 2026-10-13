@@ -1,7 +1,8 @@
 //! What a job asks for. Workflows say `runs-on: superci` for the default machine (set in the dashboard), or name
 //! the machine in the label itself, in any order: `superci-8cpu`, `superci-8cpu-32gb`, `superci-arm64`,
 //! `superci-100disk`, `superci-windows`, `superci-gpu` (or a GPU by name: `superci-l4`),
-//! `superci-aws`, `superci-ondemand`. Nothing has to be created first;
+//! `superci-aws`, `superci-ondemand`; and of its disk on AWS: `superci-500mbs`, `superci-6000iops`,
+//! `superci-ramdisk`, `superci-localdisk`. Nothing has to be created first;
 //! the machine registers with GitHub under the exact label the job used, so only jobs asking for the same can take it.
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,30 @@ pub struct Spec {
     /// Only this cloud ("aws", "cloudflare", "modal").
     #[serde(default, skip_serializing_if = "Option::is_none")] pub cloud: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub on_demand: bool,
+    /// Its disk's speed on AWS, when not left to the machine's size (see `disk_speed`): MiB a second, and IOPS.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
+    /// What a job writes most (Docker's files, its work folder, /tmp) in memory (`ramdisk`), or on a disk in the
+    /// machine itself (`localdisk`: a machine type with an NVMe disk of its own). AWS, Linux.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub nvme: bool,
+}
+
+/// What AWS includes with a disk at no extra price: MiB a second, and IOPS.
+pub const DISK_MIBS_INCLUDED: u32 = 125;
+pub const DISK_IOPS_INCLUDED: u32 = 3000;
+
+/// How fast a machine's disk is on AWS (MiB a second, IOPS). Left to the machine's size: 62.5 MiB a second for each
+/// CPU, no less than what AWS includes and no more than 1,000 (the extra is then about a tenth of a spot machine's
+/// price at every size; a machine of any size can use it, for its first half hour). IOPS: what AWS includes, or what
+/// the speed needs. As asked, when a label or the default machine says: within what a gp3 volume takes (125 to 2,000
+/// MiB a second, 3,000 to 80,000 IOPS, 4 IOPS for each MiB a second, 500 IOPS for each GB).
+pub fn disk_speed(cpu: u32, disk_gb: u32, s: &Spec) -> (u32, u32) {
+    let by_size = (cpu * 125 / 2).clamp(DISK_MIBS_INCLUDED, 1000);
+    let most_iops = (disk_gb.saturating_mul(500)).clamp(DISK_IOPS_INCLUDED, 80_000);
+    let mibs = s.disk_mibs.unwrap_or(by_size).clamp(DISK_MIBS_INCLUDED, 2000).min(most_iops / 4);
+    let iops = s.disk_iops.unwrap_or(DISK_IOPS_INCLUDED).clamp(DISK_IOPS_INCLUDED, 80_000).max(mibs * 4).min(most_iops);
+    (mibs, iops)
 }
 
 /// The clouds a label may name.
@@ -34,7 +59,7 @@ pub const GPUS: [&str; 8] = ["t4", "l4", "a10g", "l40s", "a100", "h100", "h200",
 pub fn valid_label(label: &str) -> Result<(), String> {
     let ok = (2..=24).contains(&label.len()) && label.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) && label.as_bytes()[0].is_ascii_lowercase();
     if !ok { return Err("A label is 2 to 24 lowercase letters and digits, starting with a letter (acmeci, ci2).".into()) }
-    const TAKEN: [&str; 22] = ["ubuntu", "windows", "macos", "linux", "self", "hosted", "selfhosted", "x64", "arm64", "arm", "amd64", "x86", "mac", "osx", "win", "gpu", "aws", "cloudflare", "modal", "ondemand", "spot", "latest"];
+    const TAKEN: [&str; 26] = ["tmpfs", "localdisk", "ubuntu", "windows", "macos", "linux", "self", "hosted", "selfhosted", "x64", "arm64", "arm", "amd64", "x86", "mac", "osx", "win", "gpu", "aws", "cloudflare", "modal", "ondemand", "spot", "latest", "ramdisk", "nvme"];
     if TAKEN.contains(&label) || GPUS.contains(&label) { return Err(format!("{label} means something else in a label already: choose another word.")) }
     Ok(())
 }
@@ -67,7 +92,12 @@ impl Spec {
         let mut s = Spec::default();
         for part in rest.split('-') {
             let num = |suffix: &str| part.strip_suffix(suffix).and_then(|n| n.parse::<u32>().ok()).filter(|n| *n > 0);
-            if let Some(n) = num("cpu") { if n > 192 { return Some(Err(format!("{n} CPUs is more than any machine has"))) } s.cpu = Some(n) }
+            // (Said in plain words; the words others use for the same are understood too.)
+            if ["ramdisk", "tmpfs"].contains(&part) { s.ramdisk = true }
+            else if ["localdisk", "nvme"].contains(&part) { s.nvme = true }
+            else if let Some(n) = num("mbs") { if !(125..=2000).contains(&n) { return Some(Err(format!("a disk's speed is 125 to 2000 MiB a second, not {n}"))) } s.disk_mibs = Some(n) }
+            else if let Some(n) = num("iops") { if !(3000..=80_000).contains(&n) { return Some(Err(format!("a disk has 3000 to 80000 IOPS, not {n}"))) } s.disk_iops = Some(n) }
+            else if let Some(n) = num("cpu") { if n > 192 { return Some(Err(format!("{n} CPUs is more than any machine has"))) } s.cpu = Some(n) }
             else if let Some(n) = num("disk") { if n > 16_000 { return Some(Err(format!("{n} GB of disk is too much"))) } s.disk_gb = Some(n) }
             else if let Some(n) = num("gb") { if n > 1536 { return Some(Err(format!("{n} GB of memory is more than any machine has"))) } s.ram_gb = Some(n) }
             else if ["arm64", "arm"].contains(&part) { s.arch = Some("arm64".into()) }
@@ -79,7 +109,7 @@ impl Spec {
             else if part == "linux" { s.os = Some("linux".into()) }
             else if part == "ondemand" { s.on_demand = true }
             else if CLOUDS.contains(&part) { s.cloud = Some(part.into()) }
-            else { return Some(Err(format!("“{part}” in runs-on: {label} is not understood (sizes are like 8cpu, 32gb, 100disk; also arm64, windows, gpu or a GPU like l4, ondemand, or a cloud: aws, cloudflare, modal)"))) }
+            else { return Some(Err(format!("“{part}” in runs-on: {label} is not understood (sizes are like 8cpu, 32gb, 100disk; also arm64, windows, gpu or a GPU like l4, ondemand, a disk's speed like 500mbs, ramdisk, localdisk, or a cloud: aws, cloudflare, modal)"))) }
         }
         Some(Ok(s))
     }
@@ -95,6 +125,8 @@ impl Spec {
             os: self.os.clone().or_else(|| default.os.clone().filter(|_| self.arch.is_none() && self.gpu.is_none())),
             gpu: self.gpu.clone().or_else(|| default.gpu.clone()),
             cloud: self.cloud.clone().or_else(|| default.cloud.clone()), on_demand: self.on_demand || default.on_demand,
+            disk_mibs: self.disk_mibs.or(default.disk_mibs), disk_iops: self.disk_iops.or(default.disk_iops),
+            ramdisk: self.ramdisk || default.ramdisk, nvme: self.nvme || default.nvme,
         }
     }
 
@@ -114,6 +146,10 @@ impl Spec {
         if self.os.is_some() { parts.push(self.os().to_string()) }
         match self.gpu.as_deref() { Some("any") => parts.push("a GPU".into()), Some(g) => parts.push(format!("{} GPU", g.to_uppercase())), None => {} }
         if self.on_demand { parts.push("on-demand".into()) }
+        match self.disk_mibs { Some(DISK_MIBS_INCLUDED) => parts.push("standard disk speed".into()), Some(m) => parts.push(format!("{m} MiB/s disk")), None => {} }
+        if let Some(i) = self.disk_iops { parts.push(format!("{i} IOPS")) }
+        if self.ramdisk { parts.push("RAM disk".into()) }
+        if self.nvme { parts.push("local disk".into()) }
         if let Some(c) = &self.cloud { parts.push(format!("only {c}")) }
         if parts.is_empty() { "the default machine".into() } else { parts.join(", ") }
     }
@@ -131,6 +167,8 @@ pub struct Capacity {
     pub min_ram_per_cpu: u32,
     /// The GPUs it has (one per machine), least costly first; none: no GPUs.
     #[serde(default)] pub gpus: Vec<String>,
+    /// Whether it can put a job's files in memory, or on a machine's own NVMe disk, when a label asks (AWS).
+    #[serde(default)] pub scratch: bool,
 }
 
 /// A machine as a place starts it.
@@ -155,6 +193,10 @@ impl Capacity {
         if !self.arch.iter().any(|a| a == s.arch()) { return Err(format!("{} only", self.arch.join(", "))) }
         if !self.os.iter().any(|o| o == s.os()) { return Err(format!("{} only", self.os.join(", "))) }
         if s.on_demand && !self.on_demand { return Err("no on-demand machines".into()) }
+        if s.ramdisk && !self.scratch { return Err("no RAM disk".into()) }
+        if s.nvme && !self.scratch { return Err("no machines with a local disk to ask for".into()) }
+        if (s.ramdisk || s.nvme) && s.os() != "linux" { return Err("a RAM disk or a local disk on Linux only".into()) }
+        if s.nvme && s.gpu.is_some() { return Err("no GPU machines with a local disk to ask for".into()) }
         if s.os() == "windows" && s.arch() != "x64" { return Err("Windows on x64 only".into()) }
         let gpu = match s.gpu.as_deref() {
             None => None,
@@ -175,14 +217,14 @@ impl Capacity {
     /// AWS: any size EC2 has, x64 and arm64, Linux and Windows, spot or on-demand; standard 4 CPU, 8 GB, 60 GB disk.
     /// GPUs: NVIDIA T4 (g4dn), L4 (g6), A10G (g5), L40S (g6e), one per machine.
     pub fn aws() -> Self { Capacity { max_cpu: 192, max_ram_gb: 1536, max_disk_gb: 16_000, arch: vec!["x64".into(), "arm64".into()], os: vec!["linux".into(), "windows".into()], on_demand: true,
-        std_cpu: 4, std_ram_gb: 8, std_disk_gb: 60, ram_per_cpu: 4, min_ram_per_cpu: 0, gpus: ["t4", "l4", "a10g", "l40s"].map(String::from).to_vec() } }
+        std_cpu: 4, std_ram_gb: 8, std_disk_gb: 60, ram_per_cpu: 4, min_ram_per_cpu: 0, gpus: ["t4", "l4", "a10g", "l40s"].map(String::from).to_vec(), scratch: true } }
     /// Cloudflare containers, sized per job: 1 to 4 CPU, at least 3 GB per CPU, up to 12 GB and 20 GB disk, x64. CPU is
     /// billed only while used, so the standard machine is the largest: 4 CPU, 12 GB, 20 GB.
     pub fn cloudflare() -> Self { Capacity { max_cpu: 4, max_ram_gb: 12, max_disk_gb: 20, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true,
-        std_cpu: 4, std_ram_gb: 12, std_disk_gb: 20, ram_per_cpu: 4, min_ram_per_cpu: 3, gpus: vec![] } }
+        std_cpu: 4, std_ram_gb: 12, std_disk_gb: 20, ram_per_cpu: 4, min_ram_per_cpu: 3, gpus: vec![], scratch: false } }
     /// Modal sandboxes (non-preemptible, x64); standard 2 CPU, 8 GB; any of Modal's GPUs, one per sandbox.
     pub fn modal() -> Self { Capacity { max_cpu: 64, max_ram_gb: 336, max_disk_gb: 512, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true,
-        std_cpu: 2, std_ram_gb: 8, std_disk_gb: 64, ram_per_cpu: 4, min_ram_per_cpu: 0, gpus: GPUS.map(String::from).to_vec() } }
+        std_cpu: 2, std_ram_gb: 8, std_disk_gb: 64, ram_per_cpu: 4, min_ram_per_cpu: 0, gpus: GPUS.map(String::from).to_vec(), scratch: false } }
 }
 
 /// EC2 instance types for a machine, best first (fallbacks for when one has no spot capacity): the smallest size with
@@ -194,7 +236,14 @@ pub fn aws_instance_types(s: &Spec) -> Vec<String> {
     let cpu = s.cpu.unwrap_or(4);
     let ram = s.ram().unwrap_or(if s.cpu.is_none() { 8 } else { cpu * 4 });
     let mut out = vec![];
-    for (per_cpu, families) in [(2, if arm { ["c8g", "c7g"] } else { ["c8a", "c7a"] }), (4, if arm { ["m8g", "m7g"] } else { ["m8a", "m7a"] }), (8, if arm { ["r8g", "r7g"] } else { ["r8a", "r7a"] })] {
+    // (With a local NVMe disk, when asked for: the families that have one.)
+    let families = match (s.nvme, arm) {
+        (false, false) => [(2, ["c8a", "c7a"]), (4, ["m8a", "m7a"]), (8, ["r8a", "r7a"])],
+        (false, true) => [(2, ["c8g", "c7g"]), (4, ["m8g", "m7g"]), (8, ["r8g", "r7g"])],
+        (true, false) => [(2, ["c8id", "c6id"]), (4, ["m8id", "m6id"]), (8, ["r8id", "r6id"])],
+        (true, true) => [(2, ["c8gd", "c7gd"]), (4, ["m8gd", "m7gd"]), (8, ["r8gd", "r7gd"])],
+    };
+    for (per_cpu, families) in families {
         let Some((c, size)) = SIZES.iter().find(|(c, _)| *c >= cpu && c * per_cpu >= ram) else { continue };
         for f in families { out.push((*c, per_cpu, format!("{f}.{size}"))) }
     }
@@ -247,6 +296,25 @@ mod tests {
         assert_eq!(Spec::parse("superci-gpu", "superci").unwrap().unwrap().gpu.as_deref(), Some("any"));
         assert_eq!(Spec::parse("superci-a10-16cpu", "superci").unwrap().unwrap().gpu.as_deref(), Some("a10g"));
         assert_eq!(Spec::parse("superci-H100", "superci").unwrap().unwrap().describe(), "H100 GPU");
+        // A disk's speed, and where a job's files go.
+        let s = Spec::parse("superci-8cpu-500mbs-6000iops-ramdisk", "superci").unwrap().unwrap();
+        assert_eq!((s.disk_mibs, s.disk_iops, s.ramdisk, s.nvme, s.disk_gb), (Some(500), Some(6000), true, false, None));
+        assert_eq!(s.describe(), "8 CPU, 500 MiB/s disk, 6000 IOPS, RAM disk");
+        assert!(Spec::parse("superci-50mbs", "superci").unwrap().unwrap_err().contains("125 to 2000") && Spec::parse("superci-100iops", "superci").unwrap().is_err());
+        let nvme = Spec::parse("superci-16cpu-localdisk", "superci").unwrap().unwrap();
+        assert_eq!((Spec::parse("superci-16cpu-nvme", "superci"), Spec::parse("superci-tmpfs", "superci")), (Some(Ok(nvme.clone())), Spec::parse("superci-ramdisk", "superci")), "the words others use for the same");
+        assert_eq!(nvme.describe(), "16 CPU, local disk");
+        assert_eq!(aws_instance_types(&nvme)[..2], ["m8id.4xlarge".to_string(), "m6id.4xlarge".to_string()]);
+        assert_eq!(aws_instance_types(&Spec { arch: Some("arm64".into()), ..nvme.clone() })[0], "m8gd.4xlarge");
+        assert!(Capacity::cloudflare().refuses(&nvme).is_some() && Capacity::modal().refuses(&s).is_some() && Capacity::aws().refuses(&s).is_none());
+        assert!(Capacity::aws().refuses(&Spec::parse("superci-windows-ramdisk", "superci").unwrap().unwrap()).unwrap().contains("Linux only"));
+        // The disk's speed follows the machine's size unless said; what is said stays within what a gp3 volume takes.
+        let d = Spec::default();
+        assert_eq!([2, 4, 8, 16, 32, 96].map(|cpu| disk_speed(cpu, 60, &d)), [(125, 3000), (250, 3000), (500, 3000), (1000, 4000), (1000, 4000), (1000, 4000)]);
+        assert_eq!(disk_speed(4, 60, &Spec { disk_mibs: Some(125), ..Default::default() }), (125, 3000), "the standard speed, when the default machine says so");
+        assert_eq!(disk_speed(4, 60, &Spec { disk_mibs: Some(2000), ..Default::default() }), (2000, 8000));
+        assert_eq!(disk_speed(4, 60, &Spec { disk_iops: Some(80_000), ..Default::default() }), (250, 30_000), "500 IOPS for each GB at most");
+        assert_eq!(disk_speed(32, 8, &d), (1000, 4000));
     }
 
     #[test]

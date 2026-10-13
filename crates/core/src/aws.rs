@@ -204,6 +204,9 @@ pub struct Launch<'a> {
     pub types: &'a [String],
     pub user_data: &'a str,
     pub disk_gb: u32,
+    /// The disk's speed: MiB a second and IOPS (see `spec::disk_speed`).
+    pub disk_mibs: u32,
+    pub disk_iops: u32,
     pub tags: &'a [(String, String)],
     /// Spot (cheaper; can be taken back) or on-demand.
     pub spot: bool,
@@ -282,7 +285,7 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
             "ImageId": l.image, "InstanceType": t, "MinCount": 1, "MaxCount": 1, "UserData": b64(l.user_data.as_bytes()),
             "InstanceInitiatedShutdownBehavior": "terminate",
             "MetadataOptions": { "HttpTokens": "required" },
-            "BlockDeviceMapping": [{ "DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": l.disk_gb, "VolumeType": "gp3", "DeleteOnTermination": "true" } }],
+            "BlockDeviceMapping": [{ "DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": l.disk_gb, "VolumeType": "gp3", "Throughput": l.disk_mibs, "Iops": l.disk_iops, "DeleteOnTermination": "true" } }],
             "TagSpecification": [{ "ResourceType": "instance", "Tag": l.tags.iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect::<Vec<_>>() }],
         });
         if l.spot { params["InstanceMarketOptions"] = serde_json::json!({ "MarketType": "spot", "SpotOptions": { "SpotInstanceType": "one-time", "InstanceInterruptionBehavior": "terminate" } }); }
@@ -584,9 +587,13 @@ pub const DATA_OUT_USD_PER_GB: f64 = 0.09;
 /// A public IPv4 address, per hour (every machine in a default VPC gets one).
 pub const PUBLIC_IPV4_USD_PER_HOUR: f64 = 0.005;
 
-/// What a machine pays per hour besides itself: its disk (gp3, `gb_month` per GB-month) and its public address
-/// (none in a private subnet).
-pub fn extras_usd_per_hour(gb_month: f64, disk_gb: u32, public_address: bool) -> f64 { disk_gb as f64 * gb_month / 730.0 + if public_address { PUBLIC_IPV4_USD_PER_HOUR } else { 0.0 } }
+/// What a machine pays per hour besides itself: its disk (gp3, `gb_month` per GB-month), the disk's speed above
+/// what AWS includes, and its public address (none in a private subnet). AWS prices a MiB a second for a month at
+/// half a GB's price and an IOPS at a sixteenth, in every region ($0.040 and $0.005 where a GB is $0.08).
+pub fn extras_usd_per_hour(gb_month: f64, disk_gb: u32, disk_mibs: u32, disk_iops: u32, public_address: bool) -> f64 {
+    let (mibs, iops) = (disk_mibs.saturating_sub(crate::spec::DISK_MIBS_INCLUDED) as f64, disk_iops.saturating_sub(crate::spec::DISK_IOPS_INCLUDED) as f64);
+    (disk_gb as f64 + mibs / 2.0 + iops / 16.0) * gb_month / 730.0 + if public_address { PUBLIC_IPV4_USD_PER_HOUR } else { 0.0 }
+}
 
 /// Whether a launch failed for want of room in the region (spot capacity, or the account's quota there), so the next
 /// region may have it.
@@ -882,6 +889,40 @@ if [ -n "$disk" ] && [ -n "$part" ]; then growpart "/dev/$disk" "$part" || true;
 df -h / | tail -n 1
 "#;
 
+/// A fast place for what a job writes most: Docker's files, its work folder and /tmp, bound from one place that
+/// `MOUNT_SCRATCH` mounts (memory, or the machine's own NVMe disk). Before Docker starts. With nothing mounted
+/// (a machine with no such disk), everything stays on the root disk as it was.
+const SCRATCH: &str = r#"scratch=/mnt/superci; mkdir -p "$scratch"
+MOUNT_SCRATCH
+if mountpoint -q "$scratch"; then
+  systemctl stop docker.socket docker containerd > /dev/null 2>&1 || true
+  for d in /var/lib/docker /var/lib/containerd /home/runner/work /tmp; do mkdir -p "$d" "$scratch$d"; mount --bind "$scratch$d" "$d"; done
+  chmod 1777 /tmp; chown runner: /home/runner/work 2>/dev/null || true
+  df -h "$scratch" | tail -n 1
+fi
+"#;
+
+/// The machine's own NVMe disks (instance storage; several as one): formatted and mounted. Nothing kept there
+/// outlives the machine, so its inode tables are not written out behind the job's back (`noinit_itable`: on a real
+/// machine that work took the disk from the job's first half minute).
+const MOUNT_NVME: &str = r#"set -- $(lsblk -d -n -o NAME,MODEL | awk '/Instance Storage/{print "/dev/"$1}'); dev="$1"
+if [ $# -gt 1 ] && command -v mdadm > /dev/null && mdadm --create /dev/md0 --run --level=0 --raid-devices=$# "$@" > /dev/null 2>&1; then dev=/dev/md0; fi
+if [ -n "$dev" ] && mkfs.ext4 -q -F -E nodiscard,lazy_itable_init=1,lazy_journal_init=1 "$dev"; then mount -o noatime,noinit_itable "$dev" "$scratch"; fi"#;
+
+/// Memory as that place: up to three quarters of the machine's, used only as files are written (and counted as
+/// memory: what a job keeps there must fit beside what it runs). Full, it says "No space left on device"; the last
+/// quarter stays for what the job runs.
+const MOUNT_RAM: &str = r#"mount -t tmpfs -o size=75% tmpfs "$scratch""#;
+
+/// A Linux machine's start-up script with a fast place for a job's files (see `SCRATCH`): the machine's own NVMe
+/// disk, memory, or memory over the disk when both are asked for. Set up after the root filesystem is grown and
+/// before Docker and the runner start. (Not for the runner that only says why a job failed.)
+pub fn with_scratch(script: String, ramdisk: bool, nvme: bool) -> String {
+    if !(ramdisk || nvme) || !script.contains(GROW_ROOT) { return script }
+    let mount = [nvme.then_some(MOUNT_NVME), ramdisk.then_some(MOUNT_RAM)].into_iter().flatten().collect::<Vec<_>>().join("\n");
+    script.replacen(GROW_ROOT, &format!("{GROW_ROOT}{}", SCRATCH.replace("MOUNT_SCRATCH", &mount)), 1)
+}
+
 pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<String> {
     let (jit_config, fail) = match work {
         crate::io::Work::GitHub { jit } => (jit.as_str(), None),
@@ -1070,6 +1111,20 @@ mod tests {
         assert!(win.contains("Resize-Partition -DriveLetter C -Size $max") && win.find("Resize-Partition").unwrap() < win.find("run.cmd --jitconfig").unwrap(), "{win}");
         // (The runner that only says why a job failed uses no disk.)
         assert!(!runner_user_data(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10).unwrap().contains("growpart"));
+        // A fast place for a job's files, when its label asks: memory, or the machine's own NVMe disk, mounted before
+        // Docker and the runner start, with Docker's files, the work folder and /tmp bound from it.
+        let ram = with_scratch(script.clone(), true, false);
+        assert!(ram.contains(r#"mount -t tmpfs -o size=75% tmpfs "$scratch""#) && !ram.contains("Instance Storage") && ram.contains("for d in /var/lib/docker /var/lib/containerd /home/runner/work /tmp;"), "{ram}");
+        assert!(ram.find("growpart").unwrap() < ram.find("tmpfs").unwrap() && ram.find("mount --bind").unwrap() < ram.find("systemctl start docker").unwrap() && ram.find("mount --bind").unwrap() < ram.find("./run.sh").unwrap());
+        let local = with_scratch(script.clone(), false, true);
+        assert!(local.contains("/Instance Storage/") && local.contains("mkfs.ext4 -q -F") && !local.contains("tmpfs") && !local.contains("MOUNT_SCRATCH"), "{local}");
+        assert!(with_scratch(gl.clone(), true, true).contains("tmpfs") && with_scratch(script.clone(), false, false) == script);
+        let failing = runner_user_data(&crate::io::Work::Fail { jit: "abc".into(), why: "abc".into() }, 10).unwrap();
+        assert_eq!(with_scratch(failing.clone(), true, true), failing);
+        // The disk's speed above what AWS includes is in the price of the hour: 1,000 MiB a second and 4,000 IOPS on
+        // 60 GB, where a GB is $0.08 a month, add $0.055.
+        let (plain, fast) = (extras_usd_per_hour(0.08, 60, 125, 3000, false), extras_usd_per_hour(0.08, 60, 1000, 4000, false));
+        assert!((plain - 60.0 * 0.08 / 730.0).abs() < 1e-9 && (fast - plain - 0.0548).abs() < 0.0002, "{plain} {fast}");
     }
 
     #[test]

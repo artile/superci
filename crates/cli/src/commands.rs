@@ -37,8 +37,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: acmeci`, `acmeci-8cpu`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
     ("name", "  superci name retrieve\n  superci name update NAME",
         "What your CI is called where people read it: the dashboard's header, the GitHub App's name for an organization\nadded from then on, and what a job's page says when it could not be run. SuperCI unless you name it.\n\nupdate    Calls it NAME (\"AcmeCI\", \"Acme CI\"): 2 to 24 letters, digits, spaces and dashes. `SuperCI` puts it back.\n          The command stays `superci`; what workflows name is `superci labels`."),
-    ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--arch=x64|arm64] [--os=linux|windows] [--on-demand=true|false]",
-        "The machine `runs-on: superci` alone gets. A job's label can ask for another (`superci-8cpu-arm64`)."),
+    ("machine", "  superci machine retrieve\n  superci machine update [--cpu=N] [--ram=GB] [--disk=GB] [--disk-speed=auto|standard|MIBS] [--arch=x64|arm64] [--os=linux|windows]\n                         [--on-demand=true|false]",
+        "The machine `runs-on: superci` alone gets. A job's label can ask for another (`superci-8cpu-arm64`).\n\n--disk-speed  On AWS a disk's speed follows the machine's size (`auto`: 62.5 MiB a second for each CPU, up to 1,000;\n              the extra is in a job's price). `standard` is what AWS includes at no extra price (125 MiB a second);\n              a number sets it (125 to 2000). A label can say it for one job: `superci-8cpu-500mbs`."),
     ("limits", "  superci limits retrieve\n  superci limits update [--max-cpu=N] [--max-hours=N] [--monthly-usd=N|none] [--daily-usd=N|none]",
         "--monthly-usd The most the CI may spend on machines in a month, all providers together (no limit unless set).\n              At it no job starts until next month or a higher limit. A cloud account's own limit is\n              `superci accounts update aws --monthly-usd=N`; a provider's, `superci runners update`.\n--daily-usd   The same for a day (UTC): a day that runs away stops that day.\n--max-cpu     The largest machine a label may ask for (32 unless set). A label asking for more is refused.\n--max-hours   The longest a job may run: its machine is ended after this (6 unless set, as on GitHub's own runners;\n              120 at most). Whatever is set, a machine on Cloudflare lives 6 hours at most and one on Modal 24. A\n              workflow's timeout-minutes ends a job sooner."),
     ("public_repos", "  superci public_repos list\n  superci public_repos create OWNER/REPO\n  superci public_repos delete OWNER/REPO",
@@ -134,7 +134,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 10] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add"];
-const VALUES: [&str; 30] = ["workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 31] = ["disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "on-demand", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -779,11 +779,13 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut d = signed_in();
             let now = view(&mut d)?.machine();
             if operation == "update" {
-                if !["cpu", "ram", "disk", "arch", "os", "on-demand"].iter().any(|f| args.has(f)) { return usage("Say what to change: `superci machine update --cpu=4 --ram=16` (see `superci help machine`).") }
+                if !["cpu", "ram", "disk", "disk-speed", "arch", "os", "on-demand"].iter().any(|f| args.has(f)) { return usage("Say what to change: `superci machine update --cpu=4 --ram=16` (see `superci help machine`).") }
                 let number = |flag: &str, now: Option<u32>| args.get(flag).map(str::to_string).or(now.map(|n| n.to_string())).unwrap_or_default();
                 let mut fields = vec![field("cpu", number("cpu", now.cpu)), field("ram", number("ram", now.ram_gb)), field("disk", number("disk", now.disk_gb)),
                     field("arch", args.get("arch").map(str::to_string).or(now.arch.clone()).unwrap_or_else(|| "x64".into())),
                     field("os", args.get("os").map(str::to_string).or(now.os.clone()).unwrap_or_else(|| "linux".into()))];
+                // (The disk's speed on AWS: `auto` leaves it to the machine's size, `standard` is what AWS includes.)
+                fields.push(field("speed", args.get("disk-speed").map(str::to_string).unwrap_or_else(|| match now.disk_mibs { Some(superci_core::spec::DISK_MIBS_INCLUDED) => "standard".into(), Some(s) => s.to_string(), None => String::new() })));
                 if truth(args, "on-demand")?.unwrap_or(now.on_demand) { fields.push(field("ondemand", "on")) }
                 to_set(&mut d)?;
                 let would = fields.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ");
@@ -1120,7 +1122,8 @@ fn job_line(j: &Value) -> String {
 
 fn machine_words(m: &Value) -> String {
     let n = |k: &str, unit: &str| m[k].as_u64().map(|v| format!("{v} {unit}"));
-    let parts: Vec<String> = [n("cpu", "CPUs"), n("ram_gb", "GB memory"), n("disk_gb", "GB disk"), m["arch"].as_str().map(str::to_string), m["os"].as_str().map(str::to_string), (m["on_demand"] == true).then(|| "on-demand".to_string())].into_iter().flatten().collect();
+    let speed = match m["disk_mibs"].as_u64() { Some(125) => Some("standard disk speed".to_string()), Some(s) => Some(format!("{s} MiB/s disk")), None => None };
+    let parts: Vec<String> = [n("cpu", "CPUs"), n("ram_gb", "GB memory"), n("disk_gb", "GB disk"), speed, m["arch"].as_str().map(str::to_string), m["os"].as_str().map(str::to_string), (m["on_demand"] == true).then(|| "on-demand".to_string())].into_iter().flatten().collect();
     if parts.is_empty() { "each provider's standard machine (Linux, x64)".into() } else { parts.join(", ") }
 }
 
