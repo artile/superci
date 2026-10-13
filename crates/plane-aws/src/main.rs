@@ -1,7 +1,8 @@
 //! A SuperCI control plane on AWS Lambda (provided.al2023, arm64): GitHub's webhooks arrive through the function's
 //! URL; state is one DynamoDB table; secrets (the GitHub App, runner agents, dashboard keys) are SecureString parameters
-//! under /superci/<id>/ in SSM Parameter Store, written by the dashboard; a schedule calls the sweep every two
-//! minutes. Machines in this account are started with the function's own role, so AWS needs no OpenID Connect here.
+//! under /superci/<id>/ in SSM Parameter Store, written by the dashboard; a schedule calls the sweep every minute,
+//! and the function calls itself for a sweep sooner than that (see `Scheduled`). Machines in this account are
+//! started with the function's own role, so AWS needs no OpenID Connect here.
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -86,11 +87,43 @@ impl Store for Dynamo<'_> {
 struct SystemClock;
 impl Clock for SystemClock { fn now_ms(&self) -> u64 { now_ms() } }
 
-/// The schedule calls the sweep every minute whatever is asked, so a wake-up needs nothing here.
-struct Scheduled;
+/// A wake-up asked for within this long is the function's own doing; a later one is left to the schedule.
+const SOON_MS: u64 = 30_000;
+
+/// The schedule calls the sweep every minute, which is late for what is asked for sooner: a start that failed and
+/// is tried again, jobs waiting for room (twenty seconds). For those the function calls itself, not waiting for the
+/// answer; that call waits out the time and sweeps (see `main`). One such call is on its way at a time, however
+/// many jobs ask (claimed in the table): a sweep is for every job, and asks for the next itself while any waits.
+/// Where it may not call itself (a role from before), the schedule does it, as it did.
+struct Scheduled<'a> { http: &'a Blocking, store: &'a Dynamo<'a>, region: &'a str, function: &'a str }
+
+/// Where a sweep that is going notes itself (when it began, ms).
+const SWEEPING: &str = "aws:sweeping";
+
+/// Where a sweep that is on its way is noted (when it is for, ms). One still there well after its time never came.
+const WAKING: &str = "aws:waking";
+
 #[async_trait(?Send)]
-impl Timer for Scheduled {
-    async fn wake_in(&self, _ms: u64) -> io::Result<()> { Ok(()) }
+impl Timer for Scheduled<'_> {
+    async fn wake_in(&self, ms: u64) -> io::Result<()> {
+        if ms > SOON_MS || self.function.is_empty() { return Ok(()) }
+        let at = now_ms() + ms;
+        // (Nothing here fails what asked: the schedule's sweep comes within the minute whatever happens.)
+        if !self.store.put_if_absent(WAKING, at.to_string()).await.unwrap_or(false) {
+            let coming = self.store.get(WAKING).await.ok().flatten().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            if now_ms() < coming + SOON_MS { return Ok(()) }
+            let _ = self.store.put(WAKING, at.to_string()).await;
+        }
+        let body = json!({ "superci": "wake", "at": at }).to_string();
+        let url = format!("https://lambda.{}.amazonaws.com/2015-03-31/functions/{}/invocations", self.region, self.function);
+        let headers = vec![("content-type".to_string(), "application/json".to_string()), ("x-amz-invocation-type".to_string(), "Event".to_string())];
+        let sent = match aws::sigv4("POST", &url, &headers, body.as_bytes(), &own_credentials(), self.region, "lambda", &aws::amz_date(now_ms())) {
+            Ok(signed) => { let mut r = Request::new("POST", &url).with_body(body); r.headers = signed; self.http.send(r).await.is_ok_and(|r| r.status < 300) }
+            Err(_) => false,
+        };
+        if !sent { let _ = self.store.delete(WAKING).await; }
+        Ok(())
+    }
     /// A Lambda answers one request at a time: it simply waits.
     async fn pause(&self, ms: u64) { std::thread::sleep(Duration::from_millis(ms)) }
 }
@@ -177,6 +210,7 @@ fn main() {
     let (http, runtime) = (Blocking(agent()), ureq::Agent::from(ureq::Agent::config_builder().http_status_as_error(false).build()));
     let table = std::env::var("TABLE").unwrap_or_default();
     let plane_id = std::env::var("PLANE_ID").unwrap_or_default();
+    let function = std::env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or_default();
     let cache = Cache::default();
     let mut secrets = Secrets { at: None, values: vec![] };
     loop {
@@ -195,8 +229,30 @@ fn main() {
             secrets.refresh(&http, &region, &plane_id, unknown || moving)?;
             let config = config(&secrets, &account_id);
             let store = Dynamo { http: &http, table: table.clone(), region: region.clone() };
-            let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &Scheduled, config: &config, cache: &cache, containers: None };
-            if event["superci"] == "sweep" { return block_on(plane.alarm()).map(|_| json!({ "swept": true })) }
+            let timer = Scheduled { http: &http, store: &store, region: &region, function: &function };
+            let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &timer, config: &config, cache: &cache, containers: None };
+            // One sweep at a time: the schedule's and the function's own could otherwise each start a machine for
+            // the same waiting job. One that finds another going leaves it to that one (which asks for the next
+            // itself); a note older than a minute and a half is of a sweep that was cut off.
+            let sweep = || -> io::Result<Value> {
+                let now = now_ms();
+                if !block_on(store.put_if_absent(SWEEPING, now.to_string())).unwrap_or(true) {
+                    let since = block_on(store.get(SWEEPING)).ok().flatten().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                    if now.saturating_sub(since) < 90_000 { return Ok(json!({ "swept": false })) }
+                    let _ = block_on(store.put(SWEEPING, now.to_string()));
+                }
+                let done = block_on(plane.alarm()).map(|_| json!({ "swept": true }));
+                let _ = block_on(store.delete(SWEEPING));
+                done
+            };
+            if event["superci"] == "sweep" { return sweep() }
+            // Its own call for a sweep sooner than the schedule's: the time is waited out here, then the sweep.
+            if event["superci"] == "wake" {
+                let at = event["at"].as_u64().unwrap_or(0);
+                std::thread::sleep(Duration::from_millis(at.saturating_sub(now_ms()).min(SOON_MS)));
+                let _ = block_on(store.delete(WAKING));
+                return sweep()
+            }
             Ok(response(block_on(plane.handle(request(&event)))))
         })();
         let _ = match outcome {

@@ -68,6 +68,8 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         { "Sid": "State", "Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"], "Resource": table_arn },
         { "Sid": "Secrets", "Effect": "Allow", "Action": "ssm:GetParametersByPath", "Resource": [params_arn, format!("{params_arn}/*")] },
         { "Sid": "Logs", "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": format!("arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{name}:*") },
+        // Itself, and nothing else: a sweep sooner than the schedule's minute (a start tried again, jobs waiting for room).
+        { "Sid": "WakeItself", "Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": format!("arn:aws:lambda:{region}:{account_id}:function:{name}") },
     ] });
     a.iam("PutRolePolicy", json!({ "RoleName": name, "PolicyName": "control-plane", "PolicyDocument": own.to_string() }))?;
     if runners {
@@ -95,13 +97,13 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         a.lambda("PUT", &format!("/2015-03-31/functions/{name}/code"), Some(json!({ "ZipFile": zip, "Architectures": ["arm64"] })))?;
         // Its size as set now (one set up before had a smaller one: slower to start and to answer).
         wait_ready(&a, &name)?;
-        a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(json!({ "MemorySize": MEMORY_MB, "Timeout": 30 })))?;
+        a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(json!({ "MemorySize": MEMORY_MB, "Timeout": 60 })))?;
     } else {
         // A new role takes a few seconds before Lambda may use it.
         let mut last = String::new();
         for attempt in 0..12 {
             match a.lambda("POST", "/2015-03-31/functions", Some(json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap",
-                "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 30, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
+                "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 60, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
                 "Tags": { "superci-plane": plane_id } }))) {
                 Ok(_) => { last.clear(); break }
                 Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; std::thread::sleep(Duration::from_secs(3 + attempt)) }
