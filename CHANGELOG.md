@@ -2,6 +2,14 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.16.7 — 2026-10-13
+- A job on AWS has the disk it was given. The volume had the size asked for (60 GB, or what a label like `superci-8cpu-120disk` says), but the root filesystem stayed at the image's 29 GB, 18 of them used: a job had 11 GB free whatever it asked for, and a large one ran out of space. The machine now grows its root filesystem to the whole disk before the runner starts (under a second), on GitHub's and GitLab's jobs alike, and the C: drive on Windows. Update your control plane for it; a step that grows the disk by hand is no longer needed.
+- A job run again after AWS took back its spot machine, in an account whose on-demand limit is too small for it, goes back on a spot machine. Before, it was kept on on-demand, where a machine larger than that limit can never start: it waited and then failed, while the spot limit it had just run under was free. The job says so: "On a spot machine again: an on-demand one does not fit your AWS account's on-demand limit".
+- A job with no spot machine to be had now, whose on-demand machine the account's limit refuses, waits for a spot machine. Before, it was tried twice more and failed.
+- A job waiting at the account's limit said "in use by 1 of your job there; it starts when one ends" when nothing of yours was running: the one counted was a machine that had ended a moment ago, which AWS counts a little longer. It now says that, and is tried again.
+- A job on an on-demand machine because it was run again after a reclaim says "On-demand: run again after AWS took back its spot machine" (it read "AWS had no spot machine for it").
+- A job's row has its disk beside its machine when it is not the standard 60 GB ("32 CPU · r8a.8xlarge · 120 GB disk"), in `superci jobs list` too.
+
 ## 0.16.6 — 2026-10-13
 - Runs. The Jobs page has a Runs tab: a workflow's jobs together (on GitLab, a pipeline's), with how the run stands, how long it took from its first job queued to its last one over, what its machines cost together, and the job that was over last, the one the run waited for ("Last to end: E2E (1/2), 6m 12s after 1m 5s waiting for a machine"). A run or a job run again is its own row ("attempt 2"), for jobs from this version on. Only the jobs SuperCI ran are counted. In commands: `superci runs list` and `superci runs retrieve ID` (with `--json`).
 - A control plane in AWS tries again within seconds. A job waiting for room, and a start AWS refused that is tried again, waited for the next minute's sweep; the control plane now asks itself for one twenty seconds on. Update your control plane for it (the update gives it leave to call itself, and nothing else).
