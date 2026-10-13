@@ -234,6 +234,9 @@ pub struct Job {
     /// Its disk's speed, when above what AWS includes (MiB a second, IOPS): counted in its price.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
+    /// What it writes most is in memory, or on its machine's own disk (its label asked: `-ramdisk`, `-localdisk`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub local_disk: bool,
     /// Its machine has no public address (a private subnet of the account's own: none is billed).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub private: bool,
     /// What its machine cost, settled once it ended: at the prices the cloud billed for its time ("prices"), or as the
@@ -1913,6 +1916,7 @@ impl<'a> ControlPlane<'a> {
                         job.disk_gb = Some(disk_gb);
                         job.disk_mibs = Some(disk_mibs).filter(|m| *m > DISK_MIBS_INCLUDED);
                         job.disk_iops = Some(disk_iops).filter(|i| *i > DISK_IOPS_INCLUDED);
+                        (job.ramdisk, job.local_disk) = (spec.ramdisk && spec.os() == "linux", spec.nvme && spec.os() == "linux");
                         Ok(Tried::Started(machine.id, machine.kind))
                     }.await,
                     Runner::Own => async {

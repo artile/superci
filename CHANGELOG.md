@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.16.9 — unreleased
+- A job says the disk it had. Its row and `superci jobs list` have the disk's speed beside its size when it is above what AWS includes ("32 CPU · m7a.8xlarge · 120 GB disk at 1000 MiB/s"), and "RAM disk" or "local disk" when its label asked for one. With `--json` a job has `disk`: its size, speed, IOPS, and whether its files were in memory or on a local disk. Before, only the size was shown, and the speed had to be measured inside the job.
+- A job with `-ramdisk` or `-localdisk` keeps the disk speed AWS includes, at no extra price: its writes go to memory or to the local disk, and the faster disk was paid for and barely used. A speed said in the label or on the default machine is still given (`superci-32cpu-ramdisk-500mbs`). Update your control plane for it.
+
 ## 0.16.8 — 2026-10-13
 - A machine's disk on AWS is as fast as its size deserves. Every disk had the speed AWS includes, 125 MiB a second, whatever the machine: a 32-CPU machine wrote no faster than a 2-CPU one, and a job that pulls Docker images or runs a database waited for its disk. The speed now follows the machine: 31.25 MiB a second for each CPU, up to 1,000. That is 250 on 8 CPUs, 500 on 16 and 1,000 from 32; the standard 4-CPU machine keeps what AWS includes, and costs what it did. Measured on real machines: sixteen copies of a 300 MB database made in 14 seconds on a 1,000 MiB disk where it took 110, a database's first start in 3 seconds where it took 26, and 6 GB of Docker images pulled in half the time at twice the speed. Update your control plane for it.
 - What it costs is in each job's price: $0.007 an hour on 8 CPUs, $0.021 on 16, $0.055 from 32, a twentieth to a tenth of a spot machine's price. The default machine's Disk speed sets it for every job: Standard keeps what AWS includes at no extra price, a number gives every machine that speed (250 MiB a second on the standard machine is $0.007 an hour). In commands: `superci machine update --disk-speed=standard`, `=250`, or `=auto` to put it back.

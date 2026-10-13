@@ -38,10 +38,11 @@ pub const DISK_IOPS_INCLUDED: u32 = 3000;
 /// CPU, no less than what AWS includes and no more than 1,000. So the standard 4-CPU machine has what AWS includes,
 /// at no extra price, and the extra on a larger one is a twentieth to a tenth of a spot machine's price (a machine of
 /// any size could use more, for its first half hour: its size sets what is worth paying for, not what it can do). IOPS: what AWS includes, or what
-/// the speed needs. As asked, when a label or the default machine says: within what a gp3 volume takes (125 to 2,000
+/// the speed needs. A job whose files are in memory or on a local disk barely writes to this one: it keeps what AWS
+/// includes, unless a speed is said. As asked, when a label or the default machine says: within what a gp3 volume takes (125 to 2,000
 /// MiB a second, 3,000 to 80,000 IOPS, 4 IOPS for each MiB a second, 500 IOPS for each GB).
 pub fn disk_speed(cpu: u32, disk_gb: u32, s: &Spec) -> (u32, u32) {
-    let by_size = (cpu * 125 / 4).clamp(DISK_MIBS_INCLUDED, 1000);
+    let by_size = if s.ramdisk || s.nvme { DISK_MIBS_INCLUDED } else { (cpu * 125 / 4).clamp(DISK_MIBS_INCLUDED, 1000) };
     let most_iops = (disk_gb.saturating_mul(500)).clamp(DISK_IOPS_INCLUDED, 80_000);
     let mibs = s.disk_mibs.unwrap_or(by_size).clamp(DISK_MIBS_INCLUDED, 2000).min(most_iops / 4);
     let iops = s.disk_iops.unwrap_or(DISK_IOPS_INCLUDED).clamp(DISK_IOPS_INCLUDED, 80_000).max(mibs * 4).min(most_iops);
@@ -315,6 +316,9 @@ mod tests {
         assert_eq!(disk_speed(4, 60, &Spec { disk_mibs: Some(2000), ..Default::default() }), (2000, 8000));
         assert_eq!(disk_speed(8, 60, &Spec { disk_iops: Some(80_000), ..Default::default() }), (250, 30_000), "500 IOPS for each GB at most");
         assert_eq!(disk_speed(32, 8, &d), (1000, 4000));
+        // With its files in memory or on a local disk, the disk is not what a job writes to: what AWS includes, unless said.
+        assert_eq!((disk_speed(32, 60, &Spec { ramdisk: true, ..Default::default() }), disk_speed(32, 60, &Spec { nvme: true, ..Default::default() })), ((125, 3000), (125, 3000)));
+        assert_eq!(disk_speed(32, 60, &Spec { ramdisk: true, disk_mibs: Some(500), ..Default::default() }), (500, 3000));
     }
 
     #[test]

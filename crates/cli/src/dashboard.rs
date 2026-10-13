@@ -403,7 +403,7 @@ pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
     let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { off_spot(j).map(|(why, _)| why).unwrap_or_default() };
     // (How the job itself ended, where a machine ran it to its end: `passed`, `failed`, …; apart from `state`.)
     let ended = Some(job_ended(j).1.to_lowercase()).filter(|_| state == "done" && j["conclusion"].is_string());
-    serde_json::json!({ "id": j["job_id"], "state": state, "ended": ended, "job": title, "in": sub, "runner": runner_text(j).1, "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
+    serde_json::json!({ "id": j["job_id"], "state": state, "ended": ended, "job": title, "in": sub, "runner": runner_text(j).1, "disk": job_disk(j), "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
 }
 
 /// A run as commands say it: how it stands, what it is, how many of its jobs ran here, how long it took (ms, from its
@@ -749,14 +749,14 @@ fn job_names(j: &serde_json::Value) -> (String, String) {
     (name.to_string(), if workflow.is_empty() { short } else { format!("{short} · {workflow}") })
 }
 
-/// A job's disk speed on AWS (MiB a second), when it is not what its machine's size gives by itself: a label or the
-/// default machine said it.
-fn disk_speed_said(j: &serde_json::Value) -> Option<u64> {
-    let (cpu, gb) = (j["cpu"].as_u64()? as u32, j["disk_gb"].as_u64()? as u32);
-    let has = j["disk_mibs"].as_u64().unwrap_or(superci_core::spec::DISK_MIBS_INCLUDED as u64);
-    // (Jobs from before the disk's speed was set have no speed kept and ran at what AWS includes: nothing to say.)
-    if j["disk_mibs"].is_null() && j["disk_iops"].is_null() { return None }
-    Some(has).filter(|h| *h != superci_core::spec::disk_speed(cpu, gb, &Spec::default()).0 as u64)
+/// A job's disk on AWS, for commands: its size, its speed (what AWS includes when none was kept: 125 MiB a second,
+/// 3,000 IOPS; the IOPS a speed needs when only the speed was), and whether its files were in memory or on a local
+/// disk. Nothing for a job with no disk kept (another cloud's, or one that never got a machine).
+fn job_disk(j: &serde_json::Value) -> serde_json::Value {
+    let Some(gb) = j["disk_gb"].as_u64().filter(|_| j["cloud"] == "aws") else { return serde_json::Value::Null };
+    let mibs = j["disk_mibs"].as_u64().unwrap_or(superci_core::spec::DISK_MIBS_INCLUDED as u64);
+    let iops = j["disk_iops"].as_u64().unwrap_or((mibs * 4).max(superci_core::spec::DISK_IOPS_INCLUDED as u64));
+    serde_json::json!({ "gb": gb, "mibs": mibs, "iops": iops, "ramdisk": j["ramdisk"] == true, "local_disk": j["local_disk"] == true })
 }
 
 /// The runner a job got, in words: its provider's logo and its size ("4 CPU · 12 GB"), or the AWS machine's type.
@@ -768,9 +768,12 @@ fn runner_text(j: &serde_json::Value) -> (String, String) {
         // From before computers were set aside (coming soon).
         "machine" => ("machine".into(), "Your computer".into()),
         // An on-demand machine says so (its label asked, or the order sent it there).
-        // (Its disk too, when it is not the standard 60 GB: what its label asked for.)
-        "aws" => ("aws".into(), format!("{}{}{}", match j["cpu"].as_u64() { Some(c) if !kind.is_empty() => format!("{c} CPU · {kind}"), _ => kind.to_string() },
-            match (j["disk_gb"].as_u64(), disk_speed_said(j)) { _ if kind.is_empty() => String::new(), (Some(d), Some(s)) => format!(" · {d} GB disk at {s} MiB/s"), (Some(d), None) if d != 60 => format!(" · {d} GB disk"), _ => String::new() }, if j["on_demand"] == true && !kind.is_empty() { " · on-demand" } else { "" })),
+        // (Its disk too: its size when it is not the standard 60 GB, its speed when above what AWS includes (it is in
+        // the job's price), and where the job's files went when its label asked for memory or a local disk.)
+        "aws" => ("aws".into(), format!("{}{}{}{}", match j["cpu"].as_u64() { Some(c) if !kind.is_empty() => format!("{c} CPU · {kind}"), _ => kind.to_string() },
+            match (j["disk_gb"].as_u64(), j["disk_mibs"].as_u64()) { _ if kind.is_empty() => String::new(), (Some(60) | None, Some(s)) => format!(" · {s} MiB/s disk"), (Some(d), Some(s)) => format!(" · {d} GB disk at {s} MiB/s"), (Some(d), None) if d != 60 => format!(" · {d} GB disk"), _ => String::new() },
+            if kind.is_empty() { "" } else if j["ramdisk"] == true { " · RAM disk" } else if j["local_disk"] == true { " · local disk" } else { "" },
+            if j["on_demand"] == true && !kind.is_empty() { " · on-demand" } else { "" })),
         _ => {
             // "4cpu-12gb" as "4 CPU · 12 GB".
             let size = kind.split_once("cpu-").and_then(|(c, r)| Some(format!("{c} CPU · {} GB", r.strip_suffix("gb")?)));
@@ -6294,11 +6297,13 @@ mod tests {
         assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge · 120 GB disk");
         again["disk_gb"] = 60.into();
         assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge");
-        // Its disk's speed too, when a label or the default machine set it (by the machine's size it is 1,000 here).
+        // Its disk's speed too, when above what AWS includes; and where its files went, when its label asked.
         again["disk_mibs"] = 1000.into();
-        assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge");
-        again["disk_mibs"] = 2000.into();
-        assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge · 60 GB disk at 2000 MiB/s");
+        assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge · 1000 MiB/s disk");
+        (again["disk_gb"], again["ramdisk"]) = (120.into(), true.into());
+        assert_eq!(job_words(&again)["runner"], "32 CPU · r8a.8xlarge · 120 GB disk at 1000 MiB/s · RAM disk");
+        let words = job_words(&again);
+        assert_eq!((words["disk"]["gb"].as_u64(), words["disk"]["mibs"].as_u64(), words["disk"]["iops"].as_u64(), words["disk"]["ramdisk"].as_bool()), (Some(120), Some(1000), Some(4000), Some(true)));
         assert_eq!(job_words(&ran(None))["why"], "", "a job whose label asked for on-demand");
         assert!(job_table(&[limited.clone()]).contains(r#"<small class="jt-why open">On-demand: your AWS spot limit in N. Virginia was reached</small>"#));
         let notice = spot_limit_notice(&[limited.clone(), limited, ran(None)]);

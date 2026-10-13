@@ -2394,8 +2394,12 @@ fn an_aws_machines_disk_is_as_fast_as_its_size_deserves_unless_said_and_a_label_
     // A job's files in memory, or on a machine's own NVMe disk (a machine type that has one), when its label asks.
     let ram = run(8, "superci-8cpu-ramdisk");
     assert!(user_data_of(&ram).contains("mount -t tmpfs -o size=75% tmpfs") && field(&ram, "InstanceType") == "m8a.2xlarge");
+    // (Its disk keeps what AWS includes: the job's writes go to memory. A speed said in the label is still given.)
+    assert_eq!((speed(&ram), job(&store, 8)["ramdisk"].as_bool(), job(&store, 8).get("disk_mibs"), job(&store, 3).get("ramdisk")), (s("125", "3000"), Some(true), None, None));
+    assert_eq!(speed(&run(13, "superci-8cpu-ramdisk-500mbs")), s("500", "3000"));
     let local = run(9, "superci-8cpu-localdisk");
     assert!(user_data_of(&local).contains("/Instance Storage/") && !user_data_of(&local).contains("tmpfs") && field(&local, "InstanceType") == "m8id.2xlarge", "{}", field(&local, "InstanceType"));
+    assert_eq!((speed(&local), job(&store, 9)["local_disk"].as_bool()), (s("125", "3000"), Some(true)));
     assert!(!user_data_of(&run(10, "superci-8cpu")).contains("/mnt/superci"));
     // The default machine can say the speed for every job: what AWS includes, at no extra price.
     config.machine = superci_core::spec::Spec { disk_mibs: Some(125), ..Default::default() };
