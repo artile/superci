@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.16.4 — unreleased
+## 0.16.4 — 2026-10-13
 - The dashboard's tab has an icon: your GitHub organization's picture when the workspace has one, SuperCI's mark otherwise.
 - The AWS account section reads as what it is. An account its organization keeps to some regions, with everything else allowed, says where SuperCI works ("SuperCI works there in N. Virginia") in place of "Restricted: some of what SuperCI does there is refused". The Runner image row says where the image is; a region the account may also use that lacks it is no warning, and has "Copy into Stockholm" beside it (before, the image could only be copied in from a terminal once a control plane was set up). A provider's region list says where to copy it in.
 
