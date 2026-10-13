@@ -468,7 +468,7 @@ fn region_unusable(look: Option<&aws::Look>, region: &str) -> Option<&'static st
     let look = look?;
     match look.regions.iter().find(|(r, _)| r == region) {
         Some((_, aws::Answer::Refused(r))) => Some(if matches!(r.by, superci_core::aws::By::Organization | superci_core::aws::By::OrganizationResources) { "not allowed by your AWS organization" } else { "not allowed for this sign-in" }),
-        _ if look.regions_without_image().contains(&region) => Some("no runner image there yet"),
+        _ if look.regions_without_image().contains(&region) => Some("copy the runner image in first"),
         _ => None,
     }
 }
@@ -514,7 +514,7 @@ fn quota_text(region: &str, cpus: u32) -> String {
 fn jobs_word(n: u32) -> String { if n == 1 { "1 job".into() } else { format!("{n} jobs") } }
 
 /// The mark: four broad petals, one solid shape (the same outline as on superci.dev).
-const MARK: &str = r#"<svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M4.31 12.77L4.58 12.25L4.56 11.66L4.40 11.34L3.58 10.29L3.10 9.39L2.72 8.33L2.51 7.12L2.51 5.99L2.69 4.85L3.16 3.56L3.52 3.18L4.53 2.79L5.54 2.56L6.65 2.48L7.69 2.58L8.65 2.81L9.52 3.15L10.48 3.71L11.42 4.45L11.97 4.61L12.56 4.46L13.62 3.64L14.61 3.10L15.56 2.75L16.65 2.53L17.89 2.50L19.04 2.67L20.42 3.15L20.82 3.52L21.21 4.53L21.44 5.54L21.52 6.65L21.42 7.69L21.19 8.65L20.85 9.52L20.29 10.48L19.55 11.42L19.39 11.97L19.54 12.56L20.36 13.62L20.90 14.61L21.28 15.65L21.47 16.65L21.51 17.81L21.33 19.04L20.85 20.42L20.48 20.82L19.47 21.21L18.46 21.44L17.35 21.52L16.31 21.42L15.35 21.19L14.50 20.86L13.60 20.34L12.58 19.55L11.99 19.39L11.42 19.55L10.40 20.34L9.50 20.86L8.57 21.21L7.69 21.42L6.65 21.52L5.54 21.44L4.53 21.21L3.56 20.84L3.16 20.44L2.69 19.15L2.51 18.01L2.52 16.79L2.72 15.67L3.10 14.61L3.64 13.62L4.31 12.77Z"/></svg>"#;
+const MARK: &str = concat!(r#"<svg class="mark" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d=""#, superci_core::mark_path!(), r#""/></svg>"#);
 
 fn row(dot: &str, name: &str, sub: &str, end: &str) -> String {
     format!(r#"<div class="row"><span class="dot {dot}"></span><span><span class="row-name">{name}</span>{}</span><span class="row-end">{end}</span></div>"#,
@@ -1214,7 +1214,16 @@ impl Dashboard {
             aws::Kind::Unanswered => ("Not known", "open", format!("AWS did not answer when asked what this account allows ({}). Refresh asks again.", look.unanswered().unwrap_or_default().chars().take(120).collect::<String>())),
             aws::Kind::Project { region, activated: false } => ("AWS project", "open", format!("A project of AWS's new sign-up: AWS keeps it to {} and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.", region_short(&region))),
             aws::Kind::Project { region, activated: true } => ("AWS project", "good", format!("A project of AWS's new sign-up: it works in {} only. Everything SuperCI does works there.", region_short(&region))),
-            aws::Kind::Restricted => ("Restricted", "open", "Some of what SuperCI does there is refused: see below.".to_string()),
+            // Kept to some regions by its organization, with everything else allowed: said as where it works, which
+            // is no trouble. Anything else refused (spot machines, on-demand ones, or by the sign-in's own
+            // permissions) is said as that.
+            aws::Kind::Restricted => {
+                let usable = look.usable_regions();
+                let only_regions = !matches!(look.spot, Some(aws::Answer::Refused(_))) && !matches!(look.on_demand, Some(aws::Answer::Refused(_)))
+                    && look.regions.iter().all(|(_, a)| match a { aws::Answer::Refused(_) => a.by_organization().is_some(), _ => true });
+                if only_regions && !usable.is_empty() { ("Some regions", "good", format!("SuperCI works there in {}. Its AWS organization keeps it out of the other regions.", names(&usable))) }
+                else { ("Restricted", "open", "Some of what SuperCI does there is refused: see below.".to_string()) }
+            }
         };
         let mut rows = vec![];
         // Regions: where it may work, and whose rule keeps it from the others.
@@ -1247,15 +1256,30 @@ impl Dashboard {
             let copying = self.aws_copying.get(&account).cloned().unwrap_or_default();
             // The account's own copy, of an older build than its maker's newest: said, with copying the new one in.
             let behind = self.aws_behind.get(&account).and_then(|b| b.first()).cloned();
-            let (more, end) = match (&behind, without.is_empty()) {
-                (_, false) if without.iter().any(|r| copying.iter().any(|c| c == r)) => ("It is being copied in: about ten minutes.".to_string(), String::new()),
-                (_, false) => (esc("No job can start there until it is copied in: about ten minutes, and about $1.50 a month for the copy's storage in your account."), String::new()),
+            let being_copied = |r: &&str| copying.iter().any(|c| c == *r);
+            // Copying it into a region that lacks it: a press here (as `superci images create REGION`).
+            let copy_into = |region: &str| format!(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="{}"><input type="hidden" name="region" value="{}"><input type="hidden" name="next"><button class="button secondary sm">Copy into {}</button></form>"#, esc(&account), esc(region), esc(&region_short(region)));
+            let (more, end) = match (&behind, usable.is_empty()) {
+                // In none of its regions: nothing can run until it is copied in (setting up offers that first).
+                (_, true) if without.iter().any(being_copied) => ("It is being copied in: about ten minutes.".to_string(), String::new()),
+                (_, true) => (esc("No job can start there until it is copied in: about ten minutes, and about $1.50 a month for the copy's storage in your account."), String::new()),
                 (Some((region, _, newest, true)), _) => (esc(&format!("The build of {} is being copied into {}: about ten minutes. Jobs start from your older copy until it is there.", aws::build_day(newest), region_short(region))), String::new()),
                 (Some((region, have, newest, false)), _) => (esc(&format!("Your copy in {} is the build of {}. Its maker has one of {} out.", region_short(region), aws::build_day(have), aws::build_day(newest))),
                     format!(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="{}"><input type="hidden" name="region" value="{}"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#, esc(&account), esc(region))),
-                (None, true) => (String::new(), String::new()),
+                // Where jobs run it is there. A region the account may also use lacks it: nothing is wrong, and it
+                // is copied in at a press by whoever wants jobs there too.
+                (None, false) if !without.is_empty() => {
+                    let (coming, missing): (Vec<&str>, Vec<&str>) = without.iter().copied().partition(|r| being_copied(&r));
+                    let mut said = vec![];
+                    if !coming.is_empty() { said.push(format!("It is being copied into {}: about ten minutes. Then {} can be added as a region on Runners.", names(&coming), if coming.len() == 1 { "it" } else { "they" })) }
+                    if !missing.is_empty() { said.push(format!("Not in {}, which this account may also use. To run jobs there too, copy it in: about ten minutes, and about $1.50 a month for the copy's storage.", names(&missing))) }
+                    (esc(&said.join(" ")), missing.iter().map(|r| copy_into(r)).collect::<String>())
+                }
+                (None, false) => (String::new(), String::new()),
             };
-            rows.push(row("Runner image", if without.is_empty() { if usable.len() == allowed.len() && usable.len() > 1 { "In every region it may use".to_string() } else { format!("In {}", esc(&names(&usable))) } } else { format!("Not in {}", esc(&names(&without))) }, more, end));
+            let value = if usable.is_empty() { format!("Not in {}", esc(&names(&without))) } else if without.is_empty() && usable.len() > 1 { "In every region it may use".to_string() }
+                else if usable.len() > 3 { format!("In {} of the {} regions it may use", usable.len(), allowed.len()) } else { format!("In {}", esc(&names(&usable))) };
+            rows.push(row("Runner image", value, more, if end.is_empty() { String::new() } else { format!(r#"<span class="acct-do">{end}</span>"#) }));
         }
         if let (Some(org), Some(managed)) = (&look.organization_id, look.management_account.as_deref().filter(|m| *m != account)) {
             rows.push(row("Organization", esc(org), esc(&format!("Managed from account {managed}: its policies are not this account's to read or change.")), String::new()));
@@ -2039,7 +2063,8 @@ impl Dashboard {
                 if !copying.contains(&region) { copying.push(region) }
                 // (Looked at again at the next page: when the copy is there, the region can be set up in.)
                 if let Some((at, _)) = self.aws_looks.get_mut(&account) { *at = 0 }
-                Ok(Response::redirect("/?p=plane"))
+                // (Back to the page it was asked from: the set-up page, or the account's section.)
+                Ok(Response::redirect(&if field("next").is_empty() { "/?p=plane".to_string() } else { format!("/{}#aws-account", safe_return(&field("next"))) }))
             }
             // Refresh, in an AWS account's section: it is looked at again now (beside the page it is on).
             ("POST", "/aws/look") => {
@@ -2687,7 +2712,7 @@ function qp(n){return new URLSearchParams(location.search).get(n)||''}
 function cc(){return qp('c')}
 function keep(u){['w','c'].forEach(function(n){if(!u.searchParams.has(n)){if(qp(n))u.searchParams.set(n,qp(n))}else if(!u.searchParams.get(n))u.searchParams.delete(n)});return u}
 (function(){var u=new URL(location.href);if(u.searchParams.has('c')&&!u.searchParams.get('c')){u.searchParams.delete('c');history.replaceState(null,'',u.pathname+u.search+u.hash)}})();
-function mark(){var sw=main.querySelector('[data-switch]'),ss=document.getElementById('side-switch');if(sw&&ss){if(ss.innerHTML!==sw.innerHTML)ss.innerHTML=sw.innerHTML;sw.remove()}if(ss){ss.parentNode.classList.toggle('has',!!ss.innerHTML);var bs=ss.parentNode.querySelector('summary'),pic=ss.querySelector('a[aria-current=true]>img.logo'),bi=bs.querySelector('img.mark'),bv=bs.querySelector('svg.mark');if(pic){if(!bi){bi=document.createElement('img');bi.className='mark';bi.alt='';bs.insertBefore(bi,bv)}if(bi.getAttribute('src')!==pic.getAttribute('src'))bi.setAttribute('src',pic.getAttribute('src'));bv.setAttribute('hidden','')}else if(sw||ss.innerHTML){if(bi)bi.remove();bv.removeAttribute('hidden')}}document.querySelectorAll('a[href^="/"]').forEach(function(a){if(a.target)return;if(!a.dataset.to)a.dataset.to=a.getAttribute('href');var u=new URL(a.dataset.to,location.href);if(u.pathname==='/workspaces')return;if(!u.searchParams.has('w')&&qp('w'))u.searchParams.set('w',qp('w'));if(!u.searchParams.has('c')&&cc())u.searchParams.set('c',cc());a.setAttribute('href',u.pathname+u.search+u.hash)});document.body.classList.toggle('listing',!!main.querySelector('[data-list]'))}
+function mark(){var sw=main.querySelector('[data-switch]'),ss=document.getElementById('side-switch');if(sw&&ss){if(ss.innerHTML!==sw.innerHTML)ss.innerHTML=sw.innerHTML;sw.remove()}if(ss){ss.parentNode.classList.toggle('has',!!ss.innerHTML);var bs=ss.parentNode.querySelector('summary'),pic=ss.querySelector('a[aria-current=true]>img.logo'),bi=bs.querySelector('img.mark'),bv=bs.querySelector('svg.mark');if(pic){if(!bi){bi=document.createElement('img');bi.className='mark';bi.alt='';bs.insertBefore(bi,bv)}if(bi.getAttribute('src')!==pic.getAttribute('src'))bi.setAttribute('src',pic.getAttribute('src'));bv.setAttribute('hidden','')}else if(sw||ss.innerHTML){if(bi)bi.remove();bv.removeAttribute('hidden')}}document.querySelectorAll('a[href^="/"]').forEach(function(a){if(a.target)return;if(!a.dataset.to)a.dataset.to=a.getAttribute('href');var u=new URL(a.dataset.to,location.href);if(u.pathname==='/workspaces')return;if(!u.searchParams.has('w')&&qp('w'))u.searchParams.set('w',qp('w'));if(!u.searchParams.has('c')&&cc())u.searchParams.set('c',cc());a.setAttribute('href',u.pathname+u.search+u.hash)});document.body.classList.toggle('listing',!!main.querySelector('[data-list]'));var ic=document.getElementById('icon'),bm=document.querySelector('.brand img.mark');if(ic){if(!ic.dataset.own)ic.dataset.own=ic.getAttribute('href');var want=bm?bm.getAttribute('src'):ic.dataset.own;if(ic.getAttribute('href')!==want){var ni=ic.cloneNode();ni.setAttribute('href',want);if(bm)ni.removeAttribute('type');else ni.setAttribute('type','image/svg+xml');ic.parentNode.replaceChild(ni,ic)}}}
 function frag(){var q=location.search;return '/'+(q?q+'&fragment=1':'?fragment=1')+(nav?'&went=1':'')}
 function current(){var p=new URLSearchParams(location.search).get('p')||'overview';p=sections[p]||p;document.querySelectorAll('.side .nav a').forEach(function(a){a.setAttribute('aria-current',String(new URL(a.href).searchParams.get('p')===p))})}
 var shown='',nav=false;
@@ -4510,6 +4535,11 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
                 Some(why) => format!(r#"<option value="{r}" disabled>{} · {r} · {why}</option>"#, region_name(r)),
                 None => format!(r#"<option value="{r}">{} · {r}{}</option>"#, region_name(r), if *r == "us-east-1" { format!(" · {best}") } else { String::new() }),
             }).collect::<String>();
+            // A region the account may use and the runner image is not in: where it is copied in.
+            let image_first = match look.map(|l| l.regions_without_image()).filter(|w| !w.is_empty()) {
+                Some(without) => format!(r#" The runner image is not in {} yet: <a href="/?p=planes#aws-account">copy it in</a> under Control plane, then add the region here."#, esc(&without.iter().map(|r| region_short(r)).collect::<Vec<_>>().join(", "))),
+                None => String::new(),
+            };
             let total: u32 = list.iter().filter_map(|r| quotas.get(r).and_then(|q| q.as_ref().ok())).sum();
             let low = list.iter().find(|r| matches!(quotas.get(*r), Some(Ok(n)) if *n < 16));
             let quota = match (total, low) {
@@ -4522,7 +4552,7 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
                 Some(st) => { let text = given_networks_text(st); format!(r#"<details class="field-more"{}><summary>Your own network</summary><label class="field"><textarea name="networks" rows="3" spellcheck="false" placeholder="us-east-1 subnet-0abc… subnet-0def… sg-0123… private">{}</textarea><small>One line a region: its subnets and security groups. Machines there start in your network, so jobs reach what it reaches. Add <code>private</code> for subnets with no public addresses (they need a NAT to reach GitHub). Regions not listed use the network SuperCI made.</small></label></details>"#, if text.is_empty() { "" } else { " open" }, esc(&text)) }
                 None => String::new(),
             };
-            format!(r#"<div class="field"><span>Regions</span><ol class="rg-list" data-regions>{rows}</ol><select class="rg-add" aria-label="Add a region" onchange="superciRegionAdd(this)"><option value="">+ Add a region…</option>{more}</select><small>Machines start in the first; when it has no spot capacity left, in the next. Drag to reorder.{quota}</small></div>{networks}"#)
+            format!(r#"<div class="field"><span>Regions</span><ol class="rg-list" data-regions>{rows}</ol><select class="rg-add" aria-label="Add a region" onchange="superciRegionAdd(this)"><option value="">+ Add a region…</option>{more}</select><small>Machines start in the first; when it has no spot capacity left, in the next. Drag to reorder.{quota}{image_first}</small></div>{networks}"#)
         } else if p.cloud == "cloudflare" && v.status.as_ref().is_some_and(|s| s.get("cloudflare_location").is_some()) {
             // Cloudflare: where its containers start.
             let current = v.status.as_ref().and_then(|s| s["cloudflare_location"].as_str().map(str::to_string)).unwrap_or_else(|| "enam".into());
@@ -5787,7 +5817,7 @@ mod tests {
         // and while that one is on its way.
         d.aws_behind.insert("111111111111".into(), vec![("eu-north-1".into(), "20261006080949".into(), "20261020070000".into(), false)]);
         let behind = d.plane_page();
-        assert!(behind.contains(r#"<dt>Runner image</dt><dd>In Stockholm<small>Your copy in Stockholm is the build of 6 October 2026. Its maker has one of 20 October 2026 out.</small></dd><form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#), "{behind}");
+        assert!(behind.contains(r#"<dt>Runner image</dt><dd>In Stockholm<small>Your copy in Stockholm is the build of 6 October 2026. Its maker has one of 20 October 2026 out.</small></dd><span class="acct-do"><form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><input type="hidden" name="newer" value="1"><button class="button secondary sm">Copy the new one in</button></form>"#), "{behind}");
         d.aws_behind.get_mut("111111111111").unwrap()[0].3 = true;
         let coming = d.plane_page();
         assert!(coming.contains("The build of 20 October 2026 is being copied into Stockholm: about ten minutes. Jobs start from your older copy until it is there.") && !coming.contains("Copy the new one in"), "{coming}");
@@ -5803,6 +5833,26 @@ mod tests {
         let unknown = d.aws_account_section();
         assert!(unknown.contains(r#"<small>AWS did not answer when asked what this account allows (AWS did not answer in time). Refresh asks again.</small></span><span class="acct-do"><span class="pill open"><i></i>Not known</span>"#) && !unknown.contains("Nothing refused"), "{unknown}");
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-activated/look.jsonl"))));
+        // Kept to two regions by its organization, set up in the one that has the runner image (as that project was
+        // once its owner let N. Virginia in): said as where SuperCI works, with nothing wrong. The image row says
+        // where it is; the region that lacks it is no trouble, and has its copy a press away.
+        let mut two = looked(include_str!("../fixtures/aws/project-activated/look.jsonl"));
+        for (region, answer) in two.regions.iter_mut() { if region == "us-east-1" { *answer = aws::Answer::Allowed } }
+        two.images = vec![("us-east-1".into(), Some(true)), ("eu-north-1".into(), Some(false))];
+        d.aws_looks.insert("111111111111".into(), (now_ms(), two));
+        let section = d.aws_account_section();
+        for said in [r#"<small>SuperCI works there in N. Virginia. Its AWS organization keeps it out of the other regions.</small></span><span class="acct-do"><span class="pill good"><i></i>Some regions</span>"#,
+            "<dt>Regions</dt><dd>N. Virginia, Stockholm<small>The other 10 are refused.",
+            r#"<dt>Runner image</dt><dd>In N. Virginia<small>Not in Stockholm, which this account may also use. To run jobs there too, copy it in: about ten minutes, and about $1.50 a month for the copy&#39;s storage.</small></dd><span class="acct-do"><form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><input type="hidden" name="next"><button class="button secondary sm">Copy into Stockholm</button></form></span>"#] {
+            assert!(section.contains(said), "{said}\n\n{section}");
+        }
+        assert!(!section.contains("No job can start") && !section.contains("Restricted"), "{section}");
+        // Asked for there, it is on its way: said, with what comes after.
+        d.aws_copying.insert("111111111111".into(), vec!["eu-north-1".into()]);
+        let coming_in = d.aws_account_section();
+        assert!(coming_in.contains("<dt>Runner image</dt><dd>In N. Virginia<small>It is being copied into Stockholm: about ten minutes. Then it can be added as a region on Runners.</small></dd></div>") && !coming_in.contains("Copy into"), "{coming_in}");
+        d.aws_copying.clear();
+        d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-activated/look.jsonl"))));
         // Refresh asks AWS again (the look is marked old; the next page starts one beside it). While it is on its
         // way the section says so in the button's place, and the page looks again by itself until it is in.
         assert!(coming.contains(r#"<button class="button secondary sm" title="Asks AWS again what this account allows">Refresh</button>"#) && !coming.contains("Asking AWS…"), "{coming}");
@@ -5817,14 +5867,14 @@ mod tests {
         d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/classic/look.jsonl"))));
         let page = d.plane_page();
         assert!(page.contains(r#"<span class="pill good"><i></i>Nothing refused</span>"#) && page.contains("<dt>Regions</dt><dd>All 12 SuperCI works in</dd>") && page.contains("<dt>Spot machines</dt><dd>Allowed</dd>")
-            && page.contains("<dt>CPUs at once</dt><dd>64 on-demand · 96 spot<small>24 jobs of the default size at a time, in N. Virginia.</small></dd>") && page.contains("<dt>Runner image</dt><dd>Not in Canada, Stockholm<small>"), "{page}");
+            && page.contains("<dt>CPUs at once</dt><dd>64 on-demand · 96 spot<small>24 jobs of the default size at a time, in N. Virginia.</small></dd>") && page.contains("<dt>Runner image</dt><dd>In 10 of the 12 regions it may use<small>Not in Canada, Stockholm, which this account may also use. To run jobs there too, copy it in:") && page.contains(r#"<button class="button secondary sm">Copy into Canada</button>"#) && page.contains(r#"<button class="button secondary sm">Copy into Stockholm</button>"#), "{page}");
         assert!(page.contains(r#"<option value="us-east-1" selected>"#) && page.contains(r#"<option value="eu-west-1">"#) && !page.contains(r#"<option value="eu-north-1">"#) && !page.contains(r#"<option value="ca-central-1">"#), "{page}");
         // Where regions are chosen (a provider's regions on Runners), one the account cannot use is shown and cannot
         // be chosen, with why; the one chosen to begin with is one it can use.
         let (project, classic) = (looked(include_str!("../fixtures/aws/project-paid/look.jsonl")), looked(include_str!("../fixtures/aws/classic/look.jsonl")));
-        assert_eq!((region_unusable(Some(&project), "us-east-1"), region_unusable(Some(&project), "eu-north-1"), region_unusable(None, "us-east-1")), (Some("not allowed by your AWS organization"), Some("no runner image there yet"), None));
+        assert_eq!((region_unusable(Some(&project), "us-east-1"), region_unusable(Some(&project), "eu-north-1"), region_unusable(None, "us-east-1")), (Some("not allowed by your AWS organization"), Some("copy the runner image in first"), None));
         let options = region_select_options("us-east-1", &HashMap::new(), "closest to GitHub", Some(&classic));
-        assert!(options.contains(r#"<option value="us-east-1" selected>US East (N. Virginia) · us-east-1 · closest to GitHub</option>"#) && options.contains(r#"<option value="eu-north-1" disabled>Europe (Stockholm) · eu-north-1 · no runner image there yet</option>"#) && options.contains(r#"<option value="eu-west-1">"#), "{options}");
+        assert!(options.contains(r#"<option value="us-east-1" selected>US East (N. Virginia) · us-east-1 · closest to GitHub</option>"#) && options.contains(r#"<option value="eu-north-1" disabled>Europe (Stockholm) · eu-north-1 · copy the runner image in first</option>"#) && options.contains(r#"<option value="eu-west-1">"#), "{options}");
         let options = region_select_options("us-east-1", &HashMap::new(), "closest to GitHub", Some(&project));
         assert!(options.contains(r#"<option value="us-east-1" disabled>US East (N. Virginia) · us-east-1 · not allowed by your AWS organization</option>"#) && !options.contains("selected"), "{options}");
         // A refusal in plain words, by whose rule it is (the first as the project answered a deploy to N. Virginia).

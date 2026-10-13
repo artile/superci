@@ -403,9 +403,17 @@ max-height:calc(100dvh - 36px);overflow-y:auto;overscroll-behavior:contain;borde
 const THEME: &str = r#"<script>(function(){var m=matchMedia('(prefers-color-scheme: dark)');function f(){document.documentElement.dataset.theme=m.matches?'dark':'light'}f();if(m.addEventListener)m.addEventListener('change',f)})();</script>"#;
 
 /// A full page with the shared look; `body` is placed as is.
+/// SuperCI's mark, as a path in a box of 24 by 24.
+#[macro_export]
+macro_rules! mark_path { () => { "M4.31 12.77L4.58 12.25L4.56 11.66L4.40 11.34L3.58 10.29L3.10 9.39L2.72 8.33L2.51 7.12L2.51 5.99L2.69 4.85L3.16 3.56L3.52 3.18L4.53 2.79L5.54 2.56L6.65 2.48L7.69 2.58L8.65 2.81L9.52 3.15L10.48 3.71L11.42 4.45L11.97 4.61L12.56 4.46L13.62 3.64L14.61 3.10L15.56 2.75L16.65 2.53L17.89 2.50L19.04 2.67L20.42 3.15L20.82 3.52L21.21 4.53L21.44 5.54L21.52 6.65L21.42 7.69L21.19 8.65L20.85 9.52L20.29 10.48L19.55 11.42L19.39 11.97L19.54 12.56L20.36 13.62L20.90 14.61L21.28 15.65L21.47 16.65L21.51 17.81L21.33 19.04L20.85 20.42L20.48 20.82L19.47 21.21L18.46 21.44L17.35 21.52L16.31 21.42L15.35 21.19L14.50 20.86L13.60 20.34L12.58 19.55L11.99 19.39L11.42 19.55L10.40 20.34L9.50 20.86L8.57 21.21L7.69 21.42L6.65 21.52L5.54 21.44L4.53 21.21L3.56 20.84L3.16 20.44L2.69 19.15L2.51 18.01L2.52 16.79L2.72 15.67L3.10 14.61L3.64 13.62L4.31 12.77Z" } }
+
+/// The icon a browser shows on a page's tab: SuperCI's mark, white on a dark tile (as superci.dev has it). The
+/// dashboard puts the picture of the workspace's organization in its place when it has one.
+const ICON: &str = concat!(r#"<link rel="icon" id="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2310141c'/%3E%3Cpath fill='%23fff' transform='translate(4 4)' d='"#, mark_path!(), r#"'/%3E%3C/svg%3E">"#);
+
 pub fn document(status: u16, title: &str, body: &str, refresh_secs: Option<u32>) -> Response {
     let refresh = refresh_secs.map(|s| format!(r#"<meta http-equiv="refresh" content="{s}">"#)).unwrap_or_default();
-    let page = format!(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{refresh}<title>{}</title>{THEME}<style>{STYLE}</style></head><body>{body}</body></html>"#, esc(title));
+    let page = format!(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">{refresh}<title>{}</title>{ICON}{THEME}<style>{STYLE}</style></head><body>{body}</body></html>"#, esc(title));
     Response::new(status, "text/html; charset=utf-8", page).with_header("x-frame-options", "DENY").with_header("referrer-policy", "no-referrer")
 }
 
