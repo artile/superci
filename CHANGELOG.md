@@ -22,13 +22,13 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 
 ## 0.16.8 — 2026-10-13
 - A machine's disk on AWS is as fast as its size deserves. Every disk had the speed AWS includes, 125 MiB a second, whatever the machine: a 32-CPU machine wrote no faster than a 2-CPU one, and a job that pulls Docker images or runs a database waited for its disk. The speed now follows the machine: 31.25 MiB a second for each CPU, up to 1,000. That is 250 on 8 CPUs, 500 on 16 and 1,000 from 32; the standard 4-CPU machine keeps what AWS includes, and costs what it did. Measured on real machines: sixteen copies of a 300 MB database made in 14 seconds on a 1,000 MiB disk where it took 110, a database's first start in 3 seconds where it took 26, and 6 GB of Docker images pulled in half the time at twice the speed. Update your control plane for it.
-- What it costs is in each job's price: $0.007 an hour on 8 CPUs, $0.021 on 16, $0.055 from 32, a twentieth to a tenth of a spot machine's price. The default machine's Disk speed sets it for every job: Standard keeps what AWS includes at no extra price, a number gives every machine that speed (250 MiB a second on the standard machine is $0.007 an hour). In commands: `superci machine update --disk-speed=standard`, `=250`, or `=auto` to put it back.
-- A label can say the disk's speed for one job: `superci-8cpu-1000mbs`, and `superci-6000iops` for IOPS (125 to 2000 MiB a second, 3000 to 80000 IOPS; SuperCI keeps them within what a disk of that size takes).
-- `superci-ramdisk`: Docker's files, the job's work folder and /tmp in memory, for a job whose many small synced writes (databases, test set-up) no disk speed helps. They count as memory, up to three quarters of the machine's: ask for it on a machine with memory to spare. AWS, Linux.
-- `superci-localdisk`: a machine with an NVMe disk of its own (AWS's `d` families: m8id, c8id, r8id, and m8gd on arm64), with the same folders on it. Ten times the small synced writes of a disk AWS attaches; for writing a lot at once a small machine's is no faster. Nothing on it outlives the machine. AWS, Linux.
+- What it costs is in each job's price: $0.007 an hour on 8 CPUs, $0.021 on 16, $0.055 from 32, a twentieth to a tenth of a spot machine's price. The default machine's Disk speed sets it for every job: Standard keeps what AWS includes at no extra price, a number gives every machine that speed (250 MiB a second on the standard machine is $0.007 an hour). In commands: `superci machine update --disk-speed=125`, `=250`, or `=default` to put it back.
+- A label can say the disk's speed for one job: `superci/cpu=8/disk-speed=1000`, and `superci/disk-iops=6000` for IOPS (125 to 2000 MiB a second, 3000 to 80000 IOPS; SuperCI keeps them within what a disk of that size takes).
+- `superci/scratch=ramdisk`: Docker's files, the job's work folder and /tmp in memory, for a job whose many small synced writes (databases, test set-up) no disk speed helps. They count as memory, up to three quarters of the machine's: ask for it on a machine with memory to spare. AWS, Linux.
+- `superci/scratch=localdisk`: a machine with an NVMe disk of its own (AWS's `d` families: m8id, c8id, r8id, and m8gd on arm64), with the same folders on it. Ten times the small synced writes of a disk AWS attaches; for writing a lot at once a small machine's is no faster. Nothing on it outlives the machine. AWS, Linux.
 
 ## 0.16.7 — 2026-10-13
-- A job on AWS has the disk it was given. The volume had the size asked for (60 GB, or what a label like `superci-8cpu-120disk` says), but the root filesystem stayed at the image's 29 GB, 18 of them used: a job had 11 GB free whatever it asked for, and a large one ran out of space. The machine now grows its root filesystem to the whole disk before the runner starts (under a second), on GitHub's and GitLab's jobs alike, and the C: drive on Windows. Update your control plane for it; a step that grows the disk by hand is no longer needed.
+- A job on AWS has the disk it was given. The volume had the size asked for (60 GB, or what a label like `superci/cpu=8/disk=120` says), but the root filesystem stayed at the image's 29 GB, 18 of them used: a job had 11 GB free whatever it asked for, and a large one ran out of space. The machine now grows its root filesystem to the whole disk before the runner starts (under a second), on GitHub's and GitLab's jobs alike, and the C: drive on Windows. Update your control plane for it; a step that grows the disk by hand is no longer needed.
 - A job run again after AWS took back its spot machine, in an account whose on-demand limit is too small for it, goes back on a spot machine. Before, it was kept on on-demand, where a machine larger than that limit can never start: it waited and then failed, while the spot limit it had just run under was free. The job says so: "On a spot machine again: an on-demand one does not fit your AWS account's on-demand limit".
 - A job with no spot machine to be had now, whose on-demand machine the account's limit refuses, waits for a spot machine. Before, it was tried twice more and failed.
 - A job waiting at the account's limit said "in use by 1 of your job there; it starts when one ends" when nothing of yours was running: the one counted was a machine that had ended a moment ago, which AWS counts a little longer. It now says that, and is tried again.
@@ -122,7 +122,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - `superci login aws` opens on a page of SuperCI's with one button to AWS. When AWS answers “400 Bad Request” (an old AWS sign-in in the browser is in the way), Back comes to that page again, which then offers to sign out of AWS and try again.
 
 ## 0.12.0 — 2026-10-09
-- Labels of your own. Your control plane answers to a list of labels, `superci` alone to begin with: add one on Workflows → Labels, or with `superci labels create acmeci`, and workflows can name it in `runs-on` (`runs-on: acmeci`, `acmeci-8cpu-arm64`). Every label in the list works at once, so workflows change one at a time and nothing waits the day you add one; remove a label when nothing names it any more. The one added last is the one shown in examples. Two to twenty-four lowercase letters and digits.
+- Labels of your own. Your control plane answers to a list of labels, `superci` alone to begin with: add one on Workflows → Labels, or with `superci labels create acmeci`, and workflows can name it in `runs-on` (`runs-on: acmeci`, `acmeci/cpu=8/arch=arm64`). Every label in the list works at once, so workflows change one at a time and nothing waits the day you add one; remove a label when nothing names it any more. The one added last is the one shown in examples. Two to twenty-four lowercase letters and digits.
 - A name of your own. Workflows → Name, or `superci name update AcmeCI`: the dashboard's header and tab say it, a GitHub App made for a further organization starts with it (AcmeCI acme …), GitLab's runners are described with it, and a job that could not be run says "AcmeCI could not run this job". `SuperCI` puts it back. The command stays `superci`.
 - A move to another control plane takes the labels and the name along.
 - Installs without Node too, as the same program: `brew install supercorp-ai/tap/superci`, `curl -fsSL https://superci.dev/install.sh | sh` (macOS and Linux; checked against npm's checksum, put in `~/.local/bin`), or `cargo install superci`. Then `superci dashboard`.
@@ -189,7 +189,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A job run again after AWS took its spot machine back, and jobs started while spot is paused after several were taken, also go to the next provider below AWS's spot machines (before: always on-demand).
 
 ## 0.10.0 — 2026-10-04
-- The name is SuperCI. The program is `superci`, the label is `runs-on: superci` (with sizes: `superci-8cpu`, `superci-gpu`, …), and what it makes in your clouds is named after it: control planes `superci-plane-<id>`, runner agents `superci-runners-<id>`, the GitHub App `SuperCI <owner>`, the tag `superci-plane`.
+- The name is SuperCI. The program is `superci`, the label is `runs-on: superci` (with sizes: `superci/cpu=8`, `superci/gpu=any`, …), and what it makes in your clouds is named after it: control planes `superci-plane-<id>`, runner agents `superci-runners-<id>`, the GitHub App `SuperCI <owner>`, the tag `superci-plane`.
 
 ## 0.9.37 — 2026-10-04
 - Several GitLabs on one control plane: Repositories → Another GitLab adds another server, or another account's token on the same one, beside the first. Each is a row with its own settings (its projects, a new token, Disconnect) and its own line under Permissions; their jobs run on the same runners. Jobs and runners of different GitLabs are kept apart even when their numbers are the same.
@@ -239,7 +239,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
   - A network that cannot be read is an error (the job is tried again), never a reason to use AWS's default network.
   - Removing AWS deletes what lets the control plane start machines first, then its machines and network; a sign-in that ended is said before anything changes.
   - Adding an organization never replaces the first one's App on a guess; removing one forgets it even if GitHub will not uninstall its App; a move takes every App and waits for each.
-  - `-windows` and GPU labels no longer take a default machine's arm64 with them.
+  - `os=windows` and GPU labels no longer take a default machine's arm64 with them.
 
 ## 0.9.31 — 2026-10-04
 - Several GitHub organizations on one control plane: Repositories → Another organization makes a private App in that organization too (a private App belongs to one account), kept beside the first; its jobs run on the same runners, with the same limits. Each organization is a row (Install, Manage, Remove), and Control plane → Permissions says for each what its App asks for and what was accepted. Removing one uninstalls its App there; the App itself is deleted on GitHub.
@@ -278,8 +278,8 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - AWS GPU jobs say which quota to raise even when a later region has no GPU image.
 
 ## 0.9.22 — 2026-10-03
-- GPUs: `runs-on: superci-gpu` gets one NVIDIA GPU (the least costly: T4), or name one: `superci-l4`, `-a10g`, `-l40s` on AWS or Modal, `-a100`, `-h100`, `-h200`, `-b200` on Modal. AWS uses RunsOn's image with NVIDIA's drivers; Modal's sandboxes get the GPU, priced per second.
-- Windows: `runs-on: superci-windows` runs on AWS (Windows Server 2025, x64), spot by default, priced at Windows' rates.
+- GPUs: `runs-on: superci/gpu=any` gets one NVIDIA GPU (the least costly: T4), or name one: `superci/gpu=l4`, `gpu=a10g`, `gpu=l40s` on AWS or Modal, `gpu=a100`, `gpu=h100`, `gpu=h200`, `gpu=b200` on Modal. AWS uses RunsOn's image with NVIDIA's drivers; Modal's sandboxes get the GPU, priced per second.
+- Windows: `runs-on: superci/os=windows` runs on AWS (Windows Server 2025, x64), spot by default, priced at Windows' rates.
 - An AWS account that allows no GPU machines (AWS's quota for them starts at 0) fails GPU jobs at once, saying which quota to raise, instead of trying for a day.
 - The machine picker (Workflows) offers Windows and GPUs.
 
@@ -300,7 +300,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A computer's jobs run in a folder without spaces in its path (GitHub's runner does not quote a step's script).
 
 ## 0.9.17 — 2026-10-02
-- `superci-macos` means Apple silicon (arm64), as GitHub's macos-latest does; `superci-macos-x64` asks for an Intel Mac.
+- `superci/os=macos` means Apple silicon (arm64), as GitHub's macos-latest does; `superci/arch=x64/os=macos` asks for an Intel Mac.
 - A macOS job with no Mac added fails saying so, and how to add one (or to use GitHub's macos-latest).
 
 ## 0.9.16 — 2026-10-02
@@ -401,7 +401,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - Runner pools are called runner providers (Add a provider).
 
 ## 0.7.0 — 2026-10-01
-- GitLab CI, next to GitHub: connect GitLab with a token (made on GitLab in one click, with the scopes ticked), then turn projects on. Jobs whose `tags:` name your label (`tags: [superci-8cpu]`) run on your runners; GitLab's own runners keep the rest.
+- GitLab CI, next to GitHub: connect GitLab with a token (made on GitLab in one click, with the scopes ticked), then turn projects on. Jobs whose `tags:` name your label (`tags: [superci/cpu=8]`) run on your runners; GitLab's own runners keep the rest.
 - GitLab jobs run in Docker, as on GitLab's own runners: on AWS spot machines, Cloudflare containers (services on `localhost`) and your computers (macOS jobs on the Mac itself). Modal's sandboxes have no Docker, so they skip GitLab jobs and say why.
 - One project runner per set of tags is made once and reused (GitLab has no runner for one job); each machine takes one job and ends.
 - Repositories, in the sidebar: where jobs come from, GitHub and GitLab in one list (GitLab's connect form opens in its row, its projects below), and how a workflow asks for your runners on both. Overview's second step offers either.
@@ -428,16 +428,16 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 
 ## 0.4.0 — 2026-10-01
 - The default machine has its own line and dialog: what plain `runs-on: superci` gets, and any part a label leaves out.
-- The machine picker starts at Default for everything and names only what you pick, so `superci-4cpu` always means 4 CPU, whatever the default.
+- The machine picker starts at Default for everything and names only what you pick, so `superci/cpu=4` always means 4 CPU, whatever the default.
 - A label that asks for CPU but not memory gets 4 GB per CPU, not the default machine's memory.
 
 ## 0.3.0 — 2026-10-01
 - Runner pools: each cloud, and each of your computers, is a pool of its own. Drag pools to reorder them; each has its settings (jobs at once, a monthly budget; a computer is removed there).
 - Machines: pick CPU, memory, disk, architecture and system to get the `runs-on` label, and see which pools can run it. Use as default sets what plain `runs-on: superci` gets.
-- Rules by repository are gone from the page: a workflow picks a pool in its label instead (`runs-on: superci-aws`).
+- Rules by repository are gone from the page: a workflow picks a pool in its label instead (`runs-on: superci/provider=aws`).
 
 ## 0.2.0 — 2026-10-01
-- Machine sizes in the label, in any order: `runs-on: superci-8cpu`, `-32gb`, `-100disk`, `-arm64`, `-macos`, `-ondemand`, or a place (`aws`, `cloudflare`, `modal`, `machine`).
+- Machine sizes in the label, in any order: `runs-on: superci/cpu=8`, `ram=32`, `disk=100`, `arch=arm64`, `os=macos`, `spot=false`, or a provider (`provider=aws`, `cloudflare`, `modal`).
 - A default machine for `runs-on: superci`, set on the Runners page.
 - Places in order, each with jobs at once and dollars a month. When every place is full, jobs wait for one.
 - Your own computers: run `superci join` with a link from the dashboard. Linux jobs run in Docker, macOS jobs on the Mac.
