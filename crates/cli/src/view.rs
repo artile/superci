@@ -61,7 +61,7 @@ impl PlaneView {
         for j in jobs.iter_mut() {
             let Some(ran) = j["ran"].as_u64().and_then(|id| own.get(&id)) else { continue };
             j["started_for"] = j["job_id"].clone();
-            for field in ["job_id", "name", "workflow", "run_id", "repo", "conclusion"] { j[field] = ran[field].clone() }
+            for field in ["job_id", "name", "workflow", "run_id", "attempt", "repo", "conclusion"] { j[field] = ran[field].clone() }
         }
         jobs
     }

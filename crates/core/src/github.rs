@@ -320,6 +320,8 @@ pub struct JobEvent {
     pub action: String,
     pub job_id: u64,
     pub run_id: u64,
+    /// Which attempt of its run it is in (1, then 2 when the run or a job of it is run again).
+    pub attempt: u32,
     pub repo: String,
     pub installation_id: u64,
     pub runner_name: Option<String>,
@@ -357,6 +359,7 @@ pub fn our_job_among(payload: &serde_json::Value, bases: &[String], owner_login:
         action: payload["action"].as_str()?.to_string(),
         job_id: job["id"].as_u64()?,
         run_id: job["run_id"].as_u64().unwrap_or_default(),
+        attempt: job["run_attempt"].as_u64().unwrap_or_default() as u32,
         repo: repo.to_string(),
         installation_id,
         runner_name: job["runner_name"].as_str().map(str::to_string),

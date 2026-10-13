@@ -2,6 +2,12 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.16.6 — unreleased
+- Runs. The Jobs page has a Runs tab: a workflow's jobs together (on GitLab, a pipeline's), with how the run stands, how long it took from its first job queued to its last one over, what its machines cost together, and the job that was over last, the one the run waited for ("Last to end: E2E (1/2), 6m 12s after 1m 5s waiting for a machine"). A run or a job run again is its own row ("attempt 2"), for jobs from this version on. Only the jobs SuperCI ran are counted. In commands: `superci runs list` and `superci runs retrieve ID` (with `--json`).
+- A control plane in AWS tries again within seconds. A job waiting for room, and a start AWS refused that is tried again, waited for the next minute's sweep; the control plane now asks itself for one twenty seconds on. Update your control plane for it (the update gives it leave to call itself, and nothing else).
+- An AWS account that is its organization's management account is said so under AWS account, with signing in to another: it is easily picked by mistake where AWS lists the sessions.
+- A project of AWS's new sign-up whose region does not have the runner image yet no longer reads "Everything SuperCI does works there" beside the step that comes first: it says the image is copied in first, and the Copy the image button says it is needed before Set up and takes about ten minutes.
+
 ## 0.16.5 — 2026-10-13
 - A job on a spot machine AWS is taking back has what is left of AWS's two minutes to end by itself. Its runner is stopped twenty seconds before the machine goes (forty on Windows), and only if the job is still going. Before, the runner was stopped the moment the notice came: a job a minute from its end failed and was run again, where it now passes. A job with longer to go fails as before, and is run again once its run has finished.
 - Several jobs queued at once, in an AWS account that AWS lets ask for few machines in a moment (a new one): four of five went to on-demand machines, at about twice the price, with nothing said of why. A spot request AWS refuses for its rate is now asked again for the same pool after a wait, in place of the whole launch starting over (which spent more requests and was refused again). One still refused after its waits goes on-demand as before, and the job says so: "On-demand: AWS refused the spot request for its rate (many machines asked for at once)".

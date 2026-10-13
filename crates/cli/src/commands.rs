@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use crate::dashboard::{day_of, job_words, plane_json, read_keys, Background, Dashboard, Task, AWS_ENDED, NOT_SIGNED_IN};
+use crate::dashboard::{day_of, job_words, plane_json, read_keys, run_words, runs_of, with_hosts, Background, Dashboard, Task, AWS_ENDED, NOT_SIGNED_IN};
 use crate::plane::Plane;
 use crate::view::{PlaneView, DASHBOARD_VERSION};
 use crate::store;
@@ -27,6 +27,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "With --json: the control plane, and under \"status\" everything it says of itself (repositories, runner providers,\nlimits, the latest jobs)."),
     ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N]",
         "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job, with the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, a million at most). GitHub keeps a job's log once the job has ended."),
+    ("runs", "  superci runs list\n  superci runs retrieve ID",
+        "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again).\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
     ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
@@ -104,7 +106,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits"]),
                 group(&["connections", "deliveries", "projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -372,6 +374,32 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 None => said.push(format!("No log: {}.", got["error"].as_str().unwrap_or("the control plane gave none").trim_end_matches('.'))),
             }
             Ok(Done { said, data: json!({ "job": words, "log": got["log"], "truncated": got["truncated"], "log_error": got["error"] }) })
+        }
+        ("runs", "list") => {
+            let mut d = signed_in();
+            let runs: Vec<Value> = runs(&view(&mut d)?).iter().map(run_words).collect();
+            let said = runs.iter().take(40).map(run_line).collect::<Vec<_>>();
+            Ok(Done { said: if said.is_empty() { vec!["No runs yet.".into()] } else { said }, data: json!({ "runs": runs }) })
+        }
+        ("runs", "retrieve") => {
+            let id = w(2);
+            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return usage("Say which: `superci runs retrieve ID` (ids are in `superci runs list`).") }
+            let mut d = signed_in();
+            let v = view(&mut d)?;
+            let of: Vec<Value> = runs(&v).iter().filter(|r| r["id"].as_u64().is_some_and(|n| n.to_string() == id)).map(run_words).collect();
+            if of.is_empty() { return Err("That run is not among the latest this control plane keeps (ids are in `superci runs list`).".into()) }
+            let jobs = v.jobs();
+            let (mut said, mut data) = (vec![], vec![]);
+            for r in of.iter().rev() {
+                let its: Vec<Value> = jobs.iter().filter(|j| j["run_id"] == r["id"] && j["attempt"].as_u64().filter(|a| *a > 0) == r["attempt"].as_u64()).map(job_words).collect();
+                said.push(run_line(r));
+                said.push(r["link"].as_str().unwrap_or_default().to_string());
+                said.extend(its.iter().map(|j| format!("  {}", job_line(j))));
+                let mut r = r.clone();
+                r["job_list"] = its.into();
+                data.push(r);
+            }
+            Ok(Done { said, data: json!({ "runs": data }) })
         }
         ("keys", "list") => {
             let mut d = signed_in();
@@ -1069,6 +1097,19 @@ fn jobs() -> Result<Done> {
 }
 
 /// A job in a line: its id, how it stands, what it is, and (its runner, how long, its cost, why it failed or waits).
+/// The control plane's latest jobs by run, each linked to where its code host is.
+fn runs(v: &crate::view::PlaneView) -> Vec<Value> {
+    let jobs: Vec<Value> = v.jobs().iter().map(|j| with_hosts(v, j)).collect();
+    runs_of(&jobs)
+}
+
+fn run_line(r: &Value) -> String {
+    let s = |k: &str| r[k].as_str().unwrap_or_default().to_string();
+    let count = r["jobs"].as_u64().unwrap_or_default();
+    let tail: Vec<String> = [format!("{count} {}", if count == 1 { "job" } else { "jobs" }), s("took"), r["usd"].as_f64().map(|c| format!("${c:.3}")).unwrap_or_default(), s("last_said")].into_iter().filter(|t| !t.is_empty()).collect();
+    format!("{:<12} {:<9} {} · {}  ({})", r["id"].as_u64().unwrap_or_default(), s("state"), s("run"), s("in"), tail.join(" · "))
+}
+
 fn job_line(j: &Value) -> String {
     let s = |k: &str| j[k].as_str().unwrap_or_default().to_string();
     let tail: Vec<String> = [s("runner"), s("took"), j["usd"].as_f64().map(|c| format!("${c:.3}")).unwrap_or_default(), s("why")].into_iter().filter(|t| !t.is_empty()).collect();
@@ -1179,7 +1220,7 @@ mod tests {
         assert!(all.starts_with("SuperCI —") && all.contains("superci <resource> <operation> [id] [--param=value]") && all.contains("superci help RESOURCE") && all.contains("SUPERCI_HOME") && all.contains("--workspace=ID") && help("workspaces").contains("SUPERCI_WORKSPACE=ID"));
         assert!(help("runners").contains("aws-on-demand") && help("connections").contains("SUPERCI_GITLAB_TOKEN") && help("connections").contains("GitHub offers that nowhere else"));
         // Every command `run` and `in_browser` know is in some resource's lines.
-        for command in ["superci dashboard", "superci login", "superci logout", "superci status", "superci jobs list", "superci jobs retrieve ID", "superci keys list", "superci keys create NAME", "superci keys delete NAME",
+        for command in ["superci dashboard", "superci login", "superci logout", "superci status", "superci jobs list", "superci jobs retrieve ID", "superci runs list", "superci runs retrieve ID", "superci keys list", "superci keys create NAME", "superci keys delete NAME",
             "superci runners list", "superci runners create", "superci runners update CLOUD", "superci runners order", "superci runners delete CLOUD", "superci labels list", "superci labels create NAME", "superci labels delete NAME", "superci machine retrieve", "superci machine update", "superci limits retrieve", "superci limits update",
             "superci planes list", "superci planes create", "superci planes update", "superci planes move ID", "superci planes allow", "superci planes delete ID", "superci leave --confirm", "superci connections list", "superci connections create github OWNER", 
             "superci deliveries list", "superci deliveries retrieve ID", "superci connections create gitlab", "superci connections delete github OWNER", "superci connections delete gitlab", "superci projects list", "superci projects update", "superci public_repos list", "superci public_repos create", "superci public_repos delete",
@@ -1209,7 +1250,7 @@ mod tests {
         for name in ["SUPERCI_GITLAB_TOKEN", "SUPERCI_KEY", "SUPERCI_PLANE"] { std::env::remove_var(name) }
         let run = |line: &str| run(&args(line), &mut |_| {}).map(|d| d.said).unwrap_err();
         let signed_out = Fail::Failed(NOT_SIGNED_IN.into());
-        for line in ["status", "jobs list", "jobs retrieve 7", "deliveries list", "deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create acmeci", "name retrieve", "name update AcmeCI", "connections list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
+        for line in ["status", "jobs list", "jobs retrieve 7", "runs list", "runs retrieve 7", "deliveries list", "deliveries retrieve 7", "keys list", "keys create agent", "keys delete agent", "runners list", "labels list", "labels create acmeci", "name retrieve", "name update AcmeCI", "connections list", "planes list", "public_repos list", "machine retrieve", "machine update --cpu=8",
             "planes update", "planes create modal", "planes create aws --region=us-east-1", "runners create aws", "runners order aws", "runners update aws --max-jobs=3", "limits retrieve", "limits update --max-cpu=8", "limits update --max-hours 12",
             "public_repos create acme/site", "public_repos delete acme/site", "projects list", "projects update 7 --enabled=true", "projects update --all --enabled=true", "planes allow", "planes move abcdef123456",
             "planes update --dry-run", "runners create cloudflare --dry-run"] {
@@ -1222,7 +1263,7 @@ mod tests {
         }
         for (line, says) in [("runners create gcp", "Say which: `superci runners create aws`"), ("planes create", "Say where: `superci planes create aws"), ("planes create aws", "Say where: --region"), ("planes move", "Say where to:"), ("planes delete", "Say which:"),
             ("runners order", "Say the order:"), ("public_repos create", "Say which:"), ("connections create gitlab", "Give the GitLab token by name: SUPERCI_GITLAB_TOKEN"), ("connections create gitlab --token-env MY_TOKEN", "Give the GitLab token by name: MY_TOKEN"),
-            ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
+            ("jobs retrieve", "Say which: `superci jobs retrieve ID`"), ("runs retrieve", "Say which: `superci runs retrieve ID`"), ("jobs retrieve seven", "Say which: `superci jobs retrieve ID`"), ("keys create", "Give it a name:"), ("keys delete", "Say which:"), ("name update", "Say what to call it:"), ("keys create agent --days soon", "--days is a number"),
             ("projects update 7", "Say which way:"), ("projects update --all --enabled=false", "Projects are switched off one at a time"),
             ("planes", "`superci planes` takes an operation."), ("limits", "`superci limits` takes an operation."), ("runners frob", "`frob` is not an operation of `superci runners`."), ("limits set", "`set` is not an operation of `superci limits`."),
             ("aws", "`aws` is not a command of superci."), ("accounts", "`superci accounts` takes an operation."), ("accounts frob", "`frob` is not an operation of `superci accounts`."), ("accounts retrieve", "Say which cloud's:"), ("accounts retrieve modal", "Say which cloud's:"),

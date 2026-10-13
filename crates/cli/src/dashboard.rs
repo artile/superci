@@ -406,6 +406,14 @@ pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "id": j["job_id"], "state": state, "ended": ended, "job": title, "in": sub, "runner": runner_text(j).1, "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
 }
 
+/// A run as commands say it: how it stands, what it is, how many of its jobs ran here, how long it took (ms, from its
+/// first job queued to its last one over), what it cost, and the job that was over last.
+pub fn run_words(r: &serde_json::Value) -> serde_json::Value {
+    let (title, sub) = run_names(r);
+    serde_json::json!({ "id": r["id"], "attempt": r["attempt"], "state": r["state"], "run": title, "in": sub, "jobs": r["jobs"], "job_ids": r["job_ids"], "took": r["took_ms"].as_u64().map(span), "took_ms": r["took_ms"],
+        "usd": r["usd"], "last": r["last"], "last_said": Some(run_last(r)).filter(|l| !l.is_empty()), "link": r["link"], "at_ms": r["at_ms"] })
+}
+
 /// A control plane as commands say it.
 pub fn plane_json(v: &PlaneView) -> serde_json::Value {
     serde_json::json!({ "id": v.plane.plane_id(), "cloud": v.plane.cloud(), "where": v.plane.place(), "url": v.plane.url(), "label": v.label(),
@@ -649,6 +657,85 @@ fn job_table(jobs: &[serde_json::Value]) -> String {
             esc(&job_link(j)), esc(&title), esc(&sub), ago(j["at_ms"].as_u64().unwrap_or_default()))
     }).collect::<String>();
     format!(r#"<div class="jt"><div class="jt-head"><span>Job</span><span>Runner</span><span class="jt-num">Time</span><span class="jt-num">Cost</span><span>Status</span><span class="jt-when"></span></div>{rows}</div>"#)
+}
+
+/// A span of time in words: "45s", "6m 12s", "25m".
+fn span(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 { format!("{s}s") } else if s % 60 == 0 || s >= 600 { format!("{}m", s / 60) } else { format!("{}m {}s", s / 60, s % 60) }
+}
+
+/// Jobs by the run they are of (a workflow run on GitHub, a pipeline on GitLab; an attempt of one apart, where the
+/// control plane kept which), newest first. Each with how it stands, how long it took from its first job queued to
+/// its last one over, what its machines cost together, and the job that was over last: the one the run waited for.
+/// Only the jobs SuperCI ran are counted: a run's jobs on other runners are not known here.
+pub fn runs_of(jobs: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let key = |j: &serde_json::Value| (j["repo"].as_str().unwrap_or_default().to_string(), j["run_id"].as_u64().unwrap_or_default(), j["attempt"].as_u64().unwrap_or_default());
+    let mut order: Vec<(String, u64, u64)> = vec![];
+    let mut by: HashMap<(String, u64, u64), Vec<&serde_json::Value>> = HashMap::new();
+    for j in jobs.iter().filter(|j| j["run_id"].as_u64().is_some_and(|r| r > 0)) {
+        let k = key(j);
+        if !by.contains_key(&k) { order.push(k.clone()) }
+        by.entry(k).or_default().push(j);
+    }
+    let now = now_ms();
+    let mut runs: Vec<serde_json::Value> = order.into_iter().map(|k| {
+        let rows = &by[&k];
+        let n = |j: &serde_json::Value, f: &str| j[f].as_u64();
+        let words: Vec<&str> = rows.iter().map(|j| job_ended(j).1).collect();
+        let going = words.iter().any(|w| ["Running", "Waiting", "Starting"].contains(w));
+        let state = if going { "running" } else if words.contains(&"Failed") { "failed" } else if words.contains(&"Cancelled") { "cancelled" }
+            else if words.iter().all(|w| ["Passed", "Skipped"].contains(w)) { "passed" } else { "done" };
+        let at = rows.iter().filter_map(|j| n(j, "at_ms")).min().unwrap_or_default();
+        // (A job that never got a machine has no end of its own: the run is over when its last machine was.)
+        let end = if going { None } else { rows.iter().filter_map(|j| n(j, "ended_ms")).max() };
+        let took_ms = match end { Some(end) => Some(end.saturating_sub(at)), None if going => Some(now.saturating_sub(at)), None => None };
+        let usd: f64 = rows.iter().filter_map(|j| job_cost(j)).sum();
+        // The one over last, with how long it waited for a machine and how long it ran.
+        let last = rows.iter().filter(|j| n(j, "ended_ms").is_some() && n(j, "started_ms").is_some()).max_by_key(|j| n(j, "ended_ms")).map(|j| {
+            let (queued, started, ended) = (n(j, "at_ms").unwrap_or_default(), n(j, "started_ms").unwrap_or_default(), n(j, "ended_ms").unwrap_or_default());
+            serde_json::json!({ "id": j["job_id"], "job": job_names(j).0, "waited_ms": started.saturating_sub(queued), "ran_ms": ended.saturating_sub(started) })
+        });
+        let mut ids: Vec<u64> = rows.iter().filter_map(|j| n(j, "job_id")).collect();
+        ids.sort_unstable(); ids.dedup();
+        let first = rows[0];
+        let link = if first["provider"] == "gitlab" { format!("{}/{}/-/pipelines/{}", first["gitlab_url"].as_str().unwrap_or("https://gitlab.com"), k.0, k.1) }
+            else { format!("{}/{}/actions/runs/{}{}", first["github_web"].as_str().unwrap_or("https://github.com"), k.0, k.1, if k.2 > 1 { format!("/attempts/{}", k.2) } else { String::new() }) };
+        serde_json::json!({ "id": k.1, "attempt": Some(k.2).filter(|a| *a > 0), "repo": k.0, "workflow": first["workflow"], "provider": first["provider"], "state": state, "jobs": ids.len(), "job_ids": ids,
+            "took_ms": took_ms, "usd": Some(usd).filter(|c| *c > 0.0), "last": last, "link": link, "at_ms": at })
+    }).collect();
+    runs.sort_by_key(|r| std::cmp::Reverse(r["at_ms"].as_u64().unwrap_or_default()));
+    runs
+}
+
+/// What is said of the job a run waited for: "Last to end: E2E (1/2), 6m 12s after 1m 5s waiting for a machine".
+pub fn run_last(r: &serde_json::Value) -> String {
+    if r["jobs"].as_u64().unwrap_or_default() < 2 || !r["last"].is_object() { return String::new() }
+    let (waited, ran) = (r["last"]["waited_ms"].as_u64().unwrap_or_default(), r["last"]["ran_ms"].as_u64().unwrap_or_default());
+    format!("Last to end: {}, {}{}", r["last"]["job"].as_str().unwrap_or_default(), span(ran), if waited >= 20_000 { format!(" after {} waiting for a machine", span(waited)) } else { String::new() })
+}
+
+/// A run's name and the line under it: its workflow, with its repository (and which attempt, after the first).
+pub fn run_names(r: &serde_json::Value) -> (String, String) {
+    let repo = r["repo"].as_str().unwrap_or_default();
+    let short = repo.rsplit('/').next().unwrap_or(repo).to_string();
+    let again = r["attempt"].as_u64().filter(|a| *a > 1).map(|a| format!(" · attempt {a}")).unwrap_or_default();
+    match r["workflow"].as_str().filter(|w| !w.is_empty()) { Some(w) => (w.to_string(), format!("{short}{again}")), None => (short, format!("{}{again}", repo.split('/').next().unwrap_or_default())) }
+}
+
+/// Runs as a table, like the jobs': what the run is, how many jobs of it ran here, how long it took, what it cost,
+/// how it stands, and when. Each row opens the run on its code host.
+fn run_table(runs: &[serde_json::Value]) -> String {
+    let rows = runs.iter().map(|r| {
+        let (kind, word) = match r["state"].as_str().unwrap_or_default() { "passed" => ("good", "Passed"), "failed" => ("bad", "Failed"), "cancelled" => ("", "Cancelled"), "running" => ("accent", "Running"), _ => ("good", "Done") };
+        let (title, sub) = run_names(r);
+        let host = if r["provider"] == "gitlab" { logo("gitlab", 14) } else { logo("github", 14) };
+        let last = Some(run_last(r)).filter(|l| !l.is_empty()).map(|l| format!(r#"<small class="jt-why held">{}</small>"#, esc(&l))).unwrap_or_default();
+        let count = r["jobs"].as_u64().unwrap_or_default();
+        format!(r#"<a class="jt-row" href="{}" target="_blank" rel="noopener"><span class="jt-job"><strong>{}</strong><small>{host}{}</small>{last}</span><span class="jt-runner count">{count} {}</span><span class="jt-num">{}</span><span class="jt-num">{}</span><span class="jt-state {kind}"><i></i>{word}</span><span class="jt-when">{}</span></a>"#,
+            esc(r["link"].as_str().unwrap_or_default()), esc(&title), esc(&sub), if count == 1 { "job" } else { "jobs" }, r["took_ms"].as_u64().map(span).unwrap_or_default(), r["usd"].as_f64().map(usd_fine).unwrap_or_default(), ago(r["at_ms"].as_u64().unwrap_or_default()))
+    }).collect::<String>();
+    format!(r#"<div class="jt"><div class="jt-head"><span>Run</span><span>Jobs here</span><span class="jt-num">Time</span><span class="jt-num">Cost</span><span>Status</span><span class="jt-when"></span></div>{rows}</div>"#)
 }
 
 /// A job's name for people, and the line under it: "four" with "superci-bench · sizes" (jobs from before names were
@@ -1232,6 +1319,7 @@ impl Dashboard {
             aws::Kind::Open => ("Nothing refused", "good", "Nothing SuperCI does there is refused.".to_string()),
             aws::Kind::Unanswered => ("Not known", "open", format!("AWS did not answer when asked what this account allows ({}). Refresh asks again.", look.unanswered().unwrap_or_default().chars().take(120).collect::<String>())),
             aws::Kind::Project { region, activated: false } => ("AWS project", "open", format!("A project of AWS's new sign-up: AWS keeps it to {} and allows it no spot machines, so jobs run on on-demand machines, at about twice the price.", region_short(&region))),
+            aws::Kind::Project { region, activated: true } if look.usable_regions().is_empty() => ("AWS project", "open", format!("A project of AWS's new sign-up: it works in {} only. The image jobs run on is not there yet: copying it in comes first.", region_short(&region))),
             aws::Kind::Project { region, activated: true } => ("AWS project", "good", format!("A project of AWS's new sign-up: it works in {} only. Everything SuperCI does works there.", region_short(&region))),
             // Kept to some regions by its organization, with everything else allowed: said as where it works, which
             // is no trouble. Anything else refused (spot machines, on-demand ones, or by the sign-in's own
@@ -1302,6 +1390,12 @@ impl Dashboard {
         }
         if let (Some(org), Some(managed)) = (&look.organization_id, look.management_account.as_deref().filter(|m| *m != account)) {
             rows.push(row("Organization", esc(org), esc(&format!("Managed from account {managed}: its policies are not this account's to read or change.")), String::new()));
+        }
+        // Signed in to the organization's management account itself: said, since it is easily picked by mistake
+        // where AWS lists sessions, and a CI is better kept out of the account that governs the others.
+        if let (Some(org), true) = (&look.organization_id, look.management_account.as_deref() == Some(account.as_str())) {
+            rows.push(row("Organization", esc(org), esc("The organization's management account. A CI is better kept in an account of its own."),
+                r#"<form method="post" action="/aws/signin"><input type="hidden" name="next"><button class="button secondary sm">Another AWS account</button></form>"#.to_string()));
         }
         // Looked at again each time the page is opened (when the last look is older than twenty seconds), and at a
         // press: said while it is on its way, and the page looks again until it is in.
@@ -2982,7 +3076,8 @@ mark();load()})();</script>"#;
             // (With what the AWS account in hand allows, when that is not everything.)
             "add-runners" => (format!("{}{}", self.add_runners_page(current), self.aws_account_section()), self.modal_pending.is_some()),
             _ if self.modal_pending.is_some() && current.is_none() => (self.overview_page(current).0, true),
-            "jobs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1></div><div class="cards">{}</div>"#, jobs_card(current, 200)), false),
+            "jobs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(false), jobs_card(current, 200)), false),
+            "runs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(true), runs_card(current)), false),
             "planes" => (self.planes_page(views), self.deploy_running()),
             "changes" => (changes_page(views, &views.get(view::in_use(views)).map(|v| self.aws_lacks(v)).unwrap_or_default()), false),
             "workflows" => (self.workflows_page(current), false),
@@ -3010,7 +3105,7 @@ mark();load()})();</script>"#;
     }
 
     fn sidebar(section: &str) -> String {
-        let current = match section { "plane" => "planes", "add-runners" => "runners", "gitlab" => "repos", s => s };
+        let current = match section { "plane" => "planes", "add-runners" => "runners", "gitlab" => "repos", "runs" => "jobs", s => s };
         let link = |id: &str, label: &str, icon: &str| format!(r#"<a href="/?p={id}" aria-current="{}">{icon}<span>{label}</span></a>"#, current == id);
         let nav = format!(r#"<nav class="nav">{}{}{}{}{}</nav>"#, link("overview", "Overview", ICON_OVERVIEW), link("repos", "Repositories", ICON_REPOS), link("runners", "Runners", ICON_RUNNERS),
             link("workflows", "Workflows", ICON_WORKFLOWS), link("jobs", "Jobs", ICON_JOBS));
@@ -3078,7 +3173,7 @@ mark();load()})();</script>"#;
                         let (without, copying) = (self.aws_look().map(|l| l.regions_without_image()).unwrap_or_default(), self.aws.as_ref().and_then(|a| self.aws_copying.get(&a.account_id)).cloned().unwrap_or_default());
                         Some(match without.first() {
                             Some(region) if copying.iter().any(|c| c == region) => format!(r#"<span class="waiting-for"><span class="mini-spin"></span>Copying the image into {}: about ten minutes</span>"#, esc(&region_short(region))),
-                            Some(region) => format!(r#"<form method="post" action="/aws/image">{account}<input type="hidden" name="region" value="{}"><button class="button primary sm">Copy the image into {}</button></form>"#, esc(region), esc(&region_short(region))),
+                            Some(region) => format!(r#"<form method="post" action="/aws/image" class="aws-add">{account}<input type="hidden" name="region" value="{}"><span class="note">Needed before Set up: about ten minutes</span><button class="button primary sm">Copy the image into {1}</button></form>"#, esc(region), esc(&region_short(region))),
                             None => r#"<span class="note">No region to set it up in</span>"#.to_string(),
                         })
                     }
@@ -4329,7 +4424,7 @@ fn skeleton(section: &str, title: &str) -> String {
         "settings" => format!(r#"<div class="cards"><section class="card dm-card">{}</section>{}</div>"#,
             r#"<div class="default-machine"><span class="sk logo-sk"></span><span class="dm-main"><span class="sk w30"></span><span class="sk w60 thin"></span></span><span class="sk pillish"></span><span></span></div>"#.repeat(2),
             card("Limits", true, r#"<span class="sk w60"></span><span class="sk w70 thin"></span><span class="sk w60"></span><span class="sk w70 thin"></span>"#.to_string())),
-        "jobs" => format!(r#"<div class="cards">{}</div>"#, card("Recent jobs", true, format!(r#"<div class="rows">{}</div>"#, SK_ROWS.repeat(6)))),
+        "jobs" | "runs" => format!(r#"<div class="cards">{}</div>"#, card(if section == "runs" { "Recent runs" } else { "Recent jobs" }, true, format!(r#"<div class="rows">{}</div>"#, SK_ROWS.repeat(6)))),
         "planes" => format!(r#"<div class="cards">{}</div>"#,
             card("Your control plane", true, format!(r#"<span class="sk w70 thin"></span><div class="picks">{SK_PICK}</div><span class="sk w70 thin"></span>"#))),
         "changes" => format!(r#"<div class="cards">{}</div>"#,
@@ -4349,7 +4444,7 @@ fn empty_state(icon_svg: &str, title: &str, text: &str, action: &str) -> String 
 
 fn section_name(section: &str) -> &str {
     match section {
-        s if ["plane", "planes", "all", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "repos", "gitlab"].contains(&s) => s,
+        s if ["plane", "planes", "all", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "runs", "repos", "gitlab"].contains(&s) => s,
         _ => "overview",
     }
 }
@@ -4357,7 +4452,7 @@ fn section_name(section: &str) -> &str {
 fn section_title(section: &str) -> &'static str {
     match section {
         "plane" => "Set up a control plane", "planes" => "Control plane", "changes" => "Changelog", "add-runners" => "Add a provider", "runners" => "Runners",
-        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" => "Jobs", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
+        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" | "runs" => "Jobs", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
     }
 }
 
@@ -4959,6 +5054,24 @@ fn jobs_card(v: Option<&PlaneView>, limit: usize) -> String {
     format!(r#"<section class="card"><div class="card-head"><h2>Recent jobs</h2></div>{body}</section>"#)
 }
 
+/// The Jobs page's two ways to look: job by job, or by the run they are of.
+fn jobs_tabs(runs: bool) -> String {
+    format!(r#"<div class="tabs" role="tablist"><a class="tab" role="tab" href="/?p=jobs" aria-selected="{}">Jobs</a><a class="tab" role="tab" href="/?p=runs" aria-selected="{runs}">Runs</a></div>"#, !runs)
+}
+
+/// The latest runs, of the jobs the control plane keeps.
+fn runs_card(v: Option<&PlaneView>) -> String {
+    let jobs: Vec<serde_json::Value> = v.map(|v| v.jobs().iter().map(|j| with_hosts(v, j)).collect()).unwrap_or_default();
+    let runs = runs_of(&jobs);
+    let body = match v {
+        Some(v) if v.status.is_none() && v.online => SK_ROWS.repeat(3),
+        Some(v) if v.status.is_none() => empty_state(&icon("jobs"), "Runs are out of reach", "Sign in where the control plane runs to see its jobs.", ""),
+        _ if runs.is_empty() => empty_state(&icon("play"), "No runs yet", "A workflow's jobs that ran here show up together, with how long the run took and what it cost.", ""),
+        _ => format!(r#"{}<p class="note" style="margin:10px 8px 0">A run's time is from its first job queued here to its last one over. Jobs of it on other runners are not counted.</p>"#, run_table(&runs)),
+    };
+    format!(r#"<section class="card"><div class="card-head"><h2>Recent runs</h2></div>{body}</section>"#)
+}
+
 const ICON_OVERVIEW: &str = r#"<svg viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></svg>"#;
 const ICON_RUNNERS: &str = r#"<svg viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6.5" rx="2"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="2"/><path d="M7 7.25h.01M7 16.75h.01"/></svg>"#;
 const ICON_REPOS: &str = r#"<svg viewBox="0 0 24 24"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5"/><path d="M5 19.5A1.5 1.5 0 0 0 6.5 21H19v-3"/><path d="M5 4.5v15"/><path d="M9 7h6"/></svg>"#;
@@ -4995,7 +5108,7 @@ fn app_settings_link(host: Option<&str>, owner: &str, slug: &str, org: bool) -> 
 }
 
 /// A job as the pages link it: where its GitLab is, and where its GitHub is (its App's; github.com unless said).
-fn with_hosts(v: &PlaneView, j: &serde_json::Value) -> serde_json::Value {
+pub fn with_hosts(v: &PlaneView, j: &serde_json::Value) -> serde_json::Value {
     let mut j = j.clone();
     let gls = v.gitlabs();
     let its = j["gitlab"].as_str().unwrap_or_default();
@@ -5806,7 +5919,7 @@ mod tests {
         // (The row says the account alone: there is no region to name until the image is there.)
         assert!(page.contains("A Lambda function with a table · account 111111111111</small>") && !page.contains("N. Virginia"), "{page}");
         // The one thing to press is copying the image in; setting up comes after.
-        assert!(page.contains(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><button class="button primary sm">Copy the image into Stockholm</button></form>"#) && !page.contains(r#"action="/plane/aws""#), "{page}");
+        assert!(page.contains(r#"<form method="post" action="/aws/image" class="aws-add"><input type="hidden" name="account" value="111111111111"><input type="hidden" name="region" value="eu-north-1"><span class="note">Needed before Set up: about ten minutes</span><button class="button primary sm">Copy the image into Stockholm</button></form>"#) && !page.contains(r#"action="/plane/aws""#), "{page}");
         // While AWS copies, that is said, and the page looks again by itself.
         d.aws_copying.insert("111111111111".into(), vec!["eu-north-1".into()]);
         let copying = d.plane_page();
@@ -5832,6 +5945,22 @@ mod tests {
             assert!(page.contains(said), "{said}\n\n{page}");
         }
         assert!(!page.contains("management account"), "{page}");
+        // The same project before its image is there: the headline does not say everything works beside a step
+        // that has to come first.
+        let mut bare = looked(include_str!("../fixtures/aws/project-activated/look.jsonl"));
+        for image in bare.images.iter_mut() { image.1 = Some(false); }
+        d.aws_looks.insert("111111111111".into(), (now_ms(), bare));
+        let first = d.plane_page();
+        preview("plane-aws-project-no-image", &first);
+        assert!(first.contains("it works in Stockholm only. The image jobs run on is not there yet: copying it in comes first.</small>") && first.contains(r#"<span class="pill open"><i></i>AWS project</span>"#) && !first.contains("Everything SuperCI does works there"), "{first}");
+        // Signed in to the organization's management account itself: said, with signing in to another.
+        let mut managing = looked(include_str!("../fixtures/aws/project-activated/look.jsonl"));
+        managing.management_account = Some("111111111111".into());
+        d.aws_looks.insert("111111111111".into(), (now_ms(), managing));
+        let own = d.plane_page();
+        preview("plane-aws-management", &own);
+        assert!(own.contains("<dt>Organization</dt><dd>o-example001<small>The organization&#39;s management account. A CI is better kept in an account of its own.</small></dd>") && own.contains("Another AWS account</button>"), "{own}");
+        d.aws_looks.insert("111111111111".into(), (now_ms(), looked(include_str!("../fixtures/aws/project-activated/look.jsonl"))));
         // Its copy of the image is of an older build than its maker's newest: said, with copying the new one in;
         // and while that one is on its way.
         d.aws_behind.insert("111111111111".into(), vec![("eu-north-1".into(), "20261006080949".into(), "20261020070000".into(), false)]);
@@ -6892,6 +7021,48 @@ mod tests {
         assert!(settings.contains("<strong>Longest job</strong>") && settings.contains(r#"name="max_hours" min="1" max="120" value="6""#), "a job's machine lives six hours unless set");
         assert!(settings.contains("<h2>Limits</h2>") && settings.contains(r#"name="max_cpu" min="1" max="192" value="32""#) && settings.contains(r#"value="public_add""#) && !workflows.contains("tag-chips"));
         assert!(workflows.contains(r#"<input type="radio" name="host" id="use-gh" checked>"#) && workflows.contains("Turn the project on in") && workflows.contains("tags: [superci]"));
+    }
+
+    #[test]
+    fn jobs_are_also_shown_by_the_run_they_are_of_with_its_time_cost_and_the_job_it_waited_for() {
+        let d = with_cloudflare(&[("a1", "Acme Inc.")]);
+        let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
+        let t = now_ms() - 3_600_000;
+        // (A job queued `at` after the hour began, that waited and then ran, in seconds; a price of $3.60 an hour is a
+        // tenth of a cent for each second it ran.)
+        let job = |id: u64, run: u64, attempt: Option<u64>, name: &str, at: u64, waited: u64, ran: u64, state: &str, conclusion: Option<&str>| serde_json::json!({ "job_id": id, "run_id": run, "attempt": attempt, "repo": "acme/app", "state": state, "at_ms": t + at * 1000,
+            "runner": null, "runner_id": null, "installation_id": 1, "cloud": "aws", "machine_id": "i-1", "machine_type": "m7a.large", "error": null, "seen_in_progress": true, "usd_per_hour": 3.6,
+            "started_ms": t + (at + waited) * 1000, "ended_ms": if state == "running" { None } else { Some(t + (at + waited + ran) * 1000) }, "cpu": 2, "name": name, "workflow": "Tests", "conclusion": conclusion });
+        let jobs = vec![
+            // A run of three: lint and a test at once, then an end-to-end job that waited a minute for its machine.
+            job(1, 70, Some(1), "Lint", 0, 10, 50, "done", Some("success")), job(2, 70, Some(1), "Unit", 0, 12, 108, "done", Some("success")), job(3, 70, Some(1), "E2E (1/2)", 120, 65, 372, "done", Some("failure")),
+            // The failed job run again: the same run's second attempt, apart.
+            job(4, 70, Some(2), "E2E (1/2)", 900, 5, 300, "done", Some("success")),
+            // One still going, and a job alone in its run (from before attempts were kept).
+            job(5, 71, Some(1), "Unit", 1000, 8, 0, "running", None), job(6, 72, None, "Deploy", 2000, 5, 40, "done", Some("success")) ];
+        let runs = runs_of(&jobs);
+        let said: Vec<(u64, Option<u64>, &str, u64, Option<u64>)> = runs.iter().map(|r| (r["id"].as_u64().unwrap(), r["attempt"].as_u64(), r["state"].as_str().unwrap(), r["jobs"].as_u64().unwrap(), r["took_ms"].as_u64().filter(|_| r["state"] != "running"))).collect();
+        assert_eq!(said, vec![(72, None, "passed", 1, Some(45_000)), (71, Some(1), "running", 1, None), (70, Some(2), "passed", 1, Some(305_000)), (70, Some(1), "failed", 3, Some(557_000))]);
+        // The run's cost is its machines' together; the job it waited for is the one over last.
+        let first = &runs[3];
+        assert!((first["usd"].as_f64().unwrap() - 0.53).abs() < 0.001, "{first}");
+        assert_eq!(run_last(first), "Last to end: E2E (1/2), 6m 12s after 1m 5s waiting for a machine");
+        assert_eq!((run_last(&runs[0]).as_str(), run_last(&runs[1]).as_str()), ("", ""), "one job: nothing to compare");
+        assert_eq!((first["link"].as_str(), runs[2]["link"].as_str()), (Some("https://github.com/acme/app/actions/runs/70"), Some("https://github.com/acme/app/actions/runs/70/attempts/2")));
+        assert_eq!(run_names(&runs[2]), ("Tests".to_string(), "app · attempt 2".to_string()));
+        let words = run_words(first);
+        assert_eq!((words["state"].as_str(), words["took"].as_str(), words["jobs"].as_u64(), words["last"]["job"].as_str(), words["job_ids"].to_string()), (Some("failed"), Some("9m 17s"), Some(3), Some("E2E (1/2)"), "[1,2,3]".to_string()));
+        // The Jobs page has them under Runs, beside the jobs one by one.
+        let status = serde_json::json!({ "containers": true, "agents": [], "aws": { "account_id": "1", "region": "us-east-1" }, "jobs": jobs });
+        let view = PlaneView { plane, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(status) };
+        let page = d.render("runs", &[view.clone()], None);
+        preview("runs", &page);
+        assert!(page.contains(r#"<a class="tab" role="tab" href="/?p=jobs" aria-selected="false">Jobs</a><a class="tab" role="tab" href="/?p=runs" aria-selected="true">Runs</a>"#) && page.contains("<h2>Recent runs</h2>"), "{page}");
+        assert!(page.contains(r#"<small class="jt-why held">Last to end: E2E (1/2), 6m 12s after 1m 5s waiting for a machine</small></span><span class="jt-runner count">3 jobs</span><span class="jt-num">9m 17s</span><span class="jt-num">$0.53</span><span class="jt-state bad"><i></i>Failed</span>"#), "{page}");
+        assert!(page.contains(r#"<span class="jt-runner count">1 job</span>"#) && page.contains(r#"<span class="jt-state accent"><i></i>Running</span>"#) && page.contains("app · attempt 2"));
+        let jobs_page = d.render("jobs", &[view], None);
+        assert!(jobs_page.contains(r#"href="/?p=jobs" aria-selected="true">Jobs</a>"#) && jobs_page.contains("<h2>Recent jobs</h2>"));
+        assert!(Dashboard::sidebar("runs").contains(r#"<a href="/?p=jobs" aria-current="true">"#));
     }
 
     #[test]

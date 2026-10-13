@@ -240,6 +240,8 @@ pub struct Job {
     /// What its AWS machine sent (GB, CloudWatch's count, read a little after it ended; -1: AWS would not say); its
     /// cost is in `cost_usd`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub sent_gb: Option<f64>,
+    /// Which attempt of its run it is in, as GitHub counts them (a run, or a job of it, run again is the next).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub attempt: Option<u32>,
     /// Nothing here could run it: a runner was started that failed it at once on GitHub, saying why (`fail_fast`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub failed_fast: bool,
     /// Its job ended on another job's runner while its own machine had not begun anything: the machine is kept a
@@ -1659,7 +1661,7 @@ impl<'a> ControlPlane<'a> {
     async fn launch(&self, plane_url: &str, ev: &github::JobEvent, app: &App) -> Result<()> {
         let key = format!("job:{}", ev.job_id);
         let mut job = Job { job_id: ev.job_id, run_id: ev.run_id, repo: ev.repo.clone(), state: "launching".into(), at_ms: self.clock.now_ms(), installation_id: ev.installation_id, label: ev.label.clone(),
-            name: ev.name.clone(), workflow: ev.workflow.clone(), app_id: Some(app.id), ..Default::default() };
+            name: ev.name.clone(), workflow: ev.workflow.clone(), app_id: Some(app.id), attempt: Some(ev.attempt).filter(|a| *a > 0), ..Default::default() };
         // Claimed once, however many deliveries of the event arrive at once. A claim that never got past launching (the
         // runtime restarted mid-way) is taken over by a later delivery.
         if !self.store.put_if_absent(&key, serde_json::to_string(&job).map_err(|e| e.to_string())?).await? {
