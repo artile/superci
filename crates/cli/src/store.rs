@@ -225,6 +225,15 @@ impl Store {
 
     pub fn path(&self) -> PathBuf { self.dir.join("sign-ins.json") }
 
+    /// Held while a sign-in is renewed (see `Dashboard::cf_client`): Cloudflare takes what renews a sign-in once, and
+    /// two SuperCIs renewing the same one at once would end it. Let go when dropped.
+    pub fn renewing(&self) -> Option<std::fs::File> {
+        std::fs::create_dir_all(&self.dir).ok()?;
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.dir.join(".renewing")).ok()?;
+        f.lock().ok()?;
+        Some(f)
+    }
+
     /// What is kept (nothing, when there is no file or it cannot be read as this version writes it).
     pub fn read(&self) -> Kept {
         std::fs::read(self.path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()

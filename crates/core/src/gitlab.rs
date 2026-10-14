@@ -68,6 +68,11 @@ pub async fn job_trace(http: &dyn Http, gl: &GitLab, project_id: u64, job_id: u6
 }
 
 /// A job's tags and status (the webhook does not carry its tags).
+/// A project's jobs that wait for a runner (the newest fifty).
+pub async fn pending_jobs(http: &dyn Http, gl: &GitLab, project_id: u64) -> Result<Vec<serde_json::Value>> {
+    Ok(api(http, gl, "GET", &format!("/projects/{project_id}/jobs?scope[]=pending&per_page=50"), None).await?.as_array().cloned().unwrap_or_default())
+}
+
 pub async fn job(http: &dyn Http, gl: &GitLab, project_id: u64, job_id: u64) -> Result<(Vec<String>, String)> {
     let v = api(http, gl, "GET", &format!("/projects/{project_id}/jobs/{job_id}"), None).await?;
     Ok((v["tag_list"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect(), v["status"].as_str().unwrap_or_default().to_string()))

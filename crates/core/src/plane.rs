@@ -1407,6 +1407,11 @@ impl<'a> ControlPlane<'a> {
         let Some(gl) = self.gitlab_signed(req) else { return Ok(Response::text(401, "bad token")) };
         put_json(self.store, &last_event_key(&gl.id), &self.clock.now_ms()).await?;
         let Some(ev) = gitlab::job_event(&req.body) else { return Ok(Response::text(200, "ignored")) };
+        self.gitlab_job_event(gl, ev, plane_url).await
+    }
+
+    /// A GitLab job's event: as GitLab sent it, or a waiting job GitLab never told of, found by asking (`untold_gitlab`).
+    async fn gitlab_job_event(&self, gl: &GitLab, ev: gitlab::JobEvent, plane_url: &str) -> Result<Response> {
         self.timer.wake_in(300_000).await?;
         let key = format!("job:gl{}", gitlab::local(&gl.id, ev.job_id));
         // A project's path, told apart across connections (for the note that a job is run again).
@@ -1984,15 +1989,17 @@ impl<'a> ControlPlane<'a> {
     /// request came to. A job to start: only as it was left, claimed and nothing of a machine yet (one cancelled
     /// meanwhile gets none, see `gone_key`; one taken up by a sweep is that sweep's).
     pub async fn later(&self, url: &str, what: &str) -> Result<()> {
+        // (After a sweep there was no request: the control plane's own address, as it last saw it.)
+        let base = match origin(url) { o if o.starts_with("http") => o, _ => get_json::<String>(self.store, "plane_url").await?.unwrap_or_default() };
         // A launch template whose one use is over (see `aws::fleet`).
         if let Some((region, name)) = what.strip_prefix("template ").and_then(|t| t.split_once(' ')) {
-            if let Some(a) = self.aws_connection().await? { let creds = self.aws_creds(&origin(url), &a).await?; self.remove_template(&creds, region, name).await }
+            if let Some(a) = self.aws_connection().await? { let creds = self.aws_creds(&base, &a).await?; self.remove_template(&creds, region, name).await }
             return Ok(())
         }
         let Some(key) = what.strip_prefix("start ") else { return Ok(()) };
         let Some(mut job) = get_json::<Job>(self.store, key).await? else { return Ok(()) };
         if job.state != "launching" || job.machine_id.is_some() || job.runner.is_some() { return Ok(()) }
-        self.start(&origin(url), &mut job).await
+        self.start(&base, &mut job).await
     }
 
     /// One machine for a job, of the size the label asks for, in the first place in the order that can run it now, with
@@ -3329,6 +3336,7 @@ impl<'a> ControlPlane<'a> {
         // The cache: what goes (over a repository's limit, unused for a week, never finished), once an hour.
         if let Err(e) = self.sweep_cache(&plane_url, now).await { let _ = self.store.put("cache-sweep-error", e).await; }
         self.redeliver_failed().await;
+        self.untold_gitlab(&plane_url, now).await;
         let moved_lately = self.untold(&plane_url, now).await;
         // Every 20 seconds while jobs wait for room; every minute while machines are up, or just after a move here;
         // every five otherwise (redeliveries, jobs not told of).
@@ -3373,6 +3381,42 @@ impl<'a> ControlPlane<'a> {
             }
         }
         moved_lately
+    }
+
+    /// GitLab's jobs that wait for a runner of this control plane and that GitLab never told it of (a job event GitLab
+    /// did not send, or that did not arrive): found by asking each project whose jobs come here for its pending jobs,
+    /// every few minutes, and given a machine as if the event had come. Which projects those are is asked less often.
+    async fn untold_gitlab(&self, plane_url: &str, now: u64) {
+        if self.config.gitlabs().next().is_none() { return }
+        let asked = self.store.get("gitlab:untold").await.ok().flatten().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        if now.saturating_sub(asked) < 180_000 { return }
+        let _ = self.store.put("gitlab:untold", now.to_string()).await;
+        for gl in self.config.gitlabs() {
+            let known = format!("gitlab:enabled:{}", gl.id);
+            let kept = get_json::<(Vec<(u64, String)>, u64)>(self.store, &known).await.ok().flatten();
+            let projects = match kept {
+                Some((p, at)) if now.saturating_sub(at) < 15 * 60_000 => p,
+                _ => {
+                    let Ok(all) = gitlab::projects(self.http, gl, &format!("{plane_url}/gitlab/webhook")).await else { continue };
+                    let on: Vec<(u64, String)> = all.into_iter().filter(|p| p.enabled).map(|p| (p.id, p.path)).collect();
+                    let _ = put_json(self.store, &known, &(on.clone(), now)).await;
+                    on
+                }
+            };
+            for (project, path) in projects {
+                let Ok(waiting) = gitlab::pending_jobs(self.http, gl, project).await else { continue };
+                for job in waiting {
+                    let Some(id) = job["id"].as_u64() else { continue };
+                    if matches!(self.store.get(&format!("job:gl{}", gitlab::local(&gl.id, id))).await, Ok(Some(_)) | Err(_)) { continue }
+                    // Made a moment ago: its event may still be on its way.
+                    if job["created_at"].as_str().and_then(aws::parse_iso_ms).is_none_or(|at| now.saturating_sub(at) < 45_000) { continue }
+                    let ev = gitlab::JobEvent { job_id: id, status: "pending".into(), project_id: project, project: path.clone(), pipeline_id: job["pipeline"]["id"].as_u64().unwrap_or(0),
+                        name: job["name"].as_str().unwrap_or_default().to_string(), stage: job["stage"].as_str().unwrap_or_default().to_string(), runner_id: None,
+                        git_ref: job["ref"].as_str().map(str::to_string), tag: job["tag"] == true, default_branch: None };
+                    let _ = self.gitlab_job_event(gl, ev, plane_url).await;
+                }
+            }
+        }
     }
 
     /// A webhook that failed while the runtime restarted (a secret changed, a new version) would leave its job waiting

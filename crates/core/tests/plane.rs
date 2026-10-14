@@ -3653,3 +3653,62 @@ fn a_gitlab_jobs_cache_is_its_projects_by_the_branch_gitlab_said_once_the_job_be
     assert_eq!(store.0.borrow().get(&format!("cachename:{ns}")).map(String::as_str), Some("acme/app"), "listed by the project's path");
     let _ = &mut began;
 }
+
+#[test]
+fn a_gitlab_job_gitlab_never_told_of_gets_its_machine_from_the_sweep() {
+    let hook = format!("{PLANE_URL}/gitlab/webhook");
+    let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+        let u = r.url.as_str();
+        let json = |v: serde_json::Value| Some(Response::new(200, "application/json", v.to_string()));
+        if u.starts_with("https://gitlab.example/api/v4/projects?membership=true") { return json(serde_json::json!([{ "id": 380, "path_with_namespace": "acme/app" }, { "id": 381, "path_with_namespace": "acme/other" }])) }
+        if u == "https://gitlab.example/api/v4/projects/380/hooks" { return json(serde_json::json!([{ "id": 1, "url": hook }])) }
+        if u == "https://gitlab.example/api/v4/projects/381/hooks" { return json(serde_json::json!([])) }
+        if u.starts_with("https://gitlab.example/api/v4/projects/380/jobs?scope[]=pending") {
+            return json(serde_json::json!([{ "id": 1977, "name": "test", "stage": "test", "ref": "main", "tag": false, "created_at": "2026-09-21T00:00:00Z", "pipeline": { "id": 9 } },
+                { "id": 1990, "name": "new", "created_at": "2026-09-21T14:13:00Z" }]))
+        }
+        assert!(!u.contains("/projects/381/jobs"), "a project whose jobs do not come here is not asked");
+        None
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(get("/health")));
+    block_on(plane.alarm()).unwrap();
+    // The job that waited unseen has its machine; the one made a moment ago waits for its event.
+    let job: serde_json::Value = serde_json::from_str(&store.0.borrow()["job:gl1977"]).unwrap();
+    assert_eq!((job["state"].as_str(), job["project_id"].as_u64()), (Some("launched"), Some(380)));
+    assert_eq!(launches(&clouds.0).len(), 1);
+    assert!(!store.0.borrow().contains_key("job:gl1990"));
+    // Asked again only minutes later.
+    let asked = clouds.0.calls.borrow().iter().filter(|c| c.1.contains("scope[]=pending")).count();
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(clouds.0.calls.borrow().iter().filter(|c| c.1.contains("scope[]=pending")).count(), asked);
+}
+
+/// A runtime that leaves what it can for after the answer, as the AWS control plane does.
+struct Leaves(RefCell<Vec<String>>);
+#[async_trait(?Send)]
+impl Timer for Leaves {
+    async fn wake_in(&self, _: u64) -> io::Result<()> { Ok(()) }
+    fn later(&self, what: &str) -> bool { self.0.borrow_mut().push(what.to_string()); true }
+}
+
+#[test]
+fn a_job_started_after_a_sweep_gets_the_control_planes_own_links() {
+    let (store, cache, leaves) = (Mem::default(), Cache::default(), Leaves(RefCell::new(vec![])));
+    let http = WithCache { clouds: FakeClouds::default(), keys: serde_json::json!({ "keys": [] }) };
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &leaves, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    let left = leaves.0.borrow().clone();
+    assert_eq!(left, ["start job:7"]);
+    // A sweep has no request: the job's machine is started with what the runtime gives, which is no address.
+    block_on(plane.later("", &left[0])).unwrap();
+    let script = String::from_utf8(STANDARD.decode(field(&launches(&http.clouds).pop().unwrap(), "UserData")).unwrap()).unwrap();
+    assert!(script.contains(&format!("c='{PLANE_URL}/cache/")) && script.contains(&format!("{PLANE_URL}/hello?runner=")), "{script}");
+}

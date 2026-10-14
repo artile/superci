@@ -1308,7 +1308,7 @@ impl Dashboard {
             let mut have: Vec<Plane> = self.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. })).cloned().collect();
             if let Some(k) = self.kept_plane.clone().filter(|k| !have.iter().any(|p| p.plane_id() == k.plane_id())) { have.push(k) }
             have.retain(|p| self.keyed.contains(p.plane_id()));
-            let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+            let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
             for p in have {
                 match writer.drop(&p, &self.status_secret) {
                     Ok(()) => said.push(format!("The control plane ({}) no longer takes this machine's key.", p.place())),
@@ -1751,9 +1751,26 @@ impl Dashboard {
         Ok(())
     }
 
+    /// A client for the kept Cloudflare sign-in. Renewed by one SuperCI at a time: with the folder's lock held, the file
+    /// is read again (another one may have just renewed it, and Cloudflare takes what renews a sign-in once: renewed
+    /// twice, the sign-in ends), and what was renewed is written before the lock is let go.
+    fn cf_client(&mut self) -> Result<Cloudflare> {
+        if self.cf.as_ref().is_some_and(|s| s.due()) && !self.cf_given {
+            if let Some(store) = self.store.clone() {
+                let _held = store.renewing();
+                self.take_in();
+                let renewed = self.cf.as_mut().map(|s| s.client());
+                self.keep();
+                if let Some(r) = renewed { return r }
+            }
+        }
+        self.cf.as_mut().ok_or_else(|| "Sign in with Cloudflare first.".to_string())?.client()
+    }
+
     fn cloudflare(&mut self) -> Result<Cloudflare> {
         let ended = self.cf_ended;
-        let client = self.cf.as_mut().ok_or(if ended { CF_ENDED } else { "Sign in with Cloudflare first." })?.client();
+        if self.cf.is_none() { return Err(if ended { CF_ENDED } else { "Sign in with Cloudflare first." }.into()) }
+        let client = self.cf_client();
         // Cloudflare no longer renews the kept sign-in: forgotten, and said as that.
         match client { Err(e) if cloudflare::over(&e) && !self.cf_given => { self.cf_over(); Err(CF_ENDED.into()) } other => other }
     }
@@ -1946,7 +1963,7 @@ impl Dashboard {
             return;
         }
         let (new, name) = (folder_key(), format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()));
-        let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+        let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
         if !planes.iter().all(|p| writer.put(p, &name, &cloudflare::plane_key(&new, p.url())).is_ok()) { return }
         let old = std::mem::replace(&mut self.status_secret, name);
         for p in &planes { let _ = writer.drop(p, &old); }
@@ -1961,7 +1978,7 @@ impl Dashboard {
         let unkeyed: Vec<Plane> = self.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. }) && !self.keyed.contains(p.plane_id())).cloned().collect();
         if unkeyed.is_empty() { return }
         // Handed to each at once.
-        let writer = Writer { cf: self.cf.as_mut().and_then(|s| s.client().ok()), aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+        let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
         let (name, key) = (self.status_secret.clone(), self.status_key.clone());
         let done: Vec<String> = std::thread::scope(|s| {
             let hs: Vec<_> = unkeyed.iter().map(|p| { let (writer, name, key) = (&writer, &name, &key); s.spawn(move || timed(&format!("{}: hand it this session's key", p.place()), || writer.put(p, name, &cloudflare::plane_key(key, p.url()))).ok().map(|_| p.plane_id().to_string())) }).collect();
@@ -2422,7 +2439,7 @@ impl Dashboard {
                 }
                 let plan = self.carry_plan(&from_view, &to_view);
                 if let Some(Carry::NeedsSignIn(p)) = plan.iter().find(|c| matches!(c, Carry::NeedsSignIn(_))) { return Ok(message(409, &format!("Sign in with {} first", provider_name(p)), "Its runners come along with the move.")) }
-                let writer = Writer { cf: self.cf.as_mut().map(|s| s.client()).transpose()?, aws: self.aws.as_mut().map(|s| s.credentials()).transpose()?, modal: self.modal.clone(), own: self.own() };
+                let writer = Writer { cf: if self.cf.is_some() { Some(self.cf_client()?) } else { None }, aws: self.aws.as_mut().map(|s| s.credentials()).transpose()?, modal: self.modal.clone(), own: self.own() };
                 let aws_account = self.aws.as_ref().map(|a| a.account_id.clone());
                 let cf_account = match &from { Plane::Cloudflare { account_id, .. } => Some(account_id.clone()), _ => self.cf_accounts.first().map(|a| a.0.clone()) };
                 let state = self.moving.clone();
@@ -3902,7 +3919,7 @@ mark();load()})();</script>"#;
                 Some((url.clone(), key, id, j["launched_ms"].as_u64().or(j["at_ms"].as_u64()).unwrap_or(end), end, gb * ran * 0.9))
             })
         }).collect();
-        let cf = if d.cf_accounts.is_empty() { None } else { d.cf.as_mut().and_then(|s| s.client().ok()) };
+        let cf = if d.cf_accounts.is_empty() || d.cf.is_none() { None } else { d.cf_client().ok() };
         let (accounts, key, shared, modal) = (d.cf_accounts.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(), d.status_key.clone(), shared.clone(), d.modal.clone());
         d.measuring = true;
         std::thread::spawn(move || {
@@ -7602,6 +7619,25 @@ mod tests {
         *lock(&d.deployed) = true;
         assert!(d.render("plane", &[], None).contains(r#"<div data-go="/"></div>"#));
         assert!(d.render("plane", &[], None).contains("Set up a control plane"));
+    }
+
+    #[test]
+    fn a_cloudflare_sign_in_another_superci_just_renewed_is_taken_not_renewed_again() {
+        let dir = std::env::temp_dir().join(format!("superci-renew-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        let store = Store::at(&dir);
+        // Two SuperCIs on one folder, both with the sign-in as it was (due to be renewed, here with nothing to renew it).
+        let mut first = Dashboard::signed_in(Some(store.clone()));
+        first.cf = Some(cloudflare::Session::expired_for_test());
+        first.keep();
+        let mut second = Dashboard::signed_in(Some(store.clone()));
+        assert!(second.cf.as_ref().is_some_and(|s| s.due()));
+        // The first renews it and writes it (as a renewal does).
+        first.cf = Some(cloudflare::Session::from_token("renewed"));
+        first.keep();
+        // The second, its own due, takes the renewed one from the file instead of renewing (which would end it).
+        assert!(second.cf_client().is_ok());
+        assert!(second.cf.as_ref().is_some_and(|s| !s.due()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

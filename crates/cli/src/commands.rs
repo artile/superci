@@ -568,6 +568,14 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let got = cf.debug_call(w(2), w(3), body)?;
             Ok(Done { said: vec![got.to_string()], data: got })
         }
+        #[cfg(debug_assertions)]
+        ("debug", "cloudflare-r2") => {
+            let mut d = signed_in();
+            let cf = d.cf.as_mut().ok_or("Sign in with Cloudflare first.")?.client()?;
+            let account = cf.accounts()?.first().map(|(id, _)| id.clone()).ok_or("no Cloudflare account")?;
+            let got = cf.debug_r2_binding(&account, w(2))?;
+            Ok(Done { said: vec![got.to_string()], data: got })
+        }
         // (GitHub's runner taking one job from SuperCI's own service, run here: `superci debug runner-service FILE JOB
         // ROOT PORT JITFILE [--secret=N=V] [--var=N=V]`, ROOT being where the runner's calls go, e.g. http://localhost:8080/runner/rig.)
         #[cfg(debug_assertions)]
