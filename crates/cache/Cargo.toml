@@ -15,3 +15,6 @@ path = "src/main.rs"
 serde_json.workspace = true
 getrandom.workspace = true
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+serde_json.workspace = true

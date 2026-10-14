@@ -229,7 +229,8 @@ impl State {
         if let Some(hash) = path.strip_prefix("v1/cache/") { return self.nx(&req, hash) }
         if let Some(rest) = path.strip_prefix("bazel/") { return self.bazel(&req, rest, body) }
         // GitLab's runner's cache: "S3" here, path-style, in the bucket `superci` (see the machine's start-up script).
-        if let Some(key) = path.strip_prefix("superci/") { return self.gitlab(&req, key, body) }
+        // (Its keys are under the cache path it is given, `gl`: the program's own addresses are `superci/u/`, `superci/d/`.)
+        if path.starts_with("superci/gl/") { return self.gitlab(&req, &path["superci/".len()..], body) }
         let blob = path.strip_prefix("superci/u/");
         let reply = match blob { Some(id) => self.upload(&req, id, query), None => self.results(&req, &url) };
         let reply = reply.unwrap_or_else(|e| { eprintln!("{e}"); Response::bytes(500, "text/plain", e.into_bytes()) });
