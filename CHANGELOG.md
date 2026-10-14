@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.0 — unreleased
+## 0.19.0 — 2026-10-15
 - `superci runs create` prints every line of a run's jobs. GitHub's runner sends its lines as it goes only as fast as it can, holding 1,024 at most and dropping the rest, so a job that printed a lot (an e2e suite's 5,000 lines) was cut short though it passed. Each step's whole log, which the runner sends when the step ends, is now kept (in the control plane's bucket, where there is one) and what was dropped is printed from it, in order. The dashboard's log of such a job is the whole one too.
 - The control plane keeps its records apart by kind (on AWS, a DynamoDB partition for each), so one kind's traffic never slows another's; what an earlier version kept is moved over by itself, a little at each minute's sweep, with nothing to do.
 - Starting a machine, the minute's sweep and the dashboard read only the jobs still going and each day's totals, not every job ever kept, so they stay as fast with a year of history as with a day's. Spend, limits and usage come from each day's totals.
