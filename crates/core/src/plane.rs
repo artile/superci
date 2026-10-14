@@ -681,6 +681,62 @@ pub fn github_usd_per_minute(cpu: u32, arm64: bool) -> f64 {
     match cpu { 0..=2 => 0.006, 3..=4 => 0.012, 5..=8 => 0.022, 9..=16 => 0.042, 17..=32 => 0.082, 33..=64 => 0.162, _ => 0.252 }
 }
 
+/// GitHub's price per minute for its hosted Windows runner with this many CPUs (from GitHub's price list).
+pub fn github_windows_usd_per_minute(cpu: u32) -> f64 {
+    match cpu { 0..=2 => 0.010, 3..=4 => 0.022, 5..=8 => 0.042, 9..=16 => 0.082, 17..=32 => 0.162, _ => 0.322 }
+}
+
+/// GitLab.com's price per minute for its hosted runner of this many CPUs: compute minutes by the runner's size (one
+/// a minute on the small one of 2 CPUs, two on the medium of 4, three on the large of 8, six on 16, twelve on 32),
+/// each $10 for 1,000 bought beyond a plan's.
+pub fn gitlab_usd_per_minute(cpu: u32) -> f64 {
+    0.01 * match cpu { 0..=2 => 1.0, 3..=4 => 2.0, 5..=8 => 3.0, 9..=16 => 6.0, 17..=32 => 12.0, _ => 24.0 }
+}
+
+/// The periods usage is told for: a day (by the hour), a week and 30 days (by the day).
+pub const USAGE_PERIODS: [(&str, u64, usize); 3] = [("day", 3_600_000, 24), ("week", 86_400_000, 7), ("month", 86_400_000, 30)];
+
+/// What jobs used in a period up to now, and what the code host's own runners would have charged for them: how many
+/// were queued, ran and did not run, their machines' minutes and GitHub's billed minutes (each job rounded up to a
+/// whole minute, as GitHub and GitLab bill), what they cost and what the code host would have, how long they waited
+/// for a machine; and the same for each hour or day of it, the oldest first.
+pub fn usage(jobs: &[Job], host_price: impl Fn(&Job) -> f64, now: u64, step_ms: u64, steps: usize) -> serde_json::Value {
+    let since = now.saturating_sub(step_ms * steps as u64);
+    let mut buckets = vec![(0u64, 0u64, 0f64, 0f64, 0f64, Vec::<u64>::new()); steps];
+    let (mut queued, mut ran, mut not_ran, mut machine_ms, mut billed, mut cost, mut host) = (0u64, 0u64, 0u64, 0u64, 0u64, 0f64, 0f64);
+    let mut waits = vec![];
+    for j in jobs.iter().filter(|j| j.at_ms >= since && j.at_ms <= now) {
+        let b = &mut buckets[(((j.at_ms - since) / step_ms) as usize).min(steps - 1)];
+        queued += 1;
+        let usd = job_usd(j, now);
+        cost += usd;
+        b.3 += usd;
+        if ["failed", "orphan", "swept"].contains(&j.state.as_str()) && j.started_ms.is_none() { not_ran += 1; b.1 += 1 }
+        let Some(start) = j.started_ms else { continue };
+        ran += 1;
+        b.0 += 1;
+        let took = j.ended_ms.unwrap_or(if active(j) { now } else { start }).saturating_sub(start);
+        machine_ms += took;
+        let minutes = took.div_ceil(60_000).max(1);
+        billed += minutes;
+        let theirs = minutes as f64 * host_price(j);
+        host += theirs;
+        b.2 += took as f64 / 60_000.0;
+        b.4 += theirs;
+        let wait = start.saturating_sub(j.queued_ms.unwrap_or(j.at_ms));
+        waits.push(wait);
+        b.5.push(wait);
+    }
+    waits.sort_unstable();
+    let median = |w: &mut Vec<u64>| { w.sort_unstable(); w.get(w.len() / 2).copied() };
+    serde_json::json!({
+        "since_ms": since, "step_ms": step_ms, "jobs": queued, "ran": ran, "not_ran": not_ran,
+        "machine_minutes": (machine_ms as f64 / 60_000.0 * 10.0).round() / 10.0, "billed_minutes": billed, "usd": cost, "host_usd": host,
+        "wait_median_ms": waits.get(waits.len() / 2), "wait_fastest_ms": waits.first(), "wait_slowest_ms": waits.last(),
+        "steps": buckets.iter_mut().map(|(r, n, m, c, h, w)| serde_json::json!({ "ran": r, "not_ran": n, "minutes": (*m * 10.0).round() / 10.0, "usd": c, "host_usd": h, "wait_median_ms": median(w) })).collect::<Vec<_>>(),
+    })
+}
+
 /// What a cloud's machines can be (the clouds this control plane starts machines in).
 fn capacity_of(cloud: &str) -> Capacity {
     match cloud { "aws" => Capacity::aws(), "modal" => Capacity::modal(), _ => Capacity::cloudflare() }
@@ -1159,6 +1215,9 @@ impl<'a> ControlPlane<'a> {
         let mut jobs_all: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
         jobs_all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
         let jobs: Vec<Job> = jobs_all.iter().take(50).cloned().collect();
+        // What jobs used over a day, a week and 30 days, beside what the code host's runners would have charged.
+        let now = self.clock.now_ms();
+        let usage: serde_json::Map<String, serde_json::Value> = USAGE_PERIODS.iter().map(|(name, step, steps)| (name.to_string(), usage(&jobs_all, |j| self.host_price(j), now, *step, *steps))).collect();
         // Each with what its machine said of its own start, where one did (kept apart: see `MachineStart`).
         let hellos: HashMap<String, serde_json::Value> = self.store.list("hello:").await.unwrap_or_default().into_iter().filter_map(|(k, v)| Some((k.strip_prefix("hello:")?.to_string(), serde_json::from_str(&v).ok()?))).collect();
         let with_machines: Vec<serde_json::Value> = jobs.iter().map(|j| {
@@ -1208,7 +1267,19 @@ impl<'a> ControlPlane<'a> {
                 "denied": self.store.list("denied:").await?.into_iter().filter_map(|(k, v)| Some((k.strip_prefix("denied:")?.to_string(), serde_json::from_str::<serde_json::Value>(&v).ok()?))).collect::<serde_json::Map<_, _>>(),
             },
             "jobs": with_machines,
+            "usage": usage,
         })))
+    }
+
+    /// What the code host's own runner of a job's size charges a minute: GitLab.com's for a GitLab job, else GitHub's
+    /// (Linux x64 or arm64, Windows; with a GPU, GitHub's 4-core GPU runner).
+    fn host_price(&self, j: &Job) -> f64 {
+        let spec = self.config.parse(&j.label).and_then(|s| s.ok()).map(|s| s.or(&self.config.machine)).unwrap_or_else(|| self.config.machine.clone());
+        let cpu = j.cpu.or(spec.cpu).unwrap_or(2);
+        if j.provider == "gitlab" { return gitlab_usd_per_minute(cpu) }
+        if spec.gpu.is_some() { return 0.052 }
+        if spec.os() == "windows" { return github_windows_usd_per_minute(cpu) }
+        github_usd_per_minute(cpu, spec.arch.as_deref() == Some("arm64"))
     }
 
     /// What the App asks GitHub for (asked again after ten minutes).

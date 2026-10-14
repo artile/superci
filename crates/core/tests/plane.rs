@@ -3819,3 +3819,30 @@ fn a_working_tree_goes_to_the_control_planes_bucket_in_one_and_its_checkout_is_s
     let none = block_on(plane2.handle(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id=tree-fedcba9876543210&part=0&link=1")).with_header("authorization", "Bearer dashboard-session-key-1")));
     assert!(json(&none)["url"].is_null());
 }
+
+#[test]
+fn usage_counts_every_job_of_a_period_its_minutes_and_what_the_code_host_would_have_charged() {
+    use superci_core::plane::{usage, Job};
+    let now = 100 * 86_400_000u64;
+    let job = |at_ago: u64, ran_s: Option<u64>, state: &str, usd: f64, provider: &str| Job { job_id: at_ago, at_ms: now - at_ago, state: state.into(), provider: provider.into(), cost_usd: Some(usd),
+        started_ms: ran_s.map(|_| now - at_ago + 10_000), ended_ms: ran_s.map(|s| now - at_ago + 10_000 + s * 1000), ..Default::default() };
+    let jobs = vec![
+        job(3_600_000, Some(61), "done", 0.01, ""),          // an hour ago: 61 s, billed 2 minutes
+        job(5 * 3_600_000, Some(30), "done", 0.02, "gitlab"), // five hours ago: 30 s, billed 1 minute
+        job(7_200_000, None, "failed", 0.0, ""),              // two hours ago: never ran
+        job(3 * 86_400_000, Some(600), "done", 0.05, ""),     // three days ago: in the week only
+        job(40 * 86_400_000, Some(600), "done", 0.05, ""),    // forty days ago: in none
+    ];
+    let price = |j: &Job| if j.provider == "gitlab" { 0.01 } else { 0.006 };
+    let day = usage(&jobs, price, now, 3_600_000, 24);
+    assert_eq!((day["jobs"].as_u64(), day["ran"].as_u64(), day["not_ran"].as_u64(), day["billed_minutes"].as_u64()), (Some(3), Some(2), Some(1), Some(3)));
+    assert_eq!(day["machine_minutes"].as_f64(), Some(1.5));
+    assert!((day["usd"].as_f64().unwrap() - 0.03).abs() < 1e-9 && (day["host_usd"].as_f64().unwrap() - (2.0 * 0.006 + 0.01)).abs() < 1e-9, "{day}");
+    assert_eq!(day["wait_median_ms"].as_u64(), Some(10_000));
+    // By the hour, the oldest first (the last is the hour up to now; a job just an hour ago is in it).
+    let steps = day["steps"].as_array().unwrap();
+    assert_eq!((steps.len(), steps[23]["ran"].as_u64(), steps[19]["ran"].as_u64(), steps[22]["not_ran"].as_u64()), (24, Some(1), Some(1), Some(1)));
+    let week = usage(&jobs, price, now, 86_400_000, 7);
+    assert_eq!((week["jobs"].as_u64(), week["billed_minutes"].as_u64(), week["steps"].as_array().unwrap().len()), (Some(4), Some(13), 7));
+    assert_eq!(usage(&jobs, price, now, 86_400_000, 30)["jobs"].as_u64(), Some(4));
+}

@@ -94,6 +94,8 @@ pub struct Dashboard {
     gitlab_shown: String,
     /// The job its page shows (`?p=job&id=…`, and `gl=…` for a GitLab job of a further connection).
     job_shown: (String, String),
+    /// Overview's period for its figures: day, week or month.
+    usage_shown: String,
     /// The run its page shows (`?p=run&repo=…&id=…&attempt=…`).
     run_shown: (String, String, String),
     aws_pending: Option<aws::Pending>,
@@ -976,7 +978,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), usage_shown: String::new(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -3554,7 +3556,7 @@ mark();load()})();</script>"#;
         let (setup, waiting) = self.setup_card(v);
         // Still reading it: the page's own loading shape (the same as before the first answer), looked at again.
         if v.status.is_none() && v.online && setup.is_empty() { return (skeleton("overview", "Overview"), true) }
-        let jobs_card = if v.status.is_none() && v.online { overview_skeleton_cards() } else { overview_cards(v, &jobs) };
+        let jobs_card = if v.status.is_none() && v.online { overview_skeleton_cards() } else { overview_cards(v, &jobs, &self.usage_shown) };
         (format!(r#"<div class="bar"><h1 class="page-title">Overview</h1></div><div class="cards">{setup}{jobs_card}</div>"#), waiting)
     }
 
@@ -5340,7 +5342,7 @@ fn job_link(j: &serde_json::Value) -> String {
 
 /// Overview's cards: the last day's jobs (did they get a machine, how fast, at what cost), the ones that need a look,
 /// the latest; then where they ran.
-fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value]) -> String {
+fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> String {
     let jobs: Vec<serde_json::Value> = jobs.iter().map(|j| with_hosts(v, j)).collect();
     let now = now_ms();
     let day: Vec<&serde_json::Value> = jobs.iter().filter(|j| now.saturating_sub(j["at_ms"].as_u64().unwrap_or_default()) < 86_400_000).collect();
@@ -5431,10 +5433,74 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value]) -> String {
         format!(r#"<div class="sub-block"><h3>Where they ran</h3><div class="split" title="{total} jobs that ran">{bar}</div><div class="split-legend">{legend}</div></div>"#)
     };
     let figures = if day.is_empty() { r#"<p class="note">No jobs in the last day.</p>"#.to_string() } else { format!(r#"<div class="kpis">{jobs_kpi}{wait_kpi}{spend_kpi}</div>"#) };
-    // The day in one card; the latest jobs in their own, with all of them a click away.
-    let jobs_card = format!(r#"<section class="card big jobs-card"><div class="card-head"><h2>Jobs</h2><span class="card-sub">Last 24 hours</span></div>{figures}{split}</section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div>{latest}<div class="card-foot end"><a class="chip" href="/?p=jobs">All jobs ›</a></div></section>"#);
+    // From a control plane that counts every job it keeps (0.18.2 and newer): the period chosen, with its minutes
+    // and what the code host's own runners would have charged. Else the last day of the latest jobs, as before.
+    let (head, figures, split) = match v.status.as_ref().map(|s| &s["usage"]).filter(|u| u.is_object()) {
+        Some(all) => {
+            let period = if ["week", "month"].contains(&period) { period } else { "day" };
+            let u = &all[period];
+            let switch = [("day", "24 hours"), ("week", "7 days"), ("month", "30 days")].iter()
+                .map(|(p, name)| format!(r#"<a href="/?p=overview&amp;usage={p}"{}>{name}</a>"#, if *p == period { r#" class="on" aria-current="true""# } else { "" })).collect::<String>();
+            let head = format!(r#"<h2>Usage</h2><span class="card-sub"></span><nav class="seg seg-links" aria-label="Period">{switch}</nav>"#);
+            let figures = if u["jobs"].as_u64().unwrap_or(0) == 0 { format!(r#"<p class="note">No jobs in the last {}.</p>"#, match period { "week" => "7 days", "month" => "30 days", _ => "24 hours" }) } else { usage_figures(u, period, &jobs) };
+            (head, figures, if period == "day" { split } else { String::new() })
+        }
+        None => (r#"<h2>Jobs</h2><span class="card-sub">Last 24 hours</span>"#.to_string(), figures, split),
+    };
+    // The period in one card; the latest jobs in their own, with all of them a click away.
+    let jobs_card = format!(r#"<section class="card big jobs-card"><div class="card-head">{head}</div>{figures}{split}</section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div>{latest}<div class="card-foot end"><a class="chip" href="/?p=jobs">All jobs ›</a></div></section>"#);
 
     jobs_card
+}
+
+/// Overview's four figures for a period, from the control plane's count of every job in it (see
+/// `superci_core::plane::usage`): jobs, machine minutes, the wait for a machine, and what they cost beside what the
+/// code host's own runners would have charged. Each with its hours (a day) or days (a week, 30 days) as bars.
+fn usage_figures(u: &serde_json::Value, period: &str, jobs: &[serde_json::Value]) -> String {
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    let f = |k: &str| u[k].as_f64().unwrap_or(0.0);
+    let steps = u["steps"].as_array().cloned().unwrap_or_default();
+    let count = steps.len();
+    let step_name = |i: usize| { let ago = count - 1 - i; match (period, ago) { ("day", 0) => "this hour".to_string(), ("day", 1) => "an hour ago".into(), ("day", a) => format!("{a} hours ago"), (_, 0) => "the last 24 hours".into(), (_, 1) => "the day before".into(), (_, a) => format!("{a} days ago") } };
+    let kpi = |big: String, caption: &str, spark: String, sub: String| format!(r#"<div class="kpi"><div class="kpi-num">{big}</div><div class="kpi-cap">{caption}</div>{spark}<div class="kpi-sub">{sub}</div></div>"#);
+    let spark = |values: Vec<(f64, f64, String)>| {
+        let most = values.iter().map(|(a, b, _)| a + b).fold(0.0_f64, f64::max).max(f64::MIN_POSITIVE);
+        let w = 240.0 / values.len().max(1) as f64;
+        let bar = (w * 0.6).max(2.0);
+        let bars = values.iter().enumerate().map(|(i, (a, b, tip))| {
+            let x = i as f64 * w + (w - bar) / 2.0;
+            let (ha, hb) = (a / most * 30.0, b / most * 30.0);
+            let lower = if *a > 0.0 { format!(r#"<rect class="a" x="{x:.1}" y="{:.1}" width="{bar:.1}" height="{:.1}" rx="1.5"/>"#, 34.0 - ha.max(1.5), ha.max(1.5)) } else { String::new() };
+            let upper = if *b > 0.0 { format!(r#"<rect class="b" x="{x:.1}" y="{:.1}" width="{bar:.1}" height="{:.1}" rx="1.5"/>"#, 34.0 - ha - hb.max(1.5) - if *a > 0.0 { 1.5 } else { 0.0 }, hb.max(1.5)) } else { String::new() };
+            format!(r#"<g><title>{}</title><rect class="hit" x="{:.1}" y="0" width="{w:.1}" height="36"/>{lower}{upper}</g>"#, esc(tip), i as f64 * w)
+        }).collect::<String>();
+        format!(r#"<svg class="spark" viewBox="0 0 240 36" preserveAspectRatio="none" aria-hidden="true"><line class="base" x1="0" y1="35.5" x2="240" y2="35.5"/>{bars}</svg>"#)
+    };
+    let s = |i: usize, k: &str| steps[i][k].as_f64().unwrap_or(0.0);
+    // Jobs: those that ran and those that did not.
+    let jobs_spark = spark((0..count).map(|i| (s(i, "ran"), s(i, "not_ran"), format!("{}: {} ran{}", step_name(i), s(i, "ran"), if s(i, "not_ran") > 0.0 { format!(", {} did not", s(i, "not_ran")) } else { String::new() }))).collect());
+    let jobs_kpi = kpi(n("jobs").to_string(), if n("jobs") == 1 { "job" } else { "jobs" }, jobs_spark,
+        if n("not_ran") == 0 { format!("{} ran", n("ran")) } else { format!(r#"{} ran<span class="sep">·</span><span class="bad-text">{} did not</span>"#, n("ran"), n("not_ran")) });
+    // Minutes: what the machines ran, and what the code host bills (each job rounded up to a minute).
+    let minutes = |m: f64| if m >= 6000.0 { format!("{:.0} h", m / 60.0) } else if m >= 100.0 { format!("{:.0} min", m) } else { format!("{:.1} min", m) };
+    let host = if jobs.iter().any(|j| j["provider"] == "gitlab") && jobs.iter().any(|j| j["provider"] != "gitlab") { "GitHub and GitLab" } else if jobs.iter().any(|j| j["provider"] == "gitlab") { "GitLab" } else { "GitHub" };
+    let minutes_spark = spark((0..count).map(|i| (s(i, "minutes"), 0.0, format!("{}: {}", step_name(i), minutes(s(i, "minutes"))))).collect());
+    let minutes_kpi = kpi(minutes(f("machine_minutes")), "machine minutes", minutes_spark, format!("{} min as {host} {} them", n("billed_minutes"), if host.contains(" and ") { "bill" } else { "bills" }));
+    // The wait for a machine: each step's median.
+    let secs = |ms: u64| if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { format!("{} min", ms / 60_000) };
+    let wait_spark = spark((0..count).map(|i| { let m = steps[i]["wait_median_ms"].as_u64(); (m.unwrap_or(0) as f64, 0.0, match m { Some(m) => format!("{}: {} median", step_name(i), secs(m)), None => format!("{}: no jobs", step_name(i)) }) }).collect());
+    let wait_kpi = kpi(u["wait_median_ms"].as_u64().map(secs).unwrap_or_else(|| "—".into()), "median wait for a machine", wait_spark,
+        match (u["wait_fastest_ms"].as_u64(), u["wait_slowest_ms"].as_u64()) { (Some(a), Some(b)) => format!("Fastest {} · slowest {}", secs(a), secs(b)), _ => "From queued to running".into() });
+    // What it cost, beside what the code host's runners of the same sizes would have charged: what that saved.
+    let (spent, theirs) = (f("usd"), f("host_usd"));
+    let spend_spark = spark((0..count).map(|i| (s(i, "usd"), 0.0, format!("{}: {} (at {host}: {})", step_name(i), usd(s(i, "usd")), usd(s(i, "host_usd"))))).collect());
+    let top = spent.max(theirs).max(0.000_001);
+    let compare = format!(r#"<div class="vs"><div><span>Yours</span><span class="vs-bar"><i class="you" style="width:{:.0}%"></i></span><span class="mono">{}</span></div><div><span>{host}</span><span class="vs-bar"><i class="them" style="width:{:.0}%"></i></span><span class="mono">{}</span></div></div>"#,
+        spent / top * 100.0, usd(spent), theirs / top * 100.0, usd(theirs));
+    let saved = if theirs > spent { format!(r#"<span class="good-text">{} saved</span><span class="sep">·</span>{:.0}% less"#, usd(theirs - spent), (1.0 - spent / theirs) * 100.0) } else if theirs > 0.0 { format!("{}: {}", host, usd(theirs)) } else { String::new() };
+    let versus = format!(r#"<span class="gh-mark" tabindex="0">{saved}<span class="gh-pop" role="tooltip"><strong>Against {host}'s own runners</strong>{compare}<small>The same jobs on runners of the same size there, each billed by the minute.</small></span></span>"#);
+    let spend_kpi = kpi(usd(spent), "spent", spend_spark, versus);
+    format!(r#"<div class="kpis four">{jobs_kpi}{minutes_kpi}{wait_kpi}{spend_kpi}</div>"#)
 }
 
 /// Overview's cards before any job has run: the same shapes with nothing in them yet, so the page already shows what
@@ -5893,6 +5959,7 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
         if q("fragment") == "1" {
             shared.lock().unwrap_or_else(|e| e.into_inner()).gitlab_shown = q("g").chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).take(12).collect();
             if q("p") == "run" { shared.lock().unwrap_or_else(|e| e.into_inner()).run_shown = (q("repo").chars().filter(|c| c.is_ascii_alphanumeric() || "-_./".contains(*c)).take(200).collect(), q("id").chars().filter(|c| c.is_ascii_digit()).take(20).collect(), q("attempt").chars().filter(|c| c.is_ascii_digit()).take(4).collect()) }
+            if ["", "overview"].contains(&q("p")) { shared.lock().unwrap_or_else(|e| e.into_inner()).usage_shown = match q("usage") { u @ ("week" | "month") => u.to_string(), _ => "day".to_string() } }
             if q("p") == "job" { shared.lock().unwrap_or_else(|e| e.into_inner()).job_shown = (q("id").chars().filter(|c| c.is_ascii_digit()).take(20).collect(), q("gl").chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-').take(24).collect()) }
             return Response::new(200, "text/html; charset=utf-8", Dashboard::live(shared, q("p"), q("plane").parse().ok(), new_here, req.last.as_deref()))
         }

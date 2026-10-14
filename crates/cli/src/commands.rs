@@ -51,6 +51,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "The projects a GitLab connection's token reaches (on GitHub, repositories are chosen where the App is installed).\n\nlist      Each with its id and whether its jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
     ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]\n  superci accounts update aws [--monthly-usd=N|none] [--daily-usd=N|none]\n                              [--aws-budget=none|emails|stops|lift] [--email=ADDRESS]",
         "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most the AWS account may spend on machines in a month and in a day (UTC), its spot and on-demand\n          machines together (`none` lifts one). At a limit, jobs go to the providers of other accounts in the\n          order. The whole CI's limits are `superci limits update`.\n          --aws-budget: a budget in the AWS account itself for the monthly limit, made with your sign-in (the\n          control plane gets no permission for it). AWS counts the account's real bill, all of it and hours late.\n          emails: AWS writes to --email at 80% and at 100%. stops: that, and at 100% AWS refuses new machines to\n          the control plane until the next month. lift: takes that refusal off now. none: removes all of it.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
+    ("usage", "  superci usage retrieve [--period=day|week|month]",
+        "What jobs used in the last 24 hours (day, unless given), 7 days or 30 days: how many ran, their machines' minutes and\nthe minutes GitHub or GitLab would bill (each job rounded up to a minute), what they cost, and what the code host's\nown runners of the same sizes would have charged."),
     ("artifacts", "  superci artifacts list --run=ID\n  superci artifacts retrieve NAME --run=ID [--out=DIR]",
         "What a run from a computer's jobs kept with upload-artifact, kept for a day. (A run of GitHub's keeps its artifacts at\nGitHub: `gh run download`.)\n\nlist      Each artifact's name and size.\nretrieve  Fetches one and unpacks it into DIR (./NAME unless given), as download-artifact would."),
     ("caches", "  superci caches retrieve\n  superci caches list [--repo=OWNER/NAME]\n  superci caches update [--enabled=true|false] [--size-gb=N] [--days=N]\n  superci caches delete --repo=OWNER/NAME [KEY] [--scope=REF] --confirm",
@@ -110,7 +112,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "artifacts"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits", "caches"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "artifacts", "usage"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits", "caches"]),
                 group(&["connections", "deliveries", "projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -138,7 +140,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 11] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs"];
-const VALUES: [&str; 46] = ["run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 47] = ["period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -396,6 +398,21 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 None => { let d = ready()?; let plane = in_use(&d)?; (plane.url().to_string(), crate::cloudflare::plane_key(d.key(), plane.url())) }
             };
             Ok(crate::local_run::create(&url, &key, workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, steps)?)
+        }
+        ("usage", "retrieve") => {
+            let period = args.get("period").unwrap_or("day");
+            let Some(&(_, _, _)) = superci_core::plane::USAGE_PERIODS.iter().find(|(p, _, _)| *p == period) else { return usage("--period is day, week or month.") };
+            let mut d = signed_in();
+            let (v, _) = look(&mut d)?;
+            let u = v.status.as_ref().map(|s| s["usage"][period].clone()).filter(|u| u.is_object()).ok_or("The control plane does not count usage yet: update it (`superci planes update`).")?;
+            let (n, f) = (|k: &str| u[k].as_u64().unwrap_or(0), |k: &str| u[k].as_f64().unwrap_or(0.0));
+            let span = match period { "week" => "7 days", "month" => "30 days", _ => "24 hours" };
+            let (spent, theirs) = (f("usd"), f("host_usd"));
+            let mut said = vec![format!("The last {span}: {} jobs, {} ran{}.", n("jobs"), n("ran"), if n("not_ran") > 0 { format!(", {} did not", n("not_ran")) } else { String::new() }),
+                format!("{:.1} machine minutes; {} minutes as GitHub or GitLab bills them (each job rounded up).", f("machine_minutes"), n("billed_minutes")),
+                format!("Spent ${spent:.2}; the same jobs on the code host's own runners: ${theirs:.2}{}.", if theirs > spent { format!(" (${:.2} saved, {:.0}% less)", theirs - spent, (1.0 - spent / theirs) * 100.0) } else { String::new() })];
+            if let Some(m) = u["wait_median_ms"].as_u64() { said.push(format!("Median wait for a machine: {} s.", (m + 500) / 1000)) }
+            Ok(Done { said, data: json!({ "period": period, "usage": u }) })
         }
         ("artifacts", operation @ ("list" | "retrieve")) => {
             let mut d = signed_in();

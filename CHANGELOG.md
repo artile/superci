@@ -2,7 +2,8 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.18.2 — unreleased
+## 0.18.2 — 2026-10-14
+- Overview's figures cover the last 24 hours, 7 days or 30 days (a switch on the card), counted by the control plane over every job it keeps, not from the latest fifty: jobs, machine minutes beside the minutes GitHub or GitLab would bill (each job rounded up to a minute), the wait for a machine, and what they cost beside what the code host's own runners of the same sizes would have charged, with what that saved. `superci usage retrieve --period=day|week|month` says the same.
 - A run from a computer with a working tree of many MB failed before it started: the tree went into the control plane's DynamoDB table, which writes only so much a second, and DynamoDB refused it ("ThrottlingException"). The tree now goes into the control plane's bucket in one piece, as a build service takes its source, and its machine fetches it from there; a tree may be 1 GB packed (150 MB before). A control plane with no bucket takes it as before.
 - The control plane on AWS asks DynamoDB again when it says it is too busy, waiting a little longer each time, as AWS's own tools do, rather than fail at once.
 
