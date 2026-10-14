@@ -321,12 +321,17 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         // spare machines there, the earlier in this order the better. With few left, one by one is as quick.
         if at == 1 && l.spot && l.fleet && pools.len() - at >= FLEET_FROM {
             let rest: Vec<(String, Option<String>, String)> = pools[at..].iter().take(FLEET_MOST).map(|(t, p)| ((*t).clone(), p.0.map(|(_, id)| id.clone()), zone_of(*p))).collect();
-            // AWS goes by where most machines are spare, which is often an older type, and a job is over sooner on
-            // a newer one: the pools as fast as the first choice are asked first, the slower ones only when none of
-            // those has a machine (a second request, when there are enough of each to be worth one).
-            let first = speed(pools[0].0);
-            let (fast, slow): (Vec<_>, Vec<_>) = rest.iter().cloned().partition(|(kind, ..)| speed(kind) >= first - 0.001);
-            let groups = if fast.len() >= FLEET_FROM && !slow.is_empty() { vec![fast, slow] } else { vec![rest] };
+            // AWS goes by where most machines are spare, which is often an older type or a larger one, and a job is
+            // over sooner on a newer type and costs less on the size it asked for: the pools of that size and as
+            // fast as the first choice are asked first; then the slower ones of that size; larger sizes only when no
+            // pool of the size asked for has a machine (each a request of its own).
+            let (first, size) = (speed(pools[0].0), cpus(pools[0].0));
+            let tier = |kind: &str| (cpus(kind) > size) as u8 * 2 + (speed(kind) < first - 0.001) as u8;
+            let mut groups: Vec<Vec<(String, Option<String>, String)>> = vec![];
+            for t in 0..4u8 {
+                let group: Vec<_> = rest.iter().filter(|(kind, ..)| tier(kind) == t).cloned().collect();
+                if !group.is_empty() { groups.push(group) }
+            }
             match fleet(http, creds, l, &groups, now_ms, told).await {
                 Ok(answer) => return answer,
                 // Not to be had in one request here: one by one, as before.
@@ -492,6 +497,15 @@ pub async fn offered_types(http: &dyn Http, region: &str, creds: &Credentials, t
     let xml = ec2(http, region, creds, "DescribeInstanceTypeOfferings", serde_json::json!({ "LocationType": "region", "Filter": [{ "Name": "instance-type", "Value": types }] }), now_ms).await?;
     let have: Vec<&str> = xml.split("<item>").skip(1).filter_map(|item| xml_tag(item, "instanceType")).collect();
     Ok(types.iter().filter(|t| have.contains(&t.as_str())).cloned().collect())
+}
+
+/// How many CPUs a machine type of the usual sizes has, by its name (`m8a.large` 2, `c8a.4xlarge` 16); none known:
+/// counted as the same size as any other.
+pub fn cpus(kind: &str) -> u32 {
+    match kind.rsplit('.').next().unwrap_or_default() {
+        "nano" | "micro" | "small" | "medium" => 1, "large" => 2, "xlarge" => 4,
+        size => size.strip_suffix("xlarge").and_then(|n| n.parse::<u32>().ok()).map(|n| n * 4).unwrap_or(0),
+    }
 }
 
 /// How fast a machine type is beside one of the generation before, for choosing among spot pools by what a job

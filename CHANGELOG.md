@@ -8,6 +8,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - As GitHub runs them: each combination of a matrix is a job of its own, on the machine its `runs-on` says; a job starts once the jobs it `needs` have ended, runs if its `if` holds (by default, if they all succeeded), and knows their results and outputs. `--job=NAME` runs that job and those it needs.
 - The command waits for the run and prints its jobs' lines; it fails when the run does. Its jobs are listed with the others (`superci jobs list`, Runs), with their machines and their cost.
 - A key for coding agents: `superci keys create agent --runs` makes a key that starts such runs and changes nothing else, within limits (`--max-cpu=16` CPUs a job, `--daily-usd=10` of machines a day, three runs at a time). With it and your control plane's address, `superci runs create` works with no sign-in.
+- A job no longer lands on a larger machine than it asked for when its first choice has no spot machine. In 0.17.0 the one request for the other pools also held larger sizes, and AWS, going by what it has spare, often gave one of those: a 2-CPU job on a 4-CPU machine, at twice the price. Larger sizes are now asked only after every pool of the size asked for said no.
 - Not yet: a call of another workflow, a matrix made by an expression, GitHub's artifacts between jobs. `actions/checkout` puts the working tree in place as one commit; another repository is not checked out.
 
 ## 0.17.0 — 2026-10-14

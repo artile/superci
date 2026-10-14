@@ -2824,6 +2824,25 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
     assert_eq!((calls_of(&clouds.0, "CreateLaunchTemplate").len(), launches(&clouds.0).len(), told.template_left.is_some()), (1, 1, true));
     assert_eq!(told.asked.iter().map(|a| (a.0.as_str(), a.2.as_str(), a.4)).collect::<Vec<_>>(), [("m8a.8xlarge", "InsufficientInstanceCapacity", 0), ("", "InsufficientInstanceCapacity", 11), ("r7a.8xlarge", "started", 12)]);
 
+    // A larger size only when no pool of the size asked for has a machine: AWS, going by what is spare, would often
+    // give the larger (dearer) one first.
+    let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+        let xml = |s: &str| Some(Response::new(200, "text/xml", s.to_string()));
+        if body.contains("Action=DescribeSpotPriceHistory") { return xml("<spotPriceHistorySet/>") }
+        if body.contains("Action=RunInstances") { return Some(aws_refuses("InsufficientInstanceCapacity")) }
+        if body.contains("Action=CreateLaunchTemplate") { return xml(FLEET_TEMPLATE) }
+        if body.contains("Action=CreateFleet") { return xml(newer_none) }
+        if body.contains("Action=DeleteLaunchTemplate") { return xml(FLEET_TEMPLATE_REMOVED) }
+        None
+    });
+    let types: Vec<String> = ["m8a.large", "c8a.large", "m8a.xlarge", "c8a.xlarge"].map(String::from).to_vec();
+    let launch = Launch { region: "us-east-1", network: Some(&network), image: "ami-new", types: &types, user_data: "#!/bin/bash\n", disk_gb: 60, disk_mibs: 125, disk_iops: 3000, clock: Some(&FixedClock), skip: &[], tags: &tags,
+        spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: true };
+    let _ = block_on(run_instance(&clouds, &creds, &launch, 1_790_000_000_000, &mut Told::default()));
+    let fleets = calls_of(&clouds.0, "CreateFleet");
+    assert_eq!((fleets.len(), kinds(&fleets[0]).0, kinds(&fleets[1]).0), (2, vec!["c8a.large".to_string(), "m8a.large".to_string()], vec!["c8a.xlarge".to_string(), "m8a.xlarge".to_string()]));
+    assert_eq!((superci_core::aws::cpus("m8a.large"), superci_core::aws::cpus("c8a.4xlarge"), superci_core::aws::cpus("r8a.xlarge")), (2, 16, 4));
+
     // Where the pools may not be asked in one request, or few are left, they are asked one by one, as before.
     let (machine, told, clouds) = ask(&["c8a.16xlarge", "m8a.16xlarge", "r8a.16xlarge"], FLEET_STARTED, false);
     assert!(machine.is_err() && calls_of(&clouds, "CreateFleet").is_empty() && launches(&clouds).len() == 12 && told.more);
