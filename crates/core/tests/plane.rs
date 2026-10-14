@@ -3336,4 +3336,45 @@ fn a_run_from_a_computer_gets_its_machine_and_its_runner_takes_the_job_from_the_
     let later = json(&run(key(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}?after={}", status["next"])))));
     assert!(later["lines"].as_array().is_some_and(|l| l.is_empty()));
     assert!(!store.0.borrow().values().any(|v| v.contains("hunter2hunter2")), "no secret is left in the store");
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("rtree")), "nor its working tree, once fetched and the job over");
+}
+
+#[test]
+fn a_key_for_coding_agents_starts_only_the_runs_it_may() {
+    // A key that may start runs from a computer: jobs of 4 CPUs at most, $1 a day, three at a time. It also reads.
+    let key = "superci_run_0123456789abcdef0123456789abcdef";
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.read_keys = vec![superci_core::plane::read_key("READ_KEY_4102444800_AGENT", &format!("{}:runs:4:1", superci_core::crypto::sha256_hex(key.as_bytes()))).unwrap(),
+        superci_core::plane::read_key("READ_KEY_4102444800_LOOKER", &superci_core::crypto::sha256_hex(b"superci_read_0123456789abcdef0123456789abcdef")).unwrap()];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |label: &str, k: &str| {
+        let workflow = format!("jobs:\n  test:\n    runs-on: {label}\n    steps:\n      - run: echo hi\n");
+        block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", &format!("Bearer {k}"))
+            .with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string())))
+    };
+    // A key that only reads starts nothing; this one starts a run of 4 CPUs, and is told no for 8.
+    assert_eq!(run("superci", "superci_read_0123456789abcdef0123456789abcdef").status, 404);
+    let made = run("superci", key);
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    let id: u64 = json(&made)["run_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(job(&store, id)["by"], "AGENT");
+    let big = run("superci/cpu=8", key);
+    assert_eq!((big.status, big.body_text().as_str()), (403, "the key agent may start jobs of 4 CPUs at most; test asks for 8"));
+    // Three at a time.
+    run("superci", key); run("superci", key);
+    let fourth = run("superci", key);
+    assert_eq!((fourth.status, fourth.body_text().contains("3 runs of the key agent are going")), (429, true));
+    // So much a day: what its runs cost (here, ended ones that cost $1 between them).
+    for (k, v) in store.0.borrow_mut().iter_mut() {
+        if k.starts_with("job:") { let mut j: serde_json::Value = serde_json::from_str(v).unwrap(); j["state"] = "done".into(); j["cost_usd"] = 0.34.into(); *v = j.to_string(); }
+    }
+    let over = run("superci", key);
+    assert_eq!((over.status, over.body_text().contains("has spent $1.02 of its $1.00 for a day")), (429, true), "{}", over.body_text());
+    // The dashboard sees what each key may do.
+    let status = json(&block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/status")).with_header("authorization", "Bearer dashboard-session-key-1"))));
+    assert_eq!(status["read_keys"], serde_json::json!([{ "name": "AGENT", "until_ms": 4_102_444_800_000u64, "runs": { "cpu": 4, "daily_usd": 1.0, "at_once": 3 } }, { "name": "LOOKER", "until_ms": 4_102_444_800_000u64 }]));
 }

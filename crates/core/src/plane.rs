@@ -247,6 +247,8 @@ pub struct Job {
     /// A job of a run from a computer (provider "local"): the token in its runner's address, `/runner/<token>`,
     /// where the runner takes its job from this control plane in place of GitHub (see `runner_service`).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub local: Option<String>,
+    /// The key for coding agents that started it (its name), when one did (see `RunKey`).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub by: Option<String>,
     /// What it writes most is in memory, or on its machine's own disk (its label asked: `-ramdisk`, `-localdisk`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub local_disk: bool,
@@ -686,10 +688,29 @@ pub struct ControlPlane<'a> {
 
 /// A key that only reads, from the name and value it is stored under (`READ_KEY_<expires, unix seconds>_<NAME>`, the
 /// key's SHA-256): when it expires (ms), its name, the hash. A removed one (emptied, where a store keeps names) is none.
+/// A key that may also start runs from a computer carries what it may start after the hash, `<hash>:runs:<most CPUs
+/// for a job>:<most USD a day>` (see `RunKey`), and is kept whole.
 pub fn read_key(name: &str, value: &str) -> Option<(u64, String, String)> {
     let (until, key_name) = name.strip_prefix("READ_KEY_")?.split_once('_')?;
-    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) { return None }
+    let (hash, more) = value.split_once(':').unwrap_or((value, ""));
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) { return None }
+    if !more.is_empty() && RunKey::of(more).is_none() { return None }
     Some((until.parse::<u64>().ok()? * 1000, key_name.to_string(), value.to_ascii_lowercase()))
+}
+
+/// What a key for coding agents may start: runs from a computer, each job on a machine of at most `cpu` CPUs, at
+/// most `at_once` of them going at a time, and at most `daily_usd` of machines in a day (estimated as they run).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunKey { pub name: String, pub cpu: u32, pub daily_usd: f64, pub at_once: usize }
+
+impl RunKey {
+    /// From what is kept after the key's hash: `runs:<cpu>:<daily_usd>`.
+    fn of(more: &str) -> Option<RunKey> {
+        let mut p = more.split(':');
+        if p.next()? != "runs" { return None }
+        let (cpu, usd) = (p.next()?.parse::<u32>().ok()?, p.next()?.parse::<f64>().ok()?);
+        (p.next().is_none() && cpu > 0 && usd > 0.0).then(|| RunKey { name: String::new(), cpu, daily_usd: usd, at_once: 3 })
+    }
 }
 
 fn nothing_here() -> Response {
@@ -914,8 +935,9 @@ impl<'a> ControlPlane<'a> {
                 Ok(Response::json(&serde_json::json!({ "kept": kept })))
             }
             // Runs from a computer: the working tree in parts, a run, how it goes; and its runner's calls.
-            ("POST", "/runs/tree") if self.dashboard(&req) => self.tree_part(&url, &req).await,
-            ("POST", "/runs") if self.dashboard(&req) => self.create_run(&req, &plane_url).await,
+            ("POST", "/runs/tree") if self.dashboard(&req) || self.run_key(&req).is_some() => self.tree_part(&url, &req).await,
+            ("POST", "/runs") if self.dashboard(&req) => self.create_run(&req, &plane_url, None).await,
+            ("POST", "/runs") if self.run_key(&req).is_some() => { let k = self.run_key(&req); self.create_run(&req, &plane_url, k).await }
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
             (_, p) if p.starts_with("/runner/") => self.for_runner(&req, &plane_url, &url).await,
             _ => Ok(nothing_here()),
@@ -1054,7 +1076,20 @@ impl<'a> ControlPlane<'a> {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         if given.len() < 16 { return false }
         let (hash, now) = (sha256_hex(given.as_bytes()), self.clock.now_ms());
-        self.config.read_keys.iter().any(|(until, _, kept)| *until > now && safe_eq(hash.as_bytes(), kept.as_bytes()))
+        self.config.read_keys.iter().any(|(until, _, kept)| *until > now && safe_eq(hash.as_bytes(), kept.split(':').next().unwrap_or_default().as_bytes()))
+    }
+
+    /// A key for coding agents the request comes with, one that may start runs from a computer (see `RunKey`), and
+    /// has not expired.
+    fn run_key(&self, req: &Request) -> Option<RunKey> {
+        let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+        if given.len() < 16 { return None }
+        let (hash, now) = (sha256_hex(given.as_bytes()), self.clock.now_ms());
+        self.config.read_keys.iter().filter(|(until, _, _)| *until > now).find_map(|(_, name, kept)| {
+            let (h, more) = kept.split_once(':')?;
+            if !safe_eq(hash.as_bytes(), h.as_bytes()) { return None }
+            RunKey::of(more).map(|k| RunKey { name: name.clone(), ..k })
+        })
     }
 
     /// A job's log, for whoever may read: GitHub's for the job (with the App's token for its repository), or GitLab's
@@ -1126,7 +1161,11 @@ impl<'a> ControlPlane<'a> {
             // Every GitLab connection (the first, then each further one, by its name), with its token's scopes.
             "gitlabs": gitlabs,
             "routing": self.config.routing,
-            "read_keys": if self.dashboard(req) { serde_json::json!(self.config.read_keys.iter().map(|(until, name, _)| serde_json::json!({ "name": name, "until_ms": until })).collect::<Vec<_>>()) } else { serde_json::Value::Null },
+            "read_keys": if self.dashboard(req) { serde_json::json!(self.config.read_keys.iter().map(|(until, name, kept)| {
+                let mut k = serde_json::json!({ "name": name, "until_ms": until });
+                if let Some(r) = kept.split_once(':').and_then(|(_, more)| RunKey::of(more)) { k["runs"] = serde_json::json!({ "cpu": r.cpu, "daily_usd": r.daily_usd, "at_once": r.at_once }) }
+                k
+            }).collect::<Vec<_>>()) } else { serde_json::Value::Null },
             "machine": self.config.machine,
             "spend": self.month_spend(&jobs_all).await,
             // (It keeps the CI's and a cloud account's limit for the month: one from before would drop them unsaid.)
@@ -2618,7 +2657,7 @@ impl<'a> ControlPlane<'a> {
     /// A run from a computer: a workflow file's job, run as GitHub would run it, on a machine as any job of this
     /// control plane's, with the working tree uploaded (`tree_part`) in place of a checkout, and what a run gives
     /// beyond GitHub's (`secrets`, `vars`). The job's runner takes the job from here (see `runner_service`).
-    async fn create_run(&self, req: &Request, plane_url: &str) -> Result<Response> {
+    async fn create_run(&self, req: &Request, plane_url: &str, key: Option<RunKey>) -> Result<Response> {
         #[derive(Deserialize)]
         struct NewRun { workflow: String, path: String, #[serde(default)] job: Option<String>, repository: String, #[serde(default, rename = "ref")] reference: String,
             #[serde(default)] sha: String, #[serde(default)] actor: String, #[serde(default)] event_name: String, #[serde(default)] secrets: Vec<(String, String)>,
@@ -2640,6 +2679,16 @@ impl<'a> ControlPlane<'a> {
         let runs_on = found.and_then(|j| j.get("runs-on")).and_then(|n| n.text()).unwrap_or_default().to_string();
         let label = if self.config.parse(&runs_on).is_some() { runs_on } else { self.config.label.clone() };
         let now = self.clock.now_ms();
+        // A key for coding agents starts only what it may: a machine of so many CPUs, so many runs at once, so much
+        // in a day (what its runs' machines cost, estimated as they run). Its own runs are counted, no one else's.
+        if let Some(k) = &key {
+            let cpu = match self.config.parse(&label) { Some(Ok(s)) => Capacity::aws().fit(&s.or(&self.config.machine)).map(|s| s.cpu).unwrap_or(4), _ => 4 };
+            if cpu > k.cpu { return Ok(Response::text(403, &format!("the key {} may start jobs of {} CPUs at most; {job_name} asks for {cpu}", k.name.to_lowercase(), k.cpu))) }
+            let mine: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.by.as_deref() == Some(k.name.as_str())).collect();
+            if mine.iter().filter(|j| active(j) || j.state == "waiting").count() >= k.at_once { return Ok(Response::text(429, &format!("{} runs of the key {} are going: wait for one to end", k.at_once, k.name.to_lowercase()))) }
+            let spent: f64 = mine.iter().filter(|j| now.saturating_sub(j.at_ms) < 86_400_000).map(|j| j.cost_usd.unwrap_or_else(|| j.usd_per_hour.unwrap_or(0.0) * (j.ended_ms.unwrap_or(now).saturating_sub(j.launched_ms.unwrap_or(now))) as f64 / 3_600_000.0)).sum();
+            if spent >= k.daily_usd { return Ok(Response::text(429, &format!("the key {} has spent ${spent:.2} of its ${:.2} for a day: wait, or ask for more", k.name.to_lowercase(), k.daily_usd))) }
+        }
         // (Ids far above GitHub's, so that no job of GitHub's is ever taken for one of these.)
         let job_id = (1u64 << 62) + now * 1000 + (crate::crypto::random_bytes(2).iter().map(|b| *b as u64).sum::<u64>() % 1000);
         let token = crate::crypto::random_token(24);
@@ -2656,7 +2705,7 @@ impl<'a> ControlPlane<'a> {
         let display = message["jobDisplayName"].as_str().unwrap_or(&job_name).to_string();
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: r.tree.clone(), parts: r.parts, at_ms: now, job_id, ..Default::default() }).await?;
         let mut job = Job { job_id, run_id: job_id, repo: r.repository.clone(), state: "launching".into(), at_ms: now, label, name: display, workflow: r.path.clone(), provider: "local".into(),
-            local: Some(token.clone()), queued_ms: Some(now), ..Default::default() };
+            local: Some(token.clone()), queued_ms: Some(now), by: key.as_ref().map(|k| k.name.clone()), ..Default::default() };
         put_json(self.store, &format!("run:{job_id}"), &serde_json::json!({ "jobs": [job_id], "token": token, "tree": r.tree, "at_ms": now })).await?;
         if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(Response::text(409, "try again")) }
         self.start_soon(plane_url, &mut job).await?;
@@ -2716,6 +2765,11 @@ impl<'a> ControlPlane<'a> {
                     let ev = github::JobEvent { action: "completed".into(), job_id: job.job_id, run_id: job.run_id, attempt: 1, created_ms: job.queued_ms, repo: job.repo.clone(), installation_id: 0,
                         runner_name: Some(after.runner.clone()), conclusion: Some(conclusion), name: job.name.clone(), workflow: job.workflow.clone(), label: job.label.clone(), spec: Ok(Spec::default()), public: false };
                     self.completed(plane_url, &ev).await?;
+                }
+                // (Its working tree is fetched: it goes now, not after a day.)
+                if let Some(tree) = &after.tree {
+                    for (k, _) in self.store.list(&format!("rtree:{tree}:")).await? { self.store.delete(&k).await? }
+                    self.store.delete(&format!("rtree-at:{tree}")).await?;
                 }
                 // (Its secrets go with the job: nothing of them is kept once it has ended.)
                 let mut done = after.clone();

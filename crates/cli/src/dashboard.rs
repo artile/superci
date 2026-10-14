@@ -1262,7 +1262,7 @@ impl Dashboard {
     /// A key that only reads, for a coding agent or a script that should look and not change: made here, its SHA-256
     /// written into the control plane's secrets (through the cloud's API, like every setting), and shown once. The
     /// key, and when it ends (unix seconds).
-    pub fn create_key(&mut self, name: &str, days: u64) -> Result<(String, u64)> {
+    pub fn create_key(&mut self, name: &str, days: u64, runs: Option<(u32, f64)>) -> Result<(String, u64)> {
         let plane = self.plane()?;
         let name = name.to_ascii_uppercase();
         if name.is_empty() || name.len() > 24 || !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) { return Err("A key's name is letters and digits, 24 at most (agent, ci2).".into()) }
@@ -1271,8 +1271,12 @@ impl Dashboard {
         if view::older(seen.version.as_deref(), "0.11.0") { return Err("Update the control plane first: keys that only read need control plane 0.11.0 or newer (`superci planes update`).".into()) }
         let status = seen.status.or_else(|| status_soon(plane.url(), &self.status_key)).ok_or("The control plane did not answer: try again in a few seconds")?;
         if read_keys(&status).iter().any(|(n, _)| *n == name) { return Err(format!("There is a key named {} already: `superci keys delete {}` first.", name.to_lowercase(), name.to_lowercase())) }
-        let (key, until) = (format!("superci_read_{}", random_token(32)), now_ms() / 1000 + days * 86_400);
-        self.put_secret(&plane, &format!("READ_KEY_{until}_{name}"), &superci_core::crypto::sha256_hex(key.as_bytes()))?;
+        // (A key that may also start runs from a computer says so, and how much, after its hash.)
+        if runs.is_some() && view::older(seen.version.as_deref(), "0.18.0") { return Err("Update the control plane first: keys that start runs need control plane 0.18.0 or newer (`superci planes update`).".into()) }
+        let (key, until) = (format!("superci_{}_{}", if runs.is_some() { "run" } else { "read" }, random_token(32)), now_ms() / 1000 + days * 86_400);
+        let hash = superci_core::crypto::sha256_hex(key.as_bytes());
+        let value = match runs { Some((cpu, usd)) => format!("{hash}:runs:{cpu}:{usd}"), None => hash };
+        self.put_secret(&plane, &format!("READ_KEY_{until}_{name}"), &value)?;
         let n = name.clone();
         if !wait_for(plane.url(), &self.status_key, move |s| read_keys(s).iter().any(|(k, _)| *k == n)) { return Err("The control plane has not taken the key yet. It is written; look with `superci keys list` in a moment, and make it again if it is not there (the key itself was not shown).".into()) }
         Ok((key, until))
