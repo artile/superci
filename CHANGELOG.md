@@ -2,6 +2,11 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.18.1 — unreleased
+- What a run from a computer's jobs keep with `upload-artifact` can be fetched to the computer: `superci artifacts list --run=ID` names them, `superci artifacts retrieve NAME --run=ID [--out=DIR]` unpacks one, as `download-artifact` would. With a key that only reads too.
+- A key for coding agents has no limits of its own: its jobs keep to the control plane's, as every job does (the largest machine, what may be spent in a month and a day). `superci keys create agent --runs` takes no `--max-cpu` or `--daily-usd`; a key made by 0.18.0 is no longer taken, so make it again.
+- `superci runs create` against a control plane older than 0.18.0 says to update it, rather than that the control plane has nothing there.
+
 ## 0.18.0 — 2026-10-14
 - GitHub's cache, kept in your own AWS account: each region your machines run in gets a bucket of the control plane's, and a free S3 endpoint in its network, so a cache never leaves your account and never goes over the internet. Nothing in your workflows changes: `actions/cache`, the setup actions' caches, Docker's `type=gha` and the rest reach it as they reach GitHub's. On a 16-CPU machine a 4 GB cache saved in 10 s and was back in 11 s (GitHub's own: 12 s and 21 s).
 - Each machine runs `superci-cache`, which holds no keys: for every lookup and save it asks the control plane with the job's own token, and the control plane checks it against GitHub's keys and signs links to the bucket that each do one thing. A job reads and writes what GitHub would let it: a pull request reads its own branch's caches, then its base's and the default branch's, and writes only its own.

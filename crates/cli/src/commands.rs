@@ -51,10 +51,12 @@ const HELP: &[(&str, &str, &str)] = &[
         "The projects a GitLab connection's token reaches (on GitHub, repositories are chosen where the App is installed).\n\nlist      Each with its id and whether its jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
     ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]\n  superci accounts update aws [--monthly-usd=N|none] [--daily-usd=N|none]\n                              [--aws-budget=none|emails|stops|lift] [--email=ADDRESS]",
         "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most the AWS account may spend on machines in a month and in a day (UTC), its spot and on-demand\n          machines together (`none` lifts one). At a limit, jobs go to the providers of other accounts in the\n          order. The whole CI's limits are `superci limits update`.\n          --aws-budget: a budget in the AWS account itself for the monthly limit, made with your sign-in (the\n          control plane gets no permission for it). AWS counts the account's real bill, all of it and hours late.\n          emails: AWS writes to --email at 80% and at 100%. stops: that, and at 100% AWS refuses new machines to\n          the control plane until the next month. lift: takes that refusal off now. none: removes all of it.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
+    ("artifacts", "  superci artifacts list --run=ID\n  superci artifacts retrieve NAME --run=ID [--out=DIR]",
+        "What a run from a computer's jobs kept with upload-artifact, kept for a day. (A run of GitHub's keeps its artifacts at\nGitHub: `gh run download`.)\n\nlist      Each artifact's name and size.\nretrieve  Fetches one and unpacks it into DIR (./NAME unless given), as download-artifact would."),
     ("caches", "  superci caches retrieve\n  superci caches list [--repo=OWNER/NAME]\n  superci caches update [--enabled=true|false] [--size-gb=N] [--days=N]\n  superci caches delete --repo=OWNER/NAME [KEY] [--scope=REF] --confirm",
         "GitHub's cache for jobs on AWS, kept in a bucket of your control plane's in your account, in each region its machines\nrun in. Workflows do not change: actions/cache, the setup actions' caches and Docker's type=gha reach it as they reach\nGitHub's. A job reads and writes what GitHub would let it (a pull request writes only its own branch's).\n\nretrieve  Whether it is on, what it keeps, and each repository with what it keeps now.\nlist      Each repository with its entries and size; --repo: that repository's entries (key, branch, size, last use).\nupdate    --enabled=false: jobs use GitHub's own cache. --size-gb: what one repository keeps at most (25 unless set;\n          the least recently used go first). --days: how long an entry may go unused (7 unless set). An entry saved 30\n          days ago is saved anew whatever its use.\ndelete    Takes a repository's entries out, all of them or KEY's (--scope: on that branch only, as refs/heads/main)."),
-    ("keys", "  superci keys list\n  superci keys create NAME [--days=30] [--runs [--max-cpu=16] [--daily-usd=10]]\n  superci keys delete NAME",
-        "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, the key also starts runs from a computer (`superci runs create`), and nothing else: each job on\n          a machine of --max-cpu CPUs at most (16), at most --daily-usd dollars of machines in a day (10), three\n          runs at a time. For a coding agent that should run the tests without pushing and without your sign-in.\ndelete    Ends one at once."),
+    ("keys", "  superci keys list\n  superci keys create NAME [--days=30] [--runs]\n  superci keys delete NAME",
+        "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, the key also starts runs from a computer (`superci runs create`), and nothing else. Its jobs keep\n          to this control plane's limits, as every job does (`superci limits`). For a coding agent that should run the\n          tests without pushing and without your sign-in.\ndelete    Ends one at once."),
     ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images update REGION [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
         "The image AWS machines start from (GitHub's own runner image, published for AWS by RunsOn in most regions).\n\nlist      Each region the AWS account can use: whether the image is published there, or your own copy is.\ncreate    Copies the image into a region it is not published in, so that jobs can start there. Where to copy\n          from is read from its maker's public list; --from names a region and an image instead. AWS takes about\n          ten minutes. The copy is kept in your account's storage there (about $1.50 a month).\nupdate    Copies the newest build in, where your copy is of an older one (its maker builds the image anew every\n          week or two; `list` says when one is out). Jobs start from the older copy until the new one is\n          there; the older one is then removed.\ndelete    Removes your copy from a region, with its storage."),
     ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces delete ID --confirm",
@@ -108,7 +110,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits", "caches"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "artifacts"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits", "caches"]),
                 group(&["connections", "deliveries", "projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -136,7 +138,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 11] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs"];
-const VALUES: [&str; 44] = ["repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 46] = ["run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -395,6 +397,16 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             };
             Ok(crate::local_run::create(&url, &key, workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, steps)?)
         }
+        ("artifacts", operation @ ("list" | "retrieve")) => {
+            let mut d = signed_in();
+            let (v, key) = look(&mut d)?;
+            crate::local_run::new_enough(v.version.as_deref())?;
+            let key = crate::cloudflare::plane_key(&key, v.plane.url());
+            let run = args.get("run").unwrap_or_default();
+            if run.is_empty() || !run.bytes().all(|b| b.is_ascii_digit()) { return usage("Say which run: --run=ID (ids are in `superci runs list`).") }
+            if operation == "retrieve" && w(2).is_empty() { return usage("Say which artifact: `superci artifacts retrieve NAME --run=ID` (names are in `superci artifacts list --run=ID`).") }
+            if operation == "list" { Ok(crate::local_run::artifacts(v.plane.url(), &key, run)?) } else { Ok(crate::local_run::artifact(v.plane.url(), &key, run, &w(2), args.get("out"))?) }
+        }
         ("runs", "list") => {
             let mut d = signed_in();
             let runs: Vec<Value> = runs(&view(&mut d)?).iter().map(run_words).collect();
@@ -477,7 +489,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let keys: Vec<Value> = read_keys(&status).into_iter().map(|(name, until)| { let mut k = json!({ "name": name.to_lowercase(), "until": day_of(until / 1000) }); if let Some(r) = runs_of(&name) { k["runs"] = r } k }).collect();
             let said = if keys.is_empty() { vec!["No keys that only read. Make one for a coding agent or a script: `superci keys create agent`.".to_string()] }
                 else { keys.iter().map(|k| match k.get("runs") {
-                    Some(r) => format!("{:<24} reads and starts runs (jobs of {} CPUs at most, ${} a day) until {}", k["name"].as_str().unwrap_or_default(), r["cpu"], r["daily_usd"], k["until"].as_str().unwrap_or_default()),
+                    Some(_) => format!("{:<24} reads and starts runs from a computer until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default()),
                     None => format!("{:<24} reads until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default()),
                 }).collect() };
             Ok(Done { said, data: json!({ "keys": keys }) })
@@ -485,21 +497,18 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("keys", "create") => {
             if w(2).is_empty() { return usage("Give it a name: `superci keys create agent`.") }
             let Ok(days) = args.get("days").unwrap_or("30").parse::<u64>() else { return usage("--days is a number of days (30 unless given).") };
-            // A key that may also start runs from a computer, within limits (--runs).
-            let runs = if args.has("runs") {
-                let (Ok(cpu), Ok(usd)) = (args.get("max-cpu").unwrap_or("16").parse::<u32>(), args.get("daily-usd").unwrap_or("10").parse::<f64>()) else { return usage("--max-cpu is a number of CPUs, --daily-usd a number of dollars.") };
-                if cpu == 0 || !(usd > 0.0) { return usage("--max-cpu and --daily-usd are more than 0.") }
-                Some((cpu, usd))
-            } else { None };
+            // A key that may also start runs from a computer (--runs), within the control plane's own limits.
+            if args.has("max-cpu") || args.has("daily-usd") { return usage("A key has no limits of its own: its jobs keep to the control plane's (`superci limits update --max-cpu=64 --daily-usd=50`).") }
+            let runs = args.has("runs");
             let mut d = ready_to_set()?;
             let plane = in_use(&d)?;
-            let what = match runs { Some((cpu, usd)) => format!("that reads and starts runs from a computer (jobs of {cpu} CPUs at most, ${usd} a day, three at a time)"), None => "that only reads".to_string() };
+            let what = if runs { "that reads and starts runs from a computer" } else { "that only reads" };
             if let Some(done) = dry(args, &format!("make a key named {} {what}, good for {days} days", w(2)), "keys", &[]) { return Ok(done) }
             let (key, until) = d.create_key(w(2), days, runs)?;
-            if let Some((cpu, usd)) = runs {
-                return Ok(Done { said: vec![format!("A key for coding agents, until {}: it reads, and starts runs from a computer (jobs of {cpu} CPUs at most, ${usd} a day, three at a time). It is shown this once:", day_of(until)), String::new(),
+            if runs {
+                return Ok(Done { said: vec![format!("A key for coding agents, until {}: it reads, and starts runs from a computer, within this control plane's limits (`superci limits retrieve`). It is shown this once:", day_of(until)), String::new(),
                     format!("  SUPERCI_PLANE={} SUPERCI_KEY={key}", plane.url()), String::new(), "With these two set, `superci runs create --workflow=…` works with no sign-in, and nothing else can be changed.".to_string()],
-                    data: json!({ "ok": true, "name": w(2).to_lowercase(), "until": day_of(until), "runs": { "max_cpu": cpu, "daily_usd": usd, "at_once": 3 }, "env": { "SUPERCI_PLANE": plane.url(), "SUPERCI_KEY": key } }) })
+                    data: json!({ "ok": true, "name": w(2).to_lowercase(), "until": day_of(until), "runs": true, "env": { "SUPERCI_PLANE": plane.url(), "SUPERCI_KEY": key } }) })
             }
             Ok(Done { said: vec![format!("A key that only reads, until {}. It is shown this once:", day_of(until)), String::new(), format!("  SUPERCI_PLANE={} SUPERCI_KEY={key}", plane.url()), String::new(),
                 "With these two set, whatever looks works with no sign-in (`superci status`, `superci jobs list`, `superci runners list`…), and nothing can be changed.".to_string()],

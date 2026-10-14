@@ -701,8 +701,8 @@ pub struct ControlPlane<'a> {
 
 /// A key that only reads, from the name and value it is stored under (`READ_KEY_<expires, unix seconds>_<NAME>`, the
 /// key's SHA-256): when it expires (ms), its name, the hash. A removed one (emptied, where a store keeps names) is none.
-/// A key that may also start runs from a computer carries what it may start after the hash, `<hash>:runs:<most CPUs
-/// for a job>:<most USD a day>` (see `RunKey`), and is kept whole.
+/// A key that may also start runs from a computer says so after the hash, `<hash>:runs` (see `RunKey`), and is kept
+/// whole.
 pub fn read_key(name: &str, value: &str) -> Option<(u64, String, String)> {
     let (until, key_name) = name.strip_prefix("READ_KEY_")?.split_once('_')?;
     let (hash, more) = value.split_once(':').unwrap_or((value, ""));
@@ -711,19 +711,14 @@ pub fn read_key(name: &str, value: &str) -> Option<(u64, String, String)> {
     Some((until.parse::<u64>().ok()? * 1000, key_name.to_string(), value.to_ascii_lowercase()))
 }
 
-/// What a key for coding agents may start: runs from a computer, each job on a machine of at most `cpu` CPUs, at
-/// most `at_once` of them going at a time, and at most `daily_usd` of machines in a day (estimated as they run).
+/// A key for coding agents: it may also start runs from a computer. It has no limits of its own: its jobs are any
+/// job of this control plane's, within its limits (the largest machine, what may be spent in a month and a day).
 #[derive(Clone, Debug, PartialEq)]
-pub struct RunKey { pub name: String, pub cpu: u32, pub daily_usd: f64, pub at_once: usize }
+pub struct RunKey { pub name: String }
 
 impl RunKey {
-    /// From what is kept after the key's hash: `runs:<cpu>:<daily_usd>`.
-    fn of(more: &str) -> Option<RunKey> {
-        let mut p = more.split(':');
-        if p.next()? != "runs" { return None }
-        let (cpu, usd) = (p.next()?.parse::<u32>().ok()?, p.next()?.parse::<f64>().ok()?);
-        (p.next().is_none() && cpu > 0 && usd > 0.0).then(|| RunKey { name: String::new(), cpu, daily_usd: usd, at_once: 3 })
-    }
+    /// From what is kept after the key's hash: `runs`.
+    fn of(more: &str) -> Option<RunKey> { (more == "runs").then(|| RunKey { name: String::new() }) }
 }
 
 fn nothing_here() -> Response {
@@ -954,6 +949,7 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/runs/tree") if self.dashboard(&req) || self.run_key(&req).is_some() => self.tree_part(&url, &req).await,
             ("POST", "/runs") if self.dashboard(&req) => self.create_run(&req, &plane_url, None).await,
             ("POST", "/runs") if self.run_key(&req).is_some() => { let k = self.run_key(&req); self.create_run(&req, &plane_url, k).await }
+            ("GET", p) if p.starts_with("/runs/") && p.ends_with("/artifacts") && self.reader(&req) => self.run_artifacts(p, &url, &plane_url).await,
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
             (_, p) if p.starts_with("/runner/") => self.for_runner(&req, &plane_url, &url).await,
             // A machine's `superci-cache` (with the link only it has), for a job's cache.
@@ -1110,7 +1106,7 @@ impl<'a> ControlPlane<'a> {
         self.config.read_keys.iter().filter(|(until, _, _)| *until > now).find_map(|(_, name, kept)| {
             let (h, more) = kept.split_once(':')?;
             if !safe_eq(hash.as_bytes(), h.as_bytes()) { return None }
-            RunKey::of(more).map(|k| RunKey { name: name.clone(), ..k })
+            RunKey::of(more).map(|_| RunKey { name: name.clone() })
         })
     }
 
@@ -1191,7 +1187,7 @@ impl<'a> ControlPlane<'a> {
             "routing": self.config.routing,
             "read_keys": if self.dashboard(req) { serde_json::json!(self.config.read_keys.iter().map(|(until, name, kept)| {
                 let mut k = serde_json::json!({ "name": name, "until_ms": until });
-                if let Some(r) = kept.split_once(':').and_then(|(_, more)| RunKey::of(more)) { k["runs"] = serde_json::json!({ "cpu": r.cpu, "daily_usd": r.daily_usd, "at_once": r.at_once }) }
+                if kept.split_once(':').and_then(|(_, more)| RunKey::of(more)).is_some() { k["runs"] = true.into() }
                 k
             }).collect::<Vec<_>>()) } else { serde_json::Value::Null },
             "machine": self.config.machine,
@@ -2748,20 +2744,6 @@ impl<'a> ControlPlane<'a> {
             }
         }
         if instances.len() > 64 { return Ok(Response::text(400, &format!("{} jobs: a run from a computer runs 64 at most", instances.len()))) }
-        // A key for coding agents starts only what it may (see `RunKey`): checked for each job when it starts, and
-        // here for what is known now.
-        if let Some(k) = &key {
-            for inst in &instances {
-                let name = inst["key"].as_str().unwrap_or_default();
-                let values: serde_json::Map<String, serde_json::Value> = [("matrix".to_string(), inst["matrix"].clone())].into_iter().collect();
-                let c = crate::expression::Contexts { values: &values, status: crate::expression::Status::Success };
-                let runs_on = wf.get("jobs").and_then(|j| j.get(name)).and_then(|j| j.get("runs-on")).and_then(|n| n.text()).and_then(|t| crate::expression::interpolate(t, &c).ok()).unwrap_or_default();
-                let label = if self.config.parse(&runs_on).is_some() { runs_on } else { self.config.label.clone() };
-                let cpu = match self.config.parse(&label) { Some(Ok(s)) => Capacity::aws().fit(&s.or(&self.config.machine)).map(|s| s.cpu).unwrap_or(4), _ => 4 };
-                if cpu > k.cpu { return Ok(Response::text(403, &format!("the key {} may start jobs of {} CPUs at most; {name} asks for {cpu}", k.name.to_lowercase(), k.cpu))) }
-            }
-            if let Err(why) = self.within(k, now).await { return Ok(Response::text(429, &why)) }
-        }
         let run_id = local_id(now);
         // Its jobs' cache: the repository's entries, as GitHub's jobs keep them when GitHub knows it here.
         let (ns, default_branch) = match self.repository_of(&r.repository).await { Some((id, default)) => (format!("gh{id}"), default), None => (cache::local_ns(&r.repository), "main".to_string()) };
@@ -2772,17 +2754,6 @@ impl<'a> ControlPlane<'a> {
         if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
         let run = get_json::<serde_json::Value>(self.store, &format!("run:{run_id}")).await?.unwrap_or_default();
         Ok(Response::json(&serde_json::json!({ "run_id": run_id.to_string(), "jobs": run["jobs"].as_array().map(|j| j.iter().map(|j| j["name"].clone()).collect::<Vec<_>>()).unwrap_or_default() })))
-    }
-
-    /// Whether a key for coding agents may start another run now: so many runs at a time, so much in a day.
-    async fn within(&self, k: &RunKey, now: u64) -> std::result::Result<(), String> {
-        let mine: Vec<Job> = self.store.list("job:").await.map_err(|e| e.to_string())?.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.by.as_deref() == Some(k.name.as_str())).collect();
-        let mut going: Vec<u64> = mine.iter().filter(|j| active(j) || j.state == "waiting").map(|j| j.run_id).collect();
-        going.sort_unstable(); going.dedup();
-        if going.len() >= k.at_once { return Err(format!("{} runs of the key {} are going: wait for one to end", k.at_once, k.name.to_lowercase())) }
-        let spent: f64 = mine.iter().filter(|j| now.saturating_sub(j.at_ms) < 86_400_000).map(|j| j.cost_usd.unwrap_or_else(|| j.usd_per_hour.unwrap_or(0.0) * (j.ended_ms.unwrap_or(now).saturating_sub(j.launched_ms.unwrap_or(now))) as f64 / 3_600_000.0)).sum();
-        if spent >= k.daily_usd { return Err(format!("the key {} has spent ${spent:.2} of its ${:.2} for a day: wait, or ask for more", k.name.to_lowercase(), k.daily_usd)) }
-        Ok(())
     }
 
     /// Moves a run from a computer on: notes how its started jobs ended, then starts each job whose needs have all
@@ -2957,6 +2928,24 @@ impl<'a> ControlPlane<'a> {
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), ..Default::default() };
         if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(()) }
         self.start_soon(plane_url, &mut job).await
+    }
+
+    /// `GET /runs/<id>/artifacts`: a run from a computer's artifacts (each one's name and size), or with `name`, links
+    /// to read that one's pieces, in order. Whoever may look may fetch them, as at GitHub.
+    async fn run_artifacts(&self, path: &str, url: &url::Url, plane_url: &str) -> Result<Response> {
+        let Some(id) = path.trim_start_matches("/runs/").trim_end_matches("/artifacts").parse::<u64>().ok() else { return Ok(nothing_here()) };
+        if get_json::<serde_json::Value>(self.store, &format!("run:{id}")).await?.is_none() { return Ok(nothing_here()) }
+        let run = id.to_string();
+        let Some(name) = url.query_pairs().find(|(k, _)| k == "name").map(|(_, v)| v.into_owned()) else {
+            let all = cache::artifacts(self.store, &run).await?;
+            return Ok(Response::json(&serde_json::json!({ "artifacts": all.iter().map(|(n, e)| serde_json::json!({ "name": n, "size": e.size, "made": e.made })).collect::<Vec<_>>() })));
+        };
+        let Some((_, entry)) = cache::artifact(self.store, &run, &name, true).await? else { return Ok(Response::text(404, &format!("the run has no artifact {name}"))) };
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(Response::text(409, "this control plane has no AWS account")) };
+        let (creds, now) = (self.aws_creds(plane_url, &a).await?, self.clock.now_ms());
+        let (bucket, prefix) = (cache::bucket(&self.config.plane_id, &entry.region), entry.prefix(&cache::artifact_ns(&run)));
+        let pieces = entry.pieces.iter().map(|(p, size)| Ok(serde_json::json!({ "url": aws::presign("GET", &aws::s3_url(&bucket, &entry.region, &format!("{prefix}/{p}")), &creds, &entry.region, cache::LINK_SECONDS, now)?, "size": size }))).collect::<Result<Vec<_>>>()?;
+        Ok(Response::json(&serde_json::json!({ "name": name, "size": entry.size, "pieces": pieces })))
     }
 
     /// How a run from a computer goes: each job's name, state, how it ended, its machine, and the lines its runner
