@@ -94,8 +94,6 @@ pub struct Dashboard {
     gitlab_shown: String,
     /// The job its page shows (`?p=job&id=…`, and `gl=…` for a GitLab job of a further connection).
     job_shown: (String, String),
-    /// Overview's period for its figures: day, week or month.
-    usage_shown: String,
     /// The run its page shows (`?p=run&repo=…&id=…&attempt=…`).
     run_shown: (String, String, String),
     aws_pending: Option<aws::Pending>,
@@ -978,7 +976,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), usage_shown: String::new(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -3556,7 +3554,7 @@ mark();load()})();</script>"#;
         let (setup, waiting) = self.setup_card(v);
         // Still reading it: the page's own loading shape (the same as before the first answer), looked at again.
         if v.status.is_none() && v.online && setup.is_empty() { return (skeleton("overview", "Overview"), true) }
-        let jobs_card = if v.status.is_none() && v.online { overview_skeleton_cards() } else { overview_cards(v, &jobs, &self.usage_shown) };
+        let jobs_card = if v.status.is_none() && v.online { overview_skeleton_cards() } else { overview_cards(v, &jobs, &usage_shown()) };
         (format!(r#"<div class="bar"><h1 class="page-title">Overview</h1></div><div class="cards">{setup}{jobs_card}</div>"#), waiting)
     }
 
@@ -5439,9 +5437,7 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
         Some(all) => {
             let period = if ["week", "month"].contains(&period) { period } else { "day" };
             let u = &all[period];
-            let switch = [("day", "24 hours"), ("week", "7 days"), ("month", "30 days")].iter()
-                .map(|(p, name)| format!(r#"<a href="/?p=overview&amp;usage={p}"{}>{name}</a>"#, if *p == period { r#" class="on" aria-current="true""# } else { "" })).collect::<String>();
-            let head = format!(r#"<h2>Usage</h2><span class="card-sub"></span><nav class="seg seg-links" aria-label="Period">{switch}</nav>"#);
+            let head = format!(r#"<h2>Usage</h2><span class="card-sub"></span>{}"#, usage_switch(period));
             let figures = if u["jobs"].as_u64().unwrap_or(0) == 0 { format!(r#"<p class="note">No jobs in the last {}.</p>"#, match period { "week" => "7 days", "month" => "30 days", _ => "24 hours" }) } else { usage_figures(u, period, &jobs) };
             (head, figures, if period == "day" { split } else { String::new() })
         }
@@ -5451,6 +5447,18 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
     let jobs_card = format!(r#"<section class="card big jobs-card"><div class="card-head">{head}</div>{figures}{split}</section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div>{latest}<div class="card-foot end"><a class="chip" href="/?p=jobs">All jobs ›</a></div></section>"#);
 
     jobs_card
+}
+
+/// Overview's period, as its link last said: day, week or month (one dashboard, one person looking).
+static USAGE_SHOWN: Mutex<String> = Mutex::new(String::new());
+
+fn usage_shown() -> String { let p = lock(&USAGE_SHOWN).clone(); if ["week", "month"].contains(&p.as_str()) { p } else { "day".into() } }
+
+/// Overview's period switch: 24 hours, 7 days, 30 days, the one shown marked.
+fn usage_switch(period: &str) -> String {
+    let links = [("day", "24 hours"), ("week", "7 days"), ("month", "30 days")].iter()
+        .map(|(p, name)| format!(r#"<a href="/?p=overview&amp;usage={p}"{}>{name}</a>"#, if *p == period { r#" class="on" aria-current="true""# } else { "" })).collect::<String>();
+    format!(r#"<nav class="seg seg-links" aria-label="Period">{links}</nav>"#)
 }
 
 /// Overview's four figures for a period, from the control plane's count of every job in it (see
@@ -5511,16 +5519,17 @@ fn overview_empty_cards(label: &str) -> String {
     let snippet = format!(r#"<pre class="snippet empty-snippet">jobs:
   test:
     <span class="hl">runs-on: {}</span></pre>"#, esc(label));
-    format!(r#"<section class="card big jobs-card"><div class="card-head"><h2>Jobs</h2><span class="card-sub">Last 24 hours</span></div><div class="kpis">{}{}{}</div></section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div>{}</section>"#,
-        kpi("0", "jobs", "Hour by hour, once jobs run"), kpi("—", "median wait for a machine", "From queued to running"), kpi("$0.00", "spent", "At your cloud's prices"),
+    format!(r#"<section class="card big jobs-card"><div class="card-head"><h2>Usage</h2><span class="card-sub"></span>{}</div><div class="kpis four">{}{}{}{}</div></section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div>{}</section>"#,
+        usage_switch("day"), kpi("0", "jobs", "Hour by hour, once jobs run"), kpi("0 min", "machine minutes", "Beside what GitHub or GitLab would bill"), kpi("—", "median wait for a machine", "From queued to running"), kpi("$0.00", "spent", "Beside what GitHub or GitLab would charge"),
         empty_state(&icon("play"), "No jobs yet", "Every job with your label shows up here, with the machine it ran on, how long it took and what it cost:", &snippet))
 }
 
 /// Overview's cards while the control plane is being read: the same shapes, empty.
 fn overview_skeleton_cards() -> String {
+    let period = usage_shown();
     let kpi = r#"<div class="kpi"><span class="sk fig"></span><span class="sk w60 thin"></span><span class="sk spark-sk"></span><span class="sk w40 thin"></span></div>"#;
-    format!(r#"<section class="card big jobs-card"><div class="card-head"><h2>Jobs</h2>{LOADING}</div><div class="kpis">{}</div></section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div><div class="rows">{}</div></section>"#,
-        kpi.repeat(3), SK_ROWS.repeat(5))
+    format!(r#"<section class="card big jobs-card"><div class="card-head"><h2>Usage</h2><span class="card-sub">{LOADING}</span>{}</div><div class="kpis four">{}</div></section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div><div class="rows">{}</div></section>"#,
+        usage_switch(&period), kpi.repeat(4), SK_ROWS.repeat(5))
 }
 
 /// The loader, inside the first card of a page that is still reading its control plane.
@@ -5955,11 +5964,12 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
         else if d.task_done().is_some() { return Response::new(200, "text/html; charset=utf-8", r#"<div class="empty">Done. Back to your terminal: you can close this tab.</div>"#.to_string()) }
     }
     if req.method == "GET" && req.path == "/" {
+        // Overview's period, from its link (the page itself, its live part, and the shapes drawn while it loads).
+        if ["", "overview"].contains(&q("p")) { *lock(&USAGE_SHOWN) = match q("usage") { u @ ("week" | "month") => u.to_string(), _ => "day".to_string() } }
         let new_here = match q("new") { "1" => Some(true), "0" => Some(false), _ => None };
         if q("fragment") == "1" {
             shared.lock().unwrap_or_else(|e| e.into_inner()).gitlab_shown = q("g").chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).take(12).collect();
             if q("p") == "run" { shared.lock().unwrap_or_else(|e| e.into_inner()).run_shown = (q("repo").chars().filter(|c| c.is_ascii_alphanumeric() || "-_./".contains(*c)).take(200).collect(), q("id").chars().filter(|c| c.is_ascii_digit()).take(20).collect(), q("attempt").chars().filter(|c| c.is_ascii_digit()).take(4).collect()) }
-            if ["", "overview"].contains(&q("p")) { shared.lock().unwrap_or_else(|e| e.into_inner()).usage_shown = match q("usage") { u @ ("week" | "month") => u.to_string(), _ => "day".to_string() } }
             if q("p") == "job" { shared.lock().unwrap_or_else(|e| e.into_inner()).job_shown = (q("id").chars().filter(|c| c.is_ascii_digit()).take(20).collect(), q("gl").chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-').take(24).collect()) }
             return Response::new(200, "text/html; charset=utf-8", Dashboard::live(shared, q("p"), q("plane").parse().ok(), new_here, req.last.as_deref()))
         }
@@ -7769,7 +7779,7 @@ mod tests {
     fn pages_wait_in_the_shape_of_what_is_coming() {
         preview("skeleton", &String::from_utf8(Dashboard::page("overview").body).unwrap().split(r#"id="live">"#).nth(1).unwrap().split("</main>").next().unwrap().to_string());
         let page = String::from_utf8(Dashboard::page("overview").body).unwrap();
-        assert!(page.contains("<h2>Jobs</h2>") && page.contains("Reading your control plane"));
+        assert!(page.contains("<h2>Usage</h2>") && page.contains("Reading your control plane") && page.contains(r#"aria-label="Period""#) && page.contains(r#"<div class="kpis four">"#));
     }
 
     #[test]
