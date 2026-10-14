@@ -493,6 +493,22 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let said = match said { Ok(s) => s, Err(e) => format!("refused or failed: {e}") };
             Ok(Done { data: json!({ "answer": said }), said: vec![said] })
         }
+        // (A signed call to an AWS service that speaks REST, S3 among them: `superci debug rest REGION SERVICE METHOD URL
+        // [FILE]`, FILE being the body.)
+        #[cfg(debug_assertions)]
+        ("debug", "rest") => {
+            let mut d = signed_in();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            let body = if w(6).is_empty() { vec![] } else { std::fs::read(w(6)).map_err(|e| format!("{}: {e}", w(6)))? };
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
+            let headers = vec![("x-amz-content-sha256".to_string(), superci_core::crypto::sha256_hex(&body))];
+            let signed = superci_core::aws::sigv4(w(4), w(5), &headers, &body, &creds, w(2), w(3), &superci_core::aws::amz_date(now))?;
+            let mut r = superci_core::io::Request::new(w(4), w(5)).with_body(body);
+            r.headers = signed;
+            let res = futures::executor::block_on(superci_core::io::Http::send(&crate::aws::Blocking::new(), r))?;
+            let said = format!("{} {}", res.status, res.body_text());
+            Ok(Done { data: json!({ "answer": said }), said: vec![said] })
+        }
         // (GitHub's runner taking one job from SuperCI's own service, run here: `superci debug runner-service FILE JOB
         // ROOT PORT JITFILE [--secret=N=V] [--var=N=V]`, ROOT being where the runner's calls go, e.g. http://localhost:8080/runner/rig.)
         #[cfg(debug_assertions)]
