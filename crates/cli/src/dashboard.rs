@@ -5224,7 +5224,7 @@ fn strip_log(log: &str) -> String {
 }
 
 /// A size in words: 940 MB, 3.4 GB.
-pub(crate) fn size_words(bytes: u64) -> String { if bytes >= 1_000_000_000 { format!("{:.1} GB", bytes as f64 / 1e9) } else { format!("{} MB", bytes.div_ceil(1_000_000)) } }
+pub(crate) fn size_words(bytes: u64) -> String { if bytes >= 1_000_000_000 { format!("{:.1} GB", bytes as f64 / 1e9) } else if bytes >= 1_000_000 { format!("{} MB", bytes.div_ceil(1_000_000)) } else { format!("{} KB", bytes.div_ceil(1000)) } }
 
 /// How long ago, in words: 5 minutes, 3 hours, 2 days.
 fn ago_words(ms: u64) -> String {
