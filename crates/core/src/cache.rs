@@ -1,0 +1,418 @@
+//! The cache: GitHub's Actions cache for jobs on SuperCI's machines, kept in a bucket of the control plane's own cloud
+//! account, in the region the machine runs in. Each machine runs `superci-cache` (the `cache` crate), which speaks
+//! GitHub's cache protocol to the job's actions and holds no keys: it asks the control plane, with the job's own
+//! token, and the control plane decides here and signs links to the bucket that do one thing each.
+//!
+//! What a job may read and write is what GitHub says in its token (`ac`: the branches whose caches it may read, in
+//! the order to look, and the one it may write): a pull request reads its own branch, then its base, then the
+//! default branch, and writes only its own. A run from a computer gets a token from the control plane in the same
+//! form (see `local_access`): it reads its branch's and the default branch's caches, and writes only its own scope.
+//!
+//! Entries are kept by repository (`ns`), scope, version (GitHub's hash of the paths and compression) and key, never
+//! changed once written. Each repository keeps `LIMIT_BYTES` at most (the least recently used go first) and an
+//! entry not used for `UNUSED_MS` goes; the bucket also drops anything older than `BUCKET_DAYS` by itself.
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::io::{get_json, put_json, Result, Store};
+
+/// What a repository keeps at most (as GitHub's 10 GB a repository).
+pub const LIMIT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// An entry not used for this long goes (GitHub: 7 days).
+pub const UNUSED_MS: u64 = 7 * 86_400_000;
+/// The bucket's own rule: any object older than this goes, whatever the control plane's index says.
+pub const BUCKET_DAYS: u32 = 30;
+/// An entry begun and not finished within this goes (its job stopped or failed while saving).
+pub const UNFINISHED_MS: u64 = 3_600_000;
+/// An entry begun and not finished within this may be begun again by another job (until then the key is being
+/// saved, as GitHub says it: BuildKit then takes it as there, and a job left saving would keep it from everyone).
+pub const TAKEOVER_MS: u64 = 600_000;
+/// How long a signed link to the bucket works.
+pub const LINK_SECONDS: u64 = 3600;
+/// Pieces of an entry at most (a piece is one upload of GitHub's cache client: 32 MB or so; 10 GB in 128 MB pieces).
+pub const MOST_PIECES: usize = 2000;
+
+/// The bucket for a control plane's cache in a region.
+pub fn bucket(plane_id: &str, region: &str) -> String { format!("superci-plane-{plane_id}-{region}") }
+
+/// Where `superci-cache` for an architecture (`x86_64`, `aarch64`) of this version is in each bucket.
+pub fn program_key(arch: &str) -> String { format!("superci/cache-{}-{arch}", crate::plane::VERSION) }
+
+/// One scope: a branch's caches (GitHub's `refs/heads/main`, `refs/pull/5/merge`), and whether the job may write there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Scope { pub name: String, pub write: bool }
+
+/// What a job may do in the cache: its repository's entries in these scopes, read in this order; and, for a run from
+/// a computer, which run's artifacts are its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Access { pub ns: String, pub scopes: Vec<Scope>, pub run: Option<String> }
+
+impl Access {
+    fn writes_to(&self) -> Option<&Scope> { self.scopes.iter().find(|s| s.write) }
+}
+
+/// GitHub's `ac` claim (a JSON list in a string: `[{"Scope":"refs/heads/main","Permission":3}]`, 1 read, 2 write).
+fn scopes(ac: &str) -> Result<Vec<Scope>> {
+    let list: Vec<Value> = serde_json::from_str(ac).map_err(|e| format!("the token's cache scopes: {e}"))?;
+    let scopes: Vec<Scope> = list.iter().filter_map(|s| {
+        let (name, permission) = (s["Scope"].as_str()?, s["Permission"].as_u64()?);
+        (permission & 1 == 1 || permission & 2 == 2).then(|| Scope { name: name.to_string(), write: permission & 2 == 2 })
+    }).collect();
+    if scopes.iter().any(|s| !plain(&s.name)) { return Err("a cache scope with characters SuperCI does not keep".into()) }
+    Ok(scopes)
+}
+
+/// Names kept as they are in the index: no control characters, nothing that ends a key's part.
+fn plain(s: &str) -> bool { !s.is_empty() && s.len() <= 512 && !s.chars().any(|c| c.is_control() || c == ':') }
+
+/// From a job's runtime token as GitHub signed it (its claims, checked by the caller): its repository and scopes.
+pub fn github_access(claims: &Value) -> Result<Access> {
+    let repo = claims["repository_id"].as_str().map(str::to_string).or_else(|| claims["repository_id"].as_u64().map(|n| n.to_string())).ok_or("a token without its repository")?;
+    if repo.is_empty() || !repo.bytes().all(|b| b.is_ascii_digit()) { return Err("a token without its repository".into()) }
+    Ok(Access { ns: format!("gh{repo}"), scopes: scopes(claims["ac"].as_str().unwrap_or("[]"))?, run: None })
+}
+
+/// The claims of a token the control plane gives a run from a computer, so its jobs reach the cache as GitHub's do:
+/// the repository's entries (`ns`: GitHub's repository id when it is known, as GitHub's own jobs keep them), its own
+/// scope to write (`superci/<who>`: the key that started it, or `computer`), and its branch's and the default
+/// branch's to read.
+/// It also says its run and job in GitHub's form (`scp`), where GitHub's artifact client looks for them.
+pub fn local_claims(ns: &str, who: &str, reference: &str, default_branch: &str, run: &str, job: &str) -> Value {
+    let mut ac = vec![serde_json::json!({ "Scope": format!("refs/superci/{who}"), "Permission": 3 })];
+    for r in [reference.to_string(), format!("refs/heads/{default_branch}")] {
+        if !r.is_empty() && plain(&r) && !ac.iter().any(|s| s["Scope"] == r.as_str()) { ac.push(serde_json::json!({ "Scope": r, "Permission": 1 })) }
+    }
+    serde_json::json!({ "ns": ns, "ac": serde_json::Value::Array(ac).to_string(), "scp": format!("Actions.Results:{run}:{job}"), "run": run })
+}
+
+/// From such a token's claims (checked by the caller).
+pub fn local_access(claims: &Value) -> Result<Access> {
+    let ns = claims["ns"].as_str().unwrap_or_default();
+    if !(ns.starts_with("gh") || ns.starts_with("local-")) || !ns.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') { return Err("a token without its repository".into()) }
+    let run = claims["run"].as_str().filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
+    Ok(Access { ns: ns.to_string(), scopes: scopes(claims["ac"].as_str().unwrap_or("[]"))?, run })
+}
+
+/// A repository's entries for a run from a computer whose repository GitHub does not know (no App there).
+pub fn local_ns(repository: &str) -> String { format!("local-{}", &crate::crypto::sha256_hex(repository.as_bytes())[..20]) }
+
+/// One entry: its pieces in the bucket of `region` (named in order, with their sizes), when it was made and last
+/// used, and whether it was finished (until then it is being saved and is no hit).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Entry {
+    pub id: String,
+    pub region: String,
+    #[serde(default)] pub pieces: Vec<(String, u64)>,
+    #[serde(default)] pub size: u64,
+    pub made: u64,
+    #[serde(default)] pub used: u64,
+    #[serde(default)] pub done: bool,
+}
+
+impl Entry {
+    /// Where its pieces are in the bucket: the repository's, then the entry's own.
+    pub fn prefix(&self, ns: &str) -> String { format!("c/{ns}/{}", self.id) }
+}
+
+fn index(ns: &str, scope: &str, version: &str, key: &str) -> String { format!("cache:{ns}:{scope}:{version}:{key}") }
+
+/// A key as GitHub takes it: at most 512 characters, no comma (a colon is fine: BuildKit's have them; the key is the
+/// index's last part).
+fn key_ok(key: &str) -> bool { !key.is_empty() && key.len() <= 512 && !key.chars().any(|c| c.is_control() || c == ',') }
+
+/// A key and version as GitHub's client sends them (a version is a SHA-256 in hex).
+fn check(key: &str, version: &str) -> Result<()> {
+    if !key_ok(key) { return Err("a cache key GitHub would not take (empty, too long, or with a comma)".into()) }
+    if version.is_empty() || version.len() > 128 || !version.bytes().all(|b| b.is_ascii_alphanumeric()) { return Err("a cache version SuperCI does not keep".into()) }
+    Ok(())
+}
+
+/// A hit: the key that matched, its entry, and where it is in the index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hit { pub key: String, pub entry: Entry, pub index: String }
+
+/// GitHub's order: in each scope in turn, the key itself, then each restore key as the start of a key (the newest
+/// such entry), before the next scope. Only finished entries of the same version count.
+pub async fn lookup(store: &dyn Store, access: &Access, key: &str, restore: &[String], version: &str) -> Result<Option<Hit>> {
+    check(key, version)?;
+    for scope in &access.scopes {
+        let at = index(&access.ns, &scope.name, version, key);
+        if let Some(e) = get_json::<Entry>(store, &at).await?.filter(|e| e.done) { return Ok(Some(Hit { key: key.to_string(), entry: e, index: at })) }
+        for prefix in restore.iter().filter(|r| key_ok(r)) {
+            let start = index(&access.ns, &scope.name, version, prefix);
+            let newest = store.list(&start).await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Entry>(&v).ok()?))).filter(|(_, e)| e.done).max_by_key(|(_, e)| e.made);
+            if let Some((at, e)) = newest {
+                // (The first such mark: scopes and the repository have no colon; a key may.)
+                let found = at.split_once(&format!(":{version}:")).map(|(_, k)| k.to_string()).unwrap_or_default();
+                return Ok(Some(Hit { key: found, entry: e, index: at }))
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Marks a hit used (at most once an hour: a busy entry is not written at every restore).
+pub async fn used(store: &dyn Store, hit: &Hit, now: u64) -> Result<()> {
+    if now.saturating_sub(hit.entry.used) < 3_600_000 { return Ok(()) }
+    let was = serde_json::to_string(&hit.entry).map_err(|e| e.to_string())?;
+    let mut e = hit.entry.clone();
+    e.used = now;
+    // Another restore at the same moment wrote it already: as good.
+    store.swap(&hit.index, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?).await.map(|_| ())
+}
+
+/// Why an entry could not be begun.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Refused { Exists, NoWrite, Bad(String) }
+
+/// Begins an entry in the job's own scope, in the bucket of `region`; what GitHub's client then uploads. An entry of
+/// that key and version that exists, or is being saved, is not begun again (GitHub's entries never change); one begun
+/// `TAKEOVER_MS` ago and never finished is.
+pub async fn begin(store: &dyn Store, access: &Access, key: &str, version: &str, region: &str, now: u64) -> std::result::Result<(String, Entry), Refused> {
+    check(key, version).map_err(Refused::Bad)?;
+    let scope = access.writes_to().ok_or(Refused::NoWrite)?;
+    let at = index(&access.ns, &scope.name, version, key);
+    let entry = Entry { id: crate::crypto::random_id(20).to_ascii_lowercase(), region: region.to_string(), made: now, used: now, ..Default::default() };
+    let text = serde_json::to_string(&entry).map_err(|e| Refused::Bad(e.to_string()))?;
+    if store.put_if_absent(&at, text.clone()).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
+    let was = store.get(&at).await.map_err(Refused::Bad)?;
+    let stale = was.as_deref().and_then(|v| serde_json::from_str::<Entry>(v).ok()).is_some_and(|e| !e.done && now.saturating_sub(e.made) > TAKEOVER_MS);
+    if stale && store.swap(&at, was.as_deref(), text).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
+    Err(Refused::Exists)
+}
+
+/// The entry being saved for this key and version in the job's own scope.
+pub async fn begun(store: &dyn Store, access: &Access, key: &str, version: &str) -> Result<Option<(String, Entry)>> {
+    check(key, version)?;
+    let Some(scope) = access.writes_to() else { return Ok(None) };
+    let at = index(&access.ns, &scope.name, version, key);
+    Ok(get_json::<Entry>(store, &at).await?.filter(|e| !e.done).map(|e| (at, e)))
+}
+
+/// A piece's name as `superci-cache` gives it (from the block id GitHub's client gave it): plain, short.
+pub fn piece_name(name: &str) -> bool { !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') }
+
+/// Finishes an entry being saved: its pieces, in order. From now on it is a hit.
+pub async fn finish(store: &dyn Store, at: &str, entry: &Entry, pieces: Vec<(String, u64)>) -> Result<Entry> {
+    if pieces.is_empty() || pieces.len() > MOST_PIECES || !pieces.iter().all(|(n, _)| piece_name(n)) { return Err("pieces SuperCI does not keep".into()) }
+    let was = serde_json::to_string(entry).map_err(|e| e.to_string())?;
+    let mut e = entry.clone();
+    e.size = pieces.iter().map(|(_, s)| s).sum();
+    e.pieces = pieces;
+    e.done = true;
+    if !store.swap(at, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?).await? { return Err("the entry changed while it was saved".into()) }
+    Ok(e)
+}
+
+/// What goes from the bucket: entries over their repository's limit (least recently used first), not used for
+/// `UNUSED_MS`, or begun and never finished. They are taken out of the index here; their pieces are for the caller
+/// to delete (region, object names).
+pub async fn evict(store: &dyn Store, now: u64, limit: u64) -> Result<Vec<(String, Vec<String>)>> {
+    let all: Vec<(String, Entry)> = store.list("cache:").await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Entry>(&v).ok()?))).collect();
+    let mut by_ns: std::collections::BTreeMap<String, Vec<(String, Entry)>> = Default::default();
+    for (k, e) in all { by_ns.entry(k.splitn(3, ':').nth(1).unwrap_or_default().to_string()).or_default().push((k, e)) }
+    let mut gone = vec![];
+    for (ns, mut entries) in by_ns {
+        entries.sort_by_key(|(_, e)| std::cmp::Reverse(e.used.max(e.made)));
+        let mut kept = 0u64;
+        for (k, e) in entries {
+            let old = if e.done { now.saturating_sub(e.used.max(e.made)) > UNUSED_MS } else { now.saturating_sub(e.made) > UNFINISHED_MS };
+            if !old && (!e.done || kept + e.size <= limit) { kept += e.size; continue }
+            store.delete(&k).await?;
+            gone.push((e.region.clone(), e.pieces.iter().map(|(p, _)| format!("{}/{p}", e.prefix(&ns))).collect()));
+        }
+    }
+    Ok(gone)
+}
+
+/// What a repository keeps now, for the dashboard: entries and bytes.
+pub async fn kept(store: &dyn Store, ns: &str) -> Result<(usize, u64)> {
+    let entries: Vec<Entry> = store.list(&format!("cache:{ns}:")).await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).filter(|e: &Entry| e.done).collect();
+    Ok((entries.len(), entries.iter().map(|e| e.size).sum()))
+}
+
+/// Artifacts of a run from a computer (it has no GitHub to keep them), kept in the bucket as cache entries are, by
+/// run and name, for as long as the run is kept (a day). A name is used once in a run, as on GitHub.
+fn artifact_index(run: &str, name: &str) -> String { format!("artifact:{run}:{name}") }
+
+/// An artifact's name as GitHub allows it (none of `"<>|*?:\/`, no control characters).
+pub fn artifact_name(name: &str) -> bool { plain(name) && name.len() <= 256 && !name.chars().any(|c| "\"<>|*?\\/".contains(c)) }
+
+/// Where an artifact's pieces are: the run's, then the entry's own.
+pub fn artifact_ns(run: &str) -> String { format!("run-{run}") }
+
+pub async fn begin_artifact(store: &dyn Store, run: &str, name: &str, region: &str, now: u64) -> std::result::Result<(String, Entry), Refused> {
+    if !artifact_name(name) { return Err(Refused::Bad("an artifact's name GitHub would not take".into())) }
+    let at = artifact_index(run, name);
+    let entry = Entry { id: crate::crypto::random_id(20).to_ascii_lowercase(), region: region.to_string(), made: now, used: now, ..Default::default() };
+    let text = serde_json::to_string(&entry).map_err(|e| Refused::Bad(e.to_string()))?;
+    if store.put_if_absent(&at, text).await.map_err(Refused::Bad)? { Ok((at, entry)) } else { Err(Refused::Exists) }
+}
+
+/// A run's artifact by its name (`done`: only a finished one).
+pub async fn artifact(store: &dyn Store, run: &str, name: &str, done: bool) -> Result<Option<(String, Entry)>> {
+    let at = artifact_index(run, name);
+    Ok(get_json::<Entry>(store, &at).await?.filter(|e| e.done == done).map(|e| (at, e)))
+}
+
+/// A run's finished artifacts, by name, the oldest first.
+pub async fn artifacts(store: &dyn Store, run: &str) -> Result<Vec<(String, Entry)>> {
+    let start = artifact_index(run, "");
+    let mut all: Vec<(String, Entry)> = store.list(&start).await?.into_iter().filter_map(|(k, v)| Some((k.strip_prefix(&start)?.to_string(), serde_json::from_str::<Entry>(&v).ok()?))).filter(|(_, e)| e.done).collect();
+    all.sort_by_key(|(_, e)| e.made);
+    Ok(all)
+}
+
+/// An artifact's number, as GitHub numbers them (from its entry: the same each time it is asked).
+pub fn artifact_id(e: &Entry) -> u64 { u64::from_str_radix(&crate::crypto::sha256_hex(e.id.as_bytes())[..12], 16).unwrap_or(1) }
+
+/// A machine's link to the cache: the region it runs in, and until when the link works (its longest job).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Machine { pub region: String, pub arch: String, pub until: u64 }
+
+pub async fn machine(store: &dyn Store, token: &str, now: u64) -> Result<Option<Machine>> {
+    if token.len() < 16 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Ok(None) }
+    Ok(get_json::<Machine>(store, &format!("cachem:{token}")).await?.filter(|m| m.until > now))
+}
+
+pub async fn add_machine(store: &dyn Store, token: &str, m: &Machine) -> Result<()> { put_json(store, &format!("cachem:{token}"), m).await }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Mem(RefCell<BTreeMap<String, String>>);
+    #[async_trait::async_trait(?Send)]
+    impl Store for Mem {
+        async fn get(&self, k: &str) -> Result<Option<String>> { Ok(self.0.borrow().get(k).cloned()) }
+        async fn put(&self, k: &str, v: String) -> Result<()> { self.0.borrow_mut().insert(k.into(), v); Ok(()) }
+        async fn put_if_absent(&self, k: &str, v: String) -> Result<bool> { if self.0.borrow().contains_key(k) { return Ok(false) } self.0.borrow_mut().insert(k.into(), v); Ok(true) }
+        async fn delete(&self, k: &str) -> Result<()> { self.0.borrow_mut().remove(k); Ok(()) }
+        async fn list(&self, p: &str) -> Result<Vec<(String, String)>> { Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
+    }
+    fn run<T>(f: impl std::future::Future<Output = T>) -> T { futures::executor::block_on(f) }
+    const V: &str = "0123abcd";
+
+    #[test]
+    fn a_runs_artifacts_by_name_once_each() {
+        let store = Mem::default();
+        let (at, e) = run(begin_artifact(&store, "41", "report", "us-east-1", 5)).unwrap();
+        assert!(run(artifact(&store, "41", "report", true)).unwrap().is_none(), "not finished yet");
+        assert_eq!(run(begin_artifact(&store, "41", "report", "us-east-1", 6)).unwrap_err(), Refused::Exists);
+        run(finish(&store, &at, &e, vec![("p1".into(), 9)])).unwrap();
+        assert_eq!(run(artifacts(&store, "41")).unwrap().iter().map(|(n, e)| (n.as_str(), e.size)).collect::<Vec<_>>(), [("report", 9)]);
+        assert!(run(artifacts(&store, "42")).unwrap().is_empty(), "another run's");
+        assert!(matches!(run(begin_artifact(&store, "41", "a/b", "us-east-1", 7)), Err(Refused::Bad(_))));
+        let a = local_access(&local_claims("gh1", "computer", "refs/heads/main", "main", "41", "9")).unwrap();
+        assert_eq!(a.run.as_deref(), Some("41"));
+        assert_eq!(local_claims("gh1", "computer", "refs/heads/main", "main", "41", "9")["scp"], "Actions.Results:41:9");
+    }
+
+    fn pr() -> Access { github_access(&serde_json::json!({ "repository_id": "77", "ac": r#"[{"Scope":"refs/pull/5/merge","Permission":3},{"Scope":"refs/heads/main","Permission":1}]"# })).unwrap() }
+    fn main_branch() -> Access { github_access(&serde_json::json!({ "repository_id": "77", "ac": r#"[{"Scope":"refs/heads/main","Permission":3}]"# })).unwrap() }
+
+    fn save(store: &Mem, access: &Access, key: &str, now: u64) -> Entry {
+        let (at, e) = run(begin(store, access, key, V, "us-east-1", now)).unwrap();
+        run(finish(store, &at, &e, vec![("p0".into(), 10), ("p1".into(), 5)])).unwrap()
+    }
+
+    #[test]
+    fn scopes_as_githubs_token_says() {
+        assert_eq!(pr().scopes, vec![Scope { name: "refs/pull/5/merge".into(), write: true }, Scope { name: "refs/heads/main".into(), write: false }]);
+        assert_eq!(pr().ns, "gh77");
+        // The token GitHub gave a job (recorded): its one scope, read and write.
+        let recorded = serde_json::json!({ "ac": "[{\"Scope\":\"refs/heads/main\",\"Permission\":3}]", "acsl": "10", "repository_id": "1000001", "run_id": "1" });
+        assert_eq!(github_access(&recorded).unwrap(), Access { ns: "gh1000001".into(), scopes: vec![Scope { name: "refs/heads/main".into(), write: true }], run: None });
+        assert!(github_access(&serde_json::json!({ "ac": "[]" })).is_err());
+        assert!(github_access(&serde_json::json!({ "repository_id": "1", "ac": r#"[{"Scope":"a:b","Permission":3}]"# })).is_err());
+    }
+
+    #[test]
+    fn a_pull_request_reads_main_and_writes_only_its_own() {
+        let store = Mem::default();
+        save(&store, &main_branch(), "deps-aaa", 1);
+        // Found in main (the PR's own scope has nothing).
+        let hit = run(lookup(&store, &pr(), "deps-aaa", &[], V)).unwrap().unwrap();
+        assert_eq!((hit.key.as_str(), hit.entry.size), ("deps-aaa", 15));
+        // Its own save goes to its own scope, and main does not see it.
+        save(&store, &pr(), "deps-bbb", 2);
+        assert!(run(lookup(&store, &main_branch(), "deps-bbb", &[], V)).unwrap().is_none());
+        assert_eq!(run(lookup(&store, &pr(), "deps-bbb", &[], V)).unwrap().unwrap().index, "cache:gh77:refs/pull/5/merge:0123abcd:deps-bbb");
+        // Read only: no save.
+        let reader = Access { ns: "gh77".into(), scopes: vec![Scope { name: "refs/heads/main".into(), write: false }], run: None };
+        assert_eq!(run(begin(&store, &reader, "x", V, "us-east-1", 3)).unwrap_err(), Refused::NoWrite);
+    }
+
+    #[test]
+    fn restore_keys_find_the_newest_of_their_start_in_each_scope_in_turn() {
+        let store = Mem::default();
+        save(&store, &main_branch(), "deps-1", 10);
+        save(&store, &main_branch(), "deps-2", 20);
+        save(&store, &main_branch(), "other-9", 30);
+        let hit = run(lookup(&store, &pr(), "deps-3", &["deps-".into()], V)).unwrap().unwrap();
+        assert_eq!(hit.key, "deps-2");
+        // The PR's own scope comes first, even with an older entry.
+        save(&store, &pr(), "deps-0", 5);
+        assert_eq!(run(lookup(&store, &pr(), "deps-3", &["deps-".into()], V)).unwrap().unwrap().key, "deps-0");
+        // Another version is no hit.
+        assert!(run(lookup(&store, &pr(), "deps-2", &[], "ffff")).unwrap().is_none());
+        // BuildKit's keys, with colons.
+        save(&store, &main_branch(), "buildkit-blob-1-sha256:62a5bc3a", 40);
+        assert_eq!(run(lookup(&store, &pr(), "buildkit-blob-1-sha256:62a5bc3a", &[], V)).unwrap().unwrap().key, "buildkit-blob-1-sha256:62a5bc3a");
+        assert_eq!(run(lookup(&store, &pr(), "nothing", &["buildkit-blob-1-sha256:".into()], V)).unwrap().unwrap().key, "buildkit-blob-1-sha256:62a5bc3a");
+        assert!(run(lookup(&store, &pr(), "a,b", &[], V)).is_err());
+    }
+
+    #[test]
+    fn an_entry_is_written_once_and_an_unfinished_one_is_no_hit() {
+        let store = Mem::default();
+        let (at, e) = run(begin(&store, &main_branch(), "k", V, "us-east-1", 100)).unwrap();
+        assert!(run(lookup(&store, &main_branch(), "k", &[], V)).unwrap().is_none());
+        assert_eq!(run(begin(&store, &main_branch(), "k", V, "us-east-1", 200)).unwrap_err(), Refused::Exists);
+        assert_eq!(run(begun(&store, &main_branch(), "k", V)).unwrap().unwrap().1.id, e.id);
+        run(finish(&store, &at, &e, vec![("a".into(), 1)])).unwrap();
+        assert_eq!(run(begin(&store, &main_branch(), "k", V, "us-east-1", 300 + UNFINISHED_MS * 2)).unwrap_err(), Refused::Exists);
+        // One begun and left (its job ended while saving) is begun again ten minutes later.
+        run(begin(&store, &main_branch(), "left", V, "us-east-1", 100)).unwrap();
+        assert_eq!(run(begin(&store, &main_branch(), "left", V, "us-east-1", 100 + TAKEOVER_MS / 2)).unwrap_err(), Refused::Exists);
+        assert!(run(begin(&store, &main_branch(), "left", V, "us-east-1", 200 + TAKEOVER_MS)).is_ok());
+        assert!(run(finish(&store, &at, &e, vec![("bad name".into(), 1)])).is_err());
+    }
+
+    #[test]
+    fn eviction_keeps_the_most_recently_used_within_the_limit() {
+        let store = Mem::default();
+        save(&store, &main_branch(), "a", 1);
+        save(&store, &main_branch(), "b", 2);
+        save(&store, &main_branch(), "c", 3);
+        let hit = run(lookup(&store, &main_branch(), "a", &[], V)).unwrap().unwrap();
+        run(used(&store, &hit, 3_700_000)).unwrap();
+        // 15 bytes each, room for two: b (least recently used) goes.
+        let gone = run(evict(&store, 3_800_000, 30)).unwrap();
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].1.len(), 2);
+        assert!(gone[0].1[0].starts_with("c/gh77/") && gone[0].1[0].ends_with("/p0"));
+        assert!(run(lookup(&store, &main_branch(), "b", &[], V)).unwrap().is_none());
+        assert_eq!(run(kept(&store, "gh77")).unwrap(), (2, 30));
+        // A week unused: gone.
+        assert_eq!(run(evict(&store, 3 + UNUSED_MS + 1, LIMIT_BYTES)).unwrap().len(), 1);
+        assert_eq!(run(kept(&store, "gh77")).unwrap(), (1, 15));
+    }
+
+    #[test]
+    fn a_run_from_a_computer_reads_its_branch_and_main_and_writes_its_own() {
+        let a = local_access(&local_claims("gh77", "agent-1", "refs/heads/feature", "main", "1", "1")).unwrap();
+        assert_eq!(a.scopes, vec![Scope { name: "refs/superci/agent-1".into(), write: true }, Scope { name: "refs/heads/feature".into(), write: false }, Scope { name: "refs/heads/main".into(), write: false }]);
+        let store = Mem::default();
+        save(&store, &main_branch(), "deps", 1);
+        assert_eq!(run(lookup(&store, &a, "deps", &[], V)).unwrap().unwrap().key, "deps");
+        save(&store, &a, "deps-local", 2);
+        assert!(run(lookup(&store, &main_branch(), "deps-local", &[], V)).unwrap().is_none());
+        assert_eq!(local_access(&local_claims("gh77", "computer", "refs/heads/main", "main", "1", "1")).unwrap().scopes.len(), 2);
+        assert!(local_access(&serde_json::json!({ "ns": "x/y", "ac": "[]" })).is_err());
+        assert!(local_ns("acme/app").starts_with("local-"));
+    }
+}

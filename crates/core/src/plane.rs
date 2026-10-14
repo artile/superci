@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::aws::{self, Credentials, Launch};
+use crate::cache;
 use crate::crypto::{safe_eq, sha256_hex, verify_hub_signature, SigningKeyStore};
 use crate::github::{self, App, Owner};
 use crate::gitlab::{self, GitLab};
@@ -187,6 +188,10 @@ pub struct Cache {
     public_repos: RefCell<Option<(Vec<String>, u64)>>,
     /// The control plane's own network per AWS region (None: not made there), and until when it is taken as current.
     network: RefCell<HashMap<String, (Option<aws::Network>, u64)>>,
+    /// Whether a region's cache bucket has this version's `superci-cache`, and until when that is taken as current.
+    cache_ready: RefCell<HashMap<String, (bool, u64)>>,
+    /// GitHub's keys for its jobs' tokens, and when they were fetched.
+    github_keys: RefCell<Option<(serde_json::Value, u64)>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -940,6 +945,9 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/runs") if self.run_key(&req).is_some() => { let k = self.run_key(&req); self.create_run(&req, &plane_url, k).await }
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
             (_, p) if p.starts_with("/runner/") => self.for_runner(&req, &plane_url, &url).await,
+            // A machine's `superci-cache` (with the link only it has), for a job's cache.
+            ("POST", p) if p.starts_with("/cache/") => self.cache_route(&req, &plane_url, p).await,
+            ("GET", p) if p.starts_with("/cache/") && p.ends_with("/program") => self.cache_program(&plane_url, p).await,
             _ => Ok(nothing_here()),
         }
     }
@@ -2113,6 +2121,8 @@ impl<'a> ControlPlane<'a> {
                             // The spot pools left after the best has no machine are asked in one request, unless
                             // this role lately could not.
                             let fleet = !on_demand && !self.store.get(NO_FLEET_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000);
+                            // GitHub's cache, kept in this region's bucket, for a Linux machine of a GitHub job.
+                            let user_data = if spec.os() == "linux" && !gitlab { self.with_cache(user_data.clone(), region, spec.arch(), &creds, plane_url, now).await } else { user_data.clone() };
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
                                 clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet };
                             let mut told = aws::Told::default();
@@ -2714,8 +2724,11 @@ impl<'a> ControlPlane<'a> {
             if let Err(why) = self.within(k, now).await { return Ok(Response::text(429, &why)) }
         }
         let run_id = (1u64 << 62) + now * 1000 + (crate::crypto::random_bytes(2).iter().map(|b| *b as u64).sum::<u64>() % 1000);
+        // Its jobs' cache: the repository's entries, as GitHub's jobs keep them when GitHub knows it here.
+        let (ns, default_branch) = match self.repository_of(&r.repository).await { Some((id, default)) => (format!("gh{id}"), default), None => (cache::local_ns(&r.repository), "main".to_string()) };
         let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
-            "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances });
+            "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances,
+            "cache": { "ns": ns, "default_branch": default_branch } });
         put_json(self.store, &format!("run:{run_id}"), &run).await?;
         if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
         let run = get_json::<serde_json::Value>(self.store, &format!("run:{run_id}")).await?.unwrap_or_default();
@@ -2851,6 +2864,20 @@ impl<'a> ControlPlane<'a> {
         })
     }
 
+    /// A repository's id and default branch as GitHub has them, where an App of this control plane is installed on it.
+    async fn repository_of(&self, repository: &str) -> Option<(u64, String)> {
+        let owner = repository.split('/').next()?;
+        let now = self.clock.now_ms();
+        for app in self.config.apps() {
+            let Ok(found) = github::installations(self.http, app, now).await else { continue };
+            let Some(i) = found.iter().find(|i| i.account.eq_ignore_ascii_case(owner)) else { continue };
+            let Ok(token) = self.installation_token(app, i.id).await else { continue };
+            let Ok(r) = github::repository(self.http, &app.api(), &token, repository).await else { continue };
+            return Some((r["id"].as_u64()?, r["default_branch"].as_str().unwrap_or("main").to_string()))
+        }
+        None
+    }
+
     /// Starts one job of a run from a computer: its message (with its matrix, strategy and needs), its record, and
     /// its machine, as any job's.
     async fn start_instance(&self, plane_url: &str, run_id: u64, run: &serde_json::Value, inst: &serde_json::Value, secrets: &[(String, String)], wf: &crate::workflow::Node) -> std::result::Result<(), String> {
@@ -2876,8 +2903,14 @@ impl<'a> ControlPlane<'a> {
         let service = format!("{plane_url}/runner/{token}/");
         let vars: Vec<(String, String)> = serde_json::from_value(run["vars"].clone()).unwrap_or_default();
         let display = inst["name"].as_str().map(str::to_string);
+        // Its token, which its actions use for the cache as a GitHub job's own (see `cache::local_claims`).
+        let who = run["by"].as_str().filter(|b| !b.is_empty() && b.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))).unwrap_or("computer");
+        let mut claims = cache::local_claims(run["cache"]["ns"].as_str().unwrap_or_default(), who, &reference, run["cache"]["default_branch"].as_str().unwrap_or("main"), &run_id.to_string(), &job_id.to_string());
+        let secs = now / 1000;
+        for (k, v) in [("iss", serde_json::json!(plane_url)), ("aud", "superci-cache".into()), ("sub", format!("run:{run_id}").into()), ("iat", secs.into()), ("exp", (secs + (self.machine_minutes("aws") as u64 + 60) * 60).into())] { claims[k] = v }
+        let access_token = self.identity().await?.signing.jwt(&claims)?;
         let given = crate::runner_service::Given { workflow: run["workflow"].as_str().unwrap_or_default(), path: &path, job: key_name, secrets, vars: &vars, github, service: &service,
-            access_token: &crate::runner_service::access_token(now), ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
+            access_token: &access_token, ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
             strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone() };
         let message = crate::runner_service::job_message(&given)?;
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, at_ms: now, job_id, ..Default::default() }).await?;
@@ -3273,6 +3306,8 @@ impl<'a> ControlPlane<'a> {
             for (k, _) in self.store.list(&format!("rtree:{tree}:")).await? { self.store.delete(&k).await? }
             self.store.delete(&k).await?;
         }
+        // The cache: what goes (over a repository's limit, unused for a week, never finished), once an hour.
+        if let Err(e) = self.sweep_cache(&plane_url, now).await { let _ = self.store.put("cache-sweep-error", e).await; }
         self.redeliver_failed().await;
         let moved_lately = self.untold(&plane_url, now).await;
         // Every 20 seconds while jobs wait for room; every minute while machines are up, or just after a move here;
@@ -3331,5 +3366,191 @@ impl<'a> ControlPlane<'a> {
                 if matches!(self.store.put_if_absent(&key, now.to_string()).await, Ok(true)) { let _ = github::redeliver(self.http, app, id, now).await; }
             }
         }
+    }
+}
+
+/// The cache (see `cache`): its routes for machines, its sweep, and `superci-cache` on each machine.
+impl<'a> ControlPlane<'a> {
+    /// Whether a region's bucket is set up and has this version's `superci-cache` for an architecture (looked at every
+    /// ten minutes; the dashboard makes the bucket and puts the program there).
+    async fn cache_ready(&self, region: &str, arch: &str, creds: &Credentials, now: u64) -> bool {
+        let at = format!("{region} {arch}");
+        if let Some((ready, _)) = self.cache.cache_ready.borrow().get(&at).filter(|(_, until)| *until > now) { return *ready }
+        let url = aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &cache::program_key(arch));
+        let ready = matches!(aws::s3(self.http, "HEAD", &url, region, creds, vec![], &[], now).await, Ok(r) if r.status == 200);
+        self.cache.cache_ready.borrow_mut().insert(at, (ready, now + 600_000));
+        ready
+    }
+
+    /// A machine's start-up script with `superci-cache` in it, when its region's bucket is ready, with the machine's
+    /// own link to this control plane (until its longest job ends; its `program` sends it on to the bucket).
+    async fn with_cache(&self, user_data: String, region: &str, arch: &str, creds: &Credentials, plane_url: &str, now: u64) -> String {
+        let arch = if arch == "arm64" { "aarch64" } else { "x86_64" };
+        if !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return user_data }
+        let token = crate::crypto::random_token(18);
+        let until = now + (self.machine_minutes("aws") as u64 + 30) * 60_000;
+        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until }).await.is_err() { return user_data }
+        aws::with_cache(user_data.clone(), &format!("{plane_url}/cache/{token}")).unwrap_or(user_data)
+    }
+
+    /// GitHub's keys for its jobs' tokens: kept a day, and fetched again for a key not among them (once a minute at most).
+    async fn github_keys(&self, kid: &str, now: u64) -> Result<serde_json::Value> {
+        let kept = self.cache.github_keys.borrow().clone();
+        let kept = match kept { Some(k) => Some(k), None => get_json::<(serde_json::Value, u64)>(self.store, "github-keys").await.ok().flatten() };
+        let has = |keys: &serde_json::Value| keys["keys"].as_array().is_some_and(|l| l.iter().any(|k| k["kid"] == kid));
+        if let Some((keys, at)) = &kept {
+            if (has(keys) && now.saturating_sub(*at) < 86_400_000) || now.saturating_sub(*at) < 60_000 { self.cache.github_keys.replace(Some((keys.clone(), *at))); return Ok(keys.clone()) }
+        }
+        let r = self.http.send(Request::new("GET", "https://token.actions.githubusercontent.com/.well-known/jwks")).await?;
+        if r.status != 200 { return kept.map(|(k, _)| k).ok_or_else(|| format!("GitHub's keys: {}", r.status)) }
+        let keys: serde_json::Value = serde_json::from_slice(&r.body).map_err(|e| format!("GitHub's keys: {e}"))?;
+        let _ = put_json(self.store, "github-keys", &(keys.clone(), now)).await;
+        self.cache.github_keys.replace(Some((keys.clone(), now)));
+        Ok(keys)
+    }
+
+    /// What a job's token lets it do in the cache: GitHub's own token (signed with GitHub's keys), or one this control
+    /// plane gave a run from a computer (signed with its own).
+    async fn cache_access(&self, token: &str, plane_url: &str, now: u64) -> Result<cache::Access> {
+        use base64::Engine;
+        let header: serde_json::Value = token.split('.').next().and_then(|h| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(h.trim_end_matches('=')).ok())
+            .and_then(|h| serde_json::from_slice(&h).ok()).ok_or("not a job's token")?;
+        if header["alg"] == "ES256" {
+            let claims = crate::crypto::verify_es256_jwt(token, &self.identity().await?.signing.public_jwk()?, now / 1000)?;
+            if claims["iss"] != plane_url || claims["aud"] != "superci-cache" { return Err("not this control plane's token".into()) }
+            return cache::local_access(&claims)
+        }
+        let keys = self.github_keys(header["kid"].as_str().unwrap_or_default(), now).await?;
+        let claims = crate::crypto::verify_rs256_jwt(token, &keys, now / 1000)?;
+        if claims["iss"] != "https://token.actions.githubusercontent.com" { return Err("not a GitHub job's token".into()) }
+        cache::github_access(&claims)
+    }
+
+    /// `GET /cache/<machine's link>/program`: on to this version's `superci-cache` for the machine, in its region's
+    /// bucket (a link that does only that, for a few minutes).
+    async fn cache_program(&self, plane_url: &str, path: &str) -> Result<Response> {
+        let now = self.clock.now_ms();
+        let token = path.trim_start_matches("/cache/").trim_end_matches("/program");
+        let Some(machine) = cache::machine(self.store, token, now).await? else { return Ok(nothing_here()) };
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(nothing_here()) };
+        let creds = self.aws_creds(plane_url, &a).await?;
+        let url = aws::s3_url(&cache::bucket(&self.config.plane_id, &machine.region), &machine.region, &cache::program_key(&machine.arch));
+        Ok(Response::redirect(&aws::presign("GET", &url, &creds, &machine.region, 600, now)?).with_status(302))
+    }
+
+    /// `POST /cache/<machine's link>/<what>`, from `superci-cache` with the job's token: `lookup` (a key, restore keys
+    /// and version: links to read the hit's pieces), `begin` (an entry to save), `sign` (links to write its pieces),
+    /// `finish` (its pieces, in order). A machine's link works for its region until its longest job is over.
+    async fn cache_route(&self, req: &Request, plane_url: &str, path: &str) -> Result<Response> {
+        let now = self.clock.now_ms();
+        let mut parts = path.trim_start_matches("/cache/").splitn(2, '/');
+        let (token, what) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+        let Some(machine) = cache::machine(self.store, token, now).await? else { return Ok(nothing_here()) };
+        let body: serde_json::Value = serde_json::from_slice(&req.body).map_err(|e| format!("not JSON: {e}"))?;
+        let refuse = |why: &str| Ok(Response::json(&serde_json::json!({ "ok": false, "why": why })).with_status(403));
+        let access = match self.cache_access(body["token"].as_str().unwrap_or_default(), plane_url, now).await { Ok(a) => a, Err(e) => return refuse(&e) };
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return refuse("this control plane has no AWS account") };
+        let creds = self.aws_creds(plane_url, &a).await?;
+        let (key, version) = (body["key"].as_str().unwrap_or_default(), body["version"].as_str().unwrap_or_default());
+        let link = |method: &str, region: &str, object: &str| aws::presign(method, &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, object), &creds, region, cache::LINK_SECONDS, now);
+        match what {
+            "lookup" => {
+                let restore: Vec<String> = body["restore_keys"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_string)).take(10).collect();
+                // (A key or version GitHub would not take is found nowhere.)
+                let Ok(Some(hit)) = cache::lookup(self.store, &access, key, &restore, version).await else { return Ok(Response::json(&serde_json::json!({ "hit": false }))) };
+                let _ = cache::used(self.store, &hit, now).await;
+                let prefix = hit.entry.prefix(&access.ns);
+                let pieces = hit.entry.pieces.iter().map(|(p, size)| Ok(serde_json::json!({ "url": link("GET", &hit.entry.region, &format!("{prefix}/{p}"))?, "size": size }))).collect::<Result<Vec<_>>>()?;
+                Ok(Response::json(&serde_json::json!({ "hit": true, "key": hit.key, "size": hit.entry.size, "pieces": pieces })))
+            }
+            "begin" => match cache::begin(self.store, &access, key, version, &machine.region, now).await {
+                Ok(_) => Ok(Response::json(&serde_json::json!({ "ok": true }))),
+                Err(cache::Refused::Exists) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": "exists" })).with_status(409)),
+                Err(cache::Refused::NoWrite) => refuse("this job may only read the cache"),
+                Err(cache::Refused::Bad(e)) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": e })).with_status(400)),
+            },
+            "sign" | "finish" => {
+                let Some((at, entry)) = cache::begun(self.store, &access, key, version).await? else { return Ok(Response::json(&serde_json::json!({ "ok": false, "why": "no entry being saved" })).with_status(404)) };
+                if what == "sign" {
+                    let names: Vec<&str> = body["names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
+                    if names.is_empty() || names.len() > 64 || !names.iter().all(|n| cache::piece_name(n)) { return Ok(Response::json(&serde_json::json!({ "ok": false, "why": "piece names" })).with_status(400)) }
+                    let prefix = entry.prefix(&access.ns);
+                    let urls = names.iter().map(|n| link("PUT", &entry.region, &format!("{prefix}/{n}"))).collect::<Result<Vec<_>>>()?;
+                    return Ok(Response::json(&serde_json::json!({ "ok": true, "urls": urls })))
+                }
+                let pieces: Vec<(String, u64)> = body["pieces"].as_array().into_iter().flatten().filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_u64()?))).collect();
+                let done = cache::finish(self.store, &at, &entry, pieces).await?;
+                Ok(Response::json(&serde_json::json!({ "ok": true, "size": done.size })))
+            }
+            // A run from a computer's artifacts (a job of GitHub's keeps them at GitHub).
+            "artifact-begin" | "artifact-sign" | "artifact-finish" | "artifacts" | "artifact-get" | "artifact-delete" => {
+                let Some(run) = access.run.clone() else { return refuse("a job of GitHub's keeps its artifacts at GitHub") };
+                let (name, ns) = (body["name"].as_str().unwrap_or_default(), cache::artifact_ns(&run));
+                let missing = || Ok(Response::json(&serde_json::json!({ "ok": false, "why": "no such artifact" })).with_status(404));
+                match what {
+                    "artifact-begin" => match cache::begin_artifact(self.store, &run, name, &machine.region, now).await {
+                        Ok(_) => Ok(Response::json(&serde_json::json!({ "ok": true }))),
+                        Err(cache::Refused::Exists) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": "an artifact of this name exists in the run" })).with_status(409)),
+                        Err(cache::Refused::Bad(e)) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": e })).with_status(400)),
+                        Err(cache::Refused::NoWrite) => refuse("this job may not keep artifacts"),
+                    },
+                    "artifact-sign" => {
+                        let Some((_, entry)) = cache::artifact(self.store, &run, name, false).await? else { return missing() };
+                        let names: Vec<&str> = body["names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
+                        if names.is_empty() || names.len() > 64 || !names.iter().all(|n| cache::piece_name(n)) { return Ok(Response::json(&serde_json::json!({ "ok": false, "why": "piece names" })).with_status(400)) }
+                        let urls = names.iter().map(|n| link("PUT", &entry.region, &format!("{}/{n}", entry.prefix(&ns)))).collect::<Result<Vec<_>>>()?;
+                        Ok(Response::json(&serde_json::json!({ "ok": true, "urls": urls })))
+                    }
+                    "artifact-finish" => {
+                        let Some((at, entry)) = cache::artifact(self.store, &run, name, false).await? else { return missing() };
+                        let pieces: Vec<(String, u64)> = body["pieces"].as_array().into_iter().flatten().filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_u64()?))).collect();
+                        let done = cache::finish(self.store, &at, &entry, pieces).await?;
+                        Ok(Response::json(&serde_json::json!({ "ok": true, "id": cache::artifact_id(&done), "size": done.size })))
+                    }
+                    "artifacts" => {
+                        let all = cache::artifacts(self.store, &run).await?;
+                        Ok(Response::json(&serde_json::json!({ "ok": true, "artifacts": all.iter().map(|(n, e)| serde_json::json!({ "name": n, "id": cache::artifact_id(e), "size": e.size, "made": e.made })).collect::<Vec<_>>() })))
+                    }
+                    "artifact-get" => {
+                        let Some((_, entry)) = cache::artifact(self.store, &run, name, true).await? else { return missing() };
+                        let pieces = entry.pieces.iter().map(|(p, size)| Ok(serde_json::json!({ "url": link("GET", &entry.region, &format!("{}/{p}", entry.prefix(&ns)))?, "size": size }))).collect::<Result<Vec<_>>>()?;
+                        Ok(Response::json(&serde_json::json!({ "ok": true, "id": cache::artifact_id(&entry), "size": entry.size, "pieces": pieces })))
+                    }
+                    _ => {
+                        let Some((at, entry)) = cache::artifact(self.store, &run, name, true).await? else { return missing() };
+                        self.store.delete(&at).await?;
+                        for (p, _) in &entry.pieces { let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, &entry.region), &entry.region, &format!("{}/{p}", entry.prefix(&ns))), &entry.region, &creds, vec![], &[], now).await; }
+                        Ok(Response::json(&serde_json::json!({ "ok": true, "id": cache::artifact_id(&entry) })))
+                    }
+                }
+            }
+            _ => Ok(nothing_here()),
+        }
+    }
+
+    /// Once an hour: entries that go (see `cache::evict`) taken out, their pieces deleted from the bucket (what is not,
+    /// the bucket's own rule removes within `cache::BUCKET_DAYS`), and machines' links past their time forgotten.
+    async fn sweep_cache(&self, plane_url: &str, now: u64) -> Result<()> {
+        let last = self.store.get("cache-swept").await?.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        if now.saturating_sub(last) < 3_600_000 { return Ok(()) }
+        self.store.put("cache-swept", now.to_string()).await?;
+        for (k, v) in self.store.list("cachem:").await? {
+            if serde_json::from_str::<cache::Machine>(&v).map(|m| m.until < now).unwrap_or(true) { self.store.delete(&k).await? }
+        }
+        let mut gone = cache::evict(self.store, now, cache::LIMIT_BYTES).await?;
+        // The artifacts of runs from a computer that are no longer kept.
+        for (k, v) in self.store.list("artifact:").await? {
+            let run = k.split(':').nth(1).unwrap_or_default().to_string();
+            if self.store.get(&format!("run:{run}")).await?.is_some() { continue }
+            self.store.delete(&k).await?;
+            if let Ok(e) = serde_json::from_str::<cache::Entry>(&v) { gone.push((e.region.clone(), e.pieces.iter().map(|(p, _)| format!("{}/{p}", e.prefix(&cache::artifact_ns(&run)))).collect())) }
+        }
+        if gone.is_empty() { return Ok(()) }
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(()) };
+        let creds = self.aws_creds(plane_url, &a).await?;
+        for (region, objects) in gone.iter().flat_map(|(r, o)| o.iter().map(move |o| (r, o))).take(500) {
+            let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, objects), region, &creds, vec![], &[], now).await;
+        }
+        Ok(())
     }
 }

@@ -6935,9 +6935,9 @@ mod tests {
         // An older control plane: its update says what it also asks for.
         let mut old = view(status(serde_json::json!({})));
         old.version = Some("0.9.11".into());
-        assert!(side_update(&old, None, &[]).contains("It also asks for 8 new permissions in AWS, 1 new permission in GitHub."));
+        assert!(side_update(&old, None, &[]).contains("It also asks for 9 new permissions in AWS, 1 new permission in GitHub."));
         old.version = Some("0.9.20".into());
-        assert!(side_update(&old, None, &[]).contains("It also asks for 6 new permissions in AWS, 1 new permission in GitHub."), "reading its network, and the network; one request for many spot pools (four); running a job again");
+        assert!(side_update(&old, None, &[]).contains("It also asks for 7 new permissions in AWS, 1 new permission in GitHub."), "reading its network, and the network; one request for many spot pools (four); its cache buckets; running a job again");
         // While it updates, on every page: says so (also when the control plane does not answer a moment, or already
         // answers with the new version); once done, that it is.
         let mut u = Update { plane: "p1".into(), steps: &UPDATE_CLOUDFLARE, at: 1, result: None, ended_ms: 0, note: String::new() };
@@ -6963,8 +6963,8 @@ mod tests {
         // Its version had them, but its role was found to lack them (made before): the update says so too.
         old.version = Some("0.9.29".into());
         let lacks: Vec<_> = AWS_RUNNER.iter().filter(|n| n.since == "0.9.12").collect();
-        // (Beside what came since its version: one request for many spot pools, four permissions.)
-        assert!(side_update(&old, None, &lacks).contains("It also asks for 5 new permissions in AWS.") && side_update(&old, None, &[]).contains("It also asks for 4 new permissions in AWS."));
+        // (Beside what came since its version: one request for many spot pools, four permissions, and its cache buckets.)
+        assert!(side_update(&old, None, &lacks).contains("It also asks for 6 new permissions in AWS.") && side_update(&old, None, &[]).contains("It also asks for 5 new permissions in AWS."));
     }
 
     #[test]

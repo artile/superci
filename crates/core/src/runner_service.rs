@@ -110,6 +110,8 @@ pub fn job_message(g: &Given) -> Result<Value> {
     }
     // A run's secrets: the runner makes its `secrets` context of them, and hides each wherever it would be printed.
     for (k, v) in g.secrets { variables.insert(k.clone(), json!({ "value": v, "isSecret": true })); }
+    // GitHub's cache as GitHub's jobs have it now (version 2: `ACTIONS_CACHE_SERVICE_V2` for the job's actions).
+    variables.insert("actions_uses_cache_service_v2".into(), json!({ "value": "true" }));
     let vars: serde_json::Map<String, Value> = g.vars.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
     m["variables"] = variables.into();
     m["mask"] = g.secrets.iter().filter(|(_, v)| !v.is_empty()).map(|(_, v)| json!({ "type": "regex", "value": regex_escape(v) })).collect();

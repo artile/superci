@@ -3453,3 +3453,97 @@ fn a_run_from_a_computer_of_several_jobs_starts_each_once_what_it_needs_has_ende
     let rec: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{rid}")]).unwrap();
     assert_eq!(rec["jobs"].as_array().unwrap().iter().map(|j| j["key"].as_str().unwrap()).collect::<Vec<_>>(), ["build", "test", "test"]);
 }
+
+/// The fake clouds, with this version's `superci-cache` in Virginia's cache bucket, and GitHub's keys for its jobs'
+/// tokens (`keys`).
+struct WithCache { clouds: FakeClouds, keys: serde_json::Value }
+#[async_trait(?Send)]
+impl Http for WithCache {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        if r.url == format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/{}", superci_core::cache::program_key("x86_64")) && r.method == "HEAD" {
+            assert!(r.header("authorization").is_some_and(|a| a.contains("/us-east-1/s3/aws4_request")));
+            return Ok(Response::new(200, "application/octet-stream", ""));
+        }
+        if r.url == "https://token.actions.githubusercontent.com/.well-known/jwks" { return Ok(Response::new(200, "application/json", self.keys.to_string())) }
+        if r.url == "https://api.github.com/repos/acme/app" { return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 77, "default_branch": "main" }).to_string())) }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn a_machine_keeps_githubs_cache_in_its_regions_bucket_as_its_jobs_token_allows() {
+    use rsa::signature::{SignatureEncoding, Signer};
+    use rsa::traits::PublicKeyParts;
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let b = |v: &[u8]| URL_SAFE_NO_PAD.encode(v);
+    let keys = serde_json::json!({ "keys": [{ "kty": "RSA", "kid": "gh1", "alg": "RS256", "n": b(&key.n().to_bytes_be()), "e": b(&key.e().to_bytes_be()) }] });
+    let github_token = |ac: &str, repo: &str| {
+        let claims = serde_json::json!({ "iss": "https://token.actions.githubusercontent.com", "ac": ac, "acsl": "10", "repository_id": repo, "run_id": "9", "nbf": 1_789_999_000, "exp": 1_790_020_000 });
+        let unsigned = format!("{}.{}", b(br#"{"alg":"RS256","kid":"gh1","typ":"JWT"}"#), b(claims.to_string().as_bytes()));
+        format!("{unsigned}.{}", b(&rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key.clone()).sign(unsigned.as_bytes()).to_vec()))
+    };
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithCache { clouds: FakeClouds::default(), keys };
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    run(webhook("queued", None));
+    // The machine fetches superci-cache with a link that does only that, and has a link of its own to the cache.
+    let launch = launches(&http.clouds).pop().expect("a machine");
+    let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
+    assert!(script.contains(r#"curl -fsSL --retry 2 -m 30 -o /usr/local/bin/superci-cache "$c/program""#), "{script}");
+    assert!(script.find("superci-cache wrap /home/runner/externals").unwrap() < script.find("cd /home/runner && ").unwrap());
+    let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let program = run(get(&format!("/cache/{link}/program")));
+    let to = program.header("location").unwrap();
+    assert_eq!(program.status, 302);
+    assert!(to.starts_with(&format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/superci/cache-")) && to.contains("-x86_64?X-Amz-Algorithm=AWS4-HMAC-SHA256") && to.contains("X-Amz-Expires=600&X-Amz-Security-Token=tok"), "{to}");
+    assert_eq!(run(get("/cache/someone-elses-link-here/program")).status, 404);
+    let call = |what: &str, body: serde_json::Value| { let r = run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/{what}")).with_body(body.to_string())); (r.status, json(&r)) };
+    let main = github_token(r#"[{"Scope":"refs/heads/main","Permission":3}]"#, "77");
+    let pr = github_token(r#"[{"Scope":"refs/pull/5/merge","Permission":3},{"Scope":"refs/heads/main","Permission":1}]"#, "77");
+    let v = "a1b2c3";
+
+    // main saves: begun, links to write its pieces in Virginia's bucket, finished.
+    assert_eq!(call("begin", serde_json::json!({ "token": main, "key": "deps-1", "version": v })), (200, serde_json::json!({ "ok": true })));
+    let (status, signed) = call("sign", serde_json::json!({ "token": main, "key": "deps-1", "version": v, "names": ["b0", "b1"] }));
+    assert_eq!(status, 200);
+    let put = signed["urls"][0].as_str().unwrap();
+    assert!(put.starts_with(&format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/c/gh77/")) && put.contains("/b0?X-Amz-Algorithm=AWS4-HMAC-SHA256"), "{put}");
+    assert_eq!(call("begin", serde_json::json!({ "token": main, "key": "deps-1", "version": v })).0, 409, "being saved already");
+    assert_eq!(call("finish", serde_json::json!({ "token": main, "key": "deps-1", "version": v, "pieces": [["b0", 100], ["b1", 20]] })), (200, serde_json::json!({ "ok": true, "size": 120 })));
+
+    // A pull request finds it in main (by a restore key), with links to read it; it may not write main's.
+    let (status, hit) = call("lookup", serde_json::json!({ "token": pr, "key": "deps-2", "restore_keys": ["deps-"], "version": v }));
+    assert_eq!((status, hit["hit"].as_bool(), hit["key"].as_str(), hit["size"].as_u64()), (200, Some(true), Some("deps-1"), Some(120)));
+    assert!(hit["pieces"][1]["url"].as_str().unwrap().contains("/b1?") && hit["pieces"][1]["size"] == 20);
+    assert_eq!(call("begin", serde_json::json!({ "token": pr, "key": "deps-1", "version": v })).0, 200, "its own scope: a new entry");
+    // Another repository sees nothing of it.
+    assert_eq!(call("lookup", serde_json::json!({ "token": github_token(r#"[{"Scope":"refs/heads/main","Permission":3}]"#, "78"), "key": "deps-1", "version": v })).1["hit"], false);
+
+    // Refused: a token changed by hand, one signed by another key, no token, and a link no machine has.
+    let mut forged: Vec<String> = main.split('.').map(str::to_string).collect();
+    forged[1] = b(br#"{"iss":"https://token.actions.githubusercontent.com","ac":"[{\"Scope\":\"refs/heads/main\",\"Permission\":3}]","repository_id":"78","exp":1790020000}"#);
+    assert_eq!(call("lookup", serde_json::json!({ "token": forged.join("."), "key": "deps-1", "version": v })).0, 403);
+    assert_eq!(call("lookup", serde_json::json!({ "key": "deps-1", "version": v })).0, 403);
+    let r = run(Request::new("POST", &format!("{PLANE_URL}/cache/not-a-machines-link-at-all/lookup")).with_body(serde_json::json!({ "token": main, "key": "deps-1", "version": v }).to_string()));
+    assert_eq!(r.status, 404);
+
+    // A run from a computer: its job's token (the control plane's) reads the repository's caches as GitHub's jobs
+    // keep them, and writes its own scope only; its actions are told to use cache version 2, as GitHub's are.
+    let made = run(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1")
+        .with_body(serde_json::json!({ "workflow": "jobs:\n  t:\n    runs-on: superci\n    steps:\n      - run: echo hi\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/feature" }).to_string()));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    let handed: serde_json::Value = store.0.borrow().iter().find(|(k, _)| k.starts_with("rjob:")).map(|(_, v)| serde_json::from_str(v).unwrap()).unwrap();
+    let message = &handed["message"];
+    let local = message["resources"]["endpoints"][0]["authorization"]["parameters"]["AccessToken"].as_str().unwrap().to_string();
+    assert_eq!(message["variables"]["actions_uses_cache_service_v2"]["value"], "true");
+    let (status, hit) = call("lookup", serde_json::json!({ "token": local, "key": "deps-1", "version": v }));
+    assert_eq!((status, hit["hit"].as_bool(), hit["key"].as_str()), (200, Some(true), Some("deps-1")), "main's, found from the feature branch's run");
+    assert_eq!(call("begin", serde_json::json!({ "token": local, "key": "deps-local", "version": v })).0, 200);
+    assert!(store.0.borrow().contains_key(&format!("cache:gh77:refs/superci/computer:{v}:deps-local")));
+    assert_eq!(call("lookup", serde_json::json!({ "token": main, "key": "deps-local", "version": v })).1["hit"], false, "not main's");
+}

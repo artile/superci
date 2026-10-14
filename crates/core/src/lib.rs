@@ -2,6 +2,7 @@
 //! (a Cloudflare Worker and Durable Object, or AWS Lambda), creates its own GitHub App, and runs GitHub Actions jobs
 //! on machines in connected clouds. Runtimes provide HTTP, storage, time and a timer (`io`); everything else is here.
 pub mod aws;
+pub mod cache;
 pub mod crypto;
 pub mod docker;
 pub mod github;

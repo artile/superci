@@ -83,6 +83,41 @@ pub fn sigv4(method: &str, url: &str, headers: &[(String, String)], body: &[u8],
     Ok(out)
 }
 
+/// A link that does one S3 request (`method` on `url`, an object's address) for `expires_s` seconds, signed in its
+/// query (Signature Version 4, the body unsigned): whoever holds it may do that and nothing else. `url`'s path must be
+/// plain (letters, digits, `/-_.`), as SuperCI's object names are.
+pub fn presign(method: &str, url: &str, creds: &Credentials, region: &str, expires_s: u64, now_ms: u64) -> Result<String> {
+    let u = url::Url::parse(url).map_err(|e| e.to_string())?;
+    if !u.path().bytes().all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b)) || u.query().is_some() { return Err("an object name SuperCI does not make".into()) }
+    let host = u.host_str().unwrap_or("").to_string();
+    let date = amz_date(now_ms);
+    let scope = format!("{}/{region}/s3/aws4_request", &date[..8]);
+    let mut query = vec![("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()), ("X-Amz-Credential".into(), format!("{}/{scope}", creds.access_key_id)),
+        ("X-Amz-Date".into(), date.clone()), ("X-Amz-Expires".into(), expires_s.to_string()), ("X-Amz-SignedHeaders".into(), "host".into())];
+    if let Some(t) = &creds.session_token { query.push(("X-Amz-Security-Token".into(), t.clone())) }
+    let mut encoded: Vec<(String, String)> = query.iter().map(|(k, v)| (rfc3986(k), rfc3986(v))).collect();
+    encoded.sort();
+    let canonical_query = encoded.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    let canonical = format!("{method}\n{}\n{canonical_query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD", u.path());
+    let to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
+    let mut key = hmac_sha256(format!("AWS4{}", creds.secret_access_key).as_bytes(), date[..8].as_bytes());
+    for part in [region, "s3", "aws4_request"] { key = hmac_sha256(&key, part.as_bytes()); }
+    Ok(format!("{}://{host}{}?{canonical_query}&X-Amz-Signature={}", u.scheme(), u.path(), hex(&hmac_sha256(&key, to_sign.as_bytes()))))
+}
+
+/// One signed S3 request (S3 also wants the body's hash as a header); its answer, whatever its status.
+pub async fn s3(http: &dyn Http, method: &str, url: &str, region: &str, creds: &Credentials, body: Vec<u8>, headers: &[(&str, &str)], now_ms: u64) -> Result<crate::io::Response> {
+    let mut all: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    all.push(("x-amz-content-sha256".into(), sha256_hex(&body)));
+    let signed = sigv4(method, url, &all, &body, creds, region, "s3", &amz_date(now_ms))?;
+    let mut req = Request::new(method, url).with_body(body);
+    req.headers = signed;
+    http.send(req).await
+}
+
+/// The address of an object in a bucket (virtual-hosted, in the bucket's region: what a VPC's S3 endpoint serves).
+pub fn s3_url(bucket: &str, region: &str, key: &str) -> String { format!("https://{bucket}.s3.{region}.amazonaws.com/{key}") }
+
 /// Query API parameters from nested JSON: arrays become `.1`, `.2`, … and objects `.Key`.
 pub fn query_params(value: &serde_json::Value, prefix: &str, out: &mut Vec<(String, String)>) {
     match value {
@@ -658,6 +693,13 @@ pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, pl
     for (_, subnet) in &subnets {
         ok_if(call("AssociateRouteTable", serde_json::json!({ "RouteTableId": route_table, "SubnetId": subnet })).await, &["Resource.AlreadyAssociated"])?;
     }
+    // S3 reached from inside the network (the cache's bucket in this region): a gateway endpoint, which AWS does not
+    // charge for, and the traffic stays in AWS's network. Without it machines reach S3 over the internet as before.
+    let s3 = format!("com.amazonaws.{region}.s3");
+    let endpoints = call("DescribeVpcEndpoints", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc), ("service-name", &s3)]) })).await;
+    if endpoints.as_ref().is_ok_and(|e| !e.contains("<vpcEndpointId>")) {
+        let _ = call("CreateVpcEndpoint", serde_json::json!({ "VpcId": vpc, "ServiceName": s3, "VpcEndpointType": "Gateway", "RouteTableId": [route_table], "TagSpecification": tagged("vpc-endpoint", plane_id) })).await;
+    }
     // Nothing comes in (no inbound rules, not even from its own machines); everything may go out (AWS's default).
     let groups = call("DescribeSecurityGroups", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc), ("group-name", NETWORK_GROUP)]) })).await?;
     let security_group = match xml_tag(&groups, "groupId") {
@@ -691,6 +733,8 @@ pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, 
         for (s, _) in pairs(&call("DescribeSubnets", serde_json::json!({ "Filter": in_vpc })).await?, "subnetId", "subnetId") {
             gone(call("DeleteSubnet", serde_json::json!({ "SubnetId": s })).await)?;
         }
+        let endpoints: Vec<String> = pairs(&call("DescribeVpcEndpoints", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc)]) })).await.unwrap_or_default(), "vpcEndpointId", "vpcEndpointId").into_iter().map(|(e, _)| e.to_string()).collect();
+        if !endpoints.is_empty() { gone(call("DeleteVpcEndpoints", serde_json::json!({ "VpcEndpointId": endpoints })).await)?; }
         for (t, _) in pairs(&call("DescribeRouteTables", serde_json::json!({ "Filter": filters(&[("tag:superci-plane", plane_id), ("vpc-id", &vpc)]) })).await?, "routeTableId", "routeTableId") {
             gone(call("DeleteRouteTable", serde_json::json!({ "RouteTableId": t })).await)?;
         }
@@ -704,6 +748,63 @@ pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, 
     for (g, _) in pairs(&call("DescribeInternetGateways", serde_json::json!({ "Filter": filters(&[("tag:superci-plane", plane_id)]) })).await?, "internetGatewayId", "internetGatewayId") {
         let _ = call("DeleteInternetGateway", serde_json::json!({ "InternetGatewayId": g })).await;
     }
+    Ok(())
+}
+
+/// The control plane's cache bucket in a region (see `cache`): made when missing, private (as AWS makes every new
+/// bucket: no public access, no ACLs, encrypted), and with a rule of its own that removes any object older than
+/// `cache::BUCKET_DAYS` (what the control plane's index no longer knows of goes that way too). Safe to repeat.
+pub async fn make_bucket(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, now_ms: u64) -> Result<()> {
+    let bucket = crate::cache::bucket(plane_id, region);
+    let url = format!("https://{bucket}.s3.{region}.amazonaws.com/");
+    let said = |r: crate::io::Response| -> Result<crate::io::Response> { if r.status < 300 { Ok(r) } else { Err(aws_error(&r.body_text(), r.status)) } };
+    let head = s3(http, "HEAD", &url, region, creds, vec![], &[], now_ms).await?;
+    match head.status {
+        200 => {}
+        404 => {
+            let body = if region == "us-east-1" { String::new() } else { format!(r#"<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>{region}</LocationConstraint></CreateBucketConfiguration>"#) };
+            let made = s3(http, "PUT", &url, region, creds, body.into_bytes(), &[], now_ms).await?;
+            if made.status >= 300 && !made.body_text().contains("BucketAlreadyOwnedByYou") { said(made)?; }
+        }
+        403 => return Err(format!("AccessDenied: the bucket {bucket} is not reachable with this sign-in (or is someone else's)")),
+        s => return Err(format!("HTTP {s}: the bucket {bucket}")),
+    }
+    let rule = format!(r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>superci-cache</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>{}</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"#, crate::cache::BUCKET_DAYS);
+    let sum = b64(&crate::crypto::sha256(rule.as_bytes()));
+    said(s3(http, "PUT", &format!("{url}?lifecycle"), region, creds, rule.into_bytes(), &[("x-amz-sdk-checksum-algorithm", "SHA256"), ("x-amz-checksum-sha256", &sum)], now_ms).await?)?;
+    Ok(())
+}
+
+/// Puts an object in the cache bucket of a region unless it is there as it is (`superci-cache` for a version; its
+/// SHA-256 is kept with it).
+pub async fn put_once(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, key: &str, body: &[u8], now_ms: u64) -> Result<()> {
+    let url = s3_url(&crate::cache::bucket(plane_id, region), region, key);
+    let sum = sha256_hex(body);
+    let there = s3(http, "HEAD", &url, region, creds, vec![], &[], now_ms).await?;
+    if there.status == 200 && there.header("x-amz-meta-sha256") == Some(sum.as_str()) { return Ok(()) }
+    let r = s3(http, "PUT", &url, region, creds, body.to_vec(), &[("x-amz-meta-sha256", &sum)], now_ms).await?;
+    if r.status >= 300 { return Err(aws_error(&r.body_text(), r.status)) }
+    Ok(())
+}
+
+/// Removes a region's cache bucket and everything in it (when its control plane is deleted); safe to repeat.
+pub async fn delete_bucket(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, now: &dyn Fn() -> u64) -> Result<()> {
+    let bucket = crate::cache::bucket(plane_id, region);
+    let url = format!("https://{bucket}.s3.{region}.amazonaws.com/");
+    loop {
+        let listed = s3(http, "GET", &format!("{url}?list-type=2&max-keys=1000"), region, creds, vec![], &[], now()).await?;
+        if listed.status == 404 { return Ok(()) }
+        if listed.status >= 300 { return Err(aws_error(&listed.body_text(), listed.status)) }
+        let xml = listed.body_text();
+        let keys: Vec<String> = xml.split("<Key>").skip(1).filter_map(|k| k.split("</Key>").next()).map(|k| k.replace("&amp;", "&")).collect();
+        if keys.is_empty() { break }
+        for k in keys {
+            let r = s3(http, "DELETE", &s3_url(&bucket, region, &k), region, creds, vec![], &[], now()).await?;
+            if r.status >= 300 && r.status != 404 { return Err(aws_error(&r.body_text(), r.status)) }
+        }
+    }
+    let r = s3(http, "DELETE", &url, region, creds, vec![], &[], now()).await?;
+    if r.status >= 300 && r.status != 404 { return Err(aws_error(&r.body_text(), r.status)) }
     Ok(())
 }
 
@@ -1144,6 +1245,24 @@ const HELLO: &str = r#"# How the start went, said to the control plane (see wher
 /// the runner's files, when it was ready to start the runner, and when the runner listened for a job. So a slow
 /// start can be seen for what it was: AWS, the boot, the disk, or the runner reaching GitHub. Sent in the
 /// background: nothing here waits for it or stops for it.
+/// What `with_cache` adds before the runner starts: `superci-cache` fetched (the machine's link sends it on to the
+/// bucket, by a link that does only that), put in front of the runner's own Node (which runs the job's actions), and
+/// started. Beside the runner, not before it: the first action runs seconds after the runner starts, and until the
+/// program is up the actions use GitHub's cache.
+const CACHE: &str = r#"# GitHub's cache, kept in this control plane's own bucket: superci-cache serves it to the job's actions (it holds no keys).
+( c='PLANE_LINK'; curl -fsSL --retry 2 -m 30 -o /usr/local/bin/superci-cache "$c/program" && chmod 755 /usr/local/bin/superci-cache && /usr/local/bin/superci-cache wrap /home/runner/externals &&
+  SUPERCI_CACHE_PLANE="$c" setsid /usr/local/bin/superci-cache serve /home/runner/externals > /var/log/superci-cache.log 2>&1 < /dev/null & ) > /dev/null 2>&1
+"#;
+
+/// A Linux machine's start-up script with `superci-cache` (see `cache`): `plane` the machine's own link to the
+/// control plane's cache.
+pub fn with_cache(script: String, plane: &str) -> Result<String> {
+    if !plane.starts_with("https://") || !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
+    const RUNNER: &str = "cd /home/runner && ";
+    let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
+    Ok(format!("{before}{}{RUNNER}{after}", CACHE.replace("PLANE_LINK", plane)))
+}
+
 pub fn with_hello(script: String, url: &str) -> Result<String> {
     if !url.starts_with("https://") || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
     const LOG: &str = "exec > >(tee /var/log/superci.log > /dev/console) 2>&1\n";
@@ -1203,6 +1322,7 @@ mod tests {
         let jit = "A".repeat(10_000);
         let script = runner_user_data_for(&crate::io::Work::GitHub { jit }, 360, "linux", Some("https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/interrupted?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken")).unwrap();
         let script = with_hello(with_scratch(script, false), "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/hello?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken").unwrap();
+        let script = with_cache(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
         assert!(script.len() < 16_384, "{} bytes", script.len());
         println!("{} bytes with a 10,000-character configuration", script.len());
     }
@@ -1277,6 +1397,8 @@ mod tests {
                 "DescribeSubnets" => made("subnet").iter().map(|s| { let (id, zone, cidr) = s.split_once('|').map(|(a, b)| { let (z, c) = b.split_once('|').unwrap(); (a, z, c) }).unwrap(); format!("<item><subnetId>{id}</subnetId><cidrBlock>{cidr}</cidrBlock><availabilityZone>{zone}</availabilityZone></item>") }).collect(),
                 "CreateSubnet" => { let id = format!("subnet-{}", get("AvailabilityZone")); make("subnet", format!("{id}|{}|{}", get("AvailabilityZone"), get("CidrBlock"))); format!("<subnet><subnetId>{id}</subnetId></subnet>") }
                 "AssociateRouteTable" => "<associationId>a</associationId>".into(),
+                "DescribeVpcEndpoints" => made("vpce").iter().map(|e| format!("<item><vpcEndpointId>{e}</vpcEndpointId></item>")).collect(),
+                "CreateVpcEndpoint" => { assert_eq!((get("ServiceName").as_str(), get("VpcEndpointType").as_str(), get("RouteTableId.1").as_str()), ("com.amazonaws.us-east-1.s3", "Gateway", "rtb-1")); format!("<vpcEndpointId>{}</vpcEndpointId>", make("vpce", "vpce-1".into())) }
                 "DescribeSecurityGroups" => made("sg").iter().map(|g| format!("<item><groupId>{g}</groupId></item>")).collect(),
                 "CreateSecurityGroup" => { assert_eq!((get("GroupName").as_str(), get("VpcId").as_str()), (NETWORK_GROUP, "vpc-1")); format!("<groupId>{}</groupId>", make("sg", "sg-1".into())) }
                 other => panic!("unexpected {other}"),
@@ -1292,7 +1414,7 @@ mod tests {
         let n = futures::executor::block_on(make_network(&ec2, "us-east-1", &creds, "p1", 0)).unwrap();
         assert_eq!(n, Network { vpc: "vpc-1".into(), security_group: "sg-1".into(), subnets: vec![("us-east-1a".into(), "subnet-us-east-1a".into()), ("us-east-1b".into(), "subnet-us-east-1b".into())], ..Default::default() });
         let made: Vec<String> = ec2.calls.borrow().iter().filter(|c| c.starts_with("Create") || c.starts_with("Attach")).cloned().collect();
-        assert_eq!(made, ["CreateVpc", "CreateInternetGateway", "AttachInternetGateway", "CreateRouteTable", "CreateRoute", "CreateSubnet", "CreateSubnet", "CreateSecurityGroup"]);
+        assert_eq!(made, ["CreateVpc", "CreateInternetGateway", "AttachInternetGateway", "CreateRouteTable", "CreateRoute", "CreateSubnet", "CreateSubnet", "CreateVpcEndpoint", "CreateSecurityGroup"]);
         assert!(ec2.made.borrow().iter().any(|(k, v)| k == "subnet" && v.ends_with("|10.212.16.0/20")), "a /20 each");
         // Again: nothing new; and it is found.
         ec2.calls.borrow_mut().clear();
@@ -1306,6 +1428,16 @@ mod tests {
         assert_eq!(parse_iso_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso_ms("2026-09-30T16:11:43Z"), Some(1_790_784_703_000));
         assert_eq!(parse_iso_ms("2024-02-29T12:00:00.123Z"), Some(1_709_208_000_000));
+    }
+
+    #[test]
+    fn presigned_link_as_aws_documents_it() {
+        // AWS's own example of a presigned GET (S3 docs, "Authenticating Requests: Using Query Parameters").
+        let creds = Credentials { access_key_id: "AKIAIOSFODNN7EXAMPLE".into(), secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(), session_token: None, expires_at_ms: 0 };
+        let link = presign("GET", "https://examplebucket.s3.amazonaws.com/test.txt", &creds, "us-east-1", 86400, 1_369_353_600_000).unwrap();
+        assert!(link.ends_with("&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"), "{link}");
+        assert!(link.starts_with("https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host"), "{link}");
+        assert!(presign("GET", "https://b.s3.amazonaws.com/a b", &creds, "us-east-1", 60, 0).is_err());
     }
 
     #[test]

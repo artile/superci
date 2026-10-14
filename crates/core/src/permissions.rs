@@ -26,6 +26,7 @@ pub const AWS_RUNNER: &[Need] = &[
     Need { id: "MakeLaunchTemplates", what: "Make launch templates, each tagged as this control plane's", why: "AWS takes such a request's machine from a launch template: one is made for the job and removed again.", since: "0.17.0", writes: true },
     Need { id: "UseItsOwnLaunchTemplates", what: "Start machines from, and remove, launch templates tagged as this control plane's", why: "The same: only its own templates, each used once.", since: "0.17.0", writes: true },
     Need { id: "TagLaunchTemplates", what: "Tag launch templates as they are made", why: "Only templates tagged as this control plane's can be used or removed by it.", since: "0.17.0", writes: true },
+    Need { id: "CacheBucket", what: "Read, write and remove what is in its own cache buckets (superci-plane-<id>-<region>)", why: "Jobs' caches are kept in your account, in the region their machines run in: it signs a job's links to what it may read and write, and removes what is old.", since: "0.18.0", writes: true },
 ];
 
 /// One of `AWS_RUNNER`'s statements, for this account and control plane.
@@ -46,6 +47,8 @@ fn aws_statement(id: &str, account_id: &str, plane_id: &str) -> Value {
         "MakeLaunchTemplates" => ("ec2:CreateLaunchTemplate".into(), arn("launch-template/*").into(), Some(json!({ "StringEquals": { "aws:RequestTag/superci-plane": plane_id } }))),
         "UseItsOwnLaunchTemplates" => (json!(["ec2:RunInstances", "ec2:DeleteLaunchTemplate"]), arn("launch-template/*").into(), Some(json!({ "StringEquals": { "aws:ResourceTag/superci-plane": plane_id } }))),
         "TagLaunchTemplates" => ("ec2:CreateTags".into(), arn("*/*").into(), Some(json!({ "StringEquals": { "ec2:CreateAction": ["CreateLaunchTemplate", "CreateFleet"] } }))),
+        // Objects only, in its own buckets (a bucket is made and removed by the dashboard, with your sign-in).
+        "CacheBucket" => (json!(["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]), format!("arn:aws:s3:::superci-plane-{plane_id}-*/*").into(), None),
         _ => unreachable!("an AWS permission without its statement: {id}"),
     };
     let mut s = json!({ "Sid": id, "Effect": "Allow", "Action": action, "Resource": resource });
@@ -149,7 +152,7 @@ mod tests {
         changed["Statement"][5]["Action"] = json!(["pricing:GetProducts"]);
         assert_eq!(aws_runner_missing(Some(&changed), "123456789012", "abc").iter().map(|n| n.id).collect::<Vec<_>>(), ["Read"]);
         // Another control plane's policy is not this one's.
-        assert_eq!(aws_runner_missing(Some(&full), "123456789012", "other").len(), 4, "its four statements naming the control plane");
+        assert_eq!(aws_runner_missing(Some(&full), "123456789012", "other").len(), 5, "its five statements naming the control plane");
         assert_eq!(aws_runner_missing(None, "123456789012", "abc").len(), AWS_RUNNER.len());
     }
 

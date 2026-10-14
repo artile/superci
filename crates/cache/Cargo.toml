@@ -1,0 +1,16 @@
+[package]
+name = "superci-cache"
+description = "GitHub's Actions cache on a SuperCI machine: serves the job's actions, keeps what they save in the control plane's own bucket, and holds no keys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "superci-cache"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }

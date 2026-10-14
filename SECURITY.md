@@ -34,8 +34,9 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
   A job's log is fetched by the control plane when a key holder asks, with your GitHub App's token for that job's
   repository (or your GitLab token), and passed on. GitHub masks secrets in logs; what a job printed is otherwise
   what a key holder reads.
-  It signs short-lived tokens (ES256), but only for its own runner agents and for AWS. It never signs claims a
-  caller picks.
+  It signs short-lived tokens (ES256), but only for its own runner agents, for AWS, and for the jobs of runs from a
+  computer (what they may read and write in the cache, as GitHub's token says it for its jobs). It never signs
+  claims a caller picks.
 - **Runner agents** (Cloudflare, Modal) accept only tokens signed by the one control plane they were set up for. The
   token must be for the agent's own address and must not have expired.
 - **Machines** run one job each and end when it ends. A machine also has its own time limit: six hours unless you
@@ -44,6 +45,21 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
   the machine itself (AWS: a timer plus a scheduled shutdown, and the machine terminates on power-off) or by the cloud
   (Cloudflare: the runner's alarm; Modal: the sandbox timeout). This works even if the control plane is gone. The
   control plane also sweeps up machines whose job never came (after 10 minutes) and machines past the limit.
+
+- **The cache** is kept in a bucket of the control plane's in each region its AWS machines run in
+  (`superci-plane-<id>-<region>`), in your account; a machine reaches it through an S3 endpoint in the control
+  plane's network, so it does not cross the internet. Nothing of it reaches SuperCI. On each machine `superci-cache`
+  serves GitHub's cache protocol to the job's actions; it holds no AWS keys. For every lookup and save it sends the
+  control plane the job's own token, with a link only that machine has (it works until the machine's longest job
+  would be over). The control plane checks the token's signature against GitHub's published keys (or its own, for a
+  run from a computer), and answers with links to the bucket that each do one thing for an hour: read one piece of
+  one entry, or write one piece of the entry being saved. What a token lets a job read and write is what GitHub put
+  in it: its repository's entries, in the scopes GitHub lists (a pull request writes only its own). A job can't read
+  another repository's cache, or write another branch's. A job runs as root on its machine, so it can use its own
+  token as `superci-cache` does: that gives it what GitHub's cache would give it, and nothing more.
+  The control plane's role may read, write and remove objects in its own buckets only, and makes no bucket; the
+  dashboard makes each bucket (private, as AWS makes every new one) with your sign-in and removes it, with all it
+  holds, when the control plane is deleted.
 
 ## Defaults that limit what a job can do
 

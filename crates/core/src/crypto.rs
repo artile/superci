@@ -28,6 +28,10 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex(&Sha256::digest(data))
 }
 
+pub fn sha256(data: &[u8]) -> Vec<u8> {
+    Sha256::digest(data).to_vec()
+}
+
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("any key length");
     mac.update(data);
@@ -160,6 +164,27 @@ pub fn verify_es256_jwt(token: &str, jwk: &serde_json::Value, now_secs: u64) -> 
     Ok(claims)
 }
 
+/// The claims of an RS256 JWT signed by one of the keys in `jwks` (a JSON Web Key Set, the key named by the token's
+/// `kid`), if the signature holds and it is within its times. Issuer and audience are for the caller to check.
+pub fn verify_rs256_jwt(token: &str, jwks: &serde_json::Value, now_secs: u64) -> Result<serde_json::Value> {
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 { return Err("not a JWT".into()); }
+    let decode = |s: &str| URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).map_err(|e| e.to_string());
+    let header: serde_json::Value = serde_json::from_slice(&decode(parts[0])?).map_err(|e| e.to_string())?;
+    if header["alg"] != "RS256" { return Err("not RS256".into()); }
+    let jwk = jwks["keys"].as_array().into_iter().flatten().find(|k| k["kid"] == header["kid"] && k["kty"] == "RSA").ok_or("signed by a key not in the set")?;
+    let number = |k: &str| decode(jwk[k].as_str().unwrap_or_default()).map(|b| rsa::BigUint::from_bytes_be(&b));
+    let key = rsa::RsaPublicKey::new(number("n")?, number("e")?).map_err(|e| e.to_string())?;
+    let sig = Signature::try_from(decode(parts[2])?.as_slice()).map_err(|e| e.to_string())?;
+    VerifyingKey::<Sha256>::new(key).verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).map_err(|_| "bad signature".to_string())?;
+    let claims: serde_json::Value = serde_json::from_slice(&decode(parts[1])?).map_err(|e| e.to_string())?;
+    if claims["exp"].as_u64().is_none_or(|exp| exp < now_secs) { return Err("expired".into()); }
+    if claims["nbf"].as_u64().is_some_and(|nbf| nbf > now_secs + 60) { return Err("not yet valid".into()); }
+    Ok(claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +204,27 @@ mod tests {
         let claims = URL_SAFE_NO_PAD.encode(br#"{"iss":"https://p","aud":"https://evil","exp":2000}"#);
         forged[1] = &claims;
         assert_eq!(verify_es256_jwt(&forged.join("."), &jwk, 1_000).unwrap_err(), "bad signature");
+    }
+
+    #[test]
+    fn rs256_tokens_verify_with_the_key_their_kid_names() {
+        use rsa::traits::PublicKeyParts;
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+        let public = key.to_public_key();
+        let jwks = serde_json::json!({ "keys": [{ "kty": "RSA", "kid": "other", "n": "AQAB", "e": "AQAB" },
+            { "kty": "RSA", "kid": "k1", "n": b64url(&public.n().to_bytes_be()), "e": b64url(&public.e().to_bytes_be()) }] });
+        let sign = |header: serde_json::Value, claims: serde_json::Value| {
+            let unsigned = jwt_parts(&header, &claims);
+            format!("{unsigned}.{}", b64url(&rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone()).sign(unsigned.as_bytes()).to_vec()))
+        };
+        let token = sign(serde_json::json!({ "alg": "RS256", "kid": "k1" }), serde_json::json!({ "ac": "[]", "nbf": 900, "exp": 2_000 }));
+        assert_eq!(verify_rs256_jwt(&token, &jwks, 1_000).unwrap()["ac"], "[]");
+        assert_eq!(verify_rs256_jwt(&token, &jwks, 3_000).unwrap_err(), "expired");
+        assert_eq!(verify_rs256_jwt(&sign(serde_json::json!({ "alg": "RS256", "kid": "k2" }), serde_json::json!({ "exp": 2_000 })), &jwks, 1_000).unwrap_err(), "signed by a key not in the set");
+        let mut forged: Vec<&str> = token.split('.').collect();
+        let claims = URL_SAFE_NO_PAD.encode(br#"{"ac":"[{\"Scope\":\"refs/heads/main\",\"Permission\":3}]","exp":2000}"#);
+        forged[1] = &claims;
+        assert_eq!(verify_rs256_jwt(&forged.join("."), &jwks, 1_000).unwrap_err(), "bad signature");
     }
 
     #[test]

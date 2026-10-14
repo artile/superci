@@ -1574,6 +1574,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "superci-cache"
+version = "0.18.0"
+dependencies = [
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "superci-core"
 version = "0.18.0"
 dependencies = [

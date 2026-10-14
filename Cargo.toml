@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/plane-cloudflare", "crates/plane-aws", "crates/plane-modal", "crates/runners-cloudflare", "crates/cli", "crates/image-reader"]
+members = ["crates/core", "crates/plane-cloudflare", "crates/plane-aws", "crates/plane-modal", "crates/runners-cloudflare", "crates/cli", "crates/image-reader", "crates/cache"]
 
 [workspace.package]
 version = "0.18.0"

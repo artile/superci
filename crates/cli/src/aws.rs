@@ -217,26 +217,49 @@ pub fn give_runner_role(creds: &Credentials, account_id: &str, plane_id: &str, r
     make_networks(creds, plane_id, regions)
 }
 
-/// The control plane's own network in each region (`aws::make_network`), the regions at once.
+/// `superci-cache` for AWS machines (Linux), by architecture, put in each region's cache bucket.
+const CACHE_PROGRAMS: [(&str, &[u8]); 2] = [("x86_64", include_bytes!(env!("SUPERCI_CACHE_X86_64"))), ("aarch64", include_bytes!(env!("SUPERCI_CACHE_AARCH64")))];
+
+/// The control plane's own network in each region (`aws::make_network`), the regions at once, and its cache bucket
+/// there with this version's `superci-cache` (see `superci_core::cache`). Without the bucket (an account that may
+/// not make one) jobs use GitHub's own cache, as before: that is no reason for the rest not to be made.
 pub fn make_networks(creds: &Credentials, plane_id: &str, regions: &[String]) -> Result<()> {
     let made: Vec<Result<()>> = std::thread::scope(|s| {
-        let each: Vec<_> = regions.iter().map(|r| s.spawn(move || futures::executor::block_on(aws::make_network(&Blocking::new(), r, creds, plane_id, now_ms()))
-            .map(|_| ()).map_err(|e| format!("{r}: {e}")))).collect();
+        let each: Vec<_> = regions.iter().map(|r| s.spawn(move || {
+            let http = Blocking::new();
+            futures::executor::block_on(aws::make_network(&http, r, creds, plane_id, now_ms())).map_err(|e| format!("{r}: {e}"))?;
+            if let Err(e) = make_cache(&http, r, creds, plane_id) { eprintln!("The cache in {r} was not set up: {e}") }
+            Ok(())
+        })).collect();
         each.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("making a network stopped".into()))).collect()
     });
     made.into_iter().collect()
 }
 
-/// Removes the control plane's machines and networks in these regions (all SuperCI offers, when it is deleted). A
+fn make_cache(http: &Blocking, region: &str, creds: &Credentials, plane_id: &str) -> Result<()> {
+    futures::executor::block_on(aws::make_bucket(http, region, creds, plane_id, now_ms()))?;
+    for (arch, program) in CACHE_PROGRAMS {
+        futures::executor::block_on(aws::put_once(http, region, creds, plane_id, &superci_core::cache::program_key(arch), program, now_ms()))?;
+    }
+    Ok(())
+}
+
+/// Removes the control plane's machines, networks and cache buckets in these regions (all SuperCI offers, when it is deleted). A
 /// region the account's organization keeps it out of has nothing of the control plane's (nothing could be made
 /// there), and is no network left behind.
 pub fn delete_networks(creds: &Credentials, plane_id: &str, regions: &[&str]) -> Result<()> {
     let sleep = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
     let done: Vec<Result<()>> = std::thread::scope(|s| {
         let each: Vec<_> = regions.iter().map(|r| s.spawn(move || {
-            match futures::executor::block_on(aws::delete_network(&Blocking::new(), r, creds, plane_id, &now_ms, &sleep)) {
+            let http = Blocking::new();
+            match futures::executor::block_on(aws::delete_network(&http, r, creds, plane_id, &now_ms, &sleep)) {
+                Err(e) if kept_out_by_organization(&e) => return Ok(()),
+                done => done.map_err(|e| format!("{r}: {e}"))?,
+            }
+            // Its cache bucket there, with all it keeps.
+            match futures::executor::block_on(aws::delete_bucket(&http, r, creds, plane_id, &now_ms)) {
                 Err(e) if kept_out_by_organization(&e) => Ok(()),
-                done => done.map_err(|e| format!("{r}: {e}")),
+                done => done.map_err(|e| format!("{r}: the cache bucket: {e}")),
             }
         })).collect();
         each.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("removing a network stopped".into()))).collect()

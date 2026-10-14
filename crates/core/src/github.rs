@@ -288,6 +288,12 @@ pub async fn rerun_failed_jobs(http: &dyn Http, api: &str, token: &str, repo: &s
 }
 
 /// A job's status at GitHub ("queued", "in_progress", "completed", …).
+/// A repository as GitHub gives it (its id, its default branch, …).
+pub async fn repository(http: &dyn Http, api: &str, token: &str, repo: &str) -> Result<serde_json::Value> {
+    if repo.split('/').count() != 2 || !repo.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b)) { return Err("not a repository".into()) }
+    gh(http, api, "GET", &format!("/repos/{repo}"), Some(token), None).await
+}
+
 pub async fn job_status(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<String> {
     job_state(http, api, token, repo, job_id).await.map(|(status, _)| status)
 }
