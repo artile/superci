@@ -119,23 +119,6 @@ impl Cloudflare {
         Err(format!("{method} {path}: {errors}"))
     }
 
-    /// Whether a Worker may be given an R2 binding with this sign-in (`superci debug cloudflare-r2 BUCKET`, a debug build
-    /// only): a throwaway Worker bound to `bucket` is uploaded, Cloudflare's answer kept, and the Worker deleted.
-    #[cfg(debug_assertions)]
-    pub fn debug_r2_binding(&self, a: &str, bucket: &str) -> Result<Value> {
-        let js = b"export default { async fetch(r, env) { const o = await env.B.list({ limit: 1 }); return new Response('objects ' + o.objects.length) } }";
-        let metadata = json!({ "main_module": "index.js", "compatibility_date": COMPATIBILITY_DATE, "bindings": [{ "type": "r2_bucket", "name": "B", "bucket_name": bucket }] });
-        let boundary = "superciprobe0123456789";
-        let mut body = Vec::new();
-        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{metadata}\r\n").as_bytes());
-        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"index.js\"; filename=\"index.js\"\r\nContent-Type: application/javascript+module\r\n\r\n").as_bytes());
-        body.extend_from_slice(js);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let put = self.call("PUT", &format!("/accounts/{a}/workers/scripts/superci-r2-probe"), Some((&format!("multipart/form-data; boundary={boundary}"), body)));
-        let gone = self.call("DELETE", &format!("/accounts/{a}/workers/scripts/superci-r2-probe"), None);
-        Ok(json!({ "upload": match put { Ok(_) => "accepted".to_string(), Err(e) => e }, "deleted": gone.is_ok() }))
-    }
-
     /// One call as it is given (`superci debug cloudflare`, in a debug build only).
     #[cfg(debug_assertions)]
     pub fn debug_call(&self, method: &str, path: &str, body: Option<Vec<u8>>) -> Result<Value> { self.call(method, path, body.map(|b| ("application/json", b))) }
