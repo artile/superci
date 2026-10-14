@@ -223,17 +223,27 @@ pub struct Launch<'a> {
     /// wait (so that launches asked at once do not ask again at once).
     pub timer: Option<&'a dyn crate::io::Timer>,
     pub jitter_ms: u64,
+    /// Whether the spot pools left after the first has no machine may be asked in one request (see `fleet`). Not
+    /// where the role lately had no permission for it: they are asked one by one, as before.
+    pub fleet: bool,
 }
 
 /// What a launch was told on the way to its machine (or to none): each pool AWS had no room in (type, zone, AWS's
 /// word for it), and how often AWS refused for the rate of requests.
 #[derive(Default, Debug)]
 pub struct Told { pub refused: Vec<(String, String, String)>, pub throttled: u32,
-    /// Every request for a machine, in order: the type, the zone, what AWS said ("started", or its word for no), and
-    /// how long the answer took (ms; with the waits, when AWS refused for the rate of requests). With `Launch::clock`.
-    pub asked: Vec<(String, String, String, u64)>,
+    /// Every request for a machine, in order: the type, the zone, what AWS said ("started", or its word for no), how
+    /// long the answer took (ms; with the waits, when AWS refused for the rate of requests), and how many pools the
+    /// request asked at once (0: the one it names; more: see `fleet`, the type and zone being the pool AWS chose,
+    /// or none). With `Launch::clock`.
+    pub asked: Vec<(String, String, String, u64, u32)>,
     /// It stopped at `MAX_TRIES` with pools left to ask: the job goes on with those, not on down the order.
-    pub more: bool }
+    pub more: bool,
+    /// Why many pools could not be asked in one request (the role may not, or AWS refused the request itself): they
+    /// were asked one by one.
+    pub fleet_refused: Option<String>,
+    /// A launch template that could not be removed after its one use: removed later (see `fleet`).
+    pub template_left: Option<String> }
 
 /// The lowest current spot price (USD per hour) for a machine type in a region, across its zones.
 /// The price now in one zone (`zone`), or the lowest across the region's zones.
@@ -302,8 +312,23 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
     pools.retain(|(t, p)| { let z = zone_of(p); !l.skip.iter().any(|(st, sz)| st == *t && *sz == z) });
     if pools.is_empty() && all > 0 { return Err("InsufficientInstanceCapacity: AWS had no machine of these types a moment ago".into()) }
     let mut tries = 0;
-    for (t, place) in pools {
+    for (at, (t, place)) in pools.iter().enumerate() {
+        let (t, place) = (*t, *place);
         let (subnet, zone) = place;
+        // The best pool had no spot machine: the others are asked in one request, not one by one (each no costs
+        // most of a second, and a large machine may have a dozen pools to say it). AWS takes the pool with the most
+        // spare machines there, the earlier in this order the better. With few left, one by one is as quick.
+        if at == 1 && l.spot && l.fleet && pools.len() - at >= FLEET_FROM {
+            let rest: Vec<(String, Option<String>, String)> = pools[at..].iter().take(FLEET_MOST).map(|(t, p)| ((*t).clone(), p.0.map(|(_, id)| id.clone()), zone_of(*p))).collect();
+            let began = l.clock.map(|c| c.now_ms());
+            let took = |began: Option<u64>| match (l.clock, began) { (Some(c), Some(b)) => c.now_ms().saturating_sub(b), _ => 0 };
+            match fleet(http, creds, l, &rest, now_ms, told).await {
+                Ok(Ok(m)) => { if l.clock.is_some() { told.asked.push((m.kind.clone(), m.zone.clone(), "started".into(), took(began), rest.len() as u32)) } return Ok(m) }
+                Ok(Err(e)) => { if l.clock.is_some() { told.asked.push((String::new(), String::new(), e.split(':').next().unwrap_or_default().to_string(), took(began), rest.len() as u32)) } return Err(e) }
+                // Not to be had in one request here: one by one, as before.
+                Err(e) => told.fleet_refused = Some(e),
+            }
+        }
         tries += 1;
         if tries > MAX_TRIES { told.more = true; return Err(last) }
         let mut params = serde_json::json!({
@@ -320,7 +345,7 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
             params["NetworkInterface"] = serde_json::json!([{ "DeviceIndex": 0, "SubnetId": id, "SecurityGroupId": groups, "AssociatePublicIpAddress": if n.private { "false" } else { "true" }, "DeleteOnTermination": "true" }]);
         }
         let began = l.clock.map(|c| c.now_ms());
-        let note = |told: &mut Told, said: &str| if let (Some(clock), Some(began)) = (l.clock, began) { told.asked.push((t.clone(), zone_of(place), said.split(':').next().unwrap_or_default().to_string(), clock.now_ms().saturating_sub(began))) };
+        let note = |told: &mut Told, said: &str| if let (Some(clock), Some(began)) = (l.clock, began) { told.asked.push((t.clone(), zone_of(place), said.split(':').next().unwrap_or_default().to_string(), clock.now_ms().saturating_sub(began), 0)) };
         loop {
             match ec2(http, l.region, creds, "RunInstances", params.clone(), now_ms).await {
                 Ok(xml) => {
@@ -347,6 +372,93 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         }
     }
     Err(last)
+}
+
+/// With so many spot pools left after the first has no machine, they are asked in one request (see `fleet`).
+pub const FLEET_FROM: usize = 4;
+/// How many pools one such request asks at most.
+pub const FLEET_MOST: usize = 100;
+
+/// One request for one spot machine from any of these pools (type, subnet in the control plane's own network, zone),
+/// best first: an "instant fleet", which answers in about three seconds whatever the number of pools, where asking
+/// them one by one takes most of a second each. AWS chooses the pool with the most spare machines (so the one least
+/// likely to be taken back), and among those alike the earliest here. A fleet takes what a machine is from a launch
+/// template and not from the request, so one is made for this one use (the start-up script is the job's own) and
+/// removed once AWS has answered.
+///
+/// Its machine; or AWS's word for none (as `RunInstances` says it), with what was said of each pool in `told.refused`;
+/// or, outside those, why the pools could not be asked this way at all.
+async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, pools: &[(String, Option<String>, String)], now_ms: u64, told: &mut Told) -> Result<Result<Started>> {
+    let tag = |k: &str| l.tags.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str()).unwrap_or_default();
+    let name = format!("superci-{}-{}-{}", tag("superci-plane"), tag("superci-job"), l.clock.map(|c| c.now_ms()).unwrap_or(now_ms));
+    let tags = |t: &[(String, String)]| t.iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect::<Vec<_>>();
+    let mut data = serde_json::json!({
+        "ImageId": l.image, "UserData": b64(l.user_data.as_bytes()), "InstanceInitiatedShutdownBehavior": "terminate", "MetadataOptions": { "HttpTokens": "required" },
+        "BlockDeviceMapping": [{ "DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": l.disk_gb, "VolumeType": "gp3", "Throughput": l.disk_mibs, "Iops": l.disk_iops, "DeleteOnTermination": "true" } }],
+        "TagSpecification": [{ "ResourceType": "instance", "Tag": tags(l.tags) }],
+    });
+    if let Some(n) = l.network.filter(|n| !n.subnets.is_empty()) {
+        let groups: Vec<&String> = std::iter::once(&n.security_group).chain(&n.more_groups).collect();
+        data["NetworkInterface"] = serde_json::json!([{ "DeviceIndex": 0, "SecurityGroupId": groups, "AssociatePublicIpAddress": if n.private { "false" } else { "true" }, "DeleteOnTermination": "true" }]);
+    }
+    let own: Vec<(String, String)> = l.tags.iter().filter(|(k, _)| k == "superci-plane").cloned().collect();
+    ec2(http, l.region, creds, "CreateLaunchTemplate", serde_json::json!({ "LaunchTemplateName": name, "LaunchTemplateData": data, "TagSpecification": [{ "ResourceType": "launch-template", "Tag": tags(&own) }] }), now_ms).await?;
+    let overrides: Vec<serde_json::Value> = pools.iter().enumerate().map(|(i, (kind, subnet, zone))| {
+        let mut o = serde_json::json!({ "InstanceType": kind, "Priority": i + 1 });
+        match subnet { Some(id) => o["SubnetId"] = id.clone().into(), None if !zone.is_empty() => o["AvailabilityZone"] = zone.clone().into(), None => {} }
+        o
+    }).collect();
+    let request = serde_json::json!({
+        "Type": "instant",
+        "TargetCapacitySpecification": { "TotalTargetCapacity": 1, "DefaultTargetCapacityType": "spot" },
+        "SpotOptions": { "AllocationStrategy": "capacity-optimized-prioritized", "InstanceInterruptionBehavior": "terminate" },
+        "LaunchTemplateConfigs": [{ "LaunchTemplateSpecification": { "LaunchTemplateName": name, "Version": "$Latest" }, "Overrides": overrides }],
+    });
+    let answer = loop {
+        match ec2(http, l.region, creds, "CreateFleet", request.clone(), now_ms).await {
+            Err(e) if e.starts_with("RequestLimitExceeded") && told.throttled < MAX_WAITS && l.timer.is_some() => {
+                told.throttled += 1;
+                if let Some(timer) = l.timer { timer.pause(300 + l.jitter_ms + told.throttled as u64 * 250).await }
+            }
+            other => break other,
+        }
+    };
+    if ec2(http, l.region, creds, "DeleteLaunchTemplate", serde_json::json!({ "LaunchTemplateName": name }), now_ms).await.is_err() { told.template_left = Some(name) }
+    fleet_said(&answer?, pools, told)
+}
+
+/// What an instant fleet answered: its machine, or what it said of each pool (kept in `told.refused` in
+/// `RunInstances`' words) and one word for all of them. An answer that is neither (the role may not start a machine
+/// this way) is an error of its own.
+fn fleet_said(xml: &str, pools: &[(String, Option<String>, String)], told: &mut Told) -> Result<Result<Started>> {
+    let section = |name: &str| xml.split_once(&format!("<{name}>")).and_then(|(_, rest)| rest.split_once(&format!("</{name}>"))).map(|(inside, _)| inside).unwrap_or_default();
+    let got = section("fleetInstanceSet");
+    if let Some(id) = xml_tag(got, "instanceIds").and_then(|ids| xml_tag(ids, "item")) {
+        let subnet = xml_tag(got, "subnetId").unwrap_or_default();
+        let zone = xml_tag(got, "availabilityZone").map(str::to_string).or_else(|| pools.iter().find(|(_, s, _)| s.as_deref() == Some(subnet)).map(|(_, _, z)| z.clone())).unwrap_or_default();
+        return Ok(Ok(Started { id: id.trim().to_string(), kind: xml_tag(got, "instanceType").unwrap_or_default().to_string(), zone }))
+    }
+    let (mut limit, mut other) = (false, None::<String>);
+    for item in section("errorSet").split("<errorCode>").skip(1) {
+        let code = item.split('<').next().unwrap_or_default();
+        let message = xml_tag(item, "errorMessage").unwrap_or_default();
+        let over = xml_tag(item, "overrides").unwrap_or_default();
+        let (kind, subnet) = (xml_tag(over, "instanceType").unwrap_or_default(), xml_tag(over, "subnetId"));
+        let zone = xml_tag(over, "availabilityZone").map(str::to_string).or_else(|| pools.iter().find(|(_, s, _)| s.is_some() && s.as_deref() == subnet).map(|(_, _, z)| z.clone())).unwrap_or_default();
+        let word = match code {
+            // (The zone does not offer the type: "Your requested instance type (…) is not supported in your requested Availability Zone".)
+            "InvalidFleetConfiguration" if message.contains("not supported in your requested Availability Zone") => "Unsupported",
+            // (No machine there now. "UnfulfillableCapacity" is also what a fleet says of the pools it did not try.)
+            "InsufficientInstanceCapacity" | "UnfulfillableCapacity" => "InsufficientInstanceCapacity",
+            "MaxSpotInstanceCountExceeded" => { limit = true; "MaxSpotInstanceCountExceeded" }
+            _ => { other.get_or_insert_with(|| format!("{code}: {message}")); continue }
+        };
+        if !kind.is_empty() { told.refused.push((kind.to_string(), zone, word.to_string())) }
+    }
+    // Refused for something else than room (the role may not launch from a template, say): not an answer about the pools.
+    if let Some(e) = other { return Err(e) }
+    if xml_tag(xml, "fleetId").is_none() { return Err("CreateFleet without a fleet".into()) }
+    Ok(Err(if limit { "MaxSpotInstanceCountExceeded: Max spot instance count exceeded".to_string() } else { format!("InsufficientInstanceCapacity: AWS had no spot machine in any of {} pools", pools.len()) }))
 }
 
 /// Which of these machine types a region has at all, in their order.
@@ -969,6 +1081,24 @@ pub fn with_scratch(script: String, ramdisk: bool) -> String {
     script.replacen(GROW_ROOT, &format!("{GROW_ROOT}{}", SCRATCH.replace("MOUNT_SCRATCH", if ramdisk { MOUNT_RAM } else { MOUNT_NVME })), 1)
 }
 
+/// What `with_hello` adds before the runner starts. A runner that took more than ten seconds to listen for a job
+/// also says what it logged meanwhile (GitHub's runner keeps a log of its own under `_diag`): when the machine
+/// started it, each wait of two seconds or more with the line before and the line after, and its warnings and
+/// errors. So a slow one says where it waited: for its own start, for a name, for GitHub's answer.
+const HELLO: &str = r#"# How the start went, said to the control plane (see where a slow one lost its time).
+( superci_t2=$(date +%s%3N); curl -s -m 5 -X POST "HELLO_URL&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$superci_t2" > /dev/null 2>&1
+  for i in $(seq 360); do grep -qs "Listening for Jobs" /var/log/superci.log && break; sleep 0.5; done
+  superci_t3=$(date +%s%3N)
+  if grep -qs "Listening for Jobs" /var/log/superci.log; then
+    curl -s -m 5 -X POST "HELLO_URL&listening=$superci_t3" > /dev/null 2>&1
+    if [ $((superci_t3 - superci_t2)) -gt 10000 ]; then
+      { echo "[$(date -u -d "@$((superci_t2 / 1000))" '+%Y-%m-%d %H:%M:%SZ') the machine's script started the runner]"; cat /home/runner/_diag/Runner_*.log 2>/dev/null; } | awk 'function at(s) { return substr(s, 13, 2) * 3600 + substr(s, 16, 2) * 60 + substr(s, 19, 2) }
+        /^\[20[0-9][0-9]-/ { t = at($0); if (n && t - p >= 2) { if (last != shown) print last; print "... " (t - p) " s ..."; print; shown = $0 } else if (!n || $0 ~ /^\[[^]]* (WARN|ERR) /) { print; shown = $0 }; p = t; last = $0; n++ }
+        END { if (last != shown) print last }' | cut -c1-400 | head -c 20000 | curl -s -m 10 -X POST -H "content-type: text/plain" --data-binary @- "HELLO_URL&log=runner" > /dev/null 2>&1
+    fi
+  fi ) &
+"#;
+
 /// A Linux machine's start-up script that also tells the control plane how its start went (`url`: a link only this
 /// machine has): how long after its kernel started the script began, when the script began, when it began reading
 /// the runner's files, when it was ready to start the runner, and when the runner listened for a job. So a slow
@@ -980,11 +1110,7 @@ pub fn with_hello(script: String, url: &str) -> Result<String> {
     const READ: &str = "# First reads from a new volume are slow";
     let runner = if script.contains("cd /home/runner && ") { "cd /home/runner && " } else if script.contains("export GL_URL=") { "export GL_URL=" } else { return Ok(script) };
     if !script.contains(LOG) || !script.contains(GROW_ROOT) { return Ok(script) }
-    let said = format!(r#"# How the start went, said to the control plane (see where a slow one lost its time).
-( curl -s -m 5 -X POST "{url}&boot=$superci_up&script=$superci_t0&read=${{superci_t1:-0}}&ready=$(date +%s%3N)" > /dev/null 2>&1
-  for i in $(seq 360); do grep -qs "Listening for Jobs" /var/log/superci.log && break; sleep 0.5; done
-  grep -qs "Listening for Jobs" /var/log/superci.log && curl -s -m 5 -X POST "{url}&listening=$(date +%s%3N)" > /dev/null 2>&1 ) &
-"#);
+    let said = HELLO.replace("HELLO_URL", url);
     let script = script.replacen(LOG, &format!("{LOG}superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)\n"), 1).replacen(READ, &format!("superci_t1=$(date +%s%3N)\n{READ}"), 1);
     let (before, after) = script.split_once(runner).ok_or("no runner in the start-up script")?;
     Ok(format!("{before}{said}{runner}{after}"))
@@ -1029,6 +1155,17 @@ poweroff
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machines_whole_script_fits_what_aws_takes() {
+        // AWS takes 16,384 bytes of start-up script. GitHub's runner configuration is the most of it (about 5,000
+        // characters lately); everything SuperCI adds, at once, leaves it twice that.
+        let jit = "A".repeat(10_000);
+        let script = runner_user_data_for(&crate::io::Work::GitHub { jit }, 360, "linux", Some("https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/interrupted?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken")).unwrap();
+        let script = with_hello(with_scratch(script, false), "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/hello?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken").unwrap();
+        assert!(script.len() < 16_384, "{} bytes", script.len());
+        println!("{} bytes with a 10,000-character configuration", script.len());
+    }
 
     /// The image maker's list of a build, as it publishes it (the shape of its release notes on 6 October 2026).
     #[test]
@@ -1191,10 +1328,12 @@ mod tests {
         assert_eq!(with_scratch(failing.clone(), true), failing);
         // A machine says how its start went, with a link of its own, in the background and before its runner starts.
         let hello = with_hello(script.clone(), "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken").unwrap();
-        assert!(hello.contains("superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)") && hello.contains("superci_t1=$(date +%s%3N)\n# First reads") && hello.contains(r#"curl -s -m 5 -X POST "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$(date +%s%3N)""#), "{hello}");
+        assert!(hello.contains("superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)") && hello.contains("superci_t1=$(date +%s%3N)\n# First reads") && hello.contains(r#"curl -s -m 5 -X POST "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$superci_t2""#), "{hello}");
+        // (And what its runner logged, when the runner was slow to listen: after it listens, and only then.)
+        assert!(hello.find("&listening=$superci_t3").unwrap() < hello.find("&log=runner").unwrap() && hello.contains("-gt 10000") && hello.contains("/home/runner/_diag/Runner_*.log") && !hello.contains("HELLO_URL"), "{hello}");
         assert!(hello.find("superci_t0=").unwrap() < hello.find("growpart").unwrap() && hello.find("&listening=").unwrap() < hello.find("./run.sh").unwrap());
         assert!(with_hello(script.clone(), "https://x/'; reboot; '").is_err() && with_hello(failing.clone(), "https://plane.example/hello?t=a").unwrap() == failing);
-        assert!(with_hello(gl.clone(), "https://plane.example/hello?gl=g-1&t=tokentokentokentoken").unwrap().contains("&ready=$(date +%s%3N)"));
+        assert!(with_hello(gl.clone(), "https://plane.example/hello?gl=g-1&t=tokentokentokentoken").unwrap().contains("&ready=$superci_t2"));
         // The disk's speed above what AWS includes is in the price of the hour: 1,000 MiB a second and 4,000 IOPS on
         // 60 GB, where a GB is $0.08 a month, add $0.055.
         let (plain, fast) = (extras_usd_per_hour(0.08, 60, 125, 3000, false), extras_usd_per_hour(0.08, 60, 1000, 4000, false));

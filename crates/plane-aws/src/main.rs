@@ -66,6 +66,15 @@ impl Store for Dynamo<'_> {
         let r = self.call("PutItem", json!({ "TableName": self.table, "Item": { "p": { "S": "s" }, "k": { "S": key }, "v": { "S": value } }, "ConditionExpression": "attribute_not_exists(k)" })).await;
         match r { Ok(_) => Ok(true), Err(e) if e.starts_with("ConditionalCheckFailedException") => Ok(false), Err(e) => Err(e) }
     }
+    /// The same for a write over what was read: only while the value is still that one.
+    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> io::Result<bool> {
+        let mut put = json!({ "TableName": self.table, "Item": { "p": { "S": "s" }, "k": { "S": key }, "v": { "S": value } } });
+        match was {
+            Some(was) => { put["ConditionExpression"] = "v = :was".into(); put["ExpressionAttributeValues"] = json!({ ":was": { "S": was } }) }
+            None => put["ConditionExpression"] = "attribute_not_exists(k)".into(),
+        }
+        match self.call("PutItem", put).await { Ok(_) => Ok(true), Err(e) if e.starts_with("ConditionalCheckFailedException") => Ok(false), Err(e) => Err(e) }
+    }
     async fn delete(&self, key: &str) -> io::Result<()> {
         self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.key(key) })).await.map(|_| ())
     }
@@ -95,7 +104,9 @@ const SOON_MS: u64 = 30_000;
 /// answer; that call waits out the time and sweeps (see `main`). One such call is on its way at a time, however
 /// many jobs ask (claimed in the table): a sweep is for every job, and asks for the next itself while any waits.
 /// Where it may not call itself (a role from before), the schedule does it, as it did.
-struct Scheduled<'a> { http: &'a Blocking, store: &'a Dynamo<'a>, region: &'a str, function: &'a str }
+struct Scheduled<'a> { http: &'a Blocking, store: &'a Dynamo<'a>, region: &'a str, function: &'a str,
+    /// What is to be done once the request at hand is answered (see `main`).
+    later: &'a std::cell::RefCell<Vec<String>> }
 
 /// Where a sweep that is going notes itself (when it began, ms).
 const SWEEPING: &str = "aws:sweeping";
@@ -126,6 +137,8 @@ impl Timer for Scheduled<'_> {
     }
     /// A Lambda answers one request at a time: it simply waits.
     async fn pause(&self, ms: u64) { std::thread::sleep(Duration::from_millis(ms)) }
+    /// Done by `main` once the answer is given: the function goes on running until it asks for its next request.
+    fn later(&self, what: &str) -> bool { self.later.borrow_mut().push(what.to_string()); true }
 }
 
 /// The secrets under /superci/<id>/, read at most every 15 seconds.
@@ -218,19 +231,21 @@ fn main() {
         let id = next.headers().get("lambda-runtime-aws-request-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let account_id = next.headers().get("lambda-runtime-invoked-function-arn").and_then(|v| v.to_str().ok()).and_then(|a| a.split(':').nth(4)).unwrap_or_default().to_string();
         let event: Value = next.body_mut().read_json().unwrap_or_default();
+        // Whoever comes with a key (the dashboard, a command) gets the settings as they are now, not as they
+        // were up to fifteen seconds ago: a change is seen at once, and the next one starts from it. A key not
+        // known yet is a new session's, set a moment ago. Webhooks and the sweep carry none, and use what was read.
+        let bearer = event["headers"]["authorization"].as_str().and_then(|a| a.strip_prefix("Bearer ")).unwrap_or_default();
+        let unknown = bearer.len() >= 16;
+        // A move's steps need what the dashboard wrote a moment ago (the App, GitLab): read fresh for them too.
+        let moving = event["rawPath"].as_str().is_some_and(|p| p.starts_with("/move/"));
+        let refreshed = secrets.refresh(&http, &region, &plane_id, unknown || moving);
+        let config = config(&secrets, &account_id);
+        let store = Dynamo { http: &http, table: table.clone(), region: region.clone() };
+        let later = std::cell::RefCell::new(vec![]);
+        let timer = Scheduled { http: &http, store: &store, region: &region, function: &function, later: &later };
+        let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &timer, config: &config, cache: &cache, containers: None };
         let outcome: io::Result<Value> = (|| {
-            // Whoever comes with a key (the dashboard, a command) gets the settings as they are now, not as they
-            // were up to fifteen seconds ago: a change is seen at once, and the next one starts from it. A key not
-            // known yet is a new session's, set a moment ago. Webhooks and the sweep carry none, and use what was read.
-            let bearer = event["headers"]["authorization"].as_str().and_then(|a| a.strip_prefix("Bearer ")).unwrap_or_default();
-            let unknown = bearer.len() >= 16;
-            // A move's steps need what the dashboard wrote a moment ago (the App, GitLab): read fresh for them too.
-            let moving = event["rawPath"].as_str().is_some_and(|p| p.starts_with("/move/"));
-            secrets.refresh(&http, &region, &plane_id, unknown || moving)?;
-            let config = config(&secrets, &account_id);
-            let store = Dynamo { http: &http, table: table.clone(), region: region.clone() };
-            let timer = Scheduled { http: &http, store: &store, region: &region, function: &function };
-            let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &timer, config: &config, cache: &cache, containers: None };
+            refreshed?;
             // One sweep at a time: the schedule's and the function's own could otherwise each start a machine for
             // the same waiting job. One that finds another going leaves it to that one (which asks for the next
             // itself); a note older than a minute and a half is of a sweep that was cut off.
@@ -259,5 +274,9 @@ fn main() {
             Ok(v) => runtime.post(&format!("http://{api}/2018-06-01/runtime/invocation/{id}/response")).send_json(v),
             Err(e) => { eprintln!("superci: {e}"); runtime.post(&format!("http://{api}/2018-06-01/runtime/invocation/{id}/error")).send_json(json!({ "errorMessage": e, "errorType": "superci" })) }
         };
+        // What was left for after the answer (a queued job's machine: GitHub has its answer, and AWS is asked now).
+        // The function runs on until it asks for its next request, and takes no other meanwhile.
+        let url = request(&event).url;
+        for what in later.take() { if let Err(e) = block_on(plane.later(&url, &what)) { eprintln!("superci: {what}: {e}") } }
     }
 }

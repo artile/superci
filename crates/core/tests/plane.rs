@@ -20,6 +20,7 @@ impl Store for Mem {
     async fn get(&self, k: &str) -> io::Result<Option<String>> { Ok(self.0.borrow().get(k).cloned()) }
     async fn put(&self, k: &str, v: String) -> io::Result<()> { self.0.borrow_mut().insert(k.into(), v); Ok(()) }
     async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { let mut m = self.0.borrow_mut(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
+    async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> { let mut m = self.0.borrow_mut(); if m.get(k).map(String::as_str) != was { return Ok(false) } m.insert(k.into(), v); Ok(true) }
     async fn delete(&self, k: &str) -> io::Result<()> { self.0.borrow_mut().remove(k); Ok(()) }
     async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
 }
@@ -2582,6 +2583,16 @@ fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself()
     let seen = &status["jobs"][0];
     assert_eq!(seen["machine"], serde_json::json!({ "boot_s": 6.61, "script_ms": 1_790_000_008_000u64, "read_ms": 1_790_000_009_000u64, "ready_ms": 1_790_000_009_500u64, "listening_ms": 1_790_000_011_000u64 }), "{seen}");
     assert!(seen.get("hello").is_none() && seen["asks"].as_array().is_some_and(|a| a.len() == asks.len()) && job(&store, 7).get("machine").is_none());
+    // A runner slow to reach GitHub: its machine sends what the runner logged meanwhile (its waits, warnings and
+    // errors), which is kept with the rest, as text and no more of it than a page shows. Only with its link.
+    assert!(script.contains(r#"--data-binary @- "https://plane.acme.workers.dev/hello?runner="#) && script.contains("&log=runner") && script.contains("/home/runner/_diag/Runner_*.log"), "{script}");
+    let log = "[2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()\n... 30 s ...\n[2026-10-13 22:56:41Z WARN GitHubActionsService] Attempt 1 of POST request failed (Socket Error: TryAgain).\u{7}\n";
+    let send = |t: &str, body: String| run(Request::new("POST", &format!("{PLANE_URL}/hello?runner=superci-{PLANE_ID}-7&t={t}&log=runner")).with_body(body)).status;
+    assert_eq!((send("wrong-wrong-wrong-wrong", log.to_string()), send(&token, format!("{log}{}", "x".repeat(40_000)))), (404, 200));
+    let kept: serde_json::Value = serde_json::from_str(&store.0.borrow()["hello:7"]).unwrap();
+    let text = kept["log"].as_str().unwrap();
+    assert!(text.starts_with("[2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()\n... 30 s ...\n[2026-10-13 22:56:41Z WARN") && !text.contains('\u{7}') && text.len() < 16_100 && text.lines().all(|l| l.len() <= 300), "{text}");
+    assert_eq!(kept["listening_ms"], 1_790_000_011_000u64, "what it said before stays");
 }
 
 #[test]
@@ -2695,4 +2706,468 @@ fn at_the_aws_accounts_limit_a_job_waits_for_one_of_its_own_to_end_and_fails_pla
     full.set(false);
     sweep_after(60_000);
     assert_eq!((job(&store, 9)["state"].as_str(), job(&store, 9)["machine_id"].as_str()), (Some("launched"), Some("i-0abc")));
+}
+
+/// AWS as a real account answered a request for one spot machine from any of several pools (an instant fleet), kept
+/// as it was said (ids replaced): a machine in one pool; none anywhere; none, the account's limit having refused.
+const FLEET_STARTED: &str = include_str!("fixtures/aws/fleet/started.xml");
+const FLEET_NONE: &str = include_str!("fixtures/aws/fleet/none.xml");
+const FLEET_LIMIT: &str = include_str!("fixtures/aws/fleet/limit.xml");
+const FLEET_TEMPLATE: &str = include_str!("fixtures/aws/fleet/template.xml");
+const FLEET_TEMPLATE_REMOVED: &str = include_str!("fixtures/aws/fleet/template-removed.xml");
+
+/// A control plane's own network with a subnet in each of six zones, as the account the answers above came from has.
+fn six_zones() -> superci_core::aws::Network {
+    superci_core::aws::Network { vpc: "vpc-1".into(), security_group: "sg-1".into(), subnets: ["a", "b", "c", "d", "e", "f"].map(|z| (format!("us-east-1{z}"), format!("subnet-{z}"))).to_vec(), more_groups: vec![], private: false }
+}
+
+/// The fields of each call of an EC2 action, in order.
+fn calls_of(clouds: &FakeClouds, action: &str) -> Vec<Vec<(String, String)>> {
+    clouds.calls.borrow().iter().filter(|c| c.2.contains(&format!("Action={action}&")) || c.2.ends_with(&format!("Action={action}"))).map(|c| url::form_urlencoded::parse(c.2.as_bytes()).into_owned().collect()).collect()
+}
+
+#[test]
+fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
+    use superci_core::aws::{run_instance, Launch, Told};
+    let (_, creds) = own_aws();
+    let creds = creds.unwrap();
+    let network = six_zones();
+    let tags = vec![("Name".to_string(), "acmeci app 7".to_string()), ("superci-plane".to_string(), PLANE_ID.to_string()), ("superci-job".to_string(), "7".to_string())];
+    let ask = |types: &[&str], fleet_says: &'static str, fleet: bool| {
+        let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+            let xml = |s: &str| Some(Response::new(200, "text/xml", s.to_string()));
+            if body.contains("Action=DescribeSpotPriceHistory") { return xml("<spotPriceHistorySet/>") }
+            if body.contains("Action=RunInstances") { return Some(aws_refuses("InsufficientInstanceCapacity")) }
+            if body.contains("Action=CreateLaunchTemplate") { return xml(FLEET_TEMPLATE) }
+            if body.contains("Action=CreateFleet") { return xml(fleet_says) }
+            if body.contains("Action=DeleteLaunchTemplate") { return xml(FLEET_TEMPLATE_REMOVED) }
+            None
+        });
+        let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+        let launch = Launch { region: "us-east-1", network: Some(&network), image: "ami-new", types: &types, user_data: "#!/bin/bash\necho job\n", disk_gb: 120, disk_mibs: 1000, disk_iops: 4000, clock: Some(&FixedClock), skip: &[], tags: &tags,
+            spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet };
+        let mut told = Told::default();
+        let machine = block_on(run_instance(&clouds, &creds, &launch, 1_790_000_000_000, &mut told));
+        (machine.map(|m| (m.id, m.kind, m.zone)), told, clouds.0)
+    };
+
+    // 64 CPUs of three families in six zones: the best pool has no spot machine. The seventeen others are asked in
+    // one request, and AWS gives one of them.
+    let (machine, told, clouds) = ask(&["c8a.16xlarge", "m8a.16xlarge", "r8a.16xlarge"], FLEET_STARTED, true);
+    assert_eq!(machine, Ok(("i-0123456789abcdef0".to_string(), "c8a.16xlarge".to_string(), "us-east-1b".to_string())));
+    let one_by_one = launches(&clouds);
+    assert_eq!((one_by_one.len(), field(&one_by_one[0], "InstanceType"), field(&one_by_one[0], "NetworkInterface.1.SubnetId")), (1, "c8a.16xlarge".to_string(), "subnet-a".to_string()), "the best pool alone is asked by itself");
+    // The machine is what one asked for by itself would be: a launch template made for this one request says it,
+    // tagged as the control plane's (its role may make and use no other).
+    let template = &calls_of(&clouds, "CreateLaunchTemplate")[0];
+    let t = |n: &str| field(template, &format!("LaunchTemplateData.{n}"));
+    assert_eq!((t("ImageId"), t("InstanceInitiatedShutdownBehavior"), t("MetadataOptions.HttpTokens"), t("BlockDeviceMapping.1.Ebs.VolumeSize"), t("BlockDeviceMapping.1.Ebs.Throughput"), t("BlockDeviceMapping.1.Ebs.Iops")),
+        ("ami-new".to_string(), "terminate".to_string(), "required".to_string(), "120".to_string(), "1000".to_string(), "4000".to_string()));
+    assert_eq!(STANDARD.decode(t("UserData")).unwrap(), b"#!/bin/bash\necho job\n");
+    assert_eq!((t("NetworkInterface.1.SecurityGroupId.1"), t("NetworkInterface.1.AssociatePublicIpAddress"), t("NetworkInterface.1.SubnetId")), ("sg-1".to_string(), "true".to_string(), String::new()), "the subnet is each pool's own");
+    assert_eq!((t("TagSpecification.1.ResourceType"), t("TagSpecification.1.Tag.2.Key"), t("TagSpecification.1.Tag.2.Value")), ("instance".to_string(), "superci-plane".to_string(), PLANE_ID.to_string()));
+    assert_eq!((field(template, "TagSpecification.1.ResourceType"), field(template, "TagSpecification.1.Tag.1.Key"), field(template, "TagSpecification.1.Tag.1.Value")), ("launch-template".to_string(), "superci-plane".to_string(), PLANE_ID.to_string()));
+    let name = field(template, "LaunchTemplateName");
+    assert_eq!(name, format!("superci-{PLANE_ID}-7-1790000000000"));
+    // One spot machine, from the pool with the most to spare, the earlier in the order the better.
+    let fleet = &calls_of(&clouds, "CreateFleet")[0];
+    let f = |n: &str| field(fleet, n);
+    assert_eq!((f("Type"), f("TargetCapacitySpecification.TotalTargetCapacity"), f("TargetCapacitySpecification.DefaultTargetCapacityType"), f("SpotOptions.AllocationStrategy"), f("SpotOptions.InstanceInterruptionBehavior")),
+        ("instant".to_string(), "1".to_string(), "spot".to_string(), "capacity-optimized-prioritized".to_string(), "terminate".to_string()));
+    assert_eq!((f("LaunchTemplateConfigs.1.LaunchTemplateSpecification.LaunchTemplateName"), f("LaunchTemplateConfigs.1.LaunchTemplateSpecification.Version")), (name.clone(), "$Latest".to_string()));
+    let pool = |n: usize| (f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.InstanceType")), f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.SubnetId")), f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.Priority")));
+    assert_eq!((pool(1), pool(6), pool(17), pool(18)), (("c8a.16xlarge".to_string(), "subnet-b".to_string(), "1".to_string()), ("m8a.16xlarge".to_string(), "subnet-a".to_string(), "6".to_string()),
+        ("r8a.16xlarge".to_string(), "subnet-f".to_string(), "17".to_string()), (String::new(), String::new(), String::new())), "every other pool, in the order they would have been asked");
+    // The template is removed once AWS has answered.
+    assert_eq!(calls_of(&clouds, "DeleteLaunchTemplate").iter().map(|c| field(c, "LaunchTemplateName")).collect::<Vec<_>>(), [name]);
+    assert_eq!(told.template_left, None);
+    // What is kept of it: the one asked by itself, then the request for the seventeen.
+    assert_eq!(told.asked.iter().map(|a| (a.0.as_str(), a.1.as_str(), a.2.as_str(), a.4)).collect::<Vec<_>>(), [("c8a.16xlarge", "us-east-1a", "InsufficientInstanceCapacity", 0), ("c8a.16xlarge", "us-east-1b", "started", 17)]);
+
+    // No pool has a machine (two GPU types): said as AWS says it of one, and each pool's own answer is kept: none
+    // now in ten, and a zone that does not offer the type (asked no more for a day).
+    let (machine, told, clouds) = ask(&["g6.xlarge", "g5.xlarge"], FLEET_NONE, true);
+    assert_eq!(machine, Err("InsufficientInstanceCapacity: AWS had no spot machine in any of 11 pools".to_string()));
+    assert_eq!((launches(&clouds).len(), calls_of(&clouds, "CreateFleet").len(), calls_of(&clouds, "DeleteLaunchTemplate").len()), (1, 1, 1));
+    let said = |word: &str| told.refused.iter().filter(|(_, _, w)| w == word).count();
+    assert_eq!((said("InsufficientInstanceCapacity"), said("Unsupported")), (1 + 10, 2), "{:?}", told.refused);
+    assert!(told.refused.iter().filter(|(_, _, w)| w == "Unsupported").all(|(_, zone, _)| zone == "us-east-1e") && told.refused.iter().all(|(kind, zone, _)| !kind.is_empty() && zone.starts_with("us-east-1")), "{:?}", told.refused);
+    assert_eq!(told.asked.last().map(|a| (a.0.as_str(), a.2.as_str(), a.4)), Some(("", "InsufficientInstanceCapacity", 11)));
+
+    // The account's limit of spot CPUs refused: said as that (no other pool would answer otherwise).
+    let (machine, _, _) = ask(&["r8a.24xlarge", "m8a.24xlarge", "c8a.24xlarge"], FLEET_LIMIT, true);
+    assert_eq!(machine, Err("MaxSpotInstanceCountExceeded: Max spot instance count exceeded".to_string()));
+
+    // Where the pools may not be asked in one request, or few are left, they are asked one by one, as before.
+    let (machine, told, clouds) = ask(&["c8a.16xlarge", "m8a.16xlarge", "r8a.16xlarge"], FLEET_STARTED, false);
+    assert!(machine.is_err() && calls_of(&clouds, "CreateFleet").is_empty() && launches(&clouds).len() == 12 && told.more);
+    let (_, _, clouds) = ask(&["c8a.16xlarge"], FLEET_STARTED, true);
+    assert_eq!((calls_of(&clouds, "CreateFleet").len(), launches(&clouds).len()), (1, 1), "six pools: one by itself, five in one request");
+}
+
+#[test]
+fn a_job_gets_its_spot_machine_from_one_request_for_every_other_pool_and_a_role_that_may_not_asks_one_by_one() {
+    let allowed = std::cell::Cell::new(true);
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| {
+        let xml = |s: String| Some(Response::new(200, "text/xml", s));
+        if body.contains("Action=DescribeVpcs") { return xml("<vpcSet><item><vpcId>vpc-1</vpcId></item></vpcSet>".into()) }
+        if body.contains("Action=DescribeSubnets") { return xml(format!("<subnetSet>{}</subnetSet>", ["a", "b", "c", "d", "e", "f"].map(|z| format!("<item><subnetId>subnet-{z}</subnetId><availabilityZone>us-east-1{z}</availabilityZone></item>")).concat())) }
+        if body.contains("Action=DescribeSecurityGroups") { return xml("<securityGroupInfo><item><groupId>sg-1</groupId></item></securityGroupInfo>".into()) }
+        if body.contains("Action=DescribeSpotPriceHistory") && !body.contains("AvailabilityZone=") { return xml("<spotPriceHistorySet/>".into()) }
+        if body.contains("Action=RunInstances") && body.contains("MarketType=spot") { return Some(aws_refuses("InsufficientInstanceCapacity")) }
+        // A role from before this was asked for: AWS refuses the template, as it refuses anything a role may not do.
+        if body.contains("Action=CreateLaunchTemplate") && !allowed.get() { return Some(Response::new(403, "text/xml", "<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>You are not authorized to perform this operation. User: arn:aws:sts::123456789012:assumed-role/superci-plane-abc123def456/superci is not authorized to perform: ec2:CreateLaunchTemplate on resource: arn:aws:ec2:us-east-1:123456789012:launch-template/* because no identity-based policy allows the ec2:CreateLaunchTemplate action.</Message></Error></Errors></Response>".to_string())) }
+        if body.contains("Action=CreateLaunchTemplate") { return xml(FLEET_TEMPLATE.into()) }
+        if body.contains("Action=CreateFleet") { return xml(FLEET_STARTED.into()) }
+        if body.contains("Action=DeleteLaunchTemplate") { return xml(FLEET_TEMPLATE_REMOVED.into()) }
+        None
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.max_cpu = Some(64);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/cpu=64/family=c8a+m8a+r8a")));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["machine_id"].as_str(), j["machine_type"].as_str(), j["zone"].as_str(), j.get("on_demand")), (Some("launched"), Some("i-0123456789abcdef0"), Some("c8a.16xlarge"), Some("us-east-1b"), None), "{j}");
+    assert_eq!((launches(&clouds.0).len(), calls_of(&clouds.0, "CreateFleet").len()), (1, 1));
+    // Its start says so: the first choice had none; AWS chose among the seventeen others.
+    let asks: Vec<(&str, &str, &str, u64)> = j["asks"].as_array().unwrap().iter().map(|a| (a["kind"].as_str().unwrap(), a["zone"].as_str().unwrap_or_default(), a["said"].as_str().unwrap(), a["pools"].as_u64().unwrap_or(0))).collect();
+    assert_eq!(asks, [("c8a.16xlarge", "us-east-1a", "InsufficientInstanceCapacity", 0), ("c8a.16xlarge", "us-east-1b", "started", 17)]);
+
+    // A role that may not: the pools are asked one by one as before, the permission is said to be missing (the
+    // dashboard offers it), and for ten minutes the next jobs do not try.
+    allowed.set(false);
+    block_on(plane.handle(labelled("queued", 8, "acme/app", None, "superci/cpu=64/family=c8a+m8a+r8a")));
+    let spot = || launches(&clouds.0).iter().filter(|l| field(l, "InstanceMarketOptions.MarketType") == "spot").count();
+    assert_eq!((calls_of(&clouds.0, "CreateLaunchTemplate").len(), calls_of(&clouds.0, "CreateFleet").len()), (2, 1));
+    assert!(spot() > 2, "asked one by one: {}", spot());
+    assert!(store.0.borrow().contains_key("aws:no-fleet") && store.0.borrow().get("denied:aws:AskSpotPoolsAtOnce").is_some_and(|d| d.contains("ec2:CreateLaunchTemplate")));
+    block_on(plane.handle(labelled("queued", 9, "acme/app", None, "superci/cpu=64/family=c8a+m8a+r8a")));
+    assert_eq!(calls_of(&clouds.0, "CreateLaunchTemplate").len(), 2, "not tried again so soon");
+}
+
+/// A runtime that can go on after it has answered (AWS Lambda): what it was left to do, in order.
+#[derive(Default)]
+struct Afterwards(Wakes, RefCell<Vec<String>>);
+#[async_trait(?Send)]
+impl Timer for Afterwards {
+    async fn wake_in(&self, ms: u64) -> io::Result<()> { self.0.wake_in(ms).await }
+    async fn pause(&self, ms: u64) { self.0.pause(ms).await }
+    fn later(&self, what: &str) -> bool { self.1.borrow_mut().push(what.to_string()); true }
+}
+
+#[test]
+fn a_queued_job_is_answered_at_once_and_its_machine_asked_for_after() {
+    let (store, clouds, timer, cache) = (Mem::default(), FakeClouds::default(), Afterwards::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &timer, config: &config, cache: &cache, containers: None };
+    let left = || timer.1.borrow_mut().drain(..).collect::<Vec<_>>();
+    let address = format!("{PLANE_URL}/webhook");
+
+    // GitHub waits ten seconds for an answer; AWS can take longer to give a machine. The event is answered with the
+    // job claimed and nothing asked of any cloud yet.
+    let r = block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    assert_eq!((r.status, clouds.calls.borrow().len(), job(&store, 7)["state"].as_str()), (202, 0, Some("launching")));
+    let what = left();
+    assert_eq!(what, ["start job:7"]);
+    // Then its machine.
+    block_on(plane.later(&address, &what[0])).unwrap();
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["machine_id"].as_str(), launches(&clouds).len()), (Some("launched"), Some("i-0abc"), 1), "{j}");
+    assert!(STANDARD.decode(field(&launches(&clouds)[0], "UserData")).is_ok_and(|script| String::from_utf8_lossy(&script).contains(&format!("{PLANE_URL}/hello?runner="))), "with the address the event came to");
+    // The same left twice (or a job a sweep has taken up meanwhile) starts nothing more.
+    block_on(plane.later(&address, &what[0])).unwrap();
+    assert_eq!(launches(&clouds).len(), 1);
+
+    // Cancelled between the answer and the asking: no machine is asked for at all.
+    block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
+    block_on(plane.handle(job_event("completed", 8, "acme/app", None)));
+    for what in left() { block_on(plane.later(&address, &what)).unwrap() }
+    let j = job(&store, 8);
+    assert_eq!((j["state"].as_str(), j["machine_id"].is_null(), launches(&clouds).len()), (Some("cancelled"), true, 1), "{j}");
+}
+
+/// Requests run side by side on a real runtime: while one waits on a cloud or on the store, another is answered
+/// whole. `Gate` makes that happen at one chosen step of a request under test: the step yields once, and what was
+/// waiting for it (another event) runs to its end before the request goes on.
+#[derive(Default)]
+struct Gate { n: std::cell::Cell<usize>, at: std::cell::Cell<usize>, hit: std::cell::Cell<bool> }
+struct Once(bool);
+impl std::future::Future for Once {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.0 { return std::task::Poll::Ready(()) }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+struct Until<'a>(&'a std::cell::Cell<bool>);
+impl std::future::Future for Until<'_> {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.0.get() { return std::task::Poll::Ready(()) }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+impl Gate {
+    async fn step(&self) {
+        self.n.set(self.n.get() + 1);
+        if self.n.get() == self.at.get() { self.hit.set(true); Once(false).await }
+    }
+}
+struct SteppedStore<'a>(&'a Mem, &'a Gate);
+#[async_trait(?Send)]
+impl Store for SteppedStore<'_> {
+    async fn get(&self, k: &str) -> io::Result<Option<String>> { self.1.step().await; self.0.get(k).await }
+    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.1.step().await; self.0.put(k, v).await }
+    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.1.step().await; self.0.put_if_absent(k, v).await }
+    async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> { self.1.step().await; self.0.swap(k, was, v).await }
+    async fn delete(&self, k: &str) -> io::Result<()> { self.1.step().await; self.0.delete(k).await }
+    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { self.1.step().await; self.0.list(p).await }
+}
+struct SteppedHttp<'a, H: Http>(&'a H, &'a Gate);
+#[async_trait(?Send)]
+impl<H: Http> Http for SteppedHttp<'_, H> {
+    async fn send(&self, r: Request) -> io::Result<Response> { self.1.step().await; self.0.send(r).await }
+}
+
+#[test]
+fn a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled() {
+    // Each way a job comes to its machine, with its cancelling arriving at every step of it in turn (each read or
+    // write of the store, each request to GitHub or AWS). Whatever the step: once things have settled, every machine
+    // AWS started for it is ended, and the job is cancelled and stays so.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Way { AtOnce, AfterTheAnswer, WaitingAtASweep, IdleAtASweep }
+    let mut tried = 0;
+    // (One App for every try: making its key is the slow part of a test.)
+    let the_app = app();
+    for way in [Way::AtOnce, Way::AfterTheAnswer, Way::WaitingAtASweep, Way::IdleAtASweep] {
+        // (First with no cancelling, to count the steps; then once for each.)
+        let mut steps = usize::MAX;
+        let mut at = 0;
+        // (What a runtime keeps between requests, GitHub's token among it, is kept between the tries too.)
+        let cache = Cache::default();
+        while at <= steps.min(400) {
+            let (cancelled, started, ended) = (std::cell::Cell::new(false), RefCell::new(Vec::<String>::new()), RefCell::new(Vec::<String>::new()));
+            let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
+                let json = |status: u16, v: serde_json::Value| Some(Response::new(status, "application/json", v.to_string()));
+                if body.contains("Action=RunInstances") {
+                    let id = format!("i-{}", started.borrow().len() + 1);
+                    started.borrow_mut().push(id.clone());
+                    return Some(Response::new(200, "text/xml", format!("<RunInstancesResponse><instancesSet><item><instanceId>{id}</instanceId><placement><availabilityZone>us-east-1b</availabilityZone></placement></item></instancesSet></RunInstancesResponse>")))
+                }
+                if body.contains("Action=TerminateInstances") {
+                    ended.borrow_mut().extend(url::form_urlencoded::parse(body.as_bytes()).filter(|(k, _)| k.starts_with("InstanceId")).map(|(_, v)| v.into_owned()));
+                    return Some(Response::new(200, "text/xml", "<TerminateInstancesResponse/>".to_string()))
+                }
+                // GitHub as it is: the job is queued until it is cancelled; its runner, never given a job, can be taken back.
+                if r.url == "https://api.github.com/repos/acme/app/actions/jobs/7" { return json(200, if cancelled.get() { serde_json::json!({ "status": "completed", "conclusion": "cancelled", "runner_name": null }) } else { serde_json::json!({ "status": "queued", "runner_name": null }) }) }
+                if r.url.contains("/actions/runners/") && r.method == "DELETE" { return Some(Response::new(204, "application/json", String::new())) }
+                if r.url.contains("/actions/runners/") && r.method == "GET" { return json(200, serde_json::json!({ "id": 5, "busy": false })) }
+                None
+            });
+            let (store, gate, wakes, afterwards) = (Mem::default(), Gate::default(), Wakes::default(), Afterwards::default());
+            let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+            let mut config = Config::new(PLANE_ID.into());
+            config.app = Some(the_app.clone());
+            (config.aws_own, config.aws_own_creds) = own_aws();
+            let (stepped_store, stepped_http) = (SteppedStore(&store, &gate), SteppedHttp(&clouds, &gate));
+            let timer: &dyn Timer = if way == Way::AfterTheAnswer { &afterwards } else { &wakes };
+            let plane = ControlPlane { store: &stepped_store, http: &stepped_http, clock: &clock, timer, config: &config, cache: &cache, containers: None };
+            // What comes before the request under test (no cancelling can arrive in it).
+            match way {
+                Way::AtOnce => {}
+                Way::AfterTheAnswer | Way::IdleAtASweep => { block_on(plane.handle(job_event("queued", 7, "acme/app", None))); }
+                Way::WaitingAtASweep => { store.0.borrow_mut().insert("job:7".into(), serde_json::json!({ "job_id": 7, "run_id": 3, "repo": "acme/app", "state": "waiting", "at_ms": 1_790_000_000_000u64, "installation_id": 42, "app_id": 99, "cloud": "", "seen_in_progress": false, "label": "superci" }).to_string()); }
+            }
+            if way == Way::IdleAtASweep { clock.0.set(clock.0.get() + 30_000) }
+            let left = afterwards.1.borrow().first().cloned().unwrap_or_default();
+            (gate.n.set(0), gate.at.set(if at == 0 { usize::MAX } else { at }), gate.hit.set(false));
+            let under_test = async {
+                match way {
+                    Way::AtOnce => { plane.handle(job_event("queued", 7, "acme/app", None)).await; }
+                    Way::AfterTheAnswer => plane.later(&format!("{PLANE_URL}/webhook"), &left).await.unwrap(),
+                    Way::WaitingAtASweep | Way::IdleAtASweep => plane.alarm().await.unwrap(),
+                }
+                gate.hit.set(true);
+            };
+            let cancelling = async {
+                if at == 0 { return }
+                Until(&gate.hit).await;
+                cancelled.set(true);
+                plane.handle(job_event("completed", 7, "acme/app", None)).await;
+            };
+            block_on(futures::future::join(under_test, cancelling));
+            if at == 0 { steps = gate.n.get(); at = 1; assert!(steps > 5, "{way:?}: {steps} steps"); println!("{way:?}: {steps} steps"); continue }
+            gate.at.set(usize::MAX);
+            // Settled: the sweeps of the next quarter of an hour.
+            for ms in [1_000, 20_000, 61_000, 120_000, 600_000, 120_000] { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap(); }
+            let j = job(&store, 7);
+            let up: Vec<String> = started.borrow().iter().filter(|id| !ended.borrow().contains(id)).cloned().collect();
+            assert!(up.is_empty(), "{way:?}, cancelled at step {at} of {steps}: {up:?} left up (started {:?}, ended {:?}); {j}", started.borrow(), ended.borrow());
+            assert_eq!(j["state"].as_str(), Some("cancelled"), "{way:?}, cancelled at step {at} of {steps}: {j}");
+            tried += 1;
+            at += 1;
+        }
+    }
+    assert!(tried > 60, "{tried}");
+}
+
+#[test]
+fn a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine() {
+    // The mirror of the test above: a machine is up and idle, a sweep is looking at it (a minute and a half on, it
+    // asks GitHub whether its job still waits), and the runner takes the job at each step of that sweep in turn.
+    // Whatever the step, the job is running after, on its machine, and the sweeps that follow leave it alone.
+    let the_app = app();
+    let (mut steps, mut at, cache) = (usize::MAX, 0, Cache::default());
+    let runner = format!("superci-{PLANE_ID}-7");
+    while at <= steps.min(400) {
+        let (began, ended) = (std::cell::Cell::new(false), std::cell::Cell::new(0));
+        let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
+            let json = |v: serde_json::Value| Some(Response::new(200, "application/json", v.to_string()));
+            if body.contains("Action=TerminateInstances") { ended.set(ended.get() + 1); return Some(Response::new(200, "text/xml", "<TerminateInstancesResponse/>".to_string())) }
+            if r.url == "https://api.github.com/repos/acme/app/actions/jobs/7" { return json(if began.get() { serde_json::json!({ "status": "in_progress", "runner_name": runner }) } else { serde_json::json!({ "status": "queued", "runner_name": null }) }) }
+            if r.url.contains("/actions/runners/") && r.method == "DELETE" { return Some(Response::new(if began.get() { 422 } else { 204 }, "application/json", r#"{"message":"Runner is still running a job"}"#.to_string())) }
+            if r.url.contains("/actions/runners/") && r.method == "GET" { return json(serde_json::json!({ "id": 5, "busy": began.get() })) }
+            None
+        });
+        let (store, gate, wakes) = (Mem::default(), Gate::default(), Wakes::default());
+        let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(the_app.clone());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let (stepped_store, stepped_http) = (SteppedStore(&store, &gate), SteppedHttp(&clouds, &gate));
+        let plane = ControlPlane { store: &stepped_store, http: &stepped_http, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+        clock.0.set(clock.0.get() + 100_000);
+        (gate.n.set(0), gate.at.set(if at == 0 { usize::MAX } else { at }), gate.hit.set(false));
+        let sweep = async { plane.alarm().await.unwrap(); gate.hit.set(true) };
+        let beginning = async {
+            if at == 0 { return }
+            Until(&gate.hit).await;
+            began.set(true);
+            plane.handle(job_event("in_progress", 7, "acme/app", Some(&runner))).await;
+        };
+        block_on(futures::future::join(sweep, beginning));
+        if at == 0 { steps = gate.n.get(); at = 1; assert!(steps > 5, "{steps} steps"); continue }
+        gate.at.set(usize::MAX);
+        for ms in [1_000, 61_000, 600_000] { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap(); }
+        let j = job(&store, 7);
+        assert_eq!((j["state"].as_str(), j["seen_in_progress"].as_bool(), j["machine_id"].as_str(), ended.get()), (Some("running"), Some(true), Some("i-0abc"), 0), "begun at step {at} of {steps}: {j}");
+        at += 1;
+    }
+}
+
+#[test]
+fn a_job_that_runs_and_ends_at_any_step_of_a_sweep_stays_done() {
+    // And a whole job within one step of a sweep: the runner takes it and it ends (GitHub then knows the job as
+    // completed and its runner no more) while the sweep holds what it read of it before. Whatever the step, the job
+    // is done as it ended, its machine ended once, and the sweep's older copy of it undoes none of that.
+    let the_app = app();
+    let (mut steps, mut at, cache) = (usize::MAX, 0, Cache::default());
+    let runner = format!("superci-{PLANE_ID}-7");
+    while at <= steps.min(400) {
+        let (began, ended) = (std::cell::Cell::new(false), std::cell::Cell::new(0));
+        let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
+            let json = |v: serde_json::Value| Some(Response::new(200, "application/json", v.to_string()));
+            if body.contains("Action=TerminateInstances") { ended.set(ended.get() + 1); return Some(Response::new(200, "text/xml", "<TerminateInstancesResponse/>".to_string())) }
+            if r.url == "https://api.github.com/repos/acme/app/actions/jobs/7" { return json(if began.get() { serde_json::json!({ "status": "completed", "conclusion": "success", "runner_name": runner }) } else { serde_json::json!({ "status": "queued", "runner_name": null }) }) }
+            if r.url.contains("/actions/runners/") && began.get() { return Some(Response::new(404, "application/json", r#"{"message":"Not Found"}"#.to_string())) }
+            if r.url.contains("/actions/runners/") && r.method == "DELETE" { return Some(Response::new(204, "application/json", String::new())) }
+            if r.url.contains("/actions/runners/") && r.method == "GET" { return json(serde_json::json!({ "id": 5, "busy": false })) }
+            None
+        });
+        let (store, gate, wakes) = (Mem::default(), Gate::default(), Wakes::default());
+        let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(the_app.clone());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let (stepped_store, stepped_http) = (SteppedStore(&store, &gate), SteppedHttp(&clouds, &gate));
+        let plane = ControlPlane { store: &stepped_store, http: &stepped_http, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+        clock.0.set(clock.0.get() + 100_000);
+        (gate.n.set(0), gate.at.set(if at == 0 { usize::MAX } else { at }), gate.hit.set(false));
+        let sweep = async { plane.alarm().await.unwrap(); gate.hit.set(true) };
+        let beginning = async {
+            if at == 0 { return }
+            Until(&gate.hit).await;
+            began.set(true);
+            plane.handle(job_event("in_progress", 7, "acme/app", Some(&runner))).await;
+            plane.handle(concluded(7, &runner, "success")).await;
+        };
+        block_on(futures::future::join(sweep, beginning));
+        if at == 0 { steps = gate.n.get(); at = 1; assert!(steps > 5, "{steps} steps"); continue }
+        gate.at.set(usize::MAX);
+        for ms in [1_000, 61_000, 600_000] { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap(); }
+        let j = job(&store, 7);
+        assert_eq!((j["state"].as_str(), j["conclusion"].as_str(), ended.get() >= 1), (Some("done"), Some("success"), true), "run and ended at step {at} of {steps}: {j}");
+        at += 1;
+    }
+}
+
+#[test]
+fn a_gitlab_job_cancelled_at_any_step_of_its_start_leaves_no_machine_and_no_runner() {
+    // GitLab's job, on an AWS machine: cancelled at every step of its start in turn. No note is passed here as for
+    // GitHub's: the event ends the job's record, and the start under way, holding what it read before, finds it
+    // ended, asks for nothing more and ends what it was given.
+    let (mut steps, mut at, cache) = (usize::MAX, 0, Cache::default());
+    while at <= steps.min(400) {
+        let (cancelled, started, ended, runners) = (std::cell::Cell::new(false), RefCell::new(Vec::<String>::new()), RefCell::new(Vec::<String>::new()), RefCell::new(Vec::<(u64, bool)>::new()));
+        let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
+            let json = |status: u16, v: serde_json::Value| Some(Response::new(status, "application/json", v.to_string()));
+            if body.contains("Action=RunInstances") {
+                let id = format!("i-{}", started.borrow().len() + 1);
+                started.borrow_mut().push(id.clone());
+                return Some(Response::new(200, "text/xml", format!("<RunInstancesResponse><instancesSet><item><instanceId>{id}</instanceId><placement><availabilityZone>us-east-1b</availabilityZone></placement></item></instancesSet></RunInstancesResponse>")))
+            }
+            if body.contains("Action=TerminateInstances") {
+                ended.borrow_mut().extend(url::form_urlencoded::parse(body.as_bytes()).filter(|(k, _)| k.starts_with("InstanceId")).map(|(_, v)| v.into_owned()));
+                return Some(Response::new(200, "text/xml", "<TerminateInstancesResponse/>".to_string()))
+            }
+            if r.url == "https://gitlab.example/api/v4/projects/380/jobs/1977" { return json(200, serde_json::json!({ "id": 1977, "status": if cancelled.get() { "canceled" } else { "pending" }, "tag_list": ["superci/cpu=2", "docker"] })) }
+            if r.url == "https://gitlab.example/api/v4/user/runners" { let id = 55 + runners.borrow().len() as u64; runners.borrow_mut().push((id, true)); return json(201, serde_json::json!({ "id": id, "token": format!("glrt-runner{id}") })) }
+            if let Some(id) = r.url.strip_prefix("https://gitlab.example/api/v4/runners/").and_then(|id| id.parse::<u64>().ok()).filter(|_| r.method == "DELETE") {
+                for runner in runners.borrow_mut().iter_mut().filter(|(r, _)| *r == id) { runner.1 = false }
+                return Some(Response::new(204, "application/json", String::new()))
+            }
+            None
+        });
+        let (store, gate, wakes, idle) = (Mem::default(), Gate::default(), Wakes::default(), std::cell::Cell::new(false));
+        let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+        let mut config = Config::new(PLANE_ID.into());
+        config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let (stepped_store, stepped_http) = (SteppedStore(&store, &gate), SteppedHttp(&clouds, &gate));
+        let plane = ControlPlane { store: &stepped_store, http: &stepped_http, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        (gate.n.set(0), gate.at.set(if at == 0 { usize::MAX } else { at }), gate.hit.set(false));
+        let start = async { plane.handle(gitlab_event(1977, "pending", "hook-secret-0123456789")).await; gate.hit.set(true) };
+        let cancelling = async {
+            if at == 0 { return }
+            Until(&gate.hit).await;
+            cancelled.set(true);
+            idle.set(store.0.borrow().get("job:gl1977").is_some_and(|j| j.contains(r#""state":"launched""#)));
+            plane.handle(gitlab_event(1977, "canceled", "hook-secret-0123456789")).await;
+        };
+        block_on(futures::future::join(start, cancelling));
+        let j = serde_json::from_str::<serde_json::Value>(&store.0.borrow().get("job:gl1977").cloned().unwrap_or("null".into())).unwrap();
+        if at == 0 { steps = gate.n.get(); at = 1; assert!(steps > 5 && j["state"] == "launched" && j["cloud"] == "aws", "{steps} steps: {j}"); continue }
+        gate.at.set(usize::MAX);
+        // At once, with no sweep waited for, while its machine was still being asked for. (A machine already up
+        // and idle is another matter at GitLab, where a runner takes any job with its tags and cannot be asked
+        // back as GitHub's can: it is ended by the next sweep, as before.)
+        let up = || started.borrow().iter().filter(|id| !ended.borrow().contains(id)).cloned().collect::<Vec<_>>();
+        let left = || runners.borrow().iter().filter(|(_, there)| *there).map(|(id, _)| *id).collect::<Vec<_>>();
+        assert!(idle.get() || (up().is_empty() && left().is_empty()), "cancelled at step {at} of {steps}: machines {:?} left up, runners {:?} left; {j}", up(), left());
+        for ms in [1_000, 61_000, 600_000] { clock.0.set(clock.0.get() + ms); block_on(plane.alarm()).unwrap(); }
+        let j = serde_json::from_str::<serde_json::Value>(&store.0.borrow().get("job:gl1977").cloned().unwrap_or("null".into())).unwrap();
+        assert!(up().is_empty() && left().is_empty(), "cancelled at step {at} of {steps}, after the sweeps: machines {:?} left up, runners {:?} left; {j}", up(), left());
+        assert!(j.is_null() || j["state"] == "cancelled" || (idle.get() && j["state"] == "swept"), "cancelled at step {at} of {steps}: {j}");
+        at += 1;
+    }
 }

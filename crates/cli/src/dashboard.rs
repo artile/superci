@@ -754,7 +754,8 @@ fn job_names(j: &serde_json::Value) -> (String, String) {
 /// Seconds in words, for a start's steps: "0.4 s", "36 s", "1m 12s".
 fn secs(ms: u64) -> String { if ms < 9_950 { format!("{:.1} s", ms as f64 / 1000.0) } else if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { span(ms) } }
 
-/// What AWS was asked for a job's machine, in a few words: "no spot m8a.8xlarge in 6 zones; m7a.8xlarge in us-east-1a".
+/// What AWS was asked for a job's machine, in a few words: "no spot m8a.8xlarge in 6 zones; m7a.8xlarge in us-east-1a",
+/// or "no spot m8a.8xlarge; r8a.8xlarge in us-east-1d, AWS's choice of 14 pools".
 fn asks_said(j: &serde_json::Value) -> String {
     let asks = j["asks"].as_array().cloned().unwrap_or_default();
     let mut said: Vec<String> = vec![];
@@ -763,6 +764,16 @@ fn asks_said(j: &serde_json::Value) -> String {
         let a = &asks[i];
         let (kind, spot, what) = (a["kind"].as_str().unwrap_or_default(), a["spot"] == true, a["said"].as_str().unwrap_or_default());
         let market = if spot { "spot " } else { "on-demand " };
+        // One request for any of several pools (see `Ask::pools`): what AWS chose among them, or that none had one.
+        if let Some(pools) = a["pools"].as_u64().filter(|p| *p > 0) {
+            said.push(match what {
+                "started" => format!("{kind}{}, AWS's choice of {pools} pools", a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default()),
+                "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" => format!("your account's limit refused the other {pools} pools"),
+                "InsufficientInstanceCapacity" => format!("no spot machine in the other {pools} pools"),
+                other => format!("{other} for the other {pools} pools"),
+            });
+            i += 1; continue
+        }
         if what == "started" { said.push(format!("{}{kind}{}", if spot { "" } else { market }, a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default())); i += 1; continue }
         // The same answer for the same type, zone after zone: said once.
         let alike = asks[i..].iter().take_while(|b| b["kind"] == a["kind"] && b["spot"] == a["spot"] && b["said"] == a["said"]).count();
@@ -827,7 +838,10 @@ pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
         _ => if let Some(s) = started { step("its machine booted and its runner took the job", launched, s, String::new()) },
     }
     let total = started.map(|s| s.saturating_sub(queued.unwrap_or(heard)));
-    serde_json::json!({ "ms": total, "steps": steps.iter().map(|(what, ms, more)| serde_json::json!({ "what": what, "ms": ms, "more": more })).collect::<Vec<_>>(), "asked": asked })
+    let mut start = serde_json::json!({ "ms": total, "steps": steps.iter().map(|(what, ms, more)| serde_json::json!({ "what": what, "ms": ms, "more": more })).collect::<Vec<_>>(), "asked": asked });
+    // What its runner logged while it was slow to reach GitHub (see `MachineStart::log`).
+    if let Some(log) = m["log"].as_str().filter(|l| !l.is_empty()) { start["runner_log"] = log.into() }
+    start
 }
 
 /// The same for a person: a line for the whole, and one for each step.
@@ -839,6 +853,11 @@ pub fn job_start_lines(j: &serde_json::Value) -> Vec<String> {
     for s in &steps {
         let more = s["more"].as_str().filter(|m| !m.is_empty()).map(|m| format!(" ({m})")).unwrap_or_default();
         out.push(format!("  {:>7}  {}{more}", secs(s["ms"].as_u64().unwrap_or_default()), s["what"].as_str().unwrap_or_default()));
+    }
+    // A runner that was slow to reach GitHub: what it logged meanwhile, as its machine sent it.
+    if let Some(log) = start["runner_log"].as_str() {
+        out.push("What its runner logged while it was slow to reach GitHub (its waits, warnings and errors):".to_string());
+        out.extend(log.lines().map(|l| format!("  {l}")));
     }
     out
 }
@@ -6845,9 +6864,9 @@ mod tests {
         // An older control plane: its update says what it also asks for.
         let mut old = view(status(serde_json::json!({})));
         old.version = Some("0.9.11".into());
-        assert!(side_update(&old, None, &[]).contains("It also asks for 4 new permissions in AWS, 1 new permission in GitHub."));
+        assert!(side_update(&old, None, &[]).contains("It also asks for 8 new permissions in AWS, 1 new permission in GitHub."));
         old.version = Some("0.9.20".into());
-        assert!(side_update(&old, None, &[]).contains("It also asks for 2 new permissions in AWS, 1 new permission in GitHub."), "reading its network, and the network; running a job again");
+        assert!(side_update(&old, None, &[]).contains("It also asks for 6 new permissions in AWS, 1 new permission in GitHub."), "reading its network, and the network; one request for many spot pools (four); running a job again");
         // While it updates, on every page: says so (also when the control plane does not answer a moment, or already
         // answers with the new version); once done, that it is.
         let mut u = Update { plane: "p1".into(), steps: &UPDATE_CLOUDFLARE, at: 1, result: None, ended_ms: 0 };
@@ -6873,7 +6892,8 @@ mod tests {
         // Its version had them, but its role was found to lack them (made before): the update says so too.
         old.version = Some("0.9.29".into());
         let lacks: Vec<_> = AWS_RUNNER.iter().filter(|n| n.since == "0.9.12").collect();
-        assert!(side_update(&old, None, &lacks).contains("It also asks for 1 new read permission in AWS.") && !side_update(&old, None, &[]).contains("asks for"));
+        // (Beside what came since its version: one request for many spot pools, four permissions.)
+        assert!(side_update(&old, None, &lacks).contains("It also asks for 5 new permissions in AWS.") && side_update(&old, None, &[]).contains("It also asks for 4 new permissions in AWS."));
     }
 
     #[test]
@@ -7263,6 +7283,23 @@ mod tests {
         let before = serde_json::json!({ "job_id": 8, "state": "done", "cloud": "aws", "machine_id": "i-2", "machine_type": "m8a.xlarge", "at_ms": t, "launched_ms": t + 3_400, "started_ms": t + 16_500 });
         assert_eq!(job_start_lines(&before), vec!["Its start: 17 s from queued to running", "    3.4 s  AWS gave a machine", "     13 s  its machine booted and its runner took the job"]);
         assert!(job_start_lines(&serde_json::json!({ "job_id": 9, "state": "waiting", "at_ms": t })).is_empty());
+        // The first choice had no spot machine, and the others were asked in one request: what AWS chose among them.
+        let mut many = j.clone();
+        many["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), { "at": 800, "kind": "r8a.8xlarge", "zone": "us-east-1d", "spot": true, "said": "started", "ms": 2_900, "pools": 14 }]);
+        many["machine_type"] = "r8a.8xlarge".into();
+        assert_eq!(job_start_lines(&many)[2], "    4.0 s  AWS gave a machine (no spot m8a.8xlarge; r8a.8xlarge in us-east-1d, AWS's choice of 14 pools)");
+        assert_eq!(job_words(&many)["choice"], "Not the first choice: AWS had no spot m8a.8xlarge");
+        // None of them had one either: said once, and the job went on to an on-demand machine.
+        many["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), { "at": 800, "kind": "", "spot": true, "said": "InsufficientInstanceCapacity", "ms": 2_900, "pools": 14 },
+            { "at": 3_700, "kind": "m8a.8xlarge", "zone": "us-east-1a", "spot": false, "said": "started", "ms": 900 }]);
+        (many["machine_type"], many["on_demand"]) = ("m8a.8xlarge".into(), true.into());
+        assert_eq!(job_start_lines(&many)[2], "    4.0 s  AWS gave a machine (no spot m8a.8xlarge; no spot machine in the other 14 pools; on-demand m8a.8xlarge in us-east-1a)");
+        // A runner that was slow to reach GitHub: what it logged meanwhile comes after the steps.
+        let mut slow = j.clone();
+        slow["machine"]["log"] = "[2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()\n... 30 s ...\n[2026-10-13 22:56:41Z WARN GitHubActionsService] Attempt 1 of POST request failed".into();
+        let lines = job_start_lines(&slow);
+        assert_eq!(lines[lines.len() - 4..], ["What its runner logged while it was slow to reach GitHub (its waits, warnings and errors):", "  [2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()", "  ... 30 s ...", "  [2026-10-13 22:56:41Z WARN GitHubActionsService] Attempt 1 of POST request failed"]);
+        assert!(job_words(&slow)["start"]["runner_log"].as_str().is_some_and(|l| l.contains("... 30 s ...")) && job_words(&j)["start"].get("runner_log").is_none());
     }
 
     #[test]

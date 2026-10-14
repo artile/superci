@@ -22,6 +22,10 @@ pub const AWS_RUNNER: &[Need] = &[
     Need { id: "MachineTraffic", what: "Read machines' network counts (CloudWatch)", why: "To add what each machine sent to its cost.", since: "0.9.13", writes: false },
     Need { id: "ReadNetwork", what: "Read its own network (VPC, subnets, security group)", why: "Machines start in a network of their own that lets nothing in.", since: "0.9.21", writes: false },
     Need { id: "SpotServiceRole", what: "Create AWS's spot service role, once", why: "AWS needs it before an account's first spot machine.", since: "0.1.0", writes: true },
+    Need { id: "AskSpotPoolsAtOnce", what: "Ask for one spot machine from any of several machine types and zones in one request", why: "When the first choice has no spot machine, the others are asked at once, not one by one (seconds sooner, and AWS picks where a machine is least likely to be taken back).", since: "0.17.0", writes: true },
+    Need { id: "MakeLaunchTemplates", what: "Make launch templates, each tagged as this control plane's", why: "AWS takes such a request's machine from a launch template: one is made for the job and removed again.", since: "0.17.0", writes: true },
+    Need { id: "UseItsOwnLaunchTemplates", what: "Start machines from, and remove, launch templates tagged as this control plane's", why: "The same: only its own templates, each used once.", since: "0.17.0", writes: true },
+    Need { id: "TagLaunchTemplates", what: "Tag launch templates as they are made", why: "Only templates tagged as this control plane's can be used or removed by it.", since: "0.17.0", writes: true },
 ];
 
 /// One of `AWS_RUNNER`'s statements, for this account and control plane.
@@ -37,6 +41,11 @@ fn aws_statement(id: &str, account_id: &str, plane_id: &str) -> Value {
         "MachineTraffic" => ("cloudwatch:GetMetricStatistics".into(), "*".into(), None),
         "ReadNetwork" => (json!(["ec2:DescribeVpcs", "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups"]), "*".into(), None),
         "SpotServiceRole" => ("iam:CreateServiceLinkedRole".into(), "*".into(), Some(json!({ "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } }))),
+        // (A fleet starts nothing by itself: its machine is started with the permissions above, tagged as they ask.)
+        "AskSpotPoolsAtOnce" => ("ec2:CreateFleet".into(), "*".into(), None),
+        "MakeLaunchTemplates" => ("ec2:CreateLaunchTemplate".into(), arn("launch-template/*").into(), Some(json!({ "StringEquals": { "aws:RequestTag/superci-plane": plane_id } }))),
+        "UseItsOwnLaunchTemplates" => (json!(["ec2:RunInstances", "ec2:DeleteLaunchTemplate"]), arn("launch-template/*").into(), Some(json!({ "StringEquals": { "aws:ResourceTag/superci-plane": plane_id } }))),
+        "TagLaunchTemplates" => ("ec2:CreateTags".into(), arn("*/*").into(), Some(json!({ "StringEquals": { "ec2:CreateAction": ["CreateLaunchTemplate", "CreateFleet"] } }))),
         _ => unreachable!("an AWS permission without its statement: {id}"),
     };
     let mut s = json!({ "Sid": id, "Effect": "Allow", "Action": action, "Resource": resource });
@@ -140,7 +149,7 @@ mod tests {
         changed["Statement"][5]["Action"] = json!(["pricing:GetProducts"]);
         assert_eq!(aws_runner_missing(Some(&changed), "123456789012", "abc").iter().map(|n| n.id).collect::<Vec<_>>(), ["Read"]);
         // Another control plane's policy is not this one's.
-        assert_eq!(aws_runner_missing(Some(&full), "123456789012", "other").len(), 2, "its two statements naming the control plane");
+        assert_eq!(aws_runner_missing(Some(&full), "123456789012", "other").len(), 4, "its four statements naming the control plane");
         assert_eq!(aws_runner_missing(None, "123456789012", "abc").len(), AWS_RUNNER.len());
     }
 

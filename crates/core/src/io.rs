@@ -87,6 +87,13 @@ pub trait Store {
     /// Writes only when the key is new; whether it wrote. The one step that must be atomic where requests run in
     /// parallel (a job is claimed once, however many deliveries of its event arrive).
     async fn put_if_absent(&self, key: &str, value: String) -> Result<bool>;
+    /// Writes only when the key holds `was` (nothing: when it is new); whether it wrote. Atomic where requests run
+    /// in parallel and the runtime can make it so (a job's record is written only over what was read of it); the
+    /// two steps one after the other where it cannot.
+    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> Result<bool> {
+        if self.get(key).await?.as_deref() != was { return Ok(false) }
+        self.put(key, value).await.map(|_| true)
+    }
     async fn delete(&self, key: &str) -> Result<()>;
     async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>>;
 }
@@ -131,6 +138,9 @@ pub trait Timer {
     async fn wake_in(&self, ms: u64) -> Result<()>;
     /// Waits `ms` in place, the request being answered waiting with it, where the runtime can; at once where not.
     async fn pause(&self, _ms: u64) {}
+    /// Leaves `what` to be done once the request at hand is answered: the runtime then gives it to the control
+    /// plane's `later`. Whether it will; a runtime that cannot says no, and it is done before the answer.
+    fn later(&self, _what: &str) -> bool { false }
 }
 
 /// Typed JSON values in a `Store`.

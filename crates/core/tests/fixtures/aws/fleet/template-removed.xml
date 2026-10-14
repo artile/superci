@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DeleteLaunchTemplateResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+    <requestId>00000000-0000-0000-0000-000000000000</requestId>
+    <launchTemplate>
+        <createTime>2026-10-14T00:00:00.000Z</createTime>
+        <createdBy>arn:aws:iam::123456789012:role/superci-plane-abc123def456</createdBy>
+        <defaultVersionNumber>1</defaultVersionNumber>
+        <latestVersionNumber>1</latestVersionNumber>
+        <launchTemplateId>lt-0123456789abcdef0</launchTemplateId>
+        <launchTemplateName>superci-abc123def456-7-1790000000000</launchTemplateName>
+        <operator>
+            <managed>false</managed>
+        </operator>
+    </launchTemplate>
+</DeleteLaunchTemplateResponse>
