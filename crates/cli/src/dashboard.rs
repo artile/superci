@@ -3859,7 +3859,7 @@ mark();load()})();</script>"#;
         its.sort_by_key(|j| j["at_ms"].as_u64().unwrap_or_default());
         let link = r["link"].as_str().unwrap_or_default().to_string();
         let at = if link.is_empty() { r#"<small class="faint">Run from a computer: it has no page at GitHub.</small>"#.to_string() }
-            else { format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">On {} ›</a>"#, esc(&link), if r["provider"] == "gitlab" { "GitLab" } else { "GitHub" }) };
+            else { format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">{}On {} ›</a>"#, esc(&link), crate::logos::bare(if r["provider"] == "gitlab" { "gitlab" } else { "github" }, 15), if r["provider"] == "gitlab" { "GitLab" } else { "GitHub" }) };
         let row = |label: &str, value: String| if value.is_empty() { String::new() } else { format!(r#"<div class="limit"><span class="limit-text"><strong>{label}</strong></span><span class="limit-do">{value}</span></div>"#) };
         let facts = [
             row("Status", format!(r#"<span class="jt-state {kind}"><i></i>{word}</span>"#)),
@@ -3891,10 +3891,15 @@ mark();load()})();</script>"#;
         let row = |label: &str, value: String| if value.is_empty() { String::new() } else { format!(r#"<div class="limit"><span class="limit-text"><strong>{label}</strong></span><span class="limit-do">{value}</span></div>"#) };
         let link = job_link(&j);
         let at = if link.is_empty() { r#"<small class="faint">Run from a computer: it has no page at GitHub.</small>"#.to_string() }
-            else { format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">On {} ›</a>"#, esc(&link), if j["provider"] == "gitlab" { "GitLab" } else { "GitHub" }) };
+            else { format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">{}On {} ›</a>"#, esc(&link), crate::logos::bare(if j["provider"] == "gitlab" { "gitlab" } else { "github" }, 15), if j["provider"] == "gitlab" { "GitLab" } else { "GitHub" }) };
         let why = { let w = plain_reason(&j); if kind == "bad" || j["state"] == "waiting" { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&w)) } else { String::new() } };
+        // The run it is of: its page here, named as the Runs tab names it.
+        let jobs: Vec<serde_json::Value> = v.jobs().iter().map(|x| with_hosts(v, x)).collect();
+        let run = runs_of(&jobs).into_iter().find(|r| r["repo"] == j["repo"] && r["id"] == j["run_id"] && r["job_ids"].as_array().is_some_and(|ids| ids.contains(&j["job_id"])));
+        let run = run.map(|r| { let n = r["jobs"].as_u64().unwrap_or(1); format!(r#"<a href="{}">{}</a><span class="faint">{n} {}</span>"#, esc(&run_page_link(&r)), esc(&run_names(&r).0), if n == 1 { "job" } else { "jobs" }) }).unwrap_or_default();
         let facts = [
             row("Status", format!(r#"<span class="jt-state {kind}"><i></i>{word}</span>"#)),
+            row("Run", run),
             row("Runner", if runner.is_empty() { String::new() } else { format!("{}<span>{}</span>", logo(&runner_logo, 16), esc(&runner)) }),
             row("Time", duration(&j)),
             row("Cost", job_cost(&j).filter(|c| *c > 0.0).map(|c| cost_text(&j, c)).unwrap_or_default()),

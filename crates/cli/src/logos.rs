@@ -51,6 +51,13 @@ pub fn logo(provider: &str, size: u32) -> String {
     }
 }
 
+/// A provider's mark alone, in its colour (black ones in the text colour), for inside a button.
+pub fn bare(provider: &str, size: u32) -> String {
+    let Some((path, color)) = mark(provider) else { return String::new() };
+    let fill = if ["#000000", "#181717", "#0B0D0E"].contains(&color) { "currentColor" } else { color };
+    format!(r##"<svg width="{size}" height="{size}" viewBox="0 0 24 24" aria-hidden="true"><path d="{path}" fill="{fill}"/></svg>"##)
+}
+
 /// Small line icons (24×24, stroked with the text colour).
 pub fn icon(name: &str) -> String {
     let d = match name {

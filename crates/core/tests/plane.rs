@@ -3721,6 +3721,8 @@ fn a_gitlab_job_whose_events_never_come_is_seen_running_and_over_by_asking_gitla
         let json = |v: serde_json::Value| Some(Response::new(200, "application/json", v.to_string()));
         match r.url.as_str() {
             "https://gitlab.example/api/v4/projects/380/jobs/1977" => json(serde_json::json!({ "id": 1977, "status": *now.borrow(), "tag_list": ["superci/cpu=2"], "ref": "feature", "tag": false,
+                "started_at": if *now.borrow() == "pending" { serde_json::Value::Null } else { "2026-10-14T15:22:39.000Z".into() },
+                "finished_at": if *now.borrow() == "success" { serde_json::json!("2026-10-14T15:23:21.000Z") } else { serde_json::Value::Null },
                 "runner": if *now.borrow() == "pending" { serde_json::Value::Null } else { serde_json::json!({ "id": 55 }) } })),
             u if u.starts_with("https://gitlab.example/api/v4/projects?membership=true") => json(serde_json::json!([])),
             _ => None,
@@ -3747,6 +3749,8 @@ fn a_gitlab_job_whose_events_never_come_is_seen_running_and_over_by_asking_gitla
     block_on(plane.alarm()).unwrap();
     assert_eq!(job()["state"], "done");
     assert!(!store.0.borrow().contains_key("glrunner:55"));
+    // Its time is GitLab's own, from when it began to when it ended.
+    assert_eq!(job()["ended_ms"].as_u64().unwrap() - job()["started_ms"].as_u64().unwrap(), 42_000);
 }
 
 #[test]

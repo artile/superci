@@ -3447,8 +3447,9 @@ impl<'a> ControlPlane<'a> {
         if v["runner"]["id"].as_u64() != Some(runner) { return false }
         let status = v["status"].as_str().unwrap_or_default();
         let mut changed = false;
-        // (Its times as GitLab kept them: when it began and ended, not when this was asked.)
+        // (Its times as GitLab kept them: when it began and ended, not when this was asked or a sweep first saw it.)
         let at = |k: &str| v[k].as_str().and_then(aws::parse_iso_ms);
+        if let Some(t) = at("started_at") { changed |= j.started_ms.replace(t) != Some(t) }
         if !j.seen_in_progress && status != "pending" {
             (j.seen_in_progress, j.state) = (true, "running".into());
             j.started_ms.get_or_insert(at("started_at").unwrap_or(now));
@@ -3464,7 +3465,7 @@ impl<'a> ControlPlane<'a> {
         if let Some(state) = match status { "success" | "failed" => Some("done"), "canceled" => Some("cancelled"), _ => None } {
             j.state = state.into();
             j.conclusion = Some(gitlab_conclusion(status).into());
-            j.ended_ms.get_or_insert(at("finished_at").unwrap_or(now));
+            j.ended_ms = at("finished_at").or(j.ended_ms).or(Some(now));
             if gitlab::delete_runner(self.http, gl, runner).await.is_ok() { let _ = self.store.delete(&format!("glrunner:{}", gitlab::local(&gl.id, runner))).await; }
             changed = true;
         }
