@@ -3214,6 +3214,13 @@ impl<'a> ControlPlane<'a> {
     /// past the job time bound (they also power themselves off).
     pub async fn alarm(&self) -> Result<()> {
         let now = self.clock.now_ms();
+        // The store's own upkeep: what an earlier layout left is moved, a little each minute; what has passed its end
+        // goes, once an hour (where the store does not remove it by itself).
+        let _ = self.store.migrate(500).await;
+        if self.store.put_if_absent(&format!("upkeep:{}", now / 3_600_000), now.to_string()).await.unwrap_or(false) {
+            let _ = self.store.put_until(&format!("upkeep:{}", now / 3_600_000), now.to_string(), now + 2 * 3_600_000).await;
+            let _ = self.store.expire(now).await;
+        }
         let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
         let (mut active, mut waiting) = (0, 0);
         let kept = self.store.list("job:").await?;

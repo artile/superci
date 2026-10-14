@@ -3,7 +3,7 @@
 //! the jobs' containers itself: one `JobRunner` Durable Object with a container per job, sized for it (no separate agent).
 use async_trait::async_trait;
 use superci_core::plane::{Cache, Config, ControlPlane};
-use superci_core::io::{self, Clock, Containers, Http, Store, Timer, Work};
+use superci_core::io::{self, Clock, Containers, Http, Store, Timer, Work, Ending};
 use superci_core::spec::Size;
 use js_sys::{Array, Function, Object, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
@@ -150,6 +150,17 @@ impl Store for DoStore<'_> {
     async fn delete(&self, key: &str) -> io::Result<()> {
         self.0.storage().delete(key).await.map(|_| ()).map_err(|e| e.to_string())
     }
+    /// The last `n` by key, read from the end (the storage keeps keys in order).
+    async fn list_last(&self, prefix: &str, n: usize) -> io::Result<Vec<(String, String)>> {
+        let map = self.0.storage().list_with_options(ListOptions::new().prefix(prefix).reverse(true).limit(n)).await.map_err(|e| e.to_string())?;
+        let mut out = vec![];
+        for entry in map.entries() {
+            let pair: js_sys::Array = entry.map_err(|e| format!("{e:?}"))?.into();
+            if let (Some(k), Some(v)) = (pair.get(0).as_string(), pair.get(1).as_string()) { out.push((k, v)); }
+        }
+        out.reverse();
+        Ok(out)
+    }
     async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {
         let map = self.0.storage().list_with_options(ListOptions::new().prefix(prefix)).await.map_err(|e| e.to_string())?;
         let mut out = vec![];
@@ -256,7 +267,7 @@ impl DurableObject for PlaneObject {
         if let (Some(until), Some(key)) = (req.headers().get(VOUCHED)?.and_then(|u| u.parse::<u64>().ok()), req.headers().get("authorization")?.and_then(|a| a.strip_prefix("Bearer ").map(str::to_string))) {
             config.dashboard_keys.push((until, key));
         }
-        let (store, timer) = (DoStore(&self.state), DoTimer(&self.state));
+        let (store, timer) = (Ending(DoStore(&self.state)), DoTimer(&self.state));
         let plane = ControlPlane { store: &store, http: &FetchHttp, clock: &WorkerClock, timer: &timer, config: &config, cache: &self.cache, containers: Some(&Runners(&self.env, config.cloudflare_location.clone(), config.cloudflare_image.clone())) };
         let r = plane.handle(request).await;
         let headers = Headers::new();
@@ -266,7 +277,7 @@ impl DurableObject for PlaneObject {
 
     async fn alarm(&self) -> Result<Response> {
         let config = self.config(None);
-        let (store, timer) = (DoStore(&self.state), DoTimer(&self.state));
+        let (store, timer) = (Ending(DoStore(&self.state)), DoTimer(&self.state));
         let plane = ControlPlane { store: &store, http: &FetchHttp, clock: &WorkerClock, timer: &timer, config: &config, cache: &self.cache, containers: Some(&Runners(&self.env, config.cloudflare_location.clone(), config.cloudflare_image.clone())) };
         plane.alarm().await.map_err(Error::RustError)?;
         Response::ok("ok")

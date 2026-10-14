@@ -65,7 +65,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     ok_if(a.iam("CreateRole", json!({ "RoleName": name, "AssumeRolePolicyDocument": trust.to_string(), "Description": format!("Runs a SuperCI control plane (Lambda, {region})."),
         "Tags": { "member": [{ "Key": "superci-plane", "Value": plane_id }] } })), &["EntityAlreadyExists"])?;
     let own = json!({ "Version": "2012-10-17", "Statement": [
-        { "Sid": "State", "Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"], "Resource": table_arn },
+        { "Sid": "State", "Effect": "Allow", "Action": ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Query"], "Resource": table_arn },
         { "Sid": "Secrets", "Effect": "Allow", "Action": "ssm:GetParametersByPath", "Resource": [params_arn, format!("{params_arn}/*")] },
         { "Sid": "Logs", "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": format!("arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{name}:*") },
         // Itself, and nothing else: a sweep sooner than the schedule's minute (a start tried again, jobs waiting for room).
@@ -86,6 +86,15 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         "AttributeDefinitions": [{ "AttributeName": "p", "AttributeType": "S" }, { "AttributeName": "k", "AttributeType": "S" }],
         "KeySchema": [{ "AttributeName": "p", "KeyType": "HASH" }, { "AttributeName": "k", "KeyType": "RANGE" }],
         "Tags": [{ "Key": "superci-plane", "Value": plane_id }] })), &["ResourceInUseException"])?;
+    // Records with an end (`x`, seconds) are removed by DynamoDB itself. Only for tidying, so a refusal stops nothing.
+    for _ in 0..30 {
+        if ddb("DescribeTable", json!({ "TableName": name })).is_ok_and(|t| t["Table"]["TableStatus"] == "ACTIVE") { break }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let ttl = ddb("DescribeTimeToLive", json!({ "TableName": name })).ok();
+    if !ttl.as_ref().is_some_and(|t| ["ENABLED", "ENABLING"].contains(&t["TimeToLiveDescription"]["TimeToLiveStatus"].as_str().unwrap_or(""))) {
+        let _ = ddb("UpdateTimeToLive", json!({ "TableName": name, "TimeToLiveSpecification": { "Enabled": true, "AttributeName": "x" } }));
+    }
 
     // The function: created, or its code replaced.
     step(2);

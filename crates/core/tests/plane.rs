@@ -3846,3 +3846,23 @@ fn usage_counts_every_job_of_a_period_its_minutes_and_what_the_code_host_would_h
     assert_eq!((week["jobs"].as_u64(), week["billed_minutes"].as_u64(), week["steps"].as_array().unwrap().len()), (Some(4), Some(13), 7));
     assert_eq!(usage(&jobs, price, now, 86_400_000, 30)["jobs"].as_u64(), Some(4));
 }
+
+#[test]
+fn a_store_without_ends_of_its_own_removes_a_record_at_its_end_and_not_one_written_again() {
+    let store = superci_core::io::Ending(Mem::default());
+    block_on(store.put_until("live:1", "a".into(), 1_000)).unwrap();
+    block_on(store.put_until("live:2", "b".into(), 1_000)).unwrap();
+    block_on(store.put("live:2", "b again, for good".into())).unwrap();
+    block_on(store.put_until("live:3", "c".into(), 5_000)).unwrap();
+    assert!(block_on(store.swap_until("live:3", Some("c"), "c later".into(), Some(9_000))).unwrap());
+    assert_eq!(block_on(store.expire(999)).unwrap(), 0, "nothing is due yet");
+    assert_eq!(block_on(store.expire(6_000)).unwrap(), 1);
+    let left: Vec<String> = block_on(store.list("live:")).unwrap().into_iter().map(|(k, _)| k).collect();
+    assert_eq!(left, ["live:2", "live:3"], "the one written again keeps no end; the one moved on keeps its newer end");
+    assert_eq!(block_on(store.expire(9_000)).unwrap(), 1);
+    assert_eq!(block_on(store.list("live:")).unwrap().len(), 1);
+    assert!(store.0.0.borrow().keys().all(|k| !k.starts_with("~x:")), "every mark is gone once due");
+    // The newest few, by key.
+    for i in 0..5 { block_on(store.put(&format!("recent:{i:03}"), i.to_string())).unwrap() }
+    assert_eq!(block_on(store.list_last("recent:", 2)).unwrap().iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["recent:003", "recent:004"]);
+}

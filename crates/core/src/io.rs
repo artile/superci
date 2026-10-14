@@ -80,6 +80,10 @@ pub trait Http {
     async fn send(&self, request: Request) -> Result<Response>;
 }
 
+/// State kept by a control plane, as records by key (`<kind>:<rest>`: `job:1717`, `rline:<token>:000001`). A store
+/// keeps each kind apart where it can (a DynamoDB partition of its own), so one kind's traffic never slows another's;
+/// a record can be given an end (`put_until`), after which the store removes it by itself (DynamoDB) or in `expire`
+/// (the others). An end is only for tidying: what reads a record still weighs its times, as it is not gone at once.
 #[async_trait(?Send)]
 pub trait Store {
     async fn get(&self, key: &str) -> Result<Option<String>>;
@@ -95,7 +99,99 @@ pub trait Store {
         self.put(key, value).await.map(|_| true)
     }
     async fn delete(&self, key: &str) -> Result<()>;
+    /// Every record whose key begins with `prefix`, by key. The prefix names a kind (`job:`), or part of one.
     async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>>;
+    /// The same, kept until `until_ms` (ms since the epoch) and then removed.
+    async fn put_until(&self, key: &str, value: String, until_ms: u64) -> Result<()> { let _ = until_ms; self.put(key, value).await }
+    /// `swap`, with an end (none: kept).
+    async fn swap_until(&self, key: &str, was: Option<&str>, value: String, until_ms: Option<u64>) -> Result<bool> { let _ = until_ms; self.swap(key, was, value).await }
+    /// The last `n` records under `prefix`, by key, the last last (keys that sort by time: the newest).
+    async fn list_last(&self, prefix: &str, n: usize) -> Result<Vec<(String, String)>> {
+        let mut all = self.list(prefix).await?;
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(all.split_off(all.len().saturating_sub(n)))
+    }
+    /// Several records at once, in the order asked (absent: none).
+    async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<String>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys { out.push(self.get(k).await?) }
+        Ok(out)
+    }
+    /// Removes what has passed its end, where the store does not by itself; how many.
+    async fn expire(&self, now_ms: u64) -> Result<usize> { let _ = now_ms; Ok(0) }
+    /// Moves records kept in an earlier layout of this store into its own, at most `budget` of them; whether none
+    /// is left (most stores have only the one layout).
+    async fn migrate(&self, budget: usize) -> Result<bool> { let _ = budget; Ok(true) }
+}
+
+/// Ends for a store that has none of its own (a Durable Object's, a Modal Dict): each record given an end has it
+/// beside it (`~e:<key>`), and a mark that sorts by it (`~x:<until>:<key>`) for `expire` to find the ones due. A record
+/// written again keeps only its newest end (none, when written without one), so an older mark never removes it.
+pub struct Ending<S>(pub S);
+
+fn end_key(key: &str) -> String { format!("~e:{key}") }
+
+/// A store lent: the same store.
+#[async_trait(?Send)]
+impl<T: Store + ?Sized> Store for &T {
+    async fn get(&self, key: &str) -> Result<Option<String>> { (**self).get(key).await }
+    async fn put(&self, key: &str, value: String) -> Result<()> { (**self).put(key, value).await }
+    async fn put_if_absent(&self, key: &str, value: String) -> Result<bool> { (**self).put_if_absent(key, value).await }
+    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> Result<bool> { (**self).swap(key, was, value).await }
+    async fn delete(&self, key: &str) -> Result<()> { (**self).delete(key).await }
+    async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>> { (**self).list(prefix).await }
+    async fn put_until(&self, key: &str, value: String, until_ms: u64) -> Result<()> { (**self).put_until(key, value, until_ms).await }
+    async fn swap_until(&self, key: &str, was: Option<&str>, value: String, until_ms: Option<u64>) -> Result<bool> { (**self).swap_until(key, was, value, until_ms).await }
+    async fn list_last(&self, prefix: &str, n: usize) -> Result<Vec<(String, String)>> { (**self).list_last(prefix, n).await }
+    async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<String>>> { (**self).get_many(keys).await }
+    async fn expire(&self, now_ms: u64) -> Result<usize> { (**self).expire(now_ms).await }
+    async fn migrate(&self, budget: usize) -> Result<bool> { (**self).migrate(budget).await }
+}
+
+#[async_trait(?Send)]
+impl<S: Store> Store for Ending<S> {
+    async fn get(&self, key: &str) -> Result<Option<String>> { self.0.get(key).await }
+    async fn put(&self, key: &str, value: String) -> Result<()> { self.0.put(key, value).await?; self.0.delete(&end_key(key)).await }
+    async fn put_if_absent(&self, key: &str, value: String) -> Result<bool> {
+        let made = self.0.put_if_absent(key, value).await?;
+        if made { self.0.delete(&end_key(key)).await? }
+        Ok(made)
+    }
+    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> Result<bool> { self.swap_until(key, was, value, None).await }
+    async fn delete(&self, key: &str) -> Result<()> { self.0.delete(key).await?; self.0.delete(&end_key(key)).await }
+    async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>> { self.0.list(prefix).await }
+    async fn put_until(&self, key: &str, value: String, until_ms: u64) -> Result<()> {
+        self.0.put(key, value).await?;
+        self.0.put(&end_key(key), until_ms.to_string()).await?;
+        self.0.put(&format!("~x:{until_ms:013}:{key}"), String::new()).await
+    }
+    async fn swap_until(&self, key: &str, was: Option<&str>, value: String, until_ms: Option<u64>) -> Result<bool> {
+        if !self.0.swap(key, was, value).await? { return Ok(false) }
+        match until_ms {
+            Some(until) => { self.0.put(&end_key(key), until.to_string()).await?; self.0.put(&format!("~x:{until:013}:{key}"), String::new()).await? }
+            None => self.0.delete(&end_key(key)).await?,
+        }
+        Ok(true)
+    }
+    async fn list_last(&self, prefix: &str, n: usize) -> Result<Vec<(String, String)>> { self.0.list_last(prefix, n).await }
+    async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<String>>> { self.0.get_many(keys).await }
+    async fn expire(&self, now_ms: u64) -> Result<usize> {
+        let mut gone = 0;
+        for (mark, _) in self.0.list("~x:").await? {
+            let Some((until, key)) = mark.strip_prefix("~x:").and_then(|r| r.split_once(':')) else { continue };
+            let Ok(until) = until.parse::<u64>() else { continue };
+            if until > now_ms { continue }
+            // Only while this is still its end: written again since, it keeps its newer one.
+            if self.0.get(&end_key(key)).await?.as_deref() == Some(until.to_string().as_str()) {
+                self.0.delete(key).await?;
+                self.0.delete(&end_key(key)).await?;
+                gone += 1;
+            }
+            self.0.delete(&mark).await?;
+        }
+        Ok(gone)
+    }
+    async fn migrate(&self, budget: usize) -> Result<bool> { self.0.migrate(budget).await }
 }
 
 /// What a machine runs: GitHub's runner with a just-in-time configuration (exactly one job), or GitLab's runner with a

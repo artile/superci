@@ -44,8 +44,18 @@ fn own_credentials() -> Credentials {
 /// What DynamoDB says when a call may be made again: too much at once, or a passing fault of its own.
 const AGAIN: [&str; 6] = ["ThrottlingException", "ProvisionedThroughputExceededException", "RequestLimitExceeded", "InternalServerError", "ServiceUnavailable", "HTTP 5"];
 
-/// State in one DynamoDB table: partition "s", sort key = the store's key, attribute v = its value.
-struct Dynamo<'a> { http: &'a Blocking, table: String, region: String }
+/// State in one DynamoDB table: each kind of record in a partition of its own (`p`: the key up to its first colon,
+/// `job` for `job:1717`), the key itself as the sort key (`k`), the record as text (`v`), and its end in seconds (`x`,
+/// the table's time to live) when it has one. Before 0.19.0 every record was in the one partition `s`: until those
+/// are moved (`migrate`, a little at each sweep; then `layout` says so), what is not found in its own is looked for
+/// there too.
+struct Dynamo<'a> { http: &'a Blocking, table: String, region: String, old: std::cell::Cell<Option<bool>> }
+
+/// The partition a key is kept in: its kind.
+fn part(key: &str) -> &str { key.split(':').next().unwrap_or(key) }
+
+/// Where the layout is said to be this one (once nothing is left in the old partition).
+const LAYOUT: &str = "layout";
 
 impl Dynamo<'_> {
     /// One call, asked again when DynamoDB says to (throttled, or a passing error of its own), as AWS's own SDKs do:
@@ -66,47 +76,137 @@ impl Dynamo<'_> {
         aws::json_call(self.http, "POST", &format!("https://dynamodb.{}.amazonaws.com/", self.region), &self.region, "dynamodb", Some(&format!("DynamoDB_20120810.{op}")),
             "application/x-amz-json-1.0", Some(&body), &own_credentials(), now_ms()).await
     }
-    fn key(&self, k: &str) -> Value { json!({ "p": { "S": "s" }, "k": { "S": k } }) }
-}
-
-#[async_trait(?Send)]
-impl Store for Dynamo<'_> {
-    async fn get(&self, key: &str) -> io::Result<Option<String>> {
-        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": self.key(key), "ConsistentRead": true })).await?;
+    fn key(&self, k: &str) -> Value { json!({ "p": { "S": part(k) }, "k": { "S": k } }) }
+    fn old_key(&self, k: &str) -> Value { json!({ "p": { "S": "s" }, "k": { "S": k } }) }
+    fn item(&self, k: &str, value: String, until_ms: Option<u64>) -> Value {
+        let mut item = json!({ "p": { "S": part(k) }, "k": { "S": k }, "v": { "S": value } });
+        if let Some(until) = until_ms { item["x"] = json!({ "N": (until / 1000).to_string() }) }
+        item
+    }
+    /// Whether records may still be in the old partition (asked once per request).
+    async fn old(&self) -> io::Result<bool> {
+        if let Some(old) = self.old.get() { return Ok(old) }
+        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": self.key(LAYOUT), "ConsistentRead": true })).await?;
+        let old = v["Item"]["v"]["S"].as_str() != Some("kinds");
+        self.old.set(Some(old));
+        Ok(old)
+    }
+    async fn get_old(&self, key: &str) -> io::Result<Option<String>> {
+        if !self.old().await? { return Ok(None) }
+        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": self.old_key(key), "ConsistentRead": true })).await?;
         Ok(v["Item"]["v"]["S"].as_str().map(str::to_string))
     }
-    async fn put(&self, key: &str, value: String) -> io::Result<()> {
-        self.call("PutItem", json!({ "TableName": self.table, "Item": { "p": { "S": "s" }, "k": { "S": key }, "v": { "S": value } } })).await.map(|_| ())
-    }
-    /// Requests run in parallel here: DynamoDB's condition makes the claim atomic.
-    async fn put_if_absent(&self, key: &str, value: String) -> io::Result<bool> {
-        let r = self.call("PutItem", json!({ "TableName": self.table, "Item": { "p": { "S": "s" }, "k": { "S": key }, "v": { "S": value } }, "ConditionExpression": "attribute_not_exists(k)" })).await;
-        match r { Ok(_) => Ok(true), Err(e) if e.starts_with("ConditionalCheckFailedException") => Ok(false), Err(e) => Err(e) }
-    }
-    /// The same for a write over what was read: only while the value is still that one.
-    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> io::Result<bool> {
-        let mut put = json!({ "TableName": self.table, "Item": { "p": { "S": "s" }, "k": { "S": key }, "v": { "S": value } } });
-        match was {
-            Some(was) => { put["ConditionExpression"] = "v = :was".into(); put["ExpressionAttributeValues"] = json!({ ":was": { "S": was } }) }
-            None => put["ConditionExpression"] = "attribute_not_exists(k)".into(),
-        }
-        match self.call("PutItem", put).await { Ok(_) => Ok(true), Err(e) if e.starts_with("ConditionalCheckFailedException") => Ok(false), Err(e) => Err(e) }
-    }
-    async fn delete(&self, key: &str) -> io::Result<()> {
-        self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.key(key) })).await.map(|_| ())
-    }
-    async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {
+    async fn query(&self, partition: &str, prefix: &str, last: Option<usize>) -> io::Result<Vec<(String, String)>> {
         let (mut out, mut start) = (vec![], Value::Null);
         loop {
-            let mut q = json!({ "TableName": self.table, "KeyConditionExpression": "p = :p AND begins_with(k, :k)", "ExpressionAttributeValues": { ":p": { "S": "s" }, ":k": { "S": prefix } }, "ConsistentRead": true });
+            let mut q = json!({ "TableName": self.table, "KeyConditionExpression": "p = :p AND begins_with(k, :k)", "ExpressionAttributeValues": { ":p": { "S": partition }, ":k": { "S": prefix } }, "ConsistentRead": true });
+            if let Some(n) = last { q["ScanIndexForward"] = false.into(); q["Limit"] = (n - out.len()).into() }
             if !start.is_null() { q["ExclusiveStartKey"] = start }
             let v = self.call("Query", q).await?;
             for item in v["Items"].as_array().into_iter().flatten() {
                 if let (Some(k), Some(val)) = (item["k"]["S"].as_str(), item["v"]["S"].as_str()) { out.push((k.to_string(), val.to_string())) }
             }
             start = v["LastEvaluatedKey"].clone();
-            if start.is_null() { return Ok(out) }
+            if start.is_null() || last.is_some_and(|n| out.len() >= n) { break }
         }
+        if last.is_some() { out.reverse() }
+        Ok(out)
+    }
+    /// A conditional write: whether it was made.
+    async fn put_when(&self, put: Value) -> io::Result<bool> {
+        match self.call("PutItem", put).await { Ok(_) => Ok(true), Err(e) if e.starts_with("ConditionalCheckFailedException") => Ok(false), Err(e) => Err(e) }
+    }
+}
+
+#[async_trait(?Send)]
+impl Store for Dynamo<'_> {
+    async fn get(&self, key: &str) -> io::Result<Option<String>> {
+        let v = self.call("GetItem", json!({ "TableName": self.table, "Key": self.key(key), "ConsistentRead": true })).await?;
+        match v["Item"]["v"]["S"].as_str() { Some(s) => Ok(Some(s.to_string())), None => self.get_old(key).await }
+    }
+    async fn put(&self, key: &str, value: String) -> io::Result<()> {
+        self.call("PutItem", json!({ "TableName": self.table, "Item": self.item(key, value, None) })).await.map(|_| ())
+    }
+    /// Requests run in parallel here: DynamoDB's condition makes the claim atomic.
+    async fn put_if_absent(&self, key: &str, value: String) -> io::Result<bool> {
+        if self.get_old(key).await?.is_some() { return Ok(false) }
+        self.put_when(json!({ "TableName": self.table, "Item": self.item(key, value, None), "ConditionExpression": "attribute_not_exists(k)" })).await
+    }
+    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> io::Result<bool> { self.swap_until(key, was, value, None).await }
+    async fn delete(&self, key: &str) -> io::Result<()> {
+        self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.key(key) })).await?;
+        if self.old().await? { self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.old_key(key) })).await?; }
+        Ok(())
+    }
+    async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {
+        let mut out = self.query(part(prefix), prefix, None).await?;
+        if self.old().await? {
+            let have: std::collections::HashSet<String> = out.iter().map(|(k, _)| k.clone()).collect();
+            out.extend(self.query("s", prefix, None).await?.into_iter().filter(|(k, _)| !have.contains(k)));
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        Ok(out)
+    }
+    async fn put_until(&self, key: &str, value: String, until_ms: u64) -> io::Result<()> {
+        self.call("PutItem", json!({ "TableName": self.table, "Item": self.item(key, value, Some(until_ms)) })).await.map(|_| ())
+    }
+    /// The same for a write over what was read: only while the value is still that one. (A record still in the old
+    /// partition is written in its own, only while that one is not there yet.)
+    async fn swap_until(&self, key: &str, was: Option<&str>, value: String, until_ms: Option<u64>) -> io::Result<bool> {
+        let mut put = json!({ "TableName": self.table, "Item": self.item(key, value, until_ms) });
+        let in_old = match was { Some(was) if self.old().await? => {
+            let here = self.call("GetItem", json!({ "TableName": self.table, "Key": self.key(key), "ConsistentRead": true })).await?;
+            here["Item"].is_null() && self.get_old(key).await?.as_deref() == Some(was)
+        } _ => false };
+        match was {
+            Some(was) if !in_old => { put["ConditionExpression"] = "v = :was".into(); put["ExpressionAttributeValues"] = json!({ ":was": { "S": was } }) }
+            _ => put["ConditionExpression"] = "attribute_not_exists(k)".into(),
+        }
+        let made = self.put_when(put).await?;
+        if made && in_old { self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.old_key(key) })).await?; }
+        Ok(made)
+    }
+    async fn list_last(&self, prefix: &str, n: usize) -> io::Result<Vec<(String, String)>> {
+        if n == 0 { return Ok(vec![]) }
+        if self.old().await? {
+            let mut all = self.list(prefix).await?;
+            return Ok(all.split_off(all.len().saturating_sub(n)))
+        }
+        self.query(part(prefix), prefix, Some(n)).await
+    }
+    /// A hundred at a time (DynamoDB's most), asked again for what it leaves for later.
+    async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> {
+        let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for chunk in keys.chunks(100) {
+            let mut want: Vec<Value> = chunk.iter().collect::<std::collections::BTreeSet<_>>().into_iter().map(|k| self.key(k)).collect();
+            for _ in 0..8 {
+                if want.is_empty() { break }
+                let v = self.call("BatchGetItem", json!({ "RequestItems": { &self.table: { "Keys": want, "ConsistentRead": true } } })).await?;
+                for item in v["Responses"][&self.table].as_array().into_iter().flatten() {
+                    if let (Some(k), Some(val)) = (item["k"]["S"].as_str(), item["v"]["S"].as_str()) { found.insert(k.to_string(), val.to_string()); }
+                }
+                want = v["UnprocessedKeys"][&self.table]["Keys"].as_array().cloned().unwrap_or_default();
+            }
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys { out.push(match found.get(k) { Some(v) => Some(v.clone()), None => self.get_old(k).await? }) }
+        Ok(out)
+    }
+    /// Moves what is left in the old partition into each record's own (not over one written there since), then says
+    /// the layout is this one.
+    async fn migrate(&self, budget: usize) -> io::Result<bool> {
+        if !self.old().await? { return Ok(true) }
+        let v = self.call("Query", json!({ "TableName": self.table, "KeyConditionExpression": "p = :p", "ExpressionAttributeValues": { ":p": { "S": "s" } }, "Limit": budget.max(1), "ConsistentRead": true })).await?;
+        let items = v["Items"].as_array().cloned().unwrap_or_default();
+        for item in &items {
+            let (Some(k), Some(val)) = (item["k"]["S"].as_str(), item["v"]["S"].as_str()) else { continue };
+            self.put_when(json!({ "TableName": self.table, "Item": self.item(k, val.to_string(), None), "ConditionExpression": "attribute_not_exists(k)" })).await?;
+            self.call("DeleteItem", json!({ "TableName": self.table, "Key": self.old_key(k) })).await?;
+        }
+        if !items.is_empty() || !v["LastEvaluatedKey"].is_null() { return Ok(false) }
+        self.put(LAYOUT, "kinds".into()).await?;
+        self.old.set(Some(false));
+        Ok(true)
     }
 }
 
@@ -257,7 +357,7 @@ fn main() {
         let moving = event["rawPath"].as_str().is_some_and(|p| p.starts_with("/move/"));
         let refreshed = secrets.refresh(&http, &region, &plane_id, unknown || moving);
         let config = config(&secrets, &account_id);
-        let store = Dynamo { http: &http, table: table.clone(), region: region.clone() };
+        let store = Dynamo { http: &http, table: table.clone(), region: region.clone(), old: std::cell::Cell::new(None) };
         let later = std::cell::RefCell::new(vec![]);
         let timer = Scheduled { http: &http, store: &store, region: &region, function: &function, later: &later };
         let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &timer, config: &config, cache: &cache, containers: None };

@@ -135,7 +135,8 @@ fn main() {
     while let Some(msg) = bridge.read() {
         let config = config(&msg["secrets"]);
         let sandboxes = Sandboxes(&bridge);
-        let plane = ControlPlane { store: &bridge, http: &http, clock: &SystemClock, timer: &bridge, config: &config, cache: &cache, containers: Some(&sandboxes) };
+        let store = superci_core::io::Ending(&bridge);
+        let plane = ControlPlane { store: &store, http: &http, clock: &SystemClock, timer: &bridge, config: &config, cache: &cache, containers: Some(&sandboxes) };
         if msg["kind"] == "alarm" {
             let r = block_on(plane.alarm());
             if let Err(e) = &r { eprintln!("superci: {e}") }
