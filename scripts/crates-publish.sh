@@ -18,7 +18,7 @@ grep -q "superci-core = { path = \"../core\", version = \"=$version\" }" crates/
   || { echo "crates/cli/Cargo.toml does not ask for superci-core =$version" >&2; exit 1; }
 
 embedded=crates/cli/embedded
-names="plane-cloudflare.js plane-cloudflare.wasm runners-cloudflare.js runners-cloudflare.wasm plane-aws.zip plane-modal cache-x86_64 cache-aarch64 CHANGELOG.md"
+names="plane-cloudflare.js plane-cloudflare.wasm runners-cloudflare.js runners-cloudflare.wasm plane-aws.zip plane-modal cache-x86_64 cache-aarch64 cache-windows.exe CHANGELOG.md"
 if [ "${1:-}" = "--embedded" ]; then
   for name in $names; do [ -f "$embedded/$name" ] || { echo "$embedded/$name is missing" >&2; exit 1; }; done
   cmp -s CHANGELOG.md "$embedded/CHANGELOG.md" || { echo "$embedded was filled from another commit (its changelog differs)" >&2; exit 1; }
@@ -33,6 +33,7 @@ else
   put crates/plane-modal/build/superci-plane plane-modal
   put target/x86_64-unknown-linux-musl/release/superci-cache cache-x86_64
   put target/aarch64-unknown-linux-musl/release/superci-cache cache-aarch64
+  put target/x86_64-pc-windows-gnu/release/superci-cache.exe cache-windows.exe
   put CHANGELOG.md CHANGELOG.md
 fi
 [ "${1:-}" = "--embed" ] && exit 0

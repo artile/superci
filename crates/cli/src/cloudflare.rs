@@ -119,6 +119,10 @@ impl Cloudflare {
         Err(format!("{method} {path}: {errors}"))
     }
 
+    /// One call as it is given (`superci debug cloudflare`, in a debug build only).
+    #[cfg(debug_assertions)]
+    pub fn debug_call(&self, method: &str, path: &str, body: Option<Vec<u8>>) -> Result<Value> { self.call(method, path, body.map(|b| ("application/json", b))) }
+
     /// One query to Cloudflare's GraphQL Analytics API.
     pub fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let mut r = self.agent.post(&format!("{API}/graphql")).header("authorization", &format!("Bearer {}", self.token)).header("content-type", "application/json")

@@ -1245,13 +1245,16 @@ const HELLO: &str = r#"# How the start went, said to the control plane (see wher
 /// the runner's files, when it was ready to start the runner, and when the runner listened for a job. So a slow
 /// start can be seen for what it was: AWS, the boot, the disk, or the runner reaching GitHub. Sent in the
 /// background: nothing here waits for it or stops for it.
-/// What `with_cache` adds before the runner starts: `superci-cache` fetched (the machine's link sends it on to the
-/// bucket, by a link that does only that), put in front of the runner's own Node (which runs the job's actions), and
-/// started. Beside the runner, not before it: the first action runs seconds after the runner starts, and until the
-/// program is up the actions use GitHub's cache.
-const CACHE: &str = r#"# GitHub's cache, kept in this control plane's own bucket: superci-cache serves it to the job's actions (it holds no keys).
-( c='PLANE_LINK'; curl -fsSL --retry 2 -m 30 -o /usr/local/bin/superci-cache "$c/program" && chmod 755 /usr/local/bin/superci-cache && /usr/local/bin/superci-cache wrap /home/runner/externals &&
-  SUPERCI_CACHE_PLANE="$c" setsid /usr/local/bin/superci-cache serve /home/runner/externals > /var/log/superci-cache.log 2>&1 < /dev/null & ) > /dev/null 2>&1
+/// What `with_cache` adds before the runner starts: the tools' remote caches pointed at `superci-cache` on this
+/// machine's private address (Turbo and Nx in the runner's own environment, Bazel in its system-wide settings: a
+/// workflow's own settings come first), then `superci-cache` fetched (the machine's link sends it on to the bucket, by a
+/// link that does only that), put in front of the runner's own Node (which runs the job's actions), and started.
+/// Beside the runner, not before it: the first action runs seconds after the runner starts, and until the program is
+/// up the actions use GitHub's cache and the tools their own.
+const CACHE: &str = r#"# GitHub's cache (and Turbo's, Nx's, Bazel's) in this control plane's own bucket, through superci-cache (it holds no keys).
+c='PLANE_LINK';i=$(hostname -I|cut -d' ' -f1);u=http://$i:8257
+[ -n "$i" ]&&printf 'TURBO_API=%s\nTURBO_TOKEN=superci\nTURBO_TEAM=superci\nNX_SELF_HOSTED_REMOTE_CACHE_SERVER=%s\nNX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=superci\n' $u $u>>/home/runner/.env&&echo "build --remote_cache=$u/bazel">>/etc/bazel.bazelrc
+(f=/usr/local/bin/superci-cache;curl -fsSL --retry 2 -m 30 -o $f "$c/program"&&chmod 755 $f&&$f wrap /home/runner/externals&&SUPERCI_CACHE_PLANE="$c" SUPERCI_CACHE_LISTEN="$i" setsid $f serve /home/runner/externals>/var/log/superci-cache.log 2>&1</dev/null&)>/dev/null 2>&1
 "#;
 
 /// A Linux machine's start-up script with `superci-cache` (see `cache`): `plane` the machine's own link to the
@@ -1261,6 +1264,46 @@ pub fn with_cache(script: String, plane: &str) -> Result<String> {
     const RUNNER: &str = "cd /home/runner && ";
     let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
     Ok(format!("{before}{}{RUNNER}{after}", CACHE.replace("PLANE_LINK", plane)))
+}
+
+/// The same for a GitLab job's machine: GitLab's runner keeps its cache in "S3" at `superci-cache` here (path-style,
+/// keys that are no secret: the program answers only what the control plane lets the job on this machine do).
+const CACHE_GITLAB: &str = r#"# GitLab's cache in this control plane's own bucket, through superci-cache (it holds no keys).
+c='PLANE_LINK';i=$(hostname -I|cut -d' ' -f1)
+[ -n "$i" ]&&export CACHE_TYPE=s3 CACHE_SHARED=true CACHE_PATH=gl CACHE_S3_SERVER_ADDRESS=$i:8257 CACHE_S3_ACCESS_KEY=superci CACHE_S3_SECRET_KEY=superci CACHE_S3_BUCKET_NAME=superci CACHE_S3_BUCKET_LOCATION=us-east-1 CACHE_S3_INSECURE=true CACHE_S3_AUTHENTICATION_TYPE=access-key
+(f=/usr/local/bin/superci-cache;curl -fsSL --retry 2 -m 30 -o $f "$c/program"&&chmod 755 $f&&SUPERCI_CACHE_PLANE="$c" SUPERCI_CACHE_LISTEN="$i" setsid $f serve /tmp>/var/log/superci-cache.log 2>&1</dev/null&)>/dev/null 2>&1
+"#;
+
+/// A GitLab job's machine's start-up script with `superci-cache`, before its runner.
+pub fn with_cache_gitlab(script: String, plane: &str) -> Result<String> {
+    if !plane.starts_with("https://") || !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
+    const RUNNER: &str = "export GL_URL=";
+    let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
+    Ok(format!("{before}{}{RUNNER}{after}", CACHE_GITLAB.replace("PLANE_LINK", plane)))
+}
+
+/// The same for a Windows machine (PowerShell): the tools' settings, then `superci-cache` fetched, put in front of
+/// the runner's Node and started, before the runner (Windows boots in minutes; this is a second of it).
+const CACHE_WINDOWS: &str = r#"# GitHub's cache (and Turbo's, Nx's, Bazel's) in this control plane's own bucket, through superci-cache (it holds no keys).
+try {
+  $c = 'PLANE_LINK'; $f = 'C:\superci-cache.exe'
+  $ip = (Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway } | Select-Object -First 1).IPv4Address.IPAddress
+  $u = "http://${ip}:8257"
+  Add-Content "$dir\.env" "TURBO_API=$u`nTURBO_TOKEN=superci`nTURBO_TEAM=superci`nNX_SELF_HOSTED_REMOTE_CACHE_SERVER=$u`nNX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN=superci"
+  Add-Content "$env:ProgramData\bazel.bazelrc" "build --remote_cache=$u/bazel"
+  Invoke-WebRequest -UseBasicParsing "$c/program" -OutFile $f
+  & $f wrap "$dir\externals"
+  $env:SUPERCI_CACHE_PLANE = $c; $env:SUPERCI_CACHE_LISTEN = $ip
+  Start-Process -FilePath $f -ArgumentList 'serve', "$dir\externals" -WindowStyle Hidden -RedirectStandardError C:\superci-cache.log -RedirectStandardOutput C:\superci-cache.out
+} catch { Write-Output "superci-cache: $_" }
+"#;
+
+/// A Windows machine's start-up script with `superci-cache` (see `cache`).
+pub fn with_cache_windows(script: String, plane: &str) -> Result<String> {
+    if !plane.starts_with("https://") || !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
+    const RUNNER: &str = "Set-Location $dir\n";
+    let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
+    Ok(format!("{before}{}{RUNNER}{after}", CACHE_WINDOWS.replace("PLANE_LINK", plane)))
 }
 
 pub fn with_hello(script: String, url: &str) -> Result<String> {
@@ -1428,6 +1471,17 @@ mod tests {
         assert_eq!(parse_iso_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso_ms("2026-09-30T16:11:43Z"), Some(1_790_784_703_000));
         assert_eq!(parse_iso_ms("2024-02-29T12:00:00.123Z"), Some(1_709_208_000_000));
+    }
+
+    #[test]
+    fn a_windows_machine_starts_the_cache_before_its_runner() {
+        let script = runner_user_data_for(&crate::io::Work::GitHub { jit: "A".repeat(10_000) }, 360, "windows", Some("https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/interrupted?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken")).unwrap();
+        let script = with_cache_windows(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
+        let at = |s: &str| script.find(s).unwrap_or_else(|| panic!("{s}"));
+        assert!(at("Invoke-WebRequest -UseBasicParsing \"$c/program\"") < at("& $f wrap \"$dir\\externals\"") && at("& $f wrap") < at("Set-Location $dir") && at("Set-Location $dir") < at("& .\\run.cmd"));
+        assert!(script.contains("TURBO_API=$u") && script.contains("$env:ProgramData\\bazel.bazelrc") && script.contains("-ArgumentList 'serve'"));
+        assert!(script.len() < 16_384, "{} bytes", script.len());
+        assert!(with_cache_windows("no runner here".into(), "https://p.example/cache/t").is_err());
     }
 
     #[test]

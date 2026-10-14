@@ -14,9 +14,10 @@ rm -f crates/plane-aws/build/bootstrap.zip
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p superci-plane-modal
 mkdir -p crates/plane-modal/build
 cp target/x86_64-unknown-linux-musl/release/superci-plane crates/plane-modal/build/superci-plane
-# The cache program for AWS machines (Linux, both architectures), put in each region's cache bucket.
+# The cache program for AWS machines (Linux, both architectures, and Windows), put in each region's cache bucket.
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p superci-cache
 cargo zigbuild --release --target aarch64-unknown-linux-musl -p superci-cache
+cargo zigbuild --release --target x86_64-pc-windows-gnu -p superci-cache
 # The image reader (Linux x86_64), published beside an image for Cloudflare's containers.
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p image-reader
 cargo build --release -p superci

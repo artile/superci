@@ -15,6 +15,7 @@ fn main() {
         ("SUPERCI_PLANE_MODAL", "../plane-modal/build/superci-plane", "plane-modal"),
         ("SUPERCI_CACHE_X86_64", "../../target/x86_64-unknown-linux-musl/release/superci-cache", "cache-x86_64"),
         ("SUPERCI_CACHE_AARCH64", "../../target/aarch64-unknown-linux-musl/release/superci-cache", "cache-aarch64"),
+        ("SUPERCI_CACHE_WINDOWS", "../../target/x86_64-pc-windows-gnu/release/superci-cache.exe", "cache-windows.exe"),
         ("SUPERCI_CHANGELOG", "../../CHANGELOG.md", "CHANGELOG.md"),
     ] {
         let (built, packed) = (here.join(built), here.join("embedded").join(packed));

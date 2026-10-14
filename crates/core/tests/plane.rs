@@ -136,6 +136,13 @@ fn labelled(action: &str, job: u64, repo: &str, runner: Option<&str>, label: &st
 
 fn json(r: &Response) -> serde_json::Value { serde_json::from_slice(&r.body).unwrap() }
 
+/// A queued job of `branch` in acme/app (GitHub's id 77, default branch main), as GitHub sends it.
+fn on_branch(job: u64, branch: &str) -> Request {
+    let payload = serde_json::json!({ "action": "queued", "workflow_job": { "id": job, "run_id": 3, "labels": ["superci"], "head_branch": branch }, "repository": { "id": 77, "full_name": "acme/app", "private": true, "default_branch": "main" }, "installation": { "id": 42 } }).to_string();
+    let sig = format!("sha256={}", hex(&hmac_sha256(b"whsec", payload.as_bytes())));
+    Request::new("POST", &format!("{PLANE_URL}/webhook")).with_header("x-github-event", "workflow_job").with_header("x-hub-signature-256", &sig).with_body(payload)
+}
+
 #[test]
 fn online_only_public_documents_and_a_yes_no_health() {
     let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
@@ -3495,8 +3502,8 @@ fn a_machine_keeps_githubs_cache_in_its_regions_bucket_as_its_jobs_token_allows(
     // The machine fetches superci-cache with a link that does only that, and has a link of its own to the cache.
     let launch = launches(&http.clouds).pop().expect("a machine");
     let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
-    assert!(script.contains(r#"curl -fsSL --retry 2 -m 30 -o /usr/local/bin/superci-cache "$c/program""#), "{script}");
-    assert!(script.find("superci-cache wrap /home/runner/externals").unwrap() < script.find("cd /home/runner && ").unwrap());
+    assert!(script.contains(r#"curl -fsSL --retry 2 -m 30 -o $f "$c/program""#) && script.contains("TURBO_API=%s") && script.contains("/etc/bazel.bazelrc"), "{script}");
+    assert!(script.find("$f wrap /home/runner/externals").unwrap() < script.find("cd /home/runner && ").unwrap());
     let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
     let program = run(get(&format!("/cache/{link}/program")));
     let to = program.header("location").unwrap();
@@ -3573,4 +3580,76 @@ fn a_cache_turned_off_leaves_jobs_to_githubs() {
     block_on(plane.handle(webhook("queued", None)));
     let launch = launches(&http.clouds).pop().expect("a machine");
     assert!(!String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap().contains("superci-cache"));
+}
+
+#[test]
+fn turbo_nx_and_bazel_keep_their_artifacts_by_the_branch_github_said_the_job_is_for() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithCache { clouds: FakeClouds::default(), keys: serde_json::json!({ "keys": [] }) };
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    // The machine link of each job's machine (the last one started).
+    let link_of = |r: Request| {
+        run(r);
+        let script = String::from_utf8(STANDARD.decode(field(&launches(&http.clouds).pop().unwrap(), "UserData")).unwrap()).unwrap();
+        assert!(script.contains("TURBO_API=%s") && script.contains("NX_SELF_HOSTED_REMOTE_CACHE_SERVER=%s") && script.contains("build --remote_cache=$u/bazel"));
+        script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string()
+    };
+    let (main, feature) = (link_of(on_branch(7, "main")), link_of(on_branch(8, "feature")));
+    let call = |link: &str, what: &str, body: serde_json::Value| { let r = run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/{what}")).with_body(body.to_string())); (r.status, json(&r)) };
+    // main keeps turbo's artifact for a hash, with what turbo keeps beside it.
+    let (status, begun) = call(&main, "tool-begin", serde_json::json!({ "tool": "turbo", "hash": "8eccf22c040ebab6" }));
+    assert_eq!(status, 200);
+    assert!(begun["url"].as_str().unwrap().contains("/c/gh77/") && begun["url"].as_str().unwrap().contains("/p00000?X-Amz-"));
+    assert_eq!(call(&main, "tool-finish", serde_json::json!({ "tool": "turbo", "hash": "8eccf22c040ebab6", "size": 300, "meta": "{\"duration\":\"12\"}" })).0, 200);
+    // The feature branch reads it (main's, after its own) with what was kept beside it.
+    let (_, hit) = call(&feature, "tool-get", serde_json::json!({ "tool": "turbo", "hash": "8eccf22c040ebab6" }));
+    assert_eq!((hit["hit"].as_bool(), hit["size"].as_u64(), hit["meta"].as_str()), (Some(true), Some(300), Some("{\"duration\":\"12\"}")));
+    // What the feature branch keeps is its own: main does not see it, so a branch cannot put an artifact where main reads.
+    call(&feature, "tool-begin", serde_json::json!({ "tool": "bazelac", "hash": "aa11" }));
+    call(&feature, "tool-finish", serde_json::json!({ "tool": "bazelac", "hash": "aa11", "size": 5 }));
+    assert_eq!(call(&feature, "tool-get", serde_json::json!({ "tool": "bazelac", "hash": "aa11" })).1["hit"], true);
+    assert_eq!(call(&main, "tool-get", serde_json::json!({ "tool": "bazelac", "hash": "aa11" })).1["hit"], false);
+    assert!(store.0.borrow().contains_key("cache:gh77:refs/heads/feature:bazelac:aa11"));
+    // Each tool's own: Nx does not find Turbo's; an unknown tool is refused.
+    assert_eq!(call(&feature, "tool-get", serde_json::json!({ "tool": "nx", "hash": "8eccf22c040ebab6" })).1["hit"], false);
+    assert_eq!(call(&feature, "tool-get", serde_json::json!({ "tool": "make", "hash": "x" })).0, 400);
+}
+
+#[test]
+fn a_gitlab_jobs_cache_is_its_projects_by_the_branch_gitlab_said_once_the_job_began() {
+    let program = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/{}", superci_core::cache::program_key("x86_64"));
+    let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| (r.method == "HEAD" && r.url == program).then(|| Response::new(200, "application/octet-stream", "")));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let secret = "hook-secret-0123456789";
+    run(gitlab_event(1977, "pending", secret));
+    // GitLab's runner keeps its cache in "S3" at superci-cache on the machine.
+    let script = user_data_of(&launches(&clouds.0)[0]);
+    assert!(script.contains("CACHE_TYPE=s3 CACHE_SHARED=true") && script.contains("CACHE_S3_SERVER_ADDRESS=$i:8257") && script.find("CACHE_TYPE=s3").unwrap() < script.find("export GL_URL=").unwrap(), "{script}");
+    let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let call = |what: &str, body: serde_json::Value| { let r = run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/{what}")).with_body(body.to_string())); (r.status, json(&r)) };
+    let key = "gl/project/380/default-non_protected/cache.zip";
+    // Before its job began, nothing (which job the runner takes is GitLab's to say).
+    assert_eq!(call("tool-begin", serde_json::json!({ "tool": "gitlab", "hash": key })).0, 403);
+    let mut began = serde_json::json!({ "object_kind": "build", "build_id": 1977, "build_name": "test", "build_status": "running", "pipeline_id": 2366, "project_id": 380, "ref": "feature", "tag": false,
+        "project": { "id": 380, "path_with_namespace": "acme/app", "default_branch": "main" }, "runner": { "id": 55 } });
+    run(Request::new("POST", &format!("{PLANE_URL}/gitlab/webhook")).with_header("x-gitlab-token", secret).with_header("x-gitlab-event", "Job Hook").with_body(began.to_string()));
+    let (status, begun) = call("tool-begin", serde_json::json!({ "tool": "gitlab", "hash": key }));
+    assert_eq!(status, 200, "{begun}");
+    let (status, more) = call("tool-sign", serde_json::json!({ "tool": "gitlab", "hash": key, "names": ["p00001"] }));
+    assert!(status == 200 && more["urls"][0].as_str().unwrap().contains("/p00001?"));
+    assert_eq!(call("tool-finish", serde_json::json!({ "tool": "gitlab", "hash": key, "pieces": [["p00000", 64], ["p00001", 6]] })).1["size"], 70);
+    let ns = superci_core::cache::gitlab_ns("", 380);
+    assert!(store.0.borrow().contains_key(&format!("cache:{ns}:refs/heads/feature:gitlab:{key}")), "the feature branch's, in its project's");
+    assert_eq!(call("tool-get", serde_json::json!({ "tool": "gitlab", "hash": key })).1["pieces"].as_array().unwrap().len(), 2);
+    assert_eq!(store.0.borrow().get(&format!("cachename:{ns}")).map(String::as_str), Some("acme/app"), "listed by the project's path");
+    let _ = &mut began;
 }

@@ -559,6 +559,15 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let said = format!("{} {}", res.status, res.body_text());
             Ok(Done { data: json!({ "answer": said }), said: vec![said] })
         }
+        // (One call to Cloudflare's API with this workspace's sign-in: `superci debug cloudflare METHOD PATH [FILE]`.)
+        #[cfg(debug_assertions)]
+        ("debug", "cloudflare") => {
+            let mut d = signed_in();
+            let cf = d.cf.as_mut().ok_or("Sign in with Cloudflare first.")?.client()?;
+            let body = if w(4).is_empty() { None } else { Some(std::fs::read(w(4)).map_err(|e| format!("{}: {e}", w(4)))?) };
+            let got = cf.debug_call(w(2), w(3), body)?;
+            Ok(Done { said: vec![got.to_string()], data: got })
+        }
         // (GitHub's runner taking one job from SuperCI's own service, run here: `superci debug runner-service FILE JOB
         // ROOT PORT JITFILE [--secret=N=V] [--var=N=V]`, ROOT being where the runner's calls go, e.g. http://localhost:8080/runner/rig.)
         #[cfg(debug_assertions)]

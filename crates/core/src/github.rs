@@ -350,6 +350,10 @@ pub struct JobEvent {
     pub spec: std::result::Result<Spec, String>,
     /// A public repository (or GitHub did not say it is private): anyone can open a pull request that runs code.
     pub public: bool,
+    /// GitHub's id of its repository, the branch it runs for, and the repository's default branch (for the cache).
+    pub repo_id: Option<u64>,
+    pub branch: Option<String>,
+    pub default_branch: Option<String>,
 }
 
 /// A `workflow_job` event this control plane should act on: in a repository of the App's owner, labelled with the control
@@ -384,6 +388,9 @@ pub fn our_job_among(payload: &serde_json::Value, bases: &[String], owner_login:
         label,
         spec,
         public: payload["repository"]["private"] != true,
+        repo_id: payload["repository"]["id"].as_u64(),
+        branch: job["head_branch"].as_str().map(str::to_string),
+        default_branch: payload["repository"]["default_branch"].as_str().map(str::to_string),
     })
 }
 

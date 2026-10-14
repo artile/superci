@@ -59,7 +59,7 @@ pub const MOST_PIECES: usize = 2000;
 /// The bucket for a control plane's cache in a region.
 pub fn bucket(plane_id: &str, region: &str) -> String { format!("superci-plane-{plane_id}-{region}") }
 
-/// Where `superci-cache` for an architecture (`x86_64`, `aarch64`) of this version is in each bucket.
+/// Where `superci-cache` for an architecture (`x86_64`, `aarch64`, `x86_64-windows`) of this version is in each bucket.
 pub fn program_key(arch: &str) -> String { format!("superci/cache-{}-{arch}", crate::plane::VERSION) }
 
 /// One scope: a branch's caches (GitHub's `refs/heads/main`, `refs/pull/5/merge`), and whether the job may write there.
@@ -131,6 +131,8 @@ pub struct Entry {
     pub made: u64,
     #[serde(default)] pub used: u64,
     #[serde(default)] pub done: bool,
+    /// What a tool kept beside its artifact (Turbo: its signature and how long the task took), given back with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub meta: Option<String>,
 }
 
 impl Entry {
@@ -217,13 +219,17 @@ pub async fn begun(store: &dyn Store, access: &Access, key: &str, version: &str)
 pub fn piece_name(name: &str) -> bool { !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') }
 
 /// Finishes an entry being saved: its pieces, in order. From now on it is a hit.
-pub async fn finish(store: &dyn Store, at: &str, entry: &Entry, pieces: Vec<(String, u64)>) -> Result<Entry> {
+pub async fn finish(store: &dyn Store, at: &str, entry: &Entry, pieces: Vec<(String, u64)>) -> Result<Entry> { finish_with(store, at, entry, pieces, None).await }
+
+/// The same, with what a tool keeps beside it.
+pub async fn finish_with(store: &dyn Store, at: &str, entry: &Entry, pieces: Vec<(String, u64)>, meta: Option<String>) -> Result<Entry> {
     if pieces.is_empty() || pieces.len() > MOST_PIECES || !pieces.iter().all(|(n, _)| piece_name(n)) { return Err("pieces SuperCI does not keep".into()) }
     let was = serde_json::to_string(entry).map_err(|e| e.to_string())?;
     let mut e = entry.clone();
     e.size = pieces.iter().map(|(_, s)| s).sum();
     e.pieces = pieces;
     e.done = true;
+    e.meta = meta.filter(|m| m.len() <= 2048);
     if !store.swap(at, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?).await? { return Err("the entry changed while it was saved".into()) }
     Ok(e)
 }
@@ -327,9 +333,31 @@ pub async fn artifacts(store: &dyn Store, run: &str) -> Result<Vec<(String, Entr
 /// An artifact's number, as GitHub numbers them (from its entry: the same each time it is asked).
 pub fn artifact_id(e: &Entry) -> u64 { u64::from_str_radix(&crate::crypto::sha256_hex(e.id.as_bytes())[..12], 16).unwrap_or(1) }
 
-/// A machine's link to the cache: the region it runs in, and until when the link works (its longest job).
+/// A machine's link to the cache: the region it runs in, its runner's name (which job it is on, as the control plane
+/// knows it), and until when the link works (its longest job).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Machine { pub region: String, pub arch: String, pub until: u64 }
+pub struct Machine { pub region: String, pub arch: String, pub until: u64, #[serde(default)] pub runner: String }
+
+/// What a job may do in the cache when it asks without a token of GitHub's (the tools on its machine: Turbo, Nx,
+/// Bazel), from what GitHub said of the job: its repository's entries, its branch's to write and read, then the
+/// default branch's to read. A push to the default branch writes the default branch's; a pull request's branch only
+/// its own (as GitHub's own token has it).
+pub fn branch_access(repo_id: u64, branch: &str, default_branch: &str) -> Option<Access> {
+    if branch.is_empty() { return None }
+    ref_access(&format!("gh{repo_id}"), &format!("refs/heads/{branch}"), default_branch)
+}
+
+/// The same for any repository's entries: `git_ref` (a full ref) to write and read, then the default branch's to read.
+pub fn ref_access(ns: &str, git_ref: &str, default_branch: &str) -> Option<Access> {
+    if !plain(git_ref) || git_ref.ends_with('/') { return None }
+    let mut scopes = vec![Scope { name: git_ref.to_string(), write: true }];
+    let default = format!("refs/heads/{default_branch}");
+    if !default_branch.is_empty() && default != git_ref && plain(&default) { scopes.push(Scope { name: default, write: false }) }
+    Some(Access { ns: ns.to_string(), scopes, run: None })
+}
+
+/// A GitLab project's entries: by its connection (a GitLab of its own) and the project's id there.
+pub fn gitlab_ns(connection: &str, project: u64) -> String { format!("gl{}x{project}", &crate::crypto::sha256_hex(connection.as_bytes())[..8]) }
 
 pub async fn machine(store: &dyn Store, token: &str, now: u64) -> Result<Option<Machine>> {
     if token.len() < 16 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Ok(None) }

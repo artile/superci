@@ -217,8 +217,8 @@ pub fn give_runner_role(creds: &Credentials, account_id: &str, plane_id: &str, r
     make_networks(creds, plane_id, regions)
 }
 
-/// `superci-cache` for AWS machines (Linux), by architecture, put in each region's cache bucket.
-const CACHE_PROGRAMS: [(&str, &[u8]); 2] = [("x86_64", include_bytes!(env!("SUPERCI_CACHE_X86_64"))), ("aarch64", include_bytes!(env!("SUPERCI_CACHE_AARCH64")))];
+/// `superci-cache` for AWS machines (Linux by architecture, and Windows), put in each region's cache bucket.
+const CACHE_PROGRAMS: [(&str, &[u8]); 3] = [("x86_64", include_bytes!(env!("SUPERCI_CACHE_X86_64"))), ("aarch64", include_bytes!(env!("SUPERCI_CACHE_AARCH64"))), ("x86_64-windows", include_bytes!(env!("SUPERCI_CACHE_WINDOWS")))];
 
 /// The control plane's own network in each region (`aws::make_network`), the regions at once, and its cache bucket
 /// there with this version's `superci-cache` (see `superci_core::cache`). Without the bucket (an account that may

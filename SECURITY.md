@@ -57,6 +57,10 @@ Supported: the latest release. Control planes are updated from the dashboard (Co
   in it: its repository's entries, in the scopes GitHub lists (a pull request writes only its own). A job can't read
   another repository's cache, or write another branch's. A job runs as root on its machine, so it can use its own
   token as `superci-cache` does: that gives it what GitHub's cache would give it, and nothing more.
+  Turbo, Nx, Bazel and GitLab's runner reach `superci-cache` with no token of GitHub's; for them the control plane
+  goes by the job it knows is on that machine (from GitHub's or GitLab's own events about it): its repository's
+  entries, its branch's to write and the default branch's to read. A GitLab machine may write nothing until GitLab
+  has said which job its runner took.
   The control plane's role may read, write and remove objects in its own buckets only, and makes no bucket; the
   dashboard makes each bucket (private, as AWS makes every new one) with your sign-in and removes it, with all it
   holds, when the control plane is deleted.

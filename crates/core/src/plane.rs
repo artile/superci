@@ -311,6 +311,11 @@ pub struct Job {
     /// How often the record was written: one more at each write (see `ControlPlane::keep`). A copy whose count is
     /// not the kept record's was read before another request wrote it.
     #[serde(default, skip_serializing_if = "unwritten")] pub rev: std::cell::Cell<u64>,
+    /// GitHub's id of its repository, the branch it runs for, and the repository's default branch: what the cache
+    /// lets the tools on its machine that have no GitHub token of their own (Turbo, Nx, Bazel) read and write.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub repo_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub default_branch: Option<String>,
 }
 
 fn unwritten(rev: &std::cell::Cell<u64>) -> bool { rev.get() == 0 }
@@ -1436,6 +1441,12 @@ impl<'a> ControlPlane<'a> {
                     // The runner that took it takes no other (a job that read its token gets nothing more with it).
                     let Some((r, _)) = made_for else { return Ok(Response::text(200, "not on a runner of ours")) };
                     let _ = gitlab::pause_runner(self.http, gl, r).await;
+                    // What the job on the runner's machine runs for, for the cache there (see `machine_access`).
+                    let at = format!("glrunner:{}", gitlab::local(&gl.id, r));
+                    if let Some(mut v) = get_json::<serde_json::Value>(self.store, &at).await? {
+                        v["running"] = serde_json::json!({ "job": ev.job_id, "project_id": ev.project_id, "project": ev.project, "ref": ev.git_ref, "tag": ev.tag, "default_branch": ev.default_branch });
+                        put_json(self.store, &at, &v).await?;
+                    }
                     if let Some(mut j) = get_json::<Job>(self.store, &machine_key).await? {
                         // Another job than the runner's own: this job's machine, still coming, is for the runner's
                         // job now (or for whichever job the runner's machine was for).
@@ -1864,7 +1875,8 @@ impl<'a> ControlPlane<'a> {
     async fn launch(&self, plane_url: &str, ev: &github::JobEvent, app: &App) -> Result<()> {
         let key = format!("job:{}", ev.job_id);
         let mut job = Job { job_id: ev.job_id, run_id: ev.run_id, repo: ev.repo.clone(), state: "launching".into(), at_ms: self.clock.now_ms(), installation_id: ev.installation_id, label: ev.label.clone(),
-            name: ev.name.clone(), workflow: ev.workflow.clone(), app_id: Some(app.id), attempt: Some(ev.attempt).filter(|a| *a > 0), queued_ms: ev.created_ms, ..Default::default() };
+            name: ev.name.clone(), workflow: ev.workflow.clone(), app_id: Some(app.id), attempt: Some(ev.attempt).filter(|a| *a > 0), queued_ms: ev.created_ms,
+            repo_id: ev.repo_id, branch: ev.branch.clone(), default_branch: ev.default_branch.clone(), ..Default::default() };
         // Claimed once, however many deliveries of the event arrive at once. A claim that never got past launching (the
         // runtime restarted mid-way) is taken over by a later delivery.
         if !self.store.put_if_absent(&key, serde_json::to_string(&job).map_err(|e| e.to_string())?).await? {
@@ -2128,7 +2140,9 @@ impl<'a> ControlPlane<'a> {
                             // this role lately could not.
                             let fleet = !on_demand && !self.store.get(NO_FLEET_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000);
                             // GitHub's cache, kept in this region's bucket, for a Linux machine of a GitHub job.
-                            let user_data = if spec.os() == "linux" && !gitlab { self.with_cache(user_data.clone(), region, spec.arch(), &creds, plane_url, now).await } else { user_data.clone() };
+                            // (A GitLab job's machine is known by its runner's id: the job that runner takes is its own.)
+                            let cache_runner = if gitlab { format!("gl:{}", gitlab::local(&job.gitlab, job.runner_id.unwrap_or_default())) } else { name.clone() };
+                            let user_data = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), &creds, plane_url, &cache_runner, now).await;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
                                 clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet };
                             let mut told = aws::Told::default();
@@ -2985,7 +2999,7 @@ impl<'a> ControlPlane<'a> {
                 let conclusion = match result.as_str() { "succeeded" => "success", "failed" => "failure", "canceled" | "cancelled" => "cancelled", other => other }.to_string();
                 if let Some(job) = get_json::<Job>(self.store, &format!("job:{}", after.job_id)).await? {
                     let ev = github::JobEvent { action: "completed".into(), job_id: job.job_id, run_id: job.run_id, attempt: 1, created_ms: job.queued_ms, repo: job.repo.clone(), installation_id: 0,
-                        runner_name: Some(after.runner.clone()), conclusion: Some(conclusion), name: job.name.clone(), workflow: job.workflow.clone(), label: job.label.clone(), spec: Ok(Spec::default()), public: false };
+                        runner_name: Some(after.runner.clone()), conclusion: Some(conclusion), name: job.name.clone(), workflow: job.workflow.clone(), label: job.label.clone(), spec: Ok(Spec::default()), public: false, repo_id: None, branch: None, default_branch: None };
                     self.completed(plane_url, &ev).await?;
                     // (The run it is a job of moves on: the jobs that needed it may start.)
                     if let Err(e) = self.advance_run(plane_url, job.run_id).await { let _ = self.store.put(&format!("run-error:{}", job.run_id), e).await; }
@@ -3390,14 +3404,43 @@ impl<'a> ControlPlane<'a> {
 
     /// A machine's start-up script with `superci-cache` in it, when its region's bucket is ready, with the machine's
     /// own link to this control plane (until its longest job ends; its `program` sends it on to the bucket).
-    async fn with_cache(&self, user_data: String, region: &str, arch: &str, creds: &Credentials, plane_url: &str, now: u64) -> String {
-        let arch = if arch == "arm64" { "aarch64" } else { "x86_64" };
+    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, creds: &Credentials, plane_url: &str, runner: &str, now: u64) -> String {
+        // Which build of the program: by architecture, and Windows' of its own.
+        let arch = match (os, arch) { ("windows", _) => "x86_64-windows", (_, "arm64") => "aarch64", _ => "x86_64" };
+        if !["linux", "windows"].contains(&os) { return user_data }
         // (Turned off in the dashboard: jobs use GitHub's cache.)
         if self.config.routing.cache.off || !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return user_data }
         let token = crate::crypto::random_token(18);
         let until = now + (self.machine_minutes("aws") as u64 + 30) * 60_000;
-        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until }).await.is_err() { return user_data }
-        aws::with_cache(user_data.clone(), &format!("{plane_url}/cache/{token}")).unwrap_or(user_data)
+        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string() }).await.is_err() { return user_data }
+        let link = format!("{plane_url}/cache/{token}");
+        if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data)
+    }
+
+    /// What the job on a machine may do in the cache, asked without a token (see `cache::branch_access`): a GitHub
+    /// job's, by what GitHub said of it; a run from a computer's, as its token would say it.
+    async fn machine_access(&self, machine: &cache::Machine) -> Result<cache::Access> {
+        // A GitLab machine: the job its runner took, as GitLab said when it began (none yet: nothing to write).
+        if let Some(local) = machine.runner.strip_prefix("gl:") {
+            let runner = get_json::<serde_json::Value>(self.store, &format!("glrunner:{local}")).await?.ok_or("its runner is not kept")?;
+            let r = &runner["running"];
+            let (Some(project), Some(git_ref)) = (r["project_id"].as_u64(), r["ref"].as_str()) else { return Err("its job has not begun".into()) };
+            let connection = runner["gitlab"].as_str().unwrap_or_default();
+            let ns = cache::gitlab_ns(connection, project);
+            if let Some(path) = r["project"].as_str().filter(|p| !p.is_empty()) { let _ = self.store.put_if_absent(&format!("cachename:{ns}"), path.to_string()).await; }
+            return cache::ref_access(&ns, &if r["tag"] == true { format!("refs/tags/{git_ref}") } else { format!("refs/heads/{git_ref}") }, r["default_branch"].as_str().unwrap_or_default())
+                .ok_or_else(|| "a branch SuperCI does not keep".to_string())
+        }
+        let job = self.by_runner(Some(&machine.runner)).await?.ok_or("no job on this machine")?;
+        if job.provider == "local" {
+            let run = get_json::<serde_json::Value>(self.store, &format!("run:{}", job.run_id)).await?.ok_or("its run is not kept")?;
+            let who = run["by"].as_str().filter(|b| !b.is_empty() && b.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))).unwrap_or("computer");
+            let claims = cache::local_claims(run["cache"]["ns"].as_str().unwrap_or_default(), who, run["ref"].as_str().unwrap_or("refs/heads/main"), run["cache"]["default_branch"].as_str().unwrap_or("main"), &job.run_id.to_string(), &job.job_id.to_string());
+            return cache::local_access(&claims)
+        }
+        if !job.provider.is_empty() { return Err("not a GitHub job".into()) }
+        let (Some(repo), Some(branch)) = (job.repo_id, job.branch.as_deref()) else { return Err("GitHub did not say the job's repository and branch".into()) };
+        cache::branch_access(repo, branch, job.default_branch.as_deref().unwrap_or_default()).ok_or_else(|| "a branch SuperCI does not keep".to_string())
     }
 
     /// GitHub's keys for its jobs' tokens: kept a day, and fetched again for a key not among them (once a minute at most).
@@ -3455,7 +3498,10 @@ impl<'a> ControlPlane<'a> {
         let Some(machine) = cache::machine(self.store, token, now).await? else { return Ok(nothing_here()) };
         let body: serde_json::Value = serde_json::from_slice(&req.body).map_err(|e| format!("not JSON: {e}"))?;
         let refuse = |why: &str| Ok(Response::json(&serde_json::json!({ "ok": false, "why": why })).with_status(403));
-        let access = match self.cache_access(body["token"].as_str().unwrap_or_default(), plane_url, now).await { Ok(a) => a, Err(e) => return refuse(&e) };
+        // The tools on the machine with no token of GitHub's (Turbo, Nx, Bazel): what the job on it may (see
+        // `machine_access`); everything else, with the job's own token.
+        let access = if what.starts_with("tool-") { self.machine_access(&machine).await } else { self.cache_access(body["token"].as_str().unwrap_or_default(), plane_url, now).await };
+        let access = match access { Ok(a) => a, Err(e) => return refuse(&e) };
         let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return refuse("this control plane has no AWS account") };
         let creds = self.aws_creds(plane_url, &a).await?;
         let (key, version) = (body["key"].as_str().unwrap_or_default(), body["version"].as_str().unwrap_or_default());
@@ -3488,6 +3534,43 @@ impl<'a> ControlPlane<'a> {
                 let pieces: Vec<(String, u64)> = body["pieces"].as_array().into_iter().flatten().filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_u64()?))).collect();
                 let done = cache::finish(self.store, &at, &entry, pieces).await?;
                 Ok(Response::json(&serde_json::json!({ "ok": true, "size": done.size })))
+            }
+            // A tool's artifact (Turbo's, Nx's, Bazel's): one piece, under its hash, kept as a cache entry of its kind.
+            "tool-get" | "tool-begin" | "tool-sign" | "tool-finish" => {
+                let tool = body["tool"].as_str().unwrap_or_default();
+                if !["turbo", "nx", "bazelac", "bazelcas", "gitlab"].contains(&tool) { return Ok(Response::json(&serde_json::json!({ "ok": false, "why": "not a tool SuperCI keeps" })).with_status(400)) }
+                let hash = body["hash"].as_str().unwrap_or_default();
+                match what {
+                    "tool-get" => {
+                        let Ok(Some(hit)) = cache::lookup(self.store, &access, hash, &[], tool, now).await else { return Ok(Response::json(&serde_json::json!({ "hit": false }))) };
+                        let _ = cache::used(self.store, &hit, now).await;
+                        let prefix = hit.entry.prefix(&access.ns);
+                        let pieces = hit.entry.pieces.iter().map(|(p, size)| Ok(serde_json::json!({ "url": link("GET", &hit.entry.region, &format!("{prefix}/{p}"))?, "size": size }))).collect::<Result<Vec<_>>>()?;
+                        Ok(Response::json(&serde_json::json!({ "hit": true, "size": hit.entry.size, "pieces": pieces, "meta": hit.entry.meta })))
+                    }
+                    "tool-begin" => match cache::begin(self.store, &access, hash, tool, &machine.region, now).await {
+                        Ok((_, entry)) => Ok(Response::json(&serde_json::json!({ "ok": true, "url": link("PUT", &entry.region, &format!("{}/p00000", entry.prefix(&access.ns)))? }))),
+                        Err(cache::Refused::Exists) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": "exists" })).with_status(409)),
+                        Err(cache::Refused::NoWrite) => refuse("this job may only read the cache"),
+                        Err(cache::Refused::Bad(e)) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": e })).with_status(400)),
+                    },
+                    _ => {
+                        let Some((at, entry)) = cache::begun(self.store, &access, hash, tool).await? else { return Ok(Response::json(&serde_json::json!({ "ok": false, "why": "no entry being saved" })).with_status(404)) };
+                        // More pieces of a large one.
+                        if what == "tool-sign" {
+                            let names: Vec<&str> = body["names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
+                            if names.is_empty() || names.len() > 64 || !names.iter().all(|n| cache::piece_name(n)) { return Ok(Response::json(&serde_json::json!({ "ok": false, "why": "piece names" })).with_status(400)) }
+                            let urls = names.iter().map(|n| link("PUT", &entry.region, &format!("{}/{n}", entry.prefix(&access.ns)))).collect::<Result<Vec<_>>>()?;
+                            return Ok(Response::json(&serde_json::json!({ "ok": true, "urls": urls })))
+                        }
+                        let pieces: Vec<(String, u64)> = match body["pieces"].as_array() {
+                            Some(list) => list.iter().filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_u64()?))).collect(),
+                            None => vec![("p00000".into(), body["size"].as_u64().unwrap_or(0))],
+                        };
+                        let done = cache::finish_with(self.store, &at, &entry, pieces, body["meta"].as_str().map(str::to_string)).await?;
+                        Ok(Response::json(&serde_json::json!({ "ok": true, "size": done.size })))
+                    }
+                }
             }
             // A run from a computer's artifacts (a job of GitHub's keeps them at GitHub).
             "artifact-begin" | "artifact-sign" | "artifact-finish" | "artifacts" | "artifact-get" | "artifact-delete" => {
@@ -3579,7 +3662,7 @@ impl<'a> ControlPlane<'a> {
     async fn caches_delete(&self, req: &Request, plane_url: &str) -> Result<Response> {
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
         let repo = body["repo"].as_str().unwrap_or_default();
-        let ns = if repo.starts_with("gh") || repo.starts_with("local-") { repo.to_string() } else {
+        let ns = if repo.starts_with("gh") || repo.starts_with("gl") || repo.starts_with("local-") { repo.to_string() } else {
             let mut found = None;
             for l in cache::list(self.store, None).await? { if self.cache_repo_name(&l.ns).await.is_some_and(|n| n.eq_ignore_ascii_case(repo)) { found = Some(l.ns); break } }
             match found { Some(n) => n, None => return Ok(Response::json(&serde_json::json!({ "removed": 0 }))) }

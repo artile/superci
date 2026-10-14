@@ -35,14 +35,24 @@ const SERVICE: &str = "twirp/github.actions.results.api.v1.CacheService/";
 const ARTIFACTS: &str = "twirp/github.actions.results.api.v1.ArtifactService/";
 /// GitHub's results service (its cache, artifacts), where what is not this cache goes.
 const GITHUB: &str = "https://results-receiver.actions.githubusercontent.com";
+/// Where it listens, on the machine's private address: Turbo, Nx and Bazel are told of it before it starts.
+const PORT: u16 = 8257;
+/// What the tools are given as their token here: a request with another (a workflow's own, for Vercel's remote cache)
+/// goes on to where that token is for.
+const TOOL_TOKEN: &str = "superci";
+/// Vercel's API, where Turbo's requests with a token of Vercel's go.
+const VERCEL: &str = "https://vercel.com/api";
+
 /// Where the address is written, in the runner's externals folder (a job's containers see it at /__e).
 const ADDRESS: &str = "superci-cache.address";
 /// Parts of a download fetched at a time, and their size.
 const CHUNK: u64 = 16 << 20;
+/// A large upload (a tool's, GitLab's) goes to the bucket in pieces of this.
+const PIECE: u64 = 64 << 20;
 
 fn main() {
     let given: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if given.first().and_then(|a| Path::new(a).file_name()).is_some_and(|n| n == "node") { node(given) }
+    if given.first().and_then(|a| Path::new(a).file_stem()).is_some_and(|n| n == "node") { node(given) }
     let args: Vec<String> = std::env::args().collect();
     let done = match (args.get(1).map(String::as_str), args.get(2)) {
         (Some("wrap"), Some(dir)) => wrap(Path::new(dir)),
@@ -52,47 +62,57 @@ fn main() {
     if let Err(e) = done { eprintln!("superci-cache: {e}"); std::process::exit(1) }
 }
 
+/// The real Node's name beside this program, once `wrap` put it there.
+const REAL: &str = if cfg!(windows) { "node.real.exe" } else { "node.real" };
+const NODE: &str = if cfg!(windows) { "node.exe" } else { "node" };
+
 /// Run as the runner's `node`: the real one, with the action's results service here when this program is up (and
-/// not here already: a Node an action started itself).
+/// not here already: a Node an action started itself). On Linux it becomes the real Node; on Windows, which has no
+/// such thing, it runs it and ends as it ends.
 fn node(given: Vec<std::ffi::OsString>) -> ! {
-    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().unwrap_or_default();
     let dir = exe.parent().unwrap_or(Path::new("."));
-    let mut real = std::process::Command::new(dir.join("node.real"));
-    real.arg0(&given[0]).args(&given[1..]);
+    let mut real = std::process::Command::new(dir.join(REAL));
+    #[cfg(unix)] { use std::os::unix::process::CommandExt; real.arg0(&given[0]); }
+    real.args(&given[1..]);
     let here = std::fs::read_to_string(dir.join("../..").join(ADDRESS)).unwrap_or_default();
     let here = here.trim();
     if let Ok(results) = std::env::var("ACTIONS_RESULTS_URL") {
         if !here.is_empty() && results.starts_with("http") && !results.starts_with(here) { real.env("ACTIONS_RESULTS_URL", format!("{here}/")); }
     }
-    let e = real.exec();
-    eprintln!("superci-cache: {}: {e}", dir.join("node.real").display());
+    #[cfg(unix)] let e = { use std::os::unix::process::CommandExt; real.exec() };
+    #[cfg(not(unix))] let e = match real.status() { Ok(s) => std::process::exit(s.code().unwrap_or(1)), Err(e) => e };
+    eprintln!("superci-cache: {}: {e}", dir.join(REAL).display());
     std::process::exit(127)
 }
 
 /// Puts this program in front of each of the runner's Nodes (again: only this program is put there anew).
 fn wrap(externals: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut wrapped = 0;
     for dir in std::fs::read_dir(externals).map_err(|e| format!("{}: {e}", externals.display()))?.flatten() {
         if !dir.file_name().to_string_lossy().starts_with("node") { continue }
-        let (node, real) = (dir.path().join("bin/node"), dir.path().join("bin/node.real"));
+        let (node, real) = (dir.path().join("bin").join(NODE), dir.path().join("bin").join(REAL));
         if !real.exists() {
             if !node.is_file() { continue }
             std::fs::rename(&node, &real).map_err(|e| format!("{}: {e}", node.display()))?;
         }
-        let next = dir.path().join("bin/.node.superci");
-        std::fs::copy(&me, &next).and_then(|_| std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755))).and_then(|_| std::fs::rename(&next, &node)).map_err(|e| format!("{}: {e}", node.display()))?;
+        let next = dir.path().join("bin").join(".node.superci");
+        std::fs::copy(&me, &next).and_then(|_| executable(&next)).and_then(|_| std::fs::rename(&next, &node)).map_err(|e| format!("{}: {e}", node.display()))?;
         wrapped += 1;
     }
     if wrapped == 0 { return Err(format!("no Node in {}", externals.display())) }
     Ok(())
 }
 
+#[cfg(unix)]
+fn executable(path: &Path) -> std::io::Result<()> { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) }
+#[cfg(not(unix))]
+fn executable(_: &Path) -> std::io::Result<()> { Ok(()) }
+
 /// The machine's private address (what its network gives it; containers on it reach it there).
 fn private_ip() -> Result<IpAddr, String> {
-    if let Ok(given) = std::env::var("SUPERCI_CACHE_LISTEN") { return given.parse().map_err(|e| format!("SUPERCI_CACHE_LISTEN: {e}")) }
+    if let Some(given) = std::env::var("SUPERCI_CACHE_LISTEN").ok().filter(|g| !g.is_empty()) { return given.parse().map_err(|e| format!("SUPERCI_CACHE_LISTEN: {e}")) }
     let s = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     s.connect("169.254.169.254:80").map_err(|e| e.to_string())?;
     Ok(s.local_addr().map_err(|e| e.to_string())?.ip())
@@ -100,7 +120,7 @@ fn private_ip() -> Result<IpAddr, String> {
 
 fn random_hex(n: usize) -> Result<String, String> {
     let mut b = vec![0u8; n];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|e| e.to_string())?;
+    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
     Ok(hex(&b))
 }
 
@@ -123,7 +143,9 @@ fn unpercent(s: &str) -> String {
 fn serve(externals: &Path) -> Result<(), String> {
     let plane = std::env::var("SUPERCI_CACHE_PLANE").map_err(|_| "SUPERCI_CACHE_PLANE is not set")?;
     let ip = private_ip()?;
-    let listener = std::net::TcpListener::bind((ip, 0)).map_err(|e| e.to_string())?;
+    // The port the tools are told of (see the machine's start-up script), else any.
+    let port: u16 = std::env::var("SUPERCI_CACHE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(PORT);
+    let listener = std::net::TcpListener::bind((ip, port)).or_else(|_| std::net::TcpListener::bind((ip, 0))).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
     let base = format!("http://{host}:{port}");
@@ -135,7 +157,7 @@ fn serve(externals: &Path) -> Result<(), String> {
     let (at, next) = (externals.join(ADDRESS), externals.join(format!(".{ADDRESS}")));
     std::fs::write(&next, &base).and_then(|_| std::fs::rename(&next, &at)).map_err(|e| format!("{}: {e}", at.display()))?;
     eprintln!("serving GitHub's cache at {host}:{port}");
-    http::serve(listener, move |req| state.handle(req));
+    http::serve(listener, move |req, body| state.handle(req, body));
     Ok(())
 }
 
@@ -198,10 +220,16 @@ fn mb(n: u64) -> String { format!("{:.0} MB", n as f64 / 1e6) }
 impl State {
     fn id(&self) -> String { format!("{}{}", self.ids.fetch_add(1, Ordering::Relaxed), random_hex(6).unwrap_or_default()) }
 
-    fn handle(self: &Arc<Self>, req: Request) -> Response {
+    fn handle(self: &Arc<Self>, req: Request, body: &mut dyn Read) -> Response {
         let url = req.target.trim_start_matches('/').to_string();
         let (path, query) = url.split_once('?').unwrap_or((&url, ""));
         if let Some(id) = path.strip_prefix("superci/d/") { return self.download(&req, id) }
+        // The tools' own remote caches.
+        if path == "v8/artifacts" || path.starts_with("v8/artifacts/") { return self.turbo(&req, path, query).unwrap_or_else(|e| { eprintln!("turbo: {e}"); empty(500) }) }
+        if let Some(hash) = path.strip_prefix("v1/cache/") { return self.nx(&req, hash) }
+        if let Some(rest) = path.strip_prefix("bazel/") { return self.bazel(&req, rest, body) }
+        // GitLab's runner's cache: "S3" here, path-style, in the bucket `superci` (see the machine's start-up script).
+        if let Some(key) = path.strip_prefix("superci/") { return self.gitlab(&req, key, body) }
         let blob = path.strip_prefix("superci/u/");
         let reply = match blob { Some(id) => self.upload(&req, id, query), None => self.results(&req, &url) };
         let reply = reply.unwrap_or_else(|e| { eprintln!("{e}"); Response::bytes(500, "text/plain", e.into_bytes()) });
@@ -370,6 +398,145 @@ impl State {
                 Err((s, why)) => twirp(s.max(400), "internal", &why),
             },
             _ => twirp(501, "unimplemented", "not on SuperCI's machines yet"),
+        }
+    }
+
+    /// A tool's artifact by its hash: its pieces' links, its size and what was kept beside it; none when not kept
+    /// (or the control plane cannot be reached: a tool then does without).
+    fn tool_get(&self, tool: &str, hash: &str) -> Option<(Vec<(String, u64)>, u64, Value)> {
+        let (status, hit) = self.plane("tool-get", json!({ "tool": tool, "hash": hash })).ok()?;
+        if status != 200 || hit["hit"] != true { return None }
+        let pieces = hit["pieces"].as_array()?.iter().filter_map(|p| Some((p["url"].as_str()?.to_string(), p["size"].as_u64()?))).collect();
+        let meta = hit["meta"].as_str().and_then(|m| serde_json::from_str(m).ok()).unwrap_or(Value::Null);
+        Some((pieces, hit["size"].as_u64().unwrap_or(0), meta))
+    }
+
+    /// Keeps a tool's artifact under its hash: whether it is kept now (true), or was already (false).
+    fn tool_put(&self, tool: &str, hash: &str, body: &[u8], meta: Option<Value>) -> Result<bool, String> {
+        self.tool_put_from(tool, hash, &mut &body[..], body.len() as u64, meta)
+    }
+
+    /// The same from a reader of `length` bytes (a large one in pieces of `PIECE`, each to the bucket as it comes).
+    fn tool_put_from(&self, tool: &str, hash: &str, body: &mut dyn Read, length: u64, meta: Option<Value>) -> Result<bool, String> {
+        let (status, said) = self.plane("tool-begin", json!({ "tool": tool, "hash": hash }))?;
+        if status == 409 { return Ok(false) }
+        let mut links: std::collections::VecDeque<(String, String)> = Default::default();
+        links.push_back(("p00000".into(), said["url"].as_str().filter(|_| status == 200).ok_or_else(|| format!("{tool} {hash}: not taken ({status} {})", said["why"].as_str().unwrap_or_default()))?.to_string()));
+        let (mut pieces, mut left, mut next) = (vec![], length, 1u32);
+        loop {
+            let n = left.min(PIECE);
+            let mut chunk = vec![0u8; n as usize];
+            body.read_exact(&mut chunk).map_err(|e| format!("{tool} {hash}: {e}"))?;
+            if links.is_empty() {
+                let names: Vec<String> = (next..next + 32).map(|i| format!("p{i:05}")).collect();
+                next += 32;
+                let (status, said) = self.plane("tool-sign", json!({ "tool": tool, "hash": hash, "names": names }))?;
+                let urls: Vec<String> = said["urls"].as_array().into_iter().flatten().filter_map(|u| u.as_str().map(str::to_string)).collect();
+                if status != 200 || urls.len() != names.len() { return Err(format!("{tool} {hash}: no links ({status})")) }
+                links.extend(names.into_iter().zip(urls));
+            }
+            let (name, link) = links.pop_front().unwrap_or_default();
+            self.put(&link, &chunk)?;
+            pieces.push(json!([name, n]));
+            left -= n;
+            if left == 0 { break }
+        }
+        let (status, said) = self.plane("tool-finish", json!({ "tool": tool, "hash": hash, "pieces": pieces, "meta": meta.map(|m| m.to_string()) }))?;
+        if status != 200 { return Err(format!("{tool} {hash}: not finished ({status} {})", said["why"].as_str().unwrap_or_default())) }
+        Ok(true)
+    }
+
+    /// A tool's artifact given back (or only its size, to a `HEAD`), with what was kept beside it as headers.
+    fn tool_answer(&self, req: &Request, pieces: Vec<(String, u64)>, size: u64, headers: Vec<(String, String)>) -> Response {
+        let mut headers = headers;
+        headers.push(("content-type".into(), "application/octet-stream".into()));
+        if req.method == "HEAD" { return Response::stream(200, Box::new(std::io::empty()), size).with_headers(headers) }
+        Response::stream(200, Box::new(Parallel::start(self.agent.clone(), parts(&pieces, 0, size), self.workers)), size).with_headers(headers)
+    }
+
+    /// Turbo's remote cache (Vercel's `/v8/artifacts` API), with the token the machine gives it; with any other token
+    /// (a workflow's own, for Vercel), on to Vercel as it came.
+    fn turbo(&self, req: &Request, path: &str, query: &str) -> Result<Response, String> {
+        if req.header("authorization").map(|a| a.trim_start_matches("Bearer ").trim()) != Some(TOOL_TOKEN) {
+            let vercel = std::env::var("SUPERCI_CACHE_VERCEL").unwrap_or_else(|_| VERCEL.to_string());
+            return self.forward(req, &vercel, &if query.is_empty() { path.to_string() } else { format!("{path}?{query}") })
+        }
+        let hash = path.strip_prefix("v8/artifacts/").unwrap_or_default();
+        Ok(match (req.method.as_str(), hash) {
+            ("GET", "status") => json_reply(json!({ "status": "enabled" })),
+            ("POST", "events") => json_reply(json!({})),
+            // Which of these hashes are kept, and how large each is.
+            ("POST", "") => {
+                let asked: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let mut out = serde_json::Map::new();
+                for h in asked["hashes"].as_array().into_iter().flatten().filter_map(|h| h.as_str()).take(100) {
+                    out.insert(h.to_string(), match self.tool_get("turbo", h) { Some((_, size, meta)) => json!({ "size": size, "taskDurationMs": meta["duration"].as_str().and_then(|d| d.parse::<u64>().ok()).unwrap_or(0), "tag": meta["tag"] }), None => Value::Null });
+                }
+                json_reply(Value::Object(out))
+            }
+            ("GET" | "HEAD", h) if !h.is_empty() => match self.tool_get("turbo", h) {
+                Some((pieces, size, meta)) => {
+                    let mut headers = vec![];
+                    if let Some(d) = meta["duration"].as_str() { headers.push(("x-artifact-duration".to_string(), d.to_string())) }
+                    if let Some(t) = meta["tag"].as_str() { headers.push(("x-artifact-tag".to_string(), t.to_string())) }
+                    self.tool_answer(req, pieces, size, headers)
+                }
+                None => empty(404),
+            },
+            ("PUT", h) if !h.is_empty() => {
+                let mut meta = serde_json::Map::new();
+                if let Some(d) = req.header("x-artifact-duration") { meta.insert("duration".into(), d.into()); }
+                if let Some(t) = req.header("x-artifact-tag") { meta.insert("tag".into(), t.into()); }
+                self.tool_put("turbo", h, &req.body, Some(Value::Object(meta)))?;
+                Response::bytes(202, "application/json", json!({ "urls": [] }).to_string().into_bytes())
+            }
+            _ => empty(404),
+        })
+    }
+
+    /// Nx's self-hosted remote cache (`/v1/cache/{hash}`: a task's outputs as a tar).
+    fn nx(&self, req: &Request, hash: &str) -> Response {
+        match req.method.as_str() {
+            "GET" | "HEAD" => match self.tool_get("nx", hash) { Some((pieces, size, _)) => self.tool_answer(req, pieces, size, vec![]), None => empty(404) },
+            "PUT" => match self.tool_put("nx", hash, &req.body, None) {
+                Ok(true) => empty(200),
+                Ok(false) => Response::bytes(409, "text/plain", b"already kept".to_vec()),
+                Err(e) => { eprintln!("nx: {e}"); Response::bytes(500, "text/plain", e.into_bytes()) }
+            },
+            _ => empty(405),
+        }
+    }
+
+    /// GitLab's runner's cache, as S3 (it signs links to it with keys that are no secret; what a job may read and
+    /// write is the control plane's to say): `GET`, `HEAD` and `PUT` of an object, its key all after the bucket's name.
+    fn gitlab(&self, req: &Request, key: &str, body: &mut dyn Read) -> Response {
+        let key = unpercent(key);
+        match req.method.as_str() {
+            "GET" | "HEAD" => match self.tool_get("gitlab", &key) {
+                Some((pieces, size, _)) => self.tool_answer(req, pieces, size, vec![("etag".into(), format!("\"{}\"", size)), ("last-modified".into(), http_date(0))]),
+                None => Response::bytes(404, "application/xml", b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>".to_vec()),
+            },
+            "PUT" => {
+                let done = if req.streamed { self.tool_put_from("gitlab", &key, body, req.length, None) } else { self.tool_put("gitlab", &key, &req.body, None) };
+                match done {
+                    Ok(_) => { eprintln!("gitlab {key}: kept, {}", mb(req.length)); empty(200).with_headers(vec![("etag".into(), "\"superci\"".into())]) }
+                    Err(e) => { eprintln!("gitlab: {e}"); empty(500) }
+                }
+            }
+            _ => empty(405),
+        }
+    }
+
+    /// Bazel's HTTP remote cache: `ac/{hash}` (what an action made) and `cas/{hash}` (content by its hash), after any
+    /// instance name.
+    fn bazel(&self, req: &Request, rest: &str, body: &mut dyn Read) -> Response {
+        let mut parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+        let (Some(hash), Some(kind)) = (parts.pop(), parts.pop()) else { return empty(404) };
+        let tool = match kind { "ac" => "bazelac", "cas" => "bazelcas", _ => return empty(404) };
+        match req.method.as_str() {
+            "GET" | "HEAD" => match self.tool_get(tool, hash) { Some((pieces, size, _)) => self.tool_answer(req, pieces, size, vec![]), None => empty(404) },
+            "PUT" => match if req.streamed { self.tool_put_from(tool, hash, body, req.length, None) } else { self.tool_put(tool, hash, &req.body, None) } { Ok(_) => empty(200), Err(e) => { eprintln!("bazel: {e}"); empty(500) } },
+            _ => empty(405),
         }
     }
 

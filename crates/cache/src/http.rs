@@ -6,10 +6,14 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
-/// A request's body at most (GitHub's client sends 128 MB at most in one).
+/// A request's body read whole at most (GitHub's client sends 128 MB at most in one); a larger one, with its length,
+/// is the handler's to read as it comes (GitLab's runner sends a whole cache in one).
+const WHOLE: u64 = 256 << 20;
+/// A chunked body at most (no client of these sends a large one chunked).
 const MOST: u64 = 1 << 30;
 
-pub struct Request { pub method: String, pub target: String, pub headers: Vec<(String, String)>, pub body: Vec<u8> }
+/// A request; `streamed`: its body (`length` bytes) is not in `body` but the reader the handler is given.
+pub struct Request { pub method: String, pub target: String, pub headers: Vec<(String, String)>, pub body: Vec<u8>, pub streamed: bool, pub length: u64 }
 
 impl Request {
     /// A header's value (names compared without case).
@@ -27,7 +31,7 @@ impl Response {
     pub fn with_headers(mut self, more: Vec<(String, String)>) -> Response { self.headers.extend(more); self }
 }
 
-pub fn serve(listener: TcpListener, handle: impl Fn(Request) -> Response + Send + Sync + 'static) {
+pub fn serve(listener: TcpListener, handle: impl Fn(Request, &mut dyn Read) -> Response + Send + Sync + 'static) {
     let handle = Arc::new(handle);
     for stream in listener.incoming().flatten() {
         let handle = handle.clone();
@@ -35,7 +39,7 @@ pub fn serve(listener: TcpListener, handle: impl Fn(Request) -> Response + Send 
     }
 }
 
-fn connection(stream: TcpStream, handle: &dyn Fn(Request) -> Response) -> std::io::Result<()> {
+fn connection(stream: TcpStream, handle: &dyn Fn(Request, &mut dyn Read) -> Response) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let mut reader = BufReader::with_capacity(1 << 16, stream.try_clone()?);
     let mut writer = BufWriter::with_capacity(1 << 16, stream);
@@ -56,16 +60,21 @@ fn connection(stream: TcpStream, handle: &dyn Fn(Request) -> Response) -> std::i
         }
         let get = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
         if get("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) { writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?; writer.flush()?; }
-        let body = if get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) { chunked(&mut reader)? } else {
-            let n: u64 = get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-            if n > MOST { return Err(std::io::Error::other("a body larger than superci-cache takes")) }
+        let chunks = get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
+        let n: u64 = if chunks { 0 } else { get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0) };
+        let streamed = n > WHOLE;
+        let body = if chunks { chunked(&mut reader)? } else if streamed { vec![] } else {
             let mut b = vec![0u8; n as usize];
             reader.read_exact(&mut b)?;
             b
         };
-        let close = version == "HTTP/1.0" || get("connection").is_some_and(|c| c.eq_ignore_ascii_case("close"));
+        let length = if chunks { body.len() as u64 } else { n };
+        let mut close = version == "HTTP/1.0" || get("connection").is_some_and(|c| c.eq_ignore_ascii_case("close"));
         let head = method == "HEAD";
-        let res = handle(Request { method, target, headers, body });
+        let mut rest = (&mut reader).take(if streamed { n } else { 0 });
+        let res = handle(Request { method, target, headers, body, streamed, length }, &mut rest);
+        // A streamed body the handler did not read to its end: the connection cannot go on to another request.
+        if rest.limit() > 0 { close = true }
         write(&mut writer, res, head, close)?;
         if close { return Ok(()) }
     }
@@ -113,7 +122,7 @@ mod tests {
     fn requests_by_length_or_chunked_on_one_kept_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let at = listener.local_addr().unwrap();
-        std::thread::spawn(move || serve(listener, |r: Request| Response::bytes(200, "text/plain", format!("{} {} {}", r.method, r.target, r.body.len()).into_bytes())));
+        std::thread::spawn(move || serve(listener, |r: Request, _: &mut dyn Read| Response::bytes(200, "text/plain", format!("{} {} {}", r.method, r.target, r.body.len()).into_bytes())));
         let mut s = TcpStream::connect(at).unwrap();
         s.write_all(b"PUT /a?x=1 HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhelloPOST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\nHEAD /c HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
         let mut out = String::new();

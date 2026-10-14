@@ -31,7 +31,9 @@ pub fn local(connection: &str, id: u64) -> String {
 
 /// A job event from a project's webhook.
 #[derive(Debug, Clone, PartialEq)]
-pub struct JobEvent { pub job_id: u64, pub status: String, pub project_id: u64, pub project: String, pub pipeline_id: u64, pub name: String, pub stage: String, pub runner_id: Option<u64> }
+pub struct JobEvent { pub job_id: u64, pub status: String, pub project_id: u64, pub project: String, pub pipeline_id: u64, pub name: String, pub stage: String, pub runner_id: Option<u64>,
+    /// The branch or tag it runs for (`tag`: a tag), and its project's default branch (for the cache).
+    pub git_ref: Option<String>, pub tag: bool, pub default_branch: Option<String> }
 
 /// A job event, if the body is one (`object_kind: build`).
 pub fn job_event(body: &[u8]) -> Option<JobEvent> {
@@ -42,6 +44,7 @@ pub fn job_event(body: &[u8]) -> Option<JobEvent> {
         project: v["project"]["path_with_namespace"].as_str().or(v["project_name"].as_str()).unwrap_or_default().to_string(),
         pipeline_id: v["pipeline_id"].as_u64().or(v["commit"]["id"].as_u64()).unwrap_or(0), name: v["build_name"].as_str().unwrap_or_default().to_string(),
         stage: v["build_stage"].as_str().unwrap_or_default().to_string(), runner_id: v["runner"]["id"].as_u64(),
+        git_ref: v["ref"].as_str().map(str::to_string), tag: v["tag"] == true, default_branch: v["project"]["default_branch"].as_str().map(str::to_string),
     })
 }
 
@@ -173,7 +176,7 @@ mod tests {
     fn job_events_from_webhooks() {
         let body = serde_json::json!({ "object_kind": "build", "build_id": 1977, "build_name": "test", "build_status": "pending", "pipeline_id": 2366,
             "project_id": 380, "project_name": "gitlab-org/gitlab-test", "project": { "id": 380, "path_with_namespace": "gitlab-org/gitlab-test" } }).to_string();
-        assert_eq!(job_event(body.as_bytes()), Some(JobEvent { job_id: 1977, status: "pending".into(), project_id: 380, project: "gitlab-org/gitlab-test".into(), pipeline_id: 2366, name: "test".into(), stage: String::new(), runner_id: None }));
+        assert_eq!(job_event(body.as_bytes()), Some(JobEvent { job_id: 1977, status: "pending".into(), project_id: 380, project: "gitlab-org/gitlab-test".into(), pipeline_id: 2366, name: "test".into(), stage: String::new(), runner_id: None, git_ref: None, tag: false, default_branch: None }));
         assert_eq!(job_event(br#"{"object_kind":"push"}"#), None);
     }
 }

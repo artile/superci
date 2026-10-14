@@ -46,7 +46,7 @@ pub struct Dashboard {
     status_key: String,
     status_secret: String,
     keyed: HashSet<String>,
-    cf: Option<cloudflare::Session>,
+    pub(crate) cf: Option<cloudflare::Session>,
     /// A sign-in given by name for this run (SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID): used, never kept.
     cf_given: bool,
     modal_given: bool,

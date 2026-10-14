@@ -1577,6 +1577,7 @@ dependencies = [
 name = "superci-cache"
 version = "0.18.0"
 dependencies = [
+ "getrandom",
  "serde_json",
  "ureq",
 ]
