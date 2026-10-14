@@ -29,7 +29,19 @@ pub struct HandedJob {
     /// How many lines and logs were kept (`rline:<id>:<n>`, `rlog:<id>:<n>`).
     #[serde(default)] pub lines: u64,
     #[serde(default)] pub logs: u64,
+    /// The working tree the run was started with, as uploaded (`rtree:<tree>:…`, in `parts`), for its checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub tree: Option<String>,
+    #[serde(default)] pub parts: u32,
+    /// When it was handed out (ms): what is kept of it goes after a day.
+    #[serde(default)] pub at_ms: u64,
+    /// The control plane's record of the job (`job:<id>`) and its runner's name.
+    #[serde(default)] pub job_id: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")] pub runner: String,
 }
+
+/// How long a runner asking for a job when there is none is held before it is told so (it asks again at once):
+/// said with the answer, in `x-superci-hold`, for whoever answers to wait that long first.
+pub const HOLD_MS: u64 = 20_000;
 
 /// What a job's message needs beyond the workflow file: the job's own ids, what a run was given on the command
 /// line (secrets, variables), the `github` context (as plain JSON: the event, the repository, the commit), and
@@ -127,6 +139,91 @@ pub fn access_token(now_ms: u64) -> String {
     format!("{}.{}.{}", b(json!({ "alg": "RS256", "typ": "JWT" })), b(json!({ "nbf": secs, "iat": secs, "exp": secs + 6 * 3600, "iss": "superci", "aud": "superci" })), crate::crypto::b64url(&crate::crypto::random_bytes(32)))
 }
 
+/// What runs in place of `actions/checkout` for a run from a computer: the working tree the run was started with,
+/// fetched in its parts from `tree` (an address this job's machine alone has), unpacked where the checkout would
+/// have put the repository, and made one commit, as a checkout of one commit leaves it. It takes every input
+/// `actions/checkout` takes (so none is said to be unexpected); another repository than the run's own is refused.
+pub fn checkout_action(tree: &str, parts: u32) -> String {
+    const INPUTS: [&str; 20] = ["repository", "ref", "token", "ssh-key", "ssh-known-hosts", "ssh-strict", "ssh-user", "persist-credentials", "path", "clean", "filter", "sparse-checkout",
+        "sparse-checkout-cone-mode", "fetch-depth", "fetch-tags", "show-progress", "lfs", "submodules", "set-safe-directory", "github-server-url"];
+    let inputs: String = INPUTS.iter().map(|i| format!("  {i}:\n    required: false\n    default: ''\n")).collect();
+    let fetch = if parts == 0 { "true".to_string() } else { format!("for part in $(seq 0 {}); do curl -fsS --retry 3 \"{tree}?part=$part\"; done | tar -xz", parts - 1) };
+    format!(r#"name: Check out (SuperCI)
+description: The working tree a run from a computer was started with, in place of a checkout from GitHub.
+inputs:
+{inputs}runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        SUPERCI_PATH: ${{{{ inputs.path }}}}
+        SUPERCI_REPOSITORY: ${{{{ inputs.repository }}}}
+      run: |
+        set -euo pipefail
+        if [ -n "$SUPERCI_REPOSITORY" ] && [ "$SUPERCI_REPOSITORY" != "$GITHUB_REPOSITORY" ]; then echo "::error::A run from a computer has its own working tree only; $SUPERCI_REPOSITORY is not checked out here."; exit 1; fi
+        dir="$GITHUB_WORKSPACE/$SUPERCI_PATH"; mkdir -p "$dir"; cd "$dir"
+        {fetch}
+        git init -q . && git add -A && git -c user.name=superci -c user.email=superci@users.noreply.github.com commit -q --no-verify --allow-empty -m "The working tree of a run from a computer"
+        echo "The working tree as it was on the computer: $(git ls-files | wc -l | tr -d ' ') files"
+"#)
+}
+
+/// The checkout above as GitHub serves an action: a gzipped tar with the action in one folder.
+pub fn checkout_tarball(tree: &str, parts: u32) -> Vec<u8> { gzip_stored(&tar(&[("checkout/action.yml", checkout_action(tree, parts).as_bytes())])) }
+
+/// A tar of these files (each in a folder the runner takes off as it unpacks).
+fn tar(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = vec![];
+    let header = |name: &str, size: usize, kind: u8, mode: &str| {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        let octal = |h: &mut [u8; 512], at: usize, width: usize, n: u64| { let s = format!("{n:0w$o}", w = width - 1); h[at..at + width - 1].copy_from_slice(s.as_bytes()) };
+        h[100..100 + mode.len()].copy_from_slice(mode.as_bytes());
+        octal(&mut h, 108, 8, 0); octal(&mut h, 116, 8, 0); octal(&mut h, 124, 12, size as u64); octal(&mut h, 136, 12, 0);
+        h[156] = kind;
+        h[257..263].copy_from_slice(b"ustar\0"); h[263..265].copy_from_slice(b"00");
+        h[148..156].copy_from_slice(b"        ");
+        let sum: u32 = h.iter().map(|b| *b as u32).sum();
+        let s = format!("{sum:06o}\0 ");
+        h[148..156].copy_from_slice(s.as_bytes());
+        h
+    };
+    let folder = files.first().and_then(|(n, _)| n.split_once('/')).map(|(f, _)| format!("{f}/")).unwrap_or_default();
+    if !folder.is_empty() { out.extend_from_slice(&header(&folder, 0, b'5', "0000755")) }
+    for (name, data) in files {
+        out.extend_from_slice(&header(name, data.len(), b'0', "0000644"));
+        out.extend_from_slice(data);
+        out.resize(out.len().div_ceil(512) * 512, 0);
+    }
+    out.resize(out.len() + 1024, 0);
+    out
+}
+
+/// Gzip of these bytes, not compressed (stored blocks): what an action of a few kilobytes needs.
+fn gzip_stored(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    let chunks: Vec<&[u8]> = if data.is_empty() { vec![&[][..]] } else { data.chunks(65_535).collect() };
+    for (i, c) in chunks.iter().enumerate() {
+        out.push(if i + 1 == chunks.len() { 1 } else { 0 });
+        let len = c.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(c);
+    }
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for b in data {
+        crc ^= *b as u32;
+        for _ in 0..8 { crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 } }
+    }
+    !crc
+}
+
 /// The configuration a runner starts with (`run.sh --jitconfig …`), as GitHub hands one out for a just-in-time
 /// runner, here pointing at this service: `root` is where its calls go (no trailing slash), `name` what it is
 /// called. It runs one job and ends. Its key is made for it (the runner signs with it when it asks for a token;
@@ -141,7 +238,8 @@ pub fn jit_config(root: &str, name: &str) -> Result<String> {
     let (dp, dq) = (key.d() % (p - &one), key.d() % (q - &one));
     let inverse_q = key.crt_coefficient().ok_or("no CRT coefficient")?;
     let rsaparams = json!({ "d": n(key.d()), "dp": n(&dp), "dq": n(&dq), "exponent": n(key.e()), "inverseQ": n(&inverse_q), "modulus": n(key.n()), "p": n(p), "q": n(q) });
-    let runner = json!({ "AgentId": "1", "AgentName": name, "DisableUpdate": "True", "Ephemeral": "True", "PoolId": "1", "PoolName": "Default", "ServerUrl": root, "WorkFolder": "_work", "GitHubUrl": root });
+    // (Its work folder where GitHub's own runners have theirs, as SuperCI's machines expect.)
+    let runner = json!({ "AgentId": "1", "AgentName": name, "DisableUpdate": "True", "Ephemeral": "True", "PoolId": "1", "PoolName": "Default", "ServerUrl": root, "WorkFolder": "/home/runner/work", "GitHubUrl": root });
     let credentials = json!({ "Scheme": "OAuth", "Data": { "ClientId": guid(), "AuthorizationUrl": format!("{root}/_apis/v1/auth/"), "RequireFipsCryptography": "False" } });
     let b = |v: &Value| crate::crypto::b64(v.to_string().as_bytes());
     Ok(b(&json!({ ".runner": b(&runner), ".credentials": b(&credentials), ".credentials_rsaparams": b(&rsaparams) })))
@@ -151,8 +249,8 @@ fn ok(body: Value) -> Response { Response::json(&body) }
 fn empty() -> Response { Response::new(200, "application/json", "") }
 
 /// Answers one of the runner's calls for the job kept at `rjob:<id>`. `path`: the call's path after the job's own
-/// prefix. `hold`: waits a moment in place (a runner asking for a message when there is none is held, then told so).
-pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str, hold: &dyn Fn(u64)) -> Result<Response> {
+/// prefix. A runner asking for a message when there is none is told so with `x-superci-hold` (see `HOLD_MS`).
+pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> Result<Response> {
     let key = format!("rjob:{id}");
     let Some(mut job) = get_json::<HandedJob>(store, &key).await? else { return Ok(Response::text(404, "no such job")) };
     // (The runner starts some bodies with a byte-order mark, as .NET writes UTF-8.)
@@ -175,19 +273,21 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str, hold
             put_json(store, &key, &job).await?;
             return Ok(ok(json!({ "messageId": 1, "messageType": "PipelineAgentJobRequest", "body": job.message.to_string() })))
         }
-        hold(20_000);
-        Response::new(204, "application/json", "")
+        Response::new(204, "application/json", "").with_header("x-superci-hold", &HOLD_MS.to_string())
     } else if p.contains("/AgentRequest/") {
         let mut r = body; r["lockedUntil"] = "2099-01-01T00:00:00Z".into(); ok(r)
     } else if p.contains("/feedstream/") {
         Response::new(400, "text/plain", "")
     } else if p.contains("/ActionDownloadInfo/") {
-        // Where each action's code is: GitHub's public tarball of it at the version named.
+        // Where each action's code is: GitHub's public tarball of it at the version named; `actions/checkout`
+        // is this service's own, which puts the run's working tree in place (see `checkout_tarball`).
+        let service = job.message["resources"]["endpoints"][0]["url"].as_str().unwrap_or_default().to_string();
         let mut out = serde_json::Map::new();
         for a in body["actions"].as_array().into_iter().flatten() {
             let (name, r) = (a["nameWithOwner"].as_str().unwrap_or_default(), a["ref"].as_str().unwrap_or_default());
+            let tarball = if name.eq_ignore_ascii_case("actions/checkout") { format!("{service}superci/checkout.tar.gz") } else { format!("https://api.github.com/repos/{name}/tarball/{r}") };
             out.insert(format!("{name}@{r}"), json!({ "nameWithOwner": name, "resolvedNameWithOwner": name, "resolvedSha": r, "ref": r,
-                "tarballUrl": format!("https://api.github.com/repos/{name}/tarball/{r}"), "zipballUrl": format!("https://api.github.com/repos/{name}/zipball/{r}") }));
+                "tarballUrl": tarball, "zipballUrl": format!("https://api.github.com/repos/{name}/zipball/{r}") }));
         }
         ok(json!({ "actions": out }))
     } else if p.contains("/TimeLineWebConsoleLog/") {
@@ -239,5 +339,21 @@ mod tests {
         let g = guid();
         assert!(g.len() == 36 && g.as_bytes()[14] == b'4', "{g}");
         assert_eq!(access_token(1_790_000_000_000).split('.').count(), 3);
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn the_checkout_is_an_action_the_runner_can_unpack() {
+        let gz = checkout_tarball("https://plane.example/runner/abc/superci/tree", 3);
+        assert_eq!(&gz[..3], &[0x1f, 0x8b, 8]);
+        // (Unpacked by the system's own tar, as the runner does.)
+        let dir = std::env::temp_dir().join(format!("superci-checkout-{}", guid()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.tar.gz"), &gz).unwrap();
+        let ok = std::process::Command::new("tar").args(["xzf", "a.tar.gz", "--strip-components", "1"]).current_dir(&dir).status().unwrap().success();
+        let action = std::fs::read_to_string(dir.join("action.yml")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ok && action.contains("using: composite") && action.contains("for part in $(seq 0 2); do curl -fsS --retry 3 \"https://plane.example/runner/abc/superci/tree?part=$part\"") && action.contains("  fetch-depth:\n    required: false"), "{action}");
+        assert!(action.contains("SUPERCI_PATH: ${{ inputs.path }}"));
     }
 }

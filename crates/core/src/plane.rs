@@ -244,6 +244,9 @@ pub struct Job {
     /// `MORE_SPOT`); back to none once it has a machine.
     #[serde(default, skip_serializing_if = "is_zero")] pub spot_rounds: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub hello: Option<String>,
+    /// A job of a run from a computer (provider "local"): the token in its runner's address, `/runner/<token>`,
+    /// where the runner takes its job from this control plane in place of GitHub (see `runner_service`).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub local: Option<String>,
     /// What it writes most is in memory, or on its machine's own disk (its label asked: `-ramdisk`, `-localdisk`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub local_disk: bool,
@@ -910,6 +913,11 @@ impl<'a> ControlPlane<'a> {
                 }
                 Ok(Response::json(&serde_json::json!({ "kept": kept })))
             }
+            // Runs from a computer: the working tree in parts, a run, how it goes; and its runner's calls.
+            ("POST", "/runs/tree") if self.dashboard(&req) => self.tree_part(&url, &req).await,
+            ("POST", "/runs") if self.dashboard(&req) => self.create_run(&req, &plane_url).await,
+            ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
+            (_, p) if p.starts_with("/runner/") => self.for_runner(&req, &plane_url, &url).await,
             _ => Ok(nothing_here()),
         }
     }
@@ -1959,7 +1967,16 @@ impl<'a> ControlPlane<'a> {
             job.cloud = cloud_of(&places[0].1);
             job.on_demand = places[0].0 == AWS_ON_DEMAND;
             let name = format!("{}-{}{}{}", runner_prefix(self.config.name(), &self.config.plane_id), if gitlab { "gl" } else { "" }, if gitlab { gitlab::local(&job.gitlab, job.job_id) } else { job.job_id.to_string() }, job.runner_suffix);
-            let work = if gitlab {
+            let work = if job.provider == "local" {
+                // A run from a computer: its runner takes the job from this control plane, at its own address.
+                let token = job.local.clone().ok_or("a run from a computer without its address")?;
+                let jit = crate::runner_service::jit_config(&format!("{plane_url}/runner/{token}"), &name)?;
+                job.runner = Some(name.clone());
+                self.keep(&key, &*job).await?;
+                put_json(self.store, &format!("runner:{name}"), &job.job_id).await?;
+                if let Some(mut handed) = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await? { handed.runner = name.clone(); put_json(self.store, &format!("rjob:{token}"), &handed).await? }
+                Work::GitHub { jit }
+            } else if gitlab {
                 let gl = self.gitlab_of(job).ok_or("its GitLab is not connected any more")?;
                 let token = self.gitlab_runner(gl, job).await?;
                 job.runner = Some(name.clone());
@@ -2586,6 +2603,129 @@ impl<'a> ControlPlane<'a> {
         true
     }
 
+    /// A part of the working tree a run from a computer is started with (a gzipped tar, cut in parts of a few MB):
+    /// kept in pieces the store takes (`rtree:<tree>:<part>:<piece>`), for its checkout to fetch (`for_runner`).
+    async fn tree_part(&self, url: &url::Url, req: &Request) -> Result<Response> {
+        let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        let id = q.get("id").filter(|i| (16..=64).contains(&i.len()) && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        let (Some(id), Some(part)) = (id, q.get("part").and_then(|p| p.parse::<u32>().ok()).filter(|p| *p < 1000)) else { return Ok(Response::text(400, "say which tree (id) and which part")) };
+        if req.body.len() > 5_000_000 { return Ok(Response::text(413, "a part is 5 MB at most")) }
+        for (i, piece) in req.body.chunks(300_000).enumerate() { self.store.put(&format!("rtree:{id}:{part:05}:{i:03}"), crate::crypto::b64(piece)).await? }
+        let _ = self.store.put_if_absent(&format!("rtree-at:{id}"), self.clock.now_ms().to_string()).await;
+        Ok(Response::json(&serde_json::json!({ "stored": req.body.len() })))
+    }
+
+    /// A run from a computer: a workflow file's job, run as GitHub would run it, on a machine as any job of this
+    /// control plane's, with the working tree uploaded (`tree_part`) in place of a checkout, and what a run gives
+    /// beyond GitHub's (`secrets`, `vars`). The job's runner takes the job from here (see `runner_service`).
+    async fn create_run(&self, req: &Request, plane_url: &str) -> Result<Response> {
+        #[derive(Deserialize)]
+        struct NewRun { workflow: String, path: String, #[serde(default)] job: Option<String>, repository: String, #[serde(default, rename = "ref")] reference: String,
+            #[serde(default)] sha: String, #[serde(default)] actor: String, #[serde(default)] event_name: String, #[serde(default)] secrets: Vec<(String, String)>,
+            #[serde(default)] vars: Vec<(String, String)>, #[serde(default)] tree: Option<String>, #[serde(default)] parts: u32 }
+        let r: NewRun = match serde_json::from_slice(&req.body) { Ok(r) => r, Err(e) => return Ok(Response::text(400, &format!("not a run: {e}"))) };
+        let wf = match crate::workflow::parse(&r.workflow) { Ok(w) => w, Err(e) => return Ok(Response::text(400, &e)) };
+        let names: Vec<String> = wf.get("jobs").map(|j| j.pairs().iter().filter_map(|(k, _)| k.text().map(str::to_string)).collect()).unwrap_or_default();
+        let job_name = match (r.job.clone(), names.as_slice()) {
+            (Some(j), _) if names.contains(&j) => j,
+            (Some(j), _) => return Ok(Response::text(400, &format!("{} has no job named {j}: {}", r.path, names.join(", ")))),
+            (None, [one]) => one.clone(),
+            (None, _) => return Ok(Response::text(400, &format!("say which job: {}", names.join(", ")))),
+        };
+        let found = wf.get("jobs").and_then(|j| j.get(&job_name));
+        if found.and_then(|j| j.get("needs")).is_some() { return Ok(Response::text(400, &format!("the job {job_name} needs other jobs; a run from a computer runs one job by itself yet"))) }
+        // Its machine: the one its label says when it is this control plane's, else the default machine.
+        let runs_on = found.and_then(|j| j.get("runs-on")).and_then(|n| n.text()).unwrap_or_default().to_string();
+        let label = if self.config.parse(&runs_on).is_some() { runs_on } else { self.config.label.clone() };
+        let now = self.clock.now_ms();
+        // (Ids far above GitHub's, so that no job of GitHub's is ever taken for one of these.)
+        let job_id = (1u64 << 62) + now * 1000 + (crate::crypto::random_bytes(2).iter().map(|b| *b as u64).sum::<u64>() % 1000);
+        let token = crate::crypto::random_token(24);
+        let owner = r.repository.split('/').next().unwrap_or_default().to_string();
+        let reference = if r.reference.is_empty() { "refs/heads/main".to_string() } else { r.reference.clone() };
+        let github = serde_json::json!({ "event_name": if r.event_name.is_empty() { "push" } else { r.event_name.as_str() }, "event": {}, "repository": r.repository, "repository_owner": owner,
+            "ref": reference, "ref_name": reference.rsplit('/').next().unwrap_or_default(), "ref_type": if reference.starts_with("refs/tags/") { "tag" } else { "branch" }, "sha": r.sha,
+            "actor": r.actor, "triggering_actor": r.actor, "workflow": wf.get("name").and_then(|n| n.text()).unwrap_or(&r.path), "run_id": job_id.to_string(), "run_number": "1", "run_attempt": "1",
+            "server_url": "https://github.com", "api_url": "https://api.github.com", "graphql_url": "https://api.github.com/graphql", "job": job_name, "retention_days": "1" });
+        let service = format!("{plane_url}/runner/{token}/");
+        let given = crate::runner_service::Given { workflow: &r.workflow, path: &r.path, job: &job_name, secrets: &r.secrets, vars: &r.vars, github, service: &service,
+            access_token: &crate::runner_service::access_token(now), ids: crate::runner_service::Ids::new(1) };
+        let message = match crate::runner_service::job_message(&given) { Ok(m) => m, Err(e) => return Ok(Response::text(400, &e)) };
+        let display = message["jobDisplayName"].as_str().unwrap_or(&job_name).to_string();
+        put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: r.tree.clone(), parts: r.parts, at_ms: now, job_id, ..Default::default() }).await?;
+        let mut job = Job { job_id, run_id: job_id, repo: r.repository.clone(), state: "launching".into(), at_ms: now, label, name: display, workflow: r.path.clone(), provider: "local".into(),
+            local: Some(token.clone()), queued_ms: Some(now), ..Default::default() };
+        put_json(self.store, &format!("run:{job_id}"), &serde_json::json!({ "jobs": [job_id], "token": token, "tree": r.tree, "at_ms": now })).await?;
+        if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(Response::text(409, "try again")) }
+        self.start_soon(plane_url, &mut job).await?;
+        Ok(Response::json(&serde_json::json!({ "run_id": job_id.to_string(), "job": job_name })))
+    }
+
+    /// How a run from a computer goes: its job's state, how it ended, its steps, and the lines its runner wrote
+    /// after `after` (a count the answer gives back as `next`).
+    async fn run_status(&self, path: &str, url: &url::Url) -> Result<Response> {
+        let Some(id) = path.trim_start_matches("/runs/").parse::<u64>().ok() else { return Ok(nothing_here()) };
+        let Some(run) = get_json::<serde_json::Value>(self.store, &format!("run:{id}")).await? else { return Ok(nothing_here()) };
+        let token = run["token"].as_str().unwrap_or_default();
+        let after = url.query_pairs().find(|(k, _)| k == "after").and_then(|(_, v)| v.parse::<u64>().ok()).unwrap_or(0);
+        let job = get_json::<Job>(self.store, &format!("job:{id}")).await?;
+        let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?;
+        let (mut lines, mut next) = (vec![], after);
+        for (k, v) in self.store.list(&format!("rline:{token}:")).await? {
+            let n = k.rsplit(':').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+            if n > after { lines.extend(serde_json::from_str::<Vec<String>>(&v).unwrap_or_default()); next = next.max(n) }
+        }
+        Ok(Response::json(&serde_json::json!({ "run_id": id.to_string(), "state": job.as_ref().map(|j| j.state.clone()), "error": job.as_ref().and_then(|j| j.error.clone()),
+            "machine": job.as_ref().and_then(|j| j.machine_type.clone()), "result": handed.as_ref().and_then(|h| h.result.clone()), "steps": handed.as_ref().map(|h| h.steps.clone()).unwrap_or_default(),
+            "lines": lines, "next": next })))
+    }
+
+    /// A call of the runner of a run from a computer, at `/runner/<token>/…`: its checkout and working tree, or
+    /// one of GitHub's runner's own calls (see `runner_service::answer`). When it takes its job, the job has begun;
+    /// when it says how the job ended, the job has ended (as GitHub's events say of other jobs).
+    async fn for_runner(&self, req: &Request, plane_url: &str, url: &url::Url) -> Result<Response> {
+        let rest = url.path().trim_start_matches("/runner/");
+        let (token, sub) = rest.split_once('/').unwrap_or((rest, ""));
+        if token.len() < 16 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Ok(nothing_here()) }
+        let key = format!("rjob:{token}");
+        let Some(before) = get_json::<crate::runner_service::HandedJob>(self.store, &key).await? else { return Ok(nothing_here()) };
+        if sub == "superci/checkout.tar.gz" {
+            return Ok(Response::new(200, "application/gzip", crate::runner_service::checkout_tarball(&format!("{plane_url}/runner/{token}/superci/tree"), before.parts)))
+        }
+        if sub == "superci/tree" {
+            let part = url.query_pairs().find(|(k, _)| k == "part").and_then(|(_, v)| v.parse::<u32>().ok()).unwrap_or(0);
+            let Some(tree) = &before.tree else { return Ok(nothing_here()) };
+            let mut bytes = vec![];
+            for (_, piece) in self.store.list(&format!("rtree:{tree}:{part:05}:")).await? {
+                use base64::Engine;
+                bytes.extend(base64::engine::general_purpose::STANDARD.decode(piece.trim_matches('"')).map_err(|e| e.to_string())?);
+            }
+            return Ok(Response::new(200, "application/octet-stream", bytes))
+        }
+        let full = url[url::Position::BeforePath..].to_string();
+        let path = full.trim_start_matches(&format!("/runner/{token}")).to_string();
+        let res = crate::runner_service::answer(self.store, token, req, &path).await?;
+        let after = get_json::<crate::runner_service::HandedJob>(self.store, &key).await?.unwrap_or_default();
+        if !before.taken && after.taken { self.started(plane_url, after.job_id, Some(&after.runner)).await? }
+        if before.result.is_none() {
+            if let Some(result) = &after.result {
+                let conclusion = match result.as_str() { "succeeded" => "success", "failed" => "failure", "canceled" | "cancelled" => "cancelled", other => other }.to_string();
+                if let Some(job) = get_json::<Job>(self.store, &format!("job:{}", after.job_id)).await? {
+                    let ev = github::JobEvent { action: "completed".into(), job_id: job.job_id, run_id: job.run_id, attempt: 1, created_ms: job.queued_ms, repo: job.repo.clone(), installation_id: 0,
+                        runner_name: Some(after.runner.clone()), conclusion: Some(conclusion), name: job.name.clone(), workflow: job.workflow.clone(), label: job.label.clone(), spec: Ok(Spec::default()), public: false };
+                    self.completed(plane_url, &ev).await?;
+                }
+                // (Its secrets go with the job: nothing of them is kept once it has ended.)
+                let mut done = after.clone();
+                if let Some(vars) = done.message.get_mut("variables").and_then(|v| v.as_object_mut()) { vars.retain(|_, v| v["isSecret"] != true) }
+                done.message["mask"] = serde_json::json!([]);
+                put_json(self.store, &key, &done).await?;
+            }
+        }
+        if res.header("x-superci-hold").is_some() { self.timer.pause(crate::runner_service::HOLD_MS).await }
+        Ok(res)
+    }
+
     /// A finished job ends the machine that ran it, found by the runner's name (GitHub may hand a job to any idle runner
     /// with the label). A job cancelled before any runner took it leaves its own machine idle: marked for the sweep.
     async fn completed(&self, plane_url: &str, ev: &github::JobEvent) -> Result<()> {
@@ -2873,6 +3013,21 @@ impl<'a> ControlPlane<'a> {
             if at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) < 30_000) { continue }
             let removed = match self.aws_connection().await { Ok(Some(a)) => match self.aws_creds(&plane_url, &a).await { Ok(c) => aws::delete_template(self.http, region, &c, name, now).await, Err(e) => Err(e) }, _ => Err("no AWS".into()) };
             if removed.is_ok() || at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > 86_400_000) { self.store.delete(&k).await? }
+        }
+        // What a run from a computer kept (its job's message, lines, logs, working tree): gone after a day.
+        for (k, v) in self.store.list("run:").await? {
+            let run: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
+            if run["at_ms"].as_u64().is_some_and(|at| now.saturating_sub(at) < 86_400_000) { continue }
+            let token = run["token"].as_str().unwrap_or_default();
+            for prefix in [format!("rline:{token}:"), format!("rlog:{token}:")] { for (k, _) in self.store.list(&prefix).await? { self.store.delete(&k).await? } }
+            self.store.delete(&format!("rjob:{token}")).await?;
+            self.store.delete(&k).await?;
+        }
+        for (k, at) in self.store.list("rtree-at:").await? {
+            if at.trim_matches('"').parse::<u64>().is_ok_and(|at| now.saturating_sub(at) < 86_400_000) { continue }
+            let tree = k.trim_start_matches("rtree-at:");
+            for (k, _) in self.store.list(&format!("rtree:{tree}:")).await? { self.store.delete(&k).await? }
+            self.store.delete(&k).await?;
         }
         self.redeliver_failed().await;
         let moved_lately = self.untold(&plane_url, now).await;

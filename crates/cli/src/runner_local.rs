@@ -63,7 +63,8 @@ pub fn serve(workflow: &str, job: &str, port: u16, root: &str, secrets: &[(Strin
             let path = target.strip_prefix(&prefix).unwrap_or(&target).to_string();
             let mut req = Request::new(&method, &format!("http://localhost{target}"));
             req.body = body;
-            let res = block_on(answer(&store, "local", &req, &path, &|ms| std::thread::sleep(std::time::Duration::from_millis(ms.min(10_000)))));
+            let res = block_on(answer(&store, "local", &req, &path));
+            if res.as_ref().is_ok_and(|r| r.header("x-superci-hold").is_some()) { std::thread::sleep(std::time::Duration::from_millis(10_000)) }
             let res = res.unwrap_or_else(|e| io::Response::text(500, &e));
             eprintln!("{method} {} -> {}", path.split('?').next().unwrap_or_default(), res.status);
             let head = format!("HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", res.status, res.header("content-type").unwrap_or("application/json"), res.body.len());

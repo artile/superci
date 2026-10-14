@@ -28,7 +28,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N]",
         "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job: how its start went step by step (what AWS was asked and answered, when its machine booted, when\n          its runner listened), and the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, a million at most). GitHub keeps a job's log once the job has ended."),
     ("runs", "  superci runs list\n  superci runs retrieve ID",
-        "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again).\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
+        "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again).\ncreate    Runs a workflow's job from this computer, as GitHub would run it, on a machine as any job here: the working\n          tree as it is (what git tracks, and new files it does not ignore), with nothing pushed. --workflow=FILE,\n          --job=NAME when it has several, --event=push|pull_request (push unless given), and what GitHub would give it\n          and cannot here: --secret=NAME=VALUE and --var=NAME=VALUE, as often as needed. It waits for the job and\n          prints its lines; it fails when the job does.\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
     ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
@@ -134,7 +134,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 10] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add"];
-const VALUES: [&str; 38] = ["secret", "var", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 41] = ["secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -377,6 +377,14 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 None => said.push(format!("No log: {}.", got["error"].as_str().unwrap_or("the control plane gave none").trim_end_matches('.'))),
             }
             Ok(Done { said, data: json!({ "job": words, "log": got["log"], "truncated": got["truncated"], "log_error": got["error"] }) })
+        }
+        ("runs", "create") => {
+            let Some(workflow) = args.get("workflow") else { return usage("Say which workflow: `superci runs create --workflow=.github/workflows/ci.yml` (and --job=NAME when it has several jobs).") };
+            let d = ready()?;
+            let plane = in_use(&d)?;
+            let pairs = |flag: &str| args.all(flag).iter().map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or(format!("--{flag} is NAME=VALUE"))).collect::<std::result::Result<Vec<_>, String>>();
+            let (secrets, vars) = match (pairs("secret"), pairs("var")) { (Ok(s), Ok(v)) => (s, v), (Err(e), _) | (_, Err(e)) => return usage(e) };
+            Ok(crate::local_run::create(plane.url(), d.key(), workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, steps)?)
         }
         ("runs", "list") => {
             let mut d = signed_in();

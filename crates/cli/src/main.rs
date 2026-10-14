@@ -15,6 +15,7 @@ mod commands;
 mod dashboard;
 mod image;
 mod live;
+mod local_run;
 mod logos;
 mod modal;
 mod plane;

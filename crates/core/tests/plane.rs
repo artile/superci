@@ -3262,7 +3262,7 @@ fn the_runners_calls_for_a_job_are_answered_as_its_service_answers_them() {
         let r: serde_json::Value = serde_json::from_str(line).unwrap();
         let mut req = Request::new(r["method"].as_str().unwrap(), &format!("https://plane.example/runner/abc{}", r["path"].as_str().unwrap()));
         req.body = r["request"].as_str().unwrap().as_bytes().to_vec();
-        let res = block_on(answer(&store, "abc", &req, r["path"].as_str().unwrap(), &|_| {})).unwrap();
+        let res = block_on(answer(&store, "abc", &req, r["path"].as_str().unwrap())).unwrap();
         assert!(res.status == 200 || res.status == 204 || (res.status == 400 && r["path"].as_str().unwrap().contains("feedstream")), "{} {}: {}", r["method"], r["path"], res.status);
         if r["path"].as_str().unwrap().contains("/Message/") && r["method"] == "GET" { messages.push(res.status) }
     }
@@ -3273,6 +3273,67 @@ fn the_runners_calls_for_a_job_are_answered_as_its_service_answers_them() {
     assert!(job.steps.iter().any(|s| s["type"] == "Job" && s["result"] == "succeeded") && job.lines > 0 && job.logs > 0, "{:?}", job.steps);
     assert!(store.0.borrow().keys().any(|k| k.starts_with("rline:abc:")) && store.0.borrow().keys().any(|k| k.starts_with("rlog:abc:")));
     // Another job's prefix, or none at all, is nothing here.
-    let res = block_on(answer(&store, "other", &Request::new("GET", "https://plane.example/runner/other/_apis/connectionData"), "/_apis/connectionData", &|_| {})).unwrap();
+    let res = block_on(answer(&store, "other", &Request::new("GET", "https://plane.example/runner/other/_apis/connectionData"), "/_apis/connectionData")).unwrap();
     assert_eq!(res.status, 404);
+}
+
+#[test]
+fn a_run_from_a_computer_gets_its_machine_and_its_runner_takes_the_job_from_the_control_plane() {
+    use base64::Engine;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    // The working tree, in two parts (a gzipped tar cut in two), then the run. Nothing without the key.
+    let tree = vec![7u8; 400_000];
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id=tree-0123456789abcdef&part=0")).with_body(tree[..350_000].to_vec())).status, 404);
+    for (part, bytes) in [(0, &tree[..350_000]), (1, &tree[350_000..])] {
+        assert_eq!(run(key(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id=tree-0123456789abcdef&part={part}")).with_body(bytes.to_vec()))).status, 200);
+    }
+    let body = serde_json::json!({ "workflow": include_str!("fixtures/runner/three.yml"), "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main", "sha": "abc",
+        "actor": "someone", "secrets": [["A_SECRET", "hunter2hunter2"]], "vars": [["A_VAR", "fromcli"]], "tree": "tree-0123456789abcdef", "parts": 2 }).to_string();
+    let made = run(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(body)));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    let run_id = json(&made)["run_id"].as_str().unwrap().to_string();
+    // Its machine, as any job's, with a runner that takes its job from here and not from GitHub.
+    let launched = launches(&clouds);
+    assert_eq!(launched.len(), 1);
+    let script = String::from_utf8(STANDARD.decode(field(&launched[0], "UserData")).unwrap()).unwrap();
+    let jit = script.split("--jitconfig ").nth(1).unwrap().split_whitespace().next().unwrap();
+    let config_of = |name: &str| -> serde_json::Value { let all: serde_json::Value = serde_json::from_slice(&STANDARD.decode(jit).unwrap()).unwrap(); serde_json::from_slice(&STANDARD.decode(all[name].as_str().unwrap()).unwrap()).unwrap() };
+    let server = config_of(".runner")["ServerUrl"].as_str().unwrap().to_string();
+    assert!(server.starts_with(&format!("{PLANE_URL}/runner/")) && config_of(".credentials")["Data"]["AuthorizationUrl"] == format!("{server}/_apis/v1/auth/"), "{server}");
+    assert!(!clouds.calls.borrow().iter().any(|c| c.1.contains("generate-jitconfig")), "GitHub is not asked for a runner");
+    let job_id: u64 = run_id.parse().unwrap();
+    assert!(job_id > 1 << 62 && job(&store, job_id)["provider"] == "local" && job(&store, job_id)["state"] == "launched");
+    // Its checkout: the action that puts the tree in place, and the tree in its parts, as uploaded.
+    let checkout = run(Request::new("GET", &format!("{server}/superci/checkout.tar.gz")));
+    assert_eq!((checkout.status, &checkout.body[..2]), (200, &[0x1f, 0x8b][..]));
+    let parts: Vec<u8> = [0, 1].iter().flat_map(|p| run(Request::new("GET", &format!("{server}/superci/tree?part={p}"))).body).collect();
+    assert!(parts == tree);
+    assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/runner/not-a-token-of-any-job-here/superci/tree?part=0"))).status, 404);
+    // The runner's calls, as a real runner made them: it takes the job (the job has begun), and says how it ended.
+    for line in include_str!("fixtures/runner/runner-requests.jsonl").lines() {
+        let r: serde_json::Value = serde_json::from_str(line).unwrap();
+        let path = r["path"].as_str().unwrap().trim_start_matches("/runner/server");
+        let mut req = Request::new(r["method"].as_str().unwrap(), &format!("{server}{path}"));
+        req.body = r["request"].as_str().unwrap().as_bytes().to_vec();
+        let res = run(req);
+        assert!([200, 204, 400].contains(&res.status), "{} {path}: {} {}", r["method"], res.status, res.body_text());
+        if path.contains("/Message/") && r["method"] == "GET" && res.status == 200 { assert_eq!(job(&store, job_id)["state"], "running") }
+    }
+    let j = job(&store, job_id);
+    assert_eq!((j["state"].as_str(), j["conclusion"].as_str()), (Some("done"), Some("success")), "{j}");
+    assert!(clouds.calls.borrow().iter().any(|c| c.2.contains("Action=TerminateInstances")), "its machine is ended with it");
+    // How it went, for the command that started it: its result and its lines; and its secrets are kept no more.
+    let status = json(&run(key(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}")))));
+    assert_eq!(status["result"], "succeeded");
+    assert!(status["lines"].as_array().is_some_and(|l| !l.is_empty()) && status["next"].as_u64() > Some(0), "{status}");
+    let later = json(&run(key(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}?after={}", status["next"])))));
+    assert!(later["lines"].as_array().is_some_and(|l| l.is_empty()));
+    assert!(!store.0.borrow().values().any(|v| v.contains("hunter2hunter2")), "no secret is left in the store");
 }
