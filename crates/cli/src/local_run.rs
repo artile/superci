@@ -72,30 +72,43 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts });
     let made = call("POST", "/runs", body.to_string().into_bytes())?;
     let run = made["run_id"].as_str().unwrap_or_default().to_string();
-    say(&format!("Run {run}: {} of {path}, on a machine of this control plane's", made["job"].as_str().unwrap_or_default()));
-    let (began, mut after, mut last_state) = (std::time::Instant::now(), 0u64, String::new());
+    say(&format!("Run {run} of {path}, on machines of this control plane's"));
+    let (began, mut after, mut last): (std::time::Instant, Vec<u64>, Vec<String>) = (std::time::Instant::now(), vec![], vec![]);
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        let st = call("GET", &format!("/runs/{run}?after={after}"), vec![])?;
-        let state = st["state"].as_str().unwrap_or_default().to_string();
-        if state != last_state && !state.is_empty() {
-            say(&match state.as_str() { "launching" => "Asking for its machine".to_string(), "launched" => format!("Its machine is starting ({})", st["machine"].as_str().unwrap_or("")), "running" => "Running".to_string(), other => other.to_string() });
-            last_state = state.clone();
+        let cursor = after.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+        let st = call("GET", &format!("/runs/{run}?after={cursor}"), vec![])?;
+        let jobs = st["jobs"].as_array().cloned().unwrap_or_default();
+        after.resize(jobs.len(), 0);
+        last.resize(jobs.len(), String::new());
+        let several = jobs.len() > 1;
+        for (i, j) in jobs.iter().enumerate() {
+            let name = j["name"].as_str().unwrap_or_default();
+            let mark = if several { format!("[{name}] ") } else { String::new() };
+            // How each job stands, when that changes.
+            let state = match (j["state"].as_str().unwrap_or_default(), j["result"].as_str()) {
+                (_, Some("skipped")) => "skipped".to_string(),
+                ("pending", _) => String::new(),
+                ("launching", _) => "asking for its machine".to_string(),
+                ("launched", _) => format!("its machine is starting ({})", j["machine"].as_str().unwrap_or("")),
+                ("running", _) => "running".to_string(),
+                (_, Some(r)) => format!("ended: {r}"),
+                (other, _) => other.to_string(),
+            };
+            if !state.is_empty() && state != last[i] { say(&format!("{mark}{}{}", &state[..1].to_uppercase(), &state[1..])); last[i] = state }
+            // Its lines as GitHub shows them: a group's heading is a line, its end is nothing.
+            for line in j["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str()) {
+                if line.starts_with("##[endgroup]") { continue }
+                say(&format!("{}{mark}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(line)))
+            }
+            after[i] = j["next"].as_u64().unwrap_or(after[i]);
         }
-        // The job's lines as GitHub shows them: a group's heading is a line, its end is nothing.
-        for line in st["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str()) {
-            if line.starts_with("##[endgroup]") { continue }
-            say(&format!("{}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(line)))
-        }
-        after = st["next"].as_u64().unwrap_or(after);
-        if let Some(result) = st["result"].as_str() {
-            let took = began.elapsed().as_secs();
-            let said = format!("The job ended: {result}, {took} s after it was sent.");
-            if result != "succeeded" { return Err(said) }
-            return Ok(Done { said: vec![said], data: json!({ "run_id": run, "result": result, "seconds": took }) })
-        }
-        if ["failed", "cancelled", "swept"].contains(&state.as_str()) {
-            return Err(format!("The job ended before its runner said how: {}", st["error"].as_str().unwrap_or(&state)))
+        if st["over"] == true {
+            let (result, took) = (st["result"].as_str().unwrap_or_default().to_string(), began.elapsed().as_secs());
+            let tally: Vec<String> = jobs.iter().map(|j| format!("{} {}", j["name"].as_str().unwrap_or_default(), j["result"].as_str().unwrap_or("?"))).collect();
+            let said = format!("The run ended: {result}, {took} s after it was sent{}.", if several { format!(" ({})", tally.join(", ")) } else { String::new() });
+            if result != "success" { return Err(said) }
+            return Ok(Done { said: vec![said], data: json!({ "run_id": run, "result": result, "seconds": took, "jobs": jobs.iter().map(|j| json!({ "name": j["name"], "result": j["result"] })).collect::<Vec<_>>() }) })
         }
         if began.elapsed().as_secs() > 6 * 3600 { return Err(format!("Still not over after six hours: `superci runs retrieve {run}`.")) }
     }

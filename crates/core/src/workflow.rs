@@ -256,6 +256,54 @@ pub fn job_parts(workflow: &Node, path: &str, job: &str, ids: &mut dyn FnMut() -
     Ok(out)
 }
 
+/// A value of a matrix as GitHub reads it: a number, `true`, `null` as such, else text.
+fn matrix_value(n: &Node) -> std::result::Result<Value, String> {
+    match n {
+        Node::Scalar { text, plain, line, .. } => {
+            if text.contains("${{") { return Err(format!("line {line}: a matrix made by an expression is not run here yet")) }
+            if !*plain { return Ok(Value::String(text.clone())) }
+            Ok(match text.as_str() { "true" => json!(true), "false" => json!(false), "null" | "~" | "" => Value::Null, t => t.parse::<f64>().map(|f| json!(f)).unwrap_or_else(|_| json!(t)) })
+        }
+        Node::Seq { items, .. } => items.iter().map(matrix_value).collect::<std::result::Result<Vec<_>, _>>().map(Value::Array),
+        Node::Map { pairs, .. } => pairs.iter().map(|(k, v)| Ok((k.text().unwrap_or_default().to_string(), matrix_value(v)?))).collect::<std::result::Result<serde_json::Map<_, _>, String>>().map(Value::Object),
+    }
+}
+
+/// A job's matrix: every combination its `strategy.matrix` makes, with `exclude` taken out and `include` added as
+/// GitHub adds it (to each combination it does not change, else as one of its own). None: the job has no matrix.
+pub fn matrix(job: &Node) -> std::result::Result<Option<Vec<serde_json::Map<String, Value>>>, String> {
+    let Some(m) = job.get("strategy").and_then(|s| s.get("matrix")) else { return Ok(None) };
+    if let Node::Scalar { line, .. } = m { return Err(format!("line {line}: a matrix made by an expression is not run here yet")) }
+    let mut combos: Vec<serde_json::Map<String, Value>> = vec![serde_json::Map::new()];
+    let mut keys = vec![];
+    for (k, v) in m.pairs() {
+        let key = k.text().unwrap_or_default().to_string();
+        if key == "include" || key == "exclude" { continue }
+        let Value::Array(values) = matrix_value(v)? else { return Err(format!("the matrix's {key} is not a list")) };
+        keys.push(key.clone());
+        combos = combos.into_iter().flat_map(|c| { let key = key.clone(); values.iter().map(move |v| { let mut c = c.clone(); c.insert(key.clone(), v.clone()); c }) }).collect();
+    }
+    if keys.is_empty() { combos.clear() }
+    let entries = |name: &str| -> std::result::Result<Vec<serde_json::Map<String, Value>>, String> {
+        match m.get(name) { Some(n) => match matrix_value(n)? { Value::Array(a) => Ok(a.into_iter().filter_map(|v| v.as_object().cloned()).collect()), _ => Err(format!("the matrix's {name} is not a list")) }, None => Ok(vec![]) }
+    };
+    for ex in entries("exclude")? { combos.retain(|c| !ex.iter().all(|(k, v)| c.get(k) == Some(v))) }
+    let original = combos.len();
+    for inc in entries("include")? {
+        let mut matched = false;
+        for c in combos.iter_mut().take(original) {
+            if inc.iter().filter(|(k, _)| keys.contains(k)).all(|(k, v)| c.get(k) == Some(v)) { for (k, v) in &inc { if !keys.contains(k) || c.get(k).is_none() { c.insert(k.clone(), v.clone()); } } matched = true }
+        }
+        if !matched { combos.push(inc) }
+    }
+    Ok(Some(combos))
+}
+
+/// The jobs a job needs, by name.
+pub fn needs(job: &Node) -> Vec<String> {
+    match job.get("needs") { Some(Node::Scalar { text, .. }) => vec![text.clone()], Some(n) => n.items().iter().filter_map(|i| i.text().map(str::to_string)).collect(), None => vec![] }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +317,17 @@ mod tests {
         // A `}}` inside a quoted string does not end the expression; one never closed is text.
         assert_eq!(t("${{ format('{0}}}', 1) }}"), json!({ "type": 3, "expr": "format('{0}}}', 1)" }));
         assert_eq!(t("${{ open"), json!({ "type": 0, "lit": "${{ open" }));
+    }
+
+    #[test]
+    fn a_matrix_makes_its_combinations_as_github_makes_them() {
+        let job = parse("strategy:\n  matrix:\n    node: [20, 22]\n    os: [linux, mac]\n    exclude:\n      - node: 20\n        os: mac\n    include:\n      - node: 22\n        extra: yes\n      - node: 24\n        os: linux\nneeds: [a, b]\n").unwrap();
+        let m = matrix(&job).unwrap().unwrap();
+        let shown: Vec<String> = m.iter().map(|c| serde_json::to_string(c).unwrap()).collect();
+        assert_eq!(shown, [r#"{"node":20.0,"os":"linux"}"#, r#"{"extra":"yes","node":22.0,"os":"linux"}"#, r#"{"extra":"yes","node":22.0,"os":"mac"}"#, r#"{"node":24.0,"os":"linux"}"#]);
+        assert_eq!(needs(&job), ["a", "b"]);
+        assert!(matrix(&parse("runs-on: x").unwrap()).unwrap().is_none());
+        assert!(matrix(&parse("strategy:\n  matrix: ${{ fromJSON(needs.a.outputs.m) }}").unwrap()).is_err());
     }
 
     #[test]

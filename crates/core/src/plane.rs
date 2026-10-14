@@ -2654,9 +2654,12 @@ impl<'a> ControlPlane<'a> {
         Ok(Response::json(&serde_json::json!({ "stored": req.body.len() })))
     }
 
-    /// A run from a computer: a workflow file's job, run as GitHub would run it, on a machine as any job of this
-    /// control plane's, with the working tree uploaded (`tree_part`) in place of a checkout, and what a run gives
-    /// beyond GitHub's (`secrets`, `vars`). The job's runner takes the job from here (see `runner_service`).
+    /// A run from a computer: a workflow file's jobs, run as GitHub would run them, each on a machine as any job of
+    /// this control plane's, with the working tree uploaded (`tree_part`) in place of a checkout, and what a run gives
+    /// beyond GitHub's (`secrets`, `vars`). Each combination of a matrix is a job of its own; a job starts once the
+    /// jobs it needs have ended, and runs if its `if` holds (by default, if they all succeeded), knowing their
+    /// results and outputs (see `advance_run`). Each job's runner takes the job from here (see `runner_service`).
+    /// With `--job`, that job and the jobs it needs.
     async fn create_run(&self, req: &Request, plane_url: &str, key: Option<RunKey>) -> Result<Response> {
         #[derive(Deserialize)]
         struct NewRun { workflow: String, path: String, #[serde(default)] job: Option<String>, repository: String, #[serde(default, rename = "ref")] reference: String,
@@ -2664,71 +2667,251 @@ impl<'a> ControlPlane<'a> {
             #[serde(default)] vars: Vec<(String, String)>, #[serde(default)] tree: Option<String>, #[serde(default)] parts: u32 }
         let r: NewRun = match serde_json::from_slice(&req.body) { Ok(r) => r, Err(e) => return Ok(Response::text(400, &format!("not a run: {e}"))) };
         let wf = match crate::workflow::parse(&r.workflow) { Ok(w) => w, Err(e) => return Ok(Response::text(400, &e)) };
-        let names: Vec<String> = wf.get("jobs").map(|j| j.pairs().iter().filter_map(|(k, _)| k.text().map(str::to_string)).collect()).unwrap_or_default();
-        let job_name = match (r.job.clone(), names.as_slice()) {
-            (Some(j), _) if names.contains(&j) => j,
-            (Some(j), _) => return Ok(Response::text(400, &format!("{} has no job named {j}: {}", r.path, names.join(", ")))),
-            (None, [one]) => one.clone(),
-            (None, _) => return Ok(Response::text(400, &format!("say which job: {}", names.join(", ")))),
+        let jobs = wf.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default();
+        let names: Vec<String> = jobs.iter().filter_map(|(k, _)| k.text().map(str::to_string)).collect();
+        if names.is_empty() { return Ok(Response::text(400, &format!("{} has no jobs", r.path))) }
+        // Which jobs: all of them, or the one asked for and those it needs (and those they need).
+        let mut wanted: Vec<String> = match &r.job {
+            Some(j) if names.contains(j) => vec![j.clone()],
+            Some(j) => return Ok(Response::text(400, &format!("{} has no job named {j}: {}", r.path, names.join(", ")))),
+            None => names.clone(),
         };
-        let found = wf.get("jobs").and_then(|j| j.get(&job_name));
-        if found.and_then(|j| j.get("needs")).is_some() { return Ok(Response::text(400, &format!("the job {job_name} needs other jobs; a run from a computer runs one job by itself yet"))) }
-        if found.and_then(|j| j.get("strategy")).and_then(|s| s.get("matrix")).is_some() { return Ok(Response::text(400, &format!("the job {job_name} has a matrix; a run from a computer runs a job without one yet"))) }
-        if found.and_then(|j| j.get("uses")).is_some() { return Ok(Response::text(400, &format!("the job {job_name} calls another workflow; a run from a computer runs a job with steps of its own yet"))) }
-        // Its machine: the one its label says when it is this control plane's, else the default machine.
-        let runs_on = found.and_then(|j| j.get("runs-on")).and_then(|n| n.text()).unwrap_or_default().to_string();
-        let label = if self.config.parse(&runs_on).is_some() { runs_on } else { self.config.label.clone() };
-        let now = self.clock.now_ms();
-        // A key for coding agents starts only what it may: a machine of so many CPUs, so many runs at once, so much
-        // in a day (what its runs' machines cost, estimated as they run). Its own runs are counted, no one else's.
-        if let Some(k) = &key {
-            let cpu = match self.config.parse(&label) { Some(Ok(s)) => Capacity::aws().fit(&s.or(&self.config.machine)).map(|s| s.cpu).unwrap_or(4), _ => 4 };
-            if cpu > k.cpu { return Ok(Response::text(403, &format!("the key {} may start jobs of {} CPUs at most; {job_name} asks for {cpu}", k.name.to_lowercase(), k.cpu))) }
-            let mine: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.by.as_deref() == Some(k.name.as_str())).collect();
-            if mine.iter().filter(|j| active(j) || j.state == "waiting").count() >= k.at_once { return Ok(Response::text(429, &format!("{} runs of the key {} are going: wait for one to end", k.at_once, k.name.to_lowercase()))) }
-            let spent: f64 = mine.iter().filter(|j| now.saturating_sub(j.at_ms) < 86_400_000).map(|j| j.cost_usd.unwrap_or_else(|| j.usd_per_hour.unwrap_or(0.0) * (j.ended_ms.unwrap_or(now).saturating_sub(j.launched_ms.unwrap_or(now))) as f64 / 3_600_000.0)).sum();
-            if spent >= k.daily_usd { return Ok(Response::text(429, &format!("the key {} has spent ${spent:.2} of its ${:.2} for a day: wait, or ask for more", k.name.to_lowercase(), k.daily_usd))) }
+        let mut i = 0;
+        while i < wanted.len() {
+            let job = wf.get("jobs").and_then(|j| j.get(&wanted[i])).cloned();
+            for n in job.as_ref().map(crate::workflow::needs).unwrap_or_default() {
+                if !names.contains(&n) { return Ok(Response::text(400, &format!("the job {} needs {n}, which {} does not have", wanted[i], r.path))) }
+                if !wanted.contains(&n) { wanted.push(n) }
+            }
+            i += 1;
         }
-        // (Ids far above GitHub's, so that no job of GitHub's is ever taken for one of these.)
-        let job_id = (1u64 << 62) + now * 1000 + (crate::crypto::random_bytes(2).iter().map(|b| *b as u64).sum::<u64>() % 1000);
-        let token = crate::crypto::random_token(24);
-        let owner = r.repository.split('/').next().unwrap_or_default().to_string();
-        let reference = if r.reference.is_empty() { "refs/heads/main".to_string() } else { r.reference.clone() };
-        let github = serde_json::json!({ "event_name": if r.event_name.is_empty() { "push" } else { r.event_name.as_str() }, "event": {}, "repository": r.repository, "repository_owner": owner,
-            "ref": reference, "ref_name": reference.rsplit('/').next().unwrap_or_default(), "ref_type": if reference.starts_with("refs/tags/") { "tag" } else { "branch" }, "sha": r.sha,
-            "actor": r.actor, "triggering_actor": r.actor, "workflow": wf.get("name").and_then(|n| n.text()).unwrap_or(&r.path), "run_id": job_id.to_string(), "run_number": "1", "run_attempt": "1",
-            "server_url": "https://github.com", "api_url": "https://api.github.com", "graphql_url": "https://api.github.com/graphql", "job": job_name, "retention_days": "1" });
-        let service = format!("{plane_url}/runner/{token}/");
-        let given = crate::runner_service::Given { workflow: &r.workflow, path: &r.path, job: &job_name, secrets: &r.secrets, vars: &r.vars, github, service: &service,
-            access_token: &crate::runner_service::access_token(now), ids: crate::runner_service::Ids::new(1) };
-        let message = match crate::runner_service::job_message(&given) { Ok(m) => m, Err(e) => return Ok(Response::text(400, &e)) };
-        let display = message["jobDisplayName"].as_str().unwrap_or(&job_name).to_string();
-        put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: r.tree.clone(), parts: r.parts, at_ms: now, job_id, ..Default::default() }).await?;
-        let mut job = Job { job_id, run_id: job_id, repo: r.repository.clone(), state: "launching".into(), at_ms: now, label, name: display, workflow: r.path.clone(), provider: "local".into(),
-            local: Some(token.clone()), queued_ms: Some(now), by: key.as_ref().map(|k| k.name.clone()), ..Default::default() };
-        put_json(self.store, &format!("run:{job_id}"), &serde_json::json!({ "jobs": [job_id], "token": token, "tree": r.tree, "at_ms": now })).await?;
-        if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(Response::text(409, "try again")) }
-        self.start_soon(plane_url, &mut job).await?;
-        Ok(Response::json(&serde_json::json!({ "run_id": job_id.to_string(), "job": job_name })))
+        // Each job, each combination of its matrix: one job of the run, in the order of the file.
+        let now = self.clock.now_ms();
+        let mut instances = vec![];
+        for name in names.iter().filter(|n| wanted.contains(n)) {
+            let job = wf.get("jobs").and_then(|j| j.get(name)).cloned().unwrap_or(crate::workflow::Node::Scalar { text: String::new(), plain: true, line: 0, col: 0 });
+            if job.get("uses").is_some() { return Ok(Response::text(400, &format!("the job {name} calls another workflow; a run from a computer runs jobs with steps of their own yet"))) }
+            let combos = match crate::workflow::matrix(&job) { Ok(Some(c)) => c.into_iter().map(serde_json::Value::Object).collect::<Vec<_>>(), Ok(None) => vec![serde_json::Value::Null], Err(e) => return Ok(Response::text(400, &format!("the job {name}: {e}"))) };
+            if combos.is_empty() { continue }
+            let total = combos.len();
+            for (index, matrix) in combos.into_iter().enumerate() {
+                instances.push(serde_json::json!({ "key": name, "index": index, "total": total, "matrix": matrix, "needs": crate::workflow::needs(&job), "state": "pending" }));
+            }
+        }
+        if instances.len() > 64 { return Ok(Response::text(400, &format!("{} jobs: a run from a computer runs 64 at most", instances.len()))) }
+        // A key for coding agents starts only what it may (see `RunKey`): checked for each job when it starts, and
+        // here for what is known now.
+        if let Some(k) = &key {
+            for inst in &instances {
+                let name = inst["key"].as_str().unwrap_or_default();
+                let values: serde_json::Map<String, serde_json::Value> = [("matrix".to_string(), inst["matrix"].clone())].into_iter().collect();
+                let c = crate::expression::Contexts { values: &values, status: crate::expression::Status::Success };
+                let runs_on = wf.get("jobs").and_then(|j| j.get(name)).and_then(|j| j.get("runs-on")).and_then(|n| n.text()).and_then(|t| crate::expression::interpolate(t, &c).ok()).unwrap_or_default();
+                let label = if self.config.parse(&runs_on).is_some() { runs_on } else { self.config.label.clone() };
+                let cpu = match self.config.parse(&label) { Some(Ok(s)) => Capacity::aws().fit(&s.or(&self.config.machine)).map(|s| s.cpu).unwrap_or(4), _ => 4 };
+                if cpu > k.cpu { return Ok(Response::text(403, &format!("the key {} may start jobs of {} CPUs at most; {name} asks for {cpu}", k.name.to_lowercase(), k.cpu))) }
+            }
+            if let Err(why) = self.within(k, now).await { return Ok(Response::text(429, &why)) }
+        }
+        let run_id = (1u64 << 62) + now * 1000 + (crate::crypto::random_bytes(2).iter().map(|b| *b as u64).sum::<u64>() % 1000);
+        let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
+            "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances });
+        put_json(self.store, &format!("run:{run_id}"), &run).await?;
+        if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
+        let run = get_json::<serde_json::Value>(self.store, &format!("run:{run_id}")).await?.unwrap_or_default();
+        Ok(Response::json(&serde_json::json!({ "run_id": run_id.to_string(), "jobs": run["jobs"].as_array().map(|j| j.iter().map(|j| j["name"].clone()).collect::<Vec<_>>()).unwrap_or_default() })))
     }
 
-    /// How a run from a computer goes: its job's state, how it ended, its steps, and the lines its runner wrote
-    /// after `after` (a count the answer gives back as `next`).
+    /// Whether a key for coding agents may start another run now: so many runs at a time, so much in a day.
+    async fn within(&self, k: &RunKey, now: u64) -> std::result::Result<(), String> {
+        let mine: Vec<Job> = self.store.list("job:").await.map_err(|e| e.to_string())?.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.by.as_deref() == Some(k.name.as_str())).collect();
+        let mut going: Vec<u64> = mine.iter().filter(|j| active(j) || j.state == "waiting").map(|j| j.run_id).collect();
+        going.sort_unstable(); going.dedup();
+        if going.len() >= k.at_once { return Err(format!("{} runs of the key {} are going: wait for one to end", k.at_once, k.name.to_lowercase())) }
+        let spent: f64 = mine.iter().filter(|j| now.saturating_sub(j.at_ms) < 86_400_000).map(|j| j.cost_usd.unwrap_or_else(|| j.usd_per_hour.unwrap_or(0.0) * (j.ended_ms.unwrap_or(now).saturating_sub(j.launched_ms.unwrap_or(now))) as f64 / 3_600_000.0)).sum();
+        if spent >= k.daily_usd { return Err(format!("the key {} has spent ${spent:.2} of its ${:.2} for a day: wait, or ask for more", k.name.to_lowercase(), k.daily_usd)) }
+        Ok(())
+    }
+
+    /// Moves a run from a computer on: notes how its started jobs ended, then starts each job whose needs have all
+    /// ended and whose `if` holds (one that does not is skipped), as long as anything changes. The run's record is
+    /// written over exactly what was read of it (`Store::swap`), so that two requests that move it at once (two
+    /// jobs ending together) never start a job twice: the jobs are started only once that write has been made.
+    async fn advance_run(&self, plane_url: &str, run_id: u64) -> std::result::Result<(), String> {
+        let key = format!("run:{run_id}");
+        for _ in 0..16 {
+            let Some(was) = self.store.get(&key).await? else { return Ok(()) };
+            let mut run: serde_json::Value = serde_json::from_str(&was).map_err(|e| e.to_string())?;
+            let wf = crate::workflow::parse(run["workflow"].as_str().unwrap_or_default())?;
+            let mut changed = false;
+            // How each started job ended: its runner said, or its machine never came (a start that failed).
+            let jobs = run["jobs"].as_array().cloned().unwrap_or_default();
+            let mut jobs = jobs;
+            for j in jobs.iter_mut().filter(|j| j["state"] == "started") {
+                let (Some(id), Some(token)) = (j["job_id"].as_str().and_then(|i| i.parse::<u64>().ok()), j["token"].as_str()) else { continue };
+                let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?;
+                let record = get_json::<Job>(self.store, &format!("job:{id}")).await?;
+                let said = handed.as_ref().and_then(|h| h.result.clone());
+                let over = record.as_ref().is_some_and(|r| r.ended_ms.is_some() || ["failed", "swept", "cancelled", "orphan"].contains(&r.state.as_str()));
+                if said.is_none() && !over { continue }
+                let result = match said.as_deref() { Some("succeeded") => "success", Some("cancelled" | "canceled") => "cancelled", Some("skipped") => "skipped", _ => "failure" };
+                let outputs: serde_json::Map<String, serde_json::Value> = handed.as_ref().and_then(|h| h.outputs.clone()).and_then(|o| o.as_object().cloned()).unwrap_or_default()
+                    .into_iter().map(|(k, v)| (k, v.get("value").cloned().unwrap_or(v))).collect();
+                j["state"] = "done".into(); j["result"] = result.into(); j["outputs"] = outputs.into();
+                changed = true;
+            }
+            // Each job whose needs have ended: started, or skipped.
+            let mut start = vec![];
+            loop {
+                let mut moved = false;
+                for i in 0..jobs.len() {
+                    if jobs[i]["state"] != "pending" { continue }
+                    let needed: Vec<String> = jobs[i]["needs"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(str::to_string)).collect();
+                    let of = |n: &str| jobs.iter().filter(|j| j["key"] == n).collect::<Vec<_>>();
+                    if needed.iter().any(|n| of(n).iter().any(|j| j["state"] != "done")) { continue }
+                    let mut needs = serde_json::Map::new();
+                    let mut status = crate::expression::Status::Success;
+                    let mut all_good = true;
+                    for n in &needed {
+                        let results: Vec<&str> = of(n).iter().map(|j| j["result"].as_str().unwrap_or("skipped")).collect();
+                        let result = if results.contains(&"failure") { "failure" } else if results.contains(&"cancelled") { "cancelled" } else if results.iter().all(|r| *r == "skipped") { "skipped" } else { "success" };
+                        if result == "failure" { status = crate::expression::Status::Failure }
+                        if result == "cancelled" && status == crate::expression::Status::Success { status = crate::expression::Status::Cancelled }
+                        all_good &= result == "success";
+                        let mut outputs = serde_json::Map::new();
+                        for j in of(n) { for (k, v) in j["outputs"].as_object().into_iter().flatten() { outputs.insert(k.clone(), v.clone()); } }
+                        needs.insert(n.clone(), serde_json::json!({ "result": result, "outputs": outputs }));
+                    }
+                    let key_name = jobs[i]["key"].as_str().unwrap_or_default().to_string();
+                    let job = wf.get("jobs").and_then(|j| j.get(&key_name));
+                    let values = self.run_contexts(&run, &jobs[i], &needs);
+                    let c = crate::expression::Contexts { values: &values, status };
+                    let runs = match job.and_then(|j| j.get("if")).and_then(|n| n.text()) {
+                        Some(cond) => crate::expression::holds(cond, &c).map_err(|e| format!("the job {key_name}'s if: {e}"))?,
+                        None => all_good,
+                    };
+                    let name = self.instance_name(job, &jobs[i], &values)?;
+                    jobs[i]["name"] = name.into();
+                    jobs[i]["needs_said"] = serde_json::Value::Object(needs);
+                    if runs {
+                        // (Reserved here, started once the record says so: see above.)
+                        let now = self.clock.now_ms();
+                        jobs[i]["state"] = "started".into();
+                        jobs[i]["job_id"] = ((1u64 << 62) + now * 1000 + (crate::crypto::random_bytes(2).iter().map(|b| *b as u64).sum::<u64>() % 1000)).to_string().into();
+                        jobs[i]["token"] = crate::crypto::random_token(24).into();
+                        start.push(i);
+                    } else {
+                        jobs[i]["state"] = "done".into(); jobs[i]["result"] = "skipped".into();
+                    }
+                    moved = true;
+                }
+                if !moved { break }
+                changed = true;
+            }
+            if !changed { return Ok(()) }
+            // A run all over keeps no secret.
+            if jobs.iter().all(|j| j["state"] == "done") { run["secrets"] = serde_json::json!([]) }
+            let secrets: Vec<(String, String)> = serde_json::from_value(run["secrets"].clone()).unwrap_or_default();
+            run["jobs"] = serde_json::Value::Array(jobs.clone());
+            if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
+            for i in start { self.start_instance(plane_url, run_id, &run, &jobs[i], &secrets, &wf).await? }
+            // (All over: its working tree goes now, not after a day.)
+            if let Some(tree) = run["tree"].as_str().filter(|_| jobs.iter().all(|j| j["state"] == "done")) {
+                for (k, _) in self.store.list(&format!("rtree:{tree}:")).await? { self.store.delete(&k).await? }
+                self.store.delete(&format!("rtree-at:{tree}")).await?;
+            }
+            return Ok(())
+        }
+        Err("the run kept changing while it was moved on".into())
+    }
+
+    /// The contexts a job of a run from a computer is read with: `github`, `vars`, `inputs`, its `matrix`, its
+    /// `strategy`, and what it `needs`.
+    fn run_contexts(&self, run: &serde_json::Value, job: &serde_json::Value, needs: &serde_json::Map<String, serde_json::Value>) -> serde_json::Map<String, serde_json::Value> {
+        let vars: serde_json::Map<String, serde_json::Value> = serde_json::from_value::<Vec<(String, String)>>(run["vars"].clone()).unwrap_or_default().into_iter().map(|(k, v)| (k, v.into())).collect();
+        let reference = run["ref"].as_str().filter(|r| !r.is_empty()).unwrap_or("refs/heads/main");
+        let mut c = serde_json::Map::new();
+        c.insert("github".into(), serde_json::json!({ "event_name": run["event_name"].as_str().filter(|e| !e.is_empty()).unwrap_or("push"), "repository": run["repository"], "ref": reference, "sha": run["sha"], "actor": run["actor"] }));
+        c.insert("vars".into(), vars.into());
+        c.insert("inputs".into(), serde_json::json!({}));
+        c.insert("matrix".into(), job["matrix"].clone());
+        c.insert("strategy".into(), serde_json::json!({ "fail-fast": true, "job-index": job["index"], "job-total": job["total"], "max-parallel": job["total"] }));
+        c.insert("needs".into(), serde_json::Value::Object(needs.clone()));
+        c
+    }
+
+    /// A job's name as shown: its `name:` (with its expressions read), else its key, with its matrix's values.
+    fn instance_name(&self, job: Option<&crate::workflow::Node>, inst: &serde_json::Value, values: &serde_json::Map<String, serde_json::Value>) -> std::result::Result<String, String> {
+        let key = inst["key"].as_str().unwrap_or_default();
+        let c = crate::expression::Contexts { values, status: crate::expression::Status::Success };
+        if let Some(n) = job.and_then(|j| j.get("name")).and_then(|n| n.text()) { return crate::expression::interpolate(n, &c) }
+        Ok(match inst["matrix"].as_object().filter(|m| !m.is_empty()) {
+            Some(m) => format!("{key} ({})", m.values().map(crate::expression::text).collect::<Vec<_>>().join(", ")),
+            None => key.to_string(),
+        })
+    }
+
+    /// Starts one job of a run from a computer: its message (with its matrix, strategy and needs), its record, and
+    /// its machine, as any job's.
+    async fn start_instance(&self, plane_url: &str, run_id: u64, run: &serde_json::Value, inst: &serde_json::Value, secrets: &[(String, String)], wf: &crate::workflow::Node) -> std::result::Result<(), String> {
+        let (key_name, token) = (inst["key"].as_str().unwrap_or_default(), inst["token"].as_str().unwrap_or_default());
+        let job_id: u64 = inst["job_id"].as_str().and_then(|i| i.parse().ok()).ok_or("a job without its id")?;
+        let job = wf.get("jobs").and_then(|j| j.get(key_name));
+        let needs = inst["needs_said"].as_object().cloned().unwrap_or_default();
+        let values = self.run_contexts(run, inst, &needs);
+        let c = crate::expression::Contexts { values: &values, status: crate::expression::Status::Success };
+        // Its machine: the one its label says when it is this control plane's, else the default machine.
+        let runs_on = job.and_then(|j| j.get("runs-on")).and_then(|n| n.text()).map(|t| crate::expression::interpolate(t, &c)).transpose()?.unwrap_or_default();
+        let label = if self.config.parse(&runs_on).is_some() { runs_on } else { self.config.label.clone() };
+        let now = self.clock.now_ms();
+        let repository = run["repository"].as_str().unwrap_or_default().to_string();
+        let reference = run["ref"].as_str().filter(|r| !r.is_empty()).unwrap_or("refs/heads/main").to_string();
+        let actor = run["actor"].as_str().unwrap_or_default();
+        let path = run["path"].as_str().unwrap_or_default().to_string();
+        let github = serde_json::json!({ "event_name": run["event_name"].as_str().filter(|e| !e.is_empty()).unwrap_or("push"), "event": {}, "repository": repository,
+            "repository_owner": repository.split('/').next().unwrap_or_default(), "ref": reference, "ref_name": reference.rsplit('/').next().unwrap_or_default(),
+            "ref_type": if reference.starts_with("refs/tags/") { "tag" } else { "branch" }, "sha": run["sha"], "actor": actor, "triggering_actor": actor,
+            "workflow": wf.get("name").and_then(|n| n.text()).unwrap_or(&path), "run_id": run_id.to_string(), "run_number": "1", "run_attempt": "1",
+            "server_url": "https://github.com", "api_url": "https://api.github.com", "graphql_url": "https://api.github.com/graphql", "job": key_name, "retention_days": "1" });
+        let service = format!("{plane_url}/runner/{token}/");
+        let vars: Vec<(String, String)> = serde_json::from_value(run["vars"].clone()).unwrap_or_default();
+        let display = inst["name"].as_str().map(str::to_string);
+        let given = crate::runner_service::Given { workflow: run["workflow"].as_str().unwrap_or_default(), path: &path, job: key_name, secrets, vars: &vars, github, service: &service,
+            access_token: &crate::runner_service::access_token(now), ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
+            strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone() };
+        let message = crate::runner_service::job_message(&given)?;
+        put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, at_ms: now, job_id, ..Default::default() }).await?;
+        let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),
+            local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), ..Default::default() };
+        if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(()) }
+        self.start_soon(plane_url, &mut job).await
+    }
+
+    /// How a run from a computer goes: each job's name, state, how it ended, its machine, and the lines its runner
+    /// wrote after the count given for it in `after` (one count for each job, in order, comma between; the answer
+    /// gives them back as `next`); and the run's own state and result once all its jobs are over.
     async fn run_status(&self, path: &str, url: &url::Url) -> Result<Response> {
         let Some(id) = path.trim_start_matches("/runs/").parse::<u64>().ok() else { return Ok(nothing_here()) };
         let Some(run) = get_json::<serde_json::Value>(self.store, &format!("run:{id}")).await? else { return Ok(nothing_here()) };
-        let token = run["token"].as_str().unwrap_or_default();
-        let after = url.query_pairs().find(|(k, _)| k == "after").and_then(|(_, v)| v.parse::<u64>().ok()).unwrap_or(0);
-        let job = get_json::<Job>(self.store, &format!("job:{id}")).await?;
-        let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?;
-        let (mut lines, mut next) = (vec![], after);
-        for (k, v) in self.store.list(&format!("rline:{token}:")).await? {
-            let n = k.rsplit(':').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-            if n > after { lines.extend(serde_json::from_str::<Vec<String>>(&v).unwrap_or_default()); next = next.max(n) }
+        let after: Vec<u64> = url.query_pairs().find(|(k, _)| k == "after").map(|(_, v)| v.split(',').map(|n| n.parse().unwrap_or(0)).collect()).unwrap_or_default();
+        let mut out = vec![];
+        for (i, j) in run["jobs"].as_array().into_iter().flatten().enumerate() {
+            let from = after.get(i).copied().unwrap_or(0);
+            let (mut lines, mut next) = (vec![], from);
+            let record = match j["job_id"].as_str().and_then(|i| i.parse::<u64>().ok()) { Some(jid) => get_json::<Job>(self.store, &format!("job:{jid}")).await?, None => None };
+            if let Some(token) = j["token"].as_str() {
+                for (k, v) in self.store.list(&format!("rline:{token}:")).await? {
+                    let n = k.rsplit(':').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                    if n > from { lines.extend(serde_json::from_str::<Vec<String>>(&v).unwrap_or_default()); next = next.max(n) }
+                }
+            }
+            out.push(serde_json::json!({ "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
+                "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next }));
         }
-        Ok(Response::json(&serde_json::json!({ "run_id": id.to_string(), "state": job.as_ref().map(|j| j.state.clone()), "error": job.as_ref().and_then(|j| j.error.clone()),
-            "machine": job.as_ref().and_then(|j| j.machine_type.clone()), "result": handed.as_ref().and_then(|h| h.result.clone()), "steps": handed.as_ref().map(|h| h.steps.clone()).unwrap_or_default(),
-            "lines": lines, "next": next })))
+        let jobs = run["jobs"].as_array().cloned().unwrap_or_default();
+        let over = jobs.iter().all(|j| j["state"] == "done");
+        let result = over.then(|| if jobs.iter().any(|j| j["result"] == "failure") { "failure" } else if jobs.iter().any(|j| j["result"] == "cancelled") { "cancelled" } else { "success" });
+        Ok(Response::json(&serde_json::json!({ "run_id": id.to_string(), "over": over, "result": result, "jobs": out })))
     }
 
     /// A call of the runner of a run from a computer, at `/runner/<token>/…`: its checkout and working tree, or
@@ -2765,11 +2948,8 @@ impl<'a> ControlPlane<'a> {
                     let ev = github::JobEvent { action: "completed".into(), job_id: job.job_id, run_id: job.run_id, attempt: 1, created_ms: job.queued_ms, repo: job.repo.clone(), installation_id: 0,
                         runner_name: Some(after.runner.clone()), conclusion: Some(conclusion), name: job.name.clone(), workflow: job.workflow.clone(), label: job.label.clone(), spec: Ok(Spec::default()), public: false };
                     self.completed(plane_url, &ev).await?;
-                }
-                // (Its working tree is fetched: it goes now, not after a day.)
-                if let Some(tree) = &after.tree {
-                    for (k, _) in self.store.list(&format!("rtree:{tree}:")).await? { self.store.delete(&k).await? }
-                    self.store.delete(&format!("rtree-at:{tree}")).await?;
+                    // (The run it is a job of moves on: the jobs that needed it may start.)
+                    if let Err(e) = self.advance_run(plane_url, job.run_id).await { let _ = self.store.put(&format!("run-error:{}", job.run_id), e).await; }
                 }
                 // (Its secrets go with the job: nothing of them is kept once it has ended.)
                 let mut done = after.clone();
@@ -3070,13 +3250,21 @@ impl<'a> ControlPlane<'a> {
             let removed = match self.aws_connection().await { Ok(Some(a)) => match self.aws_creds(&plane_url, &a).await { Ok(c) => aws::delete_template(self.http, region, &c, name, now).await, Err(e) => Err(e) }, _ => Err("no AWS".into()) };
             if removed.is_ok() || at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > 86_400_000) { self.store.delete(&k).await? }
         }
-        // What a run from a computer kept (its job's message, lines, logs, working tree): gone after a day.
+        // Runs from a computer with jobs still going: moved on (a job whose machine never came has ended).
+        for (k, v) in self.store.list("run:").await? {
+            let run: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
+            if run["jobs"].as_array().is_some_and(|j| j.iter().any(|j| j["state"] != "done")) {
+                if let Ok(id) = k.trim_start_matches("run:").parse::<u64>() { let _ = self.advance_run(&plane_url, id).await; }
+            }
+        }
+        // What a run from a computer kept (its jobs' messages, lines, logs, working tree): gone after a day.
         for (k, v) in self.store.list("run:").await? {
             let run: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
             if run["at_ms"].as_u64().is_some_and(|at| now.saturating_sub(at) < 86_400_000) { continue }
-            let token = run["token"].as_str().unwrap_or_default();
-            for prefix in [format!("rline:{token}:"), format!("rlog:{token}:")] { for (k, _) in self.store.list(&prefix).await? { self.store.delete(&k).await? } }
-            self.store.delete(&format!("rjob:{token}")).await?;
+            for token in run["jobs"].as_array().into_iter().flatten().filter_map(|j| j["token"].as_str()) {
+                for prefix in [format!("rline:{token}:"), format!("rlog:{token}:")] { for (k, _) in self.store.list(&prefix).await? { self.store.delete(&k).await? } }
+                self.store.delete(&format!("rjob:{token}")).await?;
+            }
             self.store.delete(&k).await?;
         }
         for (k, at) in self.store.list("rtree-at:").await? {

@@ -3245,7 +3245,7 @@ fn the_runners_calls_for_a_job_are_answered_as_its_service_answers_them() {
     let store = Mem::default();
     let given = Given { workflow: include_str!("fixtures/runner/three.yml"), path: ".github/workflows/ci.yml", job: "test", secrets: &[("A_SECRET".into(), "hunter2.hunter2".into())],
         vars: &[("A_VAR".into(), "fromcli".into())], github: serde_json::json!({ "event_name": "push", "repository": "acme/app", "ref": "refs/heads/main" }),
-        service: "https://plane.example/runner/abc/", access_token: &access_token(1_790_000_000_000), ids: Ids::new(4) };
+        service: "https://plane.example/runner/abc/", access_token: &access_token(1_790_000_000_000), ids: Ids::new(4), matrix: serde_json::Value::Null, strategy: serde_json::Value::Null, needs: serde_json::Value::Null, display: None };
     let message = job_message(&given).unwrap();
     // (Every part GitHub's own message has, but GitHub's own bookkeeping.)
     let github: serde_json::Value = serde_json::from_str(include_str!("fixtures/runner/record.github.json")).unwrap();
@@ -3308,8 +3308,9 @@ fn a_run_from_a_computer_gets_its_machine_and_its_runner_takes_the_job_from_the_
     let server = config_of(".runner")["ServerUrl"].as_str().unwrap().to_string();
     assert!(server.starts_with(&format!("{PLANE_URL}/runner/")) && config_of(".credentials")["Data"]["AuthorizationUrl"] == format!("{server}/_apis/v1/auth/"), "{server}");
     assert!(!clouds.calls.borrow().iter().any(|c| c.1.contains("generate-jitconfig")), "GitHub is not asked for a runner");
-    let job_id: u64 = run_id.parse().unwrap();
-    assert!(job_id > 1 << 62 && job(&store, job_id)["provider"] == "local" && job(&store, job_id)["state"] == "launched");
+    let record: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{run_id}")]).unwrap();
+    let job_id: u64 = record["jobs"][0]["job_id"].as_str().unwrap().parse().unwrap();
+    assert!(job_id > 1 << 62 && job(&store, job_id)["provider"] == "local" && job(&store, job_id)["state"] == "launched" && job(&store, job_id)["name"] == "The test job");
     // Its checkout: the action that puts the tree in place, and the tree in its parts, as uploaded.
     let checkout = run(Request::new("GET", &format!("{server}/superci/checkout.tar.gz")));
     assert_eq!((checkout.status, &checkout.body[..2]), (200, &[0x1f, 0x8b][..]));
@@ -3331,10 +3332,10 @@ fn a_run_from_a_computer_gets_its_machine_and_its_runner_takes_the_job_from_the_
     assert!(clouds.calls.borrow().iter().any(|c| c.2.contains("Action=TerminateInstances")), "its machine is ended with it");
     // How it went, for the command that started it: its result and its lines; and its secrets are kept no more.
     let status = json(&run(key(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}")))));
-    assert_eq!(status["result"], "succeeded");
-    assert!(status["lines"].as_array().is_some_and(|l| !l.is_empty()) && status["next"].as_u64() > Some(0), "{status}");
-    let later = json(&run(key(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}?after={}", status["next"])))));
-    assert!(later["lines"].as_array().is_some_and(|l| l.is_empty()));
+    assert_eq!((status["over"].as_bool(), status["result"].as_str(), status["jobs"][0]["result"].as_str(), status["jobs"][0]["name"].as_str()), (Some(true), Some("success"), Some("success"), Some("The test job")), "{status}");
+    assert!(status["jobs"][0]["lines"].as_array().is_some_and(|l| !l.is_empty()) && status["jobs"][0]["next"].as_u64() > Some(0), "{status}");
+    let later = json(&run(key(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}?after={}", status["jobs"][0]["next"])))));
+    assert!(later["jobs"][0]["lines"].as_array().is_some_and(|l| l.is_empty()));
     assert!(!store.0.borrow().values().any(|v| v.contains("hunter2hunter2")), "no secret is left in the store");
     assert!(!store.0.borrow().keys().any(|k| k.starts_with("rtree")), "nor its working tree, once fetched and the job over");
 }
@@ -3360,8 +3361,9 @@ fn a_key_for_coding_agents_starts_only_the_runs_it_may() {
     assert_eq!(run("superci", "superci_read_0123456789abcdef0123456789abcdef").status, 404);
     let made = run("superci", key);
     assert_eq!(made.status, 200, "{}", made.body_text());
-    let id: u64 = json(&made)["run_id"].as_str().unwrap().parse().unwrap();
-    assert_eq!(job(&store, id)["by"], "AGENT");
+    let run_id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let record: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{run_id}")]).unwrap();
+    assert_eq!(job(&store, record["jobs"][0]["job_id"].as_str().unwrap().parse().unwrap())["by"], "AGENT");
     let big = run("superci/cpu=8", key);
     assert_eq!((big.status, big.body_text().as_str()), (403, "the key agent may start jobs of 4 CPUs at most; test asks for 8"));
     // Three at a time.
@@ -3377,4 +3379,58 @@ fn a_key_for_coding_agents_starts_only_the_runs_it_may() {
     // The dashboard sees what each key may do.
     let status = json(&block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/status")).with_header("authorization", "Bearer dashboard-session-key-1"))));
     assert_eq!(status["read_keys"], serde_json::json!([{ "name": "AGENT", "until_ms": 4_102_444_800_000u64, "runs": { "cpu": 4, "daily_usd": 1.0, "at_once": 3 } }, { "name": "LOOKER", "until_ms": 4_102_444_800_000u64 }]));
+}
+
+#[test]
+fn a_run_from_a_computer_of_several_jobs_starts_each_once_what_it_needs_has_ended() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    let workflow = "jobs:\n  build:\n    runs-on: superci\n    outputs:\n      version: ${{ steps.v.outputs.version }}\n    steps:\n      - id: v\n        run: echo version=1.2 >> $GITHUB_OUTPUT\n  test:\n    needs: build\n    if: needs.build.outputs.version == '1.2'\n    runs-on: superci/cpu=${{ matrix.cpu }}\n    strategy:\n      matrix:\n        cpu: [2, 4]\n    steps:\n      - run: echo ${{ matrix.cpu }}\n  report:\n    needs: test\n    if: failure()\n    runs-on: superci\n    steps:\n      - run: echo something failed\n";
+    let made = run(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string())));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    let run_id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let record = || -> serde_json::Value { serde_json::from_str(&store.0.borrow()[&format!("run:{run_id}")]).unwrap() };
+    let states = || record()["jobs"].as_array().unwrap().iter().map(|j| format!("{}={}{}", j["name"].as_str().or(j["key"].as_str()).unwrap(), j["state"].as_str().unwrap(), j["result"].as_str().map(|r| format!(":{r}")).unwrap_or_default())).collect::<Vec<_>>();
+    // Only the build starts: the tests need it, the report needs them.
+    assert_eq!(states(), ["build=started", "test=pending", "test=pending", "report=pending"]);
+    assert_eq!(launches(&clouds).len(), 1);
+    // A job's runner, as a real one: takes its job, and says it ended (with these outputs).
+    let finish = |i: usize, outputs: &str| {
+        let token = record()["jobs"][i]["token"].as_str().unwrap().to_string();
+        for line in include_str!("fixtures/runner/runner-requests.jsonl").lines() {
+            let r: serde_json::Value = serde_json::from_str(line).unwrap();
+            let path = r["path"].as_str().unwrap().trim_start_matches("/runner/server");
+            let mut req = Request::new(r["method"].as_str().unwrap(), &format!("{PLANE_URL}/runner/{token}{path}"));
+            req.body = r["request"].as_str().unwrap().replace("\"outputs\":{}", &format!("\"outputs\":{outputs}")).into_bytes();
+            run(req);
+        }
+    };
+    finish(0, r#"{"version":{"value":"1.2"}}"#);
+    // Its output known, both tests start (each on the machine its matrix asks for), knowing what they need.
+    assert_eq!(states(), ["build=done:success", "test (2)=started", "test (4)=started", "report=pending"]);
+    assert_eq!(launches(&clouds).iter().skip(1).map(|l| field(l, "InstanceType")).collect::<Vec<_>>(), ["m8a.large", "m8a.xlarge"]);
+    let message = |i: usize| -> serde_json::Value { let h: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("rjob:{}", record()["jobs"][i]["token"].as_str().unwrap())]).unwrap(); h["message"].clone() };
+    let m = message(1);
+    assert_eq!((m["jobDisplayName"].as_str(), &m["contextData"]["matrix"]), (Some("test (2)"), &serde_json::json!({ "t": 2, "d": [{ "k": "cpu", "v": 2.0 }] })));
+    assert_eq!(m["contextData"]["needs"], serde_json::json!({ "t": 2, "d": [{ "k": "build", "v": { "t": 2, "d": [{ "k": "outputs", "v": { "t": 2, "d": [{ "k": "version", "v": "1.2" }] } }, { "k": "result", "v": "success" }] } }] }));
+    assert_eq!(message(2)["contextData"]["strategy"], serde_json::json!({ "t": 2, "d": [{ "k": "fail-fast", "v": true }, { "k": "job-index", "v": 1.0 }, { "k": "job-total", "v": 2.0 }, { "k": "max-parallel", "v": 2.0 }] }));
+    // One test ending is not enough for the report; both ending well, it is skipped (it runs on a failure).
+    finish(1, "{}");
+    assert_eq!(states()[3], "report=pending");
+    finish(2, "{}");
+    assert_eq!(states(), ["build=done:success", "test (2)=done:success", "test (4)=done:success", "report=done:skipped"]);
+    assert_eq!(launches(&clouds).len(), 3, "no machine for a job skipped");
+    let status = json(&run(key(Request::new("GET", &format!("{PLANE_URL}/runs/{run_id}")))));
+    assert_eq!((status["over"].as_bool(), status["result"].as_str(), status["jobs"].as_array().map(|j| j.len())), (Some(true), Some("success"), Some(4)));
+    // A job asked for by name brings what it needs, and nothing else.
+    let one = run(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "job": "test" }).to_string())));
+    let rid = json(&one)["run_id"].as_str().unwrap().to_string();
+    let rec: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{rid}")]).unwrap();
+    assert_eq!(rec["jobs"].as_array().unwrap().iter().map(|j| j["key"].as_str().unwrap()).collect::<Vec<_>>(), ["build", "test", "test"]);
 }

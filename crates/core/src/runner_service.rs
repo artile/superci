@@ -56,6 +56,12 @@ pub struct Given<'a> {
     pub service: &'a str,
     pub access_token: &'a str,
     pub ids: Ids,
+    /// This job's place in its matrix (its combination, or null), its strategy (`job-index`, `job-total`), what it
+    /// needs (`{name: {result, outputs}}`), and its name as shown when a matrix or an expression makes it.
+    pub matrix: Value,
+    pub strategy: Value,
+    pub needs: Value,
+    pub display: Option<String>,
 }
 
 /// The ids a job's message carries (GUIDs; the runner puts some of them in the paths of its calls).
@@ -96,7 +102,7 @@ pub fn job_message(g: &Given) -> Result<Value> {
     let workflow = crate::workflow::parse(g.workflow)?;
     let mut m = crate::workflow::job_parts(&workflow, g.path, g.job, &mut guid)?;
     let job = workflow.get("jobs").and_then(|j| j.get(g.job));
-    let display = job.and_then(|j| j.get("name")).and_then(|n| n.text()).filter(|n| !n.contains("${{")).unwrap_or(g.job).to_string();
+    let display = g.display.clone().unwrap_or_else(|| job.and_then(|j| j.get("name")).and_then(|n| n.text()).filter(|n| !n.contains("${{")).unwrap_or(g.job).to_string());
     let mut variables = serde_json::Map::new();
     for s in SWITCHES { variables.insert(s.to_string(), json!({ "value": "true" })); }
     for (k, v) in [("system.github.job", g.job), ("system.phaseDisplayName", g.job), ("system.runnerGroupName", "Default"), ("system.runner.lowdiskspacethreshold", "100"), ("system.workflowFilePath", g.path)] {
@@ -118,9 +124,11 @@ pub fn job_message(g: &Given) -> Result<Value> {
     let feed = format!("{}_apis/v1/TimeLineWebConsoleLog/feedstream/{}/ws", g.service.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1), g.ids.timeline);
     m["resources"] = json!({ "endpoints": [{ "data": { "CacheServerUrl": g.service, "FeedStreamUrl": feed, "ResultsServiceUrl": g.service }, "name": "SystemVssConnection", "url": g.service,
         "authorization": { "parameters": { "AccessToken": g.access_token }, "scheme": "OAuth" }, "isShared": false, "isReady": true }] });
+    let needs = if g.needs.is_object() { g.needs.clone() } else { json!({}) };
+    let strategy = if g.strategy.is_object() { g.strategy.clone() } else { json!({ "fail-fast": true, "job-index": 0, "job-total": 1, "max-parallel": 1 }) };
     m["contextData"] = json!({
-        "github": context(&g.github), "inputs": { "t": 2 }, "vars": context(&Value::Object(vars)), "needs": { "t": 2 }, "matrix": null,
-        "strategy": context(&json!({ "fail-fast": true, "job-index": 0, "job-total": 1, "max-parallel": 1 })),
+        "github": context(&g.github), "inputs": { "t": 2 }, "vars": context(&Value::Object(vars)),
+        "needs": context(&needs), "matrix": if g.matrix.is_null() { Value::Null } else { context(&g.matrix) }, "strategy": context(&strategy),
     });
     m["workspace"] = json!({});
     Ok(m)
