@@ -17,6 +17,7 @@ mod image;
 mod live;
 mod local_run;
 mod logos;
+mod log_view;
 mod modal;
 mod plane;
 #[cfg(debug_assertions)]

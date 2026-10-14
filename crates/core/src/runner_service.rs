@@ -330,7 +330,7 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> R
         // Each step's record: the last word of each kept.
         for r in body["value"].as_array().into_iter().flatten() {
             let log = r["log"]["id"].clone();
-            let mut slim = json!({ "id": r["id"], "type": r["type"], "name": r["name"], "state": r["state"], "result": r["result"], "order": r["order"], "log": log });
+            let mut slim = json!({ "id": r["id"], "type": r["type"], "name": r["name"], "state": r["state"], "result": r["result"], "order": r["order"], "log": log, "start": r["startTime"], "finish": r["finishTime"] });
             match job.steps.iter_mut().find(|s| s["id"] == r["id"]) {
                 // (A later word that leaves something out keeps what was said of it before.)
                 Some(s) => { for (k, v) in slim.as_object_mut().into_iter().flatten() { if v.is_null() { *v = s[k.as_str()].clone() } } *s = slim }

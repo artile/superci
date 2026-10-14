@@ -1245,6 +1245,13 @@ impl<'a> ControlPlane<'a> {
         // A GitLab job is kept under its connection's name and its id (`gl`: the name; nothing for the first).
         let key = match q("gl") { Some(g) if gitlab::valid_id(&g) || g.is_empty() => format!("job:gl{}", gitlab::local(&g, id.parse().unwrap_or_default())), Some(_) => return Err("which GitLab?".into()), None => format!("job:{id}") };
         let Some(j) = get_json::<Job>(self.store, &key).await? else { return Ok(Response::json(&serde_json::json!({ "error": "This control plane has no such job (it keeps the latest ones)." }))) };
+        // With `steps`: the job's steps too (GitHub's as it has them now, with their times; a run from a computer's with
+        // each one's log, or its lines so far while it runs). GitLab's are in its log, marked as sections.
+        let steps = if q("steps").is_none() { serde_json::Value::Null } else if j.provider == "local" {
+            serde_json::Value::Array(self.local_steps(j.local.as_deref().unwrap_or_default()).await?)
+        } else if j.provider.is_empty() {
+            match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_steps(self.http, &app.api(), &token, &j.repo, j.job_id).await.map(serde_json::Value::Array).unwrap_or_default(), _ => serde_json::Value::Null }
+        } else { serde_json::Value::Null };
         // A run from a computer: each step's whole log as its runner sent it here, else the lines it sent as it went.
         let fetched = if j.provider == "local" {
             let token = j.local.clone().unwrap_or_default();
@@ -1254,12 +1261,12 @@ impl<'a> ControlPlane<'a> {
         } else {
             match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) }
         };
-        let log = match fetched { Ok(l) => l, Err(e) => return Ok(Response::json(&serde_json::json!({ "error": e }))) };
+        let log = match fetched { Ok(l) => l, Err(e) => return Ok(Response::json(&serde_json::json!({ "error": e, "steps": steps }))) };
         let want = q("bytes").and_then(|b| b.parse::<usize>().ok()).unwrap_or(200_000).clamp(1_000, 1_000_000);
         // From a line's start, when the cut falls inside one.
         let from = log.len().saturating_sub(want);
         let from = if from == 0 { 0 } else { log[from..].iter().position(|b| *b == b'\n').map(|n| from + n + 1).unwrap_or(from) };
-        Ok(Response::json(&serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0 })))
+        Ok(Response::json(&serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0, "steps": steps })))
     }
 
     /// What the dashboard shows, for a key a dashboard session set and that has not expired (or one that only reads):
@@ -3039,6 +3046,24 @@ impl<'a> ControlPlane<'a> {
                 }
                 None => out.extend(base64::engine::general_purpose::STANDARD.decode(v.trim_matches('"')).map_err(|e| e.to_string())?),
             }
+        }
+        Ok(out)
+    }
+
+    /// A run's job's steps in order, each with its log: the whole one once the runner sent it, else the lines it sent
+    /// of the step as it went.
+    async fn local_steps(&self, token: &str) -> Result<Vec<serde_json::Value>> {
+        let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
+        let mut steps: Vec<&serde_json::Value> = handed.steps.iter().filter(|s| s["type"] != "Job").collect();
+        steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
+        let posts: Vec<(Option<String>, Vec<String>)> = self.store.list(&format!("rline:{token}:")).await?.into_iter().map(|(_, v)| { let (step, _, lines) = crate::runner_service::feed(&v); (step, lines) }).collect();
+        let mut out = vec![];
+        for s in steps {
+            let text = match s["log"].as_u64() {
+                Some(n) => String::from_utf8_lossy(&self.log_text(token, n).await?).into_owned(),
+                None => posts.iter().filter(|(step, _)| step.as_deref() == s["id"].as_str()).flat_map(|(_, l)| l.iter().cloned()).collect::<Vec<_>>().join("\n"),
+            };
+            out.push(serde_json::json!({ "name": s["name"], "state": s["state"], "result": s["result"], "start": s["start"], "finish": s["finish"], "text": text }));
         }
         Ok(out)
     }

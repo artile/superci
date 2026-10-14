@@ -300,6 +300,14 @@ pub async fn repository_by_id(http: &dyn Http, api: &str, token: &str, id: &str)
     gh(http, api, "GET", &format!("/repositories/{id}"), Some(token), None).await
 }
 
+/// A job's steps as GitHub has them now: each one's name, status ("queued", "in_progress", "completed"), conclusion,
+/// and when it began and ended.
+pub async fn job_steps(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<Vec<serde_json::Value>> {
+    let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/jobs/{job_id}"), Some(token), None).await?;
+    Ok(v["steps"].as_array().cloned().unwrap_or_default().into_iter().map(|s| serde_json::json!({ "name": s["name"], "status": s["status"], "conclusion": s["conclusion"], "number": s["number"],
+        "started_at": s["started_at"], "completed_at": s["completed_at"] })).collect())
+}
+
 pub async fn job_status(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<String> {
     job_state(http, api, token, repo, job_id).await.map(|(status, _)| status)
 }
