@@ -1064,6 +1064,7 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/runs") if self.dashboard(&req) => self.create_run(&req, &plane_url, None).await,
             ("POST", "/runs") if self.run_key(&req).is_some() => { let k = self.run_key(&req); self.create_run(&req, &plane_url, k).await }
             ("GET", p) if p.starts_with("/runs/") && p.ends_with("/artifacts") && self.reader(&req) => self.run_artifacts(p, &url, &plane_url).await,
+            ("GET", p) if p.starts_with("/runs/") && p.ends_with("/log") && self.reader(&req) => self.run_log(p, &url).await,
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
             (_, p) if p.starts_with("/runner/") => self.for_runner(&req, &plane_url, &url).await,
             // A machine's `superci-cache` (with the link only it has), for a job's cache.
@@ -1240,12 +1241,10 @@ impl<'a> ControlPlane<'a> {
         // A GitLab job is kept under its connection's name and its id (`gl`: the name; nothing for the first).
         let key = match q("gl") { Some(g) if gitlab::valid_id(&g) || g.is_empty() => format!("job:gl{}", gitlab::local(&g, id.parse().unwrap_or_default())), Some(_) => return Err("which GitLab?".into()), None => format!("job:{id}") };
         let Some(j) = get_json::<Job>(self.store, &key).await? else { return Ok(Response::json(&serde_json::json!({ "error": "This control plane has no such job (it keeps the latest ones)." }))) };
-        // A run from a computer: the lines its runner sent here, as the control plane keeps them.
+        // A run from a computer: each step's whole log as its runner sent it here, else the lines it sent as it went.
         let fetched = if j.provider == "local" {
             let token = j.local.clone().unwrap_or_default();
-            let mut lines = vec![];
-            for (_, v) in self.store.list(&format!("rline:{token}:")).await? { lines.extend(serde_json::from_str::<Vec<String>>(&v).unwrap_or_default()) }
-            Ok(lines.join("\n").into_bytes())
+            self.local_log(&token).await
         } else if j.provider == "gitlab" {
             match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(project)) => gitlab::job_trace(self.http, gl, project, j.job_id).await, _ => Err("its GitLab is no longer connected".into()) }
         } else {
@@ -1337,6 +1336,8 @@ impl<'a> ControlPlane<'a> {
             },
             "jobs": with_machines,
             "usage": usage,
+            // How its store stands: whether the jobs' indexes are built, and nothing is left in an earlier layout.
+            "store": { "indexed": self.indexed().await, "moved": self.store.migrate(0).await.unwrap_or(false) },
         })))
     }
 
@@ -3014,6 +3015,43 @@ impl<'a> ControlPlane<'a> {
         Ok(())
     }
 
+    /// A log a run's job sent (`n`, the runner's number for it), whole: its pieces in order, from the store or the
+    /// bucket.
+    async fn log_text(&self, token: &str, n: u64) -> Result<Vec<u8>> {
+        use base64::Engine;
+        let mut out = vec![];
+        let mut creds = None;
+        for (k, v) in self.store.list(&format!("rlog:{token}:{n:04}:")).await? {
+            match v.trim_matches('"').strip_prefix("s3:") {
+                Some(region) => {
+                    if creds.is_none() {
+                        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
+                        if let Some(a) = self.aws_connection().await?.filter(|a| a.connected) { creds = Some(self.aws_creds(&plane_url, &a).await?) }
+                    }
+                    let Some(c) = &creds else { continue };
+                    let seq = k.rsplit(':').next().unwrap_or("0000");
+                    let got = aws::s3(self.http, "GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &format!("runs/{token}/log-{n:04}-{seq}")), region, c, vec![], &[], self.clock.now_ms()).await?;
+                    if got.status < 300 { out.extend(got.body) }
+                }
+                None => out.extend(base64::engine::general_purpose::STANDARD.decode(v.trim_matches('"')).map_err(|e| e.to_string())?),
+            }
+        }
+        Ok(out)
+    }
+
+    /// A run's job's log: each step's whole log in order, where the runner sent them; else the lines it sent as it went.
+    async fn local_log(&self, token: &str) -> Result<Vec<u8>> {
+        let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
+        let mut steps: Vec<&serde_json::Value> = handed.steps.iter().filter(|s| s["log"].as_u64().is_some()).collect();
+        steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
+        let mut out = vec![];
+        for s in steps { out.extend(self.log_text(token, s["log"].as_u64().unwrap_or(0)).await?); if !out.ends_with(b"\n") { out.push(b'\n') } }
+        if !out.is_empty() { return Ok(out) }
+        let mut lines = vec![];
+        for (_, v) in self.store.list(&format!("rline:{token}:")).await? { lines.extend(crate::runner_service::feed(&v).2) }
+        Ok(lines.join("\n").into_bytes())
+    }
+
     /// A run from a computer: a workflow file's jobs, run as GitHub would run them, each on a machine as any job of
     /// this control plane's, with the working tree uploaded (`tree_part`) in place of a checkout, and what a run gives
     /// beyond GitHub's (`secrets`, `vars`). Each combination of a matrix is a job of its own; a job starts once the
@@ -3261,6 +3299,16 @@ impl<'a> ControlPlane<'a> {
         Ok(Response::json(&serde_json::json!({ "name": name, "size": entry.size, "pieces": pieces })))
     }
 
+    /// `GET /runs/<id>/log?job=<i>&log=<n>`: a whole log the run's `i`th job's runner sent (a step's), as text.
+    async fn run_log(&self, path: &str, url: &url::Url) -> Result<Response> {
+        let Some(id) = path.trim_start_matches("/runs/").trim_end_matches("/log").parse::<u64>().ok() else { return Ok(nothing_here()) };
+        let Some(run) = get_json::<serde_json::Value>(self.store, &format!("run:{id}")).await? else { return Ok(nothing_here()) };
+        let q = |k: &str| url.query_pairs().find(|(n, _)| n == k).and_then(|(_, v)| v.parse::<u64>().ok());
+        let (Some(i), Some(n)) = (q("job"), q("log")) else { return Ok(Response::text(400, "say which job and which log")) };
+        let Some(token) = run["jobs"][i as usize]["token"].as_str() else { return Ok(nothing_here()) };
+        Ok(Response::new(200, "text/plain; charset=utf-8", self.log_text(token, n).await?))
+    }
+
     /// How a run from a computer goes: each job's name, state, how it ended, its machine, and the lines its runner
     /// wrote after the count given for it in `after` (one count for each job, in order, comma between; the answer
     /// gives them back as `next`); and the run's own state and result once all its jobs are over.
@@ -3273,14 +3321,23 @@ impl<'a> ControlPlane<'a> {
             let from = after.get(i).copied().unwrap_or(0);
             let (mut lines, mut next) = (vec![], from);
             let record = match j["job_id"].as_str().and_then(|i| i.parse::<u64>().ok()) { Some(jid) => get_json::<Job>(self.store, &format!("job:{jid}")).await?, None => None };
+            // Its lines since then, each post with its step and where in that step's log it begins; and its steps,
+            // with the number of each one's whole log (for what the runner did not send as it went).
+            let (mut posts, mut steps) = (vec![], vec![]);
             if let Some(token) = j["token"].as_str() {
                 for (k, v) in self.store.list(&format!("rline:{token}:")).await? {
                     let n = k.rsplit(':').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
-                    if n > from { lines.extend(serde_json::from_str::<Vec<String>>(&v).unwrap_or_default()); next = next.max(n) }
+                    if n <= from { continue }
+                    let (step, start, those) = crate::runner_service::feed(&v);
+                    lines.extend(those.iter().cloned());
+                    posts.push(serde_json::json!({ "step": step, "start": start, "lines": those }));
+                    next = next.max(n);
                 }
+                let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
+                steps = handed.steps.iter().filter(|s| s["type"] != "Job").map(|s| serde_json::json!({ "id": s["id"], "name": s["name"], "state": s["state"], "result": s["result"], "order": s["order"], "log": s["log"] })).collect();
             }
             out.push(serde_json::json!({ "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
-                "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next }));
+                "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next, "posts": posts, "steps": steps }));
         }
         let jobs = run["jobs"].as_array().cloned().unwrap_or_default();
         let over = jobs.iter().all(|j| j["state"] == "done");
@@ -3317,6 +3374,19 @@ impl<'a> ControlPlane<'a> {
                 bytes.extend(base64::engine::general_purpose::STANDARD.decode(piece.trim_matches('"')).map_err(|e| e.to_string())?);
             }
             return Ok(Response::new(200, "application/octet-stream", bytes))
+        }
+        // A log's content: into the bucket where there is one (a log of many MB never goes through the store).
+        if let Some(n) = Some(sub).filter(|s| s.contains("Logfiles/")).and_then(|s| s.split('?').next()).and_then(|s| s.trim_end_matches('/').rsplit('/').next()).and_then(|n| n.parse::<u64>().ok()).filter(|_| ["POST", "PUT"].contains(&req.method.as_str())) {
+            let now = self.clock.now_ms();
+            if let Some((region, creds)) = self.tree_bucket(plane_url, now).await? {
+                let seq = self.store.list(&format!("rlog:{token}:{n:04}:")).await?.len();
+                let object = format!("runs/{token}/log-{n:04}-{seq:04}");
+                let put = aws::s3(self.http, "PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &object), &region, &creds, req.body.clone(), &[], now).await?;
+                if put.status < 300 {
+                    self.store.put_until(&format!("rlog:{token}:{n:04}:{seq:04}"), format!("s3:{region}"), now + crate::runner_service::KEPT_MS).await?;
+                    return Ok(Response::new(200, "application/json", ""))
+                }
+            }
         }
         let full = url[url::Position::BeforePath..].to_string();
         let path = full.trim_start_matches(&format!("/runner/{token}")).to_string();
@@ -3651,7 +3721,18 @@ impl<'a> ControlPlane<'a> {
             let run: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
             if run["at_ms"].as_u64().is_some_and(|at| now.saturating_sub(at) < 86_400_000) { continue }
             for token in run["jobs"].as_array().into_iter().flatten().filter_map(|j| j["token"].as_str()) {
-                for prefix in [format!("rline:{token}:"), format!("rlog:{token}:")] { for (k, _) in self.store.list(&prefix).await? { self.store.delete(&k).await? } }
+                for prefix in [format!("rline:{token}:"), format!("rlog:{token}:")] {
+                    for (k, v) in self.store.list(&prefix).await? {
+                        // (A log kept in the bucket goes from there too.)
+                        if let Some(region) = v.trim_matches('"').strip_prefix("s3:") {
+                            if let Some((_, creds)) = self.tree_bucket(&plane_url, now).await.ok().flatten() {
+                                let (n, seq) = { let mut p = k.rsplit(':'); let seq = p.next().unwrap_or_default().to_string(); (p.next().unwrap_or_default().to_string(), seq) };
+                                let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &format!("runs/{token}/log-{n}-{seq}")), region, &creds, vec![], &[], now).await;
+                            }
+                        }
+                        self.store.delete(&k).await?
+                    }
+                }
                 self.store.delete(&format!("rjob:{token}")).await?;
             }
             self.store.delete(&k).await?;

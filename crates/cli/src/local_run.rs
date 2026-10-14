@@ -102,6 +102,8 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     let run = made["run_id"].as_str().unwrap_or_default().to_string();
     say(&format!("Run {run} of {path}, on machines of this control plane's"));
     let (began, mut after, mut last): (std::time::Instant, Vec<u64>, Vec<String>) = (std::time::Instant::now(), vec![], vec![]);
+    let mut logs: Vec<Lines> = vec![];
+    let mut over_at: Option<std::time::Instant> = None;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let cursor = after.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
@@ -109,6 +111,7 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         let jobs = st["jobs"].as_array().cloned().unwrap_or_default();
         after.resize(jobs.len(), 0);
         last.resize(jobs.len(), String::new());
+        logs.resize_with(jobs.len(), Lines::default);
         let several = jobs.len() > 1;
         for (i, j) in jobs.iter().enumerate() {
             let name = j["name"].as_str().unwrap_or_default();
@@ -124,13 +127,22 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
                 (other, _) => other.to_string(),
             };
             if !state.is_empty() && state != last[i] { say(&format!("{mark}{}{}", &state[..1].to_uppercase(), &state[1..])); last[i] = state }
-            // Its lines as GitHub shows them: a group's heading is a line, its end is nothing.
-            for line in j["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str()) {
+            // Its lines as GitHub shows them (a group's heading is a line, its end is nothing), each step's whole: what
+            // the runner sent as it went while nothing is missing, then the rest from the step's own log once it ends
+            // (the runner drops lines it cannot send as fast as they come).
+            let fetch = |n: u64| -> Option<String> {
+                let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&log={n}")).with_header("authorization", &format!("Bearer {key}"));
+                block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text())
+            };
+            for line in logs[i].take(j, st["over"] == true && over_at.is_some_and(|t| t.elapsed().as_secs() > 15), &fetch) {
                 if line.starts_with("##[endgroup]") { continue }
-                say(&format!("{}{mark}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(line)))
+                say(&format!("{}{mark}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(&line)))
             }
             after[i] = j["next"].as_u64().unwrap_or(after[i]);
         }
+        // Over: once every step's lines are out (its log may come a moment after), or a little later at most.
+        if st["over"] == true && over_at.is_none() { over_at = Some(std::time::Instant::now()) }
+        if st["over"] == true && logs.iter().any(|l| !l.complete()) && over_at.is_some_and(|t| t.elapsed().as_secs() <= 15) { continue }
         if st["over"] == true {
             let (result, took) = (st["result"].as_str().unwrap_or_default().to_string(), began.elapsed().as_secs());
             let tally: Vec<String> = jobs.iter().map(|j| format!("{} {}", j["name"].as_str().unwrap_or_default(), j["result"].as_str().unwrap_or("?"))).collect();
@@ -248,6 +260,79 @@ fn unzip(path: &Path, dir: &Path) -> std::result::Result<usize, Unpack> {
     Ok(files)
 }
 
+/// A job's lines as they are printed: each step in turn, its lines in order, none twice and none missing.
+#[derive(Default)]
+struct Lines {
+    /// What came and is not printed yet: each post's step, where it begins in that step's log, and its lines.
+    held: Vec<(Option<String>, Option<u64>, Vec<String>)>,
+    /// The last line printed of each step, and the steps whose lines are all out.
+    shown: std::collections::HashMap<String, u64>,
+    done: std::collections::HashSet<String>,
+    /// Steps known (from the run's status): no steps, no order to keep (an older control plane).
+    steps: usize,
+}
+
+impl Lines {
+    /// What to print now from the job's latest status (`j`: its new posts and its steps). `give_up`: the run is over
+    /// and a step's log has not come: what is held is printed as it is. `fetch`: a step's whole log by its number.
+    fn take(&mut self, j: &Value, give_up: bool, fetch: &dyn Fn(u64) -> Option<String>) -> Vec<String> {
+        for p in j["posts"].as_array().into_iter().flatten() {
+            let lines = p["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
+            self.held.push((p["step"].as_str().map(str::to_string), p["start"].as_u64(), lines));
+        }
+        // An older control plane: its lines as they come.
+        if j["posts"].is_null() { return j["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect() }
+        let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
+        steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
+        self.steps = steps.len();
+        let mut out = vec![];
+        if steps.is_empty() { for (_, _, lines) in self.held.drain(..) { out.extend(lines) } return out }
+        for s in steps {
+            let Some(id) = s["id"].as_str() else { continue };
+            if self.done.contains(id) { continue }
+            let shown = self.shown.entry(id.to_string()).or_insert(0);
+            // What was sent of it as it went, while it follows on from what is out.
+            let mut rest = vec![];
+            for (step, start, lines) in self.held.drain(..) {
+                if step.as_deref() != Some(id) { rest.push((step, start, lines)); continue }
+                match start {
+                    Some(start) if start <= *shown + 1 => for (k, line) in lines.into_iter().enumerate() { if start + k as u64 > *shown { out.push(line); *shown = start + k as u64 } },
+                    Some(_) => {}
+                    None => { *shown += lines.len() as u64; out.extend(lines) }
+                }
+            }
+            self.held = rest;
+            // Over: the rest from its whole log, then the next step.
+            let ended = s["state"] == "completed";
+            match (ended, s["log"].as_u64()) {
+                (true, Some(n)) => match fetch(n) {
+                    Some(text) => {
+                        out.extend(text.lines().skip(*shown as usize).map(|l| without_time(l).to_string()));
+                        self.done.insert(id.to_string());
+                    }
+                    None if give_up => { self.done.insert(id.to_string()); }
+                    None => return out,
+                },
+                (true, None) if give_up => { self.done.insert(id.to_string()); }
+                _ => return out,
+            }
+        }
+        out
+    }
+
+    /// Whether every step's lines are out.
+    fn complete(&self) -> bool { self.steps == 0 || self.done.len() >= self.steps }
+}
+
+/// A log's line without the time the runner put before it ("2026-10-14T21:09:53.1234567Z ").
+fn without_time(line: &str) -> &str {
+    let b = line.as_bytes();
+    if b.len() > 20 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) {
+        if let Some(at) = line.find("Z ") { if at < 40 { return &line[at + 2..] } }
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +353,25 @@ mod tests {
         std::fs::write(dir.join("plain.txt"), "not a zip").unwrap();
         assert!(matches!(unzip(&dir.join("plain.txt"), &dir.join("out2")), Err(Unpack::NotZip)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_steps_lines_are_printed_whole_and_in_order_what_the_runner_dropped_from_its_log() {
+        let mut l = Lines::default();
+        let step = |id: &str, order: u64, state: &str, log: Option<u64>| json!({ "id": id, "order": order, "state": state, "log": log });
+        let post = |s: &str, start: u64, lines: &[&str]| json!({ "step": s, "start": start, "lines": lines });
+        let logs = |n: u64| Some(match n { 1 => "2026-10-14T21:09:53.1234567Z a1\n2026-10-14T21:09:53.1234567Z a2\n2026-10-14T21:09:53.1234567Z a3\n2026-10-14T21:09:54.0000000Z a4".to_string(), _ => "b1\nb2".to_string() });
+        let none = |_: u64| None;
+        // Step a sends line 1, then 4 (2 and 3 were dropped); b's first line comes before a's log does.
+        let j = json!({ "posts": [post("a", 1, &["a1"]), post("a", 4, &["a4"]), post("b", 1, &["b1"])], "steps": [step("a", 1, "inProgress", None), step("b", 2, "pending", None)] });
+        assert_eq!(l.take(&j, false, &none), ["a1"], "after a gap, nothing more of a until its log; b waits for a");
+        let j = json!({ "posts": [], "steps": [step("a", 1, "completed", Some(1)), step("b", 2, "inProgress", None)] });
+        assert_eq!(l.take(&j, false, &logs), ["a2", "a3", "a4", "b1"], "the rest of a from its log, its time taken off; then b");
+        let j = json!({ "posts": [post("b", 2, &["b2"])], "steps": [step("a", 1, "completed", Some(1)), step("b", 2, "completed", Some(2))] });
+        assert_eq!(l.take(&j, false, &logs), ["b2"]);
+        assert!(l.complete());
+        // An older control plane: its lines as they come.
+        assert_eq!(Lines::default().take(&json!({ "lines": ["x", "y"] }), false, &none), ["x", "y"]);
     }
 
     #[test]

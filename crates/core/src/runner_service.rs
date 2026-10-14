@@ -39,6 +39,20 @@ pub struct HandedJob {
     #[serde(default, skip_serializing_if = "String::is_empty")] pub runner: String,
 }
 
+/// How long what a run's job left (its lines, its logs) is kept.
+pub const KEPT_MS: u64 = 2 * 86_400_000;
+/// A piece of a log as the store keeps it (DynamoDB takes 400 KB a record; this, as base64, stays under).
+pub const LOG_PIECE: usize = 280_000;
+
+/// What a post of lines was kept as (`rline:<id>:<n>`): its step, the number of its first line in that step's log,
+/// and its lines. (Kept as the lines alone before 0.19.0.)
+pub fn feed(v: &str) -> (Option<String>, Option<u64>, Vec<String>) {
+    match serde_json::from_str::<Value>(v).unwrap_or_default() {
+        Value::Array(lines) => (None, None, lines.into_iter().filter_map(|l| l.as_str().map(str::to_string)).collect()),
+        o => (o["step"].as_str().map(str::to_string), o["start"].as_u64(), o["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect()),
+    }
+}
+
 /// How long a runner asking for a job when there is none is held before it is told so (it asks again at once):
 /// said with the answer, in `x-superci-hold`, for whoever answers to wait that long first.
 pub const HOLD_MS: u64 = 20_000;
@@ -301,26 +315,38 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> R
         }
         ok(json!({ "actions": out }))
     } else if p.contains("/TimeLineWebConsoleLog/") {
-        // The job's lines as they are written: kept in order, each post as one entry.
+        // The job's lines as they are written, each post as one entry, with its step and the number of its first line
+        // in that step's log: the runner drops lines when it writes faster than it sends them (it holds 1,024 at
+        // most), so a gap is seen, and the step's whole log (`/Logfiles/`) fills it.
         let lines: Vec<String> = body["value"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
         if !lines.is_empty() {
             job.lines += 1;
-            put_json(store, &format!("rline:{id}:{:06}", job.lines), &lines).await?;
+            let step = body["stepId"].as_str().map(str::to_string).or_else(|| p.trim_end_matches('/').rsplit('/').next().map(str::to_string));
+            store.put_until(&format!("rline:{id}:{:06}", job.lines), json!({ "step": step, "start": body["startLine"], "lines": lines }).to_string(), job.at_ms + KEPT_MS).await?;
             put_json(store, &key, &job).await?;
         }
         empty()
     } else if p.contains("/Timeline/") {
         // Each step's record: the last word of each kept.
         for r in body["value"].as_array().into_iter().flatten() {
-            let slim = json!({ "id": r["id"], "type": r["type"], "name": r["name"], "state": r["state"], "result": r["result"], "order": r["order"] });
-            match job.steps.iter_mut().find(|s| s["id"] == r["id"]) { Some(s) => *s = slim, None => job.steps.push(slim) }
+            let log = r["log"]["id"].clone();
+            let mut slim = json!({ "id": r["id"], "type": r["type"], "name": r["name"], "state": r["state"], "result": r["result"], "order": r["order"], "log": log });
+            match job.steps.iter_mut().find(|s| s["id"] == r["id"]) {
+                // (A later word that leaves out its log keeps the one said before.)
+                Some(s) => { if slim["log"].is_null() { slim["log"] = s["log"].clone() } *s = slim }
+                None => job.steps.push(slim),
+            }
         }
         put_json(store, &key, &job).await?;
         ok(body)
     } else if p.contains("/Logfiles/") {
-        if p.rsplit('/').next().is_some_and(|last| last.parse::<u64>().is_ok()) {
-            let n = p.rsplit('/').next().unwrap_or_default();
-            store.put(&format!("rlog:{id}:{n}"), String::from_utf8_lossy(&req.body).chars().take(200_000).collect()).await?;
+        if let Some(n) = p.rsplit('/').next().and_then(|last| last.parse::<u64>().ok()) {
+            // A log's content, whole (each upload after the first adds to it), in pieces the store takes. (Where the
+            // control plane has a bucket, it keeps them there instead, see `ControlPlane::for_runner`.)
+            let seq = store.list(&format!("rlog:{id}:{n:04}:")).await?.len();
+            for (i, piece) in req.body.chunks(LOG_PIECE).enumerate() {
+                store.put_until(&format!("rlog:{id}:{n:04}:{:04}", seq + i), crate::crypto::b64(piece), job.at_ms + KEPT_MS).await?;
+            }
             return Ok(empty())
         }
         job.logs += 1;
