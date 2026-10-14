@@ -134,7 +134,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 10] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add"];
-const VALUES: [&str; 36] = ["disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 38] = ["secret", "var", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -459,6 +459,14 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 _ => b.found().map(|f| format!("{f:?}")),
             };
             let said = match said { Ok(s) => s, Err(e) => format!("refused or failed: {e}") };
+            Ok(Done { data: json!({ "answer": said }), said: vec![said] })
+        }
+        // (GitHub's runner taking one job from SuperCI's own service, run here: `superci debug runner-service FILE JOB
+        // ROOT PORT JITFILE [--secret=N=V] [--var=N=V]`, ROOT being where the runner's calls go, e.g. http://localhost:8080/runner/rig.)
+        #[cfg(debug_assertions)]
+        ("debug", "runner-service") => {
+            let pairs = |flag: &str| args.all(flag).iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+            let said = crate::runner_local::serve(w(2), w(3), w(5).parse().unwrap_or(8099), w(4), &pairs("secret"), &pairs("var"), w(6))?;
             Ok(Done { data: json!({ "answer": said }), said: vec![said] })
         }
         #[cfg(debug_assertions)]

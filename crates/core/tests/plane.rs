@@ -3236,3 +3236,43 @@ fn a_workflow_files_job_is_written_for_the_runner_as_github_writes_it() {
         }
     }
 }
+
+#[test]
+fn the_runners_calls_for_a_job_are_answered_as_its_service_answers_them() {
+    use superci_core::runner_service::{answer, job_message, access_token, Given, HandedJob, Ids};
+    // A job handed to a runner, then every call a real runner made for one (recorded, in order): each is answered,
+    // the runner takes its job once, and what it says of the job is kept: its steps, its lines, its logs, how it ended.
+    let store = Mem::default();
+    let given = Given { workflow: include_str!("fixtures/runner/three.yml"), path: ".github/workflows/ci.yml", job: "test", secrets: &[("A_SECRET".into(), "hunter2.hunter2".into())],
+        vars: &[("A_VAR".into(), "fromcli".into())], github: serde_json::json!({ "event_name": "push", "repository": "acme/app", "ref": "refs/heads/main" }),
+        service: "https://plane.example/runner/abc/", access_token: &access_token(1_790_000_000_000), ids: Ids::new(4) };
+    let message = job_message(&given).unwrap();
+    // (Every part GitHub's own message has, but GitHub's own bookkeeping.)
+    let github: serde_json::Value = serde_json::from_str(include_str!("fixtures/runner/record.github.json")).unwrap();
+    for key in ["environmentVariables", "fileTable", "steps", "variables", "messageType", "plan", "timeline", "jobId", "jobDisplayName", "jobName", "requestId", "lockedUntil", "resources", "contextData", "mask"] {
+        assert!(message.get(key).is_some(), "{key}");
+    }
+    assert!(github.get("steps").is_some());
+    assert_eq!((message["jobDisplayName"].as_str(), message["variables"]["A_SECRET"]["isSecret"].as_bool(), message["mask"][0]["value"].as_str()), (Some("The test job"), Some(true), Some("hunter2\\.hunter2")));
+    assert_eq!(message["contextData"]["vars"], serde_json::json!({ "t": 2, "d": [{ "k": "A_VAR", "v": "fromcli" }] }));
+    assert_eq!(message["resources"]["endpoints"][0]["data"]["FeedStreamUrl"].as_str().unwrap(), format!("wss://plane.example/runner/abc/_apis/v1/TimeLineWebConsoleLog/feedstream/{}/ws", message["timeline"]["id"].as_str().unwrap()));
+    block_on(store.put("rjob:abc", serde_json::to_string(&HandedJob { message, ..Default::default() }).unwrap())).unwrap();
+    let mut messages = vec![];
+    for line in include_str!("fixtures/runner/runner-requests.jsonl").lines() {
+        let r: serde_json::Value = serde_json::from_str(line).unwrap();
+        let mut req = Request::new(r["method"].as_str().unwrap(), &format!("https://plane.example/runner/abc{}", r["path"].as_str().unwrap()));
+        req.body = r["request"].as_str().unwrap().as_bytes().to_vec();
+        let res = block_on(answer(&store, "abc", &req, r["path"].as_str().unwrap(), &|_| {})).unwrap();
+        assert!(res.status == 200 || res.status == 204 || (res.status == 400 && r["path"].as_str().unwrap().contains("feedstream")), "{} {}: {}", r["method"], r["path"], res.status);
+        if r["path"].as_str().unwrap().contains("/Message/") && r["method"] == "GET" { messages.push(res.status) }
+    }
+    assert_eq!(messages[0], 200, "the job, the first time");
+    assert!(messages[1..].iter().all(|s| *s == 204), "nothing more after: {messages:?}");
+    let job: HandedJob = serde_json::from_str(&store.0.borrow()["rjob:abc"]).unwrap();
+    assert_eq!(job.result.as_deref(), Some("succeeded"));
+    assert!(job.steps.iter().any(|s| s["type"] == "Job" && s["result"] == "succeeded") && job.lines > 0 && job.logs > 0, "{:?}", job.steps);
+    assert!(store.0.borrow().keys().any(|k| k.starts_with("rline:abc:")) && store.0.borrow().keys().any(|k| k.starts_with("rlog:abc:")));
+    // Another job's prefix, or none at all, is nothing here.
+    let res = block_on(answer(&store, "other", &Request::new("GET", "https://plane.example/runner/other/_apis/connectionData"), "/_apis/connectionData", &|_| {})).unwrap();
+    assert_eq!(res.status, 404);
+}

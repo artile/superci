@@ -35,6 +35,13 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 /// A random URL-safe token (for sessions, states, ids).
+/// So many random bytes.
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    getrandom::getrandom(&mut buf).expect("randomness");
+    buf
+}
+
 pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     getrandom::getrandom(&mut buf).expect("randomness");

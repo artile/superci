@@ -18,6 +18,8 @@ mod live;
 mod logos;
 mod modal;
 mod plane;
+#[cfg(debug_assertions)]
+mod runner_local;
 mod store;
 mod view;
 

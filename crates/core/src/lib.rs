@@ -12,3 +12,4 @@ pub mod page;
 pub mod permissions;
 pub mod spec;
 pub mod workflow;
+pub mod runner_service;
