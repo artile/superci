@@ -37,20 +37,60 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// The working tree as a gzipped tar: what git tracks and the new files it does not ignore (an ignored `.env`
-/// stays here), as they are on disk now. By the system's own tar.
-fn pack(root: &Path) -> Result<Vec<u8>> {
+/// The working tree's files: what git tracks and the new files it does not ignore (an ignored `.env` stays here).
+fn tree_files(root: &Path) -> Result<Vec<Vec<u8>>> {
     let listed = Command::new("git").current_dir(root).args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"]).output().map_err(|e| format!("git: {e}"))?;
-    let files: Vec<&[u8]> = listed.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()).filter(|f| root.join(String::from_utf8_lossy(f).as_ref()).symlink_metadata().is_ok_and(|m| !m.is_dir())).collect();
-    let mut tar = Command::new("tar").current_dir(root).args(["-czf", "-", "--no-xattrs", "--null", "-T", "-"]).env("COPYFILE_DISABLE", "1")
+    Ok(listed.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()).filter(|f| root.join(String::from_utf8_lossy(f).as_ref()).symlink_metadata().is_ok_and(|m| !m.is_dir())).map(<[u8]>::to_vec).collect())
+}
+
+/// Each file's content hash (a link's: where it points), by its path: what a base kept before is told apart by.
+fn hashes(root: &Path, files: &[Vec<u8>]) -> std::collections::BTreeMap<String, (String, u64)> {
+    use sha2::Digest;
+    files.iter().map(|f| {
+        let path = String::from_utf8_lossy(f).into_owned();
+        let at = root.join(&path);
+        let (bytes, size) = match std::fs::read_link(&at) { Ok(to) => (format!("link:{}", to.display()).into_bytes(), 0), Err(_) => { let b = std::fs::read(&at).unwrap_or_default(); let n = b.len() as u64; (b, n) } };
+        #[cfg(unix)]
+        let mode = at.symlink_metadata().map(|m| { use std::os::unix::fs::PermissionsExt; m.permissions().mode() & 0o111 }).unwrap_or(0);
+        #[cfg(not(unix))]
+        let mode = 0u32;
+        let mut h = sha2::Sha256::new();
+        h.update(&bytes);
+        h.update(mode.to_le_bytes());
+        (path, (format!("{:x}", h.finalize()), size))
+    }).collect()
+}
+
+/// The files given of the working tree as a gzipped tar, as they are on disk now, with `removed` (paths
+/// gone since a base) as `.superci-removed`. By the system's own tar.
+fn pack_files(root: &Path, files: &[Vec<u8>], removed: &[String]) -> Result<Vec<u8>> {
+    let files: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
+    let extra = std::env::temp_dir().join(format!("superci-removed-{}", superci_core::crypto::random_token(8)));
+    let mut args = vec!["-czf".to_string(), "-".into(), "--no-xattrs".into(), "--null".into(), "-T".into(), "-".into()];
+    if !removed.is_empty() {
+        std::fs::create_dir_all(&extra).map_err(|e| e.to_string())?;
+        std::fs::write(extra.join(".superci-removed"), removed.join("\n") + "\n").map_err(|e| e.to_string())?;
+        args.extend(["-C".to_string(), extra.to_string_lossy().into_owned(), ".superci-removed".into()]);
+    }
+    let mut tar = Command::new("tar").current_dir(root).args(&args).env("COPYFILE_DISABLE", "1")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("tar: {e}"))?;
     let list: Vec<u8> = files.iter().flat_map(|f| f.iter().copied().chain([0])).collect();
     let mut stdin = tar.stdin.take().ok_or("tar took no input")?;
     let writer = std::thread::spawn(move || stdin.write_all(&list));
     let out = tar.wait_with_output().map_err(|e| format!("tar: {e}"))?;
     let _ = writer.join();
+    let _ = std::fs::remove_dir_all(&extra);
     if !out.status.success() { return Err(format!("tar: {}", String::from_utf8_lossy(&out.stderr).trim())) }
     Ok(out.stdout)
+}
+
+/// What this computer last kept as a base for a repository's runs on a control plane: its name and each file's hash.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Base { name: String, files: std::collections::BTreeMap<String, (String, u64)> }
+
+fn base_path(plane: &str, root: &Path) -> Option<std::path::PathBuf> {
+    let key = superci_core::crypto::sha256_hex(format!("{plane}\n{}", root.display()).as_bytes());
+    Some(crate::store::root()?.join("trees").join(format!("{}.json", &key[..32])))
 }
 
 /// `owner/name` of the repository this checkout's `origin` is on GitHub (else the folder's name under `local/`).
@@ -74,30 +114,62 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         if res.status >= 300 { return Err(format!("the control plane said {}: {}", res.status, res.body_text().trim())) }
         serde_json::from_slice(&res.body).map_err(|e| format!("the control plane's answer: {e}"))
     };
-    let packed = pack(&root)?;
     let tree = format!("tree-{}", superci_core::crypto::random_token(18));
-    // Into the control plane's bucket, in one, when it has one (as a build service takes its source); else through
-    // the control plane, in parts (it takes a request of a few MB).
-    let link = call("POST", &format!("/runs/tree?id={tree}&part=0&link=1"), vec![])?["url"].as_str().map(str::to_string);
-    let most = if link.is_some() { MOST_IN_BUCKET } else { MOST };
-    if packed.len() > most { return Err(format!("The working tree is {} MB packed; a run from a computer takes {} MB at most.", packed.len() / 1_000_000, most / 1_000_000)) }
-    let parts = match &link {
-        Some(link) => {
-            say(&format!("Sending the working tree ({} KB packed)", packed.len().div_ceil(1000)));
-            let res = block_on(http.send(Request::new("PUT", link).with_body(packed.clone())))?;
-            if res.status >= 300 { return Err(format!("the bucket said {} to the working tree: {}", res.status, res.body_text().trim())) }
-            1
+    let put = |link: &str, bytes: Vec<u8>| -> Result<()> {
+        let res = block_on(http.send(Request::new("PUT", link).with_body(bytes)))?;
+        if res.status >= 300 { return Err(format!("the bucket said {} to the working tree: {}", res.status, res.body_text().trim())) }
+        Ok(())
+    };
+    // Only what changed since the base this computer kept for the repository, when the control plane still has it
+    // and that is less than half of the tree: the machine puts the base in place, then the changes.
+    let files = tree_files(&root)?;
+    let now = hashes(&root, &files);
+    let kept_at = base_path(plane, &root);
+    let kept: Option<Base> = kept_at.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok());
+    let mut sent: Option<(u32, bool)> = None;
+    if let Some(base) = &kept {
+        let changed: Vec<Vec<u8>> = files.iter().filter(|f| { let p = String::from_utf8_lossy(f); base.files.get(p.as_ref()) != now.get(p.as_ref()) }).cloned().collect();
+        let removed: Vec<String> = base.files.keys().filter(|p| !now.contains_key(*p)).cloned().collect();
+        let (some, all) = (changed.iter().map(|f| now.get(String::from_utf8_lossy(f).as_ref()).map(|h| h.1).unwrap_or(0)).sum::<u64>(), now.values().map(|h| h.1).sum::<u64>());
+        if some * 2 < all.max(1) {
+            let asked = call("POST", &format!("/runs/tree?id={tree}&part=1&link=1&base={}", base.name), vec![])?;
+            if let (Some(link), true) = (asked["url"].as_str(), asked["base"] == true) {
+                let packed = pack_files(&root, &changed, &removed)?;
+                say(&format!("Sending what changed in the working tree ({} file{}, {} removed, {} KB packed)", changed.len(), if changed.len() == 1 { "" } else { "s" }, removed.len(), packed.len().div_ceil(1000)));
+                put(link, packed)?;
+                sent = Some((2, true));
+            }
         }
-        None => {
+    }
+    // Else all of it, into the control plane's bucket in one when it has one (as a build service takes its source),
+    // kept there as the base for the next runs'; else through the control plane, in parts (it takes a request of a
+    // few MB).
+    let packed = if sent.is_some() { vec![] } else { pack_files(&root, &files, &[])? };
+    let name = format!("b{}", &superci_core::crypto::sha256_hex(serde_json::to_string(&now).unwrap_or_default().as_bytes())[..40]);
+    let link = if sent.is_some() { None } else { call("POST", &format!("/runs/tree?id={tree}&part=0&link=1&keep={name}"), vec![])?["url"].as_str().map(str::to_string) };
+    let most = if link.is_some() || sent.is_some() { MOST_IN_BUCKET } else { MOST };
+    if packed.len() > most { return Err(format!("The working tree is {} MB packed; a run from a computer takes {} MB at most.", packed.len() / 1_000_000, most / 1_000_000)) }
+    let (parts, layered) = match (&link, sent) {
+        (_, Some(sent)) => sent,
+        (Some(link), None) => {
+            say(&format!("Sending the working tree ({} KB packed)", packed.len().div_ceil(1000)));
+            put(link, packed.clone())?;
+            if let Some(at) = &kept_at {
+                let _ = std::fs::create_dir_all(at.parent().unwrap_or(Path::new(".")));
+                let _ = std::fs::write(at, serde_json::to_vec(&Base { name: name.clone(), files: now.clone() }).unwrap_or_default());
+            }
+            (1, false)
+        }
+        (None, None) => {
             let parts = packed.chunks(PART).count() as u32;
             say(&format!("Sending the working tree ({} KB packed, {parts} part{})", packed.len().div_ceil(1000), if parts == 1 { "" } else { "s" }));
             for (i, part) in packed.chunks(PART).enumerate() { call("POST", &format!("/runs/tree?id={tree}&part={i}"), part.to_vec())?; }
-            parts
+            (parts, false)
         }
     };
     let reference = git(&root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_else(|_| "refs/heads/main".into());
     let body = json!({ "workflow": text, "path": path, "job": job, "repository": repository(&root), "ref": reference, "sha": git(&root, &["rev-parse", "HEAD"]).unwrap_or_default(),
-        "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts });
+        "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts, "layered": layered });
     let made = call("POST", "/runs", body.to_string().into_bytes())?;
     let run = made["run_id"].as_str().unwrap_or_default().to_string();
     say(&format!("Run {run} of {path}, on machines of this control plane's"));

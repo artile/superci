@@ -32,6 +32,9 @@ pub struct HandedJob {
     /// The working tree the run was started with, as uploaded (`rtree:<tree>:…`, in `parts`), for its checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub tree: Option<String>,
     #[serde(default)] pub parts: u32,
+    /// Whether its parts are archives one on another (a base kept from before, then what changed since, with the
+    /// paths removed since in `.superci-removed`), not pieces of one.
+    #[serde(default)] pub layered: bool,
     /// When it was handed out (ms): what is kept of it goes after a day.
     #[serde(default)] pub at_ms: u64,
     /// The control plane's record of the job (`job:<id>`) and its runner's name.
@@ -167,11 +170,16 @@ pub fn access_token(now_ms: u64) -> String {
 /// fetched in its parts from `tree` (an address this job's machine alone has), unpacked where the checkout would
 /// have put the repository, and made one commit, as a checkout of one commit leaves it. It takes every input
 /// `actions/checkout` takes (so none is said to be unexpected); another repository than the run's own is refused.
-pub fn checkout_action(tree: &str, parts: u32) -> String {
+pub fn checkout_action(tree: &str, parts: u32, layered: bool) -> String {
     const INPUTS: [&str; 20] = ["repository", "ref", "token", "ssh-key", "ssh-known-hosts", "ssh-strict", "ssh-user", "persist-credentials", "path", "clean", "filter", "sparse-checkout",
         "sparse-checkout-cone-mode", "fetch-depth", "fetch-tags", "show-progress", "lfs", "submodules", "set-safe-directory", "github-server-url"];
     let inputs: String = INPUTS.iter().map(|i| format!("  {i}:\n    required: false\n    default: ''\n")).collect();
-    let fetch = if parts == 0 { "true".to_string() } else { format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\"; done | tar -xz", parts - 1) };
+    let fetch = match (parts, layered) {
+        (0, _) => "true".to_string(),
+        // Each archive on the one before; then what was removed since the base.
+        (_, true) => format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\" | tar -xz; done; if [ -f .superci-removed ]; then tr '\\n' '\\0' < .superci-removed | xargs -0 -r rm -f --; rm -f .superci-removed; fi", parts - 1),
+        _ => format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\"; done | tar -xz", parts - 1),
+    };
     format!(r#"name: Check out (SuperCI)
 description: The working tree a run from a computer was started with, in place of a checkout from GitHub.
 inputs:
@@ -193,7 +201,7 @@ inputs:
 }
 
 /// The checkout above as GitHub serves an action: a gzipped tar with the action in one folder.
-pub fn checkout_tarball(tree: &str, parts: u32) -> Vec<u8> { gzip_stored(&tar(&[("checkout/action.yml", checkout_action(tree, parts).as_bytes())])) }
+pub fn checkout_tarball(tree: &str, parts: u32, layered: bool) -> Vec<u8> { gzip_stored(&tar(&[("checkout/action.yml", checkout_action(tree, parts, layered).as_bytes())])) }
 
 /// A tar of these files (each in a folder the runner takes off as it unpacks).
 fn tar(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -380,7 +388,9 @@ mod tests {
 
     #[test]
     fn the_checkout_is_an_action_the_runner_can_unpack() {
-        let gz = checkout_tarball("https://plane.example/runner/abc/superci/tree", 3);
+        let gz = checkout_tarball("https://plane.example/runner/abc/superci/tree", 3, false);
+        let layered = checkout_action("https://plane.example/runner/abc/superci/tree", 2, true);
+        assert!(layered.contains(r#"for part in $(seq 0 1); do curl -fsSL --retry 3 "https://plane.example/runner/abc/superci/tree?part=$part" | tar -xz; done"#) && layered.contains("xargs -0 -r rm -f --") && layered.contains(r"tr '\n' '\0' < .superci-removed"), "{layered}");
         assert_eq!(&gz[..3], &[0x1f, 0x8b, 8]);
         // (Unpacked by the system's own tar, as the runner does.)
         let dir = std::env::temp_dir().join(format!("superci-checkout-{}", guid()));

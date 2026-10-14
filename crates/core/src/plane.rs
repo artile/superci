@@ -3005,9 +3005,26 @@ impl<'a> ControlPlane<'a> {
         if q.contains_key("link") {
             let now = self.clock.now_ms();
             let Some((region, creds)) = self.tree_bucket(plane_url, now).await? else { return Ok(Response::json(&serde_json::json!({ "url": null }))) };
-            let link = aws::presign("PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &tree_object(id, part)), &creds, &region, cache::LINK_SECONDS, now)?;
-            self.store.put(&format!("rtree-s3:{id}:{part:05}"), region).await?;
+            let bucket = cache::bucket(&self.config.plane_id, &region);
+            let named = |n: &String| (8..=80).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_alphanumeric());
             let _ = self.store.put_if_absent(&format!("rtree-at:{id}"), now.to_string()).await;
+            // A tree the computer keeps as a base for later runs' (`keep`): in the bucket under its name, kept there
+            // as long as the bucket keeps anything; or only what changed since one kept before (`base`), on top of it.
+            let object = match (q.get("keep").filter(|n| named(n)), q.get("base").filter(|n| named(n))) {
+                (Some(name), _) => format!("bases/{name}.tar.gz"),
+                (None, Some(name)) => {
+                    let base = format!("bases/{name}.tar.gz");
+                    let there = aws::s3(self.http, "HEAD", &aws::s3_url(&bucket, &region, &base), &region, &creds, vec![], &[], now).await.is_ok_and(|r| r.status == 200);
+                    if !there { return Ok(Response::json(&serde_json::json!({ "url": null, "base": false }))) }
+                    self.store.put(&format!("rtree-s3:{id}:00000"), format!("{region}|{base}")).await?;
+                    let changed = tree_object(id, 1);
+                    self.store.put(&format!("rtree-s3:{id}:00001"), format!("{region}|{changed}")).await?;
+                    return Ok(Response::json(&serde_json::json!({ "url": aws::presign("PUT", &aws::s3_url(&bucket, &region, &changed), &creds, &region, cache::LINK_SECONDS, now)?, "base": true, "parts": 2 })))
+                }
+                _ => tree_object(id, part),
+            };
+            let link = aws::presign("PUT", &aws::s3_url(&bucket, &region, &object), &creds, &region, cache::LINK_SECONDS, now)?;
+            self.store.put(&format!("rtree-s3:{id}:{part:05}"), format!("{region}|{object}")).await?;
             return Ok(Response::json(&serde_json::json!({ "url": link })))
         }
         if req.body.len() > 5_000_000 { return Ok(Response::text(413, "a part is 5 MB at most")) }
@@ -3033,9 +3050,10 @@ impl<'a> ControlPlane<'a> {
         if !in_bucket.is_empty() {
             let now = self.clock.now_ms();
             let creds = match self.aws_connection().await?.filter(|a| a.connected) { Some(a) => Some(self.aws_creds(plane_url, &a).await?), None => None };
-            for (k, region) in in_bucket {
-                let (region, part) = (region.trim_matches('"').to_string(), k.rsplit(':').next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0));
-                if let Some(creds) = &creds { let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &tree_object(tree, part)), &region, creds, vec![], &[], now).await; }
+            for (k, kept) in in_bucket {
+                let (region, object) = tree_place(kept.trim_matches('"'), tree, k.rsplit(':').next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0));
+                // (A base stays for later runs' trees; the bucket removes it in time.)
+                if let (Some(creds), true) = (&creds, object.starts_with("runs/")) { let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &object), &region, creds, vec![], &[], now).await; }
                 self.store.delete(&k).await?;
             }
         }
@@ -3156,7 +3174,7 @@ impl<'a> ControlPlane<'a> {
         #[derive(Deserialize)]
         struct NewRun { workflow: String, path: String, #[serde(default)] job: Option<String>, repository: String, #[serde(default, rename = "ref")] reference: String,
             #[serde(default)] sha: String, #[serde(default)] actor: String, #[serde(default)] event_name: String, #[serde(default)] secrets: Vec<(String, String)>,
-            #[serde(default)] vars: Vec<(String, String)>, #[serde(default)] tree: Option<String>, #[serde(default)] parts: u32 }
+            #[serde(default)] vars: Vec<(String, String)>, #[serde(default)] tree: Option<String>, #[serde(default)] parts: u32, #[serde(default)] layered: bool }
         let r: NewRun = match serde_json::from_slice(&req.body) { Ok(r) => r, Err(e) => return Ok(Response::text(400, &format!("not a run: {e}"))) };
         let wf = match crate::workflow::parse(&r.workflow) { Ok(w) => w, Err(e) => return Ok(Response::text(400, &e)) };
         let jobs = wf.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default();
@@ -3195,7 +3213,7 @@ impl<'a> ControlPlane<'a> {
         // Its jobs' cache: the repository's entries, as GitHub's jobs keep them when GitHub knows it here.
         let (ns, default_branch) = match self.repository_of(&r.repository).await { Some((id, default)) => (format!("gh{id}"), default), None => (cache::local_ns(&r.repository), "main".to_string()) };
         let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
-            "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances,
+            "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances,
             "cache": { "ns": ns, "default_branch": default_branch } });
         put_json(self.store, &format!("run:{run_id}"), &run).await?;
         if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
@@ -3367,7 +3385,7 @@ impl<'a> ControlPlane<'a> {
             access_token: &access_token, ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
             strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone() };
         let message = crate::runner_service::job_message(&given)?;
-        put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, at_ms: now, job_id, ..Default::default() }).await?;
+        put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, layered: run["layered"] == true, at_ms: now, job_id, ..Default::default() }).await?;
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), ..Default::default() };
         if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(()) }
@@ -3449,17 +3467,18 @@ impl<'a> ControlPlane<'a> {
         let key = format!("rjob:{token}");
         let Some(before) = get_json::<crate::runner_service::HandedJob>(self.store, &key).await? else { return Ok(nothing_here()) };
         if sub == "superci/checkout.tar.gz" {
-            return Ok(Response::new(200, "application/gzip", crate::runner_service::checkout_tarball(&format!("{plane_url}/runner/{token}/superci/tree"), before.parts)))
+            return Ok(Response::new(200, "application/gzip", crate::runner_service::checkout_tarball(&format!("{plane_url}/runner/{token}/superci/tree"), before.parts, before.layered)))
         }
         if sub == "superci/tree" {
             let part = url.query_pairs().find(|(k, _)| k == "part").and_then(|(_, v)| v.parse::<u32>().ok()).unwrap_or(0);
             let Some(tree) = &before.tree else { return Ok(nothing_here()) };
             // (In the bucket: a link there, for a while.)
-            if let Some(region) = self.store.get(&format!("rtree-s3:{tree}:{part:05}")).await? {
-                let (region, now) = (region.trim_matches('"').to_string(), self.clock.now_ms());
+            if let Some(kept) = self.store.get(&format!("rtree-s3:{tree}:{part:05}")).await? {
+                let now = self.clock.now_ms();
+                let (region, object) = tree_place(kept.trim_matches('"'), tree, part);
                 let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(Response::text(409, "this control plane has no AWS account")) };
                 let creds = self.aws_creds(plane_url, &a).await?;
-                let link = aws::presign("GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &tree_object(tree, part)), &creds, &region, cache::LINK_SECONDS, now)?;
+                let link = aws::presign("GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &object), &creds, &region, cache::LINK_SECONDS, now)?;
                 return Ok(Response::new(302, "text/plain", Vec::new()).with_header("location", &link))
             }
             let mut bytes = vec![];
@@ -4311,3 +4330,8 @@ fn local_id(now: u64) -> u64 {
 
 /// Where a part of a run's working tree is kept in the bucket.
 fn tree_object(tree: &str, part: u32) -> String { format!("runs/{tree}/{part:05}") }
+
+/// A tree's part as kept (`region|object`; the region alone before bases were kept).
+fn tree_place(kept: &str, tree: &str, part: u32) -> (String, String) {
+    match kept.split_once('|') { Some((region, object)) => (region.to_string(), object.to_string()), None => (kept.to_string(), tree_object(tree, part)) }
+}

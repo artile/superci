@@ -3796,6 +3796,9 @@ fn a_working_tree_goes_to_the_control_planes_bucket_in_one_and_its_checkout_is_s
     let ready = std::rc::Rc::new(std::cell::Cell::new(true));
     let is_ready = ready.clone();
     let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+        let base = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/bases/bkeptbefore01.tar.gz");
+        if r.method == "HEAD" && r.url == base { return Some(Response::new(200, "application/octet-stream", "")) }
+        if r.method == "HEAD" && r.url.contains("/bases/") { return Some(Response::new(404, "application/octet-stream", "")) }
         (r.method == "HEAD" && r.url == program).then(|| Response::new(if is_ready.get() { 200 } else { 404 }, "application/octet-stream", ""))
     });
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
@@ -3824,6 +3827,15 @@ fn a_working_tree_goes_to_the_control_planes_bucket_in_one_and_its_checkout_is_s
     assert_eq!(fetched.status, 302);
     let to = fetched.header("location").unwrap();
     assert!(to.contains("/runs/tree-0123456789abcdef/00000?") && to.contains("X-Amz-Signature"), "{to}");
+    // A tree kept as a base for the next runs' (in the bucket under its name); then a run with only what changed since
+    // it: the base, then the changes, as two parts; and when the base is gone, the computer is told so.
+    let kept = json(&run(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id=tree-aaaaaaaaaaaaaaaa&part=0&link=1&keep=bkeptbefore01"))));
+    assert!(kept["url"].as_str().unwrap().contains("/bases/bkeptbefore01.tar.gz?"), "{kept}");
+    let changes = json(&run(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id=tree-bbbbbbbbbbbbbbbb&part=1&link=1&base=bkeptbefore01"))));
+    assert!(changes["base"] == true && changes["parts"] == 2 && changes["url"].as_str().unwrap().contains("/runs/tree-bbbbbbbbbbbbbbbb/00001?"), "{changes}");
+    assert!(store.0.borrow()["rtree-s3:tree-bbbbbbbbbbbbbbbb:00000"].ends_with("|bases/bkeptbefore01.tar.gz"));
+    let gone = json(&run(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id=tree-cccccccccccccccc&part=1&link=1&base=bgonelongago01"))));
+    assert!(gone["base"] == false && gone["url"].is_null(), "{gone}");
     // With no bucket ready, the tree goes through the control plane as before.
     ready.set(false);
     let cache2 = Cache::default();
