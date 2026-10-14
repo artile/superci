@@ -2798,6 +2798,32 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
     let (machine, _, _) = ask(&["r8a.24xlarge", "m8a.24xlarge", "c8a.24xlarge"], FLEET_LIMIT, true);
     assert_eq!(machine, Err("MaxSpotInstanceCountExceeded: Max spot instance count exceeded".to_string()));
 
+    // Two generations of machine: AWS goes by where most machines are spare, which is often the older type, and a
+    // job is over sooner on the newer. So the pools as fast as the first choice are asked first, in one request,
+    // and the slower ones in a second only when none of those has a machine. One template serves both.
+    let newer_none: &'static str = Box::leak(FLEET_NONE.replace("g6.xlarge", "m8a.8xlarge").replace("g5.xlarge", "r8a.8xlarge").into_boxed_str());
+    let older_started: &'static str = Box::leak(FLEET_STARTED.replace("c8a.16xlarge", "r7a.8xlarge").replace("m8a.16xlarge", "m7a.8xlarge").replace("r8a.16xlarge", "r7a.8xlarge").into_boxed_str());
+    let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+        let xml = |s: &str| Some(Response::new(200, "text/xml", s.to_string()));
+        if body.contains("Action=DescribeSpotPriceHistory") { return xml("<spotPriceHistorySet/>") }
+        if body.contains("Action=RunInstances") { return Some(aws_refuses("InsufficientInstanceCapacity")) }
+        if body.contains("Action=CreateLaunchTemplate") { return xml(FLEET_TEMPLATE) }
+        if body.contains("Action=CreateFleet") { return xml(if body.contains("InstanceType=m7a.8xlarge") { older_started } else { newer_none }) }
+        if body.contains("Action=DeleteLaunchTemplate") { return xml(FLEET_TEMPLATE_REMOVED) }
+        None
+    });
+    let types: Vec<String> = ["m8a.8xlarge", "r8a.8xlarge", "m7a.8xlarge", "r7a.8xlarge"].map(String::from).to_vec();
+    let launch = Launch { region: "us-east-1", network: Some(&network), image: "ami-new", types: &types, user_data: "#!/bin/bash\n", disk_gb: 60, disk_mibs: 125, disk_iops: 3000, clock: Some(&FixedClock), skip: &[], tags: &tags,
+        spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: true };
+    let mut told = Told::default();
+    let machine = block_on(run_instance(&clouds, &creds, &launch, 1_790_000_000_000, &mut told)).map(|m| (m.kind, m.zone));
+    assert_eq!(machine, Ok(("r7a.8xlarge".to_string(), "us-east-1b".to_string())));
+    let fleets = calls_of(&clouds.0, "CreateFleet");
+    let kinds = |f: &Vec<(String, String)>| { let mut k: Vec<String> = f.iter().filter(|(n, _)| n.ends_with(".InstanceType")).map(|(_, v)| v.clone()).collect(); k.sort(); k.dedup(); (k, f.iter().filter(|(n, _)| n.ends_with(".InstanceType")).count()) };
+    assert_eq!((fleets.len(), kinds(&fleets[0]), kinds(&fleets[1])), (2, (vec!["m8a.8xlarge".to_string(), "r8a.8xlarge".to_string()], 11), (vec!["m7a.8xlarge".to_string(), "r7a.8xlarge".to_string()], 12)));
+    assert_eq!((calls_of(&clouds.0, "CreateLaunchTemplate").len(), calls_of(&clouds.0, "DeleteLaunchTemplate").len(), launches(&clouds.0).len()), (1, 1, 1));
+    assert_eq!(told.asked.iter().map(|a| (a.0.as_str(), a.2.as_str(), a.4)).collect::<Vec<_>>(), [("m8a.8xlarge", "InsufficientInstanceCapacity", 0), ("", "InsufficientInstanceCapacity", 11), ("r7a.8xlarge", "started", 12)]);
+
     // Where the pools may not be asked in one request, or few are left, they are asked one by one, as before.
     let (machine, told, clouds) = ask(&["c8a.16xlarge", "m8a.16xlarge", "r8a.16xlarge"], FLEET_STARTED, false);
     assert!(machine.is_err() && calls_of(&clouds, "CreateFleet").is_empty() && launches(&clouds).len() == 12 && told.more);

@@ -320,11 +320,14 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         // spare machines there, the earlier in this order the better. With few left, one by one is as quick.
         if at == 1 && l.spot && l.fleet && pools.len() - at >= FLEET_FROM {
             let rest: Vec<(String, Option<String>, String)> = pools[at..].iter().take(FLEET_MOST).map(|(t, p)| ((*t).clone(), p.0.map(|(_, id)| id.clone()), zone_of(*p))).collect();
-            let began = l.clock.map(|c| c.now_ms());
-            let took = |began: Option<u64>| match (l.clock, began) { (Some(c), Some(b)) => c.now_ms().saturating_sub(b), _ => 0 };
-            match fleet(http, creds, l, &rest, now_ms, told).await {
-                Ok(Ok(m)) => { if l.clock.is_some() { told.asked.push((m.kind.clone(), m.zone.clone(), "started".into(), took(began), rest.len() as u32)) } return Ok(m) }
-                Ok(Err(e)) => { if l.clock.is_some() { told.asked.push((String::new(), String::new(), e.split(':').next().unwrap_or_default().to_string(), took(began), rest.len() as u32)) } return Err(e) }
+            // AWS goes by where most machines are spare, which is often an older type, and a job is over sooner on
+            // a newer one: the pools as fast as the first choice are asked first, the slower ones only when none of
+            // those has a machine (a second request, when there are enough of each to be worth one).
+            let first = speed(pools[0].0);
+            let (fast, slow): (Vec<_>, Vec<_>) = rest.iter().cloned().partition(|(kind, ..)| speed(kind) >= first - 0.001);
+            let groups = if fast.len() >= FLEET_FROM && !slow.is_empty() { vec![fast, slow] } else { vec![rest] };
+            match fleet(http, creds, l, &groups, now_ms, told).await {
+                Ok(answer) => return answer,
                 // Not to be had in one request here: one by one, as before.
                 Err(e) => told.fleet_refused = Some(e),
             }
@@ -379,8 +382,8 @@ pub const FLEET_FROM: usize = 4;
 /// How many pools one such request asks at most.
 pub const FLEET_MOST: usize = 100;
 
-/// One request for one spot machine from any of these pools (type, subnet in the control plane's own network, zone),
-/// best first: an "instant fleet", which answers in about three seconds whatever the number of pools, where asking
+/// One request for one spot machine from any of a group of pools (type, subnet in the control plane's own network,
+/// zone), best first, and the next group when none of a group has one: an "instant fleet", which answers in about three seconds whatever the number of pools, where asking
 /// them one by one takes most of a second each. AWS chooses the pool with the most spare machines (so the one least
 /// likely to be taken back), and among those alike the earliest here. A fleet takes what a machine is from a launch
 /// template and not from the request, so one is made for this one use (the start-up script is the job's own) and
@@ -388,7 +391,7 @@ pub const FLEET_MOST: usize = 100;
 ///
 /// Its machine; or AWS's word for none (as `RunInstances` says it), with what was said of each pool in `told.refused`;
 /// or, outside those, why the pools could not be asked this way at all.
-async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, pools: &[(String, Option<String>, String)], now_ms: u64, told: &mut Told) -> Result<Result<Started>> {
+async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[Vec<(String, Option<String>, String)>], now_ms: u64, told: &mut Told) -> Result<Result<Started>> {
     let tag = |k: &str| l.tags.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str()).unwrap_or_default();
     let name = format!("superci-{}-{}-{}", tag("superci-plane"), tag("superci-job"), l.clock.map(|c| c.now_ms()).unwrap_or(now_ms));
     let tags = |t: &[(String, String)]| t.iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect::<Vec<_>>();
@@ -402,29 +405,45 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, pools: &[(S
         data["NetworkInterface"] = serde_json::json!([{ "DeviceIndex": 0, "SecurityGroupId": groups, "AssociatePublicIpAddress": if n.private { "false" } else { "true" }, "DeleteOnTermination": "true" }]);
     }
     let own: Vec<(String, String)> = l.tags.iter().filter(|(k, _)| k == "superci-plane").cloned().collect();
+    let began = l.clock.map(|c| c.now_ms());
     ec2(http, l.region, creds, "CreateLaunchTemplate", serde_json::json!({ "LaunchTemplateName": name, "LaunchTemplateData": data, "TagSpecification": [{ "ResourceType": "launch-template", "Tag": tags(&own) }] }), now_ms).await?;
-    let overrides: Vec<serde_json::Value> = pools.iter().enumerate().map(|(i, (kind, subnet, zone))| {
-        let mut o = serde_json::json!({ "InstanceType": kind, "Priority": i + 1 });
-        match subnet { Some(id) => o["SubnetId"] = id.clone().into(), None if !zone.is_empty() => o["AvailabilityZone"] = zone.clone().into(), None => {} }
-        o
-    }).collect();
-    let request = serde_json::json!({
-        "Type": "instant",
-        "TargetCapacitySpecification": { "TotalTargetCapacity": 1, "DefaultTargetCapacityType": "spot" },
-        "SpotOptions": { "AllocationStrategy": "capacity-optimized-prioritized", "InstanceInterruptionBehavior": "terminate" },
-        "LaunchTemplateConfigs": [{ "LaunchTemplateSpecification": { "LaunchTemplateName": name, "Version": "$Latest" }, "Overrides": overrides }],
-    });
-    let answer = loop {
-        match ec2(http, l.region, creds, "CreateFleet", request.clone(), now_ms).await {
-            Err(e) if e.starts_with("RequestLimitExceeded") && told.throttled < MAX_WAITS && l.timer.is_some() => {
-                told.throttled += 1;
-                if let Some(timer) = l.timer { timer.pause(300 + l.jitter_ms + told.throttled as u64 * 250).await }
+    // Each group in turn, until one has a machine. (The time of making the template is counted with the first.)
+    let mut answer: Result<Result<Started>> = Err("no pools to ask".into());
+    let mut began = began;
+    for pools in groups {
+        let overrides: Vec<serde_json::Value> = pools.iter().enumerate().map(|(i, (kind, subnet, zone))| {
+            let mut o = serde_json::json!({ "InstanceType": kind, "Priority": i + 1 });
+            match subnet { Some(id) => o["SubnetId"] = id.clone().into(), None if !zone.is_empty() => o["AvailabilityZone"] = zone.clone().into(), None => {} }
+            o
+        }).collect();
+        let request = serde_json::json!({
+            "Type": "instant",
+            "TargetCapacitySpecification": { "TotalTargetCapacity": 1, "DefaultTargetCapacityType": "spot" },
+            "SpotOptions": { "AllocationStrategy": "capacity-optimized-prioritized", "InstanceInterruptionBehavior": "terminate" },
+            "LaunchTemplateConfigs": [{ "LaunchTemplateSpecification": { "LaunchTemplateName": name, "Version": "$Latest" }, "Overrides": overrides }],
+        });
+        let said = loop {
+            match ec2(http, l.region, creds, "CreateFleet", request.clone(), now_ms).await {
+                Err(e) if e.starts_with("RequestLimitExceeded") && told.throttled < MAX_WAITS && l.timer.is_some() => {
+                    told.throttled += 1;
+                    if let Some(timer) = l.timer { timer.pause(300 + l.jitter_ms + told.throttled as u64 * 250).await }
+                }
+                other => break other,
             }
-            other => break other,
+        };
+        answer = match said { Ok(xml) => fleet_said(&xml, pools, told), Err(e) => Err(e) };
+        let took = match (l.clock, began) { (Some(c), Some(b)) => c.now_ms().saturating_sub(b), _ => 0 };
+        began = l.clock.map(|c| c.now_ms());
+        match &answer {
+            Ok(Ok(m)) => if l.clock.is_some() { told.asked.push((m.kind.clone(), m.zone.clone(), "started".into(), took, pools.len() as u32)) },
+            Ok(Err(e)) => if l.clock.is_some() { told.asked.push((String::new(), String::new(), e.split(':').next().unwrap_or_default().to_string(), took, pools.len() as u32)) },
+            Err(_) => {}
         }
-    };
+        // A machine, or the account's limit (no other pool would answer otherwise), or no answer at all: no more is asked.
+        if !matches!(&answer, Ok(Err(e)) if e.starts_with("InsufficientInstanceCapacity")) { break }
+    }
     if ec2(http, l.region, creds, "DeleteLaunchTemplate", serde_json::json!({ "LaunchTemplateName": name }), now_ms).await.is_err() { told.template_left = Some(name) }
-    fleet_said(&answer?, pools, told)
+    answer
 }
 
 /// What an instant fleet answered: its machine, or what it said of each pool (kept in `told.refused` in

@@ -768,9 +768,9 @@ fn asks_said(j: &serde_json::Value) -> String {
         if let Some(pools) = a["pools"].as_u64().filter(|p| *p > 0) {
             said.push(match what {
                 "started" => format!("{kind}{}, AWS's choice of {pools} pools", a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default()),
-                "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" => format!("your account's limit refused the other {pools} pools"),
-                "InsufficientInstanceCapacity" => format!("no spot machine in the other {pools} pools"),
-                other => format!("{other} for the other {pools} pools"),
+                "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" => format!("your account's limit refused {pools} other pools"),
+                "InsufficientInstanceCapacity" => format!("no spot machine in {pools} other pools"),
+                other => format!("{other} for {pools} other pools"),
             });
             i += 1; continue
         }
@@ -7293,7 +7293,7 @@ mod tests {
         many["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), { "at": 800, "kind": "", "spot": true, "said": "InsufficientInstanceCapacity", "ms": 2_900, "pools": 14 },
             { "at": 3_700, "kind": "m8a.8xlarge", "zone": "us-east-1a", "spot": false, "said": "started", "ms": 900 }]);
         (many["machine_type"], many["on_demand"]) = ("m8a.8xlarge".into(), true.into());
-        assert_eq!(job_start_lines(&many)[2], "    4.0 s  AWS gave a machine (no spot m8a.8xlarge; no spot machine in the other 14 pools; on-demand m8a.8xlarge in us-east-1a)");
+        assert_eq!(job_start_lines(&many)[2], "    4.0 s  AWS gave a machine (no spot m8a.8xlarge; no spot machine in 14 other pools; on-demand m8a.8xlarge in us-east-1a)");
         // A runner that was slow to reach GitHub: what it logged meanwhile comes after the steps.
         let mut slow = j.clone();
         slow["machine"]["log"] = "[2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()\n... 30 s ...\n[2026-10-13 22:56:41Z WARN GitHubActionsService] Attempt 1 of POST request failed".into();
