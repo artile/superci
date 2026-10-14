@@ -2,6 +2,13 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.0 — unreleased
+- `superci runs create` prints every line of a run's jobs. GitHub's runner sends its lines as it goes only as fast as it can, holding 1,024 at most and dropping the rest, so a job that printed a lot (an e2e suite's 5,000 lines) was cut short though it passed. Each step's whole log, which the runner sends when the step ends, is now kept (in the control plane's bucket, where there is one) and what was dropped is printed from it, in order. The dashboard's log of such a job is the whole one too.
+- The control plane keeps its records apart by kind (on AWS, a DynamoDB partition for each), so one kind's traffic never slows another's; what an earlier version kept is moved over by itself, a little at each minute's sweep, with nothing to do.
+- Starting a machine, the minute's sweep and the dashboard read only the jobs still going and each day's totals, not every job ever kept, so they stay as fast with a year of history as with a day's. Spend, limits and usage come from each day's totals.
+- Records end by themselves: a job's 90 days after it ends (60 before), its lines and logs after two days, a machine's start record with its job, cache entries with their pieces in the bucket.
+- `superci status --json` says how the control plane's store stands (`store`: its jobs indexed, nothing left in an earlier layout).
+
 ## 0.18.2 — 2026-10-14
 - Overview's figures cover the last 24 hours, 7 days or 30 days (a switch on the card), counted by the control plane over every job it keeps, not from the latest fifty: jobs, machine minutes beside the minutes GitHub or GitLab would bill (each job rounded up to a minute), the wait for a machine, and what they cost beside what the code host's own runners of the same sizes would have charged, with what that saved. `superci usage retrieve --period=day|week|month` says the same. The page waits in the same shape while it loads.
 - A run from a computer with a working tree of many MB failed before it started: the tree went into the control plane's DynamoDB table, which writes only so much a second, and DynamoDB refused it ("ThrottlingException"). The tree now goes into the control plane's bucket in one piece, as a build service takes its source, and its machine fetches it from there; a tree may be 1 GB packed (150 MB before). A control plane with no bucket takes it as before.

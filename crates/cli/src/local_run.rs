@@ -287,8 +287,11 @@ impl Lines {
         self.steps = steps.len();
         let mut out = vec![];
         if steps.is_empty() { for (_, _, lines) in self.held.drain(..) { out.extend(lines) } return out }
-        for s in steps {
+        // (A step is over once one after it has begun, whatever its own record says.)
+        let begun: Vec<bool> = steps.iter().map(|s| s["state"].as_str().is_some_and(|st| st != "pending")).collect();
+        for (at, s) in steps.iter().enumerate() {
             let Some(id) = s["id"].as_str() else { continue };
+            let s = *s;
             if self.done.contains(id) { continue }
             let shown = self.shown.entry(id.to_string()).or_insert(0);
             // What was sent of it as it went, while it follows on from what is out.
@@ -302,20 +305,20 @@ impl Lines {
                 }
             }
             self.held = rest;
-            // Over: the rest from its whole log, then the next step.
-            let ended = s["state"] == "completed";
-            match (ended, s["log"].as_u64()) {
-                (true, Some(n)) => match fetch(n) {
-                    Some(text) => {
-                        out.extend(text.lines().skip(*shown as usize).map(|l| without_time(l).to_string()));
-                        self.done.insert(id.to_string());
-                    }
-                    None if give_up => { self.done.insert(id.to_string()); }
-                    None => return out,
-                },
-                (true, None) if give_up => { self.done.insert(id.to_string()); }
-                _ => return out,
+            // Over: the rest from its whole log, then the next step. (The run over and its log long in coming: what
+            // came of it as it went, as it is.)
+            let ended = s["state"] == "completed" || begun[at + 1..].iter().any(|b| *b) || give_up;
+            if !ended { return out }
+            match s["log"].as_u64().and_then(fetch) {
+                Some(text) => out.extend(text.lines().skip(*shown as usize).map(|l| without_time(l).to_string())),
+                None if give_up => {
+                    let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held).into_iter().partition(|(step, _, _)| step.as_deref() == Some(id));
+                    self.held = rest;
+                    for (_, start, lines) in mine { for (k, line) in lines.into_iter().enumerate() { if start.is_none_or(|st| st + k as u64 > *shown) { out.push(line) } } }
+                }
+                None => return out,
             }
+            self.done.insert(id.to_string());
         }
         out
     }
@@ -326,6 +329,8 @@ impl Lines {
 
 /// A log's line without the time the runner put before it ("2026-10-14T21:09:53.1234567Z ").
 fn without_time(line: &str) -> &str {
+    // (A log's first line begins with a byte order mark.)
+    let line = line.trim_start_matches('\u{feff}');
     let b = line.as_bytes();
     if b.len() > 20 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) {
         if let Some(at) = line.find("Z ") { if at < 40 { return &line[at + 2..] } }
