@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.18.1 — unreleased
+## 0.18.1 — 2026-10-14
 - What a run from a computer's jobs keep with `upload-artifact` can be fetched to the computer: `superci artifacts list --run=ID` names them, `superci artifacts retrieve NAME --run=ID [--out=DIR]` unpacks one, as `download-artifact` would. With a key that only reads too.
 - A key for coding agents has no limits of its own: its jobs keep to the control plane's, as every job does (the largest machine, what may be spent in a month and a day). `superci keys create agent --runs` takes no `--max-cpu` or `--daily-usd`; a key made by 0.18.0 is no longer taken, so make it again.
 - `superci runs create` against a control plane older than 0.18.0 says to update it, rather than that the control plane has nothing there.
