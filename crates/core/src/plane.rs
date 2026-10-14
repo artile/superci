@@ -932,6 +932,12 @@ impl<'a> ControlPlane<'a> {
                 // (Times near now only: a machine's clock is set by AWS before its script runs.)
                 let now = self.clock.now_ms();
                 let ms = |k: &str| q.get(k).and_then(|v| v.parse::<u64>().ok()).filter(|t| t.abs_diff(now) < 3_600_000);
+                // What its runner wrote of a step so far (a page of its log, from `at` on), kept for its page here.
+                if let Some(file) = q.get("live").filter(|f| f.len() <= 120 && f.ends_with(".log") && f.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))) {
+                    let at = q.get("at").and_then(|a| a.parse::<u64>().ok()).unwrap_or(0);
+                    if !req.body.is_empty() && req.body.len() <= 4_000_000 { self.keep_live(job_key(&j).trim_start_matches("job:"), file, at, &req.body, &plane_url, now).await? }
+                    return Ok(Response::text(200, "ok"))
+                }
                 let key = format!("hello:{}", job_key(&j).trim_start_matches("job:"));
                 let mut said = get_json::<MachineStart>(self.store, &key).await?.unwrap_or_default();
                 if let Some(script) = ms("script") { said.script_ms = script; said.boot_s = q.get("boot").and_then(|b| b.parse::<f64>().ok()).filter(|b| (0.0..3600.0).contains(b)).unwrap_or_default() }
@@ -1259,7 +1265,12 @@ impl<'a> ControlPlane<'a> {
         } else if j.provider == "gitlab" {
             match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(project)) => gitlab::job_trace(self.http, gl, project, j.job_id).await, _ => Err("its GitLab is no longer connected".into()) }
         } else {
-            match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) }
+            let from_github = match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) };
+            // Not yet from GitHub (it gives a job's log once it has ended): what its runner wrote as it went.
+            match from_github {
+                Ok(l) if !l.is_empty() => Ok(l),
+                other => match self.live_log(key.trim_start_matches("job:"), 1_000_000).await { Ok(l) if !l.is_empty() => Ok(l), _ => other },
+            }
         };
         let log = match fetched { Ok(l) => l, Err(e) => return Ok(Response::json(&serde_json::json!({ "error": e, "steps": steps }))) };
         let want = q("bytes").and_then(|b| b.parse::<usize>().ok()).unwrap_or(200_000).clamp(1_000, 1_000_000);
@@ -3048,6 +3059,54 @@ impl<'a> ControlPlane<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// A piece of what a GitHub job's runner wrote as it went (`file`, a page of its log; `at`, where in it): in the
+    /// bucket where there is one (the store keeps where), else in the store. Gone after two days.
+    async fn keep_live(&self, id: &str, file: &str, at: u64, body: &[u8], plane_url: &str, now: u64) -> Result<()> {
+        let (mark, until) = (format!("glive:{id}:{file}:{at:013}"), now + 2 * 86_400_000);
+        if let Some((region, creds)) = self.tree_bucket(plane_url, now).await? {
+            let object = format!("live/{id}/{file}-{at:013}");
+            let put = aws::s3(self.http, "PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &object), &region, &creds, body.to_vec(), &[], now).await?;
+            if put.status < 300 { return self.store.put_until(&mark, format!("s3:{region}:{}", body.len()), until).await }
+        }
+        for (i, piece) in body.chunks(crate::runner_service::LOG_PIECE).enumerate() {
+            self.store.put_until(&format!("{mark}:{i:03}"), crate::crypto::b64(piece), until).await?;
+        }
+        Ok(())
+    }
+
+    /// What a GitHub job's runner wrote as it went, its last `want` bytes or so: each page in order (by the time its
+    /// first line was written), its pieces one after another.
+    async fn live_log(&self, id: &str, want: usize) -> Result<Vec<u8>> {
+        use base64::Engine;
+        let marks = self.store.list(&format!("glive:{id}:")).await?;
+        let size = |v: &str| v.trim_matches('"').strip_prefix("s3:").and_then(|r| r.rsplit(':').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(v.len() * 3 / 4);
+        // From the end, as much as is wanted.
+        let (mut total, mut from) = (0usize, marks.len());
+        while from > 0 && total < want { from -= 1; total += size(&marks[from].1) }
+        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
+        let mut creds = None;
+        let mut pages: Vec<(String, Vec<u8>)> = vec![];
+        for (k, v) in &marks[from..] {
+            let rest = k.strip_prefix(&format!("glive:{id}:")).unwrap_or_default();
+            let file = rest.split(':').next().unwrap_or_default().to_string();
+            let bytes = match v.trim_matches('"').strip_prefix("s3:") {
+                Some(r) => {
+                    let region = r.split(':').next().unwrap_or_default();
+                    if creds.is_none() { if let Some(a) = self.aws_connection().await?.filter(|a| a.connected) { creds = Some(self.aws_creds(&plane_url, &a).await?) } }
+                    let Some(c) = &creds else { continue };
+                    let at = rest.split(':').nth(1).unwrap_or_default();
+                    let got = aws::s3(self.http, "GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &format!("live/{id}/{file}-{at}")), region, c, vec![], &[], self.clock.now_ms()).await?;
+                    if got.status < 300 { got.body } else { continue }
+                }
+                None => base64::engine::general_purpose::STANDARD.decode(v.trim_matches('"')).map_err(|e| e.to_string())?,
+            };
+            match pages.iter_mut().find(|(f, _)| *f == file) { Some((_, b)) => b.extend(bytes), None => pages.push((file, bytes)) }
+        }
+        // Pages in the order they were begun: by their first line's time.
+        pages.sort_by(|a, b| a.1.get(..28).cmp(&b.1.get(..28)));
+        Ok(pages.into_iter().flat_map(|(_, b)| { let mut b = b; if !b.ends_with(b"\n") { b.push(b'\n') } b }).collect())
     }
 
     /// A run's job's steps in order, each with its log: the whole one once the runner sent it, else the lines it sent

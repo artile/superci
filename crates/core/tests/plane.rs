@@ -2598,6 +2598,17 @@ fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself()
     let send = |t: &str, body: String| run(Request::new("POST", &format!("{PLANE_URL}/hello?runner=superci-{PLANE_ID}-7&t={t}&log=runner")).with_body(body)).status;
     assert_eq!((send("wrong-wrong-wrong-wrong", log.to_string()), send(&token, format!("{log}{}", "x".repeat(40_000)))), (404, 200));
     let kept: serde_json::Value = serde_json::from_str(&store.0.borrow()["hello:7"]).unwrap();
+    // What its runner writes of each step, sent as it is written (GitHub gives a job's log once it has ended): its
+    // pages, each in pieces, read back in order as the job's log while GitHub has none. Only with its link.
+    let page = |t: &str, file: &str, at: u64, body: &str| run(Request::new("POST", &format!("{PLANE_URL}/hello?runner=superci-{PLANE_ID}-7&t={t}&live={file}&at={at}")).with_body(body.to_string())).status;
+    let (setup, tests) = ("aaaa_1111_1.log", "aaaa_2222_1.log");
+    assert_eq!(page("wrong-wrong-wrong-wrong", setup, 0, "x"), 404);
+    assert_eq!(page(&token, tests, 0, "2026-10-15T10:00:05.0000000Z ##[group]Run npm test\n"), 200);
+    assert_eq!(page(&token, setup, 0, "2026-10-15T10:00:01.0000000Z Current runner version: '2.337.0'\n"), 200);
+    assert_eq!(page(&token, tests, 55, "2026-10-15T10:00:06.0000000Z ok 1 - adds\n"), 200);
+    assert_eq!(page(&token, "../escape", 0, "x"), 200, "a name that is not a page's is let be");
+    let got = json(&run(Request::new("GET", &format!("{PLANE_URL}/job/log?id=7")).with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert_eq!(got["log"].as_str().unwrap_or_else(|| panic!("{got}")), "2026-10-15T10:00:01.0000000Z Current runner version: '2.337.0'\n2026-10-15T10:00:05.0000000Z ##[group]Run npm test\n2026-10-15T10:00:06.0000000Z ok 1 - adds\n");
     let text = kept["log"].as_str().unwrap();
     assert!(text.starts_with("[2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()\n... 30 s ...\n[2026-10-13 22:56:41Z WARN") && !text.contains('\u{7}') && text.len() < 16_100 && text.lines().all(|l| l.len() <= 300), "{text}");
     assert_eq!(kept["listening_ms"], 1_790_000_011_000u64, "what it said before stays");

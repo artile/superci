@@ -1222,7 +1222,9 @@ pub fn with_scratch(script: String, ramdisk: bool) -> String {
     script.replacen(GROW_ROOT, &format!("{GROW_ROOT}{}", SCRATCH.replace("MOUNT_SCRATCH", if ramdisk { MOUNT_RAM } else { MOUNT_NVME })), 1)
 }
 
-/// What `with_hello` adds before the runner starts. A runner that took more than ten seconds to listen for a job
+/// What `with_hello` adds before the runner starts. While GitHub's runner runs, what it writes of each step (pages of
+/// its log under `_diag/pages`, in pieces as it writes them) is sent on every two seconds (`live`, the page's name;
+/// `at`, where in it): GitHub gives a job's log only once it has ended. A runner that took more than ten seconds to listen for a job
 /// also says what it logged meanwhile (GitHub's runner keeps a log of its own under `_diag`): when the machine
 /// started it, each wait of two seconds or more with the line before and the line after, and its warnings and
 /// errors. So a slow one says where it waited: for its own start, for a name, for GitHub's answer.
@@ -1238,6 +1240,7 @@ const HELLO: &str = r#"# How the start went, said to the control plane (see wher
         END { if (last != shown) print last }' | cut -c1-400 | head -c 20000 | curl -s -m 10 -X POST -H "content-type: text/plain" --data-binary @- "HELLO_URL&log=runner" > /dev/null 2>&1
     fi
   fi ) &
+(for i in $(seq 90);do pgrep -f Runner.Listener>/dev/null&&break;sleep 1;done;declare -A o;while :;do r=$(pgrep -f Runner.Listener);for f in /home/runner/_diag/pages/*.log;do [ -f "$f" ]||continue;n=${f##*/};s=$(stat -c %s "$f");p=${o[$n]:-0};[ "$s" -gt "$p" ]&&tail -c +$((p+1)) "$f"|head -c $((s-p))|curl -s -m 10 --data-binary @- "HELLO_URL&live=$n&at=$p">/dev/null&&o[$n]=$s;done;[ -z "$r" ]&&break;sleep 2;done) &
 "#;
 
 /// A Linux machine's start-up script that also tells the control plane how its start went (`url`: a link only this
