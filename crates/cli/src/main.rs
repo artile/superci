@@ -52,7 +52,12 @@ fn main() {
     }
     // A long command says each step as it begins (to a person; a program gets them with the result).
     let mut steps = vec![];
-    let result = commands::run(&args, &mut |step: &str| { if !json { println!("{step}…") } steps.push(step.to_string()) });
+    // (A line a job wrote, marked so by the command, is printed as it is.)
+    let result = commands::run(&args, &mut |step: &str| {
+        let (line, of_a_job) = match step.strip_prefix(commands::JOB_LINE) { Some(l) => (l, true), None => (step, false) };
+        if !json { if of_a_job { println!("{line}") } else { println!("{line}…") } }
+        steps.push(line.to_string())
+    });
     match result {
         Ok(done) if json => {
             let mut data = done.data;

@@ -82,7 +82,11 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
             say(&match state.as_str() { "launching" => "Asking for its machine".to_string(), "launched" => format!("Its machine is starting ({})", st["machine"].as_str().unwrap_or("")), "running" => "Running".to_string(), other => other.to_string() });
             last_state = state.clone();
         }
-        for line in st["lines"].as_array().into_iter().flatten() { say(line.as_str().unwrap_or_default()) }
+        // The job's lines as GitHub shows them: a group's heading is a line, its end is nothing.
+        for line in st["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str()) {
+            if line.starts_with("##[endgroup]") { continue }
+            say(&format!("{}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(line)))
+        }
         after = st["next"].as_u64().unwrap_or(after);
         if let Some(result) = st["result"].as_str() {
             let took = began.elapsed().as_secs();

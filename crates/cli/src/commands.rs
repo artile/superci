@@ -164,6 +164,9 @@ impl Args {
 /// What a command did or read: lines for a person, and the same as data.
 pub struct Done { pub said: Vec<String>, pub data: Value }
 
+/// How a command marks a line a job wrote among its steps: printed as it is, with nothing added.
+pub const JOB_LINE: &str = "\u{1}";
+
 impl Done {
     fn said(line: impl Into<String>) -> Done { let line = line.into(); let line = if line.is_empty() { "Done.".to_string() } else { line }; Done { data: json!({ "ok": true, "said": line }), said: vec![line] } }
 }
@@ -384,7 +387,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let plane = in_use(&d)?;
             let pairs = |flag: &str| args.all(flag).iter().map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or(format!("--{flag} is NAME=VALUE"))).collect::<std::result::Result<Vec<_>, String>>();
             let (secrets, vars) = match (pairs("secret"), pairs("var")) { (Ok(s), Ok(v)) => (s, v), (Err(e), _) | (_, Err(e)) => return usage(e) };
-            Ok(crate::local_run::create(plane.url(), d.key(), workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, steps)?)
+            // (Each control plane is handed a key of its own, made from this session's.)
+            Ok(crate::local_run::create(plane.url(), &crate::cloudflare::plane_key(d.key(), plane.url()), workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, steps)?)
         }
         ("runs", "list") => {
             let mut d = signed_in();

@@ -2634,6 +2634,8 @@ impl<'a> ControlPlane<'a> {
         };
         let found = wf.get("jobs").and_then(|j| j.get(&job_name));
         if found.and_then(|j| j.get("needs")).is_some() { return Ok(Response::text(400, &format!("the job {job_name} needs other jobs; a run from a computer runs one job by itself yet"))) }
+        if found.and_then(|j| j.get("strategy")).and_then(|s| s.get("matrix")).is_some() { return Ok(Response::text(400, &format!("the job {job_name} has a matrix; a run from a computer runs a job without one yet"))) }
+        if found.and_then(|j| j.get("uses")).is_some() { return Ok(Response::text(400, &format!("the job {job_name} calls another workflow; a run from a computer runs a job with steps of its own yet"))) }
         // Its machine: the one its label says when it is this control plane's, else the default machine.
         let runs_on = found.and_then(|j| j.get("runs-on")).and_then(|n| n.text()).unwrap_or_default().to_string();
         let label = if self.config.parse(&runs_on).is_some() { runs_on } else { self.config.label.clone() };

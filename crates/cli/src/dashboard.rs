@@ -710,7 +710,7 @@ pub fn runs_of(jobs: &[serde_json::Value]) -> Vec<serde_json::Value> {
         let mut ids: Vec<u64> = rows.iter().filter_map(|j| n(j, "job_id")).collect();
         ids.sort_unstable(); ids.dedup();
         let first = rows[0];
-        let link = if first["provider"] == "gitlab" { format!("{}/{}/-/pipelines/{}", first["gitlab_url"].as_str().unwrap_or("https://gitlab.com"), k.0, k.1) }
+        let link = if first["provider"] == "local" { String::new() } else if first["provider"] == "gitlab" { format!("{}/{}/-/pipelines/{}", first["gitlab_url"].as_str().unwrap_or("https://gitlab.com"), k.0, k.1) }
             else { format!("{}/{}/actions/runs/{}{}", first["github_web"].as_str().unwrap_or("https://github.com"), k.0, k.1, if k.2 > 1 { format!("/attempts/{}", k.2) } else { String::new() }) };
         serde_json::json!({ "id": k.1, "attempt": Some(k.2).filter(|a| *a > 0), "repo": k.0, "workflow": first["workflow"], "provider": first["provider"], "state": state, "jobs": ids.len(), "job_ids": ids,
             "took_ms": took_ms, "usd": Some(usd).filter(|c| *c > 0.0), "last": last, "link": link, "at_ms": at })
@@ -5128,6 +5128,8 @@ fn signin_button(cloud: &str, label: &str, primary: bool) -> String {
 /// A job's page on its code host.
 fn job_link(j: &serde_json::Value) -> String {
     let (repo, job, run) = (j["repo"].as_str().unwrap_or_default(), j["job_id"].as_u64().unwrap_or_default(), j["run_id"].as_u64().unwrap_or_default());
+    // (A run from a computer has no page at its code host: GitHub never knew of it.)
+    if j["provider"] == "local" { return String::new() }
     if j["provider"] == "gitlab" { format!("{}/{repo}/-/jobs/{job}", j["gitlab_url"].as_str().unwrap_or("https://gitlab.com")) } else { format!("{}/{repo}/actions/runs/{run}/job/{job}", j["github_web"].as_str().unwrap_or("https://github.com")) }
 }
 
