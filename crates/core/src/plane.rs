@@ -406,6 +406,8 @@ pub const JOB_KEPT_MS: u64 = 90 * 86_400_000;
 /// How long a job stays among the live ones once nothing more is done for it (machines counted against an account's
 /// limits a little longer than they run).
 const LIVE_AFTER_MS: u64 = 30 * 60_000;
+/// How long a runner's name is kept with its job: past the longest job.
+const RUNNER_KEPT_MS: u64 = MAX_JOB_MINUTES as u64 * 60_000 + 86_400_000;
 /// Where it is said that the jobs' indexes are complete.
 const INDEXED: &str = "indexed";
 /// How long a day's totals are kept.
@@ -938,7 +940,7 @@ impl<'a> ControlPlane<'a> {
                     let text: String = String::from_utf8_lossy(&req.body).chars().filter(|c| *c == '\n' || (!c.is_control() && *c != '\u{fffd}')).take(16_000).collect();
                     said.log = Some(text.lines().map(|l| l.chars().take(300).collect::<String>()).collect::<Vec<_>>().join("\n")).filter(|t| !t.trim().is_empty());
                 }
-                put_json(self.store, &key, &said).await?;
+                self.store.put_until(&key, serde_json::to_string(&said).map_err(|e| e.to_string())?, now + JOB_KEPT_MS).await?;
                 Ok(Response::text(200, "ok"))
             }
             // GitLab's projects, for the dashboard: which send their jobs here; switching one on or off; after the
@@ -2328,7 +2330,7 @@ impl<'a> ControlPlane<'a> {
                 let jit = crate::runner_service::jit_config(&format!("{plane_url}/runner/{token}"), &name)?;
                 job.runner = Some(name.clone());
                 self.keep(&key, &*job).await?;
-                put_json(self.store, &format!("runner:{name}"), &job.job_id).await?;
+                self.store.put_until(&format!("runner:{name}"), job.job_id.to_string(), self.clock.now_ms() + RUNNER_KEPT_MS).await?;
                 if let Some(mut handed) = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await? { handed.runner = name.clone(); put_json(self.store, &format!("rjob:{token}"), &handed).await? }
                 Work::GitHub { jit }
             } else if gitlab {
@@ -2347,7 +2349,7 @@ impl<'a> ControlPlane<'a> {
                 job.runner = Some(name.clone());
                 job.runner_id = Some(runner_id);
                 self.keep(&key, &*job).await?;
-                put_json(self.store, &format!("runner:{name}"), &job.job_id).await?;
+                self.store.put_until(&format!("runner:{name}"), job.job_id.to_string(), self.clock.now_ms() + RUNNER_KEPT_MS).await?;
                 Work::GitHub { jit }
             };
             // The places that can run it, in order. The job goes to the next when this one cannot start its machine now:
@@ -2749,7 +2751,7 @@ impl<'a> ControlPlane<'a> {
         let name = format!("{}-{}{FAILING}", runner_prefix(self.config.name(), &self.config.plane_id), job.job_id);
         let Ok((jit, runner_id)) = github::jit_config(self.http, &app.api(), &token, &owner, &job.repo, &name, &[&label], "/home/runner/work").await else { return self.fail_later(job, why).await };
         // Known by its name, as a job's runner is: it may take another job with the label (see `failed_by_runner`).
-        let _ = put_json(self.store, &format!("runner:{name}"), &job.job_id).await;
+        let _ = self.store.put_until(&format!("runner:{name}"), job.job_id.to_string(), self.clock.now_ms() + RUNNER_KEPT_MS).await;
         // macOS (no provider here runs it yet): what to do, in so many words.
         let mac = self.config.parse(&label).and_then(|s| s.ok()).is_some_and(|s| s.os() == "macos") && why.starts_with("nowhere to run");
         let called = self.config.name();
@@ -2883,7 +2885,7 @@ impl<'a> ControlPlane<'a> {
                         other.started_ms = Some(now);
                         other.ended_ms = None;
                         self.keep(&format!("job:{}", other.job_id), &other).await?;
-                        put_json(self.store, &format!("runner:{name}"), &other.job_id).await?;
+                        self.store.put_until(&format!("runner:{name}"), other.job_id.to_string(), self.clock.now_ms() + RUNNER_KEPT_MS).await?;
                         // The job this runner was for: a machine of its own, again.
                         let key = job_key(&j);
                         (j.runner, j.runner_id, j.machine_id, j.machine_type) = (None, None, None, None);
@@ -3329,7 +3331,7 @@ impl<'a> ControlPlane<'a> {
                         runner_name: Some(after.runner.clone()), conclusion: Some(conclusion), name: job.name.clone(), workflow: job.workflow.clone(), label: job.label.clone(), spec: Ok(Spec::default()), public: false, repo_id: None, branch: None, default_branch: None };
                     self.completed(plane_url, &ev).await?;
                     // (The run it is a job of moves on: the jobs that needed it may start.)
-                    if let Err(e) = self.advance_run(plane_url, job.run_id).await { let _ = self.store.put(&format!("run-error:{}", job.run_id), e).await; }
+                    if let Err(e) = self.advance_run(plane_url, job.run_id).await { let _ = self.store.put_until(&format!("run-error:{}", job.run_id), e, self.clock.now_ms() + 2 * 86_400_000).await; }
                 }
                 // (Its secrets go with the job: nothing of them is kept once it has ended.)
                 let mut done = after.clone();
@@ -3429,7 +3431,7 @@ impl<'a> ControlPlane<'a> {
         let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
         let (mut active, mut waiting) = (0, 0);
         // The jobs still cared for, once the indexes are built from the jobs kept before them (a batch at a time).
-        let _ = self.reindex(300).await;
+        let _ = self.reindex(150).await;
         let kept: Vec<(String, String)> = self.live_jobs().await?.into_iter().map(|(k, j)| (k, serde_json::to_string(&j).unwrap_or_default())).collect();
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
@@ -3792,7 +3794,7 @@ impl<'a> ControlPlane<'a> {
             let Ok(failed) = github::failed_deliveries(self.http, app, now.saturating_sub(30 * 60_000), now).await else { continue };
             for (id, guid) in failed {
                 let key = format!("redelivered:{guid}");
-                if matches!(self.store.put_if_absent(&key, now.to_string()).await, Ok(true)) { let _ = github::redeliver(self.http, app, id, now).await; }
+                if matches!(self.store.put_if_absent(&key, now.to_string()).await, Ok(true)) { let _ = self.store.put_until(&key, now.to_string(), now + 86_400_000).await; let _ = github::redeliver(self.http, app, id, now).await; }
             }
         }
     }

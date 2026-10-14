@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::io::{get_json, put_json, Result, Store};
+use crate::io::{get_json, Result, Store};
 
 /// What a repository keeps at most unless set (GitHub keeps 10 GB; the bucket is your own, at about $0.023 a GB a month).
 pub const SIZE_GB: u32 = 25;
@@ -26,6 +26,9 @@ pub const UNUSED_DAYS: u32 = 7;
 pub const MAX_AGE_DAYS: u32 = 30;
 /// The bucket's own rule: any object older than this goes, whatever the control plane's index says.
 pub const BUCKET_DAYS: u32 = MAX_AGE_DAYS + 2;
+
+/// When a saved entry's record goes by itself (eviction takes it sooner): as the bucket removes its pieces.
+fn entry_end(e: &Entry) -> u64 { e.made + BUCKET_DAYS as u64 * 86_400_000 }
 
 /// The cache as set (Settings → Cache, `superci caches update`): on unless `off`; `size_gb` a repository keeps at
 /// most; `days` an entry may go unused (none: the defaults).
@@ -184,7 +187,7 @@ pub async fn used(store: &dyn Store, hit: &Hit, now: u64) -> Result<()> {
     let mut e = hit.entry.clone();
     e.used = now;
     // Another restore at the same moment wrote it already: as good.
-    store.swap(&hit.index, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?).await.map(|_| ())
+    store.swap_until(&hit.index, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?, Some(entry_end(&e))).await.map(|_| ())
 }
 
 /// Why an entry could not be begun.
@@ -230,7 +233,7 @@ pub async fn finish_with(store: &dyn Store, at: &str, entry: &Entry, pieces: Vec
     e.pieces = pieces;
     e.done = true;
     e.meta = meta.filter(|m| m.len() <= 2048);
-    if !store.swap(at, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?).await? { return Err("the entry changed while it was saved".into()) }
+    if !store.swap_until(at, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?, Some(entry_end(&e))).await? { return Err("the entry changed while it was saved".into()) }
     Ok(e)
 }
 
@@ -364,7 +367,10 @@ pub async fn machine(store: &dyn Store, token: &str, now: u64) -> Result<Option<
     Ok(get_json::<Machine>(store, &format!("cachem:{token}")).await?.filter(|m| m.until > now))
 }
 
-pub async fn add_machine(store: &dyn Store, token: &str, m: &Machine) -> Result<()> { put_json(store, &format!("cachem:{token}"), m).await }
+pub async fn add_machine(store: &dyn Store, token: &str, m: &Machine) -> Result<()> {
+    // (Kept a day past its longest job, then gone by itself.)
+    store.put_until(&format!("cachem:{token}"), serde_json::to_string(m).map_err(|e| e.to_string())?, m.until + 86_400_000).await
+}
 
 #[cfg(test)]
 mod tests {
