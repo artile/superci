@@ -51,6 +51,8 @@ impl Store for Bridge {
         Ok(self.ask(json!({ "op": "put_if_absent", "key": key, "value": value }))?["created"] == true)
     }
     async fn delete(&self, key: &str) -> io::Result<()> { self.ask(json!({ "op": "delete", "key": key })).map(|_| ()) }
+    /// What the old one Dict still holds, moved into each kind's (see `modal_plane.py`).
+    async fn migrate(&self, budget: usize) -> io::Result<bool> { Ok(self.ask(json!({ "op": "migrate", "budget": budget }))?["done"] == true) }
     async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {
         let a = self.ask(json!({ "op": "list", "prefix": prefix }))?;
         Ok(a["items"].as_array().into_iter().flatten().filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_str()?.to_string()))).collect())

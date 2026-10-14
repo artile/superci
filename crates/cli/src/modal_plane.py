@@ -35,6 +35,25 @@ image = (
 # GitHub's runner image; the runner refuses root unless told it may (sandboxes start as root).
 runner_image = modal.Image.from_registry("ghcr.io/actions/actions-runner:latest").env({"RUNNER_ALLOW_RUNASROOT": "1"})
 state = modal.Dict.from_name(f"{NAME}-state", create_if_missing=True)
+# Each kind of record (the key up to its first colon: job, live, rline, …) in a Dict of its own, so listing one kind
+# never reads every record. Before, all were in `state`: until they are moved (`migrate`, at each sweep), what is not
+# found in its kind's Dict is looked for there too.
+kinds = {}
+layout = {"kinds": False}
+
+
+def kind_of(key):
+    kind = key.split(":", 1)[0] if ":" in key else "_"
+    safe = "".join(c if c.isalnum() or c in "-_" else "t" for c in kind)[:24] or "_"
+    if safe not in kinds:
+        kinds[safe] = modal.Dict.from_name(f"{NAME}-k-{safe}", create_if_missing=True)
+    return kinds[safe]
+
+
+async def moved():
+    if not layout["kinds"]:
+        layout["kinds"] = (await state.get.aio("__layout")) == "kinds"
+    return layout["kinds"]
 settings = modal.Dict.from_name(f"{NAME}-settings", create_if_missing=True)
 
 
@@ -65,20 +84,54 @@ class Plane:
     async def answer(self, q):
         op = q["op"]
         if op == "get":
-            return {"value": await state.get.aio(q["key"])}
+            value = await kind_of(q["key"]).get.aio(q["key"])
+            if value is None and not await moved():
+                value = await state.get.aio(q["key"])
+            return {"value": value}
         if op == "put":
-            await state.put.aio(q["key"], q["value"])
+            await kind_of(q["key"]).put.aio(q["key"], q["value"])
             return {}
         if op == "put_if_absent":
-            return {"created": bool(await state.put.aio(q["key"], q["value"], skip_if_exists=True))}
+            if not await moved() and (await state.get.aio(q["key"])) is not None:
+                return {"created": False}
+            return {"created": bool(await kind_of(q["key"]).put.aio(q["key"], q["value"], skip_if_exists=True))}
         if op == "delete":
-            try:
-                await state.pop.aio(q["key"])
-            except KeyError:
-                pass
+            for d in ([kind_of(q["key"])] + ([] if await moved() else [state])):
+                try:
+                    await d.pop.aio(q["key"])
+                except KeyError:
+                    pass
             return {}
         if op == "list":
-            return {"items": [[k, v] async for k, v in state.items.aio() if isinstance(k, str) and k.startswith(q["prefix"])]}
+            items = {k: v async for k, v in kind_of(q["prefix"]).items.aio() if isinstance(k, str) and k.startswith(q["prefix"])}
+            if not await moved():
+                async for k, v in state.items.aio():
+                    if isinstance(k, str) and k.startswith(q["prefix"]) and k not in items:
+                        items[k] = v
+            return {"items": sorted(([k, v] for k, v in items.items()), key=lambda kv: kv[0])}
+        if op == "migrate":
+            # Moves up to `budget` records from the old Dict into their kinds' (not over one written there since).
+            if await moved():
+                return {"done": True}
+            budget, batch = q.get("budget", 500), []
+            async for k in state.keys.aio():
+                if isinstance(k, str) and not k.startswith("__"):
+                    batch.append(k)
+                    if len(batch) > budget:
+                        break
+            for k in batch[:budget]:
+                value = await state.get.aio(k)
+                if value is not None:
+                    await kind_of(k).put.aio(k, value, skip_if_exists=True)
+                try:
+                    await state.pop.aio(k)
+                except KeyError:
+                    pass
+            if len(batch) > budget or (batch and budget == 0):
+                return {"done": False}
+            await state.put.aio("__layout", "kinds")
+            layout["kinds"] = True
+            return {"done": True}
         if op == "wake":
             due = await state.get.aio("__wake_at")
             if due is None or q["at_ms"] < due:
