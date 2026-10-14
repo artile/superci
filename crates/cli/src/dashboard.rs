@@ -843,7 +843,9 @@ pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
             step("it booted", kernel, script, String::new());
             let (read, ready, listening) = (n(&m["read_ms"]), n(&m["ready_ms"]), n(&m["listening_ms"]));
             if let Some(ready) = ready {
-                match read { Some(read) => { step("its disk and Docker were set up", script, read, String::new()); step("the runner's files were read from the image", read, ready, String::new()) }, None => step("its start-up script ran", script, ready, String::new()) }
+                // (GitHub's address for the runner refusing it at first is waited for here, beside the reads.)
+                let refused = m["github_wait_s"].as_u64().map(|s| format!("GitHub refused the first connection; reachable after {s} s")).unwrap_or_default();
+                match read { Some(read) => { step("its disk and Docker were set up", script, read, String::new()); step("the runner's files were read from the image", read, ready, refused) }, None => step("its start-up script ran", script, ready, String::new()) }
                 match (listening, started) {
                     (Some(l), Some(s)) if local => { step("the runner started and reached the control plane", ready, l, String::new()); step("the control plane gave it the job", l, s.max(l), String::new()) }
                     (Some(l), Some(s)) => { step("the runner started and reached GitHub", ready, l, String::new()); step("GitHub gave it the job", l, s.max(l), String::new()) }

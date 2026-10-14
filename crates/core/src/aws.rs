@@ -376,7 +376,7 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         tries += 1;
         if tries > MAX_TRIES { told.more = true; return Err(last) }
         let mut params = serde_json::json!({
-            "ImageId": l.image, "InstanceType": t, "MinCount": 1, "MaxCount": 1, "UserData": b64(l.user_data.as_bytes()),
+            "ImageId": l.image, "InstanceType": t, "MinCount": 1, "MaxCount": 1, "UserData": b64(compact(&l.user_data).as_bytes()),
             "InstanceInitiatedShutdownBehavior": "terminate",
             "MetadataOptions": { "HttpTokens": "required" },
             "BlockDeviceMapping": [{ "DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": l.disk_gb, "VolumeType": "gp3", "Throughput": l.disk_mibs, "Iops": l.disk_iops, "DeleteOnTermination": "true" } }],
@@ -437,7 +437,7 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
     let name = format!("superci-{}-{}-{}", tag("superci-plane"), tag("superci-job"), l.clock.map(|c| c.now_ms()).unwrap_or(now_ms));
     let tags = |t: &[(String, String)]| t.iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect::<Vec<_>>();
     let mut data = serde_json::json!({
-        "ImageId": l.image, "UserData": b64(l.user_data.as_bytes()), "InstanceInitiatedShutdownBehavior": "terminate", "MetadataOptions": { "HttpTokens": "required" },
+        "ImageId": l.image, "UserData": b64(compact(&l.user_data).as_bytes()), "InstanceInitiatedShutdownBehavior": "terminate", "MetadataOptions": { "HttpTokens": "required" },
         "BlockDeviceMapping": [{ "DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": l.disk_gb, "VolumeType": "gp3", "Throughput": l.disk_mibs, "Iops": l.disk_iops, "DeleteOnTermination": "true" } }],
         "TagSpecification": [{ "ResourceType": "instance", "Tag": tags(l.tags) }],
     });
@@ -1227,7 +1227,7 @@ pub fn with_scratch(script: String, ramdisk: bool) -> String {
 /// started it, each wait of two seconds or more with the line before and the line after, and its warnings and
 /// errors. So a slow one says where it waited: for its own start, for a name, for GitHub's answer.
 const HELLO: &str = r#"# How the start went, said to the control plane (see where a slow one lost its time).
-( superci_t2=$(date +%s%3N); curl -s -m 5 -X POST "HELLO_URL&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$superci_t2" > /dev/null 2>&1
+( superci_t2=$(date +%s%3N); curl -s -m 5 -X POST "HELLO_URL&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$superci_t2&gh=$(cat /tmp/superci-gh 2>/dev/null)" > /dev/null 2>&1
   for i in $(seq 360); do grep -qs "Listening for Jobs" /var/log/superci.log && break; sleep 0.5; done
   superci_t3=$(date +%s%3N)
   if grep -qs "Listening for Jobs" /var/log/superci.log; then
@@ -1318,6 +1318,35 @@ pub fn with_hello(script: String, url: &str) -> Result<String> {
     Ok(format!("{before}{said}{runner}{after}"))
 }
 
+/// A Linux start-up script as a machine is given it: without its lines that only explain (they are said here, and
+/// AWS takes 16,384 bytes at most). A Windows one as it is.
+pub fn compact(script: &str) -> String {
+    if !script.starts_with("#!/bin/bash") { return script.to_string() }
+    script.lines().filter(|l| !l.trim_start().starts_with("# ")).map(|l| format!("{l}\n")).collect()
+}
+
+/// The addresses at GitHub a runner with this just-in-time configuration reaches first (its service, and the
+/// broker when it uses one): from the configuration's `.runner`.
+pub fn runner_hosts(jit_config: &str) -> Vec<String> {
+    use base64::Engine;
+    let decode = |s: &str| base64::engine::general_purpose::STANDARD.decode(s.trim()).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let Some(runner) = decode(jit_config).and_then(|all| all[".runner"].as_str().and_then(decode)) else { return vec![] };
+    let mut hosts = vec![];
+    for k in ["ServerUrlV2", "serverUrlV2", "ServerUrl", "serverUrl"] {
+        let Some(host) = runner[k].as_str().and_then(|u| url::Url::parse(u).ok()).and_then(|u| u.host_str().map(str::to_string)) else { continue };
+        if host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b)) && !hosts.contains(&host) { hosts.push(host) }
+    }
+    hosts
+}
+
+/// What the start-up script adds for a runner of GitHub's: its addresses at GitHub tried before it starts, every
+/// second, 30 at most, beside the reads of its files. Its runner, refused once (GitHub's address for it not answering
+/// for a moment), waits 30 s before it tries again; this waits only as long as the refusal lasts, and says how long.
+fn reach_github(hosts: &[String]) -> String {
+    if hosts.is_empty() { return String::new() }
+    format!("(w=0;for h in {};do until curl -so/dev/null --connect-timeout 2 -m4 https://$h/||[ $w -ge 30 ];do sleep 1;w=$((w+1));done;done;echo $w>/tmp/superci-gh)&g=$!\n", hosts.join(" "))
+}
+
 pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<String> {
     let (jit_config, fail) = match work {
         crate::io::Work::GitHub { jit } => (jit.as_str(), None),
@@ -1345,11 +1374,13 @@ sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 # beside the runner, not at a job's first use of it (services, container jobs, docker steps).
 usermod -aG docker runner 2>/dev/null || true
 (systemctl start docker > /dev/null 2>&1 &)
-# First reads from a new volume are slow one at a time: the runner's own files are read 64 at a time first.
+{reach}# First reads from a new volume are slow one at a time: the runner's own files are read 64 at a time first.
 find /home/runner/bin -type f -print0 2>/dev/null | xargs -0 -r -P 64 -n 16 cat > /dev/null 2>&1
-{hook}cd /home/runner && sudo -u runner -H {run} --jitconfig {jit_config}
+{wait}{hook}cd /home/runner && sudo -u runner -H {run} --jitconfig {jit_config}
 poweroff
 "#), jit_config = jit_config, hook = hook, run = run, secs = max_minutes * 60, minutes = max_minutes + 1,
+        reach = if fail.is_some() { String::new() } else { reach_github(&runner_hosts(jit_config)) },
+        wait = if fail.is_some() || runner_hosts(jit_config).is_empty() { "" } else { "wait $g\n" },
         // (Not for the runner that only says why a job failed: it uses no disk.)
         grow = if fail.is_some() { "" } else { GROW_ROOT }))
 }
@@ -1362,11 +1393,16 @@ mod tests {
     fn a_machines_whole_script_fits_what_aws_takes() {
         // AWS takes 16,384 bytes of start-up script. GitHub's runner configuration is the most of it (about 5,000
         // characters lately); everything SuperCI adds, at once, leaves it twice that.
-        let jit = "A".repeat(10_000);
+        use base64::Engine;
+        let b64 = |v: serde_json::Value| base64::engine::general_purpose::STANDARD.encode(v.to_string());
+        let runner = b64(serde_json::json!({ "ServerUrl": "https://pipelinesghubeus5.actions.githubusercontent.com/AbC123/", "ServerUrlV2": "https://broker.actions.githubusercontent.com/" }));
+        let jit = b64(serde_json::json!({ ".runner": runner, ".credentials": "A".repeat(7_280) }));
+        assert!((9_900..10_100).contains(&jit.len()), "{}", jit.len());
         let script = runner_user_data_for(&crate::io::Work::GitHub { jit }, 360, "linux", Some("https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/interrupted?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken")).unwrap();
         let script = with_hello(with_scratch(script, false), "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/hello?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken").unwrap();
         let script = with_cache(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
-        assert!(script.len() < 16_384, "{} bytes", script.len());
+        let script = compact(&script);
+        assert!(script.contains("wait $g") && script.len() < 16_384, "{} bytes", script.len());
         println!("{} bytes with a 10,000-character configuration", script.len());
     }
 
@@ -1522,6 +1558,18 @@ mod tests {
     }
 
     #[test]
+    fn a_runner_waits_for_its_github_address_to_answer_before_it_starts() {
+        use base64::Engine;
+        let b64 = |v: serde_json::Value| base64::engine::general_purpose::STANDARD.encode(v.to_string());
+        let jit = b64(serde_json::json!({ ".runner": b64(serde_json::json!({ "AgentId": 5, "ServerUrl": "https://pipelinesghubeus5.actions.githubusercontent.com/AbC123/", "ServerUrlV2": "https://broker.actions.githubusercontent.com/", "UseV2Flow": true })), ".credentials": "x" }));
+        assert_eq!(runner_hosts(&jit), ["broker.actions.githubusercontent.com", "pipelinesghubeus5.actions.githubusercontent.com"]);
+        let script = runner_user_data(&crate::io::Work::GitHub { jit: jit.clone() }, 60).unwrap();
+        assert!(script.contains("for h in broker.actions.githubusercontent.com pipelinesghubeus5.actions.githubusercontent.com;do until curl") && script.contains("[ $w -ge 30 ]"), "{script}");
+        assert!(script.find("&g=$!").unwrap() < script.find("xargs -0").unwrap() && script.find("xargs -0").unwrap() < script.find("wait $g").unwrap() && script.find("wait $g").unwrap() < script.find("./run.sh").unwrap());
+        assert!(runner_hosts("not-base64!").is_empty() && !runner_user_data(&crate::io::Work::GitHub { jit: "abc".into() }, 60).unwrap().contains("wait $g"));
+    }
+
+    #[test]
     fn xml_and_user_data() {
         assert_eq!(xml_tag("<a><instanceId>i-9</instanceId></a>", "instanceId"), Some("i-9"));
         assert_eq!(xml_tag("<a/>", "instanceId"), None);
@@ -1554,7 +1602,7 @@ mod tests {
         assert_eq!(with_scratch(failing.clone(), true), failing);
         // A machine says how its start went, with a link of its own, in the background and before its runner starts.
         let hello = with_hello(script.clone(), "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken").unwrap();
-        assert!(hello.contains("superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)") && hello.contains("superci_t1=$(date +%s%3N)\n# First reads") && hello.contains(r#"curl -s -m 5 -X POST "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$superci_t2""#), "{hello}");
+        assert!(hello.contains("superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)") && hello.contains("superci_t1=$(date +%s%3N)\n# First reads") && hello.contains(r#"curl -s -m 5 -X POST "https://plane.example/hello?runner=superci-abc-7&t=tokentokentokentoken&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$superci_t2&gh=$(cat /tmp/superci-gh 2>/dev/null)""#), "{hello}");
         // (And what its runner logged, when the runner was slow to listen: after it listens, and only then.)
         assert!(hello.find("&listening=$superci_t3").unwrap() < hello.find("&log=runner").unwrap() && hello.contains("-gt 10000") && hello.contains("/home/runner/_diag/Runner_*.log") && !hello.contains("HELLO_URL"), "{hello}");
         assert!(hello.find("superci_t0=").unwrap() < hello.find("growpart").unwrap() && hello.find("&listening=").unwrap() < hello.find("./run.sh").unwrap());

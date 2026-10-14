@@ -351,6 +351,9 @@ pub struct MachineStart {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub read_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub ready_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub listening_ms: Option<u64>,
+    /// How many seconds GitHub's address for its runner refused it before the runner started (see
+    /// `aws::runner_hosts`): none, when it answered at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub github_wait_s: Option<u64>,
     /// What its runner logged while it was slow to listen for a job (more than ten seconds): each wait, with the
     /// line before and after, and its warnings and errors. As the machine sent it, cut to what a page can show.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub log: Option<String>,
@@ -935,6 +938,7 @@ impl<'a> ControlPlane<'a> {
                 said.read_ms = ms("read").or(said.read_ms);
                 said.ready_ms = ms("ready").or(said.ready_ms);
                 said.listening_ms = ms("listening").or(said.listening_ms);
+                said.github_wait_s = q.get("gh").and_then(|v| v.parse::<u64>().ok()).filter(|s| (1..=60).contains(s)).or(said.github_wait_s);
                 // (Text only, and so much of it: lines of a log, each cut where a page would cut it.)
                 if q.get("log").is_some_and(|l| l == "runner") && !req.body.is_empty() {
                     let text: String = String::from_utf8_lossy(&req.body).chars().filter(|c| *c == '\n' || (!c.is_control() && *c != '\u{fffd}')).take(16_000).collect();
