@@ -51,6 +51,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "The projects a GitLab connection's token reaches (on GitHub, repositories are chosen where the App is installed).\n\nlist      Each with its id and whether its jobs come here.\nupdate    --enabled=true: the project's jobs with `tags: [superci]` run here from then on."),
     ("accounts", "  superci accounts list\n  superci accounts retrieve aws [--account=ID]\n  superci accounts update aws [--monthly-usd=N|none] [--daily-usd=N|none]\n                              [--aws-budget=none|emails|stops|lift] [--email=ADDRESS]",
         "list      The cloud accounts signed in to: each cloud, its account, and who is signed in.\nupdate    The most the AWS account may spend on machines in a month and in a day (UTC), its spot and on-demand\n          machines together (`none` lifts one). At a limit, jobs go to the providers of other accounts in the\n          order. The whole CI's limits are `superci limits update`.\n          --aws-budget: a budget in the AWS account itself for the monthly limit, made with your sign-in (the\n          control plane gets no permission for it). AWS counts the account's real bill, all of it and hours late.\n          emails: AWS writes to --email at 80% and at 100%. stops: that, and at 100% AWS refuses new machines to\n          the control plane until the next month. lift: takes that refusal off now. none: removes all of it.\nretrieve  What an AWS account allows of what SuperCI does there: the regions, spot and on-demand machines, how many\n          vCPUs it may run at once, and whether the image jobs run on is published there. It is asked with reads and\n          dry runs only: nothing is made, started or changed. An account in an AWS organization can be held to some\n          regions or kept from spot by the organization's policies, which nothing inside the account lifts; this\n          says so, with the policy and whose it is. --account: which, when signed in to several."),
+    ("caches", "  superci caches retrieve\n  superci caches list [--repo=OWNER/NAME]\n  superci caches update [--enabled=true|false] [--size-gb=N] [--days=N]\n  superci caches delete --repo=OWNER/NAME [KEY] [--scope=REF] --confirm",
+        "GitHub's cache for jobs on AWS, kept in a bucket of your control plane's in your account, in each region its machines\nrun in. Workflows do not change: actions/cache, the setup actions' caches and Docker's type=gha reach it as they reach\nGitHub's. A job reads and writes what GitHub would let it (a pull request writes only its own branch's).\n\nretrieve  Whether it is on, what it keeps, and each repository with what it keeps now.\nlist      Each repository with its entries and size; --repo: that repository's entries (key, branch, size, last use).\nupdate    --enabled=false: jobs use GitHub's own cache. --size-gb: what one repository keeps at most (25 unless set;\n          the least recently used go first). --days: how long an entry may go unused (7 unless set). An entry saved 30\n          days ago is saved anew whatever its use.\ndelete    Takes a repository's entries out, all of them or KEY's (--scope: on that branch only, as refs/heads/main)."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30] [--runs [--max-cpu=16] [--daily-usd=10]]\n  superci keys delete NAME",
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, the key also starts runs from a computer (`superci runs create`), and nothing else: each job on\n          a machine of --max-cpu CPUs at most (16), at most --daily-usd dollars of machines in a day (10), three\n          runs at a time. For a coding agent that should run the tests without pushing and without your sign-in.\ndelete    Ends one at once."),
     ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images update REGION [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
@@ -106,7 +108,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits", "caches"]),
                 group(&["connections", "deliveries", "projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -134,7 +136,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 11] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs"];
-const VALUES: [&str; 41] = ["secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 44] = ["repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -418,6 +420,54 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 data.push(r);
             }
             Ok(Done { said, data: json!({ "runs": data }) })
+        }
+        ("caches", operation @ ("retrieve" | "list" | "update" | "delete")) => {
+            let pick = |d: &Dashboard| -> Result<(String, String)> { Ok(match given_key() { Some(k) => k, None => { let p = in_use(d)?; (p.url().to_string(), d.key().to_string()) } }) };
+            if operation == "update" {
+                if !args.has("enabled") && !args.has("size-gb") && !args.has("days") { return usage("Say what to change: `superci caches update --size-gb=50` (see `superci help caches`).") }
+                let mut d = signed_in();
+                to_set(&mut d)?;
+                in_use(&d)?;
+                if let Some(e) = args.get("enabled") {
+                    let on = match e { "true" => true, "false" => false, _ => return usage("--enabled is true or false.") };
+                    apply!(d, args, if on { "keep jobs' caches in your AWS account".to_string() } else { "leave jobs to GitHub's own cache".to_string() }, "/routing", &[field("action", "cache_on"), field("on", if on { "on" } else { "off" })]);
+                }
+                if let Some(gb) = args.get("size-gb") { apply!(d, args, format!("let each repository keep {gb} GB in the cache"), "/routing", &[field("action", "cache_size"), field("size_gb", gb)]); }
+                if let Some(days) = args.get("days") { apply!(d, args, format!("let a cache entry go unused for {days} days"), "/routing", &[field("action", "cache_days"), field("days", days)]); }
+            }
+            if operation == "delete" {
+                let Some(repo) = args.get("repo") else { return usage("Say whose: `superci caches delete --repo=OWNER/NAME [KEY] --confirm`.") };
+                let key = w(2);
+                let would = if key.is_empty() { format!("take every cache entry of {repo} out (jobs then save them anew)") } else { format!("take the cache entry {key} of {repo} out") };
+                confirmed(args, &would)?;
+                let mut d = ready_to_set()?;
+                in_use(&d)?;
+                let mut fields = vec![field("repo", repo)];
+                if !key.is_empty() { fields.push(field("key", key)) }
+                if let Some(scope) = args.get("scope") { fields.push(field("scope", scope)) }
+                apply!(d, args, would, "/caches/delete", &fields);
+                return Ok(Done::said(if key.is_empty() { format!("{repo}'s cache entries are out.") } else { format!("{key} is out of {repo}'s cache.") }))
+            }
+            let d = signed_in();
+            let (url, key) = pick(&d)?;
+            let repo = args.get("repo").filter(|_| operation == "list");
+            let got = crate::cloudflare::plane_get(&url, &key, &match repo { Some(r) => format!("/caches?repo={}", url::form_urlencoded::byte_serialize(r.as_bytes()).collect::<String>()), None => "/caches".into() })
+                .map_err(|e| if e.contains(" 404") { "This control plane keeps no cache yet: update it (`superci planes update`).".to_string() } else { e })?;
+            let now = got["now_ms"].as_u64().unwrap_or(0);
+            let ago = |ms: u64| { let m = now.saturating_sub(ms) / 60_000; match m { 0 => "just now".to_string(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) } };
+            let size = |b: u64| if b >= 1_000_000_000 { format!("{:.1} GB", b as f64 / 1e9) } else { format!("{} MB", b.div_ceil(1_000_000)) };
+            let mut said = vec![];
+            if repo.is_none() {
+                said.push(if got["on"] == true { format!("The cache is on: each repository keeps {} GB at most, and an entry goes after {} days unused ({} at most since it was saved).", got["size_gb"], got["days"], got["max_age_days"]) } else { "The cache is off: jobs use GitHub's own cache (`superci caches update --enabled=true`).".into() });
+                let repos = got["repos"].as_array().cloned().unwrap_or_default();
+                if repos.is_empty() { said.push("Nothing kept yet.".into()) }
+                for r in &repos { said.push(format!("{:<40} {:>5} entries {:>9}   used {}", r["name"].as_str().or(r["id"].as_str()).unwrap_or_default(), r["entries"], size(r["bytes"].as_u64().unwrap_or(0)), ago(r["used_ms"].as_u64().unwrap_or(0)))) }
+            } else {
+                let entries = got["entries"].as_array().cloned().unwrap_or_default();
+                if got["repo"].is_null() { said.push(format!("{} keeps nothing in the cache.", repo.unwrap_or_default())) }
+                for e in &entries { said.push(format!("{:<56} {:<28} {:>9}   used {}", e["key"].as_str().unwrap_or_default(), e["scope"].as_str().unwrap_or_default(), size(e["bytes"].as_u64().unwrap_or(0)), ago(e["used_ms"].as_u64().unwrap_or(0)))) }
+            }
+            Ok(Done { said, data: got })
         }
         ("keys", "list") => {
             let mut d = signed_in();

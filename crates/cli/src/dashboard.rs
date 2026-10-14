@@ -2903,6 +2903,17 @@ impl Dashboard {
                         if !routing.public_repos.iter().any(|r| r.eq_ignore_ascii_case(&repo)) { routing.public_repos.push(repo) }
                     }
                     "public_remove" => { let repo = field("repo"); routing.public_repos.retain(|r| *r != repo) }
+                    // The cache: on or off, what a repository keeps, how long an entry may go unused.
+                    "cache_on" => routing.cache.off = field("on") != "on",
+                    "cache_size" => {
+                        let Some(gb) = field("size_gb").parse::<u32>().ok().filter(|g| (1..=10_000).contains(g)) else { return Ok(message(400, "From 1 to 10,000 GB", "What one repository keeps in the cache at most.")) };
+                        routing.cache.size_gb = Some(gb).filter(|g| *g != superci_core::cache::SIZE_GB);
+                    }
+                    "cache_days" => {
+                        let max = superci_core::cache::MAX_AGE_DAYS;
+                        let Some(days) = field("days").parse::<u32>().ok().filter(|d| (1..=max).contains(d)) else { return Ok(message(400, &format!("From 1 to {max} days"), &format!("An entry saved {max} days ago is saved anew whatever its use."))) };
+                        routing.cache.days = Some(days).filter(|d| *d != superci_core::cache::UNUSED_DAYS);
+                    }
                     // The whole set, as chosen in the dialog (each checked repository; patterns like owner/* kept).
                     "public_set" => {
                         let chosen: Vec<String> = form.iter().filter(|(k, _)| k == "repo").map(|(_, v)| v.trim().to_string()).collect();
@@ -3008,7 +3019,16 @@ impl Dashboard {
                 let want = serde_json::to_value(&routing).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "ROUTING", &want.to_string())?;
                 self.shown(&plane, |s| s["routing"] == want)?;
-                Ok(Response::redirect(if field("action").starts_with("public") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
+                Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
+            }
+            // A repository's cache entries taken out (all of them, or one key's).
+            ("POST", "/caches/delete") => {
+                let plane = self.plane()?;
+                let mut body = serde_json::json!({ "repo": field("repo") });
+                if !field("key").is_empty() { body["key"] = field("key").into() }
+                if !field("scope").is_empty() { body["scope"] = field("scope").into() }
+                cloudflare::plane_post(plane.url(), self.key(), "/caches/delete", &body)?;
+                Ok(Response::redirect("/?p=settings"))
             }
 
             _ => Ok(message(404, "Not found", "")),
@@ -3784,7 +3804,9 @@ mark();load()})();</script>"#;
         let Some(v) = v else { return format!(r#"{bar}<div class="cards">{here}</div>"#) };
         // The public repositories GitHub's App is installed on (none when GitHub is not connected).
         let public = if v.github { cloudflare::plane_get(v.plane.url(), &self.status_key, "/github/public-repos").ok().and_then(|r| r["repos"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())) } else { Some(vec![]) };
-        format!(r#"{bar}<div class="cards">{}{}{here}</div>"#, called_card(v), limits_card(v, public))
+        // What the cache keeps (a control plane from before has none to say).
+        let caches = if v.aws { cloudflare::plane_get(v.plane.url(), &self.status_key, "/caches").ok() } else { None };
+        format!(r#"{bar}<div class="cards">{}{}{}{here}</div>"#, called_card(v), limits_card(v, public), cache_card(v, caches.as_ref()))
     }
 
     /// GitLab's settings: the projects whose jobs run here (each turned on or off, or all at once), and the connection.
@@ -5044,6 +5066,43 @@ fn limits_card(v: &PlaneView, public: Option<Vec<String>>) -> String {
 <form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="max_hours"><span class="limit-text"><strong>Longest job</strong><small>Its machine is ended after this. Cloudflare allows 6 hours, Modal 24.</small></span><span class="limit-do"><input type="number" name="max_hours" min="1" max="120" value="{hours}" aria-label="Most hours"><span class="note">hours</span><button class="button secondary sm">Save</button></span></form>
 {public_row}
 </div></section>{dialog}"#)
+}
+
+/// The cache: on or off, what a repository keeps and for how long, and what each repository keeps now (each cleared
+/// with a button). Only for a control plane with AWS machines (the cache is a bucket in that account).
+fn cache_card(v: &PlaneView, caches: Option<&serde_json::Value>) -> String {
+    if !v.aws { return String::new() }
+    let c = &v.routing().cache;
+    let (on, gb, days) = (!c.off, c.size_gb(), c.days());
+    let switch = if on { r#"<input type="hidden" name="on" value="off"><button class="button secondary sm">Turn off</button>"# } else { r#"<input type="hidden" name="on" value="on"><button class="button primary sm">Turn on</button>"# };
+    let what = if on { "On. Jobs on AWS keep GitHub's cache in a bucket of yours, in their region." } else { "Off. Jobs use GitHub's own cache." };
+    let repos = caches.and_then(|c| c["repos"].as_array()).cloned().unwrap_or_default();
+    let now = caches.and_then(|c| c["now_ms"].as_u64()).unwrap_or(0);
+    let list = repos.iter().map(|r| {
+        let (id, entries, bytes, used) = (r["id"].as_str().unwrap_or_default(), r["entries"].as_u64().unwrap_or(0), r["bytes"].as_u64().unwrap_or(0), r["used_ms"].as_u64().unwrap_or(0));
+        let name = r["name"].as_str().map(str::to_string).unwrap_or_else(|| format!("Repository {}", id.trim_start_matches("gh")));
+        format!(r#"<form method="post" action="/caches/delete" class="limit"><input type="hidden" name="repo" value="{}"><span class="limit-text"><strong>{}</strong><small>{entries} {} · {} · used {}</small></span><span class="limit-do"><button class="button secondary sm">Clear</button></span></form>"#,
+            esc(id), esc(&name), if entries == 1 { "entry" } else { "entries" }, size_words(bytes), ago_words(now.saturating_sub(used)))
+    }).collect::<String>();
+    let kept = match caches {
+        None => String::new(),
+        Some(_) => format!(r#"<div class="limit"><span class="limit-text"><strong>Kept now</strong><small>{}</small></span></div>{list}"#, if repos.is_empty() { "Nothing kept yet." } else { "Clearing a repository's makes its jobs save anew." }),
+    };
+    format!(r#"<section class="card"><div class="card-head"><h2>Cache</h2></div><div class="limits">
+<form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="cache_on"><span class="limit-text"><strong>In your AWS account</strong><small>{what}</small></span><span class="limit-do">{switch}</span></form>
+<form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="cache_size"><span class="limit-text"><strong>Each repository</strong><small>The least recently used go first. About $0.023 a GB a month in S3.</small></span><span class="limit-do"><input type="number" name="size_gb" min="1" max="10000" value="{gb}" aria-label="Most GB"><span class="note">GB</span><button class="button secondary sm">Save</button></span></form>
+<form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="cache_days"><span class="limit-text"><strong>Unused for</strong><small>An entry goes after this. One saved {} days ago is saved anew.</small></span><span class="limit-do"><input type="number" name="days" min="1" max="{}" value="{days}" aria-label="Days"><span class="note">days</span><button class="button secondary sm">Save</button></span></form>
+{kept}
+</div></section>"#, superci_core::cache::MAX_AGE_DAYS, superci_core::cache::MAX_AGE_DAYS)
+}
+
+/// A size in words: 940 MB, 3.4 GB.
+fn size_words(bytes: u64) -> String { if bytes >= 1_000_000_000 { format!("{:.1} GB", bytes as f64 / 1e9) } else { format!("{} MB", bytes.div_ceil(1_000_000)) } }
+
+/// How long ago, in words: 5 minutes, 3 hours, 2 days.
+fn ago_words(ms: u64) -> String {
+    let m = ms / 60_000;
+    match m { 0 => "just now".into(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) }
 }
 
 /// the label picker, a dialog of its own: it names only what differs from the default.
@@ -6876,6 +6935,25 @@ mod tests {
         // $0.013 + $0.040 + $0.01 = $0.06; GitHub: 6 min × $0.012 + 9 min × $0.012 = $0.18 (65% less).
         assert!(html.contains(r#"<div class="kpi-num">$0.06</div><div class="kpi-cap">spent, estimated</div>"#) && html.contains("<span>65% less</span><span class=\"gh-pop\"")
             && html.contains(r#"<span class="mono">$0.18</span>"#), "{}", &html[html.find("kpis").unwrap()..][..2500]);
+    }
+
+    #[test]
+    fn the_cache_card_says_what_is_kept_and_clears_a_repository() {
+        let plane = Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: "https://abc.lambda-url.us-east-1.on.aws".into(), plane_id: "p1".into(), label: "superci".into() };
+        let view = |st: serde_json::Value| PlaneView { plane: plane.clone(), online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(st) };
+        let status = |st: serde_json::Value| st;
+        let v = view(status(serde_json::json!({})));
+        let caches = serde_json::json!({ "repos": [{ "id": "gh77", "name": "acme/app", "entries": 3, "bytes": 3_400_000_000u64, "used_ms": 0 }, { "id": "gh78", "entries": 1, "bytes": 5_000_000, "used_ms": 7_100_000 }], "now_ms": 7_200_000 });
+        let html = cache_card(&v, Some(&caches));
+        preview("cache", &html);
+        assert!(html.contains("<small>On. Jobs on AWS") && html.contains("Turn off") && html.contains(r#"name="size_gb" min="1" max="10000" value="25""#) && html.contains(r#"name="days" min="1" max="30" value="7""#), "{html}");
+        assert!(html.contains("<strong>acme/app</strong><small>3 entries · 3.4 GB · used 2 h ago</small>") && html.contains("<strong>Repository 78</strong><small>1 entry · 5 MB · used 1 min ago</small>") && html.matches(r#"action="/caches/delete""#).count() == 2);
+        assert!(cache_card(&v, Some(&serde_json::json!({ "repos": [], "now_ms": 1 }))).contains("Nothing kept yet."));
+        let mut off = view(status(serde_json::json!({ "routing": { "cache": { "off": true, "size_gb": 50 } } })));
+        let html = cache_card(&off, None);
+        assert!(html.contains("<small>Off. Jobs use GitHub") && html.contains("Turn on") && html.contains(r#"value="50""#) && !html.contains("Nothing kept"));
+        off.aws = false;
+        assert!(cache_card(&off, None).is_empty(), "no AWS machines, no cache");
     }
 
     #[test]

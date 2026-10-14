@@ -554,6 +554,9 @@ pub struct Routing {
     /// real bill. Kept here so the pages say it without asking AWS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_budget: Option<AwsBudget>,
+    /// The cache (see `cache`): on unless turned off, and how much it keeps.
+    #[serde(default, skip_serializing_if = "cache::Settings::is_default")]
+    pub cache: cache::Settings,
 }
 
 /// What the AWS account's own budget does beside its emails.
@@ -948,6 +951,9 @@ impl<'a> ControlPlane<'a> {
             // A machine's `superci-cache` (with the link only it has), for a job's cache.
             ("POST", p) if p.starts_with("/cache/") => self.cache_route(&req, &plane_url, p).await,
             ("GET", p) if p.starts_with("/cache/") && p.ends_with("/program") => self.cache_program(&plane_url, p).await,
+            // The cache's entries (by repository, or one repository's), and taking some out.
+            ("GET", "/caches") if self.reader(&req) => self.caches(&url).await,
+            ("POST", "/caches/delete") if self.dashboard(&req) => self.caches_delete(&req, &plane_url).await,
             _ => Ok(nothing_here()),
         }
     }
@@ -3386,7 +3392,8 @@ impl<'a> ControlPlane<'a> {
     /// own link to this control plane (until its longest job ends; its `program` sends it on to the bucket).
     async fn with_cache(&self, user_data: String, region: &str, arch: &str, creds: &Credentials, plane_url: &str, now: u64) -> String {
         let arch = if arch == "arm64" { "aarch64" } else { "x86_64" };
-        if !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return user_data }
+        // (Turned off in the dashboard: jobs use GitHub's cache.)
+        if self.config.routing.cache.off || !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return user_data }
         let token = crate::crypto::random_token(18);
         let until = now + (self.machine_minutes("aws") as u64 + 30) * 60_000;
         if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until }).await.is_err() { return user_data }
@@ -3457,7 +3464,7 @@ impl<'a> ControlPlane<'a> {
             "lookup" => {
                 let restore: Vec<String> = body["restore_keys"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(str::to_string)).take(10).collect();
                 // (A key or version GitHub would not take is found nowhere.)
-                let Ok(Some(hit)) = cache::lookup(self.store, &access, key, &restore, version).await else { return Ok(Response::json(&serde_json::json!({ "hit": false }))) };
+                let Ok(Some(hit)) = cache::lookup(self.store, &access, key, &restore, version, now).await else { return Ok(Response::json(&serde_json::json!({ "hit": false }))) };
                 let _ = cache::used(self.store, &hit, now).await;
                 let prefix = hit.entry.prefix(&access.ns);
                 let pieces = hit.entry.pieces.iter().map(|(p, size)| Ok(serde_json::json!({ "url": link("GET", &hit.entry.region, &format!("{prefix}/{p}"))?, "size": size }))).collect::<Result<Vec<_>>>()?;
@@ -3528,6 +3535,66 @@ impl<'a> ControlPlane<'a> {
         }
     }
 
+    /// The cache as it stands: its settings, each repository with what it keeps (its name, as GitHub has it, found
+    /// once), and with `?repo=` (`owner/name`, or its id `gh…`) that repository's entries.
+    async fn caches(&self, url: &url::Url) -> Result<Response> {
+        let now = self.clock.now_ms();
+        let all = cache::list(self.store, None).await?;
+        let mut repos: std::collections::BTreeMap<String, (usize, u64, u64)> = Default::default();
+        for l in &all { let r = repos.entry(l.ns.clone()).or_default(); r.0 += 1; r.1 += l.entry.size; r.2 = r.2.max(l.entry.used.max(l.entry.made)) }
+        let mut named = vec![];
+        for (ns, (entries, bytes, used)) in &repos { named.push(serde_json::json!({ "id": ns, "name": self.cache_repo_name(ns).await, "entries": entries, "bytes": bytes, "used_ms": used })) }
+        named.sort_by_key(|r| std::cmp::Reverse(r["bytes"].as_u64().unwrap_or(0)));
+        let settings = &self.config.routing.cache;
+        let mut out = serde_json::json!({ "on": !settings.off, "size_gb": settings.size_gb(), "days": settings.days(), "max_age_days": cache::MAX_AGE_DAYS, "repos": named, "now_ms": now });
+        if let Some(want) = url.query_pairs().find(|(k, _)| k == "repo").map(|(_, v)| v.to_string()) {
+            let ns = named.iter().find(|r| r["id"] == want.as_str() || r["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&want))).and_then(|r| r["id"].as_str().map(str::to_string));
+            let entries: Vec<serde_json::Value> = all.iter().filter(|l| Some(&l.ns) == ns.as_ref()).map(|l| serde_json::json!({ "key": l.key, "scope": l.scope, "version": l.version,
+                "bytes": l.entry.size, "made_ms": l.entry.made, "used_ms": l.entry.used.max(l.entry.made), "region": l.entry.region })).collect();
+            out["entries"] = entries.into();
+            out["repo"] = ns.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+        }
+        Ok(Response::json(&out))
+    }
+
+    /// A repository's name for the cache's id of it (`gh<GitHub's id>`), asked of GitHub once and kept.
+    async fn cache_repo_name(&self, ns: &str) -> Option<String> {
+        let key = format!("cachename:{ns}");
+        if let Ok(Some(name)) = self.store.get(&key).await { return Some(name) }
+        let id = ns.strip_prefix("gh")?;
+        let now = self.clock.now_ms();
+        for app in self.config.apps() {
+            for i in github::installations(self.http, app, now).await.unwrap_or_default() {
+                let Ok(token) = self.installation_token(app, i.id).await else { continue };
+                if let Ok(r) = github::repository_by_id(self.http, &app.api(), &token, id).await {
+                    if let Some(name) = r["full_name"].as_str() { let _ = self.store.put(&key, name.to_string()).await; return Some(name.to_string()) }
+                }
+            }
+        }
+        None
+    }
+
+    /// `POST /caches/delete` (the dashboard's): a repository's entries taken out, all of them or those with `key`
+    /// (in `scope` only, when given), and their pieces deleted from the bucket.
+    async fn caches_delete(&self, req: &Request, plane_url: &str) -> Result<Response> {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        let repo = body["repo"].as_str().unwrap_or_default();
+        let ns = if repo.starts_with("gh") || repo.starts_with("local-") { repo.to_string() } else {
+            let mut found = None;
+            for l in cache::list(self.store, None).await? { if self.cache_repo_name(&l.ns).await.is_some_and(|n| n.eq_ignore_ascii_case(repo)) { found = Some(l.ns); break } }
+            match found { Some(n) => n, None => return Ok(Response::json(&serde_json::json!({ "removed": 0 }))) }
+        };
+        let (removed, gone) = cache::remove(self.store, &ns, body["key"].as_str(), body["scope"].as_str()).await?;
+        if let (false, Some(a)) = (gone.is_empty(), self.aws_connection().await?.filter(|a| a.connected)) {
+            let creds = self.aws_creds(plane_url, &a).await?;
+            let now = self.clock.now_ms();
+            for (region, object) in gone.iter().flat_map(|(r, o)| o.iter().map(move |o| (r, o))).take(2000) {
+                let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, object), region, &creds, vec![], &[], now).await;
+            }
+        }
+        Ok(Response::json(&serde_json::json!({ "removed": removed, "repo": ns })))
+    }
+
     /// Once an hour: entries that go (see `cache::evict`) taken out, their pieces deleted from the bucket (what is not,
     /// the bucket's own rule removes within `cache::BUCKET_DAYS`), and machines' links past their time forgotten.
     async fn sweep_cache(&self, plane_url: &str, now: u64) -> Result<()> {
@@ -3537,7 +3604,7 @@ impl<'a> ControlPlane<'a> {
         for (k, v) in self.store.list("cachem:").await? {
             if serde_json::from_str::<cache::Machine>(&v).map(|m| m.until < now).unwrap_or(true) { self.store.delete(&k).await? }
         }
-        let mut gone = cache::evict(self.store, now, cache::LIMIT_BYTES).await?;
+        let mut gone = cache::evict(self.store, now, &self.config.routing.cache).await?;
         // The artifacts of runs from a computer that are no longer kept.
         for (k, v) in self.store.list("artifact:").await? {
             let run = k.split(':').nth(1).unwrap_or_default().to_string();

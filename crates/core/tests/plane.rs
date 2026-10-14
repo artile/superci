@@ -3465,6 +3465,7 @@ impl Http for WithCache {
             return Ok(Response::new(200, "application/octet-stream", ""));
         }
         if r.url == "https://token.actions.githubusercontent.com/.well-known/jwks" { return Ok(Response::new(200, "application/json", self.keys.to_string())) }
+        if r.url == "https://api.github.com/repositories/77" { return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 77, "full_name": "acme/app" }).to_string())) }
         if r.url == "https://api.github.com/repos/acme/app" { return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 77, "default_branch": "main" }).to_string())) }
         self.clouds.send(r).await
     }
@@ -3546,4 +3547,30 @@ fn a_machine_keeps_githubs_cache_in_its_regions_bucket_as_its_jobs_token_allows(
     assert_eq!(call("begin", serde_json::json!({ "token": local, "key": "deps-local", "version": v })).0, 200);
     assert!(store.0.borrow().contains_key(&format!("cache:gh77:refs/superci/computer:{v}:deps-local")));
     assert_eq!(call("lookup", serde_json::json!({ "token": main, "key": "deps-local", "version": v })).1["hit"], false, "not main's");
+
+    // Listed, by repository (named as GitHub names it), and one repository's entries; then taken out.
+    let dash = |r: Request| run(r.with_header("authorization", "Bearer dashboard-session-key-1"));
+    let listed = json(&dash(get("/caches")));
+    assert_eq!((listed["on"].as_bool(), listed["size_gb"].as_u64(), listed["days"].as_u64()), (Some(true), Some(25), Some(7)));
+    assert_eq!((listed["repos"][0]["name"].as_str(), listed["repos"][0]["entries"].as_u64(), listed["repos"][0]["bytes"].as_u64()), (Some("acme/app"), Some(1), Some(120)));
+    assert_eq!(json(&dash(get("/caches?repo=acme/app")))["entries"][0]["key"], "deps-1");
+    assert_eq!(run(get("/caches")).status, 404, "a key is needed");
+    let removed = dash(Request::new("POST", &format!("{PLANE_URL}/caches/delete")).with_body(serde_json::json!({ "repo": "acme/app", "key": "deps-1" }).to_string()));
+    assert_eq!(json(&removed)["removed"], 2, "main's, and the one the pull request began");
+    assert!(http.clouds.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1.contains("/c/gh77/") && c.1.ends_with("/b1")), "its pieces deleted from the bucket");
+    assert_eq!(call("lookup", serde_json::json!({ "token": pr, "key": "deps-1", "version": v })).1["hit"], false);
+}
+
+#[test]
+fn a_cache_turned_off_leaves_jobs_to_githubs() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithCache { clouds: FakeClouds::default(), keys: serde_json::json!({ "keys": [] }) };
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.cache = superci_core::cache::Settings { off: true, ..Default::default() };
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    let launch = launches(&http.clouds).pop().expect("a machine");
+    assert!(!String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap().contains("superci-cache"));
 }

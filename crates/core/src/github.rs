@@ -294,6 +294,12 @@ pub async fn repository(http: &dyn Http, api: &str, token: &str, repo: &str) -> 
     gh(http, api, "GET", &format!("/repos/{repo}"), Some(token), None).await
 }
 
+/// A repository by GitHub's id of it.
+pub async fn repository_by_id(http: &dyn Http, api: &str, token: &str, id: &str) -> Result<serde_json::Value> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return Err("not a repository id".into()) }
+    gh(http, api, "GET", &format!("/repositories/{id}"), Some(token), None).await
+}
+
 pub async fn job_status(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<String> {
     job_state(http, api, token, repo, job_id).await.map(|(status, _)| status)
 }

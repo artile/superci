@@ -9,19 +9,43 @@
 //! form (see `local_access`): it reads its branch's and the default branch's caches, and writes only its own scope.
 //!
 //! Entries are kept by repository (`ns`), scope, version (GitHub's hash of the paths and compression) and key, never
-//! changed once written. Each repository keeps `LIMIT_BYTES` at most (the least recently used go first) and an
-//! entry not used for `UNUSED_MS` goes; the bucket also drops anything older than `BUCKET_DAYS` by itself.
+//! changed once written. What is kept (see `Settings`): each repository so much at most, the least recently used
+//! going first; an entry not used for so many days goes; and one saved `MAX_AGE_DAYS` ago is taken as gone (the next
+//! job saves it anew), so the bucket's own rule, which drops anything older than `BUCKET_DAYS`, never takes one still
+//! in use from under the index.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::io::{get_json, put_json, Result, Store};
 
-/// What a repository keeps at most (as GitHub's 10 GB a repository).
-pub const LIMIT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-/// An entry not used for this long goes (GitHub: 7 days).
-pub const UNUSED_MS: u64 = 7 * 86_400_000;
+/// What a repository keeps at most unless set (GitHub keeps 10 GB; the bucket is your own, at about $0.023 a GB a month).
+pub const SIZE_GB: u32 = 25;
+/// An entry not used for this many days goes, unless set (as GitHub).
+pub const UNUSED_DAYS: u32 = 7;
+/// An entry saved this many days ago is taken as gone, whatever its use: the next job saves it anew.
+pub const MAX_AGE_DAYS: u32 = 30;
 /// The bucket's own rule: any object older than this goes, whatever the control plane's index says.
-pub const BUCKET_DAYS: u32 = 30;
+pub const BUCKET_DAYS: u32 = MAX_AGE_DAYS + 2;
+
+/// The cache as set (Settings → Cache, `superci caches update`): on unless `off`; `size_gb` a repository keeps at
+/// most; `days` an entry may go unused (none: the defaults).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub off: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub size_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub days: Option<u32>,
+}
+
+impl Settings {
+    pub fn is_default(&self) -> bool { *self == Settings::default() }
+    pub fn size_gb(&self) -> u32 { self.size_gb.unwrap_or(SIZE_GB) }
+    pub fn days(&self) -> u32 { self.days.unwrap_or(UNUSED_DAYS).min(MAX_AGE_DAYS) }
+    pub fn limit_bytes(&self) -> u64 { self.size_gb() as u64 * 1024 * 1024 * 1024 }
+    pub fn unused_ms(&self) -> u64 { self.days() as u64 * 86_400_000 }
+}
+
+/// Whether an entry is too old to be used (see `MAX_AGE_DAYS`).
+pub fn too_old(e: &Entry, now: u64) -> bool { now.saturating_sub(e.made) > MAX_AGE_DAYS as u64 * 86_400_000 }
 /// An entry begun and not finished within this goes (its job stopped or failed while saving).
 pub const UNFINISHED_MS: u64 = 3_600_000;
 /// An entry begun and not finished within this may be begun again by another job (until then the key is being
@@ -133,14 +157,14 @@ pub struct Hit { pub key: String, pub entry: Entry, pub index: String }
 
 /// GitHub's order: in each scope in turn, the key itself, then each restore key as the start of a key (the newest
 /// such entry), before the next scope. Only finished entries of the same version count.
-pub async fn lookup(store: &dyn Store, access: &Access, key: &str, restore: &[String], version: &str) -> Result<Option<Hit>> {
+pub async fn lookup(store: &dyn Store, access: &Access, key: &str, restore: &[String], version: &str, now: u64) -> Result<Option<Hit>> {
     check(key, version)?;
     for scope in &access.scopes {
         let at = index(&access.ns, &scope.name, version, key);
-        if let Some(e) = get_json::<Entry>(store, &at).await?.filter(|e| e.done) { return Ok(Some(Hit { key: key.to_string(), entry: e, index: at })) }
+        if let Some(e) = get_json::<Entry>(store, &at).await?.filter(|e| e.done && !too_old(e, now)) { return Ok(Some(Hit { key: key.to_string(), entry: e, index: at })) }
         for prefix in restore.iter().filter(|r| key_ok(r)) {
             let start = index(&access.ns, &scope.name, version, prefix);
-            let newest = store.list(&start).await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Entry>(&v).ok()?))).filter(|(_, e)| e.done).max_by_key(|(_, e)| e.made);
+            let newest = store.list(&start).await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Entry>(&v).ok()?))).filter(|(_, e)| e.done && !too_old(e, now)).max_by_key(|(_, e)| e.made);
             if let Some((at, e)) = newest {
                 // (The first such mark: scopes and the repository have no colon; a key may.)
                 let found = at.split_once(&format!(":{version}:")).map(|(_, k)| k.to_string()).unwrap_or_default();
@@ -176,7 +200,7 @@ pub async fn begin(store: &dyn Store, access: &Access, key: &str, version: &str,
     let text = serde_json::to_string(&entry).map_err(|e| Refused::Bad(e.to_string()))?;
     if store.put_if_absent(&at, text.clone()).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
     let was = store.get(&at).await.map_err(Refused::Bad)?;
-    let stale = was.as_deref().and_then(|v| serde_json::from_str::<Entry>(v).ok()).is_some_and(|e| !e.done && now.saturating_sub(e.made) > TAKEOVER_MS);
+    let stale = was.as_deref().and_then(|v| serde_json::from_str::<Entry>(v).ok()).is_some_and(|e| (!e.done && now.saturating_sub(e.made) > TAKEOVER_MS) || (e.done && too_old(&e, now)));
     if stale && store.swap(&at, was.as_deref(), text).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
     Err(Refused::Exists)
 }
@@ -205,9 +229,13 @@ pub async fn finish(store: &dyn Store, at: &str, entry: &Entry, pieces: Vec<(Str
 }
 
 /// What goes from the bucket: entries over their repository's limit (least recently used first), not used for
-/// `UNUSED_MS`, or begun and never finished. They are taken out of the index here; their pieces are for the caller
-/// to delete (region, object names).
-pub async fn evict(store: &dyn Store, now: u64, limit: u64) -> Result<Vec<(String, Vec<String>)>> {
+/// as long as set, saved `MAX_AGE_DAYS` ago, or begun and never finished. They are taken out of the index here; their
+/// pieces are for the caller to delete (region, object names).
+pub async fn evict(store: &dyn Store, now: u64, settings: &Settings) -> Result<Vec<(String, Vec<String>)>> {
+    evict_within(store, now, settings.limit_bytes(), settings.unused_ms()).await
+}
+
+async fn evict_within(store: &dyn Store, now: u64, limit: u64, unused: u64) -> Result<Vec<(String, Vec<String>)>> {
     let all: Vec<(String, Entry)> = store.list("cache:").await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Entry>(&v).ok()?))).collect();
     let mut by_ns: std::collections::BTreeMap<String, Vec<(String, Entry)>> = Default::default();
     for (k, e) in all { by_ns.entry(k.splitn(3, ':').nth(1).unwrap_or_default().to_string()).or_default().push((k, e)) }
@@ -216,7 +244,7 @@ pub async fn evict(store: &dyn Store, now: u64, limit: u64) -> Result<Vec<(Strin
         entries.sort_by_key(|(_, e)| std::cmp::Reverse(e.used.max(e.made)));
         let mut kept = 0u64;
         for (k, e) in entries {
-            let old = if e.done { now.saturating_sub(e.used.max(e.made)) > UNUSED_MS } else { now.saturating_sub(e.made) > UNFINISHED_MS };
+            let old = if e.done { now.saturating_sub(e.used.max(e.made)) > unused || too_old(&e, now) } else { now.saturating_sub(e.made) > UNFINISHED_MS };
             if !old && (!e.done || kept + e.size <= limit) { kept += e.size; continue }
             store.delete(&k).await?;
             gone.push((e.region.clone(), e.pieces.iter().map(|(p, _)| format!("{}/{p}", e.prefix(&ns))).collect()));
@@ -225,10 +253,43 @@ pub async fn evict(store: &dyn Store, now: u64, limit: u64) -> Result<Vec<(Strin
     Ok(gone)
 }
 
-/// What a repository keeps now, for the dashboard: entries and bytes.
+/// What a repository keeps now: entries and bytes.
 pub async fn kept(store: &dyn Store, ns: &str) -> Result<(usize, u64)> {
     let entries: Vec<Entry> = store.list(&format!("cache:{ns}:")).await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).filter(|e: &Entry| e.done).collect();
     Ok((entries.len(), entries.iter().map(|e| e.size).sum()))
+}
+
+/// One finished entry as it is listed: its repository, scope, key, version, and the entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed { pub ns: String, pub scope: String, pub key: String, pub version: String, pub entry: Entry }
+
+/// Every finished entry (of one repository, or all), the most recently used first.
+pub async fn list(store: &dyn Store, ns: Option<&str>) -> Result<Vec<Listed>> {
+    let start = match ns { Some(n) => format!("cache:{n}:"), None => "cache:".to_string() };
+    let mut all: Vec<Listed> = store.list(&start).await?.into_iter().filter_map(|(k, v)| {
+        let entry: Entry = serde_json::from_str(&v).ok().filter(|e: &Entry| e.done)?;
+        let mut p = k.splitn(5, ':').skip(1);
+        let (ns, scope, version, key) = (p.next()?.to_string(), p.next()?.to_string(), p.next()?.to_string(), p.next()?.to_string());
+        Some(Listed { ns, scope, key, version, entry })
+    }).collect();
+    all.sort_by_key(|l| std::cmp::Reverse(l.entry.used.max(l.entry.made)));
+    Ok(all)
+}
+
+/// Takes entries of a repository out of the index (those with `key`, or all of them; in `scope` only, when given);
+/// their pieces, by region, are for the caller to delete.
+pub async fn remove(store: &dyn Store, ns: &str, key: Option<&str>, scope: Option<&str>) -> Result<(usize, Vec<(String, Vec<String>)>)> {
+    let mut gone = vec![];
+    let mut n = 0;
+    for (k, v) in store.list(&format!("cache:{ns}:")).await? {
+        let mut p = k.splitn(5, ':').skip(2);
+        let (s, _, kk) = (p.next().unwrap_or_default(), p.next(), p.next().unwrap_or_default());
+        if key.is_some_and(|want| want != kk) || scope.is_some_and(|want| want != s) { continue }
+        store.delete(&k).await?;
+        n += 1;
+        if let Ok(e) = serde_json::from_str::<Entry>(&v) { gone.push((e.region.clone(), e.pieces.iter().map(|(p, _)| format!("{}/{p}", e.prefix(ns))).collect())) }
+    }
+    Ok((n, gone))
 }
 
 /// Artifacts of a run from a computer (it has no GitHub to keep them), kept in the bucket as cache entries are, by
@@ -297,6 +358,22 @@ mod tests {
     const V: &str = "0123abcd";
 
     #[test]
+    fn entries_listed_and_removed_by_repository_key_and_scope() {
+        let store = Mem::default();
+        save(&store, &main_branch(), "deps-1", 1);
+        save(&store, &main_branch(), "buildkit-blob-1-sha256:aa", 2);
+        save(&store, &pr(), "deps-1", 3);
+        let all = run(list(&store, Some("gh77"))).unwrap();
+        assert_eq!(all.iter().map(|l| (l.scope.as_str(), l.key.as_str())).collect::<Vec<_>>(), [("refs/pull/5/merge", "deps-1"), ("refs/heads/main", "buildkit-blob-1-sha256:aa"), ("refs/heads/main", "deps-1")]);
+        assert_eq!(run(list(&store, None)).unwrap().len(), 3);
+        let (n, gone) = run(remove(&store, "gh77", Some("deps-1"), Some("refs/heads/main"))).unwrap();
+        assert_eq!((n, gone[0].1.len()), (1, 2));
+        assert_eq!(run(remove(&store, "gh77", None, None)).unwrap().0, 2);
+        assert!(run(list(&store, None)).unwrap().is_empty());
+        assert_eq!((Settings::default().size_gb(), Settings::default().days(), Settings { days: Some(90), ..Default::default() }.days()), (25, 7, MAX_AGE_DAYS));
+    }
+
+    #[test]
     fn a_runs_artifacts_by_name_once_each() {
         let store = Mem::default();
         let (at, e) = run(begin_artifact(&store, "41", "report", "us-east-1", 5)).unwrap();
@@ -335,12 +412,12 @@ mod tests {
         let store = Mem::default();
         save(&store, &main_branch(), "deps-aaa", 1);
         // Found in main (the PR's own scope has nothing).
-        let hit = run(lookup(&store, &pr(), "deps-aaa", &[], V)).unwrap().unwrap();
+        let hit = run(lookup(&store, &pr(), "deps-aaa", &[], V, 0)).unwrap().unwrap();
         assert_eq!((hit.key.as_str(), hit.entry.size), ("deps-aaa", 15));
         // Its own save goes to its own scope, and main does not see it.
         save(&store, &pr(), "deps-bbb", 2);
-        assert!(run(lookup(&store, &main_branch(), "deps-bbb", &[], V)).unwrap().is_none());
-        assert_eq!(run(lookup(&store, &pr(), "deps-bbb", &[], V)).unwrap().unwrap().index, "cache:gh77:refs/pull/5/merge:0123abcd:deps-bbb");
+        assert!(run(lookup(&store, &main_branch(), "deps-bbb", &[], V, 0)).unwrap().is_none());
+        assert_eq!(run(lookup(&store, &pr(), "deps-bbb", &[], V, 0)).unwrap().unwrap().index, "cache:gh77:refs/pull/5/merge:0123abcd:deps-bbb");
         // Read only: no save.
         let reader = Access { ns: "gh77".into(), scopes: vec![Scope { name: "refs/heads/main".into(), write: false }], run: None };
         assert_eq!(run(begin(&store, &reader, "x", V, "us-east-1", 3)).unwrap_err(), Refused::NoWrite);
@@ -352,25 +429,25 @@ mod tests {
         save(&store, &main_branch(), "deps-1", 10);
         save(&store, &main_branch(), "deps-2", 20);
         save(&store, &main_branch(), "other-9", 30);
-        let hit = run(lookup(&store, &pr(), "deps-3", &["deps-".into()], V)).unwrap().unwrap();
+        let hit = run(lookup(&store, &pr(), "deps-3", &["deps-".into()], V, 0)).unwrap().unwrap();
         assert_eq!(hit.key, "deps-2");
         // The PR's own scope comes first, even with an older entry.
         save(&store, &pr(), "deps-0", 5);
-        assert_eq!(run(lookup(&store, &pr(), "deps-3", &["deps-".into()], V)).unwrap().unwrap().key, "deps-0");
+        assert_eq!(run(lookup(&store, &pr(), "deps-3", &["deps-".into()], V, 0)).unwrap().unwrap().key, "deps-0");
         // Another version is no hit.
-        assert!(run(lookup(&store, &pr(), "deps-2", &[], "ffff")).unwrap().is_none());
+        assert!(run(lookup(&store, &pr(), "deps-2", &[], "ffff", 0)).unwrap().is_none());
         // BuildKit's keys, with colons.
         save(&store, &main_branch(), "buildkit-blob-1-sha256:62a5bc3a", 40);
-        assert_eq!(run(lookup(&store, &pr(), "buildkit-blob-1-sha256:62a5bc3a", &[], V)).unwrap().unwrap().key, "buildkit-blob-1-sha256:62a5bc3a");
-        assert_eq!(run(lookup(&store, &pr(), "nothing", &["buildkit-blob-1-sha256:".into()], V)).unwrap().unwrap().key, "buildkit-blob-1-sha256:62a5bc3a");
-        assert!(run(lookup(&store, &pr(), "a,b", &[], V)).is_err());
+        assert_eq!(run(lookup(&store, &pr(), "buildkit-blob-1-sha256:62a5bc3a", &[], V, 0)).unwrap().unwrap().key, "buildkit-blob-1-sha256:62a5bc3a");
+        assert_eq!(run(lookup(&store, &pr(), "nothing", &["buildkit-blob-1-sha256:".into()], V, 0)).unwrap().unwrap().key, "buildkit-blob-1-sha256:62a5bc3a");
+        assert!(run(lookup(&store, &pr(), "a,b", &[], V, 0)).is_err());
     }
 
     #[test]
     fn an_entry_is_written_once_and_an_unfinished_one_is_no_hit() {
         let store = Mem::default();
         let (at, e) = run(begin(&store, &main_branch(), "k", V, "us-east-1", 100)).unwrap();
-        assert!(run(lookup(&store, &main_branch(), "k", &[], V)).unwrap().is_none());
+        assert!(run(lookup(&store, &main_branch(), "k", &[], V, 0)).unwrap().is_none());
         assert_eq!(run(begin(&store, &main_branch(), "k", V, "us-east-1", 200)).unwrap_err(), Refused::Exists);
         assert_eq!(run(begun(&store, &main_branch(), "k", V)).unwrap().unwrap().1.id, e.id);
         run(finish(&store, &at, &e, vec![("a".into(), 1)])).unwrap();
@@ -388,18 +465,24 @@ mod tests {
         save(&store, &main_branch(), "a", 1);
         save(&store, &main_branch(), "b", 2);
         save(&store, &main_branch(), "c", 3);
-        let hit = run(lookup(&store, &main_branch(), "a", &[], V)).unwrap().unwrap();
+        let hit = run(lookup(&store, &main_branch(), "a", &[], V, 0)).unwrap().unwrap();
         run(used(&store, &hit, 3_700_000)).unwrap();
         // 15 bytes each, room for two: b (least recently used) goes.
-        let gone = run(evict(&store, 3_800_000, 30)).unwrap();
+        let gone = run(evict_within(&store, 3_800_000, 30, 7 * 86_400_000)).unwrap();
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0].1.len(), 2);
         assert!(gone[0].1[0].starts_with("c/gh77/") && gone[0].1[0].ends_with("/p0"));
-        assert!(run(lookup(&store, &main_branch(), "b", &[], V)).unwrap().is_none());
+        assert!(run(lookup(&store, &main_branch(), "b", &[], V, 0)).unwrap().is_none());
         assert_eq!(run(kept(&store, "gh77")).unwrap(), (2, 30));
-        // A week unused: gone.
-        assert_eq!(run(evict(&store, 3 + UNUSED_MS + 1, LIMIT_BYTES)).unwrap().len(), 1);
+        // A week unused (as set by default): gone.
+        assert_eq!(run(evict(&store, 3 + Settings::default().unused_ms() + 1, &Settings::default())).unwrap().len(), 1);
         assert_eq!(run(kept(&store, "gh77")).unwrap(), (1, 15));
+        // Used every hour, but saved MAX_AGE_DAYS ago: no hit, saved anew, and gone at the next sweep.
+        let old = MAX_AGE_DAYS as u64 * 86_400_000 + 10;
+        assert!(run(lookup(&store, &main_branch(), "a", &[], V, old)).unwrap().is_none());
+        assert!(run(begin(&store, &main_branch(), "a", V, "us-east-1", old)).is_ok(), "begun anew over the old one");
+        save(&store, &main_branch(), "z", 5);
+        assert_eq!(run(evict(&store, old, &Settings::default())).unwrap().len(), 1, "z is too old");
     }
 
     #[test]
@@ -408,9 +491,9 @@ mod tests {
         assert_eq!(a.scopes, vec![Scope { name: "refs/superci/agent-1".into(), write: true }, Scope { name: "refs/heads/feature".into(), write: false }, Scope { name: "refs/heads/main".into(), write: false }]);
         let store = Mem::default();
         save(&store, &main_branch(), "deps", 1);
-        assert_eq!(run(lookup(&store, &a, "deps", &[], V)).unwrap().unwrap().key, "deps");
+        assert_eq!(run(lookup(&store, &a, "deps", &[], V, 0)).unwrap().unwrap().key, "deps");
         save(&store, &a, "deps-local", 2);
-        assert!(run(lookup(&store, &main_branch(), "deps-local", &[], V)).unwrap().is_none());
+        assert!(run(lookup(&store, &main_branch(), "deps-local", &[], V, 0)).unwrap().is_none());
         assert_eq!(local_access(&local_claims("gh77", "computer", "refs/heads/main", "main", "1", "1")).unwrap().scopes.len(), 2);
         assert!(local_access(&serde_json::json!({ "ns": "x/y", "ac": "[]" })).is_err());
         assert!(local_ns("acme/app").starts_with("local-"));
