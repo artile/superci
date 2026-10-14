@@ -1251,6 +1251,11 @@ impl<'a> ControlPlane<'a> {
         // A GitLab job is kept under its connection's name and its id (`gl`: the name; nothing for the first).
         let key = match q("gl") { Some(g) if gitlab::valid_id(&g) || g.is_empty() => format!("job:gl{}", gitlab::local(&g, id.parse().unwrap_or_default())), Some(_) => return Err("which GitLab?".into()), None => format!("job:{id}") };
         let Some(j) = get_json::<Job>(self.store, &key).await? else { return Ok(Response::json(&serde_json::json!({ "error": "This control plane has no such job (it keeps the latest ones)." }))) };
+        // With `link`: where GitHub keeps a job's whole log, for it to be fetched from there whatever its size.
+        if q("link").is_some() && j.provider.is_empty() {
+            let link = match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log_link(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository".into()) };
+            return Ok(Response::json(&match link { Ok(url) => serde_json::json!({ "url": url }), Err(e) => serde_json::json!({ "error": e }) }))
+        }
         // With `steps`: the job's steps too (GitHub's as it has them now, with their times; a run from a computer's with
         // each one's log, or its lines so far while it runs). GitLab's are in its log, marked as sections.
         let steps = if q("steps").is_none() { serde_json::Value::Null } else if j.provider == "local" {
@@ -1273,7 +1278,8 @@ impl<'a> ControlPlane<'a> {
             }
         };
         let log = match fetched { Ok(l) => l, Err(e) => return Ok(Response::json(&serde_json::json!({ "error": e, "steps": steps }))) };
-        let want = q("bytes").and_then(|b| b.parse::<usize>().ok()).unwrap_or(200_000).clamp(1_000, 1_000_000);
+        // (Four MB at most: what the runtimes answer with, written as JSON, stays within their six.)
+        let want = q("bytes").and_then(|b| b.parse::<usize>().ok()).unwrap_or(200_000).clamp(1_000, 4_000_000);
         // From a line's start, when the cut falls inside one.
         let from = log.len().saturating_sub(want);
         let from = if from == 0 { 0 } else { log[from..].iter().position(|b| *b == b'\n').map(|n| from + n + 1).unwrap_or(from) };

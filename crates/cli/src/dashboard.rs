@@ -2069,8 +2069,14 @@ impl Dashboard {
                 if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) || !gl.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') { return Ok(message(400, "Which job?", "")) }
                 let Some(v) = self.current()? else { return Ok(message(404, "No control plane", "")) };
                 let job = v.jobs().into_iter().find(|j| j["job_id"].as_u64().is_some_and(|n| n.to_string() == id) && (gl.is_empty() || j["gitlab"].as_str() == Some(gl)));
-                let mut path = format!("/job/log?id={id}&bytes=1000000&steps=1");
+                let mut path = format!("/job/log?id={id}&bytes={}&steps=1", if req.path == "/job/raw" { 4_000_000 } else { 1_000_000 });
                 if !gl.is_empty() || job.as_ref().is_some_and(|j| j["provider"] == "gitlab") { path += &format!("&gl={gl}") }
+                // A GitHub job's whole log, from GitHub itself (any size).
+                if req.path == "/job/raw" && job.as_ref().is_some_and(|j| j["provider"].as_str().unwrap_or_default().is_empty()) {
+                    if let Ok(url) = cloudflare::plane_get(v.plane.url(), &self.status_key, &format!("/job/log?id={id}&link=1")).map(|g| g["url"].as_str().unwrap_or_default().to_string()) {
+                        if url.starts_with("https://") { return Ok(Response::new(302, "text/plain", String::new()).with_header("location", &url)) }
+                    }
+                }
                 let got = cloudflare::plane_get(v.plane.url(), &self.status_key, &path).unwrap_or_else(|e| serde_json::json!({ "error": e }));
                 if req.path == "/job/raw" {
                     return Ok(Response::new(200, "text/plain; charset=utf-8", got["log"].as_str().unwrap_or_default().to_string()).with_header("content-disposition", &format!("attachment; filename=\"job-{id}.log\"")))

@@ -185,6 +185,19 @@ pub async fn installation_token(http: &dyn Http, app: &App, installation_id: u64
 
 /// A job's log, whole, as GitHub keeps it once the job has ended. GitHub answers with where it is (a link good for a
 /// minute, to be fetched without the token); a client that follows by itself arrives with the log.
+/// Where GitHub keeps a job's whole log: a link of its own, good for a minute or so (any size, nothing through here).
+pub async fn job_log_link(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<String> {
+    let ask = Request::new("GET", &format!("{api}/repos/{repo}/actions/jobs/{job_id}/logs"))
+        .with_header("accept", "application/vnd.github+json").with_header("user-agent", "superci-plane").with_header("x-github-api-version", "2022-11-28")
+        .with_header("authorization", &format!("Bearer {token}")).without_following();
+    let r = http.send(ask).await?;
+    match r.status {
+        301 | 302 | 303 | 307 | 308 => r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map(|(_, v)| v.clone()).ok_or("GitHub did not say where the log is".into()),
+        404 => Err("GitHub has no log for it yet (a job's log is kept once it has ended), or no longer".into()),
+        s => Err(format!("GitHub would not give its log: {s}")),
+    }
+}
+
 pub async fn job_log(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<Vec<u8>> {
     let ask = Request::new("GET", &format!("{api}/repos/{repo}/actions/jobs/{job_id}/logs"))
         .with_header("accept", "application/vnd.github+json").with_header("user-agent", "superci-plane").with_header("x-github-api-version", "2022-11-28")
