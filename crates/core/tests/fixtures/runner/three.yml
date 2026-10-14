@@ -1,0 +1,53 @@
+name: three
+run-name: A run by ${{ github.actor }}
+on: [push]
+env:
+  WORKFLOW_WIDE: yes
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    name: The test job
+    runs-on: superci-trial
+    timeout-minutes: 7
+    continue-on-error: false
+    env:
+      JOB_WIDE: ${{ github.event_name }}
+      MIXED: before ${{ vars.A_VAR }} it's {braces} ${{ secrets.A_SECRET }} after
+    defaults:
+      run:
+        working-directory: /tmp
+    outputs:
+      said: ${{ steps.say.outputs.said }}
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping"
+    steps:
+      - id: say
+        name: Say ${{ github.event_name }}
+        run: echo "said=x" >> "$GITHUB_OUTPUT"
+        shell: sh
+        working-directory: /var
+        continue-on-error: true
+        timeout-minutes: 3
+        env:
+          STEP_ENV: 1
+      - run: echo always
+        if: always()
+      - run: echo cond
+        if: github.ref == 'refs/heads/main' && vars.A_VAR
+      - run: echo wrapped
+        if: ${{ failure() || true }}
+      - uses: docker://alpine:3.20
+        with:
+          args: echo hi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          check-latest: false
+      - uses: actions/setup-node@v4
+      - uses: actions/github-script/.github@v7
+        continue-on-error: true

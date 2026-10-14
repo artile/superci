@@ -1,0 +1,27 @@
+name: record
+on: [workflow_dispatch]
+env:
+  WORKFLOW_WIDE: yes
+jobs:
+  test:
+    runs-on: superci
+    timeout-minutes: 5
+    env:
+      JOB_WIDE: ${{ github.event_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Say hello
+        run: echo "hello from $JOB_WIDE with $(cat README.md | head -c 20)"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --version
+        if: success()
+      - name: What the runner was handed (its own log; secrets are masked there)
+        if: always()
+        run: |
+          echo "RECORD-BEGIN"
+          cat /home/runner/_diag/Worker_*.log | gzip -9 | base64 -w 120
+          echo "RECORD-END"
+          echo "RUNNER-FILES $(ls -a /home/runner | tr '\n' ' ')"
+          echo "RUNNER-CONFIG $(cat /home/runner/.runner | tr -d '\n' | cut -c1-900)"

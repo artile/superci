@@ -19,6 +19,7 @@ p256 = { version = "0.13", features = ["ecdsa", "jwk"] }
 getrandom = { version = "0.2", features = ["js"] }
 async-trait = "0.1"
 url = "2"
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [profile.release]
 opt-level = "s"

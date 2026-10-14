@@ -1,0 +1,191 @@
+{
+ "environmentVariables": [
+  {
+   "type": 2,
+   "file": 1,
+   "line": 4,
+   "col": 3,
+   "map": [
+    {
+     "key": {
+      "type": 0,
+      "file": 1,
+      "line": 4,
+      "col": 3,
+      "lit": "WORKFLOW_WIDE"
+     },
+     "value": {
+      "type": 0,
+      "file": 1,
+      "line": 4,
+      "col": 18,
+      "lit": "yes"
+     }
+    }
+   ]
+  },
+  {
+   "type": 2,
+   "file": 1,
+   "line": 10,
+   "col": 7,
+   "map": [
+    {
+     "key": {
+      "type": 0,
+      "file": 1,
+      "line": 10,
+      "col": 7,
+      "lit": "JOB_WIDE"
+     },
+     "value": {
+      "type": 3,
+      "file": 1,
+      "line": 10,
+      "col": 17,
+      "expr": "github.event_name"
+     }
+    }
+   ]
+  }
+ ],
+ "fileTable": [
+  ".github/workflows/record.yml"
+ ],
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/checkout",
+    "ref": "v4",
+    "repositoryType": "GitHub"
+   },
+   "contextName": "__actions_checkout",
+   "condition": "success()",
+   "name": "__actions_checkout"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "displayNameToken": {
+    "type": 0,
+    "file": 1,
+    "line": 13,
+    "col": 15,
+    "lit": "Say hello"
+   },
+   "contextName": "__run",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 14,
+       "col": 14,
+       "lit": "echo \"hello from $JOB_WIDE with $(cat README.md | head -c 20)\""
+      }
+     }
+    ]
+   },
+   "condition": "success()",
+   "name": "__run"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/setup-node",
+    "ref": "v4",
+    "repositoryType": "GitHub"
+   },
+   "contextName": "__actions_setup-node",
+   "inputs": {
+    "type": 2,
+    "file": 1,
+    "line": 17,
+    "col": 11,
+    "map": [
+     {
+      "key": {
+       "type": 0,
+       "file": 1,
+       "line": 17,
+       "col": 11,
+       "lit": "node-version"
+      },
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 17,
+       "col": 25,
+       "lit": "22"
+      }
+     }
+    ]
+   },
+   "condition": "success()",
+   "name": "__actions_setup-node"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__run_2",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 18,
+       "col": 14,
+       "lit": "node --version"
+      }
+     }
+    ]
+   },
+   "condition": "success()",
+   "name": "__run_2"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "displayNameToken": {
+    "type": 0,
+    "file": 1,
+    "line": 20,
+    "col": 15,
+    "lit": "What the runner was handed (its own log; secrets are masked there)"
+   },
+   "contextName": "__run_3",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 22,
+       "col": 14,
+       "lit": "echo \"RECORD-BEGIN\"\ncat /home/runner/_diag/Worker_*.log | gzip -9 | base64 -w 120\necho \"RECORD-END\"\necho \"RUNNER-FILES $(ls -a /home/runner | tr '\\n' ' ')\"\necho \"RUNNER-CONFIG $(cat /home/runner/.runner | tr -d '\\n' | cut -c1-900)\"\n"
+      }
+     }
+    ]
+   },
+   "condition": "always()",
+   "name": "__run_3"
+  }
+ ]
+}

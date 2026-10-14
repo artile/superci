@@ -3209,3 +3209,30 @@ fn a_gitlab_job_cancelled_at_any_step_of_its_start_leaves_no_machine_and_no_runn
         at += 1;
     }
 }
+
+#[test]
+fn a_workflow_files_job_is_written_for_the_runner_as_github_writes_it() {
+    use superci_core::workflow::{job_parts, parse};
+    // What a workflow file decides of the message the runner is handed, held to two recordings: what real GitHub
+    // sent for one workflow, and what an open-source stand-in for GitHub's service sent for one that uses most of
+    // what a step and a job can say. Every value, in its order, with its place in the file.
+    for (workflow, path, recorded) in [
+        (include_str!("fixtures/runner/record.yml"), ".github/workflows/record.yml", include_str!("fixtures/runner/record.github.json")),
+        (include_str!("fixtures/runner/three.yml"), ".github/workflows/ci.yml", include_str!("fixtures/runner/three.standin.json")),
+    ] {
+        let want: serde_json::Value = serde_json::from_str(recorded).unwrap();
+        let got = job_parts(&parse(workflow).unwrap(), path, "test", &mut || String::new()).unwrap();
+        for key in ["fileTable", "environmentVariables", "defaults", "jobOutputs", "jobServiceContainers", "jobContainer"] {
+            assert_eq!(got.get(key), want.get(key), "{path}: {key}\n got {}\nwant {}", got.get(key).unwrap_or(&serde_json::Value::Null), want.get(key).unwrap_or(&serde_json::Value::Null));
+        }
+        let (got, want) = (got["steps"].as_array().unwrap(), want["steps"].as_array().unwrap());
+        assert_eq!(got.len(), want.len(), "{path}");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            let (mut g, mut w) = (g.clone(), w.clone());
+            g.as_object_mut().unwrap().remove("id");
+            // (The stand-in writes an empty `path` for an action at the top of its repository; GitHub writes none.)
+            if w["reference"]["path"] == "" { w["reference"].as_object_mut().unwrap().remove("path"); }
+            assert_eq!(serde_json::to_string(&g).unwrap(), serde_json::to_string(&w).unwrap(), "{path}: step {}", i + 1);
+        }
+    }
+}

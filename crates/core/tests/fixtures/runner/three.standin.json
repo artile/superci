@@ -1,0 +1,543 @@
+{
+ "environmentVariables": [
+  {
+   "type": 2,
+   "file": 1,
+   "line": 5,
+   "col": 3,
+   "map": [
+    {
+     "key": {
+      "type": 0,
+      "file": 1,
+      "line": 5,
+      "col": 3,
+      "lit": "WORKFLOW_WIDE"
+     },
+     "value": {
+      "type": 0,
+      "file": 1,
+      "line": 5,
+      "col": 18,
+      "lit": "yes"
+     }
+    }
+   ]
+  },
+  {
+   "type": 2,
+   "file": 1,
+   "line": 16,
+   "col": 7,
+   "map": [
+    {
+     "key": {
+      "type": 0,
+      "file": 1,
+      "line": 16,
+      "col": 7,
+      "lit": "JOB_WIDE"
+     },
+     "value": {
+      "type": 3,
+      "file": 1,
+      "line": 16,
+      "col": 17,
+      "expr": "github.event_name"
+     }
+    },
+    {
+     "key": {
+      "type": 0,
+      "file": 1,
+      "line": 17,
+      "col": 7,
+      "lit": "MIXED"
+     },
+     "value": {
+      "type": 3,
+      "file": 1,
+      "line": 17,
+      "col": 14,
+      "expr": "format('before {0} it''s {{braces}} {1} after', vars.A_VAR, secrets.A_SECRET)"
+     }
+    }
+   ]
+  }
+ ],
+ "defaults": [
+  {
+   "type": 2,
+   "file": 1,
+   "line": 7,
+   "col": 3,
+   "map": [
+    {
+     "key": {
+      "type": 0,
+      "file": 1,
+      "line": 7,
+      "col": 3,
+      "lit": "run"
+     },
+     "value": {
+      "type": 2,
+      "file": 1,
+      "line": 8,
+      "col": 5,
+      "map": [
+       {
+        "key": {
+         "type": 0,
+         "file": 1,
+         "line": 8,
+         "col": 5,
+         "lit": "shell"
+        },
+        "value": {
+         "type": 0,
+         "file": 1,
+         "line": 8,
+         "col": 12,
+         "lit": "bash"
+        }
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "type": 2,
+   "file": 1,
+   "line": 19,
+   "col": 7,
+   "map": [
+    {
+     "key": {
+      "type": 0,
+      "file": 1,
+      "line": 19,
+      "col": 7,
+      "lit": "run"
+     },
+     "value": {
+      "type": 2,
+      "file": 1,
+      "line": 20,
+      "col": 9,
+      "map": [
+       {
+        "key": {
+         "type": 0,
+         "file": 1,
+         "line": 20,
+         "col": 9,
+         "lit": "working-directory"
+        },
+        "value": {
+         "type": 0,
+         "file": 1,
+         "line": 20,
+         "col": 28,
+         "lit": "/tmp"
+        }
+       }
+      ]
+     }
+    }
+   ]
+  }
+ ],
+ "fileTable": [
+  ".github/workflows/ci.yml"
+ ],
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "displayNameToken": {
+    "type": 3,
+    "file": 1,
+    "line": 30,
+    "col": 15,
+    "expr": "format('Say {0}', github.event_name)"
+   },
+   "contextName": "say",
+   "environment": {
+    "type": 2,
+    "file": 1,
+    "line": 37,
+    "col": 11,
+    "map": [
+     {
+      "key": {
+       "type": 0,
+       "file": 1,
+       "line": 37,
+       "col": 11,
+       "lit": "STEP_ENV"
+      },
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 37,
+       "col": 21,
+       "lit": "1"
+      }
+     }
+    ]
+   },
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 31,
+       "col": 14,
+       "lit": "echo \"said=x\" >> \"$GITHUB_OUTPUT\""
+      }
+     },
+     {
+      "key": "workingDirectory",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 33,
+       "col": 28,
+       "lit": "/var"
+      }
+     },
+     {
+      "key": "shell",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 32,
+       "col": 16,
+       "lit": "sh"
+      }
+     }
+    ]
+   },
+   "condition": "success()",
+   "continueOnError": {
+    "type": 5,
+    "file": 1,
+    "line": 34,
+    "col": 28,
+    "bool": true
+   },
+   "timeoutInMinutes": {
+    "type": 6,
+    "file": 1,
+    "line": 35,
+    "col": 26,
+    "num": 3.0
+   },
+   "name": "say"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__run",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 38,
+       "col": 14,
+       "lit": "echo always"
+      }
+     }
+    ]
+   },
+   "condition": "always()",
+   "name": "__run"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__run_2",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 40,
+       "col": 14,
+       "lit": "echo cond"
+      }
+     }
+    ]
+   },
+   "condition": "success() && (github.ref == 'refs/heads/main' && vars.A_VAR)",
+   "name": "__run_2"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__run_3",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 42,
+       "col": 14,
+       "lit": "echo wrapped"
+      }
+     }
+    ]
+   },
+   "condition": "failure() || true",
+   "name": "__run_3"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "containerRegistry",
+    "image": "alpine:3.20"
+   },
+   "contextName": "__alpine_3_20",
+   "inputs": {
+    "type": 2,
+    "file": 1,
+    "line": 46,
+    "col": 11,
+    "map": [
+     {
+      "key": {
+       "type": 0,
+       "file": 1,
+       "line": 46,
+       "col": 11,
+       "lit": "args"
+      },
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 46,
+       "col": 17,
+       "lit": "echo hi"
+      }
+     }
+    ]
+   },
+   "condition": "success()",
+   "name": "__alpine_3_20"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/setup-node",
+    "ref": "v4",
+    "repositoryType": "GitHub",
+    "path": ""
+   },
+   "contextName": "__actions_setup-node",
+   "inputs": {
+    "type": 2,
+    "file": 1,
+    "line": 49,
+    "col": 11,
+    "map": [
+     {
+      "key": {
+       "type": 0,
+       "file": 1,
+       "line": 49,
+       "col": 11,
+       "lit": "node-version"
+      },
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 49,
+       "col": 25,
+       "lit": "22"
+      }
+     },
+     {
+      "key": {
+       "type": 0,
+       "file": 1,
+       "line": 50,
+       "col": 11,
+       "lit": "check-latest"
+      },
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 50,
+       "col": 25,
+       "lit": "false"
+      }
+     }
+    ]
+   },
+   "condition": "success()",
+   "name": "__actions_setup-node"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/setup-node",
+    "ref": "v4",
+    "repositoryType": "GitHub",
+    "path": ""
+   },
+   "contextName": "__actions_setup-node_2",
+   "condition": "success()",
+   "name": "__actions_setup-node_2"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/github-script",
+    "ref": "v7",
+    "repositoryType": "GitHub",
+    "path": ".github"
+   },
+   "contextName": "__actions_github-script",
+   "condition": "success()",
+   "continueOnError": {
+    "type": 5,
+    "file": 1,
+    "line": 53,
+    "col": 28,
+    "bool": true
+   },
+   "name": "__actions_github-script"
+  }
+ ],
+ "jobOutputs": {
+  "type": 2,
+  "file": 1,
+  "line": 22,
+  "col": 7,
+  "map": [
+   {
+    "key": {
+     "type": 0,
+     "file": 1,
+     "line": 22,
+     "col": 7,
+     "lit": "said"
+    },
+    "value": {
+     "type": 3,
+     "file": 1,
+     "line": 22,
+     "col": 13,
+     "expr": "steps.say.outputs.said"
+    }
+   }
+  ]
+ },
+ "jobServiceContainers": {
+  "type": 2,
+  "file": 1,
+  "line": 24,
+  "col": 7,
+  "map": [
+   {
+    "key": {
+     "type": 0,
+     "file": 1,
+     "line": 24,
+     "col": 7,
+     "lit": "redis"
+    },
+    "value": {
+     "type": 2,
+     "file": 1,
+     "line": 25,
+     "col": 9,
+     "map": [
+      {
+       "key": {
+        "type": 0,
+        "file": 1,
+        "line": 25,
+        "col": 9,
+        "lit": "image"
+       },
+       "value": {
+        "type": 0,
+        "file": 1,
+        "line": 25,
+        "col": 16,
+        "lit": "redis:7"
+       }
+      },
+      {
+       "key": {
+        "type": 0,
+        "file": 1,
+        "line": 26,
+        "col": 9,
+        "lit": "ports"
+       },
+       "value": {
+        "type": 1,
+        "file": 1,
+        "line": 26,
+        "col": 16,
+        "seq": [
+         {
+          "type": 0,
+          "file": 1,
+          "line": 26,
+          "col": 17,
+          "lit": "6379:6379"
+         }
+        ]
+       }
+      },
+      {
+       "key": {
+        "type": 0,
+        "file": 1,
+        "line": 27,
+        "col": 9,
+        "lit": "options"
+       },
+       "value": {
+        "type": 0,
+        "file": 1,
+        "line": 27,
+        "col": 18,
+        "lit": "--health-cmd \"redis-cli ping\""
+       }
+      }
+     ]
+    }
+   }
+  ]
+ }
+}

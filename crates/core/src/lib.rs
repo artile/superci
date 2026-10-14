@@ -11,3 +11,4 @@ pub mod io;
 pub mod page;
 pub mod permissions;
 pub mod spec;
+pub mod workflow;

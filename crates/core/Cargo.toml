@@ -18,6 +18,7 @@ hmac.workspace = true
 rsa.workspace = true
 p256.workspace = true
 getrandom.workspace = true
+yaml-rust2.workspace = true
 async-trait.workspace = true
 url.workspace = true
 
