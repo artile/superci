@@ -73,6 +73,16 @@ pub async fn pending_jobs(http: &dyn Http, gl: &GitLab, project_id: u64) -> Resu
     Ok(api(http, gl, "GET", &format!("/projects/{project_id}/jobs?scope[]=pending&per_page=50"), None).await?.as_array().cloned().unwrap_or_default())
 }
 
+/// The job a runner is running now, as GitLab has it (none: it runs none).
+pub async fn runner_job(http: &dyn Http, gl: &GitLab, runner_id: u64) -> Result<Option<serde_json::Value>> {
+    Ok(api(http, gl, "GET", &format!("/runners/{runner_id}/jobs?status=running&per_page=1"), None).await?.as_array().and_then(|a| a.first().cloned()))
+}
+
+/// A job as GitLab has it (its status, its runner, its ref…).
+pub async fn job_json(http: &dyn Http, gl: &GitLab, project_id: u64, job_id: u64) -> Result<serde_json::Value> {
+    api(http, gl, "GET", &format!("/projects/{project_id}/jobs/{job_id}"), None).await
+}
+
 pub async fn job(http: &dyn Http, gl: &GitLab, project_id: u64, job_id: u64) -> Result<(Vec<String>, String)> {
     let v = api(http, gl, "GET", &format!("/projects/{project_id}/jobs/{job_id}"), None).await?;
     Ok((v["tag_list"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect(), v["status"].as_str().unwrap_or_default().to_string()))

@@ -3196,6 +3196,8 @@ impl<'a> ControlPlane<'a> {
                     // cancelled, and the event never came).
                     let (mut gone, mut on_runner) = ((j.failed_fast || j.over) && j.for_job.is_none(), None);
                     if !gone && j.provider == "gitlab" {
+                        // GitLab has it on this machine's runner (the events that said so never came): as if told.
+                        if self.gitlab_settle(&key, &mut j, now).await { if j.state == "running" { active += 1 } continue }
                         gone = match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(p)) => gitlab::job(self.http, gl, p, wanted).await.is_ok_and(|(_, s)| s != "pending"), _ => false };
                     } else if !gone {
                         if let (Some(app), Some(t)) = (self.app_of(&j), self.installation_token_for(&j).await) {
@@ -3403,6 +3405,12 @@ impl<'a> ControlPlane<'a> {
                     on
                 }
             };
+            // The jobs it has machines for, as GitLab has them now (their events may not have come either).
+            for (key, v) in self.store.list("job:gl").await.unwrap_or_default() {
+                let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
+                if j.gitlab != gl.id || !active(&j) { continue }
+                let _ = self.gitlab_settle(&key, &mut j, now).await;
+            }
             for (project, path) in projects {
                 let Ok(waiting) = gitlab::pending_jobs(self.http, gl, project).await else { continue };
                 for job in waiting {
@@ -3417,6 +3425,36 @@ impl<'a> ControlPlane<'a> {
                 }
             }
         }
+    }
+
+    /// A GitLab job its machine's runner took, as GitLab has it now: begun (and what it runs for, kept with its runner
+    /// for the cache there), or over. Whether it changed anything (GitLab's own events would have said so).
+    async fn gitlab_settle(&self, key: &str, j: &mut Job, now: u64) -> bool {
+        let (Some(gl), Some(project), Some(runner)) = (self.gitlab_of(j), j.project_id, j.runner_id) else { return false };
+        let Ok(v) = gitlab::job_json(self.http, gl, project, j.job_id).await else { return false };
+        if v["runner"]["id"].as_u64() != Some(runner) { return false }
+        let status = v["status"].as_str().unwrap_or_default();
+        let mut changed = false;
+        if !j.seen_in_progress && status != "pending" {
+            (j.seen_in_progress, j.state) = (true, "running".into());
+            j.started_ms.get_or_insert(now);
+            let at = format!("glrunner:{}", gitlab::local(&gl.id, runner));
+            if let Ok(Some(mut r)) = get_json::<serde_json::Value>(self.store, &at).await {
+                if r["running"].is_null() {
+                    r["running"] = serde_json::json!({ "job": j.job_id, "project_id": project, "project": j.repo, "ref": v["ref"], "tag": v["tag"], "default_branch": null });
+                    let _ = put_json(self.store, &at, &r).await;
+                }
+            }
+            changed = true;
+        }
+        if let Some(state) = match status { "success" => Some("done"), "failed" => Some("failed"), "canceled" => Some("cancelled"), _ => None } {
+            j.state = state.into();
+            j.ended_ms.get_or_insert(now);
+            if gitlab::delete_runner(self.http, gl, runner).await.is_ok() { let _ = self.store.delete(&format!("glrunner:{}", gitlab::local(&gl.id, runner))).await; }
+            changed = true;
+        }
+        if changed { let _ = self.keep(key, &*j).await; }
+        changed
     }
 
     /// A webhook that failed while the runtime restarted (a secret changed, a new version) would leave its job waiting
@@ -3466,7 +3504,18 @@ impl<'a> ControlPlane<'a> {
     async fn machine_access(&self, machine: &cache::Machine) -> Result<cache::Access> {
         // A GitLab machine: the job its runner took, as GitLab said when it began (none yet: nothing to write).
         if let Some(local) = machine.runner.strip_prefix("gl:") {
-            let runner = get_json::<serde_json::Value>(self.store, &format!("glrunner:{local}")).await?.ok_or("its runner is not kept")?;
+            let at = format!("glrunner:{local}");
+            let mut runner = get_json::<serde_json::Value>(self.store, &at).await?.ok_or("its runner is not kept")?;
+            // GitLab's word of the job it took has not come (or not yet): GitLab is asked which job the runner runs.
+            if runner["running"].is_null() {
+                let id = runner["id"].as_u64().unwrap_or_default();
+                if let Some(gl) = self.gitlab_by(runner["gitlab"].as_str().unwrap_or_default()) {
+                    if let Ok(Some(job)) = gitlab::runner_job(self.http, gl, id).await {
+                        runner["running"] = serde_json::json!({ "job": job["id"], "project_id": job["project"]["id"], "project": job["project"]["path_with_namespace"], "ref": job["ref"], "tag": job["tag"], "default_branch": job["project"]["default_branch"] });
+                        put_json(self.store, &at, &runner).await?;
+                    }
+                }
+            }
             let r = &runner["running"];
             let (Some(project), Some(git_ref)) = (r["project_id"].as_u64(), r["ref"].as_str()) else { return Err("its job has not begun".into()) };
             let connection = runner["gitlab"].as_str().unwrap_or_default();

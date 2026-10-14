@@ -3712,3 +3712,61 @@ fn a_job_started_after_a_sweep_gets_the_control_planes_own_links() {
     let script = String::from_utf8(STANDARD.decode(field(&launches(&http.clouds).pop().unwrap(), "UserData")).unwrap()).unwrap();
     assert!(script.contains(&format!("c='{PLANE_URL}/cache/")) && script.contains(&format!("{PLANE_URL}/hello?runner=")), "{script}");
 }
+
+#[test]
+fn a_gitlab_job_whose_events_never_come_is_seen_running_and_over_by_asking_gitlab() {
+    let status = std::rc::Rc::new(std::cell::RefCell::new("pending"));
+    let now = status.clone();
+    let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+        let json = |v: serde_json::Value| Some(Response::new(200, "application/json", v.to_string()));
+        match r.url.as_str() {
+            "https://gitlab.example/api/v4/projects/380/jobs/1977" => json(serde_json::json!({ "id": 1977, "status": *now.borrow(), "tag_list": ["superci/cpu=2"], "ref": "feature", "tag": false,
+                "runner": if *now.borrow() == "pending" { serde_json::Value::Null } else { serde_json::json!({ "id": 55 }) } })),
+            u if u.starts_with("https://gitlab.example/api/v4/projects?membership=true") => json(serde_json::json!([])),
+            _ => None,
+        }
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let job = || serde_json::from_str::<serde_json::Value>(&store.0.borrow()["job:gl1977"]).unwrap();
+    block_on(plane.handle(gitlab_event(1977, "pending", "hook-secret-0123456789")));
+    assert_eq!(job()["state"], "launched");
+    // GitLab's runner took it and GitLab sent no word of it: the next look at GitLab sees it running, and its branch is
+    // kept with its runner (for the cache on its machine).
+    *status.borrow_mut() = "running";
+    store.0.borrow_mut().remove("gitlab:untold");
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((job()["state"].as_str(), job()["seen_in_progress"].as_bool()), (Some("running"), Some(true)));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&store.0.borrow()["glrunner:55"]).unwrap()["running"]["ref"], "feature");
+    // Over: so it is said, and its runner removed.
+    *status.borrow_mut() = "success";
+    store.0.borrow_mut().remove("gitlab:untold");
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(job()["state"], "done");
+    assert!(!store.0.borrow().contains_key("glrunner:55"));
+}
+
+#[test]
+fn a_gitlab_machine_whose_jobs_event_never_came_learns_its_job_by_asking_gitlab() {
+    let program = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/{}", superci_core::cache::program_key("x86_64"));
+    let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+        if r.method == "HEAD" && r.url == program { return Some(Response::new(200, "application/octet-stream", "")) }
+        (r.url == "https://gitlab.example/api/v4/runners/55/jobs?status=running&per_page=1").then(|| Response::new(200, "application/json",
+            serde_json::json!([{ "id": 1977, "ref": "feature", "tag": false, "project": { "id": 380, "path_with_namespace": "acme/app", "default_branch": "main" } }]).to_string()))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    run(gitlab_event(1977, "pending", "hook-secret-0123456789"));
+    let script = user_data_of(&launches(&clouds.0)[0]);
+    let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let r = run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/tool-begin")).with_body(serde_json::json!({ "tool": "gitlab", "hash": "gl/project/380/k/cache.zip" }).to_string()));
+    assert_eq!(r.status, 200, "{}", r.body_text());
+    assert!(store.0.borrow().keys().any(|k| k.ends_with(":refs/heads/feature:gitlab:gl/project/380/k/cache.zip")));
+}
