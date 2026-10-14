@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.18.2 — unreleased
+- A run from a computer with a working tree of many MB failed before it started: the tree went into the control plane's DynamoDB table, which writes only so much a second, and DynamoDB refused it ("ThrottlingException"). The tree now goes into the control plane's bucket in one piece, as a build service takes its source, and its machine fetches it from there; a tree may be 1 GB packed (150 MB before). A control plane with no bucket takes it as before.
+- The control plane on AWS asks DynamoDB again when it says it is too busy, waiting a little longer each time, as AWS's own tools do, rather than fail at once.
+
 ## 0.18.1 — 2026-10-14
 - What a run from a computer's jobs keep with `upload-artifact` can be fetched to the computer: `superci artifacts list --run=ID` names them, `superci artifacts retrieve NAME --run=ID [--out=DIR]` unpacks one, as `download-artifact` would. With a key that only reads too.
 - A key for coding agents has no limits of its own: its jobs keep to the control plane's, as every job does (the largest machine, what may be spent in a month and a day). `superci keys create agent --runs` takes no `--max-cpu` or `--daily-usd`; a key made by 0.18.0 is no longer taken, so make it again.

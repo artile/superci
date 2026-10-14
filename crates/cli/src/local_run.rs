@@ -16,8 +16,10 @@ type Result<T> = std::result::Result<T, String>;
 
 /// A part of the tree is at most this much (the control plane takes a request of a few MB).
 const PART: usize = 3_000_000;
-/// The tree, packed, is at most this much.
+/// The tree, packed, is at most this much when it goes through the control plane's store, and when it goes to its
+/// bucket.
 const MOST: usize = 150_000_000;
+const MOST_IN_BUCKET: usize = 1_000_000_000;
 /// The first control plane that runs a workflow from a computer and keeps its artifacts.
 pub const SINCE: &str = "0.18.0";
 
@@ -73,11 +75,26 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         serde_json::from_slice(&res.body).map_err(|e| format!("the control plane's answer: {e}"))
     };
     let packed = pack(&root)?;
-    if packed.len() > MOST { return Err(format!("The working tree is {} MB packed; a run from a computer takes {} MB at most.", packed.len() / 1_000_000, MOST / 1_000_000)) }
     let tree = format!("tree-{}", superci_core::crypto::random_token(18));
-    let parts = packed.chunks(PART).count() as u32;
-    say(&format!("Sending the working tree ({} KB packed, {parts} part{})", packed.len().div_ceil(1000), if parts == 1 { "" } else { "s" }));
-    for (i, part) in packed.chunks(PART).enumerate() { call("POST", &format!("/runs/tree?id={tree}&part={i}"), part.to_vec())?; }
+    // Into the control plane's bucket, in one, when it has one (as a build service takes its source); else through
+    // the control plane, in parts (it takes a request of a few MB).
+    let link = call("POST", &format!("/runs/tree?id={tree}&part=0&link=1"), vec![])?["url"].as_str().map(str::to_string);
+    let most = if link.is_some() { MOST_IN_BUCKET } else { MOST };
+    if packed.len() > most { return Err(format!("The working tree is {} MB packed; a run from a computer takes {} MB at most.", packed.len() / 1_000_000, most / 1_000_000)) }
+    let parts = match &link {
+        Some(link) => {
+            say(&format!("Sending the working tree ({} KB packed)", packed.len().div_ceil(1000)));
+            let res = block_on(http.send(Request::new("PUT", link).with_body(packed.clone())))?;
+            if res.status >= 300 { return Err(format!("the bucket said {} to the working tree: {}", res.status, res.body_text().trim())) }
+            1
+        }
+        None => {
+            let parts = packed.chunks(PART).count() as u32;
+            say(&format!("Sending the working tree ({} KB packed, {parts} part{})", packed.len().div_ceil(1000), if parts == 1 { "" } else { "s" }));
+            for (i, part) in packed.chunks(PART).enumerate() { call("POST", &format!("/runs/tree?id={tree}&part={i}"), part.to_vec())?; }
+            parts
+        }
+    };
     let reference = git(&root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_else(|_| "refs/heads/main".into());
     let body = json!({ "workflow": text, "path": path, "job": job, "repository": repository(&root), "ref": reference, "sha": git(&root, &["rev-parse", "HEAD"]).unwrap_or_default(),
         "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts });

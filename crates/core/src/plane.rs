@@ -946,7 +946,7 @@ impl<'a> ControlPlane<'a> {
                 Ok(Response::json(&serde_json::json!({ "kept": kept })))
             }
             // Runs from a computer: the working tree in parts, a run, how it goes; and its runner's calls.
-            ("POST", "/runs/tree") if self.dashboard(&req) || self.run_key(&req).is_some() => self.tree_part(&url, &req).await,
+            ("POST", "/runs/tree") if self.dashboard(&req) || self.run_key(&req).is_some() => self.tree_part(&url, &req, &plane_url).await,
             ("POST", "/runs") if self.dashboard(&req) => self.create_run(&req, &plane_url, None).await,
             ("POST", "/runs") if self.run_key(&req).is_some() => { let k = self.run_key(&req); self.create_run(&req, &plane_url, k).await }
             ("GET", p) if p.starts_with("/runs/") && p.ends_with("/artifacts") && self.reader(&req) => self.run_artifacts(p, &url, &plane_url).await,
@@ -2687,16 +2687,54 @@ impl<'a> ControlPlane<'a> {
         true
     }
 
-    /// A part of the working tree a run from a computer is started with (a gzipped tar, cut in parts of a few MB):
-    /// kept in pieces the store takes (`rtree:<tree>:<part>:<piece>`), for its checkout to fetch (`for_runner`).
-    async fn tree_part(&self, url: &url::Url, req: &Request) -> Result<Response> {
+    /// A part of the working tree a run from a computer is started with (a gzipped tar, cut in parts of a few MB),
+    /// for its checkout to fetch (`for_runner`). With `link`: a link to put it in the control plane's bucket, where
+    /// there is one (`rtree-s3:<tree>:<part>` says where), so a tree of many MB never goes through the store (a
+    /// DynamoDB table writes only so much a second); else (`url` null), or without `link`, it is kept in pieces the
+    /// store takes (`rtree:<tree>:<part>:<piece>`).
+    async fn tree_part(&self, url: &url::Url, req: &Request, plane_url: &str) -> Result<Response> {
         let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
         let id = q.get("id").filter(|i| (16..=64).contains(&i.len()) && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
         let (Some(id), Some(part)) = (id, q.get("part").and_then(|p| p.parse::<u32>().ok()).filter(|p| *p < 1000)) else { return Ok(Response::text(400, "say which tree (id) and which part")) };
+        if q.contains_key("link") {
+            let now = self.clock.now_ms();
+            let Some((region, creds)) = self.tree_bucket(plane_url, now).await? else { return Ok(Response::json(&serde_json::json!({ "url": null }))) };
+            let link = aws::presign("PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &tree_object(id, part)), &creds, &region, cache::LINK_SECONDS, now)?;
+            self.store.put(&format!("rtree-s3:{id}:{part:05}"), region).await?;
+            let _ = self.store.put_if_absent(&format!("rtree-at:{id}"), now.to_string()).await;
+            return Ok(Response::json(&serde_json::json!({ "url": link })))
+        }
         if req.body.len() > 5_000_000 { return Ok(Response::text(413, "a part is 5 MB at most")) }
         for (i, piece) in req.body.chunks(300_000).enumerate() { self.store.put(&format!("rtree:{id}:{part:05}:{i:03}"), crate::crypto::b64(piece)).await? }
         let _ = self.store.put_if_absent(&format!("rtree-at:{id}"), self.clock.now_ms().to_string()).await;
         Ok(Response::json(&serde_json::json!({ "stored": req.body.len() })))
+    }
+
+    /// The bucket a working tree goes to: the first of the AWS regions whose bucket is ready, with the sign-in to it.
+    async fn tree_bucket(&self, plane_url: &str, now: u64) -> Result<Option<(String, Credentials)>> {
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(None) };
+        let creds = self.aws_creds(plane_url, &a).await?;
+        for region in self.aws_regions(&a) {
+            if self.cache_ready(&region, "x86_64", &creds, now).await { return Ok(Some((region, creds))) }
+        }
+        Ok(None)
+    }
+
+    /// A run's working tree, gone: its pieces in the store, and its parts in the bucket.
+    async fn forget_tree(&self, plane_url: &str, tree: &str) -> Result<()> {
+        for (k, _) in self.store.list(&format!("rtree:{tree}:")).await? { self.store.delete(&k).await? }
+        let in_bucket = self.store.list(&format!("rtree-s3:{tree}:")).await?;
+        if !in_bucket.is_empty() {
+            let now = self.clock.now_ms();
+            let creds = match self.aws_connection().await?.filter(|a| a.connected) { Some(a) => Some(self.aws_creds(plane_url, &a).await?), None => None };
+            for (k, region) in in_bucket {
+                let (region, part) = (region.trim_matches('"').to_string(), k.rsplit(':').next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0));
+                if let Some(creds) = &creds { let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &tree_object(tree, part)), &region, creds, vec![], &[], now).await; }
+                self.store.delete(&k).await?;
+            }
+        }
+        self.store.delete(&format!("rtree-at:{tree}")).await?;
+        Ok(())
     }
 
     /// A run from a computer: a workflow file's jobs, run as GitHub would run them, each on a machine as any job of
@@ -2839,10 +2877,7 @@ impl<'a> ControlPlane<'a> {
             if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
             for i in start { self.start_instance(plane_url, run_id, &run, &jobs[i], &secrets, &wf).await? }
             // (All over: its working tree goes now, not after a day.)
-            if let Some(tree) = run["tree"].as_str().filter(|_| jobs.iter().all(|j| j["state"] == "done")) {
-                for (k, _) in self.store.list(&format!("rtree:{tree}:")).await? { self.store.delete(&k).await? }
-                self.store.delete(&format!("rtree-at:{tree}")).await?;
-            }
+            if let Some(tree) = run["tree"].as_str().filter(|_| jobs.iter().all(|j| j["state"] == "done")) { self.forget_tree(plane_url, tree).await? }
             return Ok(())
         }
         Err("the run kept changing while it was moved on".into())
@@ -2990,6 +3025,14 @@ impl<'a> ControlPlane<'a> {
         if sub == "superci/tree" {
             let part = url.query_pairs().find(|(k, _)| k == "part").and_then(|(_, v)| v.parse::<u32>().ok()).unwrap_or(0);
             let Some(tree) = &before.tree else { return Ok(nothing_here()) };
+            // (In the bucket: a link there, for a while.)
+            if let Some(region) = self.store.get(&format!("rtree-s3:{tree}:{part:05}")).await? {
+                let (region, now) = (region.trim_matches('"').to_string(), self.clock.now_ms());
+                let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(Response::text(409, "this control plane has no AWS account")) };
+                let creds = self.aws_creds(plane_url, &a).await?;
+                let link = aws::presign("GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &tree_object(tree, part)), &creds, &region, cache::LINK_SECONDS, now)?;
+                return Ok(Response::new(302, "text/plain", Vec::new()).with_header("location", &link))
+            }
             let mut bytes = vec![];
             for (_, piece) in self.store.list(&format!("rtree:{tree}:{part:05}:")).await? {
                 use base64::Engine;
@@ -3332,9 +3375,7 @@ impl<'a> ControlPlane<'a> {
         }
         for (k, at) in self.store.list("rtree-at:").await? {
             if at.trim_matches('"').parse::<u64>().is_ok_and(|at| now.saturating_sub(at) < 86_400_000) { continue }
-            let tree = k.trim_start_matches("rtree-at:");
-            for (k, _) in self.store.list(&format!("rtree:{tree}:")).await? { self.store.delete(&k).await? }
-            self.store.delete(&k).await?;
+            self.forget_tree(&plane_url, k.trim_start_matches("rtree-at:")).await?;
         }
         // The cache: what goes (over a repository's limit, unused for a week, never finished), once an hour.
         if let Err(e) = self.sweep_cache(&plane_url, now).await { let _ = self.store.put("cache-sweep-error", e).await; }
@@ -3809,3 +3850,6 @@ fn local_id(now: u64) -> u64 {
     let r = crate::crypto::random_bytes(4);
     (1u64 << 62) + now * 1_000_000 + u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as u64 % 1_000_000
 }
+
+/// Where a part of a run's working tree is kept in the bucket.
+fn tree_object(tree: &str, part: u32) -> String { format!("runs/{tree}/{part:05}") }

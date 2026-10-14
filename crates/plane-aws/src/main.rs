@@ -41,11 +41,28 @@ fn own_credentials() -> Credentials {
     Credentials { access_key_id: var("AWS_ACCESS_KEY_ID"), secret_access_key: var("AWS_SECRET_ACCESS_KEY"), session_token: std::env::var("AWS_SESSION_TOKEN").ok(), expires_at_ms: u64::MAX }
 }
 
+/// What DynamoDB says when a call may be made again: too much at once, or a passing fault of its own.
+const AGAIN: [&str; 6] = ["ThrottlingException", "ProvisionedThroughputExceededException", "RequestLimitExceeded", "InternalServerError", "ServiceUnavailable", "HTTP 5"];
+
 /// State in one DynamoDB table: partition "s", sort key = the store's key, attribute v = its value.
 struct Dynamo<'a> { http: &'a Blocking, table: String, region: String }
 
 impl Dynamo<'_> {
+    /// One call, asked again when DynamoDB says to (throttled, or a passing error of its own), as AWS's own SDKs do:
+    /// up to ten times, each wait twice the last at most (from 50 ms to 5 s), a random part of it.
     async fn call(&self, op: &str, body: Value) -> io::Result<Value> {
+        let mut most_ms = 50u64;
+        for _ in 0..9 {
+            match aws::json_call(self.http, "POST", &format!("https://dynamodb.{}.amazonaws.com/", self.region), &self.region, "dynamodb", Some(&format!("DynamoDB_20120810.{op}")),
+                "application/x-amz-json-1.0", Some(&body), &own_credentials(), now_ms()).await {
+                Err(e) if AGAIN.iter().any(|kind| e.starts_with(kind)) => {
+                    let r = superci_core::crypto::random_bytes(2);
+                    std::thread::sleep(std::time::Duration::from_millis(u16::from_le_bytes([r[0], r[1]]) as u64 % most_ms + 1));
+                    most_ms = (most_ms * 2).min(5000);
+                }
+                done => return done,
+            }
+        }
         aws::json_call(self.http, "POST", &format!("https://dynamodb.{}.amazonaws.com/", self.region), &self.region, "dynamodb", Some(&format!("DynamoDB_20120810.{op}")),
             "application/x-amz-json-1.0", Some(&body), &own_credentials(), now_ms()).await
     }

@@ -18,7 +18,7 @@ name = "superci"
 path = "src/main.rs"
 
 [dependencies]
-superci-core = { path = "../core", version = "=0.18.1" }
+superci-core = { path = "../core", version = "=0.18.2" }
 url.workspace = true
 miniz_oxide = "0.9"
 ureq = { version = "3", features = ["json"] }

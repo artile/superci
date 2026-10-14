@@ -3777,3 +3777,45 @@ fn a_gitlab_machine_whose_jobs_event_never_came_learns_its_job_by_asking_gitlab(
     assert_eq!(r.status, 200, "{}", r.body_text());
     assert!(store.0.borrow().keys().any(|k| k.ends_with(":refs/heads/feature:gitlab:gl/project/380/k/cache.zip")));
 }
+
+#[test]
+fn a_working_tree_goes_to_the_control_planes_bucket_in_one_and_its_checkout_is_sent_there() {
+    let program = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/{}", superci_core::cache::program_key("x86_64"));
+    let ready = std::rc::Rc::new(std::cell::Cell::new(true));
+    let is_ready = ready.clone();
+    let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+        (r.method == "HEAD" && r.url == program).then(|| Response::new(if is_ready.get() { 200 } else { 404 }, "application/octet-stream", ""))
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r.with_header("authorization", "Bearer dashboard-session-key-1")));
+    // A link to put the whole tree in the bucket: nothing of it goes through the store.
+    let linked = json(&run(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id=tree-0123456789abcdef&part=0&link=1"))));
+    let link = linked["url"].as_str().unwrap();
+    assert!(link.starts_with(&format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/runs/tree-0123456789abcdef/00000?")) && link.contains("X-Amz-Signature"), "{link}");
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("rtree:")));
+    let body = serde_json::json!({ "workflow": "jobs:\n  test:\n    runs-on: superci\n    steps:\n      - uses: actions/checkout@v4\n", "path": ".github/workflows/ci.yml", "repository": "acme/app",
+        "tree": "tree-0123456789abcdef", "parts": 1 }).to_string();
+    let made = run(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(body));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    // Its checkout fetches it from there, through a link of its own.
+    let launched = launches(&clouds.0);
+    let script = String::from_utf8(STANDARD.decode(field(&launched[0], "UserData")).unwrap()).unwrap();
+    let jit = script.split("--jitconfig ").nth(1).unwrap().split_whitespace().next().unwrap();
+    let all: serde_json::Value = serde_json::from_slice(&STANDARD.decode(jit).unwrap()).unwrap();
+    let server = serde_json::from_slice::<serde_json::Value>(&STANDARD.decode(all[".runner"].as_str().unwrap()).unwrap()).unwrap()["ServerUrl"].as_str().unwrap().to_string();
+    let fetched = block_on(plane.handle(Request::new("GET", &format!("{server}/superci/tree?part=0"))));
+    assert_eq!(fetched.status, 302);
+    let to = fetched.header("location").unwrap();
+    assert!(to.contains("/runs/tree-0123456789abcdef/00000?") && to.contains("X-Amz-Signature"), "{to}");
+    // With no bucket ready, the tree goes through the control plane as before.
+    ready.set(false);
+    let cache2 = Cache::default();
+    let plane2 = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache2, containers: None };
+    let none = block_on(plane2.handle(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id=tree-fedcba9876543210&part=0&link=1")).with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert!(json(&none)["url"].is_null());
+}

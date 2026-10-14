@@ -157,7 +157,7 @@ pub fn checkout_action(tree: &str, parts: u32) -> String {
     const INPUTS: [&str; 20] = ["repository", "ref", "token", "ssh-key", "ssh-known-hosts", "ssh-strict", "ssh-user", "persist-credentials", "path", "clean", "filter", "sparse-checkout",
         "sparse-checkout-cone-mode", "fetch-depth", "fetch-tags", "show-progress", "lfs", "submodules", "set-safe-directory", "github-server-url"];
     let inputs: String = INPUTS.iter().map(|i| format!("  {i}:\n    required: false\n    default: ''\n")).collect();
-    let fetch = if parts == 0 { "true".to_string() } else { format!("for part in $(seq 0 {}); do curl -fsS --retry 3 \"{tree}?part=$part\"; done | tar -xz", parts - 1) };
+    let fetch = if parts == 0 { "true".to_string() } else { format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\"; done | tar -xz", parts - 1) };
     format!(r#"name: Check out (SuperCI)
 description: The working tree a run from a computer was started with, in place of a checkout from GitHub.
 inputs:
@@ -363,7 +363,7 @@ mod tests {
         let ok = std::process::Command::new("tar").args(["xzf", "a.tar.gz", "--strip-components", "1"]).current_dir(&dir).status().unwrap().success();
         let action = std::fs::read_to_string(dir.join("action.yml")).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(ok && action.contains("using: composite") && action.contains("for part in $(seq 0 2); do curl -fsS --retry 3 \"https://plane.example/runner/abc/superci/tree?part=$part\"") && action.contains("  fetch-depth:\n    required: false"), "{action}");
+        assert!(ok && action.contains("using: composite") && action.contains("for part in $(seq 0 2); do curl -fsSL --retry 3 \"https://plane.example/runner/abc/superci/tree?part=$part\"") && action.contains("  fetch-depth:\n    required: false"), "{action}");
         assert!(action.contains("SUPERCI_PATH: ${{ inputs.path }}"));
     }
 }
