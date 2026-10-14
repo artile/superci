@@ -277,6 +277,11 @@ fn main() {
         // What was left for after the answer (a queued job's machine: GitHub has its answer, and AWS is asked now).
         // The function runs on until it asks for its next request, and takes no other meanwhile.
         let url = request(&event).url;
-        for what in later.take() { if let Err(e) = block_on(plane.later(&url, &what)) { eprintln!("superci: {what}: {e}") } }
+        // (One thing done may leave another: each in its turn, until none is left.)
+        loop {
+            let next = { let mut left = later.borrow_mut(); if left.is_empty() { None } else { Some(left.remove(0)) } };
+            let Some(what) = next else { break };
+            if let Err(e) = block_on(plane.later(&url, &what)) { eprintln!("superci: {what}: {e}") }
+        }
     }
 }

@@ -2778,9 +2778,9 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
     let pool = |n: usize| (f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.InstanceType")), f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.SubnetId")), f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.Priority")));
     assert_eq!((pool(1), pool(6), pool(17), pool(18)), (("c8a.16xlarge".to_string(), "subnet-b".to_string(), "1".to_string()), ("m8a.16xlarge".to_string(), "subnet-a".to_string(), "6".to_string()),
         ("r8a.16xlarge".to_string(), "subnet-f".to_string(), "17".to_string()), (String::new(), String::new(), String::new())), "every other pool, in the order they would have been asked");
-    // The template is removed once AWS has answered.
-    assert_eq!(calls_of(&clouds, "DeleteLaunchTemplate").iter().map(|c| field(c, "LaunchTemplateName")).collect::<Vec<_>>(), [name]);
-    assert_eq!(told.template_left, None);
+    // The template's one use is over: left to whoever asked to remove, when that is in nobody's way.
+    assert!(calls_of(&clouds, "DeleteLaunchTemplate").is_empty());
+    assert_eq!(told.template_left, Some(name));
     // What is kept of it: the one asked by itself, then the request for the seventeen.
     assert_eq!(told.asked.iter().map(|a| (a.0.as_str(), a.1.as_str(), a.2.as_str(), a.4)).collect::<Vec<_>>(), [("c8a.16xlarge", "us-east-1a", "InsufficientInstanceCapacity", 0), ("c8a.16xlarge", "us-east-1b", "started", 17)]);
 
@@ -2788,7 +2788,7 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
     // now in ten, and a zone that does not offer the type (asked no more for a day).
     let (machine, told, clouds) = ask(&["g6.xlarge", "g5.xlarge"], FLEET_NONE, true);
     assert_eq!(machine, Err("InsufficientInstanceCapacity: AWS had no spot machine in any of 11 pools".to_string()));
-    assert_eq!((launches(&clouds).len(), calls_of(&clouds, "CreateFleet").len(), calls_of(&clouds, "DeleteLaunchTemplate").len()), (1, 1, 1));
+    assert_eq!((launches(&clouds).len(), calls_of(&clouds, "CreateFleet").len()), (1, 1));
     let said = |word: &str| told.refused.iter().filter(|(_, _, w)| w == word).count();
     assert_eq!((said("InsufficientInstanceCapacity"), said("Unsupported")), (1 + 10, 2), "{:?}", told.refused);
     assert!(told.refused.iter().filter(|(_, _, w)| w == "Unsupported").all(|(_, zone, _)| zone == "us-east-1e") && told.refused.iter().all(|(kind, zone, _)| !kind.is_empty() && zone.starts_with("us-east-1")), "{:?}", told.refused);
@@ -2821,7 +2821,7 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
     let fleets = calls_of(&clouds.0, "CreateFleet");
     let kinds = |f: &Vec<(String, String)>| { let mut k: Vec<String> = f.iter().filter(|(n, _)| n.ends_with(".InstanceType")).map(|(_, v)| v.clone()).collect(); k.sort(); k.dedup(); (k, f.iter().filter(|(n, _)| n.ends_with(".InstanceType")).count()) };
     assert_eq!((fleets.len(), kinds(&fleets[0]), kinds(&fleets[1])), (2, (vec!["m8a.8xlarge".to_string(), "r8a.8xlarge".to_string()], 11), (vec!["m7a.8xlarge".to_string(), "r7a.8xlarge".to_string()], 12)));
-    assert_eq!((calls_of(&clouds.0, "CreateLaunchTemplate").len(), calls_of(&clouds.0, "DeleteLaunchTemplate").len(), launches(&clouds.0).len()), (1, 1, 1));
+    assert_eq!((calls_of(&clouds.0, "CreateLaunchTemplate").len(), launches(&clouds.0).len(), told.template_left.is_some()), (1, 1, true));
     assert_eq!(told.asked.iter().map(|a| (a.0.as_str(), a.2.as_str(), a.4)).collect::<Vec<_>>(), [("m8a.8xlarge", "InsufficientInstanceCapacity", 0), ("", "InsufficientInstanceCapacity", 11), ("r7a.8xlarge", "started", 12)]);
 
     // Where the pools may not be asked in one request, or few are left, they are asked one by one, as before.
@@ -2858,6 +2858,10 @@ fn a_job_gets_its_spot_machine_from_one_request_for_every_other_pool_and_a_role_
     let j = job(&store, 7);
     assert_eq!((j["state"].as_str(), j["machine_id"].as_str(), j["machine_type"].as_str(), j["zone"].as_str(), j.get("on_demand")), (Some("launched"), Some("i-0123456789abcdef0"), Some("c8a.16xlarge"), Some("us-east-1b"), None), "{j}");
     assert_eq!((launches(&clouds.0).len(), calls_of(&clouds.0, "CreateFleet").len()), (1, 1));
+    // The launch template made for that request is removed (here at once: this runtime cannot go on after it has
+    // answered), and nothing is left noted for a sweep.
+    assert_eq!(calls_of(&clouds.0, "DeleteLaunchTemplate").iter().map(|c| field(c, "LaunchTemplateName")).collect::<Vec<_>>(), [format!("superci-{PLANE_ID}-7-1790000000000")]);
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("aws:template:")));
     // Its start says so: the first choice had none; AWS chose among the seventeen others.
     let asks: Vec<(&str, &str, &str, u64)> = j["asks"].as_array().unwrap().iter().map(|a| (a["kind"].as_str().unwrap(), a["zone"].as_str().unwrap_or_default(), a["said"].as_str().unwrap(), a["pools"].as_u64().unwrap_or(0))).collect();
     assert_eq!(asks, [("c8a.16xlarge", "us-east-1a", "InsufficientInstanceCapacity", 0), ("c8a.16xlarge", "us-east-1b", "started", 17)]);
@@ -2908,6 +2912,14 @@ fn a_queued_job_is_answered_at_once_and_its_machine_asked_for_after() {
     // The same left twice (or a job a sweep has taken up meanwhile) starts nothing more.
     block_on(plane.later(&address, &what[0])).unwrap();
     assert_eq!(launches(&clouds).len(), 1);
+
+    // What the start itself leaves for later is done in its turn: a launch template made for a request for many
+    // spot pools is removed after the job has its machine, and the note of it with it.
+    store.0.borrow_mut().insert("aws:template:us-east-1:superci-abc123def456-7-1".into(), "1790000000000".into());
+    block_on(plane.later(&address, "template us-east-1 superci-abc123def456-7-1")).unwrap();
+    assert!(clouds.calls.borrow().iter().any(|c| c.2.contains("Action=DeleteLaunchTemplate") && c.2.contains("LaunchTemplateName=superci-abc123def456-7-1")));
+    // (AWS here knows no such template and says an error this fake has no answer for: the note stays, for a sweep.)
+    assert!(store.0.borrow().contains_key("aws:template:us-east-1:superci-abc123def456-7-1"));
 
     // Cancelled between the answer and the asking: no machine is asked for at all.
     block_on(plane.handle(job_event("queued", 8, "acme/app", None)));

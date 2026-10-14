@@ -242,7 +242,8 @@ pub struct Told { pub refused: Vec<(String, String, String)>, pub throttled: u32
     /// Why many pools could not be asked in one request (the role may not, or AWS refused the request itself): they
     /// were asked one by one.
     pub fleet_refused: Option<String>,
-    /// A launch template that could not be removed after its one use: removed later (see `fleet`).
+    /// The launch template made for a request for many pools (see `fleet`), its one use over: to be removed by
+    /// whoever asked (`delete_template`), once that is in nobody's way.
     pub template_left: Option<String> }
 
 /// The lowest current spot price (USD per hour) for a machine type in a region, across its zones.
@@ -386,7 +387,7 @@ pub const FLEET_MOST: usize = 100;
 /// zone), best first, and the next group when none of a group has one: an "instant fleet", which answers in about three seconds whatever the number of pools, where asking
 /// them one by one takes most of a second each. AWS chooses the pool with the most spare machines (so the one least
 /// likely to be taken back), and among those alike the earliest here. A fleet takes what a machine is from a launch
-/// template and not from the request, so one is made for this one use (the start-up script is the job's own) and
+/// template and not from the request, so one is made for this one use (the start-up script is the job's own), to be
 /// removed once AWS has answered.
 ///
 /// Its machine; or AWS's word for none (as `RunInstances` says it), with what was said of each pool in `told.refused`;
@@ -442,8 +443,14 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
         // A machine, or the account's limit (no other pool would answer otherwise), or no answer at all: no more is asked.
         if !matches!(&answer, Ok(Err(e)) if e.starts_with("InsufficientInstanceCapacity")) { break }
     }
-    if ec2(http, l.region, creds, "DeleteLaunchTemplate", serde_json::json!({ "LaunchTemplateName": name }), now_ms).await.is_err() { told.template_left = Some(name) }
+    // (The template has done its one use: whoever asked removes it, when that is in nobody's way. See `Told::template_left`.)
+    told.template_left = Some(name);
     answer
+}
+
+/// Removes a launch template made for one request (see `fleet`). One that is no longer there is removed.
+pub async fn delete_template(http: &dyn Http, region: &str, creds: &Credentials, name: &str, now_ms: u64) -> Result<()> {
+    match ec2(http, region, creds, "DeleteLaunchTemplate", serde_json::json!({ "LaunchTemplateName": name }), now_ms).await { Ok(_) => Ok(()), Err(e) if e.contains("NotFound") => Ok(()), Err(e) => Err(e) }
 }
 
 /// What an instant fleet answered: its machine, or what it said of each pool (kept in `told.refused` in

@@ -309,8 +309,8 @@ fn unwritten(rev: &std::cell::Cell<u64>) -> bool { rev.get() == 0 }
 /// for ten minutes they are asked one by one without trying.
 const NO_FLEET_KEY: &str = "aws:no-fleet";
 
-/// Where a launch template that could not be removed after its one use is noted (`aws:template:<region>:<name>`),
-/// for a sweep to remove.
+/// Where a launch template made for one request is noted until it is removed (`aws:template:<region>:<name>`): one
+/// still noted later was not, and a sweep removes it.
 fn template_key(region: &str, name: &str) -> String { format!("aws:template:{region}:{name}") }
 
 /// One request to AWS for a job's machine: when (ms after the control plane heard of the job), for which machine type
@@ -1901,10 +1901,21 @@ impl<'a> ControlPlane<'a> {
         self.start(plane_url, job).await
     }
 
+    /// Removes a launch template made for one request, and the note of it (kept when AWS did not remove it: a sweep
+    /// tries again).
+    async fn remove_template(&self, creds: &Credentials, region: &str, name: &str) {
+        if aws::delete_template(self.http, region, creds, name, self.clock.now_ms()).await.is_ok() { let _ = self.store.delete(&template_key(region, name)).await; }
+    }
+
     /// What was left for after an answer (see `Timer::later`), given back by the runtime with the address the
     /// request came to. A job to start: only as it was left, claimed and nothing of a machine yet (one cancelled
     /// meanwhile gets none, see `gone_key`; one taken up by a sweep is that sweep's).
     pub async fn later(&self, url: &str, what: &str) -> Result<()> {
+        // A launch template whose one use is over (see `aws::fleet`).
+        if let Some((region, name)) = what.strip_prefix("template ").and_then(|t| t.split_once(' ')) {
+            if let Some(a) = self.aws_connection().await? { let creds = self.aws_creds(&origin(url), &a).await?; self.remove_template(&creds, region, name).await }
+            return Ok(())
+        }
         let Some(key) = what.strip_prefix("start ") else { return Ok(()) };
         let Some(mut job) = get_json::<Job>(self.store, key).await? else { return Ok(()) };
         if job.state != "launching" || job.machine_id.is_some() || job.runner.is_some() { return Ok(()) }
@@ -2054,7 +2065,14 @@ impl<'a> ControlPlane<'a> {
                                 let _ = self.store.put(NO_FLEET_KEY, now.to_string()).await;
                                 self.note_permission::<()>("aws", "AskSpotPoolsAtOnce", &Err(e)).await;
                             } else if fleet && told.asked.iter().any(|a| a.4 > 0) { self.note_permission("aws", "AskSpotPoolsAtOnce", &Ok(())).await }
-                            if let Some(name) = told.template_left.take() { let _ = self.store.put(&template_key(region, &name), now.to_string()).await; }
+                            // The launch template of a request for many pools is removed: after the request at hand
+                            // is answered where the runtime can do that (it is in the way of nothing, and the job's
+                            // machine is the sooner known), else now. Noted first, so that one not removed for any
+                            // reason is removed by a sweep.
+                            if let Some(name) = told.template_left.take() {
+                                let _ = self.store.put(&template_key(region, &name), now.to_string()).await;
+                                if !self.timer.later(&format!("template {region} {name}")) { self.remove_template(&creds, region, &name).await }
+                            }
                             // Each request and its answer is kept with the job (the last two dozen).
                             let mut at = self.clock.now_ms().saturating_sub(job.at_ms).saturating_sub(told.asked.iter().map(|a| a.3).sum());
                             for (kind, zone, said, ms, pools) in told.asked.drain(..) { job.asks.push(Ask { at, kind, zone, spot: !on_demand, said, ms, pools }); at += ms }
@@ -2851,8 +2869,10 @@ impl<'a> ControlPlane<'a> {
         for (k, at) in self.store.list("aws:template:").await? {
             let mut parts = k.trim_start_matches("aws:template:").splitn(2, ':');
             let (Some(region), Some(name)) = (parts.next(), parts.next()) else { continue };
-            let removed = match self.aws_connection().await { Ok(Some(a)) => match self.aws_creds(&plane_url, &a).await { Ok(c) => aws::ec2(self.http, region, &c, "DeleteLaunchTemplate", serde_json::json!({ "LaunchTemplateName": name }), now).await.map(|_| ()), Err(e) => Err(e) }, _ => Err("no AWS".into()) };
-            if removed.as_ref().is_ok_and(|_| true) || removed.as_ref().is_err_and(|e| e.contains("NotFound")) || at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > 86_400_000) { self.store.delete(&k).await? }
+            // (Not one of a moment ago: its removal may be on its way.)
+            if at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) < 30_000) { continue }
+            let removed = match self.aws_connection().await { Ok(Some(a)) => match self.aws_creds(&plane_url, &a).await { Ok(c) => aws::delete_template(self.http, region, &c, name, now).await, Err(e) => Err(e) }, _ => Err("no AWS".into()) };
+            if removed.is_ok() || at.parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > 86_400_000) { self.store.delete(&k).await? }
         }
         self.redeliver_failed().await;
         let moved_lately = self.untold(&plane_url, now).await;
