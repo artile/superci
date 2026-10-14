@@ -172,6 +172,8 @@ impl Config {
 /// What a runtime keeps between requests while it is alive (credentials, tokens, the image id).
 #[derive(Default)]
 pub struct Cache {
+    /// Whether the jobs' indexes are complete (once they are, they stay so).
+    indexed: std::cell::Cell<bool>,
     installed: RefCell<Option<(bool, u64)>>,
     creds: RefCell<Option<Credentials>>,
     tokens: RefCell<HashMap<u64, (String, u64)>>,
@@ -316,6 +318,9 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub repo_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub default_branch: Option<String>,
+    /// What of its cost its day's totals (`Day`) hold: none until it is over, then its cost as counted, so a cost
+    /// settled later adds only the difference. Written with the job itself, so it is counted once.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub counted_usd: Option<f64>,
 }
 
 fn unwritten(rev: &std::cell::Cell<u64>) -> bool { rev.get() == 0 }
@@ -395,6 +400,66 @@ pub fn image_address(s: &str) -> Option<String> {
 }
 
 pub fn job_key(j: &Job) -> String { if j.provider == "gitlab" { format!("job:gl{}", gitlab::local(&j.gitlab, j.job_id)) } else { format!("job:{}", j.job_id) } }
+
+/// How long a job's record is kept once it is over (the dashboard's history; spend and usage are kept by the day).
+pub const JOB_KEPT_MS: u64 = 90 * 86_400_000;
+/// How long a job stays among the live ones once nothing more is done for it (machines counted against an account's
+/// limits a little longer than they run).
+const LIVE_AFTER_MS: u64 = 30 * 60_000;
+/// Where it is said that the jobs' indexes are complete.
+const INDEXED: &str = "indexed";
+/// How long a day's totals are kept.
+const DAY_KEPT_MS: u64 = 400 * 86_400_000;
+
+/// Whether a job is over: no machine of its may still be coming or running, and it waits for nothing.
+pub fn over(j: &Job) -> bool { !["waiting", "launching", "launched", "running", "orphan", "pending"].contains(&j.state.as_str()) }
+
+/// Whether the sweep still has something to do for a job: one not over; one to be run again, or whose failure is
+/// still to be said; an AWS machine whose sent data is still to be added to its cost; a job of GitHub's that ended
+/// before any runner took it (its machine may still be coming); or one that ended a moment ago.
+pub fn needs_care(j: &Job, now: u64) -> bool {
+    let ended = j.ended_ms.unwrap_or(j.at_ms);
+    !over(j) || j.rerun.as_ref().is_some_and(|r| r.state == "pending") || j.fail_pending.is_some()
+        || (j.cloud == "aws" && j.cost_from.is_some() && j.sent_gb.is_none() && now < ended + 2 * 86_400_000)
+        || (!(j.began || j.over || j.failed_fast) && now.saturating_sub(j.at_ms) < 86_400_000)
+        || now < ended + LIVE_AFTER_MS
+}
+
+/// A day's totals (UTC), from the jobs queued in it: what each place's machines cost (see `place_of`), and its hours.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct Day { #[serde(default)] pub spend: std::collections::BTreeMap<String, f64>, #[serde(default)] pub hours: Vec<Hour> }
+
+/// An hour of a day's jobs: how many were queued, ran and did not run; their machines' time and the minutes the code
+/// host bills (each job rounded up); what they cost and what the code host's runners would have; each one's wait.
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+pub struct Hour {
+    #[serde(default)] pub jobs: u64, #[serde(default)] pub ran: u64, #[serde(default)] pub not_ran: u64, #[serde(default)] pub ms: u64,
+    #[serde(default)] pub billed: u64, #[serde(default)] pub usd: f64, #[serde(default)] pub host_usd: f64, #[serde(default)] pub waits: Vec<u64>,
+}
+
+impl Hour {
+    fn add(&mut self, o: &Hour) {
+        (self.jobs, self.ran, self.not_ran, self.ms, self.billed) = (self.jobs + o.jobs, self.ran + o.ran, self.not_ran + o.not_ran, self.ms + o.ms, self.billed + o.billed);
+        (self.usd, self.host_usd) = (self.usd + o.usd, self.host_usd + o.host_usd);
+        self.waits.extend_from_slice(&o.waits);
+    }
+}
+
+/// Where a day's totals are kept: by the day's number since the epoch, so they sort by time.
+pub fn day_key(day: u64) -> String { format!("day:{day:06}") }
+
+/// What one job adds to its hour (the hour it was queued in, counted from the epoch), as it stands at `now`.
+pub fn hour_of(j: &Job, host_price: f64, now: u64) -> (u64, Hour) {
+    let mut h = Hour { jobs: 1, usd: job_usd(j, now), ..Default::default() };
+    if ["failed", "orphan", "swept"].contains(&j.state.as_str()) && j.started_ms.is_none() { h.not_ran = 1 }
+    if let Some(start) = j.started_ms {
+        let took = j.ended_ms.unwrap_or(if active(j) { now } else { start }).saturating_sub(start);
+        let minutes = took.div_ceil(60_000).max(1);
+        (h.ran, h.ms, h.billed, h.host_usd) = (1, took, minutes, minutes as f64 * host_price);
+        h.waits.push(start.saturating_sub(j.queued_ms.unwrap_or(j.at_ms)));
+    }
+    (j.at_ms / 3_600_000, h)
+}
 
 /// Published prices, per hour, for the machines other clouds started before jobs were sized (jobs recorded without a
 /// price): a Cloudflare container of 2 vCPU, 8 GiB, 16 GB (CPU counted as fully busy, so an upper bound) and a Modal
@@ -697,44 +762,35 @@ pub fn gitlab_usd_per_minute(cpu: u32) -> f64 {
 pub const USAGE_PERIODS: [(&str, u64, usize); 3] = [("day", 3_600_000, 24), ("week", 86_400_000, 7), ("month", 86_400_000, 30)];
 
 /// What jobs used in a period up to now, and what the code host's own runners would have charged for them: how many
-/// were queued, ran and did not run, their machines' minutes and GitHub's billed minutes (each job rounded up to a
-/// whole minute, as GitHub and GitLab bill), what they cost and what the code host would have, how long they waited
-/// for a machine; and the same for each hour or day of it, the oldest first.
-pub fn usage(jobs: &[Job], host_price: impl Fn(&Job) -> f64, now: u64, step_ms: u64, steps: usize) -> serde_json::Value {
-    let since = now.saturating_sub(step_ms * steps as u64);
-    let mut buckets = vec![(0u64, 0u64, 0f64, 0f64, 0f64, Vec::<u64>::new()); steps];
-    let (mut queued, mut ran, mut not_ran, mut machine_ms, mut billed, mut cost, mut host) = (0u64, 0u64, 0u64, 0u64, 0u64, 0f64, 0f64);
-    let mut waits = vec![];
-    for j in jobs.iter().filter(|j| j.at_ms >= since && j.at_ms <= now) {
-        let b = &mut buckets[(((j.at_ms - since) / step_ms) as usize).min(steps - 1)];
-        queued += 1;
-        let usd = job_usd(j, now);
-        cost += usd;
-        b.3 += usd;
-        if ["failed", "orphan", "swept"].contains(&j.state.as_str()) && j.started_ms.is_none() { not_ran += 1; b.1 += 1 }
-        let Some(start) = j.started_ms else { continue };
-        ran += 1;
-        b.0 += 1;
-        let took = j.ended_ms.unwrap_or(if active(j) { now } else { start }).saturating_sub(start);
-        machine_ms += took;
-        let minutes = took.div_ceil(60_000).max(1);
-        billed += minutes;
-        let theirs = minutes as f64 * host_price(j);
-        host += theirs;
-        b.2 += took as f64 / 60_000.0;
-        b.4 += theirs;
-        let wait = start.saturating_sub(j.queued_ms.unwrap_or(j.at_ms));
-        waits.push(wait);
-        b.5.push(wait);
+/// were queued, ran and did not run, their machines' minutes and the billed minutes (each job rounded up to a whole
+/// minute, as GitHub and GitLab bill), what they cost and what the code host would have, how long they waited for a
+/// machine; and the same for each hour or day of it, the oldest first. From each hour's totals (by the hour since
+/// the epoch, see `hour_of`).
+pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms: u64, steps: usize) -> serde_json::Value {
+    let (first, last) = ((now.saturating_sub(step_ms * steps as u64)) / 3_600_000 + 1, now / 3_600_000);
+    let mut buckets = vec![Hour::default(); steps];
+    let mut all = Hour::default();
+    for (hour, h) in hours.range(first..=last) {
+        let i = ((hour - first) * 3_600_000 / step_ms) as usize;
+        buckets[i.min(steps - 1)].add(h);
+        all.add(h);
     }
-    waits.sort_unstable();
     let median = |w: &mut Vec<u64>| { w.sort_unstable(); w.get(w.len() / 2).copied() };
+    let mut waits = all.waits.clone();
+    waits.sort_unstable();
     serde_json::json!({
-        "since_ms": since, "step_ms": step_ms, "jobs": queued, "ran": ran, "not_ran": not_ran,
-        "machine_minutes": (machine_ms as f64 / 60_000.0 * 10.0).round() / 10.0, "billed_minutes": billed, "usd": cost, "host_usd": host,
+        "since_ms": first * 3_600_000, "step_ms": step_ms, "jobs": all.jobs, "ran": all.ran, "not_ran": all.not_ran,
+        "machine_minutes": (all.ms as f64 / 60_000.0 * 10.0).round() / 10.0, "billed_minutes": all.billed, "usd": all.usd, "host_usd": all.host_usd,
         "wait_median_ms": waits.get(waits.len() / 2), "wait_fastest_ms": waits.first(), "wait_slowest_ms": waits.last(),
-        "steps": buckets.iter_mut().map(|(r, n, m, c, h, w)| serde_json::json!({ "ran": r, "not_ran": n, "minutes": (*m * 10.0).round() / 10.0, "usd": c, "host_usd": h, "wait_median_ms": median(w) })).collect::<Vec<_>>(),
+        "steps": buckets.iter_mut().map(|h| serde_json::json!({ "ran": h.ran, "not_ran": h.not_ran, "minutes": (h.ms as f64 / 60_000.0 * 10.0).round() / 10.0, "usd": h.usd, "host_usd": h.host_usd, "wait_median_ms": median(&mut h.waits) })).collect::<Vec<_>>(),
     })
+}
+
+/// The same from the jobs themselves.
+pub fn usage(jobs: &[Job], host_price: impl Fn(&Job) -> f64, now: u64, step_ms: u64, steps: usize) -> serde_json::Value {
+    let mut hours: std::collections::BTreeMap<u64, Hour> = std::collections::BTreeMap::new();
+    for j in jobs.iter().filter(|j| j.at_ms <= now) { let (hour, h) = hour_of(j, host_price(j), now); hours.entry(hour).or_default().add(&h) }
+    usage_of(&hours, now, step_ms, steps)
 }
 
 /// What a cloud's machines can be (the clouds this control plane starts machines in).
@@ -1094,7 +1150,15 @@ impl<'a> ControlPlane<'a> {
         for pair in body["state"].as_array().into_iter().flatten() {
             let (Some(k), Some(v)) = (pair[0].as_str(), pair[1].as_str()) else { continue };
             if !(k.starts_with("glrunner:") || k.starts_with("job:")) { continue }
-            if self.store.put_if_absent(k, v.to_string()).await? { taken += 1 }
+            // A job comes with its indexes and counted in its day's totals here (its count there is not this one's).
+            let job = k.starts_with("job:").then(|| serde_json::from_str::<Job>(v).ok()).flatten();
+            let Some(mut j) = job else { if self.store.put_if_absent(k, v.to_string()).await? { taken += 1 } continue };
+            j.counted_usd = None;
+            let add = self.counting(&mut j);
+            if self.store.swap_until(k, None, serde_json::to_string(&j).map_err(|e| e.to_string())?, Self::job_end(&j, self.clock.now_ms())).await? {
+                self.indexes(k, &j, true, add).await?;
+                taken += 1;
+            }
         }
         // Not in use until the switch (`claim`).
         self.store.put("standby", "1".into()).await?;
@@ -1212,17 +1276,20 @@ impl<'a> ControlPlane<'a> {
         }
         let mut gitlabs = vec![];
         for gl in self.config.gitlabs() { gitlabs.push(serde_json::json!({ "id": gl.id, "url": gl.url, "scopes": self.gitlab_scopes(gl).await })) }
-        let mut jobs_all: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
-        jobs_all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
-        let jobs: Vec<Job> = jobs_all.iter().take(50).cloned().collect();
+        // The newest fifty jobs; the ones still going; what this month and today cost.
+        let jobs = self.newest_jobs(50).await?;
+        let live: Vec<Job> = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect();
+        let (month_spend, day_spend) = self.spend().await?;
         // What jobs used over a day, a week and 30 days, beside what the code host's runners would have charged.
         let now = self.clock.now_ms();
-        let usage: serde_json::Map<String, serde_json::Value> = USAGE_PERIODS.iter().map(|(name, step, steps)| (name.to_string(), usage(&jobs_all, |j| self.host_price(j), now, *step, *steps))).collect();
+        let (hours, _) = self.hours(31).await?;
+        let usage: serde_json::Map<String, serde_json::Value> = USAGE_PERIODS.iter().map(|(name, step, steps)| (name.to_string(), usage_of(&hours, now, *step, *steps))).collect();
         // Each with what its machine said of its own start, where one did (kept apart: see `MachineStart`).
-        let hellos: HashMap<String, serde_json::Value> = self.store.list("hello:").await.unwrap_or_default().into_iter().filter_map(|(k, v)| Some((k.strip_prefix("hello:")?.to_string(), serde_json::from_str(&v).ok()?))).collect();
-        let with_machines: Vec<serde_json::Value> = jobs.iter().map(|j| {
+        let hello_keys: Vec<String> = jobs.iter().map(|j| format!("hello:{}", job_key(j).trim_start_matches("job:"))).collect();
+        let hellos: Vec<Option<serde_json::Value>> = self.store.get_many(&hello_keys).await.unwrap_or_default().into_iter().map(|v| v.and_then(|v| serde_json::from_str(&v).ok())).collect();
+        let with_machines: Vec<serde_json::Value> = jobs.iter().enumerate().map(|(i, j)| {
             let mut v = serde_json::to_value(j).unwrap_or_default();
-            if let Some(m) = hellos.get(job_key(j).trim_start_matches("job:")) { v["machine"] = m.clone() }
+            if let Some(Some(m)) = hellos.get(i) { v["machine"] = m.clone() }
             // (Its link is the machine's alone.)
             if let Some(o) = v.as_object_mut() { o.remove("hello"); }
             v
@@ -1250,15 +1317,15 @@ impl<'a> ControlPlane<'a> {
                 k
             }).collect::<Vec<_>>()) } else { serde_json::Value::Null },
             "machine": self.config.machine,
-            "spend": self.month_spend(&jobs_all).await,
+            "spend": month_spend,
             // (It keeps the CI's and a cloud account's limit for the month: one from before would drop them unsaid.)
             "account_limits": true,
             // (And for a day; and what the AWS account's own budget does.)
             "daily_limits": true,
-            "spend_today": self.day_spend(&jobs_all),
+            "spend_today": day_spend,
             "aws_budget_stopped_ms": self.store.get(BUDGET_STOPPED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()),
             // Machines up now in each cloud, over every job (`jobs` is the newest fifty).
-            "active": jobs_all.iter().filter(|j| active(j) && !j.cloud.is_empty()).fold(HashMap::<String, u32>::new(), |mut m, j| { *m.entry(place_of(j).to_string()).or_default() += 1; m }),
+            "active": live.iter().filter(|j| active(j) && !j.cloud.is_empty()).fold(HashMap::<String, u32>::new(), |mut m, j| { *m.entry(place_of(j).to_string()).or_default() += 1; m }),
             // What the clouds and code hosts allow it (see permissions.rs): what the App asks for (each installation's
             // accepted permissions are in `installations`), the GitLab token's scopes, and permissions refused lately.
             "permissions": {
@@ -1330,32 +1397,6 @@ impl<'a> ControlPlane<'a> {
             Ok(_) => { if self.store.get(&key).await.ok().flatten().is_some() { let _ = self.store.delete(&key).await; } }
             Err(_) => {}
         }
-    }
-
-    /// Spend this month per place in the order (USD, estimated), for the order's limits and the dashboard.
-    async fn month_spend(&self, jobs: &[Job]) -> HashMap<String, f64> {
-        let now = self.clock.now_ms();
-        let since = month_start_ms(now);
-        let mut spend = HashMap::new();
-        for j in jobs.iter().filter(|j| j.at_ms >= since) { *spend.entry(place_of(j).to_string()).or_insert(0.0) += job_usd(j, now) }
-        spend
-    }
-
-    /// Whether AWS refused a machine by the rule its budget puts on this control plane's role: the refusal names
-    /// that rule, or (AWS does not always name the policy) it is an explicit deny of the role's own policies while
-    /// such a budget is on.
-    fn stopped_by_budget(&self, e: &str) -> bool {
-        e.contains(&aws::stop_policy_name(&self.config.plane_id))
-            || (self.config.routing.aws_budget.as_ref().is_some_and(|b| b.stop) && e.contains("explicit deny") && aws::refusal(e).is_some_and(|r| r.by == aws::By::Identity))
-    }
-
-    /// Spend today (UTC) per place in the order, as `month_spend` counts a month.
-    fn day_spend(&self, jobs: &[Job]) -> HashMap<String, f64> {
-        let now = self.clock.now_ms();
-        let since = day_start_ms(now);
-        let mut spend = HashMap::new();
-        for j in jobs.iter().filter(|j| j.at_ms >= since) { *spend.entry(place_of(j).to_string()).or_insert(0.0) += job_usd(j, now) }
-        spend
     }
 
     /// A job whose machine never began it: its runner registration is withdrawn and it is placed again (elsewhere, or
@@ -1503,6 +1544,7 @@ impl<'a> ControlPlane<'a> {
                     provider: "gitlab".into(), gitlab: gl.id.clone(), project_id: Some(ev.project_id), tags: tags.clone(), name: ev.name.clone(), workflow: ev.stage.clone(), ..Default::default() };
                 // Claimed once, however many deliveries arrive.
                 if !self.store.put_if_absent(&key, serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(Response::text(200, "known")) }
+                self.indexes(&key, &job, true, None).await?;
                 // Run again after AWS took its spot machine back: not on a spot machine this time.
                 let again = rerun_key(&project, ev.pipeline_id, &ev.name);
                 if self.store.get(&again).await?.is_some() {
@@ -1728,7 +1770,7 @@ impl<'a> ControlPlane<'a> {
             }
             // The other jobs of this run that wait to be run again: GitHub takes one request per attempt, so they
             // are asked for together (the run's failed jobs). Each is asked for once, whoever gets here first.
-            let others: Vec<Rerun> = self.store.list("job:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter_map(|o| o.rerun)
+            let others: Vec<Rerun> = self.live_jobs().await.unwrap_or_default().into_iter().filter_map(|(_, o)| o.rerun)
                 .filter(|o| o.state == "pending" && o.repo == r.repo && o.run_id == r.run_id && o.job_id != r.job_id).collect();
             let claim = |id: u64| format!("rerun-asked:{id}");
             match self.store.put_if_absent(&claim(r.job_id), now.to_string()).await { Ok(true) => {} Ok(false) => return Some("asked".into()), Err(_) => return None }
@@ -1755,13 +1797,13 @@ impl<'a> ControlPlane<'a> {
     /// ago (AWS counts a machine against the account's limits a little longer than it runs).
     async fn aws_machines_up(&self, job_id: u64) -> (usize, usize) {
         let now = self.clock.now_ms();
-        let jobs: Vec<Job> = self.store.list("job:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
+        let jobs: Vec<Job> = self.live_jobs().await.unwrap_or_default().into_iter().map(|(_, j)| j).collect();
         let theirs = |j: &&Job| j.job_id != job_id && j.cloud == "aws" && j.machine_id.is_some();
         (jobs.iter().filter(theirs).filter(|j| active(j)).count(), jobs.iter().filter(theirs).filter(|j| !active(j) && j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000)).count())
     }
 
     async fn gpu_machines_up(&self, job_id: u64) -> bool {
-        let jobs: Vec<Job> = self.store.list("job:").await.unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
+        let jobs: Vec<Job> = self.live_jobs().await.unwrap_or_default().into_iter().map(|(_, j)| j).collect();
         jobs.iter().any(|j| j.job_id != job_id && j.cloud == "aws" && active(j) && self.config.parse(&j.label).and_then(|s| s.ok()).is_some_and(|s| s.gpu.is_some()))
     }
 
@@ -1815,15 +1857,14 @@ impl<'a> ControlPlane<'a> {
             else if let Some(d) = &routing.default { let v = named(d); if v.is_empty() { vec![d.clone()] } else { v } }
             else { connected };
         if candidates.is_empty() { return Ok(Placement::Fail(format!("no cloud connected for jobs: connect one in the {} dashboard", self.config.name()))) }
-        let jobs: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
-        let spend = self.month_spend(&jobs).await;
+        let (spend, today) = self.spend().await?;
+        let jobs: Vec<Job> = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect();
         // The whole CI's limit for the month: at it nothing is started, wherever.
         if let Some(cap) = routing.monthly_usd {
             let spent: f64 = spend.values().sum();
             if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of {} a month (${spent:.2} spent on machines): no job starts until next month, or until the limit is raised (Runners in the dashboard, or `superci limits update --monthly-usd=N`)", self.config.name(), dollars(cap)))) }
         }
         // And for the day.
-        let today = self.day_spend(&jobs);
         if let Some(cap) = routing.daily_usd {
             let spent: f64 = today.values().sum();
             if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of {} a day (${spent:.2} spent on machines today): no job starts until tomorrow (UTC), or until the limit is raised (Runners in the dashboard, or `superci limits update --daily-usd=N`)", self.config.name(), dollars(cap)))) }
@@ -1963,7 +2004,7 @@ impl<'a> ControlPlane<'a> {
             repo_id: ev.repo_id, branch: ev.branch.clone(), default_branch: ev.default_branch.clone(), ..Default::default() };
         // Claimed once, however many deliveries of the event arrive at once. A claim that never got past launching (the
         // runtime restarted mid-way) is taken over by a later delivery.
-        if !self.store.put_if_absent(&key, serde_json::to_string(&job).map_err(|e| e.to_string())?).await? {
+        if self.store.put_if_absent(&key, serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { self.indexes(&key, &job, true, None).await? } else {
             let stuck = get_json::<Job>(self.store, &key).await?.is_some_and(|j| j.state == "launching" && job.at_ms.saturating_sub(j.at_ms) > 90_000);
             if !stuck { return Ok(()); }
             self.keep(&key, &job).await?;
@@ -2009,12 +2050,171 @@ impl<'a> ControlPlane<'a> {
     /// the record knows nothing of, is ended with its runner (a job cancelled while its machine was asked for).
     /// Changed and not ended: what only ever becomes true is kept from it (a runner took the job, the job began,
     /// how it ended, AWS's notice), the rest is this copy's.
+    /// Whether the jobs' indexes are complete: `live:` (the jobs the sweep still cares for), `recent:` (every job by
+    /// when it was queued) and `day:` (each day's totals), built once from the jobs kept before them (`reindex`).
+    /// Until then what reads them reads every job instead.
+    async fn indexed(&self) -> bool {
+        if self.cache.indexed.get() { return true }
+        let done = self.store.get(INDEXED).await.ok().flatten().is_some();
+        self.cache.indexed.set(done);
+        done
+    }
+
+    /// The jobs the sweep still cares for (see `needs_care`), each with its key, as they are kept now.
+    async fn live_jobs(&self) -> Result<Vec<(String, Job)>> {
+        let now = self.clock.now_ms();
+        if !self.indexed().await {
+            return Ok(self.store.list("job:").await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).filter(|(_, j)| needs_care(j, now)).collect())
+        }
+        // (The jobs themselves, read at once: an index says only which.)
+        let keys: Vec<String> = self.store.list("live:").await?.into_iter().filter_map(|(k, _)| Some(format!("job:{}", k.strip_prefix("live:")?))).collect();
+        Ok(keys.iter().cloned().zip(self.store.get_many(&keys).await?).filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v?).ok()?))).collect())
+    }
+
+    /// The newest `n` jobs, the newest first.
+    async fn newest_jobs(&self, n: usize) -> Result<Vec<Job>> {
+        if !self.indexed().await {
+            let mut all: Vec<Job> = self.store.list("job:").await?.into_iter().filter_map(|(_, v)| serde_json::from_str(&v).ok()).collect();
+            all.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+            all.truncate(n);
+            return Ok(all)
+        }
+        let keys: Vec<String> = self.store.list_last("recent:", n).await?.into_iter().rev().filter_map(|(k, _)| Some(format!("job:{}", k.splitn(3, ':').nth(2)?))).collect();
+        Ok(self.store.get_many(&keys).await?.into_iter().flatten().filter_map(|v| serde_json::from_str(&v).ok()).collect())
+    }
+
+    /// Each hour's totals over the last `days` days and today, from each day's (jobs still going counted as they
+    /// stand now), by the hour since the epoch; and each day's spend by place.
+    async fn hours(&self, days: u64) -> Result<(std::collections::BTreeMap<u64, Hour>, std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>)> {
+        let now = self.clock.now_ms();
+        let today = now / 86_400_000;
+        let (mut hours, mut spend) = (std::collections::BTreeMap::new(), std::collections::BTreeMap::<u64, std::collections::BTreeMap<String, f64>>::new());
+        let add = |j: &Job, hours: &mut std::collections::BTreeMap<u64, Hour>, spend: &mut std::collections::BTreeMap<u64, std::collections::BTreeMap<String, f64>>| {
+            let (hour, h) = hour_of(j, self.host_price(j), now);
+            *spend.entry(j.at_ms / 86_400_000).or_default().entry(place_of(j).to_string()).or_insert(0.0) += h.usd;
+            hours.entry(hour).or_insert_with(Hour::default).add(&h);
+        };
+        if !self.indexed().await {
+            let since = (today - days) * 86_400_000;
+            for (_, v) in self.store.list("job:").await? { if let Ok(j) = serde_json::from_str::<Job>(&v) { if j.at_ms >= since { add(&j, &mut hours, &mut spend) } } }
+            return Ok((hours, spend))
+        }
+        let keys: Vec<String> = (today - days..=today).map(day_key).collect();
+        for (day, v) in (today - days..=today).zip(self.store.get_many(&keys).await?) {
+            let Some(d) = v.and_then(|v| serde_json::from_str::<Day>(&v).ok()) else { continue };
+            for (i, h) in d.hours.iter().enumerate() { if h.jobs > 0 || h.usd != 0.0 { hours.entry(day * 24 + i as u64).or_insert_with(Hour::default).add(h) } }
+            let s = spend.entry(day).or_default();
+            for (place, usd) in d.spend { *s.entry(place).or_insert(0.0) += usd }
+        }
+        for (_, j) in self.live_jobs().await? { if j.counted_usd.is_none() && j.at_ms >= (today - days) * 86_400_000 { add(&j, &mut hours, &mut spend) } }
+        Ok((hours, spend))
+    }
+
+    /// What machines cost this month and today, by place (see `place_of`).
+    async fn spend(&self) -> Result<(HashMap<String, f64>, HashMap<String, f64>)> {
+        let now = self.clock.now_ms();
+        let (month_day, today) = (month_start_ms(now) / 86_400_000, now / 86_400_000);
+        let (_, spend) = self.hours(today - month_day).await?;
+        let (mut month, mut day) = (HashMap::new(), HashMap::new());
+        for (d, by) in spend {
+            for (place, usd) in by {
+                if d >= month_day { *month.entry(place.clone()).or_insert(0.0) += usd }
+                if d == today { *day.entry(place).or_insert(0.0) += usd }
+            }
+        }
+        Ok((month, day))
+    }
+
+    /// Whether AWS refused a machine by the rule its budget puts on this control plane's role: the refusal names
+    /// that rule, or (AWS does not always name the policy) it is an explicit deny of the role's own policies while
+    /// such a budget is on.
+    fn stopped_by_budget(&self, e: &str) -> bool {
+        e.contains(&aws::stop_policy_name(&self.config.plane_id))
+            || (self.config.routing.aws_budget.as_ref().is_some_and(|b| b.stop) && e.contains("explicit deny") && aws::refusal(e).is_some_and(|r| r.by == aws::By::Identity))
+    }
+
+    /// Adds what a job's cost changed by (all of it when it is first counted) to its day's totals.
+    async fn count(&self, j: &Job, h: &Hour) -> Result<()> {
+        let (day, hour) = (j.at_ms / 86_400_000, (j.at_ms % 86_400_000 / 3_600_000) as usize);
+        let key = day_key(day);
+        for _ in 0..8 {
+            let was = self.store.get(&key).await?;
+            let mut d: Day = was.as_deref().and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+            d.hours.resize(24, Hour::default());
+            d.hours[hour].add(h);
+            *d.spend.entry(place_of(j).to_string()).or_insert(0.0) += h.usd;
+            if self.store.swap_until(&key, was.as_deref(), serde_json::to_string(&d).map_err(|e| e.to_string())?, Some((day + 1) * 86_400_000 + DAY_KEPT_MS)).await? { return Ok(()) }
+        }
+        Err(format!("{key} kept changing while it was written"))
+    }
+
+    /// What a job's record is to carry before it is written: what of its cost its day's totals will hold, and what to
+    /// add to them once it is written (all it adds, when it is first counted; what its cost changed by, after).
+    fn counting(&self, j: &mut Job) -> Option<Hour> {
+        if !over(j) { return None }
+        let now = self.clock.now_ms();
+        let (_, h) = hour_of(j, self.host_price(j), now);
+        let add = match j.counted_usd {
+            None => h.clone(),
+            Some(c) if (h.usd - c).abs() > 1e-9 => Hour { usd: h.usd - c, ..Default::default() },
+            Some(_) => return None,
+        };
+        j.counted_usd = Some(h.usd);
+        Some(add)
+    }
+
+    /// When a job's record goes: a while after it is over.
+    fn job_end(j: &Job, now: u64) -> Option<u64> { over(j).then(|| j.ended_ms.unwrap_or(now).max(j.at_ms) + JOB_KEPT_MS) }
+
+    /// A job's indexes, once its record is written: among the live ones while the sweep cares for it (and a little
+    /// after), among the recent ones from its first write, and its day's totals.
+    async fn indexes(&self, key: &str, j: &Job, new: bool, add: Option<Hour>) -> Result<()> {
+        let now = self.clock.now_ms();
+        let id = key.trim_start_matches("job:");
+        if needs_care(j, now) { self.store.put(&format!("live:{id}"), String::new()).await? }
+        else { self.store.put_until(&format!("live:{id}"), String::new(), now + LIVE_AFTER_MS).await? }
+        if new {
+            self.store.put_until(&format!("recent:{:013}:{id}", j.at_ms), String::new(), j.at_ms + JOB_KEPT_MS).await?;
+            // A repository's newest job of GitHub's, for the look for jobs GitHub never told of (two weeks of them).
+            if j.provider.is_empty() {
+                let at = format!("repo:{}", j.repo);
+                let newer = self.store.get(&at).await?.and_then(|v| serde_json::from_str::<Job>(&v).ok()).is_none_or(|kept| kept.at_ms <= j.at_ms);
+                if newer { self.store.put_until(&at, serde_json::to_string(j).map_err(|e| e.to_string())?, j.at_ms + 14 * 86_400_000).await? }
+            }
+        }
+        if let Some(h) = add { self.count(j, &h).await? }
+        Ok(())
+    }
+
+    /// Builds the jobs' indexes from the jobs kept before them, `budget` jobs at a time (where it got to is kept);
+    /// whether they are complete.
+    async fn reindex(&self, budget: usize) -> Result<bool> {
+        if self.indexed().await { return Ok(true) }
+        let now = self.clock.now_ms();
+        let after = self.store.get("reindex-at").await?.unwrap_or_default();
+        let mut done = 0;
+        for (key, v) in self.store.list("job:").await?.into_iter().filter(|(k, _)| *k > after) {
+            if done == budget { self.store.put("reindex-at", key).await?; return Ok(false) }
+            let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
+            let add = self.counting(&mut j);
+            if self.store.swap_until(&key, Some(&v), serde_json::to_string(&j).map_err(|e| e.to_string())?, Self::job_end(&j, now)).await? {
+                self.indexes(&key, &j, true, add).await?;
+            }
+            done += 1;
+        }
+        self.store.put(INDEXED, now.to_string()).await?;
+        self.store.delete("reindex-at").await?;
+        self.cache.indexed.set(true);
+        Ok(true)
+    }
+
     async fn keep(&self, key: &str, job: &Job) -> Result<()> {
         // (Written over exactly what was read, see `Store::swap`: changed in between, it is read and weighed again.)
         for _ in 0..4 {
             let was = self.store.get(key).await.ok().flatten();
             let kept = was.as_deref().and_then(|v| serde_json::from_str::<Job>(v).ok()).filter(|kept| kept.rev != job.rev);
-            let write = match kept {
+            let counted = was.as_deref().and_then(|v| serde_json::from_str::<Job>(v).ok()).and_then(|k| k.counted_usd);
+            let mut write = match kept {
                 None => { let fresh = job.clone(); fresh.rev.set(job.rev.get() + 1); fresh }
                 Some(kept) if kept.ended_ms.is_some() => {
                     if job.machine_id.is_some() && job.machine_id != kept.machine_id {
@@ -2035,8 +2235,12 @@ impl<'a> ControlPlane<'a> {
                     merged
                 }
             };
-            if self.store.swap(key, was.as_deref(), serde_json::to_string(&write).map_err(|e| e.to_string())?).await? {
+            // (What its day's totals hold is the kept record's, whoever read it before.)
+            write.counted_usd = counted;
+            let add = self.counting(&mut write);
+            if self.store.swap_until(key, was.as_deref(), serde_json::to_string(&write).map_err(|e| e.to_string())?, Self::job_end(&write, self.clock.now_ms())).await? {
                 job.rev.set(write.rev.get());
+                self.indexes(key, &write, was.is_none(), add).await?;
                 return Ok(())
             }
         }
@@ -3033,6 +3237,7 @@ impl<'a> ControlPlane<'a> {
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), ..Default::default() };
         if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(()) }
+        self.indexes(&job_key(&job), &job, true, None).await?;
         self.start_soon(plane_url, &mut job).await
     }
 
@@ -3223,7 +3428,9 @@ impl<'a> ControlPlane<'a> {
         }
         let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
         let (mut active, mut waiting) = (0, 0);
-        let kept = self.store.list("job:").await?;
+        // The jobs still cared for, once the indexes are built from the jobs kept before them (a batch at a time).
+        let _ = self.reindex(300).await;
+        let kept: Vec<(String, String)> = self.live_jobs().await?.into_iter().map(|(k, j)| (k, serde_json::to_string(&j).unwrap_or_default())).collect();
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
         let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);
@@ -3236,12 +3443,8 @@ impl<'a> ControlPlane<'a> {
         }
         for (key, v) in kept {
             let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
-            // History is kept two months (this month's spend and the last's).
-            if !["launching", "launched", "running", "waiting"].contains(&j.state.as_str()) && now.saturating_sub(j.ended_ms.unwrap_or(j.at_ms)) > 62 * 86_400_000 {
-                self.store.delete(&key).await?;
-                let _ = self.store.delete(&format!("hello:{}", key.trim_start_matches("job:"))).await;
-                continue;
-            }
+            // Nothing more to do for it (time has passed since it was written): no longer among the live ones.
+            if self.indexed().await && !needs_care(&j, now) { self.store.delete(&format!("live:{}", key.trim_start_matches("job:"))).await?; continue }
             // Waiting for room: try again (GitHub keeps a job queued for up to a day). As it stands now, not as it
             // was listed a moment ago: it may have been cancelled, or started by another request, since.
             if j.state == "waiting" {
@@ -3478,7 +3681,8 @@ impl<'a> ControlPlane<'a> {
         if self.config.app.is_none() { return moved_lately }
         if !moved_lately && get_json::<u64>(self.store, "untold_at").await.ok().flatten().is_some_and(|at| now.saturating_sub(at) < 5 * 60_000 - 5_000) { return false }
         let _ = put_json(self.store, "untold_at", &now).await;
-        let Ok(kept) = self.store.list("job:").await else { return moved_lately };
+        let kept = if self.indexed().await { self.store.list("repo:").await } else { self.store.list("job:").await };
+        let Ok(kept) = kept else { return moved_lately };
         let mut jobs: Vec<Job> = kept.into_iter().filter_map(|(_, v)| serde_json::from_str::<Job>(&v).ok()).filter(|j| j.provider.is_empty() && now.saturating_sub(j.at_ms) < 14 * 86_400_000).collect();
         jobs.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
         // The repositories that had a job in the last day (ten at most), and five of the quieter ones of the last
@@ -3526,9 +3730,8 @@ impl<'a> ControlPlane<'a> {
                 }
             };
             // The jobs it has machines for, as GitLab has them now (their events may not have come either).
-            for (key, v) in self.store.list("job:gl").await.unwrap_or_default() {
-                let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
-                if j.gitlab != gl.id || !active(&j) { continue }
+            for (key, mut j) in self.live_jobs().await.unwrap_or_default() {
+                if j.provider != "gitlab" || j.gitlab != gl.id || !active(&j) { continue }
                 let _ = self.gitlab_settle(&key, &mut j, now).await;
             }
             for (project, path) in projects {

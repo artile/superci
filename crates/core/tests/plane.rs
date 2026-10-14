@@ -913,6 +913,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     let store = Mem::default();
     store.0.borrow_mut().insert("job:50".into(), serde_json::json!({ "job_id": 50, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_996_400_000u64, "ended_ms": 1_790_000_000_000u64,
         "installation_id": 42, "cloud": "aws", "usd_per_hour": 2.0, "seen_in_progress": true }).to_string());
+    let cache = Cache::default();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(job_event("queued", 51, "acme/app", None)));
     assert_eq!((job(&store, 51)["state"].as_str(), job(&store, 51)["on_demand"].as_bool()), (Some("launched"), Some(true)), "{}", job(&store, 51));
@@ -3839,9 +3840,9 @@ fn usage_counts_every_job_of_a_period_its_minutes_and_what_the_code_host_would_h
     assert_eq!(day["machine_minutes"].as_f64(), Some(1.5));
     assert!((day["usd"].as_f64().unwrap() - 0.03).abs() < 1e-9 && (day["host_usd"].as_f64().unwrap() - (2.0 * 0.006 + 0.01)).abs() < 1e-9, "{day}");
     assert_eq!(day["wait_median_ms"].as_u64(), Some(10_000));
-    // By the hour, the oldest first (the last is the hour up to now; a job just an hour ago is in it).
+    // By the hour, the oldest first (the last is this hour: a job an hour ago is in the one before).
     let steps = day["steps"].as_array().unwrap();
-    assert_eq!((steps.len(), steps[23]["ran"].as_u64(), steps[19]["ran"].as_u64(), steps[22]["not_ran"].as_u64()), (24, Some(1), Some(1), Some(1)));
+    assert_eq!((steps.len(), steps[22]["ran"].as_u64(), steps[18]["ran"].as_u64(), steps[21]["not_ran"].as_u64()), (24, Some(1), Some(1), Some(1)));
     let week = usage(&jobs, price, now, 86_400_000, 7);
     assert_eq!((week["jobs"].as_u64(), week["billed_minutes"].as_u64(), week["steps"].as_array().unwrap().len()), (Some(4), Some(13), 7));
     assert_eq!(usage(&jobs, price, now, 86_400_000, 30)["jobs"].as_u64(), Some(4));
@@ -3865,4 +3866,49 @@ fn a_store_without_ends_of_its_own_removes_a_record_at_its_end_and_not_one_writt
     // The newest few, by key.
     for i in 0..5 { block_on(store.put(&format!("recent:{i:03}"), i.to_string())).unwrap() }
     assert_eq!(block_on(store.list_last("recent:", 2)).unwrap().iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["recent:003", "recent:004"]);
+}
+
+#[test]
+fn jobs_kept_before_their_indexes_are_indexed_once_and_each_job_is_counted_in_its_days_totals_once() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(t));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let seed = |id: u64, state: &str, at: u64, took_s: Option<u64>, usd: Option<f64>| serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "label": "superci", "app_id": 99, "state": state, "at_ms": at, "installation_id": 42,
+        "cloud": "aws", "usd_per_hour": 1.0, "seen_in_progress": true, "began": true, "launched_ms": at, "started_ms": at + 10_000, "runner": format!("superci-{PLANE_ID}-{id}"),
+        "ended_ms": took_s.map(|s| at + 10_000 + s * 1000), "cost_usd": usd });
+    // Kept before the indexes: two over today, one three days ago, one still running.
+    for (id, j) in [(1, seed(1, "done", t - 2 * 3_600_000, Some(60), Some(0.10))), (2, seed(2, "done", t - 3_600_000, Some(30), Some(0.05))),
+        (3, seed(3, "done", t - 3 * 86_400_000, Some(600), Some(0.20))), (4, seed(4, "running", t - 600_000, None, None))] {
+        store.0.borrow_mut().insert(format!("job:{id}"), j.to_string());
+        store.0.borrow_mut().insert(format!("runner:superci-{PLANE_ID}-{id}"), id.to_string());
+    }
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let status = || json(&block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/status")).with_header("authorization", "Bearer dashboard-session-key-1"))));
+    let before = status();
+    block_on(plane.alarm()).unwrap();
+    assert!(store.0.borrow().contains_key("indexed"));
+    let keys = |p: &str| store.0.borrow().keys().filter(|k| k.starts_with(p)).cloned().collect::<Vec<_>>();
+    assert_eq!(keys("live:"), ["live:4"], "only the running one is cared for");
+    assert_eq!(keys("recent:").len(), 4);
+    // The same answers from the indexes as from every job.
+    let after = status();
+    for k in ["spend", "spend_today"] { assert!((after[k]["aws"].as_f64().unwrap() - before[k]["aws"].as_f64().unwrap()).abs() < 1e-6, "{k}: {} vs {}", after[k], before[k]) }
+    assert_eq!(after["usage"]["day"]["jobs"], before["usage"]["day"]["jobs"]);
+    assert_eq!(after["usage"]["week"]["billed_minutes"], before["usage"]["week"]["billed_minutes"]);
+    assert_eq!(after["jobs"].as_array().unwrap().iter().map(|j| j["job_id"].as_u64().unwrap()).collect::<Vec<_>>(), [4, 2, 1, 3], "the newest first");
+    let today = |k: &str| serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("day:{:06}", t / 86_400_000)]).unwrap()["spend"][k].as_f64();
+    assert!((today("aws").unwrap() - 0.15).abs() < 1e-9, "the two over today, counted once: {:?}", today("aws"));
+    block_on(plane.alarm()).unwrap();
+    assert!((today("aws").unwrap() - 0.15).abs() < 1e-9, "not again at the next sweep");
+    // The running one ends: counted once, however often it is said.
+    for _ in 0..2 { block_on(plane.handle(job_event("completed", 4, "acme/app", Some(&format!("superci-{PLANE_ID}-4"))))); }
+    let counted = job(&store, 4)["counted_usd"].as_f64().unwrap_or_else(|| panic!("{}", job(&store, 4)));
+    assert!(counted > 0.0 && (today("aws").unwrap() - (0.15 + counted)).abs() < 1e-9, "{counted} {:?}", today("aws"));
+    // Half an hour after it ended, nothing more is done for it: no longer among the live ones.
+    clock.0.set(t + 31 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert!(keys("live:").is_empty(), "{:?}", keys("live:"));
 }
