@@ -2762,7 +2762,7 @@ impl<'a> ControlPlane<'a> {
             }
             if let Err(why) = self.within(k, now).await { return Ok(Response::text(429, &why)) }
         }
-        let run_id = (1u64 << 62) + now * 1000 + (crate::crypto::random_bytes(2).iter().map(|b| *b as u64).sum::<u64>() % 1000);
+        let run_id = local_id(now);
         // Its jobs' cache: the repository's entries, as GitHub's jobs keep them when GitHub knows it here.
         let (ns, default_branch) = match self.repository_of(&r.repository).await { Some((id, default)) => (format!("gh{id}"), default), None => (cache::local_ns(&r.repository), "main".to_string()) };
         let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
@@ -2849,7 +2849,7 @@ impl<'a> ControlPlane<'a> {
                         // (Reserved here, started once the record says so: see above.)
                         let now = self.clock.now_ms();
                         jobs[i]["state"] = "started".into();
-                        jobs[i]["job_id"] = ((1u64 << 62) + now * 1000 + (crate::crypto::random_bytes(2).iter().map(|b| *b as u64).sum::<u64>() % 1000)).to_string().into();
+                        jobs[i]["job_id"] = local_id(now).to_string().into();
                         jobs[i]["token"] = crate::crypto::random_token(24).into();
                         start.push(i);
                     } else {
@@ -3812,4 +3812,11 @@ impl<'a> ControlPlane<'a> {
         }
         Ok(())
     }
+}
+
+/// An id for a run from a computer or one of its jobs: above every id GitHub or GitLab gives, ordered by time, with a
+/// million random ones in each millisecond so that runs started together never share one.
+fn local_id(now: u64) -> u64 {
+    let r = crate::crypto::random_bytes(4);
+    (1u64 << 62) + now * 1_000_000 + u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as u64 % 1_000_000
 }
