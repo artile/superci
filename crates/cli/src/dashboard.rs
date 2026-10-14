@@ -92,6 +92,8 @@ pub struct Dashboard {
     aws: Option<aws::Session>,
     /// Which GitLab connection the GitLab page shows (its name; nothing: the first).
     gitlab_shown: String,
+    /// The job its page shows (`?p=job&id=…`, and `gl=…` for a GitLab job of a further connection).
+    job_shown: (String, String),
     aws_pending: Option<aws::Pending>,
     /// When the sign-in with AWS under way was started (see `aws_stuck`).
     aws_asked_ms: u64,
@@ -664,8 +666,8 @@ fn job_table(jobs: &[serde_json::Value]) -> String {
             else { off_spot(j).map(|(why, _)| format!(r#"<small class="jt-why open">{}</small>"#, esc(&why)))
                 // (Or that its machine was not the first choice: quietly, it is no fault.)
                 .or_else(|| choice_said(j).map(|said| format!(r#"<small class="jt-why held">{}</small>"#, esc(&said)))).unwrap_or_default() };
-        format!(r#"<a class="jt-row" href="{}" target="_blank" rel="noopener"><span class="jt-job"><strong>{}</strong><small>{host}{}</small>{why}</span><span class="jt-runner">{runner}</span><span class="jt-num">{took}</span><span class="jt-num">{cost}</span><span class="jt-state {kind}"><i></i>{word}</span><span class="jt-when">{}</span></a>"#,
-            esc(&job_link(j)), esc(&title), esc(&sub), ago(j["at_ms"].as_u64().unwrap_or_default()))
+        format!(r#"<a class="jt-row" href="{}"><span class="jt-job"><strong>{}</strong><small>{host}{}</small>{why}</span><span class="jt-runner">{runner}</span><span class="jt-num">{took}</span><span class="jt-num">{cost}</span><span class="jt-state {kind}"><i></i>{word}</span><span class="jt-when">{}</span></a>"#,
+            esc(&job_page_link(j)), esc(&title), esc(&sub), ago(j["at_ms"].as_u64().unwrap_or_default()))
     }).collect::<String>();
     format!(r#"<div class="jt"><div class="jt-head"><span>Job</span><span>Runner</span><span class="jt-num">Time</span><span class="jt-num">Cost</span><span>Status</span><span class="jt-when"></span></div>{rows}</div>"#)
 }
@@ -821,7 +823,9 @@ pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
     let mut steps: Vec<(String, u64, String)> = vec![];
     let mut step = |what: &str, from: u64, to: u64, more: String| if to >= from && to - from < 86_400_000 { steps.push((what.to_string(), to - from, more)) };
     let queued = n(&j["queued_ms"]).filter(|q| *q <= heard);
-    if let Some(q) = queued { step("GitHub told SuperCI of the job", q, heard, String::new()) }
+    // (A run from a computer's job is the control plane's own: no GitHub tells of it or gives it out.)
+    let local = j["provider"] == "local";
+    if let Some(q) = queued.filter(|_| !local) { step("GitHub told SuperCI of the job", q, heard, String::new()) }
     let Some(launched) = n(&j["launched_ms"]).filter(|_| j["machine_id"].is_string()) else {
         return serde_json::json!({ "steps": steps.iter().map(|(what, ms, more)| serde_json::json!({ "what": what, "ms": ms, "more": more })).collect::<Vec<_>>(), "asked": asks_said(j) })
     };
@@ -837,7 +841,9 @@ pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
             if let Some(ready) = ready {
                 match read { Some(read) => { step("its disk and Docker were set up", script, read, String::new()); step("the runner's files were read from the image", read, ready, String::new()) }, None => step("its start-up script ran", script, ready, String::new()) }
                 match (listening, started) {
+                    (Some(l), Some(s)) if local => { step("the runner started and reached the control plane", ready, l, String::new()); step("the control plane gave it the job", l, s.max(l), String::new()) }
                     (Some(l), Some(s)) => { step("the runner started and reached GitHub", ready, l, String::new()); step("GitHub gave it the job", l, s.max(l), String::new()) }
+                    (Some(l), None) if local => step("the runner started and reached the control plane", ready, l, String::new()),
                     (Some(l), None) => step("the runner started and reached GitHub", ready, l, String::new()),
                     (None, Some(s)) => step("the runner started and took the job", ready, s.max(ready), String::new()),
                     _ => {}
@@ -966,7 +972,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -3061,7 +3067,7 @@ impl Dashboard {
         // The live part is fetched by the page itself. Links and forms within the dashboard change only that part: the
         // page stays as it is (a thin bar at the top) until the next one is ready, so nothing flashes in between.
         let script = r#"<script>(function(){var main=document.getElementById('live'),timer;
-var sections={plane:'planes','add-runners':'runners',gitlab:'repos'};
+var sections={plane:'planes','add-runners':'runners',gitlab:'repos',job:'jobs'};
 function qp(n){return new URLSearchParams(location.search).get(n)||''}
 function cc(){return qp('c')}
 function keep(u){['w','c'].forEach(function(n){if(!u.searchParams.has(n)){if(qp(n))u.searchParams.set(n,qp(n))}else if(!u.searchParams.get(n))u.searchParams.delete(n)});return u}
@@ -3326,6 +3332,7 @@ mark();load()})();</script>"#;
             "add-runners" => (format!("{}{}", self.add_runners_page(current), self.aws_account_section()), self.modal_pending.is_some()),
             _ if self.modal_pending.is_some() && current.is_none() => (self.overview_page(current).0, true),
             "jobs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(false), jobs_card(current, 200)), false),
+            "job" => (self.job_page(current), false),
             "runs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(true), runs_card(current)), false),
             "planes" => (self.planes_page(views), self.deploy_running()),
             "changes" => (changes_page(views, &views.get(view::in_use(views)).map(|v| self.aws_lacks(v)).unwrap_or_default()), false),
@@ -3354,7 +3361,7 @@ mark();load()})();</script>"#;
     }
 
     fn sidebar(section: &str) -> String {
-        let current = match section { "plane" => "planes", "add-runners" => "runners", "gitlab" => "repos", "runs" => "jobs", s => s };
+        let current = match section { "plane" => "planes", "add-runners" => "runners", "gitlab" => "repos", "runs" | "job" => "jobs", s => s };
         let link = |id: &str, label: &str, icon: &str| format!(r#"<a href="/?p={id}" aria-current="{}">{icon}<span>{label}</span></a>"#, current == id);
         let nav = format!(r#"<nav class="nav">{}{}{}{}{}</nav>"#, link("overview", "Overview", ICON_OVERVIEW), link("repos", "Repositories", ICON_REPOS), link("runners", "Runners", ICON_RUNNERS),
             link("workflows", "Workflows", ICON_WORKFLOWS), link("jobs", "Jobs", ICON_JOBS));
@@ -3824,6 +3831,53 @@ mark();load()})();</script>"#;
         // What the cache keeps (a control plane from before has none to say).
         let caches = if v.aws { cloudflare::plane_get(v.plane.url(), &self.status_key, "/caches").ok() } else { None };
         format!(r#"{bar}<div class="cards">{}{}{}{here}</div>"#, called_card(v), limits_card(v, public), cache_card(v, caches.as_ref()))
+    }
+
+    /// One job's page: what it is and how it stands, its machine and cost, how its start went, and the end of its log
+    /// (looked at again every few seconds while it runs). Its page at GitHub or GitLab is a line of it; a run from a
+    /// computer has none, so this is where it is followed.
+    fn job_page(&self, v: Option<&PlaneView>) -> String {
+        let back = r#"<a class="chip" href="/?p=jobs">‹ Jobs</a>"#;
+        let Some(v) = v else { return format!(r#"<div class="bar"><h1 class="page-title">Job</h1>{back}</div>"#) };
+        let (id, gl) = self.job_shown.clone();
+        let found = v.jobs().into_iter().find(|j| j["job_id"].as_u64().is_some_and(|n| n.to_string() == id) && (gl.is_empty() || j["gitlab"].as_str() == Some(gl.as_str())));
+        let Some(j) = found.map(|j| with_hosts(v, &j)) else {
+            return format!(r#"<div class="bar"><h1 class="page-title">Job</h1>{back}</div><div class="cards">{}</div>"#, empty_state(&icon("jobs"), "Not among the latest jobs", "The control plane keeps the latest jobs; this one is not among them.", ""))
+        };
+        let (title, sub) = job_names(&j);
+        let (kind, word) = job_ended(&j);
+        let going = ["launching", "launched", "running", "waiting"].contains(&j["state"].as_str().unwrap_or_default());
+        let (runner_logo, runner) = runner_text(&j);
+        let row = |label: &str, value: String| if value.is_empty() { String::new() } else { format!(r#"<div class="limit"><span class="limit-text"><strong>{label}</strong></span><span class="limit-do">{value}</span></div>"#) };
+        let link = job_link(&j);
+        let at = if link.is_empty() { r#"<small class="faint">Run from a computer: it has no page at GitHub.</small>"#.to_string() }
+            else { format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">On {} ›</a>"#, esc(&link), if j["provider"] == "gitlab" { "GitLab" } else { "GitHub" }) };
+        let why = { let w = plain_reason(&j); if kind == "bad" || j["state"] == "waiting" { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&w)) } else { String::new() } };
+        let facts = [
+            row("Status", format!(r#"<span class="jt-state {kind}"><i></i>{word}</span>"#)),
+            row("Runner", if runner.is_empty() { String::new() } else { format!("{}<span>{}</span>", logo(&runner_logo, 16), esc(&runner)) }),
+            row("Time", duration(&j)),
+            row("Cost", job_cost(&j).filter(|c| *c > 0.0).map(|c| cost_text(&j, c)).unwrap_or_default()),
+            row("Queued", ago(j["at_ms"].as_u64().unwrap_or_default())),
+        ].concat();
+        let lines = job_start_lines(&j);
+        let start = lines.iter().enumerate().map(|(i, l)| { let l = l.trim(); let l = if i == 0 { l.strip_prefix("Its start: ").or_else(|| l.strip_prefix("Its start, so far:")).unwrap_or(l) } else { l }; l.to_string() })
+            .filter(|l| !l.is_empty()).map(|l| format!("<li>{}</li>", esc(&l))).collect::<String>();
+        let start = if start.is_empty() { String::new() } else { format!(r#"<section class="card"><div class="card-head"><h2>Its start</h2></div><ul class="steps">{start}</ul></section>"#) };
+        // Its log, from the control plane (GitHub's or GitLab's own, read with its token; a run from a computer's lines
+        // as its runner sent them).
+        let mut path = format!("/job/log?id={id}&bytes=60000");
+        if j["provider"] == "gitlab" { path += &format!("&gl={}", j["gitlab"].as_str().unwrap_or_default()) }
+        let log = match cloudflare::plane_get(v.plane.url(), &self.status_key, &path) {
+            Ok(got) => match got["log"].as_str() {
+                Some(l) if !l.trim().is_empty() => format!(r#"<pre class="log">{}</pre>"#, esc(&strip_log(l))),
+                _ if going && j["provider"].as_str().unwrap_or_default().is_empty() => format!(r#"<p class="note">GitHub gives a job's log once it has ended. {}</p>"#, if link.is_empty() { String::new() } else { format!(r#"<a href="{}" target="_blank" rel="noopener">Follow it on GitHub ›</a>"#, esc(&link)) }),
+                _ => format!(r#"<p class="note">{}</p>"#, esc(got["error"].as_str().unwrap_or("No log yet."))),
+            },
+            Err(e) => format!(r#"<p class="note">The log could not be read: {}</p>"#, esc(&e)),
+        };
+        format!(r#"{}<div class="bar"><h1 class="page-title">{}</h1>{back}</div><div class="cards"><section class="card"><div class="card-head"><h2>{}</h2>{at}</div>{why}<div class="limits">{facts}</div></section>{start}<section class="card"><div class="card-head"><h2>Its log</h2></div>{log}</section></div>"#,
+            if going { r#"<div data-refresh="4"></div>"# } else { "" }, esc(&title), esc(&sub))
     }
 
     /// GitLab's settings: the projects whose jobs run here (each turned on or off, or all at once), and the connection.
@@ -4695,7 +4749,7 @@ fn empty_state(icon_svg: &str, title: &str, text: &str, action: &str) -> String 
 
 fn section_name(section: &str) -> &str {
     match section {
-        s if ["plane", "planes", "all", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "runs", "repos", "gitlab"].contains(&s) => s,
+        s if ["plane", "planes", "all", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "job", "runs", "repos", "gitlab"].contains(&s) => s,
         _ => "overview",
     }
 }
@@ -4703,7 +4757,7 @@ fn section_name(section: &str) -> &str {
 fn section_title(section: &str) -> &'static str {
     match section {
         "plane" => "Set up a control plane", "planes" => "Control plane", "changes" => "Changelog", "add-runners" => "Add a provider", "runners" => "Runners",
-        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" | "runs" => "Jobs", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
+        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" | "runs" => "Jobs", "job" => "Job", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
     }
 }
 
@@ -5113,6 +5167,17 @@ fn cache_card(v: &PlaneView, caches: Option<&serde_json::Value>) -> String {
 </div></section>"#, superci_core::cache::MAX_AGE_DAYS, superci_core::cache::MAX_AGE_DAYS)
 }
 
+/// A job's log as text to read: GitHub's and GitLab's colours taken out, each line's time kept.
+fn strip_log(log: &str) -> String {
+    let mut out = String::with_capacity(log.len());
+    let mut chars = log.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' { if chars.peek() == Some(&'[') { chars.next(); for n in chars.by_ref() { if n.is_ascii_alphabetic() { break } } } continue }
+        if c != '\r' { out.push(c) }
+    }
+    out
+}
+
 /// A size in words: 940 MB, 3.4 GB.
 fn size_words(bytes: u64) -> String { if bytes >= 1_000_000_000 { format!("{:.1} GB", bytes as f64 / 1e9) } else { format!("{} MB", bytes.div_ceil(1_000_000)) } }
 
@@ -5203,6 +5268,15 @@ const ICON_CHIP: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill=
 
 fn signin_button(cloud: &str, label: &str, primary: bool) -> String {
     format!(r#"<form method="post" action="/{cloud}/signin"><input type="hidden" name="next"><button class="{}">{}</button></form>"#, if primary { "button primary" } else { "button secondary" }, esc(label))
+}
+
+/// A job's page here: what it is, how its start went, and its log (its page at its code host from there).
+fn job_page_link(j: &serde_json::Value) -> String {
+    let id = j["job_id"].as_u64().unwrap_or_default();
+    match (j["provider"].as_str(), j["gitlab"].as_str().filter(|g| !g.is_empty())) {
+        (Some("gitlab"), Some(g)) => format!("/?p=job&id={id}&gl={g}"),
+        _ => format!("/?p=job&id={id}"),
+    }
 }
 
 /// A job's page on its code host.
@@ -5767,6 +5841,7 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
         let new_here = match q("new") { "1" => Some(true), "0" => Some(false), _ => None };
         if q("fragment") == "1" {
             shared.lock().unwrap_or_else(|e| e.into_inner()).gitlab_shown = q("g").chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).take(12).collect();
+            if q("p") == "job" { shared.lock().unwrap_or_else(|e| e.into_inner()).job_shown = (q("id").chars().filter(|c| c.is_ascii_digit()).take(20).collect(), q("gl").chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-').take(24).collect()) }
             return Response::new(200, "text/html; charset=utf-8", Dashboard::live(shared, q("p"), q("plane").parse().ok(), new_here, req.last.as_deref()))
         }
         return Dashboard::page(q("p"));
@@ -6611,8 +6686,8 @@ mod tests {
         if let Some(st) = corp.status.as_mut() { st["apps"][1]["host"] = "ghe.corp.example".into(); st["jobs"] = serde_json::json!([{ "job_id": 5, "run_id": 50, "repo": "beta/api", "state": "done", "cloud": "cloudflare", "at_ms": 1, "app_id": 2 }, { "job_id": 6, "run_id": 60, "repo": "acme/app", "state": "done", "cloud": "cloudflare", "at_ms": 1, "app_id": 1 }]) }
         let html_corp = d.render("repos", &[corp.clone()], None);
         assert!(html_corp.contains("https://ghe.corp.example/github-apps/superci-beta-p1/installations/new") && !html_corp.contains("https://github.com/apps/superci-beta-p1"));
-        let jobs = d.render("jobs", &[corp], None);
-        assert!(jobs.contains("https://ghe.corp.example/beta/api/actions/runs/50/job/5") && jobs.contains("https://github.com/acme/app/actions/runs/60/job/6"), "each job links to its own GitHub");
+        let links: Vec<String> = corp.jobs().iter().map(|j| job_link(&with_hosts(&corp, j))).collect();
+        assert!(links.contains(&"https://ghe.corp.example/beta/api/actions/runs/50/job/5".to_string()) && links.contains(&"https://github.com/acme/app/actions/runs/60/job/6".to_string()), "each job's page links to its own GitHub");
         // Where GitHub is can be said when an App is made (github.com unless your own is chosen).
         assert!(html.contains(r#"name="gh-where" value="own""#) && html.contains(r#"name="host" placeholder="github.example.com""#));
         // Not on a control plane from before it knew several: updated first.
@@ -7307,9 +7382,11 @@ mod tests {
         preview("repos-gitlabs", &both);
         assert!(both.contains("<strong>GitLab · gitlab.com</strong>") && both.contains("<strong>GitLab · gitlab.corp.example</strong>") && both.contains(r#"href="/?p=gitlab&g=gcorp">Settings</a>"#) && both.contains(r#"href="/?p=gitlab&g=">Settings</a>"#));
         assert!(both.contains("<strong>Another GitLab</strong>") && dialog(&both, "gl-add").contains(r#"aria-label="Add a GitLab""#) && both.matches(r#"id="gl-add""#).count() == 1);
-        // Each job links to its own GitLab; each token has its own row under Permissions.
+        // Each job opens its page here, which links to its own GitLab; each token has its own row under Permissions.
         let jobs = d.render("jobs", &[two.clone()], None);
-        assert!(jobs.contains("https://gitlab.corp.example/corp/api/-/jobs/5") && jobs.contains("https://gitlab.com/acme/app/-/jobs/6"));
+        assert!(jobs.contains(r#"href="/?p=job&amp;id=5&amp;gl=gcorp""#) && jobs.contains(r#"href="/?p=job&amp;id=6""#), "{jobs}");
+        let links: Vec<String> = two.jobs().iter().map(|j| job_link(&with_hosts(&two, j))).collect();
+        assert!(links.contains(&"https://gitlab.corp.example/corp/api/-/jobs/5".to_string()) && links.contains(&"https://gitlab.com/acme/app/-/jobs/6".to_string()), "{links:?}");
         let perms = d.render("planes", &[two.clone()], None);
         assert!(perms.contains("<small>gitlab.com: Its token has every scope</small>") && perms.contains("<small>gitlab.corp.example: Its token lacks 1 scope</small>") && perms.contains(r#"href="/?p=gitlab&g=gcorp&open=gl-token""#));
         // A control plane from before it knew several: updated first.
@@ -7360,7 +7437,8 @@ mod tests {
                 "installation_id": 0, "runner": null, "runner_id": null, "machine_type": "2cpu-8gb", "error": null, "seen_in_progress": true }] }));
         assert!(view.ready());
         assert_eq!(closest(Some(&view)), "closest to GitHub and GitLab");
-        assert!(d.render("jobs", &[view.clone()], None).contains(r#"href="https://gitlab.com/acme/app/-/jobs/1977""#));
+        assert!(d.render("jobs", &[view.clone()], None).contains(r#"href="/?p=job&amp;id=1977""#));
+        assert_eq!(job_link(&with_hosts(&view, &view.jobs()[0])), "https://gitlab.com/acme/app/-/jobs/1977");
         // Both connected: a switch between them.
         view.installed = true;
         let workflows = d.render("workflows", &[view.clone()], None);

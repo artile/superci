@@ -1119,7 +1119,13 @@ impl<'a> ControlPlane<'a> {
         // A GitLab job is kept under its connection's name and its id (`gl`: the name; nothing for the first).
         let key = match q("gl") { Some(g) if gitlab::valid_id(&g) || g.is_empty() => format!("job:gl{}", gitlab::local(&g, id.parse().unwrap_or_default())), Some(_) => return Err("which GitLab?".into()), None => format!("job:{id}") };
         let Some(j) = get_json::<Job>(self.store, &key).await? else { return Ok(Response::json(&serde_json::json!({ "error": "This control plane has no such job (it keeps the latest ones)." }))) };
-        let fetched = if j.provider == "gitlab" {
+        // A run from a computer: the lines its runner sent here, as the control plane keeps them.
+        let fetched = if j.provider == "local" {
+            let token = j.local.clone().unwrap_or_default();
+            let mut lines = vec![];
+            for (_, v) in self.store.list(&format!("rline:{token}:")).await? { lines.extend(serde_json::from_str::<Vec<String>>(&v).unwrap_or_default()) }
+            Ok(lines.join("\n").into_bytes())
+        } else if j.provider == "gitlab" {
             match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(project)) => gitlab::job_trace(self.http, gl, project, j.job_id).await, _ => Err("its GitLab is no longer connected".into()) }
         } else {
             match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) }
@@ -3435,9 +3441,11 @@ impl<'a> ControlPlane<'a> {
         if v["runner"]["id"].as_u64() != Some(runner) { return false }
         let status = v["status"].as_str().unwrap_or_default();
         let mut changed = false;
+        // (Its times as GitLab kept them: when it began and ended, not when this was asked.)
+        let at = |k: &str| v[k].as_str().and_then(aws::parse_iso_ms);
         if !j.seen_in_progress && status != "pending" {
             (j.seen_in_progress, j.state) = (true, "running".into());
-            j.started_ms.get_or_insert(now);
+            j.started_ms.get_or_insert(at("started_at").unwrap_or(now));
             let at = format!("glrunner:{}", gitlab::local(&gl.id, runner));
             if let Ok(Some(mut r)) = get_json::<serde_json::Value>(self.store, &at).await {
                 if r["running"].is_null() {
@@ -3449,7 +3457,7 @@ impl<'a> ControlPlane<'a> {
         }
         if let Some(state) = match status { "success" => Some("done"), "failed" => Some("failed"), "canceled" => Some("cancelled"), _ => None } {
             j.state = state.into();
-            j.ended_ms.get_or_insert(now);
+            j.ended_ms.get_or_insert(at("finished_at").unwrap_or(now));
             if gitlab::delete_runner(self.http, gl, runner).await.is_ok() { let _ = self.store.delete(&format!("glrunner:{}", gitlab::local(&gl.id, runner))).await; }
             changed = true;
         }
