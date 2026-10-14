@@ -65,6 +65,10 @@ pub struct Dashboard {
     keep_failed: bool,
     /// A kept AWS sign-in turned out to have ended (AWS ends one after twelve hours at most).
     aws_ended: bool,
+    /// The same of the kept Cloudflare sign-in (Cloudflare no longer renews it) and of Modal's (Modal no longer
+    /// takes its token): forgotten, and what the other sign-ins reach goes on (see `cf_over`).
+    cf_ended: bool,
+    modal_ended: bool,
     /// A sign-in to AWS came back in this run (what `superci login aws --add` waits for), and whether one is awaited
     /// although an account is signed in to already.
     aws_came: bool,
@@ -168,7 +172,9 @@ pub enum Task {
 }
 
 /// An update: of which control plane, its steps, the one it is at, and how it ended.
-struct Update { plane: String, steps: &'static [&'static str], at: usize, result: Option<Result<()>>, ended_ms: u64 }
+struct Update { plane: String, steps: &'static [&'static str], at: usize, result: Option<Result<()>>, ended_ms: u64,
+    /// What the update left out, said with its result (a part in a cloud whose sign-in is over); nothing: all of it.
+    note: String }
 
 impl Update {
     /// Uploaded, and its control plane still answers with the version before: its cloud is switching it over (with
@@ -438,6 +444,9 @@ fn plain(html: &str) -> String {
 /// What `superci status` says when SuperCI is signed in nowhere, and when its only sign-in was AWS's and has ended.
 pub const NOT_SIGNED_IN: &str = "SuperCI is not signed in on this computer. Run `superci login` (it opens your browser).";
 pub const AWS_ENDED: &str = "SuperCI's AWS sign-in has ended (AWS ends one after twelve hours at most). Run `superci login aws` to sign in again.";
+/// The same of the other clouds' sign-ins, for what needs one of them.
+pub const CF_ENDED: &str = "SuperCI's Cloudflare sign-in has expired. Run `superci login cloudflare` to sign in again.";
+pub const MODAL_ENDED: &str = "Modal no longer accepts SuperCI's sign-in. Run `superci login modal` to sign in again.";
 
 /// A day, as 2026-10-07 (UTC), from unix seconds.
 fn day(unix: u64) -> String {
@@ -957,7 +966,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -975,6 +984,7 @@ impl Dashboard {
         d.aws_others = accounts;
         if d.modal.is_none() { d.modal = kept.modal }
         d.aws_ended = kept.aws_ended && d.aws.is_none();
+        (d.cf_ended, d.modal_ended) = (kept.cloudflare_ended && d.cf.is_none(), kept.modal_ended && d.modal.is_none());
         // The key the control planes were handed, while it lasts another day; else a new one, good for thirty days.
         match kept.key.filter(|k| key_until(&k.name) > now_ms() / 1000 + 86_400) {
             // (One from before each control plane had a key of its own goes on working until it can be replaced
@@ -1077,9 +1087,9 @@ impl Dashboard {
 
     /// As `ready`; `one`: stops when several control planes are live and none is named (a listing passes false).
     fn look(&mut self, one: bool) -> Result<()> {
-        self.signed_in_as().ok_or(if self.aws_ended { AWS_ENDED } else { NOT_SIGNED_IN })?;
+        self.signed_in_as().ok_or(self.nowhere())?;
         self.discover()?;
-        if self.signed_in_as().is_none() { return Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) }
+        if self.signed_in_as().is_none() { return Err(self.nowhere().into()) }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
         if let Some(live) = view::several(&views).filter(|_| one) { return Err(view::name_one(&live)) }
         if !views.is_empty() {
@@ -1088,6 +1098,38 @@ impl Dashboard {
         }
         self.keep();
         Ok(())
+    }
+
+    /// Why nothing is signed in to, for a command that needs a sign-in: one that ended says which and how to sign in
+    /// again.
+    fn nowhere(&self) -> &'static str {
+        if self.aws_ended { AWS_ENDED } else if self.cf_ended && self.cf.is_none() { CF_ENDED } else if self.modal_ended && self.modal.is_none() { MODAL_ENDED } else { NOT_SIGNED_IN }
+    }
+
+    /// Whether a sign-in kept here turned out to be over, and has not been made again.
+    fn any_ended(&self) -> bool { self.aws_ended || (self.cf_ended && self.cf.is_none()) || (self.modal_ended && self.modal.is_none()) }
+
+    /// The sign-ins that are over and not made again, for a command to say once beside what it did: what they
+    /// reach was not looked at.
+    pub fn ended_notes(&self) -> Vec<String> {
+        let mut notes = vec![];
+        if self.cf_ended && self.cf.is_none() { notes.push("The Cloudflare sign-in has expired: what is in Cloudflare was not looked at. `superci login cloudflare` signs in again.".to_string()) }
+        if self.modal_ended && self.modal.is_none() { notes.push("Modal no longer accepts the sign-in: what is in Modal was not looked at. `superci login modal` signs in again.".to_string()) }
+        notes
+    }
+
+    /// The kept Cloudflare sign-in is over (Cloudflare said so): forgotten, and said from here on where Cloudflare
+    /// is needed. (One given by name for this run is not SuperCI's to forget: its error is said as it is.)
+    fn cf_over(&mut self) {
+        if self.cf_given { return }
+        (self.cf, self.cf_ended, self.views) = (None, true, None);
+        self.cf_accounts.clear();
+    }
+
+    /// The same of Modal's.
+    fn modal_over(&mut self) {
+        if self.modal_given { return }
+        (self.modal, self.modal_ended, self.views) = (None, true, None);
     }
 
     /// For a command that changes a setting of the control plane in use: when that one is known from the last run and
@@ -1111,7 +1153,9 @@ impl Dashboard {
         let answer = self.handle(&req);
         self.keep();
         // A change that needs AWS, after AWS ended the sign-in kept here: said as that.
-        let ended = |e: String| if self.aws_ended && e.contains("Sign in with AWS") { AWS_ENDED.to_string() } else { e };
+        let (cf, modal) = (self.cf_ended && self.cf.is_none(), self.modal_ended && self.modal.is_none());
+        let ended = |e: String| if self.aws_ended && e.contains("Sign in with AWS") { AWS_ENDED.to_string() } else if (cf && e.contains("Sign in with Cloudflare")) || (!self.cf_given && cloudflare::over(&e)) { CF_ENDED.to_string() }
+            else if (modal && e.contains("Sign in with Modal")) || (!self.modal_given && e.contains(modal::ENDED)) { MODAL_ENDED.to_string() } else { e };
         let answer = answer.map_err(ended)?;
         let said = SAID.with(|s| s.borrow_mut().take()).map(|(_, heading, text)| { let text = plain(&text); if text.is_empty() { heading } else { format!("{}: {text}", heading.trim_end_matches('.')) } });
         match (answer.status, said) {
@@ -1131,7 +1175,7 @@ impl Dashboard {
                 Background::Deploy => { let g = lock(&self.deploying); let d = g.as_ref().ok_or("no deploy was started")?;
                     (d.steps.iter().map(|s| s.to_string()).collect(), d.at, d.result.as_ref().map(|r| r.as_ref().map(|p| format!("The control plane is running: {} ({})", p.url(), p.place())).map_err(|e| plain_refusal(e).unwrap_or_else(|| e.clone())))) }
                 Background::Update => { let g = lock(&self.updating); let u = g.as_ref().ok_or("no update was started")?;
-                    (u.steps.iter().map(|s| s.to_string()).collect(), u.at, u.result.as_ref().map(|r| r.as_ref().map(|_| format!("Updated to {DASHBOARD_VERSION}.")).map_err(|e| e.clone()))) }
+                    (u.steps.iter().map(|s| s.to_string()).collect(), u.at, u.result.as_ref().map(|r| r.as_ref().map(|_| format!("Updated to {DASHBOARD_VERSION}.{}{}", if u.note.is_empty() { "" } else { " " }, u.note)).map_err(|e| e.clone()))) }
                 Background::Move => { let g = lock(&self.moving); let m = g.as_ref().ok_or("no move was started")?;
                     (MOVE_STEPS.iter().map(|s| s.to_string()).collect(), m.at, m.result.as_ref().map(|r| r.as_ref().map(|left| if left.is_empty() { "Moved.".to_string() } else { format!("Moved. Did not come along: {}.", left.join("; ")) }).map_err(|e| e.clone()))) }
             };
@@ -1159,7 +1203,7 @@ impl Dashboard {
     pub fn current(&mut self) -> Result<Option<PlaneView>> {
         // Signed in nowhere: only what is left of a sign-in AWS ended can still be read (with the kept key).
         let only_reading = self.signed_in_as().is_none();
-        if only_reading && !(self.aws_ended && self.kept_plane.is_some()) { return Err(NOT_SIGNED_IN.into()) }
+        if only_reading && !(self.any_ended() && self.kept_plane.is_some()) { return Err(NOT_SIGNED_IN.into()) }
         // The one named, when it is known here; with none named, the kept one only when no other is known (with
         // several known, which of them are live is asked first, below).
         let known = match view::named() {
@@ -1171,11 +1215,11 @@ impl Dashboard {
         // (One that says it moved away is no longer the one in use: found again below.)
         if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some() && (v.moved_to.is_none() || only_reading)) { return Ok(Some(v)) }
         // Nothing to find it again with: as it answers now (not at all, or without taking the key any more).
-        if only_reading { return match self.kept_plane.clone() { Some(p) => Ok(Some(view::plane_view(&p, Some(&self.status_key)))), None => Err(AWS_ENDED.into()) } }
+        if only_reading { return match self.kept_plane.clone() { Some(p) => Ok(Some(view::plane_view(&p, Some(&self.status_key)))), None => Err(self.nowhere().into()) } }
         // Not known yet, or its key is gone there: found again (and handed the key) with the sign-ins.
         self.keyed.clear();
         self.discover()?;
-        if self.planes.is_empty() { return if self.signed_in_as().is_none() { Err(if self.aws_ended { AWS_ENDED.into() } else { NOT_SIGNED_IN.into() }) } else { Ok(None) } }
+        if self.planes.is_empty() { return if self.signed_in_as().is_none() { Err(self.nowhere().into()) } else { Ok(None) } }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
         if let Some(live) = view::several(&views) { return Err(view::name_one(&live)) }
         let p = views[view::in_use(&views)].plane.clone();
@@ -1284,7 +1328,7 @@ impl Dashboard {
         (about.hosts, about.picture, about.picture_of) = (vec![], String::new(), String::new());
         self.set_about(about);
         (self.picture_owner, self.picture_asked_ms) = (String::new(), 0);
-        (self.aws_ended, self.looked_cf, self.looked_aws, self.looked_modal) = (false, false, false, false);
+        (self.aws_ended, self.cf_ended, self.modal_ended, self.looked_cf, self.looked_aws, self.looked_modal) = (false, false, false, false, false, false);
         (self.planes, self.selected, self.kept_plane, self.preloaded, self.views) = (vec![], 0, None, None, None);
         self.cf_accounts.clear();
         self.keyed.clear();
@@ -1307,6 +1351,8 @@ impl Dashboard {
             plane: self.planes.get(self.selected).filter(|p| !matches!(p, Plane::Seen { .. })).cloned().or_else(|| self.kept_plane.clone()),
             planes_more: self.planes.iter().enumerate().filter(|(i, p)| *i != self.selected && !matches!(p, Plane::Seen { .. })).map(|(_, p)| p.clone()).collect(),
             aws_ended: self.aws_ended && self.aws.is_none() && self.aws_others.is_empty(),
+            cloudflare_ended: self.cf_ended && self.cf.is_none(),
+            modal_ended: self.modal_ended && self.modal.is_none(),
         }
     }
 
@@ -1590,8 +1636,8 @@ impl Dashboard {
             self.aws = if all.is_empty() { None } else { Some(all.remove(at)) };
             (self.aws_others, self.aws_ended, self.looked_aws, took) = (all, on_disk.aws_ended, false, true);
         }
-        if theirs("cloudflare") && !self.cf_given { (self.cf, self.looked_cf, took) = (on_disk.cloudflare, false, true); self.cf_accounts.clear(); }
-        if theirs("modal") && !self.modal_given { (self.modal, self.looked_modal, took) = (on_disk.modal, false, true) }
+        if theirs("cloudflare") && !self.cf_given { (self.cf, self.cf_ended, self.looked_cf, took) = (on_disk.cloudflare, on_disk.cloudflare_ended, false, true); self.cf_accounts.clear(); }
+        if theirs("modal") && !self.modal_given { (self.modal, self.modal_ended, self.looked_modal, took) = (on_disk.modal, on_disk.modal_ended, false, true) }
         if theirs("key") { if let Some(k) = on_disk.key { (self.status_key, self.status_secret, self.keyed, took) = (k.value, k.name, k.planes.into_iter().collect(), true) } }
         if took { self.views = None }
     }
@@ -1702,7 +1748,10 @@ impl Dashboard {
     }
 
     fn cloudflare(&mut self) -> Result<Cloudflare> {
-        self.cf.as_mut().ok_or("Sign in with Cloudflare first.")?.client()
+        let ended = self.cf_ended;
+        let client = self.cf.as_mut().ok_or(if ended { CF_ENDED } else { "Sign in with Cloudflare first." })?.client();
+        // Cloudflare no longer renews the kept sign-in: forgotten, and said as that.
+        match client { Err(e) if cloudflare::over(&e) && !self.cf_given => { self.cf_over(); Err(CF_ENDED.into()) } other => other }
     }
 
     fn plane(&self) -> Result<Plane> { self.planes.get(self.selected).cloned().ok_or_else(|| "no control plane yet".to_string()) }
@@ -1774,7 +1823,9 @@ impl Dashboard {
     /// session's status key.
     fn discover(&mut self) -> Result<()> {
         // Every cloud signed in to and not looked in yet, at once.
-        let cf = if self.cf.is_some() && !self.looked_cf { Some(self.cloudflare()?) } else { None };
+        // (A sign-in that is over is no reason not to look where the others reach: it is forgotten and said, see
+        // `cf_over`, and the control planes known there stay listed.)
+        let cf = if self.cf.is_some() && !self.looked_cf { match self.cloudflare() { Ok(cf) => Some(cf), Err(e) if e == CF_ENDED => None, Err(e) => return Err(e) } } else { None };
         // Every AWS account signed in to: the one in hand, then the others.
         let mut aws: Vec<(superci_core::aws::Credentials, String)> = vec![];
         if !self.looked_aws {
@@ -1820,6 +1871,9 @@ impl Dashboard {
         });
         // Where the kept control plane was looked for, and what was found there.
         let (mut looked, mut there): (Vec<String>, Vec<String>) = (vec![], vec![]);
+        // Cloudflare took the token no more (ended there, where renewing it still worked a moment ago): the same.
+        let cf_found = match cf_found { Some(Err(e)) if cloudflare::over(&e) && !self.cf_given => { self.cf_over(); None } found => found };
+        let modal_found = match modal_found { Some(Err(e)) if e.contains(modal::ENDED) && !self.modal_given => { self.modal_over(); None } found => found };
         if let Some(found) = cf_found {
             let (accounts, planes) = found?;
             looked.extend(accounts.iter().map(|(id, _)| format!("cloudflare:{id}")));
@@ -2469,9 +2523,12 @@ impl Dashboard {
                 let steps: &'static [&'static str] = match plane { Plane::Cloudflare { .. } => &UPDATE_CLOUDFLARE, Plane::Aws { .. } => &UPDATE_AWS, Plane::Modal { .. } => &UPDATE_MODAL,
                     Plane::Seen { .. } => return Ok(message(400, "Sign in where this control plane runs to update it", "")) };
                 let state = self.updating.clone();
-                *lock(&state) = Some(Update { plane: plane.plane_id().to_string(), steps, at: 0, result: None, ended_ms: 0 });
                 let containers = status["containers"] == true;
                 let cf_agent = status["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare"));
+                // Its runner agent in Cloudflare is updated with it, when Cloudflare is signed in to: a sign-in
+                // that is over stops nothing else, and is said with the result.
+                let note = if cf_agent && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare runner agent was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
+                *lock(&state) = Some(Update { plane: plane.plane_id().to_string(), steps, at: 0, result: None, ended_ms: 0, note });
                 // Signed in to the AWS account its machines run in: the update also gives its runner role what this
                 // version asks for (an AWS control plane's own update does that already).
                 if let (Some(account), false) = (status["aws"]["account_id"].as_str(), matches!(plane, Plane::Aws { .. })) { self.hold_account(account); }
@@ -3119,7 +3176,7 @@ mark();load()})();</script>"#;
         // The App is installed (or the wait is over): nothing more to wait for.
         if d.github_expected.is_some_and(|until| now_ms() >= until) || views.get(view::in_use(&views)).is_some_and(|v| v.github && v.installed) { d.github_expected = None }
         let said_once = d.notice.take().map(|n| format!(r#"<div class="notice"><span>{}</span></div>"#, esc(&n))).unwrap_or_default();
-        let html = format!("{said_once}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.render(section, &views, last));
+        let html = format!("{said_once}{}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.others_ended_notice(), d.render(section, &views, last));
         let html = if look_again && !html.contains("data-refresh=") { format!(r#"<div data-refresh="2"></div>{html}"#) } else { html };
         // A change's note is said once.
         if ["planes", "runners"].contains(&section_name(section)) { d.flash = None }
@@ -3142,6 +3199,14 @@ mark();load()})();</script>"#;
     fn aws_ended_notice(&self) -> String {
         if !self.aws_ended || self.aws.is_some() || self.planes.is_empty() { return String::new() }
         format!(r#"<div class="notice warn"><span>Your AWS sign-in has ended (AWS ends one after 12 hours). You can look around; sign in again to change things in AWS.</span>{}</div>"#, signin_button("aws", "Sign in with AWS", false))
+    }
+
+    /// The same of Cloudflare's and Modal's sign-ins: the pages go on with what the other sign-ins reach.
+    fn others_ended_notice(&self) -> String {
+        let mut out = String::new();
+        if self.cf_ended && self.cf.is_none() { out.push_str(&format!(r#"<div class="notice warn"><span>Your Cloudflare sign-in has expired. Sign in again to see and change what is in Cloudflare.</span>{}</div>"#, signin_button("cloudflare", "Sign in with Cloudflare", false))) }
+        if self.modal_ended && self.modal.is_none() { out.push_str(&format!(r#"<div class="notice warn"><span>Modal no longer accepts your sign-in. Sign in again to see and change what is in Modal.</span>{}</div>"#, signin_button("modal", "Sign in with Modal", false))) }
+        out
     }
 
     /// A page's live part, with the workspace switcher's rows (see `workspaces_menu`).
@@ -4615,7 +4680,7 @@ fn side_update(v: &PlaneView, updating: Option<&Update>, aws_lacks: &[&'static s
         Some(None) => return format!(r#"<div class="side-update"><strong><span class="dot accent"></span>Updating to {DASHBOARD_VERSION}</strong><small>It keeps going while you look around. <a href="/?p=changes">Changelog</a></small>{action}</div>"#),
         Some(Some(Ok(()))) if updating.is_some_and(|u| u.restarting(v)) => return format!(r#"<div class="side-update"><strong><span class="dot accent"></span>Restarting with {DASHBOARD_VERSION}</strong><small>Uploaded; its cloud is switching it over, which can take a few minutes. <a href="/?p=changes">What changed</a></small><div data-refresh="3"></div></div>"#),
         Some(Some(Ok(()))) if v.outdated() => {}
-        Some(Some(Ok(()))) => return format!(r#"<div class="side-update"><strong><span class="dot good"></span>Updated to {DASHBOARD_VERSION}</strong><small><a href="/?p=changes">What changed</a></small></div>"#),
+        Some(Some(Ok(()))) => return format!(r#"<div class="side-update"><strong><span class="dot good"></span>Updated to {DASHBOARD_VERSION}</strong><small>{}<a href="/?p=changes">What changed</a></small></div>"#, updating.map(|u| plain(&u.note)).filter(|n| !n.is_empty()).map(|n| format!("{} ", esc(&n.replace('`', "")))).unwrap_or_default()),
         _ => {}
     }
     let needs = new_needs(v, aws_lacks);
@@ -6318,13 +6383,13 @@ mod tests {
         assert!(html.contains("<div data-side hidden>") && html.contains("Update available"));
         assert!(d.render("jobs", &[old.clone()], None).contains("Update available"), "on every page");
         // Updating: its steps where the Update button was, and the page looks again meanwhile.
-        *lock(&d.updating) = Some(Update { plane: old.plane.plane_id().to_string(), steps: &UPDATE_CLOUDFLARE, at: 1, result: None, ended_ms: 0 });
+        *lock(&d.updating) = Some(Update { plane: old.plane.plane_id().to_string(), steps: &UPDATE_CLOUDFLARE, at: 1, result: None, ended_ms: 0, note: String::new() });
         let html = d.render("jobs", &[old.clone()], None);
         assert!(html.contains(r#"<span class="upd-step"><span class="mini-spin"></span>Giving it its address</span>"#) && html.contains("data-refresh") && !html.contains(">Update to "));
         let planes = d.render("planes", &[old.clone()], None);
         preview("planes-updating", &planes);
         assert!(planes.contains(r#"<small>Updating to "#) && planes.contains("Giving it its address <span class=\"faint\">(2 of 3)</span>") && !planes.contains(r#"<span class="pick-end"><div class="upd""#), "its progress in the row's second line");
-        *lock(&d.updating) = Some(Update { plane: old.plane.plane_id().to_string(), steps: &UPDATE_CLOUDFLARE, at: 0, result: Some(Err("Cloudflare said no".into())), ended_ms: 0 });
+        *lock(&d.updating) = Some(Update { plane: old.plane.plane_id().to_string(), steps: &UPDATE_CLOUDFLARE, at: 0, result: Some(Err("Cloudflare said no".into())), ended_ms: 0, note: String::new() });
         assert!(d.render("jobs", &[old.clone()], None).contains("The update stopped: Cloudflare said no"));
         *lock(&d.updating) = None;
         d.render("jobs", &[old.clone()], None);
@@ -6869,7 +6934,7 @@ mod tests {
         assert!(side_update(&old, None, &[]).contains("It also asks for 6 new permissions in AWS, 1 new permission in GitHub."), "reading its network, and the network; one request for many spot pools (four); running a job again");
         // While it updates, on every page: says so (also when the control plane does not answer a moment, or already
         // answers with the new version); once done, that it is.
-        let mut u = Update { plane: "p1".into(), steps: &UPDATE_CLOUDFLARE, at: 1, result: None, ended_ms: 0 };
+        let mut u = Update { plane: "p1".into(), steps: &UPDATE_CLOUDFLARE, at: 1, result: None, ended_ms: 0, note: String::new() };
         let mut new = view(status(serde_json::json!({})));
         new.online = false;
         let card = side_update(&new, Some(&u), &[]);
@@ -6883,7 +6948,7 @@ mod tests {
         u.ended_ms = now_ms();
         let card = side_update(&before, Some(&u), &[]);
         assert!(card.contains(&format!("Restarting with {DASHBOARD_VERSION}")) && card.contains("data-refresh") && !card.contains(">Update to ") && !card.contains("Updated to"));
-        *lock(&d.updating) = Some(Update { plane: "p1".into(), steps: &UPDATE_CLOUDFLARE, at: 2, result: Some(Ok(())), ended_ms: now_ms() });
+        *lock(&d.updating) = Some(Update { plane: "p1".into(), steps: &UPDATE_CLOUDFLARE, at: 2, result: Some(Ok(())), ended_ms: now_ms(), note: String::new() });
         let planes = d.render("planes", &[before.clone()], None);
         assert!(planes.contains("Restarting…") && !planes.contains(">Update to "), "no second update while it restarts");
         u.ended_ms = now_ms() - 11 * 60_000;
@@ -7524,10 +7589,18 @@ mod tests {
         *lock(&d.deploying) = Some(Deploy { cloud: "modal", place: "workspace acme".into(), steps: &modal::DEPLOY_STEPS, at: 3, form: vec![], result: Some(Ok(second)) });
         d.wait(Background::Deploy, &mut |_| {}).unwrap();
         assert_eq!((d.planes.len(), d.plane_in_use().unwrap().plane_id().to_string()), (2, "abcdef123456".to_string()));
-        *lock(&d.updating) = Some(Update { plane: "abcdef123456".into(), steps: &UPDATE_AWS, at: 2, result: Some(Err("AccessDenied: lambda:UpdateFunctionCode".into())), ended_ms: now_ms() });
+        *lock(&d.updating) = Some(Update { plane: "abcdef123456".into(), steps: &UPDATE_AWS, at: 2, result: Some(Err("AccessDenied: lambda:UpdateFunctionCode".into())), ended_ms: now_ms(), note: String::new() });
         let mut steps = vec![];
         assert_eq!(d.wait(Background::Update, &mut |s: &str| steps.push(s.to_string())).unwrap_err(), "AccessDenied: lambda:UpdateFunctionCode");
         assert_eq!(steps, UPDATE_AWS[..3], "a stop says the steps up to where it stopped");
+        // An update that left a part out (its runner agent in Cloudflare, whose sign-in is over) says so with its
+        // result, to a command and on the pages: the rest was updated.
+        let left = "Its Cloudflare runner agent was not updated: the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more.";
+        *lock(&d.updating) = Some(Update { plane: "abcdef123456".into(), steps: &UPDATE_AWS, at: 3, result: Some(Ok(())), ended_ms: now_ms() - 11 * 60_000, note: left.into() });
+        assert_eq!(d.wait(Background::Update, &mut |_| {}).unwrap(), format!("Updated to {DASHBOARD_VERSION}. {left}"));
+        let updated = PlaneView { plane: d.plane_in_use().unwrap(), online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(DASHBOARD_VERSION.into()), status: None };
+        let card = side_update(&updated, lock(&d.updating).as_ref(), &[]);
+        assert!(card.contains(&format!("Updated to {DASHBOARD_VERSION}")) && card.contains("Its Cloudflare runner agent was not updated: the Cloudflare sign-in has expired."), "{card}");
         assert_eq!(d.wait(Background::Move, &mut |_| {}).unwrap_err(), "no move was started");
     }
 
@@ -7566,6 +7639,64 @@ mod tests {
         let done = String::from_utf8(g.task_page().unwrap().body).unwrap();
         if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { std::fs::write(format!("{dir}/done-github.html"), &done).unwrap() }
         assert!(done.contains("<h1>GitHub is connected</h1>") && done.contains("acme&#39;s repositories") && !done.contains(">Back<"));
+    }
+
+    #[test]
+    fn a_cloudflare_sign_in_that_expired_stops_nothing_the_other_sign_ins_reach() {
+        let dir = std::env::temp_dir().join(format!("superci-cf-ended-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        let store = Store::at(&dir);
+        let in_aws = Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: "http://127.0.0.1:9".into(), plane_id: "abcdef123456".into(), label: "superci".into() };
+        let in_cf = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "http://127.0.0.1:9".into(), plane_id: "p1".into(), label: "superci".into() };
+        // Signed in to AWS and to Cloudflare, a control plane in each; Cloudflare no longer renews its sign-in.
+        // (AWS was looked in already and both control planes have this session's key: nothing is asked of a cloud here.)
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.cf = Some(cloudflare::Session::expired_for_test());
+        d.cf_accounts = vec![("a1".into(), "Acme Inc.".into())];
+        d.aws = Some(aws::Session::for_test("123456789012"));
+        d.looked_aws = true;
+        d.planes = vec![in_aws.clone(), in_cf.clone()];
+        d.keyed.extend(["abcdef123456".to_string(), "p1".to_string()]);
+        // Looking for control planes goes on: the sign-in is forgotten, the control plane known in Cloudflare stays
+        // listed, and AWS's is still the session's.
+        d.discover().unwrap();
+        assert!(d.cf.is_none() && d.cf_ended && d.cf_accounts.is_empty());
+        assert_eq!((d.planes.len(), d.signed_in_as().as_deref()), (2, Some("AWS account 123456789012")));
+        // Said once beside what a command lists, and on the pages, with the way to sign in again.
+        assert_eq!(d.ended_notes(), ["The Cloudflare sign-in has expired: what is in Cloudflare was not looked at. `superci login cloudflare` signs in again."]);
+        let notice = d.others_ended_notice();
+        assert!(notice.contains("Your Cloudflare sign-in has expired.") && notice.contains(r#"action="/cloudflare/signin""#) && !notice.contains("Modal"), "{notice}");
+        // What needs Cloudflare says so; what does not goes on.
+        assert_eq!(d.cloudflare().err().as_deref(), Some(CF_ENDED));
+        assert_eq!((crate::commands::needs(CF_ENDED), crate::commands::needs(MODAL_ENDED)), (Some("superci login cloudflare"), Some("superci login modal")));
+        assert!(d.look(false).is_ok(), "a command that lists control planes goes on with AWS's");
+        // Kept as that: no Cloudflare sign-in, that it ended, and AWS's as it was. The next start knows.
+        d.keep();
+        let kept = store.read();
+        assert!(kept.cloudflare.is_none() && kept.cloudflare_ended && !kept.modal_ended && kept.aws.is_some());
+        let mut next = Dashboard::signed_in(Some(store.clone()));
+        assert!(next.cf_ended && next.cf.is_none() && !next.ended_notes().is_empty());
+        // Signed in again: nothing more is said, and nothing of it is kept.
+        next.cf = Some(cloudflare::Session::from_token("test"));
+        assert!(next.ended_notes().is_empty() && next.others_ended_notice().is_empty());
+        next.keep();
+        assert!(!store.read().cloudflare_ended);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Cloudflare alone was signed in to: a command says that its sign-in expired, not that there was none.
+        let mut only = Dashboard::new();
+        only.cf = Some(cloudflare::Session::expired_for_test());
+        assert_eq!(only.ready().unwrap_err(), CF_ENDED);
+        // A token given by name for this run is not SuperCI's to forget: its error is said as it is.
+        let mut given = Dashboard::new();
+        (given.cf, given.cf_given) = (Some(cloudflare::Session::expired_for_test()), true);
+        assert!(given.ready().unwrap_err().contains("the Cloudflare sign-in expired") && given.cf.is_some() && !given.cf_ended);
+        // Modal no longer taking its token is the same.
+        let mut m = Dashboard::new();
+        m.modal = Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() });
+        m.aws = Some(aws::Session::for_test("123456789012"));
+        m.modal_over();
+        assert!(m.modal.is_none() && m.others_ended_notice().contains("Modal no longer accepts your sign-in.") && m.others_ended_notice().contains(r#"action="/modal/signin""#));
+        assert_eq!(m.ended_notes(), ["Modal no longer accepts the sign-in: what is in Modal was not looked at. `superci login modal` signs in again."]);
     }
 
     #[test]

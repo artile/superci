@@ -142,7 +142,7 @@ impl Client {
         let mut grpc = tonic::client::Grpc::new(self.channel.clone());
         self.rt.block_on(async {
             grpc.ready().await.map_err(|e| format!("Modal: {e}"))?;
-            grpc.unary(req, path, tonic_prost::ProstCodec::default()).await.map(|r| r.into_inner()).map_err(|s| format!("Modal {method}: {}", s.message()))
+            grpc.unary(req, path, tonic_prost::ProstCodec::default()).await.map(|r| r.into_inner()).map_err(|s| refused(method, &s))
         })
     }
 
@@ -153,9 +153,9 @@ impl Client {
         let mut grpc = tonic::client::Grpc::new(self.channel.clone());
         self.rt.block_on(async {
             grpc.ready().await.map_err(|e| format!("Modal: {e}"))?;
-            let mut s = grpc.server_streaming(req, path, tonic_prost::ProstCodec::default()).await.map_err(|s| format!("Modal {method}: {}", s.message()))?.into_inner();
+            let mut s = grpc.server_streaming(req, path, tonic_prost::ProstCodec::default()).await.map_err(|s| refused(method, &s))?.into_inner();
             let mut out = vec![];
-            while let Some(m) = s.message().await.map_err(|s| format!("Modal {method}: {}", s.message()))? { out.push(m); if out.len() >= limit { break } }
+            while let Some(m) = s.message().await.map_err(|s| refused(method, &s))? { out.push(m); if out.len() >= limit { break } }
             Ok(out)
         })
     }
@@ -229,6 +229,14 @@ pub fn deploy_plane(session: &Session, plane_id: &str, label: &str, step: &dyn F
 
 /// A Modal control plane's app name.
 pub fn plane_app(plane_id: &str) -> String { format!("superci-plane-{plane_id}") }
+
+/// How it is said that Modal no longer takes a kept token (deleted in Modal, or expired): Modal's own words follow.
+pub const ENDED: &str = "the Modal sign-in is no longer accepted: sign in again";
+
+/// What Modal said no with, for a person: a token it does not take is said as that (see `ENDED`).
+fn refused(method: &str, status: &tonic::Status) -> String {
+    if status.code() == tonic::Code::Unauthenticated { format!("{ENDED} (Modal {method}: {})", status.message()) } else { format!("Modal {method}: {}", status.message()) }
+}
 
 /// The control planes in this workspace: deployed apps named `superci-plane-<id>`, as (plane id, URL).
 pub fn find_planes(session: &Session) -> Result<Vec<(String, String)>> {

@@ -407,9 +407,19 @@ pub fn exchange(p: Pending, code: &str) -> Result<Session> {
     token_call(&[("grant_type", "authorization_code"), ("code", code), ("client_id", OAUTH_CLIENT), ("redirect_uri", &oauth_redirect()), ("code_verifier", &p.verifier)])
 }
 
+/// How it is said that a kept sign-in is over: Cloudflare no longer renews it (its error follows in brackets).
+pub const EXPIRED: &str = "the Cloudflare sign-in expired: sign in again";
+
+/// Whether an error says the sign-in itself is over: Cloudflare no longer renews it, or no longer takes its token.
+pub fn over(error: &str) -> bool { error.contains(EXPIRED) || error.contains("(9109)") || error.contains("Invalid access token") }
+
 impl Session {
     /// A token given to SuperCI by name (SUPERCI_CLOUDFLARE_TOKEN, for a machine with no browser) never expires here.
     pub fn from_token(token: &str) -> Self { Session { access: token.trim().into(), refresh: None, expires_at_ms: now_ms() + 365 * 86_400_000 } }
+
+    /// A kept sign-in whose time is up and that nothing renews (Cloudflare is not asked), for tests.
+    #[cfg(test)]
+    pub fn expired_for_test() -> Self { Session { access: "test".into(), refresh: None, expires_at_ms: 0 } }
 
     /// What renews it, to ask Cloudflare to end it (`superci logout`).
     pub fn refresh_token(&self) -> Option<&str> { self.refresh.as_deref() }
@@ -418,10 +428,10 @@ impl Session {
     /// A client whose token is good for a few more minutes, renewing it when needed.
     pub fn client(&mut self) -> Result<Cloudflare> {
         if self.expires_at_ms < now_ms() + 300_000 {
-            let refresh = self.refresh.clone().ok_or("the Cloudflare sign-in expired: sign in again")?;
+            let refresh = self.refresh.clone().ok_or(EXPIRED)?;
             let renewed = token_call(&[("grant_type", "refresh_token"), ("refresh_token", &refresh), ("client_id", OAUTH_CLIENT)])
                 // Cloudflare refusing what renews it: the sign-in is over. Cloudflare not answering leaves it as it is.
-                .map_err(|e| if e.contains("invalid_grant") || e.contains("invalid_token") { format!("the Cloudflare sign-in expired: sign in again ({e})") } else { e })?;
+                .map_err(|e| if e.contains("invalid_grant") || e.contains("invalid_token") { format!("{EXPIRED} ({e})") } else { e })?;
             // Cloudflare may give a new one to renew with, or leave the one before in place.
             *self = Session { refresh: renewed.refresh.or(Some(refresh)), ..renewed };
         }

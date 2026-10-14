@@ -38,6 +38,12 @@ pub struct Kept {
     /// again: said where it matters, and the key and the control plane stay, so looking goes on working.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub aws_ended: bool,
+    /// The same of Cloudflare's sign-in (Cloudflare no longer renews it) and of Modal's (Modal no longer takes its
+    /// token): what the other sign-ins reach goes on working, and what needs this one says to sign in again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cloudflare_ended: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub modal_ended: bool,
 }
 
 /// What a workspace is called and looks like: what a list of workspaces says of each without asking its control
@@ -63,7 +69,7 @@ pub struct Key { pub name: String, pub value: String, pub planes: Vec<String> }
 impl Kept {
     pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || !self.aws_more.is_empty() || self.modal.is_some() }
     /// Worth keeping: a sign-in, or what is left of one AWS ended (the control plane and the key it is read with).
-    pub fn worth_keeping(&self) -> bool { self.signed_in() || (self.aws_ended && self.key.is_some() && self.plane.is_some()) }
+    pub fn worth_keeping(&self) -> bool { self.signed_in() || ((self.aws_ended || self.cloudflare_ended || self.modal_ended) && self.key.is_some() && self.plane.is_some()) }
 }
 
 #[derive(Clone)]

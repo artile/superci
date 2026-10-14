@@ -173,8 +173,8 @@ pub fn needs(error: &str) -> Option<&'static str> {
     if error == NOT_SIGNED_IN { return Some("superci login") }
     let has = |words: &[&str]| words.iter().any(|w| error.contains(w));
     if error == AWS_ENDED || has(&["Sign in with AWS", "Your AWS sign-in has ended", "ExpiredToken", "RequestExpired"]) { return Some("superci login aws") }
-    if has(&["Sign in with Cloudflare", "Cloudflare sign-in expired"]) { return Some("superci login cloudflare") }
-    if has(&["Sign in with Modal"]) { return Some("superci login modal") }
+    if has(&["Sign in with Cloudflare", "Cloudflare sign-in expired", "Cloudflare sign-in has expired"]) { return Some("superci login cloudflare") }
+    if has(&["Sign in with Modal", "Modal sign-in is no longer accepted", "Modal no longer accepts"]) { return Some("superci login modal") }
     if has(&["Sign in where this control plane runs", "sign in where it runs", "needs SuperCI's own sign-in"]) { return Some("superci login") }
     None
 }
@@ -1164,13 +1164,19 @@ fn connections() -> Result<Done> {
 }
 
 fn planes() -> Result<Done> {
-    let (views, used): (Vec<PlaneView>, usize) = signed_in().all()?;
+    let mut d = signed_in();
+    let (views, used): (Vec<PlaneView>, usize) = d.all()?;
     // One live: it is the one in use. Several: each is live, and none is "the" one (commands name theirs).
     let several = views.iter().filter(|v| v.serves_its_own()).count() > 1;
     let list: Vec<Value> = views.iter().enumerate().map(|(i, v)| { let mut p = plane_json(v); p["in_use"] = (!several && i == used).into(); p["live"] = v.serves_its_own().into(); p }).collect();
     let mut said: Vec<String> = list.iter().map(|p| format!("{}  {:<44} {}{}", p["id"].as_str().unwrap_or_default(), p["where"].as_str().unwrap_or_default(), p["version"].as_str().unwrap_or("not answering"), if p["in_use"] == true { "  in use" } else if several && p["live"] == true { "  live" } else { "" })).collect();
     if said.is_empty() { said.push(format!("No control plane in the clouds signed in to. {}", NO_PLANE.trim_start_matches("There is no control plane yet. "))) }
-    Ok(Done { said, data: json!({ "control_planes": list }) })
+    // A sign-in that is over: said once, beside what the others reach.
+    let notes = d.ended_notes();
+    said.extend(notes.iter().cloned());
+    let mut data = json!({ "control_planes": list });
+    if !notes.is_empty() { data["notes"] = json!(notes) }
+    Ok(Done { said, data })
 }
 
 #[cfg(test)]
