@@ -94,6 +94,8 @@ pub struct Dashboard {
     gitlab_shown: String,
     /// The job its page shows (`?p=job&id=…`, and `gl=…` for a GitLab job of a further connection).
     job_shown: (String, String),
+    /// The run its page shows (`?p=run&repo=…&id=…&attempt=…`).
+    run_shown: (String, String, String),
     aws_pending: Option<aws::Pending>,
     /// When the sign-in with AWS under way was started (see `aws_stuck`).
     aws_asked_ms: u64,
@@ -733,11 +735,13 @@ pub fn run_names(r: &serde_json::Value) -> (String, String) {
     let repo = r["repo"].as_str().unwrap_or_default();
     let short = repo.rsplit('/').next().unwrap_or(repo).to_string();
     let again = r["attempt"].as_u64().filter(|a| *a > 1).map(|a| format!(" · attempt {a}")).unwrap_or_default();
+    // (A GitLab job keeps its stage where a GitHub job keeps its workflow: a pipeline goes by its number.)
+    if r["provider"] == "gitlab" { return (format!("Pipeline {}", r["id"].as_u64().unwrap_or_default()), format!("{short}{again}")) }
     match r["workflow"].as_str().filter(|w| !w.is_empty()) { Some(w) => (w.to_string(), format!("{short}{again}")), None => (short, format!("{}{again}", repo.split('/').next().unwrap_or_default())) }
 }
 
 /// Runs as a table, like the jobs': what the run is, how many jobs of it ran here, how long it took, what it cost,
-/// how it stands, and when. Each row opens the run on its code host.
+/// how it stands, and when. Each row opens the run's page here.
 fn run_table(runs: &[serde_json::Value]) -> String {
     let rows = runs.iter().map(|r| {
         let (kind, word) = match r["state"].as_str().unwrap_or_default() { "passed" => ("good", "Passed"), "failed" => ("bad", "Failed"), "cancelled" => ("", "Cancelled"), "running" => ("accent", "Running"), _ => ("good", "Done") };
@@ -745,8 +749,8 @@ fn run_table(runs: &[serde_json::Value]) -> String {
         let host = if r["provider"] == "gitlab" { logo("gitlab", 14) } else { logo("github", 14) };
         let last = Some(run_last(r)).filter(|l| !l.is_empty()).map(|l| format!(r#"<small class="jt-why held">{}</small>"#, esc(&l))).unwrap_or_default();
         let count = r["jobs"].as_u64().unwrap_or_default();
-        format!(r#"<a class="jt-row" href="{}" target="_blank" rel="noopener"><span class="jt-job"><strong>{}</strong><small>{host}{}</small>{last}</span><span class="jt-runner count">{count} {}</span><span class="jt-num">{}</span><span class="jt-num">{}</span><span class="jt-state {kind}"><i></i>{word}</span><span class="jt-when">{}</span></a>"#,
-            esc(r["link"].as_str().unwrap_or_default()), esc(&title), esc(&sub), if count == 1 { "job" } else { "jobs" }, r["took_ms"].as_u64().map(span).unwrap_or_default(), r["usd"].as_f64().map(usd_fine).unwrap_or_default(), ago(r["at_ms"].as_u64().unwrap_or_default()))
+        format!(r#"<a class="jt-row" href="{}"><span class="jt-job"><strong>{}</strong><small>{host}{}</small>{last}</span><span class="jt-runner count">{count} {}</span><span class="jt-num">{}</span><span class="jt-num">{}</span><span class="jt-state {kind}"><i></i>{word}</span><span class="jt-when">{}</span></a>"#,
+            esc(&run_page_link(r)), esc(&title), esc(&sub), if count == 1 { "job" } else { "jobs" }, r["took_ms"].as_u64().map(span).unwrap_or_default(), r["usd"].as_f64().map(usd_fine).unwrap_or_default(), ago(r["at_ms"].as_u64().unwrap_or_default()))
     }).collect::<String>();
     format!(r#"<div class="jt"><div class="jt-head"><span>Run</span><span>Jobs here</span><span class="jt-num">Time</span><span class="jt-num">Cost</span><span>Status</span><span class="jt-when"></span></div>{rows}</div>"#)
 }
@@ -972,7 +976,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -3067,7 +3071,7 @@ impl Dashboard {
         // The live part is fetched by the page itself. Links and forms within the dashboard change only that part: the
         // page stays as it is (a thin bar at the top) until the next one is ready, so nothing flashes in between.
         let script = r#"<script>(function(){var main=document.getElementById('live'),timer;
-var sections={plane:'planes','add-runners':'runners',gitlab:'repos',job:'jobs'};
+var sections={plane:'planes','add-runners':'runners',gitlab:'repos',job:'jobs',run:'jobs'};
 function qp(n){return new URLSearchParams(location.search).get(n)||''}
 function cc(){return qp('c')}
 function keep(u){['w','c'].forEach(function(n){if(!u.searchParams.has(n)){if(qp(n))u.searchParams.set(n,qp(n))}else if(!u.searchParams.get(n))u.searchParams.delete(n)});return u}
@@ -3333,6 +3337,7 @@ mark();load()})();</script>"#;
             _ if self.modal_pending.is_some() && current.is_none() => (self.overview_page(current).0, true),
             "jobs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(false), jobs_card(current, 200)), false),
             "job" => (self.job_page(current), false),
+            "run" => (self.run_page(current), false),
             "runs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(true), runs_card(current)), false),
             "planes" => (self.planes_page(views), self.deploy_running()),
             "changes" => (changes_page(views, &views.get(view::in_use(views)).map(|v| self.aws_lacks(v)).unwrap_or_default()), false),
@@ -3361,7 +3366,7 @@ mark();load()})();</script>"#;
     }
 
     fn sidebar(section: &str) -> String {
-        let current = match section { "plane" => "planes", "add-runners" => "runners", "gitlab" => "repos", "runs" | "job" => "jobs", s => s };
+        let current = match section { "plane" => "planes", "add-runners" => "runners", "gitlab" => "repos", "runs" | "job" | "run" => "jobs", s => s };
         let link = |id: &str, label: &str, icon: &str| format!(r#"<a href="/?p={id}" aria-current="{}">{icon}<span>{label}</span></a>"#, current == id);
         let nav = format!(r#"<nav class="nav">{}{}{}{}{}</nav>"#, link("overview", "Overview", ICON_OVERVIEW), link("repos", "Repositories", ICON_REPOS), link("runners", "Runners", ICON_RUNNERS),
             link("workflows", "Workflows", ICON_WORKFLOWS), link("jobs", "Jobs", ICON_JOBS));
@@ -3831,6 +3836,41 @@ mark();load()})();</script>"#;
         // What the cache keeps (a control plane from before has none to say).
         let caches = if v.aws { cloudflare::plane_get(v.plane.url(), &self.status_key, "/caches").ok() } else { None };
         format!(r#"{bar}<div class="cards">{}{}{}{here}</div>"#, called_card(v), limits_card(v, public), cache_card(v, caches.as_ref()))
+    }
+
+    /// One run's page: how it stands, how long it took (its first job queued to its last over), what its machines cost,
+    /// the job it waited for last, and its jobs here (each opening its own page). Its page at GitHub or GitLab is a
+    /// line of it; a run from a computer has none.
+    fn run_page(&self, v: Option<&PlaneView>) -> String {
+        let back = r#"<a class="chip" href="/?p=runs">‹ Runs</a>"#;
+        let Some(v) = v else { return format!(r#"<div class="bar"><h1 class="page-title">Run</h1>{back}</div>"#) };
+        let (repo, id, attempt) = self.run_shown.clone();
+        let jobs: Vec<serde_json::Value> = v.jobs().iter().map(|j| with_hosts(v, j)).collect();
+        let runs = runs_of(&jobs);
+        let found = runs.into_iter().find(|r| r["repo"].as_str() == Some(repo.as_str()) && r["id"].as_u64().is_some_and(|n| n.to_string() == id) && r["attempt"].as_u64().unwrap_or(0).to_string() == if attempt.is_empty() { "0" } else { attempt.as_str() });
+        let Some(r) = found else {
+            return format!(r#"<div class="bar"><h1 class="page-title">Run</h1>{back}</div><div class="cards">{}</div>"#, empty_state(&icon("play"), "Not among the latest runs", "The control plane keeps the latest jobs; this run's are not among them.", ""))
+        };
+        let (title, sub) = run_names(&r);
+        let (kind, word) = match r["state"].as_str().unwrap_or_default() { "passed" => ("good", "Passed"), "failed" => ("bad", "Failed"), "cancelled" => ("", "Cancelled"), "running" => ("accent", "Running"), _ => ("good", "Done") };
+        let ids: Vec<u64> = r["job_ids"].as_array().into_iter().flatten().filter_map(|i| i.as_u64()).collect();
+        let mut its: Vec<serde_json::Value> = jobs.into_iter().filter(|j| j["repo"] == r["repo"] && j["run_id"] == r["id"] && j["job_id"].as_u64().is_some_and(|i| ids.contains(&i))
+            && j["attempt"].as_u64().filter(|a| *a > 0) == r["attempt"].as_u64()).collect();
+        its.sort_by_key(|j| j["at_ms"].as_u64().unwrap_or_default());
+        let link = r["link"].as_str().unwrap_or_default().to_string();
+        let at = if link.is_empty() { r#"<small class="faint">Run from a computer: it has no page at GitHub.</small>"#.to_string() }
+            else { format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">On {} ›</a>"#, esc(&link), if r["provider"] == "gitlab" { "GitLab" } else { "GitHub" }) };
+        let row = |label: &str, value: String| if value.is_empty() { String::new() } else { format!(r#"<div class="limit"><span class="limit-text"><strong>{label}</strong></span><span class="limit-do">{value}</span></div>"#) };
+        let facts = [
+            row("Status", format!(r#"<span class="jt-state {kind}"><i></i>{word}</span>"#)),
+            row("Jobs here", its.len().to_string()),
+            row("Time", r["took_ms"].as_u64().map(span).unwrap_or_default()),
+            row("Cost", r["usd"].as_f64().map(usd).unwrap_or_default()),
+            row("Last to end", esc(run_last(&r).trim_start_matches("Last to end: "))),
+        ].concat();
+        let going = kind == "accent";
+        format!(r#"{}<div class="bar"><h1 class="page-title">{}</h1>{back}</div><div class="cards"><section class="card"><div class="card-head"><h2>{}</h2>{at}</div><div class="limits">{facts}</div></section><section class="card"><div class="card-head"><h2>Its jobs</h2></div>{}<p class="note" style="margin:10px 8px 0">Its time is from its first job queued here to its last one over; jobs of it on other runners are not counted.</p></section></div>"#,
+            if going { r#"<div data-refresh="4"></div>"# } else { "" }, esc(&title), esc(&sub), job_table(&its))
     }
 
     /// One job's page: what it is and how it stands, its machine and cost, how its start went, and the end of its log
@@ -4749,7 +4789,7 @@ fn empty_state(icon_svg: &str, title: &str, text: &str, action: &str) -> String 
 
 fn section_name(section: &str) -> &str {
     match section {
-        s if ["plane", "planes", "all", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "job", "runs", "repos", "gitlab"].contains(&s) => s,
+        s if ["plane", "planes", "all", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "job", "runs", "run", "repos", "gitlab"].contains(&s) => s,
         _ => "overview",
     }
 }
@@ -4757,7 +4797,7 @@ fn section_name(section: &str) -> &str {
 fn section_title(section: &str) -> &'static str {
     match section {
         "plane" => "Set up a control plane", "planes" => "Control plane", "changes" => "Changelog", "add-runners" => "Add a provider", "runners" => "Runners",
-        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" | "runs" => "Jobs", "job" => "Job", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
+        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" | "runs" => "Jobs", "job" => "Job", "run" => "Run", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
     }
 }
 
@@ -5268,6 +5308,12 @@ const ICON_CHIP: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill=
 
 fn signin_button(cloud: &str, label: &str, primary: bool) -> String {
     format!(r#"<form method="post" action="/{cloud}/signin"><input type="hidden" name="next"><button class="{}">{}</button></form>"#, if primary { "button primary" } else { "button secondary" }, esc(label))
+}
+
+/// A run's page here: its jobs, how long it took and what it cost (its page at its code host from there).
+fn run_page_link(r: &serde_json::Value) -> String {
+    let repo: String = url::form_urlencoded::byte_serialize(r["repo"].as_str().unwrap_or_default().as_bytes()).collect();
+    format!("/?p=run&repo={repo}&id={}&attempt={}", r["id"].as_u64().unwrap_or_default(), r["attempt"].as_u64().unwrap_or(0))
 }
 
 /// A job's page here: what it is, how its start went, and its log (its page at its code host from there).
@@ -5841,6 +5887,7 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
         let new_here = match q("new") { "1" => Some(true), "0" => Some(false), _ => None };
         if q("fragment") == "1" {
             shared.lock().unwrap_or_else(|e| e.into_inner()).gitlab_shown = q("g").chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).take(12).collect();
+            if q("p") == "run" { shared.lock().unwrap_or_else(|e| e.into_inner()).run_shown = (q("repo").chars().filter(|c| c.is_ascii_alphanumeric() || "-_./".contains(*c)).take(200).collect(), q("id").chars().filter(|c| c.is_ascii_digit()).take(20).collect(), q("attempt").chars().filter(|c| c.is_ascii_digit()).take(4).collect()) }
             if q("p") == "job" { shared.lock().unwrap_or_else(|e| e.into_inner()).job_shown = (q("id").chars().filter(|c| c.is_ascii_digit()).take(20).collect(), q("gl").chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-').take(24).collect()) }
             return Response::new(200, "text/html; charset=utf-8", Dashboard::live(shared, q("p"), q("plane").parse().ok(), new_here, req.last.as_deref()))
         }

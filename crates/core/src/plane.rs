@@ -734,6 +734,9 @@ fn origin(url: &str) -> String {
     url::Url::parse(url).map(|u| u.origin().ascii_serialization()).unwrap_or_default()
 }
 
+/// How a GitLab job ended, in the words GitHub's jobs say it (`success`, `failure`, `cancelled`).
+fn gitlab_conclusion(status: &str) -> &'static str { match status { "success" => "success", "canceled" => "cancelled", _ => "failure" } }
+
 /// The role the dashboard makes in an AWS account for a control plane (`connect_runners`).
 pub fn role_arn(account_id: &str, plane_id: &str) -> String {
     format!("arn:aws:iam::{account_id}:role/superci-plane-{plane_id}")
@@ -1479,7 +1482,10 @@ impl<'a> ControlPlane<'a> {
                     // Its machine ends by itself after one job; its runner is removed.
                     if gitlab::delete_runner(self.http, gl, r).await.is_ok() { self.store.delete(&format!("glrunner:{}", gitlab::local(&gl.id, r))).await?; }
                     if let Some(mut j) = get_json::<Job>(self.store, &machine_key).await? {
-                        j.state = match ev.status.as_str() { "success" => "done", "failed" => "failed", _ => "cancelled" }.into();
+                        // Its machine ran it to its end: how the job itself ended is its own (as a GitHub job's). One whose
+                        // spot machine AWS took back failed for that, not for itself.
+                        j.state = if ev.status == "canceled" { "cancelled" } else if j.interrupted && ev.status == "failed" { "failed" } else { "done" }.into();
+                        j.conclusion = Some(gitlab_conclusion(&ev.status).into());
                         j.ended_ms.get_or_insert(now);
                         // AWS took its spot machine back: the job it was running is run again (GitLab makes a new
                         // job of it at once), at the next place in the order below AWS's spot machines.
@@ -3455,8 +3461,9 @@ impl<'a> ControlPlane<'a> {
             }
             changed = true;
         }
-        if let Some(state) = match status { "success" => Some("done"), "failed" => Some("failed"), "canceled" => Some("cancelled"), _ => None } {
+        if let Some(state) = match status { "success" | "failed" => Some("done"), "canceled" => Some("cancelled"), _ => None } {
             j.state = state.into();
+            j.conclusion = Some(gitlab_conclusion(status).into());
             j.ended_ms.get_or_insert(at("finished_at").unwrap_or(now));
             if gitlab::delete_runner(self.http, gl, runner).await.is_ok() { let _ = self.store.delete(&format!("glrunner:{}", gitlab::local(&gl.id, runner))).await; }
             changed = true;
