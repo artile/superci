@@ -74,7 +74,9 @@ fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     b.goto(&link);
     // From the Overview's recent jobs to the job's page.
     b.wait(&shows("Usage"));
-    b.click("nav a", "Jobs");
+    b.click("nav a", "Runs");
+    b.wait(&shows("Recent runs"));
+    b.click(".tabs a", "Jobs");
     b.wait(&shows("Recent jobs"));
     b.click("main a", "tests");
     b.wait("document.querySelector('details.lstep')");
@@ -174,7 +176,9 @@ fn the_default_machine_is_picked_on_workflows_and_the_workspace_renamed_in_setti
     b.click("#rename-workspace button.primary", "Save");
     until("the workspace's folder renamed", || home.join("workspaces/acme/sign-ins.json").exists() && !home.join("workspaces/default").exists());
     b.wait(&shows("acme"));
-    b.click("nav a", "Jobs");
+    b.click("nav a", "Runs");
+    b.wait(&shows("Recent runs"));
+    b.click(".tabs a", "Jobs");
     b.wait(&shows("Recent jobs"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);

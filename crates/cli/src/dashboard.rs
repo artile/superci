@@ -3413,7 +3413,7 @@ mark();load()})();</script>"#;
             "jobs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(false), jobs_card(current, 200)), false),
             "job" => (self.job_page(current), false),
             "run" => (self.run_page(current), false),
-            "runs" => (format!(r#"<div class="bar"><h1 class="page-title">Jobs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(true), runs_card(current)), false),
+            "runs" => (format!(r#"<div class="bar"><h1 class="page-title">Runs</h1>{}</div><div class="cards">{}</div>"#, jobs_tabs(true), runs_card(current)), false),
             "planes" => (self.planes_page(views), self.deploy_running()),
             "changes" => (changes_page(views, &views.get(view::in_use(views)).map(|v| self.aws_lacks(v)).unwrap_or_default()), false),
             "workflows" => (self.workflows_page(current), false),
@@ -3441,10 +3441,10 @@ mark();load()})();</script>"#;
     }
 
     fn sidebar(section: &str) -> String {
-        let current = match section { "plane" => "planes", "add-runners" => "runners", "gitlab" => "repos", "runs" | "job" | "run" => "jobs", s => s };
+        let current = match section { "plane" => "planes", "add-runners" => "runners", "gitlab" => "repos", "jobs" | "job" | "run" => "runs", s => s };
         let link = |id: &str, label: &str, icon: &str| format!(r#"<a href="/?p={id}" aria-current="{}">{icon}<span>{label}</span></a>"#, current == id);
         let nav = format!(r#"<nav class="nav">{}{}{}{}{}</nav>"#, link("overview", "Overview", ICON_OVERVIEW), link("repos", "Repositories", ICON_REPOS), link("runners", "Runners", ICON_RUNNERS),
-            link("workflows", "Workflows", ICON_WORKFLOWS), link("jobs", "Jobs", ICON_JOBS));
+            link("workflows", "Workflows", ICON_WORKFLOWS), link("runs", "Runs", ICON_JOBS));
         // At the bottom: an update for the control plane, when it needs one (filled in by the page's live part), the
         // control plane itself, its settings (and signing SuperCI out on this computer), and what is new.
         let foot = format!(r#"<div class="side-foot"><div id="side-update">{}</div><nav class="nav">{}{}{}</nav></div>"#, lock(side()), link("planes", "Control plane", ICON_PLANE), link("settings", "Settings", ICON_SETTINGS), link("changes", "Changelog", ICON_NEWS));
@@ -4880,7 +4880,7 @@ fn section_name(section: &str) -> &str {
 fn section_title(section: &str) -> &'static str {
     match section {
         "plane" => "Set up a control plane", "planes" => "Control plane", "changes" => "Changelog", "add-runners" => "Add a provider", "runners" => "Runners",
-        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" | "runs" => "Jobs", "job" => "Job", "run" => "Run", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
+        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" => "Jobs", "runs" => "Runs", "job" => "Job", "run" => "Run", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
     }
 }
 
@@ -5513,7 +5513,9 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
 
     // No jobs at all yet: the page as it will be, with nothing in it.
     if jobs.is_empty() { return overview_empty_cards(&v.label()) }
-    let latest = job_table(&jobs[..jobs.len().min(5)]);
+    // The latest runs (a run is what a push or a pull request starts; its jobs are a click away).
+    let runs = runs_of(&jobs);
+    let latest = if runs.is_empty() { job_table(&jobs[..jobs.len().min(5)]) } else { run_table(&runs[..runs.len().min(5)]) };
     // Where they ran.
     let mut by: Vec<(String, String, usize, u64, f64)> = vec![];
     for j in &day {
@@ -5547,7 +5549,7 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
         None => (r#"<h2>Jobs</h2><span class="card-sub">Last 24 hours</span>"#.to_string(), figures, split),
     };
     // The period in one card; the latest jobs in their own, with all of them a click away.
-    let jobs_card = format!(r#"<section class="card big jobs-card"><div class="card-head">{head}</div>{figures}{split}</section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div>{latest}<div class="card-foot end"><a class="chip" href="/?p=jobs">All jobs ›</a></div></section>"#);
+    let jobs_card = format!(r#"<section class="card big jobs-card"><div class="card-head">{head}</div>{figures}{split}</section><section class="card big jobs-card"><div class="card-head"><h2>Latest</h2></div>{latest}<div class="card-foot end"><a class="chip" href="/?p={}">All {} ›</a></div></section>"#, if runs.is_empty() { "jobs" } else { "runs" }, if runs.is_empty() { "jobs" } else { "runs" });
 
     jobs_card
 }
@@ -5592,6 +5594,12 @@ fn usage_figures(u: &serde_json::Value, period: &str, jobs: &[serde_json::Value]
     let jobs_spark = spark((0..count).map(|i| (s(i, "ran"), s(i, "not_ran"), format!("{}: {} ran{}", step_name(i), s(i, "ran"), if s(i, "not_ran") > 0.0 { format!(", {} did not", s(i, "not_ran")) } else { String::new() }))).collect());
     let jobs_kpi = kpi(n("jobs").to_string(), if n("jobs") == 1 { "job" } else { "jobs" }, jobs_spark,
         if n("not_ran") == 0 { format!("{} ran", n("ran")) } else { format!(r#"{} ran<span class="sep">·</span><span class="bad-text">{} did not</span>"#, n("ran"), n("not_ran")) });
+    // Runs, from a control plane that counts them (0.19.6 and newer): their number, with their jobs beside it.
+    let jobs_kpi = if u["runs"].is_u64() && n("runs") > 0 {
+        let runs_spark = spark((0..count).map(|i| (s(i, "runs"), 0.0, format!("{}: {} {}", step_name(i), s(i, "runs"), if s(i, "runs") == 1.0 { "run" } else { "runs" }))).collect());
+        kpi(n("runs").to_string(), if n("runs") == 1 { "run" } else { "runs" }, runs_spark,
+            if n("not_ran") == 0 { format!("{} {}", n("jobs"), if n("jobs") == 1 { "job" } else { "jobs" }) } else { format!(r#"{} jobs<span class="sep">·</span><span class="bad-text">{} did not run</span>"#, n("jobs"), n("not_ran")) })
+    } else { jobs_kpi };
     // Minutes: what the machines ran, and what the code host bills (each job rounded up to a minute).
     let minutes = |m: f64| if m >= 6000.0 { format!("{:.0} h", m / 60.0) } else if m >= 100.0 { format!("{:.0} min", m) } else { format!("{:.1} min", m) };
     let host = if jobs.iter().any(|j| j["provider"] == "gitlab") && jobs.iter().any(|j| j["provider"] != "gitlab") { "GitHub and GitLab" } else if jobs.iter().any(|j| j["provider"] == "gitlab") { "GitLab" } else { "GitHub" };
@@ -5662,7 +5670,7 @@ fn jobs_card(v: Option<&PlaneView>, limit: usize) -> String {
 
 /// The Jobs page's two ways to look: job by job, or by the run they are of.
 fn jobs_tabs(runs: bool) -> String {
-    format!(r#"<div class="tabs" role="tablist"><a class="tab" role="tab" href="/?p=jobs" aria-selected="{}">Jobs</a><a class="tab" role="tab" href="/?p=runs" aria-selected="{runs}">Runs</a></div>"#, !runs)
+    format!(r#"<div class="tabs" role="tablist"><a class="tab" role="tab" href="/?p=runs" aria-selected="{runs}">Runs</a><a class="tab" role="tab" href="/?p=jobs" aria-selected="{}">Jobs</a></div>"#, !runs)
 }
 
 /// The latest runs, of the jobs the control plane keeps.
@@ -7736,12 +7744,12 @@ mod tests {
         let view = PlaneView { plane, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(status) };
         let page = d.render("runs", &[view.clone()], None);
         preview("runs", &page);
-        assert!(page.contains(r#"<a class="tab" role="tab" href="/?p=jobs" aria-selected="false">Jobs</a><a class="tab" role="tab" href="/?p=runs" aria-selected="true">Runs</a>"#) && page.contains("<h2>Recent runs</h2>"), "{page}");
+        assert!(page.contains(r#"<a class="tab" role="tab" href="/?p=runs" aria-selected="true">Runs</a><a class="tab" role="tab" href="/?p=jobs" aria-selected="false">Jobs</a>"#) && page.contains("<h2>Recent runs</h2>"), "{page}");
         assert!(page.contains(r#"<small class="jt-why held">Last to end: E2E (1/2), 6m 12s after 1m 5s waiting for a machine</small></span><span class="jt-runner count">3 jobs</span><span class="jt-num">9m 17s</span><span class="jt-num">$0.53</span><span class="jt-state bad"><i></i>Failed</span>"#), "{page}");
         assert!(page.contains(r#"<span class="jt-runner count">1 job</span>"#) && page.contains(r#"<span class="jt-state accent"><i></i>Running</span>"#) && page.contains("app · attempt 2"));
         let jobs_page = d.render("jobs", &[view], None);
         assert!(jobs_page.contains(r#"href="/?p=jobs" aria-selected="true">Jobs</a>"#) && jobs_page.contains("<h2>Recent jobs</h2>"));
-        assert!(Dashboard::sidebar("runs").contains(r#"<a href="/?p=jobs" aria-current="true">"#));
+        assert!(Dashboard::sidebar("runs").contains(r#"<a href="/?p=runs" aria-current="true">"#) && Dashboard::sidebar("jobs").contains(r#"<a href="/?p=runs" aria-current="true">"#));
     }
 
     #[test]
@@ -7802,7 +7810,7 @@ mod tests {
         let d = with_cloudflare(&[("a1", "Acme Inc.")]);
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         let t = now_ms() - 3_600_000;
-        let job = |id: u64, state: &str, cloud: &str, wait: Option<u64>, took: u64, error: Option<&str>| { let t = t - (id % 4) * 3 * 3_600_000; serde_json::json!({ "job_id": id, "run_id": 9, "repo": "acme/app", "state": state, "at_ms": t,
+        let job = |id: u64, state: &str, cloud: &str, wait: Option<u64>, took: u64, error: Option<&str>| { let t = t - (id % 4) * 3 * 3_600_000; serde_json::json!({ "job_id": id, "run_id": 0, "repo": "acme/app", "state": state, "at_ms": t,
             "runner": null, "runner_id": null, "installation_id": 1, "cloud": cloud, "machine_id": if cloud.is_empty() { serde_json::Value::Null } else { "m".into() }, "machine_type": "4cpu-12gb", "error": error, "seen_in_progress": wait.is_some(),
             "usd_per_hour": 0.4, "started_ms": wait.map(|w| t + w), "ended_ms": wait.map(|w| t + w + took), "launched_ms": t, "cpu": 4,
             "name": (["", "test", "lint", "build", "e2e", "deploy", "e2e"][id as usize % 7]), "workflow": "ci" }) };
@@ -7815,6 +7823,7 @@ mod tests {
         preview("overview-new", &html);
         // The control plane is one quiet chip: no address, version or label.
         assert!(!html.contains("plane-chip") && !html.contains("superci.acme.workers.dev") && !html.contains("runs-on: superci") && !html.contains("Copy"));
+        // (Jobs of no run, as here: listed as jobs; see the next test for runs.)
         // Three figures (no "did not run" headline, no count in the footer); All jobs as a button.
         assert!(!html.contains("jobs did not run") && html.contains(r#"<div class="kpi-num">6</div><div class="kpi-cap">jobs</div>"#) && html.contains(r#"<div class="kpi-sub">3 ran<span class="sep">·</span><span class="bad-text">2 did not</span>"#)
             && html.matches(r#"<svg class="spark""#).count() == 3 && html.contains("<h2>Latest</h2>") && html.contains(">9 s</div>"));
@@ -7834,6 +7843,28 @@ mod tests {
             preview(&format!("skeleton-{section}"), &page);
             assert!(page.contains("Reading your control plane"), "{section}");
         }
+    }
+
+    #[test]
+    fn overview_lists_the_latest_runs_and_counts_runs_when_the_control_plane_does() {
+        let d = with_cloudflare(&[("a1", "Acme Inc.")]);
+        let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
+        let t = now_ms() - 3_600_000;
+        let job = |id: u64, run: u64| serde_json::json!({ "job_id": id, "run_id": run, "repo": "acme/app", "state": "done", "conclusion": "success", "at_ms": t, "started_ms": t + 5_000, "ended_ms": t + 65_000,
+            "launched_ms": t, "cloud": "cloudflare", "machine_id": "m", "machine_type": "4cpu-12gb", "cpu": 4, "usd_per_hour": 0.4, "name": format!("job{id}"), "workflow": "ci", "installation_id": 1, "runner": null, "runner_id": null, "error": null });
+        let usage = |runs: bool| { let mut u = serde_json::json!({ "jobs": 3, "ran": 3, "not_ran": 0, "machine_minutes": 3.0, "billed_minutes": 3, "usd": 0.02, "host_usd": 0.05, "steps": (0..24).map(|i| serde_json::json!({ "ran": if i == 23 { 3 } else { 0 }, "not_ran": 0, "runs": if i == 23 { 2 } else { 0 }, "minutes": 0.0, "usd": 0.0, "host_usd": 0.0 })).collect::<Vec<_>>() }); if runs { u["runs"] = 2.into() } u };
+        let view = |runs: bool| PlaneView { plane: plane.clone(), online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
+            status: Some(serde_json::json!({ "containers": true, "agents": [], "jobs": [job(1, 7), job(2, 7), job(3, 8)], "usage": { "day": usage(runs), "week": usage(runs), "month": usage(runs) } })) };
+        let html = d.render("overview", &[view(true)], None);
+        preview("overview-runs", &html);
+        // Runs counted, their jobs beside them; the latest runs listed, all of them a click away.
+        assert!(html.contains(r#"<div class="kpi-num">2</div><div class="kpi-cap">runs</div>"#) && html.contains(r#"<div class="kpi-sub">3 jobs</div>"#), "{html}");
+        assert!(html.contains(r#"<a class="chip" href="/?p=runs">All runs ›</a>"#) && html.matches(r#"class="jt-row" href="/?p=run&amp;"#).count() == 2, "{html}");
+        // A control plane that does not count runs yet: jobs, as before.
+        let older = d.render("overview", &[view(false)], None);
+        assert!(older.contains(r#"<div class="kpi-num">3</div><div class="kpi-cap">jobs</div>"#));
+        // Runs is the page in the sidebar, its Runs tab first.
+        assert!(Dashboard::sidebar("overview").contains(r#"<a href="/?p=runs" aria-current="false">"#) && Dashboard::sidebar("overview").contains("<span>Runs</span>"));
     }
 
     #[test]

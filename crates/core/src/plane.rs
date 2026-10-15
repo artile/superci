@@ -474,13 +474,15 @@ pub struct Day { #[serde(default)] pub spend: std::collections::BTreeMap<String,
 /// host bills (each job rounded up); what they cost and what the code host's runners would have; each one's wait.
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 pub struct Hour {
+    /// Runs: each counted once, in the hour of its first job counted.
+    #[serde(default)] pub runs: u64,
     #[serde(default)] pub jobs: u64, #[serde(default)] pub ran: u64, #[serde(default)] pub not_ran: u64, #[serde(default)] pub ms: u64,
     #[serde(default)] pub billed: u64, #[serde(default)] pub usd: f64, #[serde(default)] pub host_usd: f64, #[serde(default)] pub waits: Vec<u64>,
 }
 
 impl Hour {
     fn add(&mut self, o: &Hour) {
-        (self.jobs, self.ran, self.not_ran, self.ms, self.billed) = (self.jobs + o.jobs, self.ran + o.ran, self.not_ran + o.not_ran, self.ms + o.ms, self.billed + o.billed);
+        (self.runs, self.jobs, self.ran, self.not_ran, self.ms, self.billed) = (self.runs + o.runs, self.jobs + o.jobs, self.ran + o.ran, self.not_ran + o.not_ran, self.ms + o.ms, self.billed + o.billed);
         (self.usd, self.host_usd) = (self.usd + o.usd, self.host_usd + o.host_usd);
         self.waits.extend_from_slice(&o.waits);
     }
@@ -807,6 +809,9 @@ pub const USAGE_PERIODS: [(&str, u64, usize); 3] = [("day", 3_600_000, 24), ("we
 /// minute, as GitHub and GitLab bill), what they cost and what the code host would have, how long they waited for a
 /// machine; and the same for each hour or day of it, the oldest first. From each hour's totals (by the hour since
 /// the epoch, see `hour_of`).
+/// A run's mark, once one of its jobs is counted: its code host (and connection), repository, run and attempt.
+fn run_mark(j: &Job) -> String { format!("counted-run:{}:{}:{}:{}:{}", j.provider, j.gitlab, j.repo, j.run_id, j.attempt.unwrap_or(0)) }
+
 pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms: u64, steps: usize) -> serde_json::Value {
     let (first, last) = ((now.saturating_sub(step_ms * steps as u64)) / 3_600_000 + 1, now / 3_600_000);
     let mut buckets = vec![Hour::default(); steps];
@@ -820,17 +825,24 @@ pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms
     let mut waits = all.waits.clone();
     waits.sort_unstable();
     serde_json::json!({
-        "since_ms": first * 3_600_000, "step_ms": step_ms, "jobs": all.jobs, "ran": all.ran, "not_ran": all.not_ran,
+        "since_ms": first * 3_600_000, "step_ms": step_ms, "runs": all.runs, "jobs": all.jobs, "ran": all.ran, "not_ran": all.not_ran,
         "machine_minutes": (all.ms as f64 / 60_000.0 * 10.0).round() / 10.0, "billed_minutes": all.billed, "usd": all.usd, "host_usd": all.host_usd,
         "wait_median_ms": waits.get(waits.len() / 2), "wait_fastest_ms": waits.first(), "wait_slowest_ms": waits.last(),
-        "steps": buckets.iter_mut().map(|h| serde_json::json!({ "ran": h.ran, "not_ran": h.not_ran, "minutes": (h.ms as f64 / 60_000.0 * 10.0).round() / 10.0, "usd": h.usd, "host_usd": h.host_usd, "wait_median_ms": median(&mut h.waits) })).collect::<Vec<_>>(),
+        "steps": buckets.iter_mut().map(|h| serde_json::json!({ "runs": h.runs, "ran": h.ran, "not_ran": h.not_ran, "minutes": (h.ms as f64 / 60_000.0 * 10.0).round() / 10.0, "usd": h.usd, "host_usd": h.host_usd, "wait_median_ms": median(&mut h.waits) })).collect::<Vec<_>>(),
     })
 }
 
 /// The same from the jobs themselves.
 pub fn usage(jobs: &[Job], host_price: impl Fn(&Job) -> f64, now: u64, step_ms: u64, steps: usize) -> serde_json::Value {
     let mut hours: std::collections::BTreeMap<u64, Hour> = std::collections::BTreeMap::new();
-    for j in jobs.iter().filter(|j| j.at_ms <= now) { let (hour, h) = hour_of(j, host_price(j), now); hours.entry(hour).or_default().add(&h) }
+    let mut sorted: Vec<&Job> = jobs.iter().filter(|j| j.at_ms <= now).collect();
+    sorted.sort_by_key(|j| j.at_ms);
+    let mut seen = std::collections::HashSet::new();
+    for j in sorted {
+        let (hour, mut h) = hour_of(j, host_price(j), now);
+        if j.run_id > 0 && seen.insert(run_mark(j)) { h.runs = 1 }
+        hours.entry(hour).or_default().add(&h)
+    }
     usage_of(&hours, now, step_ms, steps)
 }
 
@@ -2265,7 +2277,14 @@ impl<'a> ControlPlane<'a> {
                 if newer { self.store.put_until(&at, serde_json::to_string(j).map_err(|e| e.to_string())?, j.at_ms + 14 * 86_400_000).await? }
             }
         }
-        if let Some(h) = add { self.count(j, &h).await? }
+        if let Some(mut h) = add {
+            // The first of its run's jobs counted counts the run (marked for as long as its jobs are kept).
+            if h.jobs > 0 && j.run_id > 0 && self.store.put_if_absent(&run_mark(j), String::new()).await? {
+                self.store.put_until(&run_mark(j), String::new(), j.at_ms + JOB_KEPT_MS).await?;
+                h.runs = 1;
+            }
+            self.count(j, &h).await?
+        }
         Ok(())
     }
 

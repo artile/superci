@@ -85,7 +85,9 @@ fn a_github_jobs_page_shows_its_log_in_steps_and_leads_to_github() {
     if let Some(mut b) = Browser::open(1300, 900) {
         b.goto(&link);
         b.wait("document.querySelector('main') && document.querySelector('main').innerText.includes('Usage')");
-        b.click("nav a", "Jobs");
+        b.click("nav a", "Runs");
+        b.wait("document.querySelector('main').innerText.includes('Recent runs')");
+        b.click(".tabs a", "Jobs");
         b.wait("document.querySelector('main').innerText.includes('Recent jobs')");
         b.click("main a", "test");
         b.wait("document.querySelector('details.lstep')");
