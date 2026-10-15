@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.2 — unreleased
+- `superci runs create` and `superci caches delete` go on when SuperCI's cloud sign-in has ended, or another account is signed in: they need only this computer's key with the control plane it is kept for, as looking at jobs, runs, usage and artifacts already did. (AWS ends its sign-in after twelve hours, and when you sign out of the AWS console to sign in to another account.) Changing a control plane's settings still needs a sign-in to the cloud account it runs in, and says so.
+
 ## 0.19.1 — 2026-10-15
 - A GitHub job's page shows its lines while it runs. GitHub gives a job's log only once it has ended; its machine now sends what the runner writes of each step as it goes (every two seconds, in the pieces the runner writes them), kept in the control plane's bucket until GitHub's own log is there. A step that writes little shows its lines when it ends.
 - Runs from a computer send only what changed since the working tree this computer last sent whole (kept in the control plane's bucket as a base): a few files' worth instead of the whole tree, for an agent that runs the tests after each edit. The machine puts the base in place, then the changes, and removes what was removed. A base gone (the bucket keeps it up to a month), or changes of half the tree or more, and the whole tree is sent again.

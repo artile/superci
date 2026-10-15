@@ -471,12 +471,17 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 let key = w(2);
                 let would = if key.is_empty() { format!("take every cache entry of {repo} out (jobs then save them anew)") } else { format!("take the cache entry {key} of {repo} out") };
                 confirmed(args, &would)?;
-                let mut d = ready_to_set()?;
-                in_use(&d)?;
                 let mut fields = vec![field("repo", repo)];
                 if !key.is_empty() { fields.push(field("key", key)) }
                 if let Some(scope) = args.get("scope") { fields.push(field("scope", scope)) }
-                apply!(d, args, would, "/caches/delete", &fields);
+                if let Some(done) = dry(args, &would, "/caches/delete", &fields) { return Ok(done) }
+                // Asked of the control plane with this computer's key (a key that only reads may not): no cloud
+                // sign-in is needed for it.
+                let mut d = signed_in();
+                if d.signed_in_as().is_none() && given_key().is_some() { return Err(ONLY_READS.into()) }
+                let (v, kept) = look(&mut d)?;
+                let body: serde_json::Map<String, Value> = fields.iter().map(|(k, v)| (k.to_string(), Value::String(v.clone()))).collect();
+                crate::cloudflare::plane_post(v.plane.url(), &crate::cloudflare::plane_key(&kept, v.plane.url()), "/caches/delete", &Value::Object(body))?;
                 return Ok(Done::said(if key.is_empty() { format!("{repo}'s cache entries are out.") } else { format!("{key} is out of {repo}'s cache.") }))
             }
             let d = signed_in();
