@@ -1622,6 +1622,16 @@ impl Dashboard {
 
     /// Takes the sign-in to an AWS account in hand, when it is kept: what is done next for a control plane in that
     /// account, or for its runners there, is done with that account's sign-in and no other. Whether it is in hand.
+    /// Whether this session is signed in where a control plane runs (what changing it, or updating it, needs).
+    fn signed_in_at(&self, plane: &Plane) -> bool {
+        match plane {
+            Plane::Aws { account_id, .. } => self.aws.iter().chain(self.aws_others.iter()).any(|a| &a.account_id == account_id),
+            Plane::Cloudflare { .. } => self.cf.is_some(),
+            Plane::Modal { .. } => self.modal.is_some(),
+            Plane::Seen { .. } => false,
+        }
+    }
+
     fn hold_account(&mut self, account: &str) -> bool {
         if self.aws.as_ref().is_some_and(|a| a.account_id == account) { return true }
         let Some(i) = self.aws_others.iter().position(|a| a.account_id == account) else { return false };
@@ -2606,6 +2616,11 @@ impl Dashboard {
                 let plane = self.plane();
                 self.selected = was;
                 let plane = plane?;
+                // Its cloud's sign-in ended (AWS ends one after 12 hours): said, with what to do.
+                if !self.signed_in_at(&plane) && !matches!(plane, Plane::Seen { .. }) {
+                    let name = provider_name(plane.cloud());
+                    return Ok(message(403, &format!("Sign in with {name} to update it"), &format!("Updating changes the control plane in {name}: sign in there (the sign-in kept here has ended), then press Update again.")))
+                }
                 self.own().check(&plane)?;
                 // What it runs now: whether its jobs' containers come along, and whether any would be cut short.
                 let Some(status) = status_soon(plane.url(), &self.status_key) else {
@@ -3426,7 +3441,7 @@ mark();load()})();</script>"#;
         // Shown while it is older, and also while its update runs (it does not answer for a moment while it restarts,
         // and answers with the new version before the update's last step) and for a little while after it ended.
         let its_update = |v: &PlaneView| updating.as_ref().is_some_and(|u| u.plane == v.plane.plane_id() && (u.result.is_none() || now_ms() < u.ended_ms + 20_000));
-        let card = current.filter(|v| v.outdated() || its_update(v)).map(|v| side_update(v, updating.as_ref(), &self.aws_lacks(v))).unwrap_or_default();
+        let card = current.filter(|v| v.outdated() || its_update(v)).map(|v| side_update(v, updating.as_ref(), &self.aws_lacks(v), self.signed_in_at(&v.plane))).unwrap_or_default();
         // While an update runs, the page looks again every two seconds (its steps).
         // While Modal's sign-in waits, every page looks again: Modal's page does not come back here by itself, so the
         // dashboard notices the approval wherever you are.
@@ -4891,9 +4906,11 @@ fn cloud_name(cloud: &str) -> &str {
 
 /// A control plane older than this dashboard, for the sidebar on every page: the versions, a link to what is new, and
 /// its Update button.
-fn side_update(v: &PlaneView, updating: Option<&Update>, aws_lacks: &[&'static superci_core::permissions::Need]) -> String {
+fn side_update(v: &PlaneView, updating: Option<&Update>, aws_lacks: &[&'static superci_core::permissions::Need], signed_in: bool) -> String {
     let action = if let Some(u) = updating.filter(|u| u.plane == v.plane.plane_id() && !matches!(u.result, Some(Ok(())))) { update_progress(u) }
         else if matches!(v.plane, Plane::Seen { .. }) { r#"<small>Sign in where it runs to update it.</small>"#.to_string() }
+        // Its cloud's sign-in has ended: signing in comes first, and back here.
+        else if !signed_in { signin_button(v.plane.cloud(), &format!("Sign in with {} to update", provider_name(v.plane.cloud())), true).replace(r#"class="button primary""#, r#"class="button primary sm""#) }
         else { format!(r#"<form method="post" action="/plane/update" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Updating…'"><input type="hidden" name="next"><button class="button primary sm">Update to {DASHBOARD_VERSION}</button></form>"#) };
     // While it updates, and once it has: said so, on every page.
     match updating.filter(|u| u.plane == v.plane.plane_id()).map(|u| &u.result) {
@@ -7360,36 +7377,39 @@ mod tests {
         // An older control plane: its update says what it also asks for.
         let mut old = view(status(serde_json::json!({})));
         old.version = Some("0.9.11".into());
-        assert!(side_update(&old, None, &[]).contains("It also asks for 9 new permissions in AWS, 1 new permission in GitHub."));
+        assert!(side_update(&old, None, &[], true).contains("It also asks for 9 new permissions in AWS, 1 new permission in GitHub."));
+        // Its cloud's sign-in ended: the card signs in first (and comes back), not an Update that cannot go on.
+        let card = side_update(&old, None, &[], false);
+        assert!(card.contains(&format!(r#"<form method="post" action="/{}/signin"><input type="hidden" name="next"><button class="button primary sm">Sign in with {} to update</button></form>"#, old.plane.cloud(), provider_name(old.plane.cloud()))) && !card.contains(r#"action="/plane/update""#), "{card}");
         old.version = Some("0.9.20".into());
-        assert!(side_update(&old, None, &[]).contains("It also asks for 7 new permissions in AWS, 1 new permission in GitHub."), "reading its network, and the network; one request for many spot pools (four); its cache buckets; running a job again");
+        assert!(side_update(&old, None, &[], true).contains("It also asks for 7 new permissions in AWS, 1 new permission in GitHub."), "reading its network, and the network; one request for many spot pools (four); its cache buckets; running a job again");
         // While it updates, on every page: says so (also when the control plane does not answer a moment, or already
         // answers with the new version); once done, that it is.
         let mut u = Update { plane: "p1".into(), steps: &UPDATE_CLOUDFLARE, at: 1, result: None, ended_ms: 0, note: String::new() };
         let mut new = view(status(serde_json::json!({})));
         new.online = false;
-        let card = side_update(&new, Some(&u), &[]);
+        let card = side_update(&new, Some(&u), &[], true);
         assert!(card.contains(&format!("Updating to {DASHBOARD_VERSION}")) && card.contains("It keeps going while you look around.") && card.contains("mini-spin"));
         u.result = Some(Ok(()));
-        assert!(side_update(&new, Some(&u), &[]).contains(&format!("Updated to {DASHBOARD_VERSION}")));
+        assert!(side_update(&new, Some(&u), &[], true).contains(&format!("Updated to {DASHBOARD_VERSION}")));
         // Uploaded, and the version before still answers (its cloud is switching it over): said, looked at again, and
         // no Update button meanwhile. Still the old one ten minutes on: the button is back.
         let mut before = view(status(serde_json::json!({})));
         before.version = Some("0.9.20".into());
         u.ended_ms = now_ms();
-        let card = side_update(&before, Some(&u), &[]);
+        let card = side_update(&before, Some(&u), &[], true);
         assert!(card.contains(&format!("Restarting with {DASHBOARD_VERSION}")) && card.contains("data-refresh") && !card.contains(">Update to ") && !card.contains("Updated to"));
         *lock(&d.updating) = Some(Update { plane: "p1".into(), steps: &UPDATE_CLOUDFLARE, at: 2, result: Some(Ok(())), ended_ms: now_ms(), note: String::new() });
         let planes = d.render("planes", &[before.clone()], None);
         assert!(planes.contains("Restarting…") && !planes.contains(">Update to "), "no second update while it restarts");
         u.ended_ms = now_ms() - 11 * 60_000;
-        assert!(side_update(&before, Some(&u), &[]).contains(">Update to ") && side_update(&before, Some(&u), &[]).contains("Update available"));
+        assert!(side_update(&before, Some(&u), &[], true).contains(">Update to ") && side_update(&before, Some(&u), &[], true).contains("Update available"));
         *lock(&d.updating) = None;
         // Its version had them, but its role was found to lack them (made before): the update says so too.
         old.version = Some("0.9.29".into());
         let lacks: Vec<_> = AWS_RUNNER.iter().filter(|n| n.since == "0.9.12").collect();
         // (Beside what came since its version: one request for many spot pools, four permissions, and its cache buckets.)
-        assert!(side_update(&old, None, &lacks).contains("It also asks for 6 new permissions in AWS.") && side_update(&old, None, &[]).contains("It also asks for 5 new permissions in AWS."));
+        assert!(side_update(&old, None, &lacks, true).contains("It also asks for 6 new permissions in AWS.") && side_update(&old, None, &[], true).contains("It also asks for 5 new permissions in AWS."));
     }
 
     #[test]
@@ -8079,7 +8099,7 @@ mod tests {
         *lock(&d.updating) = Some(Update { plane: "abcdef123456".into(), steps: &UPDATE_AWS, at: 3, result: Some(Ok(())), ended_ms: now_ms() - 11 * 60_000, note: left.into() });
         assert_eq!(d.wait(Background::Update, &mut |_| {}).unwrap(), format!("Updated to {DASHBOARD_VERSION}. {left}"));
         let updated = PlaneView { plane: d.plane_in_use().unwrap(), online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(DASHBOARD_VERSION.into()), status: None };
-        let card = side_update(&updated, lock(&d.updating).as_ref(), &[]);
+        let card = side_update(&updated, lock(&d.updating).as_ref(), &[], true);
         assert!(card.contains(&format!("Updated to {DASHBOARD_VERSION}")) && card.contains("Its Cloudflare runner agent was not updated: the Cloudflare sign-in has expired."), "{card}");
         assert_eq!(d.wait(Background::Move, &mut |_| {}).unwrap_err(), "no move was started");
     }
