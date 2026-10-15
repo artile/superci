@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.5 — unreleased
+- A finished job's page shows its whole log, whatever its size: a GitHub job's from GitHub, a run from a computer's from the bucket. It read only the last 1 MB, so a large log's first steps looked empty. A log that is still cut (a running job's, or one from a control plane older than 0.19.1) says so.
+- `superci jobs retrieve ID --out=FILE` says when the control plane gave only the end of a log, instead of keeping that as the whole.
+
 ## 0.19.4 — 2026-10-15
 - `superci runs create --quiet` prints how each step went and the last lines of one that failed, not every line: for a coding agent, whose every line read costs. `--detach` says the run's id and ends; `superci runs wait ID` follows it. Every run now ends with its steps' results and times, its machine and what it cost.
 - A run from a computer's page in the dashboard lists its artifacts, each a download.

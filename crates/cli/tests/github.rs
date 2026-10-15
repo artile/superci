@@ -193,3 +193,30 @@ fn github_is_connected_from_repositories_and_its_jobs_then_run() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_finished_jobs_page_shows_its_whole_log_however_large() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    served.webhook(queued);
+    served.webhook(served.github.start(id));
+    // 2.4 MB: more than the last part a running job's page reads.
+    // (Its lines in the second its steps began, as GitHub says of them.)
+    let at = served.github.job(id)["started_at"].as_str().unwrap().trim_end_matches('Z').to_string();
+    let mut log = vec![format!("{at}.1000000Z ##[group]Set up job"), format!("{at}.2000000Z ##[endgroup]"), format!("{at}.3000000Z ##[group]Run make test")];
+    log.extend((1..=40_000).map(|n| format!("{at}.4000000Z test {n} of the suite passed in good time")));
+    let log = log.join("\n");
+    assert!(log.len() > 2_000_000);
+    served.webhook(served.github.finish(id, "success", &log, served.now_ms()));
+    let (mut child, link) = dashboard(&home);
+    let (_, view) = part(&link, &format!("/job/view?id={id}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap();
+    assert_eq!(view["truncated"], false);
+    let step = view["steps"].as_array().unwrap().iter().find(|s| s["name"] == "Run make test").unwrap();
+    let lines = step["lines"].as_array().unwrap();
+    assert_eq!((lines.len(), lines[1][2].as_str(), lines[40_000][2].as_str()), (40_001, Some("test 1 of the suite passed in good time"), Some("test 40000 of the suite passed in good time")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
