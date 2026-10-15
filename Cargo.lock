@@ -1567,6 +1567,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "superci-core",
+ "superci-testkit",
  "tokio",
  "tonic",
  "tonic-prost",
@@ -1650,6 +1651,16 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "worker",
+]
+
+[[package]]
+name = "superci-testkit"
+version = "0.19.4"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde_json",
+ "superci-core",
 ]
 
 [[package]]

@@ -1,0 +1,13 @@
+[package]
+name = "superci-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Test-only: a SuperCI control plane served on this computer, with stand-ins for the clouds, for tests of the CLI and the dashboard against it."
+
+[dependencies]
+superci-core = { path = "../core" }
+async-trait.workspace = true
+futures = { version = "0.3", default-features = false, features = ["executor"] }
+serde_json.workspace = true
