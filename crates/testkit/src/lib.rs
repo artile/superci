@@ -7,7 +7,9 @@ pub mod github;
 pub use github::GitHub;
 pub mod gitlab;
 pub use gitlab::GitLab;
+#[cfg(unix)]
 pub mod cloudflare;
+#[cfg(unix)]
 pub use cloudflare::{serve_cloudflare, CloudflarePlane};
 #[cfg(unix)]
 mod browser;

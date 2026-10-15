@@ -1,6 +1,7 @@
 //! The Cloudflare control plane as Cloudflare runs it (its Worker and Durable Object, built, in Cloudflare's own
 //! runtime on this computer: `superci_testkit::serve_cloudflare`), read and used by the CLI. Skipped where `wrangler`
 //! is not installed or the Worker is not built.
+#![cfg(unix)]
 mod common;
 use common::temp;
 use std::process::Command;

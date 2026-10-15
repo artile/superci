@@ -2,12 +2,14 @@
 //! (`crates/plane-cloudflare/build`, by `./build.sh`), in Cloudflare's own runtime (`wrangler dev --local`), with
 //! storage of its own for the test. `None` where `wrangler` is not installed or the Worker is not built.
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
 pub struct CloudflarePlane { pub url: String, pub plane: String, pub key: String, pub run_key: String, child: Child, dir: std::path::PathBuf }
 
 impl Drop for CloudflarePlane {
-    fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); let _ = std::fs::remove_dir_all(&self.dir); }
+    // (The whole of it: `wrangler` starts Cloudflare's runtime as processes of its own, in its group.)
+    fn drop(&mut self) { unsafe { libc::kill(-(self.child.id() as i32), libc::SIGTERM); } let _ = self.child.kill(); let _ = self.child.wait(); let _ = std::fs::remove_dir_all(&self.dir); }
 }
 
 pub fn serve_cloudflare() -> Option<CloudflarePlane> {
@@ -22,7 +24,7 @@ pub fn serve_cloudflare() -> Option<CloudflarePlane> {
     let child = Command::new(wrangler).current_dir(&worker)
         .args(["dev", "--local", "--ip", "127.0.0.1", "--port", &port.to_string(), "--show-interactive-dev-session=false", "--persist-to", &dir.display().to_string(),
             "--var", &format!("PLANE_ID:{plane}"), "--var", &format!("DASHBOARD_KEY_4102444800_TEST:{key}"), "--var", &format!("READ_KEY_4102444800_AGENT:{read}")])
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().ok()?;
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).process_group(0).spawn().ok()?;
     let p = CloudflarePlane { url: format!("http://127.0.0.1:{port}"), plane, key, run_key, child, dir };
     // Up once it answers (its first answer builds the Worker in the runtime: a few seconds).
     let healthy = || -> bool {
