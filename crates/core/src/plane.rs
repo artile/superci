@@ -2447,6 +2447,10 @@ impl<'a> ControlPlane<'a> {
                             let token = job.hello.get_or_insert_with(|| crate::crypto::random_token(18)).clone();
                             let link = if gitlab { format!("{plane_url}/hello?gl={}&t={token}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/hello?runner={name}&t={token}") };
                             aws::with_hello(user_data.clone(), &link).unwrap_or(user_data)
+                        } else if spec.os() == "windows" && plane_url.starts_with("https://") {
+                            // (A Windows machine says the same, and sends its runner's lines as they are written.)
+                            let token = job.hello.get_or_insert_with(|| crate::crypto::random_token(18)).clone();
+                            aws::with_hello_windows(user_data.clone(), &format!("{plane_url}/hello?runner={name}&t={token}")).unwrap_or(user_data)
                         } else { user_data };
                         let mut launched = None;
                         // The regions in order: the next when this one has no room (capacity or quota) for any of the types.

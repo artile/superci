@@ -5259,7 +5259,7 @@ fn cache_card(v: &PlaneView, caches: Option<&serde_json::Value>) -> String {
 }
 
 /// A size in words: 940 MB, 3.4 GB.
-pub(crate) fn size_words(bytes: u64) -> String { if bytes >= 1_000_000_000 { format!("{:.1} GB", bytes as f64 / 1e9) } else if bytes >= 1_000_000 { format!("{} MB", bytes.div_ceil(1_000_000)) } else { format!("{} KB", bytes.div_ceil(1000)) } }
+pub(crate) fn size_words(bytes: u64) -> String { if bytes >= 1_000_000_000 { format!("{:.1} GB", bytes as f64 / 1e9) } else if bytes >= 10_000_000 { format!("{} MB", (bytes + 500_000) / 1_000_000) } else if bytes >= 1_000_000 { format!("{:.1} MB", bytes as f64 / 1e6) } else { format!("{} KB", bytes.div_ceil(1000)) } }
 
 /// How long ago, in words: 5 minutes, 3 hours, 2 days.
 fn ago_words(ms: u64) -> String {
@@ -7237,7 +7237,7 @@ mod tests {
         let html = cache_card(&v, Some(&caches));
         preview("cache", &html);
         assert!(html.contains("<small>On. Jobs on AWS") && html.contains("Turn off") && html.contains(r#"name="size_gb" min="1" max="10000" value="25""#) && html.contains(r#"name="days" min="1" max="30" value="7""#), "{html}");
-        assert!(html.contains("<strong>acme/app</strong><small>3 entries · 3.4 GB · used 2 h ago</small>") && html.contains("<strong>Repository 78</strong><small>1 entry · 5 MB · used 1 min ago</small>") && html.matches(r#"action="/caches/delete""#).count() == 2);
+        assert!(html.contains("<strong>acme/app</strong><small>3 entries · 3.4 GB · used 2 h ago</small>") && html.contains("<strong>Repository 78</strong><small>1 entry · 5.0 MB · used 1 min ago</small>") && html.matches(r#"action="/caches/delete""#).count() == 2);
         assert!(cache_card(&v, Some(&serde_json::json!({ "repos": [], "now_ms": 1 }))).contains("Nothing kept yet."));
         let mut off = view(status(serde_json::json!({ "routing": { "cache": { "off": true, "size_gb": 50 } } })));
         let html = cache_card(&off, None);

@@ -1158,8 +1158,15 @@ pub fn runner_user_data_for(work: &crate::io::Work, max_minutes: u32, os: &str, 
     let watch = notice.map(|url| SPOT_WATCH_WINDOWS.replace("NOTICE_URL", url)).unwrap_or_default();
     // PowerShell, run by EC2Launch at first boot. Bounded like Linux's: Windows powers off after the time bound
     // whatever happens (and the machine terminates when it does); then the runner, for its one job.
+    // GitHub's addresses for the runner, tried first, as on Linux (`reach_github`): a TCP connection each second, 30 at
+    // most; the runner waits 30 s after a refusal.
+    let hosts = runner_hosts(jit);
+    let reach = if hosts.is_empty() { "$w = 0\n".to_string() } else {
+        format!("$w = 0; foreach ($h in @({})) {{ while ($w -lt 30) {{ try {{ (New-Object Net.Sockets.TcpClient($h, 443)).Close(); break }} catch {{ Start-Sleep 1; $w++ }} }} }}\n", hosts.iter().map(|h| format!("'{h}'")).collect::<Vec<_>>().join(","))
+    };
     Ok(format!(r#"<powershell>
 Start-Transcript -Path C:\superci.log -Append
+$t0 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 shutdown.exe /s /f /t {secs} /c "superci: time bound"
 $ProgressPreference = 'SilentlyContinue'
 # The C: drive as large as the disk the machine was given (the image's is 100 GB).
@@ -1172,12 +1179,36 @@ if (-not (Test-Path "$dir\run.cmd")) {{
   Expand-Archive "$env:TEMP\runner.zip" $dir -Force
 }}
 Set-Location $dir
-{watch}& .\run.cmd --jitconfig {jit}
+{reach}{watch}& .\run.cmd --jitconfig {jit}
 shutdown.exe /a
 shutdown.exe /s /f /t 0
 </powershell>
-"#, secs = max_minutes * 60, jit = jit, watch = watch))
+"#, secs = max_minutes * 60, jit = jit, watch = watch, reach = reach))
 }
+
+/// What a Windows machine adds before its runner starts (as `with_hello` on Linux): how its start went, said to the
+/// control plane (when its script began, how long after the machine booted, how long GitHub's addresses refused it,
+/// when the runner was started), and, while the runner runs, what it writes of each step, every two seconds.
+pub fn with_hello_windows(script: String, url: &str) -> Result<String> {
+    if !url.starts_with("https://") || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
+    const RUNNER: &str = "& .\\run.cmd --jitconfig";
+    if !script.contains(RUNNER) || !script.contains("$t0 = ") { return Ok(script) }
+    let said = HELLO_WINDOWS.replace("HELLO_URL", url);
+    let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
+    Ok(format!("{before}{said}{RUNNER}{after}"))
+}
+
+const HELLO_WINDOWS: &str = r#"$up = ((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalSeconds
+$t2 = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+try { Invoke-RestMethod -Method Post -Uri ("HELLO_URL&boot={0:F2}&script=$t0&ready=$t2&gh=$w" -f $up) | Out-Null } catch { }
+Start-Job -ArgumentList $dir -ScriptBlock { param($d)
+  $o = @{}; for ($i = 0; $i -lt 90; $i++) { if (Get-Process Runner.Listener -ErrorAction SilentlyContinue) { break }; Start-Sleep 1 }
+  while ($true) { $r = Get-Process Runner.Listener -ErrorAction SilentlyContinue
+    foreach ($f in Get-ChildItem "$d\_diag\pages\*.log" -ErrorAction SilentlyContinue) { $p = [int64]$o[$f.Name]
+      if ($f.Length -gt $p) { try { $s = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite'); [void]$s.Seek($p, 'Begin'); $b = New-Object byte[] ($f.Length - $p); $n = $s.Read($b, 0, $b.Length); $s.Close()
+        if ($n -lt $b.Length) { $b = $b[0..($n - 1)] }; Invoke-RestMethod -Method Post -Uri "HELLO_URL&live=$($f.Name)&at=$p" -Body ([byte[]]$b) -ContentType 'application/octet-stream' | Out-Null; $o[$f.Name] = $p + $n } catch { } } }
+    if (-not $r) { break }; Start-Sleep 2 } } | Out-Null
+"#;
 
 /// The root filesystem as large as the disk the machine was given. The volume has the size asked for; the image's
 /// partition and filesystem keep the image's own (29 GB of Ubuntu's, 18 of them used) unless they are grown, which
@@ -1571,6 +1602,20 @@ mod tests {
         assert!(script.contains("for h in broker.actions.githubusercontent.com pipelinesghubeus5.actions.githubusercontent.com;do until curl") && script.contains("[ $w -ge 30 ]"), "{script}");
         assert!(script.find("&g=$!").unwrap() < script.find("xargs -0").unwrap() && script.find("xargs -0").unwrap() < script.find("wait $g").unwrap() && script.find("wait $g").unwrap() < script.find("./run.sh").unwrap());
         assert!(runner_hosts("not-base64!").is_empty() && !runner_user_data(&crate::io::Work::GitHub { jit: "abc".into() }, 60).unwrap().contains("wait $g"));
+    }
+
+    #[test]
+    fn a_windows_machine_says_how_its_start_went_and_sends_its_runners_lines() {
+        use base64::Engine;
+        let b64 = |v: serde_json::Value| base64::engine::general_purpose::STANDARD.encode(v.to_string());
+        let jit = b64(serde_json::json!({ ".runner": b64(serde_json::json!({ "ServerUrl": "https://pipelinesghubeus5.actions.githubusercontent.com/AbC123/", "ServerUrlV2": "https://broker.actions.githubusercontent.com/" })), ".credentials": "A".repeat(7_280) }));
+        let script = runner_user_data_for(&crate::io::Work::GitHub { jit }, 360, "windows", Some("https://plane.example/interrupted?runner=acmeci-abc-1&t=tokentokentokentoken")).unwrap();
+        assert!(script.contains("foreach ($h in @('broker.actions.githubusercontent.com','pipelinesghubeus5.actions.githubusercontent.com'))") && script.contains("TcpClient($h, 443)"), "{script}");
+        let said = with_hello_windows(script, "https://plane.example/hello?runner=acmeci-abc-1&t=tokentokentokentoken").unwrap();
+        let runner = said.find("& .\\run.cmd --jitconfig").unwrap();
+        assert!(said.find("&gh=$w").unwrap() < runner && said.find("&live=$($f.Name)&at=$p").unwrap() < runner && said.find("$t0 = ").unwrap() < said.find("&script=$t0").unwrap());
+        assert!(said.len() < 16_384, "{} bytes", said.len());
+        assert!(with_hello_windows(said.clone(), "https://x/'; reboot; '").is_err());
     }
 
     #[test]
