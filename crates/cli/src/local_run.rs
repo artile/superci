@@ -113,7 +113,12 @@ fn repository(root: &Path) -> String {
     if path.split('/').count() == 2 { path } else { format!("local/{}", root.file_name().and_then(|n| n.to_str()).unwrap_or("repository")) }
 }
 
-pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: &str, secrets: &[(String, String)], vars: &[(String, String)], say: &mut dyn FnMut(&str)) -> Result<Done> {
+/// How a run is followed: `quiet`, its jobs' lines are not printed (each step's result is, and the end of a failed
+/// one's log); `detach`, not at all (its id is said, for `superci runs wait`).
+#[derive(Clone, Copy, Default)]
+pub struct Follow { pub quiet: bool, pub detach: bool }
+
+pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: &str, secrets: &[(String, String)], vars: &[(String, String)], how: Follow, say: &mut dyn FnMut(&str)) -> Result<Done> {
     let here = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = std::path::PathBuf::from(git(&here, &["rev-parse", "--show-toplevel"]).map_err(|_| "Run it in a git checkout: the run takes its working tree.".to_string())?);
     let file = here.join(workflow);
@@ -185,14 +190,35 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts, "layered": layered });
     let made = call("POST", "/runs", body.to_string().into_bytes())?;
     let run = made["run_id"].as_str().unwrap_or_default().to_string();
+    if how.detach {
+        return Ok(Done { said: vec![format!("Run {run} of {path} started. Follow it: superci runs wait {run}")], data: json!({ "run_id": run, "jobs": made["jobs"] }) })
+    }
     say(&format!("Run {run} of {path}, on machines of this control plane's"));
-    let (began, mut after, mut last): (std::time::Instant, Vec<u64>, Vec<String>) = (std::time::Instant::now(), vec![], vec![]);
+    follow(plane, key, &run, how, std::time::Instant::now(), say)
+}
+
+/// `superci runs wait ID`: a run from a computer followed to its end, as `runs create` follows the one it starts.
+pub fn wait(plane: &str, key: &str, run: &str, how: Follow, say: &mut dyn FnMut(&str)) -> Result<Done> {
+    if run.is_empty() || !run.bytes().all(|b| b.is_ascii_digit()) { return Err("Say which run: `superci runs wait ID` (ids are in `superci runs list`).".into()) }
+    follow(plane, key, run, how, std::time::Instant::now(), say)
+}
+
+fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Instant, say: &mut dyn FnMut(&str)) -> Result<Done> {
+    let http = crate::aws::Blocking::new();
+    let call = |method: &str, at: &str| -> Result<Value> {
+        let r = Request::new(method, &format!("{plane}{at}")).with_header("authorization", &format!("Bearer {key}"));
+        let res = block_on(http.send(r))?;
+        if res.status == 404 { return Err(format!("No run {run} among this control plane's runs from a computer (they are kept a day).")) }
+        if res.status >= 300 { return Err(format!("the control plane said {}: {}", res.status, res.body_text().trim())) }
+        serde_json::from_slice(&res.body).map_err(|e| format!("the control plane's answer: {e}"))
+    };
+    let (mut after, mut last): (Vec<u64>, Vec<String>) = (vec![], vec![]);
     let mut logs: Vec<Lines> = vec![];
     let mut over_at: Option<std::time::Instant> = None;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let cursor = after.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-        let st = call("GET", &format!("/runs/{run}?after={cursor}"), vec![])?;
+        let st = call("GET", &format!("/runs/{run}?after={cursor}"))?;
         let jobs = st["jobs"].as_array().cloned().unwrap_or_default();
         after.resize(jobs.len(), 0);
         last.resize(jobs.len(), String::new());
@@ -224,7 +250,7 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
                 block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text())
             };
             for line in logs[i].take(j, st["over"] == true && over_at.is_some_and(|t| t.elapsed().as_secs() > 15), &fetch, &pages) {
-                if line.starts_with("##[endgroup]") { continue }
+                if line.starts_with("##[endgroup]") || how.quiet { continue }
                 say(&format!("{}{mark}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(&line)))
             }
             after[i] = j["next"].as_u64().unwrap_or(after[i]);
@@ -234,10 +260,30 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         if st["over"] == true && logs.iter().any(|l| !l.complete()) && over_at.is_some_and(|t| t.elapsed().as_secs() <= 15) { continue }
         if st["over"] == true {
             let (result, took) = (st["result"].as_str().unwrap_or_default().to_string(), began.elapsed().as_secs());
-            let tally: Vec<String> = jobs.iter().map(|j| format!("{} {}", j["name"].as_str().unwrap_or_default(), j["result"].as_str().unwrap_or("?"))).collect();
-            let said = format!("The run ended: {result}, {took} s after it was sent{}.", if several { format!(" ({})", tally.join(", ")) } else { String::new() });
+            // Each job's steps, how each went and how long it took; a failed step's last lines when they were not
+            // printed as they came.
+            let usd: f64 = jobs.iter().filter_map(|j| j["usd"].as_f64()).sum();
+            for (i, j) in jobs.iter().enumerate() {
+                say(&format!("{} ({}{}{}): {}", j["name"].as_str().unwrap_or("job"), j["machine"].as_str().unwrap_or("no machine"),
+                    j["took_ms"].as_u64().map(|ms| format!(", {}", span(ms / 1000))).unwrap_or_default(), j["usd"].as_f64().map(|u| format!(", ${u:.3}")).unwrap_or_default(), j["result"].as_str().unwrap_or("?")));
+                let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
+                steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
+                for s in steps {
+                    let mark = match s["result"].as_str() { Some("succeeded") => "✓", Some("failed") => "✗", Some("skipped") | Some("cancelled") => "–", _ => "·" };
+                    let time = match (s["start"].as_str().and_then(crate::log_view::seconds), s["finish"].as_str().and_then(crate::log_view::seconds)) { (Some(a), Some(b)) => format!(" {}", span(b.saturating_sub(a))), _ => String::new() };
+                    say(&format!("  {mark} {}{time}", s["name"].as_str().unwrap_or("step")));
+                    if how.quiet && s["result"] == "failed" {
+                        let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&log={}", s["log"].as_u64().unwrap_or(0))).with_header("authorization", &format!("Bearer {key}"));
+                        let text = block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text()).unwrap_or_default();
+                        let lines: Vec<&str> = text.lines().collect();
+                        for l in &lines[lines.len().saturating_sub(40)..] { say(&format!("{}    {}", crate::commands::JOB_LINE, without_time(l))) }
+                    }
+                }
+            }
+            let said = format!("The run ended: {result}, {} after it was sent, ${usd:.3} of machines.", span(took));
             if result != "success" { return Err(said) }
-            return Ok(Done { said: vec![said], data: json!({ "run_id": run, "result": result, "seconds": took, "jobs": jobs.iter().map(|j| json!({ "name": j["name"], "result": j["result"] })).collect::<Vec<_>>() }) })
+            return Ok(Done { said: vec![said], data: json!({ "run_id": run, "result": result, "seconds": took, "usd": usd, "jobs": jobs.iter().map(|j| json!({ "name": j["name"], "result": j["result"], "machine": j["machine"], "usd": j["usd"], "took_ms": j["took_ms"],
+                "steps": j["steps"].as_array().into_iter().flatten().map(|s| json!({ "name": s["name"], "result": s["result"], "start": s["start"], "finish": s["finish"] })).collect::<Vec<_>>() })).collect::<Vec<_>>() }) })
         }
         if began.elapsed().as_secs() > 6 * 3600 { return Err(format!("Still not over after six hours: `superci runs retrieve {run}`.")) }
     }
@@ -439,6 +485,9 @@ impl Lines {
     /// Whether every step's lines are out.
     fn complete(&self) -> bool { self.steps == 0 || self.done.len() >= self.steps }
 }
+
+/// A time in seconds as a person reads it: "42 s", "3m 5s".
+fn span(s: u64) -> String { if s < 60 { format!("{s} s") } else { format!("{}m {}s", s / 60, s % 60) } }
 
 /// Lines of a step by their numbers: "line 4", "lines 7–8".
 fn which(a: u64, b: u64) -> String { if a == b { format!("line {a}") } else { format!("lines {a}–{b}") } }

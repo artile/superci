@@ -156,7 +156,7 @@ fn line(raw: &str) -> Line {
 }
 
 /// Seconds since the epoch of a time GitHub writes ("2026-10-14T21:09:53Z", fractions allowed).
-fn seconds(t: &str) -> Option<u64> {
+pub(crate) fn seconds(t: &str) -> Option<u64> {
     let b = t.as_bytes();
     if b.len() < 19 { return None }
     let n = |r: std::ops::Range<usize>| t.get(r).and_then(|s| s.parse::<i64>().ok());

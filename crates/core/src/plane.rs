@@ -3535,10 +3535,12 @@ impl<'a> ControlPlane<'a> {
                     next = next.max(n);
                 }
                 let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
-                steps = handed.steps.iter().filter(|s| s["type"] != "Job").map(|s| serde_json::json!({ "id": s["id"], "name": s["name"], "state": s["state"], "result": s["result"], "order": s["order"], "log": s["log"] })).collect();
+                steps = handed.steps.iter().filter(|s| s["type"] != "Job").map(|s| serde_json::json!({ "id": s["id"], "name": s["name"], "state": s["state"], "result": s["result"], "order": s["order"], "log": s["log"], "start": s["start"], "finish": s["finish"] })).collect();
             }
             out.push(serde_json::json!({ "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
-                "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next, "posts": posts, "steps": steps }));
+                "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next, "posts": posts, "steps": steps,
+                // What its machine cost, and how long the job ran.
+                "usd": record.as_ref().map(|r| job_usd(r, self.clock.now_ms())), "took_ms": record.as_ref().and_then(|r| Some(r.ended_ms.unwrap_or(self.clock.now_ms()).saturating_sub(r.started_ms?))) }));
         }
         let jobs = run["jobs"].as_array().cloned().unwrap_or_default();
         let over = jobs.iter().all(|j| j["state"] == "done");
