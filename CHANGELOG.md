@@ -2,6 +2,12 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.3 — unreleased
+- `superci runs create` no longer goes quiet: after a burst of lines GitHub's runner did not send as fast as they came, 0.19.0 waited for the step to end before it printed more of it, minutes for a long step. What was dropped is now filled from what the machine sends of the step's own log every two seconds, and the lines go on as they come; the few the runner still holds come when the step ends, said as such.
+- A runner's lines are kept as they come, with nothing else read or written each time (each post of a hundred lines rewrote the job's whole record).
+- `superci jobs retrieve` shows a step still going from what its machine sent of the step's log, not only the lines the runner sent as it went.
+- The ids of runs from a computer are below 2^53, so GitHub's actions print them whole ("Artifact download URL" had the run's id rounded).
+
 ## 0.19.2 — 2026-10-15
 - `superci runs create` and `superci caches delete` go on when SuperCI's cloud sign-in has ended, or another account is signed in: they need only this computer's key with the control plane it is kept for, as looking at jobs, runs, usage and artifacts already did. (AWS ends its sign-in after twelve hours, and when you sign out of the AWS console to sign in to another account.) Changing a control plane's settings still needs a sign-in to the cloud account it runs in, and says so.
 

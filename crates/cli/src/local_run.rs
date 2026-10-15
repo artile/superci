@@ -356,6 +356,8 @@ struct Lines {
     held: Vec<(Option<String>, Option<u64>, Vec<String>)>,
     /// The last line printed of each step, and the steps whose lines are all out.
     shown: std::collections::HashMap<String, u64>,
+    /// Lines of a step not had yet when later ones came (first and last), printed once its whole log comes.
+    missing: std::collections::HashMap<String, Vec<(u64, u64)>>,
     done: std::collections::HashSet<String>,
     /// Steps known (from the run's status): no steps, no order to keep (an older control plane).
     steps: usize,
@@ -397,7 +399,14 @@ impl Lines {
                 }
                 match start {
                     Some(start) if start <= *shown + 1 => for (k, line) in lines.into_iter().enumerate() { if start + k as u64 > *shown { out.push(line); *shown = start + k as u64 } },
-                    Some(_) => {}
+                    // Still a gap (the runner keeps the last of a page until it is full or the step ends): said, and
+                    // on with what comes; what is missing follows once the step's whole log is here.
+                    Some(start) => {
+                        self.missing.entry(id.to_string()).or_default().push((*shown + 1, start - 1));
+                        out.push(format!("··· {} of this step {} when it ends", which(*shown + 1, start - 1), if *shown + 1 == start - 1 { "follows" } else { "follow" }));
+                        *shown = start + lines.len() as u64 - 1;
+                        out.extend(lines);
+                    }
                     None => { *shown += lines.len() as u64; out.extend(lines) }
                 }
             }
@@ -407,7 +416,14 @@ impl Lines {
             let ended = s["state"] == "completed" || begun[at + 1..].iter().any(|b| *b) || give_up;
             if !ended { return out }
             match s["log"].as_u64().and_then(fetch) {
-                Some(text) => out.extend(text.lines().skip(*shown as usize).map(|l| without_time(l).to_string())),
+                Some(text) => {
+                    let all: Vec<&str> = text.lines().collect();
+                    for (a, b) in self.missing.remove(id).unwrap_or_default() {
+                        out.push(format!("··· {} of this step, which came late:", which(a, b)));
+                        out.extend(all.iter().skip(a as usize - 1).take((b + 1 - a) as usize).map(|l| without_time(l).to_string()));
+                    }
+                    out.extend(all.iter().skip(*shown as usize).map(|l| without_time(l).to_string()));
+                }
                 None if give_up => {
                     let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held).into_iter().partition(|(step, _, _)| step.as_deref() == Some(id));
                     self.held = rest;
@@ -423,6 +439,9 @@ impl Lines {
     /// Whether every step's lines are out.
     fn complete(&self) -> bool { self.steps == 0 || self.done.len() >= self.steps }
 }
+
+/// Lines of a step by their numbers: "line 4", "lines 7–8".
+fn which(a: u64, b: u64) -> String { if a == b { format!("line {a}") } else { format!("lines {a}–{b}") } }
 
 /// A log's line without the time the runner put before it ("2026-10-14T21:09:53.1234567Z ").
 fn without_time(line: &str) -> &str {
@@ -466,9 +485,9 @@ mod tests {
         let none = |_: u64| None;
         // Step a sends line 1, then 4 (2 and 3 were dropped); b's first line comes before a's log does.
         let j = json!({ "posts": [post("a", 1, &["a1"]), post("a", 4, &["a4"]), post("b", 1, &["b1"])], "steps": [step("a", 1, "inProgress", None), step("b", 2, "pending", None)] });
-        assert_eq!(l.take(&j, false, &none, &|_| None), ["a1"], "after a gap and no pages, nothing more of a until its log; b waits for a");
+        assert_eq!(l.take(&j, false, &none, &|_| None), ["a1", "··· lines 2–3 of this step follow when it ends", "a4"], "past a gap with no pages, said and on; b waits for a");
         let j = json!({ "posts": [], "steps": [step("a", 1, "completed", Some(1)), step("b", 2, "inProgress", None)] });
-        assert_eq!(l.take(&j, false, &logs, &|_| None), ["a2", "a3", "a4", "b1"], "the rest of a from its log, its time taken off; then b");
+        assert_eq!(l.take(&j, false, &logs, &|_| None), ["··· lines 2–3 of this step, which came late:", "a2", "a3", "b1"], "what a missed, from its log, its time taken off; then b");
         let j = json!({ "posts": [post("b", 2, &["b2"])], "steps": [step("a", 1, "completed", Some(1)), step("b", 2, "completed", Some(2))] });
         assert_eq!(l.take(&j, false, &logs, &|_| None), ["b2"]);
         assert!(l.complete());
@@ -478,9 +497,15 @@ mod tests {
         let mut l = Lines::default();
         let pages = |s: &str| (s == "a").then(|| "2026-10-15T11:00:49.1Z a1\n2026-10-15T11:00:49.2Z a2\n2026-10-15T11:00:49.3Z a3\n".to_string());
         let j = json!({ "posts": [post("a", 1, &["a1"]), post("a", 5, &["a5"])], "steps": [step("a", 1, "inProgress", None)] });
-        assert_eq!(l.take(&j, false, &none, &pages), ["a1", "a2", "a3"], "a gap filled from the pages as far as they go");
+        assert_eq!(l.take(&j, false, &none, &pages), ["a1", "a2", "a3", "··· line 4 of this step follows when it ends", "a5"], "a gap filled from the pages as far as they go, then said");
         let j = json!({ "posts": [post("a", 4, &["a4", "a5", "a6"])], "steps": [step("a", 1, "inProgress", None)] });
-        assert_eq!(l.take(&j, false, &none, &pages), ["a4", "a5", "a6"], "and on from where they end");
+        assert_eq!(l.take(&j, false, &none, &pages), ["a6"], "and on, none twice");
+        // A gap the pages do not reach yet: said, and on; its lines once the step's whole log is here.
+        let j = json!({ "posts": [post("a", 9, &["a9"])], "steps": [step("a", 1, "inProgress", None)] });
+        assert_eq!(l.take(&j, false, &none, &pages), ["··· lines 7–8 of this step follow when it ends", "a9"]);
+        let whole = |_: u64| Some((1..=10).map(|n| format!("2026-10-15T11:00:49.1Z a{n}")).collect::<Vec<_>>().join("\n"));
+        let j = json!({ "posts": [], "steps": [step("a", 1, "completed", Some(1))] });
+        assert_eq!(l.take(&j, false, &whole, &pages), ["··· line 4 of this step, which came late:", "a4", "··· lines 7–8 of this step, which came late:", "a7", "a8", "a10"]);
     }
 
     #[test]
