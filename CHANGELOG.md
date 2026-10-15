@@ -2,6 +2,12 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.4 — unreleased
+- `superci runs create --quiet` prints how each step went and the last lines of one that failed, not every line: for a coding agent, whose every line read costs. `--detach` says the run's id and ends; `superci runs wait ID` follows it. Every run now ends with its steps' results and times, its machine and what it cost.
+- A run from a computer's page in the dashboard lists its artifacts, each a download.
+- A job's whole log, whatever its size: `superci jobs retrieve ID --out=FILE`, and the dashboard's Raw log, take a run from a computer's from its pieces in the control plane's bucket, and a GitHub job's from GitHub (4 MB at most before).
+- Windows machines say how their start went (boot, start-up script, the runner), try the runner's addresses at GitHub before starting it, and send its lines as they are written, as Linux machines do.
+
 ## 0.19.3 — 2026-10-15
 - `superci runs create` no longer goes quiet: after a burst of lines GitHub's runner did not send as fast as they came, 0.19.0 waited for the step to end before it printed more of it, minutes for a long step. What was dropped is now filled from what the machine sends of the step's own log every two seconds, and the lines go on as they come; the few the runner still holds come when the step ends, said as such.
 - A runner's lines are kept as they come, with nothing else read or written each time (each post of a hundred lines rewrote the job's whole record).
