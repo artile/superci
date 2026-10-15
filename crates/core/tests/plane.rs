@@ -3319,9 +3319,12 @@ fn a_workflow_files_job_is_written_for_the_runner_as_github_writes_it() {
     use superci_core::workflow::{job_parts, parse};
     // What a workflow file decides of the message the runner is handed, held to two recordings: what real GitHub
     // sent for one workflow, and what an open-source stand-in for GitHub's service sent for one that uses most of
-    // what a step and a job can say. Every value, in its order, with its place in the file.
+    // what a step and a job can say; and what real GitHub sent for steps run in the background, waited for, ended
+    // and run in parallel groups. Every value, in its order, with its place in the file.
     for (workflow, path, recorded) in [
         (include_str!("fixtures/runner/record.yml"), ".github/workflows/record.yml", include_str!("fixtures/runner/record.github.json")),
+        (include_str!("fixtures/runner/parallel.yml"), ".github/workflows/parallel.yml", include_str!("fixtures/runner/parallel.github.json")),
+        (include_str!("fixtures/runner/parallel2.yml"), ".github/workflows/parallel2.yml", include_str!("fixtures/runner/parallel2.github.json")),
         (include_str!("fixtures/runner/three.yml"), ".github/workflows/ci.yml", include_str!("fixtures/runner/three.standin.json")),
     ] {
         let want: serde_json::Value = serde_json::from_str(recorded).unwrap();

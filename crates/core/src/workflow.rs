@@ -190,37 +190,35 @@ fn condition(step: &Node) -> String {
 
 /// What a step is called where its outputs are kept, when it has no `id` of its own: `__run` for a script,
 /// `__actions_checkout` for an action, with `_2`, `_3` for the next of the same.
-fn context_name(base: &str, seen: &mut Vec<String>, own: bool) -> String {
-    // (A step with an id of its own is called that, and is not counted among the others.)
-    if own { return String::new() }
+fn context_name(base: &str, seen: &mut Vec<String>) -> String {
     let base: String = format!("__{}", base.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>());
     let n = seen.iter().filter(|s| **s == base).count();
     seen.push(base.clone());
     if n == 0 { base } else { format!("{base}_{}", n + 1) }
 }
 
-/// One step as the runner is given it.
-fn step(node: &Node, file: u32, seen: &mut Vec<String>, id: String) -> Result<Value> {
+/// One step as the runner is given it. `named`: what it is called when it has no `id` of its own, when that is not
+/// counted with the others (a step of a parallel group).
+fn step(node: &Node, file: u32, seen: &mut Vec<String>, id: String, named: Option<String>) -> Result<Value> {
     let (line, _) = node.place();
     let own_id = node.get("id").and_then(Node::text).map(str::to_string);
-    let own = own_id.is_some();
     let mut out = json!({ "type": "action" });
-    let name = if let Some(run) = node.get("run") {
+    let base = if let Some(run) = node.get("run") {
         out["reference"] = json!({ "type": "script" });
         let mut inputs = vec![json!({ "key": "script", "value": token(run, file) })];
         if let Some(d) = node.get("working-directory") { inputs.push(json!({ "key": "workingDirectory", "value": token(d, file) })) }
         if let Some(s) = node.get("shell") { inputs.push(json!({ "key": "shell", "value": token(s, file) })) }
         out["inputs"] = json!({ "type": 2, "map": inputs });
-        context_name("run", seen, own)
+        "run".to_string()
     } else if let Some(uses) = node.get("uses").and_then(Node::text) {
         if let Some(image) = uses.strip_prefix("docker://") {
             out["reference"] = json!({ "type": "containerRegistry", "image": image });
             if let Some(with) = node.get("with").filter(|w| !w.empty()) { out["inputs"] = token(with, file) }
-            context_name(image, seen, own)
+            image.to_string()
         } else if uses.starts_with("./") || uses.starts_with(".\\") {
             out["reference"] = json!({ "type": "repository", "path": uses, "repositoryType": "self" });
             if let Some(with) = node.get("with").filter(|w| !w.empty()) { out["inputs"] = token(with, file) }
-            context_name("self", seen, own)
+            "self".to_string()
         } else {
             let (what, reference) = uses.rsplit_once('@').ok_or_else(|| format!("line {line}: `uses: {uses}` names no version (owner/name@version)"))?;
             let mut names = what.splitn(3, '/');
@@ -229,15 +227,24 @@ fn step(node: &Node, file: u32, seen: &mut Vec<String>, id: String) -> Result<Va
             // (An action in a folder of its repository. GitHub leaves the field out for one at the top.)
             if !path.is_empty() { out["reference"]["path"] = path.into() }
             if let Some(with) = node.get("with").filter(|w| !w.empty()) { out["inputs"] = token(with, file) }
-            context_name(&format!("{owner}/{repo}"), seen, own)
+            format!("{owner}/{repo}")
         }
     } else {
-        return Err(format!("line {line}: a step has `run` or `uses`"))
+        return Err(format!("line {line}: a step has `run`, `uses`, `parallel`, `wait`, `wait-all` or `cancel`"))
     };
-    let name = own_id.unwrap_or(name);
+    // (A step with an id of its own is called that, and is not counted among the others.)
+    let name = own_id.or(named).unwrap_or_else(|| context_name(&base, seen));
     if let Some(n) = node.get("name") { out["displayNameToken"] = token(n, file) }
     out["contextName"] = name.clone().into();
     if let Some(env) = node.get("env").filter(|e| !e.empty()) { out["environment"] = token(env, file) }
+    // (Run while the next steps run: `true` or `false` as written, not an expression, as GitHub reads it.)
+    if let Some(b) = node.get("background") {
+        match b.text() {
+            Some("true") => out["background"] = true.into(),
+            Some("false") => {}
+            _ => return Err(format!("line {}: `background` is true or false", b.place().0)),
+        }
+    }
     out["condition"] = condition(node).into();
     // (`true`, `3`: what they are, when written so; an expression is left to the runner.)
     for (key, field, kind, value) in [("continue-on-error", "continueOnError", 5, "bool"), ("timeout-minutes", "timeoutInMinutes", 6, "num")] {
@@ -256,6 +263,30 @@ fn step(node: &Node, file: u32, seen: &mut Vec<String>, id: String) -> Result<Va
     Ok(out)
 }
 
+/// A step that waits for steps run in the background (`wait`, `wait-all`), or ends one (`cancel`), as the runner is
+/// given it. `known`: what the steps before it are called.
+fn control(node: &Node, file: u32, known: &[String], id: String) -> Result<Option<Value>> {
+    let Some((key, value)) = ["wait", "wait-all", "cancel"].into_iter().find_map(|k| node.get(k).map(|v| (k, v))) else { return Ok(None) };
+    let (line, _) = node.place();
+    if node.get("run").is_some() || node.get("uses").is_some() { return Err(format!("line {line}: a step that has `{key}` runs nothing itself")) }
+    if node.get("if").is_some() { return Err(format!("line {line}: a `{key}` step always runs; it takes no `if`")) }
+    let ids: Vec<String> = match (key, value) {
+        ("wait-all", _) => vec![],
+        ("wait", Node::Seq { items, .. }) => items.iter().map(|i| i.text().unwrap_or_default().to_string()).collect(),
+        (_, v) => vec![v.text().filter(|t| !t.is_empty()).ok_or_else(|| format!("line {line}: `{key}` names the id of a step"))?.to_string()],
+    };
+    if let Some(missing) = ids.iter().find(|i| !known.contains(i)) { return Err(format!("line {line}: `{key}: {missing}` names no step before it")) }
+    let fallback = match key { "wait" => "Wait", "wait-all" => "Wait for all", _ => "Cancel" };
+    let mut out = json!({ "type": "backgroundStepControl", "controlType": key });
+    if !ids.is_empty() { out["stepIds"] = ids.into() }
+    let named = node.get("name");
+    out["displayNameToken"] = named.map(|n| token(n, file)).unwrap_or(fallback.into());
+    out["condition"] = "".into();
+    out["id"] = id.into();
+    out["name"] = named.and_then(Node::text).unwrap_or(fallback).into();
+    Ok(Some(out))
+}
+
 /// What a workflow file decides of a job's message: its steps, the environment and defaults of the workflow and of
 /// the job, its outputs, its container and its service containers. `ids`: an id for each step, in order.
 pub fn job_parts(workflow: &Node, path: &str, job: &str, ids: &mut dyn FnMut() -> String) -> Result<Value> {
@@ -271,7 +302,36 @@ pub fn job_parts(workflow: &Node, path: &str, job: &str, ids: &mut dyn FnMut() -
     let mut seen = vec![];
     let steps = found.get("steps").map(Node::items).unwrap_or_default();
     if steps.is_empty() { return Err(format!("the job {job} in {path} has no steps (a job that calls another workflow is not run here yet)")) }
-    out["steps"] = steps.iter().map(|s| step(s, file, &mut seen, ids())).collect::<Result<Vec<_>>>()?.into();
+    let (mut written, mut known, mut groups) = (vec![], vec![], 0);
+    for s in steps {
+        if let Some(c) = control(s, file, &known, ids())? { written.push(c); continue }
+        let Some(group) = s.get("parallel") else {
+            let one = step(s, file, &mut seen, ids(), None)?;
+            known.push(one["contextName"].as_str().unwrap_or_default().to_string());
+            written.push(one);
+            continue
+        };
+        // A parallel group: each of its steps run in the background, then waited for together.
+        let (line, _) = s.place();
+        if let Node::Map { pairs, .. } = s { if pairs.len() > 1 { return Err(format!("line {line}: a `parallel` group has only its steps")) } }
+        let group_id = format!("__parallel_{groups}");
+        groups += 1;
+        let mut names = vec![];
+        for (i, inner) in group.items().iter().enumerate() {
+            let (at, _) = inner.place();
+            if ["parallel", "wait", "wait-all", "cancel"].iter().any(|k| inner.get(k).is_some()) { return Err(format!("line {at}: a step of a `parallel` group runs something")) }
+            let mut one = step(inner, file, &mut seen, ids(), Some(format!("{group_id}_{i}")))?;
+            one["background"] = true.into();
+            one["parallelGroupId"] = group_id.clone().into();
+            let name = one["contextName"].as_str().unwrap_or_default().to_string();
+            known.push(name.clone());
+            names.push(name);
+            written.push(one);
+        }
+        if names.is_empty() { return Err(format!("line {line}: a `parallel` group has steps")) }
+        written.push(json!({ "type": "backgroundStepControl", "controlType": "wait", "stepIds": names, "displayNameToken": "Parallel group", "condition": "", "parallelGroupId": group_id, "id": ids(), "name": "Parallel group" }));
+    }
+    out["steps"] = written.into();
     for (key, field) in [("outputs", "jobOutputs"), ("services", "jobServiceContainers"), ("container", "jobContainer")] {
         if let Some(n) = found.get(key).filter(|n| !n.empty()) { out[field] = token(n, file) }
     }
@@ -368,6 +428,31 @@ mod tests {
         // A `}}` inside a quoted string does not end the expression; one never closed is text.
         assert_eq!(t("${{ format('{0}}}', 1) }}"), json!({ "type": 3, "expr": "format('{0}}}', 1)" }));
         assert_eq!(t("${{ open"), json!({ "type": 0, "lit": "${{ open" }));
+    }
+
+    #[test]
+    fn steps_run_in_the_background_are_refused_where_github_refuses_them() {
+        // Each refused by GitHub itself (a probe of each, on GitHub), and accepted where it accepts them.
+        let read = |steps: &str| job_parts(&parse(&format!("jobs:\n  test:\n    runs-on: x\n    steps:\n{steps}")).unwrap(), "ci.yml", "test", &mut String::new);
+        for (steps, said) in [
+            ("      - run: a\n        background: ${{ true }}\n", "line 6: `background` is true or false"),
+            ("      - id: a\n        run: a\n        background: true\n      - wait: a\n        if: always()\n", "line 8: a `wait` step always runs; it takes no `if`"),
+            ("      - parallel:\n          - parallel:\n              - run: a\n", "line 6: a step of a `parallel` group runs something"),
+            ("      - wait: nowhere\n", "line 5: `wait: nowhere` names no step before it"),
+            ("      - wait: a\n      - id: a\n        run: a\n        background: true\n", "line 5: `wait: a` names no step before it"),
+            ("      - id: a\n        run: a\n        background: true\n      - parallel:\n          - wait: a\n", "line 9: a step of a `parallel` group runs something"),
+            ("      - name: Named\n        parallel:\n          - run: a\n", "line 5: a `parallel` group has only its steps"),
+            ("      - id: g\n        parallel:\n          - run: a\n", "line 5: a `parallel` group has only its steps"),
+            ("      - parallel: []\n", "line 5: a `parallel` group has steps"),
+            ("      - id: a\n        run: a\n        background: true\n      - cancel: [a]\n", "line 8: `cancel` names the id of a step"),
+            ("      - name: Nothing\n", "line 5: a step has `run`, `uses`, `parallel`, `wait`, `wait-all` or `cancel`"),
+        ] {
+            assert_eq!(read(steps).err().as_deref(), Some(said), "{steps}");
+        }
+        // Waiting for a step not run in the background, `background: false`, and an `id` on a wait (not kept).
+        let ok = read("      - id: a\n        run: a\n        background: false\n      - wait: a\n        id: w\n      - wait-all:\n").unwrap();
+        assert_eq!(ok["steps"][0].get("background"), None);
+        assert_eq!((ok["steps"][1]["stepIds"].clone(), ok["steps"][1].get("contextName"), ok["steps"][2]["controlType"].as_str(), ok["steps"][2].get("stepIds")), (json!(["a"]), None, Some("wait-all"), None));
     }
 
     #[test]

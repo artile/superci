@@ -1,0 +1,310 @@
+{
+ "fileTable": [
+  ".github/workflows/parallel.yml"
+ ],
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "displayNameToken": {
+    "type": 0,
+    "file": 1,
+    "line": 7,
+    "col": 15,
+    "lit": "Start a server"
+   },
+   "contextName": "server",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 9,
+       "col": 14,
+       "lit": "sleep 30"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "name": "server"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "two",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 12,
+       "col": 14,
+       "lit": "echo two; sleep 2"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "name": "two"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__run",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 14,
+       "col": 14,
+       "lit": "echo three"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "continueOnError": {
+    "type": 5,
+    "file": 1,
+    "line": 16,
+    "col": 28,
+    "bool": true
+   },
+   "name": "__run"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__run_2",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 17,
+       "col": 14,
+       "lit": "echo while they run"
+      }
+     }
+    ]
+   },
+   "condition": "success()",
+   "name": "__run_2"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "wait",
+   "stepIds": [
+    "two"
+   ],
+   "displayNameToken": {
+    "type": 0,
+    "file": 1,
+    "line": 18,
+    "col": 15,
+    "lit": "Wait for two"
+   },
+   "condition": "",
+   "name": "Wait for two"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "wait",
+   "stepIds": [
+    "two"
+   ],
+   "displayNameToken": "Wait",
+   "condition": "",
+   "name": "Wait"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "cancel",
+   "stepIds": [
+    "server"
+   ],
+   "displayNameToken": {
+    "type": 0,
+    "file": 1,
+    "line": 21,
+    "col": 15,
+    "lit": "Stop the server"
+   },
+   "condition": "",
+   "name": "Stop the server"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "wait-all",
+   "displayNameToken": "Wait for all",
+   "condition": "",
+   "name": "Wait for all"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "displayNameToken": {
+    "type": 0,
+    "file": 1,
+    "line": 25,
+    "col": 19,
+    "lit": "First"
+   },
+   "contextName": "__parallel_0_0",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 26,
+       "col": 18,
+       "lit": "sleep 1; echo first"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "parallelGroupId": "__parallel_0",
+   "name": "__parallel_0_0"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "second",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 28,
+       "col": 18,
+       "lit": "echo second"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "parallelGroupId": "__parallel_0",
+   "name": "second"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/checkout",
+    "ref": "v4",
+    "repositoryType": "GitHub"
+   },
+   "contextName": "__parallel_0_2",
+   "background": true,
+   "condition": "success()",
+   "parallelGroupId": "__parallel_0",
+   "name": "__parallel_0_2"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "wait",
+   "stepIds": [
+    "__parallel_0_0",
+    "second",
+    "__parallel_0_2"
+   ],
+   "displayNameToken": "Parallel group",
+   "condition": "",
+   "parallelGroupId": "__parallel_0",
+   "name": "Parallel group"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__run_3",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 30,
+       "col": 14,
+       "lit": "echo after"
+      }
+     }
+    ]
+   },
+   "condition": "success()",
+   "name": "__run_3"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "displayNameToken": {
+    "type": 0,
+    "file": 1,
+    "line": 31,
+    "col": 15,
+    "lit": "What the runner was handed (its own log; secrets are masked there)"
+   },
+   "contextName": "__run_4",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 33,
+       "col": 14,
+       "lit": "echo \"RECORD-BEGIN\"\ncat /home/runner/_diag/Worker_*.log | gzip -9 | base64 -w 120\necho \"RECORD-END\"\n"
+      }
+     }
+    ]
+   },
+   "condition": "always()",
+   "name": "__run_4"
+  }
+ ]
+}

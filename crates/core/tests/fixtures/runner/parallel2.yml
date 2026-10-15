@@ -1,0 +1,26 @@
+on: push
+jobs:
+  test:
+    runs-on: superci
+    timeout-minutes: 5
+    steps:
+      - id: mon
+        run: sleep 30
+        background: true
+      - cancel: mon
+      - parallel:
+          - run: echo a
+      - parallel:
+          - run: echo b
+          - run: echo c
+      - id: w
+        run: echo w
+        background: true
+      - wait: w
+        id: waited
+      - name: What the runner was handed (its own log; secrets are masked there)
+        if: always()
+        run: |
+          echo "RECORD-BEGIN"
+          cat /home/runner/_diag/Worker_*.log | gzip -9 | base64 -w 120
+          echo "RECORD-END"

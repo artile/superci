@@ -1,0 +1,209 @@
+{
+ "fileTable": [
+  ".github/workflows/parallel2.yml"
+ ],
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "mon",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 8,
+       "col": 14,
+       "lit": "sleep 30"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "name": "mon"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "cancel",
+   "stepIds": [
+    "mon"
+   ],
+   "displayNameToken": "Cancel",
+   "condition": "",
+   "name": "Cancel"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__parallel_0_0",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 12,
+       "col": 18,
+       "lit": "echo a"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "parallelGroupId": "__parallel_0",
+   "name": "__parallel_0_0"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "wait",
+   "stepIds": [
+    "__parallel_0_0"
+   ],
+   "displayNameToken": "Parallel group",
+   "condition": "",
+   "parallelGroupId": "__parallel_0",
+   "name": "Parallel group"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__parallel_1_0",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 14,
+       "col": 18,
+       "lit": "echo b"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "parallelGroupId": "__parallel_1",
+   "name": "__parallel_1_0"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "__parallel_1_1",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 15,
+       "col": 18,
+       "lit": "echo c"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "parallelGroupId": "__parallel_1",
+   "name": "__parallel_1_1"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "wait",
+   "stepIds": [
+    "__parallel_1_0",
+    "__parallel_1_1"
+   ],
+   "displayNameToken": "Parallel group",
+   "condition": "",
+   "parallelGroupId": "__parallel_1",
+   "name": "Parallel group"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "contextName": "w",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 17,
+       "col": 14,
+       "lit": "echo w"
+      }
+     }
+    ]
+   },
+   "background": true,
+   "condition": "success()",
+   "name": "w"
+  },
+  {
+   "type": "backgroundStepControl",
+   "controlType": "wait",
+   "stepIds": [
+    "w"
+   ],
+   "displayNameToken": "Wait",
+   "condition": "",
+   "name": "Wait"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "displayNameToken": {
+    "type": 0,
+    "file": 1,
+    "line": 21,
+    "col": 15,
+    "lit": "What the runner was handed (its own log; secrets are masked there)"
+   },
+   "contextName": "__run",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "key": "script",
+      "value": {
+       "type": 0,
+       "file": 1,
+       "line": 23,
+       "col": 14,
+       "lit": "echo \"RECORD-BEGIN\"\ncat /home/runner/_diag/Worker_*.log | gzip -9 | base64 -w 120\necho \"RECORD-END\"\n"
+      }
+     }
+    ]
+   },
+   "condition": "always()",
+   "name": "__run"
+  }
+ ]
+}

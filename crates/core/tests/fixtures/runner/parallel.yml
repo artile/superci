@@ -1,0 +1,36 @@
+on: push
+jobs:
+  test:
+    runs-on: superci
+    timeout-minutes: 5
+    steps:
+      - name: Start a server
+        id: server
+        run: sleep 30
+        background: true
+      - id: two
+        run: echo two; sleep 2
+        background: true
+      - run: echo three
+        background: true
+        continue-on-error: true
+      - run: echo while they run
+      - name: Wait for two
+        wait: two
+      - wait: [two]
+      - name: Stop the server
+        cancel: server
+      - wait-all:
+      - parallel:
+          - name: First
+            run: sleep 1; echo first
+          - id: second
+            run: echo second
+          - uses: actions/checkout@v4
+      - run: echo after
+      - name: What the runner was handed (its own log; secrets are masked there)
+        if: always()
+        run: |
+          echo "RECORD-BEGIN"
+          cat /home/runner/_diag/Worker_*.log | gzip -9 | base64 -w 120
+          echo "RECORD-END"
