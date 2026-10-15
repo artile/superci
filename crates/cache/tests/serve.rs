@@ -32,19 +32,30 @@ fn server(answer: impl Fn(&str, &str, Vec<u8>) -> (u16, Vec<u8>) + Send + Sync +
     port
 }
 
-fn call(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+fn call(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) { call_with(port, method, path, &[("authorization", "Bearer job-token")], body) }
+
+/// The same with these headers, and the answer's headers too.
+fn call_with(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> (u16, Vec<u8>) { let (s, _, b) = call_full(port, method, path, headers, body); (s, b) }
+
+fn call_full(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> (u16, String, Vec<u8>) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.write_all(format!("{method} {path} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer job-token\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+    let extra: String = headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+    s.write_all(format!("{method} {path} HTTP/1.1\r\nhost: x\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
     s.write_all(body).unwrap();
     let mut out = vec![];
     s.read_to_end(&mut out).unwrap();
     let at = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
     let status = String::from_utf8_lossy(&out[9..12]).parse().unwrap();
-    (status, out[at + 4..].to_vec())
+    (status, String::from_utf8_lossy(&out[..at]).to_lowercase(), out[at + 4..].to_vec())
 }
 
-#[test]
-fn a_save_its_restore_and_gitlabs_cache_each_go_where_they_belong() {
+/// `superci-cache serve` against the stand-in control plane and bucket: its port, the program, the bucket's objects,
+/// and its folder.
+/// The program, ended when the test ends (a failed one included: else it keeps the test's output open).
+struct Ends(std::process::Child);
+impl Drop for Ends { fn drop(&mut self) { let _ = self.0.kill(); } }
+
+fn started() -> (u16, Ends, Arc<Mutex<HashMap<String, Vec<u8>>>>, std::path::PathBuf) {
     let objects: Arc<Mutex<HashMap<String, Vec<u8>>>> = Default::default();
     let kept = objects.clone();
     let bucket = server(move |method, path, body| {
@@ -63,22 +74,36 @@ fn a_save_its_restore_and_gitlabs_cache_each_go_where_they_belong() {
             "begin" => serde_json::json!({ "ok": true }),
             "tool-begin" => serde_json::json!({ "ok": true, "url": link("p00000") }),
             "sign" | "tool-sign" => serde_json::json!({ "ok": true, "urls": b["names"].as_array().unwrap().iter().map(|n| link(n.as_str().unwrap())).collect::<Vec<_>>() }),
-            "finish" | "tool-finish" => { let pieces = b.get("pieces").cloned().unwrap_or(serde_json::json!([["p00000", b["size"]]])); e.insert(k.clone(), pieces); serde_json::json!({ "ok": true }) }
+            "finish" | "tool-finish" => {
+                let pieces = b.get("pieces").cloned().unwrap_or(serde_json::json!([["p00000", b["size"]]]));
+                e.insert(k.clone(), pieces);
+                // (A tool's own note of it, as the control plane keeps it: Turbo's task time.)
+                e.insert(format!("{k}:meta"), b["meta"].clone());
+                serde_json::json!({ "ok": true })
+            }
             "lookup" | "tool-get" => match e.get(&k) {
                 Some(p) => serde_json::json!({ "hit": true, "key": b["key"], "size": p.as_array().unwrap().iter().map(|x| x[1].as_u64().unwrap()).sum::<u64>(),
-                    "pieces": p.as_array().unwrap().iter().map(|x| serde_json::json!({ "url": link(x[0].as_str().unwrap()), "size": x[1] })).collect::<Vec<_>>() }),
+                    "pieces": p.as_array().unwrap().iter().map(|x| serde_json::json!({ "url": link(x[0].as_str().unwrap()), "size": x[1] })).collect::<Vec<_>>(),
+                    "meta": e.get(&format!("{k}:meta")).cloned().unwrap_or_default() }),
                 None => serde_json::json!({ "hit": false }),
             },
             _ => serde_json::json!({}),
         };
         (200, reply.to_string().into_bytes())
     });
-    let dir = std::env::temp_dir().join(format!("superci-cache-serve-{}", std::process::id()));
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!("superci-cache-serve-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
     std::fs::create_dir_all(&dir).unwrap();
     let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
         .env("SUPERCI_CACHE_PLANE", format!("http://127.0.0.1:{plane}/cache/t")).env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string()).spawn().unwrap();
     for _ in 0..100 { if TcpStream::connect(("127.0.0.1", port)).is_ok() { break } std::thread::sleep(std::time::Duration::from_millis(20)) }
+    (port, Ends(child), objects, dir)
+}
+
+#[test]
+fn a_save_its_restore_and_gitlabs_cache_each_go_where_they_belong() {
+    let (port, _ends, objects, dir) = started();
     let twirp = |op: &str, body: serde_json::Value| -> serde_json::Value { serde_json::from_slice(&call(port, "POST", &format!("/twirp/github.actions.results.api.v1.CacheService/{op}"), body.to_string().as_bytes()).1).unwrap() };
 
     // A save as GitHub's client makes one (one PUT of the whole archive to its upload address), then its restore.
@@ -96,6 +121,50 @@ fn a_save_its_restore_and_gitlabs_cache_each_go_where_they_belong() {
     assert_eq!(call(port, "PUT", key, b"zip bytes").0, 200);
     assert_eq!(call(port, "GET", key, b""), (200, b"zip bytes".to_vec()));
     assert!(objects.lock().unwrap().keys().any(|k| k.contains("gitlab_gl_project_380")), "{:?}", objects.lock().unwrap().keys().collect::<Vec<_>>());
-    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn turbo_nx_and_bazel_keep_their_outputs_and_a_save_in_blocks_comes_back_whole_or_in_part() {
+    let (port, _ends, _, dir) = started();
+    let tool = [("authorization", "Bearer superci")];
+    // Turbo: a task's outputs under its hash, with how long the task took; asked which are kept, and fetched.
+    assert_eq!(call_with(port, "GET", "/v8/artifacts/status", &tool, b""), (200, br#"{"status":"enabled"}"#.to_vec()));
+    assert_eq!(call_with(port, "GET", "/v8/artifacts/abc123", &tool, b"").0, 404);
+    assert_eq!(call_with(port, "PUT", "/v8/artifacts/abc123", &[tool[0], ("x-artifact-duration", "4200")], b"turbo outputs").0, 202);
+    let (status, head, got) = call_full(port, "GET", "/v8/artifacts/abc123", &tool, b"");
+    assert_eq!((status, got.as_slice()), (200, &b"turbo outputs"[..]));
+    assert!(head.contains("x-artifact-duration: 4200"), "{head}");
+    let kept: serde_json::Value = serde_json::from_slice(&call_with(port, "POST", "/v8/artifacts", &tool, br#"{"hashes":["abc123","nope"]}"#).1).unwrap();
+    assert_eq!((kept["abc123"]["size"].as_u64(), kept["abc123"]["taskDurationMs"].as_u64(), kept["nope"].is_null()), (Some(13), Some(4200), true), "{kept}");
+    // Nx: kept once; a second save of the same hash is refused, as Nx expects.
+    assert_eq!(call(port, "PUT", "/v1/cache/nx1", b"nx tar").0, 200);
+    assert_eq!(call(port, "GET", "/v1/cache/nx1", b""), (200, b"nx tar".to_vec()));
+    assert_eq!(call(port, "GET", "/v1/cache/nx2", b"").0, 404);
+    // Bazel: an action's result and content by its hash (after an instance name).
+    assert_eq!(call(port, "PUT", "/bazel/main/cas/0f1e", b"content").0, 200);
+    assert_eq!(call(port, "GET", "/bazel/main/cas/0f1e", b""), (200, b"content".to_vec()));
+    assert_eq!(call(port, "GET", "/bazel/main/ac/0f1e", b"").0, 404);
+    assert_eq!(call(port, "GET", "/bazel/main/other/0f1e", b"").0, 404);
+
+    // GitHub's client saving a large entry: blocks, then their order; restored whole, and in part (as its client
+    // downloads in ranges).
+    let twirp = |op: &str, body: serde_json::Value| -> serde_json::Value { serde_json::from_slice(&call(port, "POST", &format!("/twirp/github.actions.results.api.v1.CacheService/{op}"), body.to_string().as_bytes()).1).unwrap() };
+    let made = twirp("CreateCacheEntry", serde_json::json!({ "key": "big", "version": "v1" }));
+    let upload = made["signed_upload_url"].as_str().unwrap().split_once(&format!(":{port}")).unwrap().1.to_string();
+    let join = if upload.contains('?') { '&' } else { '?' };
+    for (id, part) in [("YmxvY2sx", &b"first-"[..]), ("YmxvY2sy", &b"second"[..])] { assert_eq!(call(port, "PUT", &format!("{upload}{join}comp=block&blockid={id}"), part).0, 201) }
+    let list = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><Latest>YmxvY2sx</Latest><Latest>YmxvY2sy</Latest></BlockList>";
+    assert_eq!(call(port, "PUT", &format!("{upload}{join}comp=blocklist"), list).0, 201);
+    assert_eq!(twirp("FinalizeCacheEntryUpload", serde_json::json!({ "key": "big", "version": "v1", "size_bytes": "12" }))["ok"], true);
+    let found = twirp("GetCacheEntryDownloadURL", serde_json::json!({ "key": "big", "version": "v1" }));
+    let download = found["signed_download_url"].as_str().unwrap().split_once(&format!(":{port}")).unwrap().1.to_string();
+    assert_eq!(call(port, "GET", &download, b""), (200, b"first-second".to_vec()));
+    let (status, head, got) = call_full(port, "GET", &download, &[("x-ms-range", "bytes=6-11")], b"");
+    assert_eq!((status, got.as_slice()), (206, &b"second"[..]));
+    assert!(head.contains("content-range: bytes 6-11/12"), "{head}");
+    assert_eq!(call_with(port, "GET", &download, &[("range", "bytes=20-30")], b"").0, 416);
+    // A key nobody saved is not found.
+    assert_eq!(twirp("GetCacheEntryDownloadURL", serde_json::json!({ "key": "none", "version": "v1" }))["ok"], false);
     let _ = std::fs::remove_dir_all(&dir);
 }
