@@ -82,14 +82,17 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     // Its keys, as a deploy and `superci keys create agent --runs` leave them.
     aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &key);
     aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
+    aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "on");
     let (s, m, a, u) = (store.clone(), machines.clone(), aws.clone(), url.clone());
     std::thread::spawn(move || {
         let cache = Cache::default();
         block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
         for stream in listener.incoming().flatten() {
             let mut config = Config::new(PLANE.into());
-            config.containers = true;
-            config.read_settings(&a.settings(PLANE));
+            let settings = a.settings(PLANE);
+            // (Its machines are its own containers, as a Cloudflare or Modal control plane's are: on until removed.)
+            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.read_settings(&settings);
             configure(&mut config);
             let plane = ControlPlane { store: &s, http: &Nowhere, clock: &Now, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let _ = answer(&plane, &u, stream);

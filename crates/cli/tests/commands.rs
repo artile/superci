@@ -112,3 +112,56 @@ fn changes_are_written_where_the_control_plane_reads_them_and_it_answers_with_th
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn runners_limits_the_cache_and_keys_are_set_and_read_back() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let ok = |args: &[&str]| { let (code, v) = json(&home, args); assert_eq!(code, 0, "{args:?}: {v}"); v };
+    let routing = || serde_json::from_str::<serde_json::Value>(&served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or("{}".into())).unwrap();
+
+    // A provider's jobs at once, its money a month, where its machines run; then back as they were.
+    let runners = ok(&["runners", "update", "cloudflare", "--max-jobs=20", "--monthly-usd=50", "--location=weur"]);
+    assert_eq!((runners["order"][0]["max_jobs"].as_u64(), runners["order"][0]["monthly_usd"].as_f64(), runners["cloudflare_location"].as_str()), (Some(20), Some(50.0), Some("weur")), "{runners}");
+    assert_eq!(routing()["order"][0], serde_json::json!({ "cloud": "cloudflare", "max_jobs": 20, "monthly_usd": 50.0 }));
+    // (Only AWS's on-demand machines are turned off: another provider is removed.)
+    let (code, off) = json(&home, &["runners", "update", "cloudflare", "--enabled=false"]);
+    assert!(code == 2 && off["error"].as_str().unwrap().contains("superci runners delete cloudflare"), "{off}");
+    let back = ok(&["runners", "update", "cloudflare", "--max-jobs=none", "--monthly-usd=none"]);
+    assert_eq!((back["order"][0]["off"].as_bool(), back["order"][0]["max_jobs"].as_u64()), (Some(false), None), "{back}");
+    let (code, wrong) = json(&home, &["runners", "update", "nowhere", "--max-jobs=2"]);
+    assert!(code == 2 && wrong["error"].as_str().unwrap().contains("one of cloudflare"), "{wrong}");
+
+    // The longest job, and what the CI may spend in a month and a day.
+    assert_eq!(ok(&["limits", "update", "--max-hours=12"])["max_hours"], 12);
+    let money = ok(&["limits", "update", "--monthly-usd=100", "--daily-usd=10"]);
+    assert_eq!((money["monthly_usd"].as_f64(), money["daily_usd"].as_f64()), (Some(100.0), Some(10.0)), "{money}");
+    assert_eq!((routing()["monthly_usd"].as_f64(), routing()["daily_usd"].as_f64()), (Some(100.0), Some(10.0)));
+    let (code, refused) = json(&home, &["limits", "update", "--max-hours=500"]);
+    assert!(code != 0 && refused["error"].as_str().unwrap().contains("120 hours"), "{refused}");
+    // The AWS account's own limit (no budget in AWS itself: nothing asked of AWS for it).
+    let account = ok(&["accounts", "update", "aws", "--monthly-usd=80", "--daily-usd=8"]);
+    assert_eq!((account["monthly_usd"].as_f64(), account["daily_usd"].as_f64(), account["aws_budget"].as_str()), (Some(80.0), Some(8.0), None), "{account}");
+
+    // The cache: what a repository keeps, how long an unused entry stays, and off.
+    let cache = ok(&["caches", "update", "--size-gb=50", "--days=3"]);
+    assert_eq!((cache["size_gb"].as_u64(), cache["days"].as_u64()), (Some(50), Some(3)), "{cache}");
+    assert_eq!(ok(&["caches", "update", "--enabled=false"])["on"], false);
+    let (code, wiped) = json(&home, &["caches", "delete", "--repo=acme/app", "--confirm"]);
+    assert_eq!(code, 0, "{wiped}");
+
+    // A key for coding agents: made (kept by the control plane as its hash), listed, ended.
+    let key = ok(&["keys", "create", "builder", "--runs", "--days=7"]);
+    assert_eq!((key["name"].as_str(), key["runs"].as_bool()), (Some("builder"), Some(true)), "{key}");
+    let secret = key["env"]["SUPERCI_KEY"].as_str().unwrap().to_string();
+    let kept: Vec<(String, String)> = served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| k.starts_with("READ_KEY_") && k.ends_with("_BUILDER")).collect();
+    assert!(kept.len() == 1 && !kept[0].1.contains(&secret) && kept[0].1.ends_with(":runs"), "{kept:?}");
+    assert!(ok(&["keys", "list"])["keys"].as_array().unwrap().iter().any(|k| k["name"] == "builder"));
+    // It reads with no sign-in.
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).args(["jobs", "list", "--json"]).env("SUPERCI_HOME", common::temp("bare")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &secret).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    ok(&["keys", "delete", "builder"]);
+    assert!(!ok(&["keys", "list"])["keys"].as_array().unwrap().iter().any(|k| k["name"] == "builder"));
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
+}

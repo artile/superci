@@ -2885,7 +2885,8 @@ impl Dashboard {
                 let want = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
                 self.put_secret(&plane, "MACHINE", &want.to_string())?;
                 self.shown(&plane, |s| s["machine"] == want)?;
-                Ok(Response::redirect("/?p=runners"))
+                // (Back where it is set: Workflows.)
+                Ok(Response::redirect("/?p=workflows"))
             }
             // Review → Allow: the control plane's AWS runner role gets what this version asks for.
             ("POST", "/permissions/aws") => {

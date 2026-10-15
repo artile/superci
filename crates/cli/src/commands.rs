@@ -898,6 +898,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut d = signed_in();
             let order = view(&mut d)?.order();
             let Some(pool) = order.iter().find(|p| p.cloud == cloud) else { return usage(format!("Say which: `superci runners update CLOUD …`, one of {}.", order.iter().map(|p| p.cloud.clone()).collect::<Vec<_>>().join(", "))) };
+            // (Only AWS's on-demand machines are turned off; another provider is removed.)
+            if args.has("enabled") && cloud != superci_core::plane::AWS_ON_DEMAND { return usage(format!("--enabled is for aws-on-demand only. To stop using {cloud}: `superci runners delete {cloud}`.")) }
             // The form's fields as they stand, with what was given in their place (the page sends them all).
             let limit = |flag: &str, now: Option<String>| match args.get(flag) { Some("none") => String::new(), Some(v) => v.to_string(), None => now.unwrap_or_default() };
             let regions: Vec<String> = args.get("regions").map(|r| r.split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect()).unwrap_or_default();
