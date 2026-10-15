@@ -1260,6 +1260,11 @@ impl<'a> ControlPlane<'a> {
             let link = match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log_link(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository".into()) };
             return Ok(Response::json(&match link { Ok(url) => serde_json::json!({ "url": url }), Err(e) => serde_json::json!({ "error": e }) }))
         }
+        // A run from a computer's: links to each piece of each step's whole log in the bucket, in order (whatever
+        // its size, nothing through here); none when a piece is kept in the store instead.
+        if q("link").is_some() && j.provider == "local" {
+            return Ok(Response::json(&match self.log_links(j.local.as_deref().unwrap_or_default()).await? { Some(urls) => serde_json::json!({ "urls": urls }), None => serde_json::json!({ "urls": null }) }))
+        }
         // With `steps`: the job's steps too (GitHub's as it has them now, with their times; a run from a computer's with
         // each one's log, or its lines so far while it runs). GitLab's are in its log, marked as sections.
         let steps = if q("steps").is_none() { serde_json::Value::Null } else if j.provider == "local" {
@@ -3208,6 +3213,26 @@ impl<'a> ControlPlane<'a> {
         }
         entries.sort_by(|a, b| a.trim_start_matches('\u{feff}').get(..28).cmp(&b.trim_start_matches('\u{feff}').get(..28)));
         Ok(entries.into_iter().flat_map(|l| format!("{l}\n").into_bytes()).collect())
+    }
+
+    /// Links to the pieces of a run's job's whole log, step after step: none when any is kept in the store.
+    async fn log_links(&self, token: &str) -> Result<Option<Vec<String>>> {
+        let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
+        let mut steps: Vec<&serde_json::Value> = handed.steps.iter().filter(|s| s["type"] != "Job" && s["log"].as_u64().is_some()).collect();
+        steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(None) };
+        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
+        let (creds, now) = (self.aws_creds(&plane_url, &a).await?, self.clock.now_ms());
+        let mut urls = vec![];
+        for s in steps {
+            let n = s["log"].as_u64().unwrap_or(0);
+            for (k, v) in self.store.list(&format!("rlog:{token}:{n:04}:")).await? {
+                let Some(region) = v.trim_matches('"').strip_prefix("s3:") else { return Ok(None) };
+                let seq = k.rsplit(':').next().unwrap_or("0000");
+                urls.push(aws::presign("GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &format!("runs/{token}/log-{n:04}-{seq}")), &creds, region, cache::LINK_SECONDS, now)?);
+            }
+        }
+        Ok(Some(urls))
     }
 
     /// A run's job's steps in order, each with its log: the whole one once the runner sent it, else the lines it sent

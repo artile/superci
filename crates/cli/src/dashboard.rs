@@ -2064,6 +2064,16 @@ impl Dashboard {
         let form_has = |n: &str| form.iter().any(|(k, _)| k == n);
         match (req.method.as_str(), req.path.as_str()) {
 
+            // A run from a computer's artifact, as its file (a zip, as upload-artifact made it).
+            ("GET", "/run/artifact") => {
+                let (run, name) = (q("run"), q("name"));
+                if run.is_empty() || !run.bytes().all(|b| b.is_ascii_digit()) || name.is_empty() { return Ok(message(400, "Which artifact?", "")) }
+                let Some(v) = self.current()? else { return Ok(message(404, "No control plane", "")) };
+                let bytes = artifact_bytes(v.plane.url(), &self.status_key, run, name)?;
+                let file: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect();
+                return Ok(Response::new(200, "application/zip", bytes).with_header("content-disposition", &format!("attachment; filename=\"{file}.zip\"")))
+            }
+
             // A job's log as its page shows it (`/job/view`: in steps, see `log_view`), and as it is (`/job/raw`).
             ("GET", "/job/view") | ("GET", "/job/raw") => {
                 let (id, gl) = (q("id"), q("gl"));
@@ -2080,7 +2090,10 @@ impl Dashboard {
                 }
                 let got = cloudflare::plane_get(v.plane.url(), &self.status_key, &path).unwrap_or_else(|e| serde_json::json!({ "error": e }));
                 if req.path == "/job/raw" {
-                    return Ok(Response::new(200, "text/plain; charset=utf-8", got["log"].as_str().unwrap_or_default().to_string()).with_header("content-disposition", &format!("attachment; filename=\"job-{id}.log\"")))
+                    // (A run from a computer's whole, from its pieces in the bucket.)
+                    let whole = match job.as_ref().filter(|j| j["provider"] == "local") { Some(j) => whole_log(v.plane.url(), &self.status_key, j).ok(), None => None };
+                    let body = whole.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|| got["log"].as_str().unwrap_or_default().to_string());
+                    return Ok(Response::new(200, "text/plain; charset=utf-8", body).with_header("content-disposition", &format!("attachment; filename=\"job-{id}.log\"")))
                 }
                 let job = job.unwrap_or_default();
                 let going = ["launching", "launched", "running", "waiting"].contains(&job["state"].as_str().unwrap_or_default());
@@ -3899,7 +3912,17 @@ mark();load()})();</script>"#;
             row("Last to end", esc(run_last(&r).trim_start_matches("Last to end: "))),
         ].concat();
         let going = kind == "accent";
-        format!(r#"{}<div class="bar"><h1 class="page-title">{}</h1>{back}</div><div class="cards"><section class="card"><div class="card-head"><h2>{}</h2>{at}</div><div class="limits">{facts}</div></section><section class="card"><div class="card-head"><h2>Its jobs</h2></div>{}<p class="note" style="margin:10px 8px 0">Its time is from its first job queued here to its last one over; jobs of it on other runners are not counted.</p></section></div>"#,
+        // A run from a computer's artifacts (a run of GitHub's keeps its own at GitHub), each a download.
+        let artifacts = if !link.is_empty() { String::new() } else {
+            let listed = cloudflare::plane_get(v.plane.url(), &self.status_key, &format!("/runs/{}/artifacts", r["id"])).ok();
+            let rows: String = listed.as_ref().and_then(|l| l["artifacts"].as_array()).into_iter().flatten().map(|a| {
+                let name = a["name"].as_str().unwrap_or_default();
+                format!(r#"<div class="limit"><span class="limit-text"><strong>{}</strong><small>{}</small></span><span class="limit-do"><a class="chip" href="/run/artifact?run={}&amp;name={}">Download</a></span></div>"#,
+                    esc(name), size_words(a["size"].as_u64().unwrap_or(0)), r["id"], url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>())
+            }).collect();
+            if rows.is_empty() { String::new() } else { format!(r#"<section class="card"><div class="card-head"><h2>Its artifacts</h2><span class="card-sub">Kept a day</span></div><div class="limits">{rows}</div></section>"#) }
+        };
+        format!(r#"{}<div class="bar"><h1 class="page-title">{}</h1>{back}</div><div class="cards"><section class="card"><div class="card-head"><h2>{}</h2>{at}</div><div class="limits">{facts}</div></section>{artifacts}<section class="card"><div class="card-head"><h2>Its jobs</h2></div>{}<p class="note" style="margin:10px 8px 0">Its time is from its first job queued here to its last one over; jobs of it on other runners are not counted.</p></section></div>"#,
             if going { r#"<div data-refresh="4"></div>"# } else { "" }, esc(&title), esc(&sub), job_table(&its))
     }
 
@@ -5340,6 +5363,40 @@ fn job_page_link(j: &serde_json::Value) -> String {
         (Some("gitlab"), Some(g)) => format!("/?p=job&id={id}&gl={g}"),
         _ => format!("/?p=job&id={id}"),
     }
+}
+
+/// Files fetched one after another through links (a bucket's, GitHub's), as one, whatever their size.
+fn fetch_all(urls: &[String]) -> Result<Vec<u8>> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(600))).build().into();
+    let mut out = vec![];
+    for u in urls {
+        let mut r = agent.get(u).call().map_err(|e| e.to_string())?;
+        if r.status().as_u16() >= 300 { return Err(format!("the bucket answered {} for a piece", r.status())) }
+        out.extend(r.body_mut().with_config().limit(u64::MAX).read_to_vec().map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+/// A job's whole log, whatever its size: a run from a computer's from its pieces in the bucket, a GitHub job's from
+/// GitHub's own link, else as the control plane gives it (4 MB at most).
+pub fn whole_log(plane_url: &str, key: &str, j: &serde_json::Value) -> Result<Vec<u8>> {
+    let id = j["job_id"].as_u64().unwrap_or_default();
+    let provider = j["provider"].as_str().unwrap_or_default();
+    if provider == "local" || provider.is_empty() {
+        if let Ok(got) = cloudflare::plane_get(plane_url, key, &format!("/job/log?id={id}&link=1")) {
+            if let Some(urls) = got["urls"].as_array() { return fetch_all(&urls.iter().filter_map(|u| u.as_str().map(str::to_string)).collect::<Vec<_>>()) }
+            if let Some(url) = got["url"].as_str() { return fetch_all(&[url.to_string()]) }
+        }
+    }
+    let gl = if provider == "gitlab" { format!("&gl={}", j["gitlab"].as_str().unwrap_or_default()) } else { String::new() };
+    let got = cloudflare::plane_get(plane_url, key, &format!("/job/log?id={id}&bytes=4000000{gl}"))?;
+    match got["log"].as_str() { Some(l) => Ok(l.as_bytes().to_vec()), None => Err(got["error"].as_str().unwrap_or("no log").to_string()) }
+}
+
+/// A run from a computer's artifact, whole: its pieces from the bucket, one after another.
+pub fn artifact_bytes(plane_url: &str, key: &str, run: &str, name: &str) -> Result<Vec<u8>> {
+    let got = cloudflare::plane_get(plane_url, key, &format!("/runs/{run}/artifacts?name={}", url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>()))?;
+    fetch_all(&got["pieces"].as_array().into_iter().flatten().filter_map(|p| p["url"].as_str().map(str::to_string)).collect::<Vec<_>>())
 }
 
 /// A job's page on its code host.
