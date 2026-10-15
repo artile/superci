@@ -262,7 +262,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             let (result, took) = (st["result"].as_str().unwrap_or_default().to_string(), began.elapsed().as_secs());
             // Each job's steps, how each went and how long it took; a failed step's last lines when they were not
             // printed as they came.
-            let usd: f64 = jobs.iter().filter_map(|j| j["usd"].as_f64()).sum();
+            let usd: f64 = jobs.iter().filter_map(|j| j["usd"].as_f64()).sum::<f64>() + 0.0;
             for (i, j) in jobs.iter().enumerate() {
                 say(&format!("{}{} ({}{}{}): {}", crate::commands::JOB_LINE, j["name"].as_str().unwrap_or("job"), j["machine"].as_str().unwrap_or("no machine"),
                     j["took_ms"].as_u64().map(|ms| format!(", {}", span(ms / 1000))).unwrap_or_default(), j["usd"].as_f64().map(|u| format!(", ${u:.3}")).unwrap_or_default(), j["result"].as_str().unwrap_or("?")));

@@ -82,14 +82,14 @@ impl PlaneView {
     /// This month's estimated machine spend by cloud.
     pub fn spend(&self, cloud: &str) -> f64 { self.status.as_ref().and_then(|s| s["spend"][cloud].as_f64()).unwrap_or(0.0) }
     /// This month's estimated machine spend in all clouds together, and in one cloud account (its providers together).
-    pub fn spend_total(&self) -> f64 { self.status.as_ref().and_then(|s| s["spend"].as_object().map(|m| m.values().filter_map(|v| v.as_f64()).sum())).unwrap_or(0.0) }
+    pub fn spend_total(&self) -> f64 { self.status.as_ref().and_then(|s| s["spend"].as_object().map(|m| m.values().filter_map(|v| v.as_f64()).sum::<f64>() + 0.0)).unwrap_or(0.0) }
     pub fn spend_account(&self, account: &str) -> f64 {
-        self.status.as_ref().and_then(|s| s["spend"].as_object().map(|m| m.iter().filter(|(c, _)| superci_core::plane::account_of(c) == account).filter_map(|(_, v)| v.as_f64()).sum())).unwrap_or(0.0)
+        self.status.as_ref().and_then(|s| s["spend"].as_object().map(|m| m.iter().filter(|(c, _)| superci_core::plane::account_of(c) == account).filter_map(|(_, v)| v.as_f64()).sum::<f64>() + 0.0)).unwrap_or(0.0)
     }
     /// Today's (UTC), likewise.
-    pub fn spend_today_total(&self) -> f64 { self.status.as_ref().and_then(|s| s["spend_today"].as_object().map(|m| m.values().filter_map(|v| v.as_f64()).sum())).unwrap_or(0.0) }
+    pub fn spend_today_total(&self) -> f64 { self.status.as_ref().and_then(|s| s["spend_today"].as_object().map(|m| m.values().filter_map(|v| v.as_f64()).sum::<f64>() + 0.0)).unwrap_or(0.0) }
     pub fn spend_today_account(&self, account: &str) -> f64 {
-        self.status.as_ref().and_then(|s| s["spend_today"].as_object().map(|m| m.iter().filter(|(c, _)| superci_core::plane::account_of(c) == account).filter_map(|(_, v)| v.as_f64()).sum())).unwrap_or(0.0)
+        self.status.as_ref().and_then(|s| s["spend_today"].as_object().map(|m| m.iter().filter(|(c, _)| superci_core::plane::account_of(c) == account).filter_map(|(_, v)| v.as_f64()).sum::<f64>() + 0.0)).unwrap_or(0.0)
     }
     /// Whether this control plane keeps limits for a day and what the AWS account's own budget does.
     pub fn daily_limits(&self) -> bool { self.status.as_ref().is_some_and(|s| s["daily_limits"] == true) }

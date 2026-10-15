@@ -1,59 +1,14 @@
-//! The dashboard as a browser shows it, against a control plane served on this computer (`superci_testkit`): its
-//! pages drawn by headless Chrome after their scripts have run (what a person sees), with a run played to its end
-//! first. Skipped where no Chrome is installed.
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use superci_testkit::{serve, Runner, Served};
+//! The dashboard against a control plane served on this computer (`superci_testkit`), a run played to its end first:
+//! each page as the dashboard's own page fetches it, and the pages headless Chrome draws once their scripts have run
+//! (what a person sees; skipped where no Chrome is installed).
+mod common;
+use common::{dashboard, home, part, played, words};
+use std::process::Command;
+use superci_testkit::serve;
 
 fn chrome() -> Option<String> {
     ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
         .iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string())
-}
-
-/// A workspace on this computer that keeps the served control plane and a key it takes, as one signed in before would.
-fn home(served: &Served) -> std::path::PathBuf {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let home = std::env::temp_dir().join(format!("superci-dash-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
-    let ws = home.join("workspaces/default");
-    std::fs::create_dir_all(&ws).unwrap();
-    std::fs::write(ws.join("sign-ins.json"), serde_json::json!({
-        "key": { "name": "DASHBOARD_KEY_4102444800_TEST", "value": served.key, "planes": ["testplane0001"] },
-        "plane": { "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": served.url, "plane_id": "testplane0001", "label": "superci" } },
-    }).to_string()).unwrap();
-    home
-}
-
-/// A run of one job played to its end: its steps, lines and log, and how it ended.
-fn played(served: &Served, dir: &std::path::Path) {
-    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
-    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
-    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(Command::new("git").current_dir(dir).args(args).status().unwrap().success()) }
-    let cli = Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"])
-        .env("SUPERCI_HOME", dir.join(".cli")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let run = loop { if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() } std::thread::sleep(std::time::Duration::from_millis(50)) };
-    let runner = loop { if let Some(r) = Runner::of_run(served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
-    let step = "dddddddd-0000-0000-0000-000000000004";
-    runner.take();
-    runner.steps(&[(step, "Run make test", 1, "inProgress", None, None)]);
-    let lines: Vec<String> = (1..=12).map(|n| format!("\u{1b}[32mtest {n} passed\u{1b}[0m")).collect();
-    runner.lines(step, 1, &lines);
-    runner.log(1, &lines.iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n"));
-    runner.steps(&[(step, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
-    runner.finish("succeeded");
-    let _ = cli.wait_with_output();
-}
-
-/// A dashboard on this computer for `home`'s workspace: its link (with the key that opens it).
-fn dashboard(home: &std::path::Path) -> (std::process::Child, String) {
-    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_superci")).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_HOME", home).env("SUPERCI_PORT", port.to_string())
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    let out = child.stdout.take().unwrap();
-    let mut lines = BufReader::new(out).lines().map_while(Result::ok);
-    let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
-    // (What it prints later is read too: a closed pipe would end it.)
-    std::thread::spawn(move || lines.for_each(drop));
-    (child, link)
 }
 
 /// A page as a browser draws it, its scripts given time to run.
@@ -63,19 +18,64 @@ fn page(chrome: &str, link: &str, home: &std::path::Path) -> String {
 }
 
 #[test]
-fn the_overview_and_a_jobs_page_show_what_ran_and_its_log_in_steps() {
+fn each_page_shows_what_the_control_plane_has() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    played(&served, &home.join("checkout"));
+    let (mut child, link) = dashboard(&home);
+    let page = |p: &str| { let (status, body) = part(&link, &format!("/?p={p}&fragment=1")); assert_eq!(status, 200, "{p}"); words(&body) };
+    let has = |p: &str, all: &[&str]| { let w = page(p); for s in all { assert!(w.contains(s), "{p} lacks {s:?}: {w}") } w };
+    let job = served.store.under("job:").into_iter().next().unwrap().1;
+    let id = job["job_id"].as_u64().unwrap();
+
+    has("overview", &["Usage", "24 hours", "7 days", "30 days", "1 job", "Control plane", "Running"]);
+    has("jobs", &["Recent jobs", "tests", "checkout · .github/workflows/ci.yml", "4 CPU · 12 GB", "Passed"]);
+    // A run, and its page by the link the list gives.
+    let (_, runs) = part(&link, "/?p=runs&fragment=1");
+    assert!(words(&runs).contains(".github/workflows/ci.yml checkout 1 job"), "{}", words(&runs));
+    let run_link = runs.split("href=\"").filter_map(|h| h.split('"').next()).find(|h| h.starts_with("/?p=run&")).expect("a run's link").replace("&amp;", "&");
+    has(run_link.trim_start_matches("/?p="), &["Run from a computer: it has no page at GitHub.", "Passed", "tests"]);
+    let shown = has(&format!("job&id={id}"), &["tests", "Run from a computer", "Status Passed", "Its start", "Its log", "Raw log"]);
+    assert!(shown.contains("from queued to running"), "{shown}");
+    has("runners", &["Runner providers", "Jobs at once", "Monthly budget"]);
+    has("add-runners", &["Add a provider", "AWS", "Modal", "Cloudflare"]);
+    has("workflows", &["Default machine", "Connect GitHub or GitLab first"]);
+    has("repos", &["Repositories", "GitHub", "Create its App"]);
+    has("gitlab", &["GitLab is not connected"]);
+    has("planes", &["Control plane", "AWS · 111111111111 · us-east-1", env!("CARGO_PKG_VERSION"), "In use"]);
+    has("settings", &["Name", "SuperCI", "Labels", "superci", "Largest machine", "Workspace", "default"]);
+    has("changes", &["Changelog", env!("CARGO_PKG_VERSION")]);
+
+    // Its log as the page reads it: in steps, its lines in colour, their times.
+    let (status, view) = part(&link, &format!("/job/view?id={id}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap();
+    assert_eq!((status, view["going"].as_bool(), view["errors"].as_u64()), (200, Some(false), Some(0)));
+    let step = &view["steps"][0];
+    assert_eq!((step["name"].as_str(), step["state"].as_str(), step["lines"].as_array().map(Vec::len)), (Some("Run make test"), Some("success"), Some(12)));
+    assert_eq!(step["lines"][11], serde_json::json!(["10:00:01", "", r#"<span class="a32">test 12 passed</span>"#]));
+    // And as it is, to save.
+    let (status, raw) = part(&link, &format!("/job/raw?id={id}"));
+    assert!(status == 200 && raw.lines().count() == 12 && raw.trim_end().ends_with("test 12 passed\u{1b}[0m"), "{raw}");
+    // A job not asked well.
+    assert_eq!(part(&link, "/job/view?id=x1").0, 400);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_overview_and_a_jobs_page_as_chrome_draws_them() {
     let Some(chrome) = chrome() else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
     let home = home(&served);
     played(&served, &home.join("checkout"));
     let (mut child, link) = dashboard(&home);
+    let main_of = |p: &str| p.split("<main").nth(1).unwrap_or(p).chars().take(6000).collect::<String>();
     // The Overview: the usage of the last day, its period switch, and the job.
     let overview = page(&chrome, &link, &home);
-    let main_of = |p: &str| p.split("<main").nth(1).unwrap_or(p).chars().take(6000).collect::<String>();
     assert!(overview.contains("<h2>Usage</h2>") && overview.contains("24 hours") && overview.contains("30 days") && overview.contains("Passed"), "{}", main_of(&overview));
-    // The job's page: its log read by the page itself, in steps, its lines in colour.
+    // The job's page: its log read by the page itself, in steps, its lines in colour. (Each Chrome run starts without
+    // the last one's cookie: the link carries the key, and names the page.)
     let job = served.store.under("job:").into_iter().next().unwrap().1["job_id"].as_u64().unwrap();
-    // (Each Chrome run starts without the last one's cookie: the link carries the key, and names the page.)
     let shown = page(&chrome, &format!("{link}&p=job&id={job}"), &home);
     assert!(shown.contains("Its log") && shown.contains("lstep success") && shown.contains("Run make test"), "{}", main_of(&shown));
     assert!(shown.contains(r#"<span class="a32">test 12 passed</span>"#), "its lines in colour");

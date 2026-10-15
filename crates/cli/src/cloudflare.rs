@@ -482,6 +482,8 @@ pub fn plane_get(plane_url: &str, key: &str, path: &str) -> Result<Value> {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(40))).build().into();
     let mut r = agent.get(&format!("{plane_url}{path}")).header("authorization", &format!("Bearer {key}")).call().map_err(|e| e.to_string())?;
     let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    // (409: what it cannot do as things stand, said as it is.)
+    if r.status().as_u16() == 409 { return Err(format!("{}.", text.trim_end_matches('.'))) }
     if r.status().as_u16() != 200 { return Err(format!("the control plane answered {}: {}", r.status(), text.chars().take(200).collect::<String>())) }
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }

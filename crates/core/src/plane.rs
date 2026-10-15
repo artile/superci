@@ -971,7 +971,7 @@ impl<'a> ControlPlane<'a> {
             ("GET", "/gitlab/projects") if self.reader(&req) => {
                 // Of one connection (`g`: its name; nothing: the first).
                 let which = url.query_pairs().find(|(k, _)| k == "g").map(|(_, v)| v.into_owned()).unwrap_or_default();
-                let gl = self.gitlab_by(&which).ok_or("GitLab is not connected")?;
+                let Some(gl) = self.gitlab_by(&which) else { return Ok(Response::text(409, "GitLab is not connected")) };
                 let list = gitlab::projects(self.http, gl, &format!("{plane_url}/gitlab/webhook")).await?;
                 // The last GitLab event that arrived, so the dashboard can say whether webhooks reach here.
                 let last = get_json::<u64>(self.store, &last_event_key(&gl.id)).await?;
@@ -979,7 +979,7 @@ impl<'a> ControlPlane<'a> {
             }
             ("POST", "/gitlab/projects") if self.dashboard(&req) => {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-                let gl = self.gitlab_by(body["gitlab"].as_str().unwrap_or_default()).ok_or("GitLab is not connected")?;
+                let Some(gl) = self.gitlab_by(body["gitlab"].as_str().unwrap_or_default()) else { return Ok(Response::text(409, "GitLab is not connected")) };
                 let hook = format!("{plane_url}/gitlab/webhook");
                 let ids: Vec<(u64, bool)> = if body["refresh"] == true {
                     gitlab::projects(self.http, gl, &hook).await?.into_iter().filter(|p| p.enabled).map(|p| (p.id, true)).collect()
@@ -1901,12 +1901,12 @@ impl<'a> ControlPlane<'a> {
         let jobs: Vec<Job> = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect();
         // The whole CI's limit for the month: at it nothing is started, wherever.
         if let Some(cap) = routing.monthly_usd {
-            let spent: f64 = spend.values().sum();
+            let spent: f64 = spend.values().sum::<f64>() + 0.0;
             if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of {} a month (${spent:.2} spent on machines): no job starts until next month, or until the limit is raised (Runners in the dashboard, or `superci limits update --monthly-usd=N`)", self.config.name(), dollars(cap)))) }
         }
         // And for the day.
         if let Some(cap) = routing.daily_usd {
-            let spent: f64 = today.values().sum();
+            let spent: f64 = today.values().sum::<f64>() + 0.0;
             if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of {} a day (${spent:.2} spent on machines today): no job starts until tomorrow (UTC), or until the limit is raised (Runners in the dashboard, or `superci limits update --daily-usd=N`)", self.config.name(), dollars(cap)))) }
         }
         let (mut later, mut never, mut places) = (vec![], vec![], vec![]);

@@ -1849,7 +1849,7 @@ fn several_gitlabs_are_kept_apart_each_with_its_own_token_and_secret() {
     let status = json(&run(key(get("/status"))));
     assert_eq!((status["gitlabs"][0]["id"].as_str(), status["gitlabs"][1]["id"].as_str(), status["gitlabs"][1]["url"].as_str(), status["gitlab"]["url"].as_str()), (Some(""), Some("corp"), Some("https://gitlab.corp.example"), Some("https://gitlab.example")));
     assert_eq!(run(key(get("/gitlab/projects?g=corp"))).status, 200);
-    assert_eq!(run(key(get("/gitlab/projects?g=nobody"))).status, 500);
+    assert_eq!(run(key(get("/gitlab/projects?g=nobody"))).status, 409);
     assert!(superci_core::gitlab::valid_id("corp") && !superci_core::gitlab::valid_id("9corp") && !superci_core::gitlab::valid_id("a-b") && !superci_core::gitlab::valid_id(""));
 }
 

@@ -705,7 +705,7 @@ pub fn runs_of(jobs: &[serde_json::Value]) -> Vec<serde_json::Value> {
         // (A job that never got a machine has no end of its own: the run is over when its last machine was.)
         let end = if going { None } else { rows.iter().filter_map(|j| n(j, "ended_ms")).max() };
         let took_ms = match end { Some(end) => Some(end.saturating_sub(at)), None if going => Some(now.saturating_sub(at)), None => None };
-        let usd: f64 = rows.iter().filter_map(|j| job_cost(j)).sum();
+        let usd: f64 = rows.iter().filter_map(|j| job_cost(j)).sum::<f64>() + 0.0;
         // The one over last, with how long it waited for a machine and how long it ran.
         let last = rows.iter().filter(|j| n(j, "ended_ms").is_some() && n(j, "started_ms").is_some()).max_by_key(|j| n(j, "ended_ms")).map(|j| {
             let (queued, started, ended) = (n(j, "at_ms").unwrap_or_default(), n(j, "started_ms").unwrap_or_default(), n(j, "ended_ms").unwrap_or_default());
@@ -1549,8 +1549,18 @@ impl Dashboard {
             let n = |cpus: Option<u32>| cpus.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
             let (limit, code) = if spot_refused { (look.on_demand_cpus, superci_core::aws::ON_DEMAND_CPU_QUOTA) } else { (look.spot_cpus, superci_core::aws::SPOT_CPU_QUOTA) };
             let jobs = limit.map(|c| if c < 8 { "One job of the default size at a time".to_string() } else { format!("{} jobs of the default size at a time", c / 4) }).unwrap_or_default();
-            rows.push(row("CPUs at once", format!("{} on-demand · {} spot", n(look.on_demand_cpus), n(look.spot_cpus)), esc(&format!("{jobs}, in {}.", region_short(region))),
-                format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">Ask AWS for more ↗</a>"#, esc(&superci_core::aws::quota_link(region, code)))));
+            // Spot and on-demand are raised apart: one button, each in its menu (only the one jobs can use, when the
+            // other is refused).
+            let on_demand_refused = matches!(look.on_demand, Some(aws::Answer::Refused(_)));
+            let ask = if spot_refused || on_demand_refused {
+                format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">Ask AWS for more ↗</a>"#, esc(&superci_core::aws::quota_link(region, code)))
+            } else {
+                let item = |what: &str, cpus: Option<u32>, code: &str| format!(r#"<a href="{}" target="_blank" rel="noopener">{what} CPUs ↗<small>{} now, in {}</small></a>"#,
+                    esc(&superci_core::aws::quota_link(region, code)), n(cpus), region_short(region));
+                format!(r#"<details class="menu"><summary class="button secondary sm">Ask AWS for more <svg class="chev" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></svg></summary><div class="menu-pop">{}{}</div></details>"#,
+                    item("Spot", look.spot_cpus, superci_core::aws::SPOT_CPU_QUOTA), item("On-demand", look.on_demand_cpus, superci_core::aws::ON_DEMAND_CPU_QUOTA))
+            };
+            rows.push(row("CPUs at once", format!("{} on-demand · {} spot", n(look.on_demand_cpus), n(look.spot_cpus)), esc(&format!("{jobs}, in {}.", region_short(region))), ask));
         }
         // The image jobs run on: where it is missing among the regions the account may use.
         let (usable, without) = (look.usable_regions(), look.regions_without_image());
@@ -5423,8 +5433,8 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
     let mut waits: Vec<u64> = day.iter().filter_map(|j| Some(j["started_ms"].as_u64()?.saturating_sub(j["at_ms"].as_u64()?))).collect();
     waits.sort();
     let median = waits.get(waits.len() / 2).copied();
-    let spent: f64 = day.iter().filter_map(|j| job_cost(j)).sum();
-    let github: f64 = day.iter().filter_map(|j| github_cost(j)).sum();
+    let spent: f64 = day.iter().filter_map(|j| job_cost(j)).sum::<f64>() + 0.0;
+    let github: f64 = day.iter().filter_map(|j| github_cost(j)).sum::<f64>() + 0.0;
 
     let _ = (settled, running, waiting);
     // Three figures of the same shape: the number, what it is, the day hour by hour, one line about it.
@@ -6524,6 +6534,11 @@ mod tests {
             assert!(page.contains(said), "{said}\n\n{page}");
         }
         assert!(!page.contains("management account"), "{page}");
+        // Both kinds allowed: more of either is asked from one button's menu.
+        let ask = page.split("<dt>CPUs at once</dt>").nth(1).and_then(|r| r.split("</details>").next()).unwrap_or_default();
+        assert!(ask.contains(r#"<summary class="button secondary sm">Ask AWS for more"#)
+            && ask.contains(r#"href="https://eu-north-1.console.aws.amazon.com/servicequotas/home/services/ec2/quotas/L-34B43A08" target="_blank" rel="noopener">Spot CPUs ↗<small>"#)
+            && ask.contains(r#"quotas/L-1216C47A" target="_blank" rel="noopener">On-demand CPUs ↗<small>"#) && ask.contains(" now, in Stockholm</small>"), "{ask}");
         // The same project before its image is there: the headline does not say everything works beside a step
         // that has to come first.
         let mut bare = looked(include_str!("../fixtures/aws/project-activated/look.jsonl"));
