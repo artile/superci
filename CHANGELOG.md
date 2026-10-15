@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.6 — unreleased
+- Runs from a computer read YAML anchors and aliases in workflow files, as GitHub Actions does; a merge key (`<<`) is refused, as GitHub Actions refuses it.
 - `superci runs retrieve ID --tests` (and `superci jobs retrieve ID --tests`): each failed job's tests, read from its whole log: the tests that failed, each with its file and error, how many passed, failed and were skipped, and where its artifacts are. It reads what Vitest, Jest, Playwright, pytest, cargo and Go print. For a coding agent: what failed, without reading the log.
 - A large log's page is quick: a step's lines are drawn when it is opened, 2,000 at a time (Show more), search looks through the log itself and shows the lines that hold the words, and a finished job's log is kept for its next opens.
 - An AWS sign-in that AWS does not finish (seen when the account is changed on its page midway) says so plainly, with the way back to the dashboard to sign in again, instead of AWS's raw error.

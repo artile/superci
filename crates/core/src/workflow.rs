@@ -35,7 +35,9 @@ impl Node {
 
 struct Build { stack: Vec<Node>, keys: Vec<Vec<Node>>, done: Option<Node>, error: Option<String>,
     /// The scalar being put is a block (`|`, `>`): it stands where its mark is, after its key, not where its text begins.
-    block: bool }
+    block: bool,
+    /// Anchors (`&name`): each value by its id, once read; and the id of each sequence and mapping being read.
+    anchors: std::collections::HashMap<usize, Node>, anchored: Vec<usize> }
 
 impl Build {
     fn put(&mut self, node: Node) {
@@ -52,6 +54,12 @@ impl Build {
                         };
                         pairs.push((key, node))
                     }
+                    // (A merge key, `<<: *defaults`, is YAML 1.1's: GitHub Actions does not read it, nor is it read here.)
+                    None if matches!(&node, Node::Scalar { text, plain: true, .. } if text == "<<") => {
+                        let (line, _) = node.place();
+                        self.error.get_or_insert(format!("line {line}: merge keys (<<) are not supported in GitHub Actions workflows (anchors and aliases are)"));
+                        keys.push(node)
+                    }
                     None => keys.push(node),
                 }
             }
@@ -60,21 +68,35 @@ impl Build {
     }
 }
 
+impl Build {
+    /// A sequence or mapping read to its end: kept by its anchor, if it has one, then put where it stands.
+    fn end(&mut self, node: Node) {
+        if let Some(anchor) = self.anchored.pop().filter(|a| *a > 0) { self.anchors.insert(anchor, node.clone()); }
+        self.put(node)
+    }
+}
+
 impl MarkedEventReceiver for Build {
     fn on_event(&mut self, event: Event, mark: Marker) {
         // (Lines from 1 and columns from 1, as GitHub counts them.)
         let (line, col) = (mark.line(), mark.col() + 1);
         match event {
-            Event::Scalar(text, style, ..) => {
+            Event::Scalar(text, style, anchor, ..) => {
                 self.block = matches!(style, TScalarStyle::Literal | TScalarStyle::Folded);
-                self.put(Node::Scalar { text, plain: style == TScalarStyle::Plain, line, col });
+                let node = Node::Scalar { text, plain: style == TScalarStyle::Plain, line, col };
+                if anchor > 0 { self.anchors.insert(anchor, node.clone()); }
+                self.put(node);
                 self.block = false;
             }
-            Event::SequenceStart(..) => self.stack.push(Node::Seq { items: vec![], line, col }),
-            Event::MappingStart(..) => { self.stack.push(Node::Map { pairs: vec![], line, col }); self.keys.push(vec![]) }
-            Event::SequenceEnd => if let Some(n) = self.stack.pop() { self.put(n) },
-            Event::MappingEnd => { self.keys.pop(); if let Some(n) = self.stack.pop() { self.put(n) } }
-            Event::Alias(_) => self.error = Some(format!("line {line}: anchors and aliases are not read here yet")),
+            Event::SequenceStart(anchor, ..) => { self.stack.push(Node::Seq { items: vec![], line, col }); self.anchored.push(anchor) }
+            Event::MappingStart(anchor, ..) => { self.stack.push(Node::Map { pairs: vec![], line, col }); self.keys.push(vec![]); self.anchored.push(anchor) }
+            Event::SequenceEnd => if let Some(n) = self.stack.pop() { self.end(n) },
+            Event::MappingEnd => { self.keys.pop(); if let Some(n) = self.stack.pop() { self.end(n) } }
+            // An alias (`*name`): the value its anchor named, as if written here (as GitHub Actions reads it).
+            Event::Alias(anchor) => match self.anchors.get(&anchor).cloned() {
+                Some(node) => self.put(node),
+                None => { self.error.get_or_insert(format!("line {line}: an alias names no anchor before it")); }
+            },
             _ => {}
         }
     }
@@ -82,7 +104,7 @@ impl MarkedEventReceiver for Build {
 
 /// Reads a workflow file.
 pub fn parse(yaml: &str) -> Result<Node> {
-    let mut build = Build { stack: vec![], keys: vec![], done: None, error: None, block: false };
+    let mut build = Build { stack: vec![], keys: vec![], done: None, error: None, block: false, anchors: Default::default(), anchored: vec![] };
     Parser::new_from_str(yaml).load(&mut build, false).map_err(|e| format!("the workflow file is not YAML: {e}"))?;
     if let Some(e) = build.error { return Err(e) }
     build.done.ok_or_else(|| "the workflow file is empty".to_string())
@@ -317,6 +339,28 @@ mod tests {
         // A `}}` inside a quoted string does not end the expression; one never closed is text.
         assert_eq!(t("${{ format('{0}}}', 1) }}"), json!({ "type": 3, "expr": "format('{0}}}', 1)" }));
         assert_eq!(t("${{ open"), json!({ "type": 0, "lit": "${{ open" }));
+    }
+
+    #[test]
+    fn anchors_and_aliases_are_read_as_github_reads_them_and_merge_keys_are_not() {
+        // A job's steps written once and named again, a value and a mapping too.
+        let yaml = "jobs:\n  a:\n    runs-on: &machine superci/cpu=16\n    env: &env\n      NODE_ENV: test\n    steps: &steps\n      - run: npm ci\n      - run: npm test\n  b:\n    runs-on: *machine\n    env: *env\n    steps: *steps\n";
+        let w = parse(yaml).unwrap();
+        let (a, b) = (w.get("jobs").unwrap().get("a").unwrap(), w.get("jobs").unwrap().get("b").unwrap());
+        assert_eq!(b.get("runs-on").unwrap().text(), Some("superci/cpu=16"));
+        assert_eq!(b.get("env").unwrap().get("NODE_ENV").unwrap().text(), Some("test"));
+        assert_eq!(b.get("steps").unwrap().items().len(), 2);
+        assert_eq!(b.get("steps").unwrap().items()[1].get("run").unwrap().text(), a.get("steps").unwrap().items()[1].get("run").unwrap().text());
+        // As the runner is handed them: the same steps in both jobs.
+        let mut n = 0;
+        let mut ids = || { n += 1; format!("id{n}") };
+        let (pa, pb) = (job_parts(&w, ".github/workflows/ci.yml", "a", &mut ids).unwrap(), job_parts(&w, ".github/workflows/ci.yml", "b", &mut ids).unwrap());
+        assert_eq!(pa["steps"].as_array().map(Vec::len), pb["steps"].as_array().map(Vec::len));
+        // A merge key is YAML 1.1's: GitHub Actions does not read it, nor does this.
+        let merged = parse("defaults: &d\n  shell: bash\njobs:\n  a:\n    <<: *d\n    runs-on: x\n");
+        assert!(merged.as_ref().is_err_and(|e| e.contains("line 5: merge keys (<<) are not supported")), "{merged:?}");
+        // An alias of an anchor not written before it is no workflow.
+        assert!(parse("a: *nowhere\nb: &nowhere 1\n").is_err());
     }
 
     #[test]
