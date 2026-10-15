@@ -194,16 +194,16 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         return Ok(Done { said: vec![format!("Run {run} of {path} started. Follow it: superci runs wait {run}")], data: json!({ "run_id": run, "jobs": made["jobs"] }) })
     }
     say(&format!("Run {run} of {path}, on machines of this control plane's"));
-    follow(plane, key, &run, how, std::time::Instant::now(), say)
+    follow(plane, key, &run, how, std::time::Instant::now(), true, say)
 }
 
 /// `superci runs wait ID`: a run from a computer followed to its end, as `runs create` follows the one it starts.
 pub fn wait(plane: &str, key: &str, run: &str, how: Follow, say: &mut dyn FnMut(&str)) -> Result<Done> {
     if run.is_empty() || !run.bytes().all(|b| b.is_ascii_digit()) { return Err("Say which run: `superci runs wait ID` (ids are in `superci runs list`).".into()) }
-    follow(plane, key, run, how, std::time::Instant::now(), say)
+    follow(plane, key, run, how, std::time::Instant::now(), false, say)
 }
 
-fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Instant, say: &mut dyn FnMut(&str)) -> Result<Done> {
+fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Instant, sent_here: bool, say: &mut dyn FnMut(&str)) -> Result<Done> {
     let http = crate::aws::Blocking::new();
     let call = |method: &str, at: &str| -> Result<Value> {
         let r = Request::new(method, &format!("{plane}{at}")).with_header("authorization", &format!("Bearer {key}"));
@@ -264,14 +264,14 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             // printed as they came.
             let usd: f64 = jobs.iter().filter_map(|j| j["usd"].as_f64()).sum();
             for (i, j) in jobs.iter().enumerate() {
-                say(&format!("{} ({}{}{}): {}", j["name"].as_str().unwrap_or("job"), j["machine"].as_str().unwrap_or("no machine"),
+                say(&format!("{}{} ({}{}{}): {}", crate::commands::JOB_LINE, j["name"].as_str().unwrap_or("job"), j["machine"].as_str().unwrap_or("no machine"),
                     j["took_ms"].as_u64().map(|ms| format!(", {}", span(ms / 1000))).unwrap_or_default(), j["usd"].as_f64().map(|u| format!(", ${u:.3}")).unwrap_or_default(), j["result"].as_str().unwrap_or("?")));
                 let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
                 steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
                 for s in steps {
                     let mark = match s["result"].as_str() { Some("succeeded") => "✓", Some("failed") => "✗", Some("skipped") | Some("cancelled") => "–", _ => "·" };
                     let time = match (s["start"].as_str().and_then(crate::log_view::seconds), s["finish"].as_str().and_then(crate::log_view::seconds)) { (Some(a), Some(b)) => format!(" {}", span(b.saturating_sub(a))), _ => String::new() };
-                    say(&format!("  {mark} {}{time}", s["name"].as_str().unwrap_or("step")));
+                    say(&format!("{}  {mark} {}{time}", crate::commands::JOB_LINE, s["name"].as_str().unwrap_or("step")));
                     if how.quiet && s["result"] == "failed" {
                         let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&log={}", s["log"].as_u64().unwrap_or(0))).with_header("authorization", &format!("Bearer {key}"));
                         let text = block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text()).unwrap_or_default();
@@ -280,7 +280,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     }
                 }
             }
-            let said = format!("The run ended: {result}, {} after it was sent, ${usd:.3} of machines.", span(took));
+            let said = format!("The run ended: {result}, {} after it was {}, ${usd:.3} of machines.", span(took), if sent_here { "sent" } else { "followed from here" });
             if result != "success" { return Err(said) }
             return Ok(Done { said: vec![said], data: json!({ "run_id": run, "result": result, "seconds": took, "usd": usd, "jobs": jobs.iter().map(|j| json!({ "name": j["name"], "result": j["result"], "machine": j["machine"], "usd": j["usd"], "took_ms": j["took_ms"],
                 "steps": j["steps"].as_array().into_iter().flatten().map(|s| json!({ "name": s["name"], "result": s["result"], "start": s["start"], "finish": s["finish"] })).collect::<Vec<_>>() })).collect::<Vec<_>>() }) })
