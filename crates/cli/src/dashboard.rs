@@ -5910,8 +5910,11 @@ fn admit(key: &str, req: &Req) -> Option<Response> {
     let q = |n: &str| req.query.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str()).unwrap_or("");
     // The first visit carries the key; later ones its cookie. SameSite=Lax: other sites' requests and form posts never carry it,
     // but coming back from a sign-in does (AWS's returns to 127.0.0.1, which is another site to a browser than localhost).
+    // The link may name a page too (`/?k=…&p=job&id=…`): sent on to it, without the key.
     if req.path == "/" && safe_eq(q("k").as_bytes(), key.as_bytes()) {
-        return Some(Response::redirect("/").with_header("set-cookie", &format!("{}={key}; Path=/; HttpOnly; SameSite=Lax", key_cookie(&req.host))));
+        let rest = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(req.query.iter().filter(|(k, _)| k != "k")).finish();
+        let to = if rest.is_empty() { "/".to_string() } else { format!("/?{rest}") };
+        return Some(Response::redirect(&to).with_header("set-cookie", &format!("{}={key}; Path=/; HttpOnly; SameSite=Lax", key_cookie(&req.host))));
     }
     // Only as this computer's own address (no other name pointing here), and changes only from the dashboard's own pages:
     // a page on another local port shares the cookie (cookies are not kept per port), not the origin.
@@ -7526,6 +7529,10 @@ mod tests {
         first.query = vec![("k".into(), "k".repeat(32))];
         let set = respond(&shared, &first);
         assert!(set.headers.iter().any(|(k, v)| k == "set-cookie" && v.starts_with(&format!("superci_local_8977={}", "k".repeat(32)))));
+        assert!(set.headers.iter().any(|(k, v)| k == "location" && v == "/"));
+        // A link that names a page goes on to it, without the key.
+        first.query.extend([("p".into(), "job".into()), ("id".into(), "42".into())]);
+        assert!(respond(&shared, &first).headers.iter().any(|(k, v)| k == "location" && v == "/?p=job&id=42"));
     }
 
     #[test]
