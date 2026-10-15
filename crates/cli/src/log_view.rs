@@ -57,11 +57,13 @@ fn github(got: &Value, log: &str) -> Vec<Step> {
     for raw in log.lines() {
         let when = raw.trim_start_matches('\u{feff}').get(..19).and_then(|t| seconds(&format!("{t}Z")));
         let l = line(raw);
-        // On to a later step: its second has come and this is how a step begins (its heading, or the first line GitHub
-        // writes for the steps of its own), or its second has passed.
-        let begins = l.1 == "g" || ["Current runner version", "Post job cleanup.", "Cleaning up orphan processes"].iter().any(|b| l.2.starts_with(b));
-        while let (Some(t), Some((_, Some(next)))) = (when, steps.get(at + 1)) {
-            if t > *next || (t == *next && begins) { at += 1 } else { break }
+        let plain = strip_controls(split_time(raw).1);
+        // On to a later step: its second has passed, or it has come and this line begins that very step (its heading
+        // names it; GitHub's own steps begin with lines of their own). (Steps of the same second are not skipped.)
+        let begins = |name: &str| plain.strip_prefix("##[group]").is_some_and(|h| h == name)
+            || (name == "Complete job" && plain.starts_with("Cleaning up orphan processes")) || (name.starts_with("Post ") && plain.starts_with("Post job cleanup."));
+        while let (Some(t), Some((step, Some(next)))) = (when, steps.get(at + 1)) {
+            if t > *next || (t == *next && begins(&step.name)) { at += 1 } else { break }
         }
         steps[at].0.lines.push(l);
     }
@@ -209,7 +211,7 @@ mod tests {
     fn githubs_lines_go_to_the_step_they_were_written_in() {
         let got = json!({ "steps": [
             { "name": "Set up job", "status": "completed", "conclusion": "success", "started_at": "2026-10-14T21:09:50Z", "completed_at": "2026-10-14T21:09:52Z" },
-            { "name": "Run tests", "status": "completed", "conclusion": "failure", "started_at": "2026-10-14T21:09:52Z", "completed_at": "2026-10-14T21:10:30Z" },
+            { "name": "Run npm test", "status": "completed", "conclusion": "failure", "started_at": "2026-10-14T21:09:52Z", "completed_at": "2026-10-14T21:10:30Z" },
             { "name": "Complete job", "status": "completed", "conclusion": "success", "started_at": "2026-10-14T21:10:30Z", "completed_at": "2026-10-14T21:10:31Z" }],
             "log": "\u{feff}2026-10-14T21:09:50.1000000Z Current runner version: '2.337.0'\n2026-10-14T21:09:52.0100000Z Prepare all required actions\n2026-10-14T21:09:52.2000000Z ##[group]Run npm test\n2026-10-14T21:09:59.0000000Z \u{1b}[31mFAIL\u{1b}[0m a <b>.test.js\n2026-10-14T21:10:29.0000000Z ##[error]Process completed with exit code 1.\n2026-10-14T21:10:30.5000000Z Cleaning up orphan processes" });
         let v = view(&json!({ "provider": "" }), &got, false);
@@ -220,6 +222,16 @@ mod tests {
         assert_eq!((steps[1]["state"].as_str(), steps[1]["ms"].as_u64(), steps[1]["lines"][0][1].as_str(), steps[1]["lines"][0][0].as_str()), (Some("failure"), Some(38_000), Some("g"), Some("21:09:52")));
         assert_eq!(lines(2), ["Cleaning up orphan processes"]);
         assert_eq!((v["errors"].as_u64(), v["warnings"].as_u64()), (Some(1), Some(0)));
+        // Steps of the same second (a set-up of under a second, a step that ends as the next begins): each line in its own.
+        let got = json!({ "steps": [
+            { "name": "Set up job", "status": "completed", "conclusion": "success", "started_at": "2026-10-15T06:51:05Z", "completed_at": "2026-10-15T06:51:05Z" },
+            { "name": "Run make", "status": "completed", "conclusion": "success", "started_at": "2026-10-15T06:51:05Z", "completed_at": "2026-10-15T06:51:46Z" },
+            { "name": "Run echo \"after\"", "status": "completed", "conclusion": "success", "started_at": "2026-10-15T06:51:46Z", "completed_at": "2026-10-15T06:51:46Z" },
+            { "name": "Complete job", "status": "completed", "conclusion": "success", "started_at": "2026-10-15T06:51:46Z", "completed_at": "2026-10-15T06:51:46Z" }],
+            "log": "2026-10-15T06:51:05.1Z Current runner version: '2.337.0'\n2026-10-15T06:51:05.5Z ##[group]Run make\n2026-10-15T06:51:45.9Z done\n2026-10-15T06:51:46.1Z ##[group]Run echo \"after\"\n2026-10-15T06:51:46.2Z after\n2026-10-15T06:51:46.4Z Cleaning up orphan processes" });
+        let v = view(&json!({ "provider": "" }), &got, false);
+        let counts: Vec<usize> = v["steps"].as_array().unwrap().iter().map(|s| s["lines"].as_array().unwrap().len()).collect();
+        assert_eq!(counts, [1, 2, 2, 1], "{v}");
     }
 
     #[test]

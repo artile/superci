@@ -177,7 +177,7 @@ pub fn checkout_action(tree: &str, parts: u32, layered: bool) -> String {
     let fetch = match (parts, layered) {
         (0, _) => "true".to_string(),
         // Each archive on the one before; then what was removed since the base.
-        (_, true) => format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\" | tar -xz; done; if [ -f .superci-removed ]; then tr '\\n' '\\0' < .superci-removed | xargs -0 -r rm -f --; rm -f .superci-removed; fi", parts - 1),
+        (_, true) => format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\" | tar -xzi; done; if [ -f .superci-removed ]; then tr '\\n' '\\0' < .superci-removed | xargs -0 -r rm -f --; rm -f .superci-removed; fi", parts - 1),
         _ => format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\"; done | tar -xz", parts - 1),
     };
     format!(r#"name: Check out (SuperCI)
@@ -390,7 +390,7 @@ mod tests {
     fn the_checkout_is_an_action_the_runner_can_unpack() {
         let gz = checkout_tarball("https://plane.example/runner/abc/superci/tree", 3, false);
         let layered = checkout_action("https://plane.example/runner/abc/superci/tree", 2, true);
-        assert!(layered.contains(r#"for part in $(seq 0 1); do curl -fsSL --retry 3 "https://plane.example/runner/abc/superci/tree?part=$part" | tar -xz; done"#) && layered.contains("xargs -0 -r rm -f --") && layered.contains(r"tr '\n' '\0' < .superci-removed"), "{layered}");
+        assert!(layered.contains(r#"for part in $(seq 0 1); do curl -fsSL --retry 3 "https://plane.example/runner/abc/superci/tree?part=$part" | tar -xzi; done"#) && layered.contains("xargs -0 -r rm -f --") && layered.contains(r"tr '\n' '\0' < .superci-removed"), "{layered}");
         assert_eq!(&gz[..3], &[0x1f, 0x8b, 8]);
         // (Unpacked by the system's own tar, as the runner does.)
         let dir = std::env::temp_dir().join(format!("superci-checkout-{}", guid()));

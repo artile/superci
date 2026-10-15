@@ -3128,9 +3128,19 @@ impl<'a> ControlPlane<'a> {
             };
             match pages.iter_mut().find(|(f, _)| *f == file) { Some((_, b)) => b.extend(bytes), None => pages.push((file, bytes)) }
         }
-        // Pages in the order they were begun: by their first line's time.
-        pages.sort_by(|a, b| a.1.get(..28).cmp(&b.1.get(..28)));
-        Ok(pages.into_iter().flat_map(|(_, b)| { let mut b = b; if !b.ends_with(b"\n") { b.push(b'\n') } b }).collect())
+        // Every line in the order it was written (each begins with its time, to the ten-millionth of a second), once:
+        // the runner writes a step's lines to the step's pages and to the job's.
+        // (A message of several lines has its time on its first only: they stay together.)
+        let timed = |l: &str| { let b = l.trim_start_matches('\u{feff}').as_bytes(); b.len() > 28 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) };
+        let mut entries: Vec<String> = vec![];
+        for (_, b) in &pages {
+            for l in String::from_utf8_lossy(b).lines().filter(|l| !l.is_empty()) {
+                match entries.last_mut() { Some(e) if !timed(l) => { e.push('\n'); e.push_str(l) } _ => entries.push(l.to_string()) }
+            }
+        }
+        entries.sort_by(|a, b| a.trim_start_matches('\u{feff}').get(..28).cmp(&b.trim_start_matches('\u{feff}').get(..28)));
+        entries.dedup();
+        Ok(entries.into_iter().flat_map(|l| format!("{l}\n").into_bytes()).collect())
     }
 
     /// A run's job's steps in order, each with its log: the whole one once the runner sent it, else the lines it sent

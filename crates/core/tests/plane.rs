@@ -2607,6 +2607,7 @@ fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself()
     assert_eq!(page(&token, setup, 0, "2026-10-15T10:00:01.0000000Z Current runner version: '2.337.0'\n"), 200);
     assert_eq!(page(&token, tests, 55, "2026-10-15T10:00:06.0000000Z ok 1 - adds\n"), 200);
     assert_eq!(page(&token, "../escape", 0, "x"), 200, "a name that is not a page's is let be");
+    assert_eq!(page(&token, "aaaa_0000_1.log", 0, "2026-10-15T10:00:06.0000000Z ok 1 - adds\n"), 200, "the job's own page, with a step's line again");
     let got = json(&run(Request::new("GET", &format!("{PLANE_URL}/job/log?id=7")).with_header("authorization", "Bearer dashboard-session-key-1")));
     assert_eq!(got["log"].as_str().unwrap_or_else(|| panic!("{got}")), "2026-10-15T10:00:01.0000000Z Current runner version: '2.337.0'\n2026-10-15T10:00:05.0000000Z ##[group]Run npm test\n2026-10-15T10:00:06.0000000Z ok 1 - adds\n");
     let text = kept["log"].as_str().unwrap();

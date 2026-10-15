@@ -64,22 +64,35 @@ fn hashes(root: &Path, files: &[Vec<u8>]) -> std::collections::BTreeMap<String, 
 /// The files given of the working tree as a gzipped tar, as they are on disk now, with `removed` (paths
 /// gone since a base) as `.superci-removed`. By the system's own tar.
 fn pack_files(root: &Path, files: &[Vec<u8>], removed: &[String]) -> Result<Vec<u8>> {
-    let files: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
+    if removed.is_empty() { return tar_of(root, files, true) }
+    // What was removed since the base, as an archive of its own after this one, the two compressed as one (the
+    // machine reads both in turn, past the end of the first).
+    let mut raw = tar_of(root, files, false)?;
     let extra = std::env::temp_dir().join(format!("superci-removed-{}", superci_core::crypto::random_token(8)));
-    let mut args = vec!["-czf".to_string(), "-".into(), "--no-xattrs".into(), "--null".into(), "-T".into(), "-".into()];
-    if !removed.is_empty() {
-        std::fs::create_dir_all(&extra).map_err(|e| e.to_string())?;
-        std::fs::write(extra.join(".superci-removed"), removed.join("\n") + "\n").map_err(|e| e.to_string())?;
-        args.extend(["-C".to_string(), extra.to_string_lossy().into_owned(), ".superci-removed".into()]);
-    }
-    let mut tar = Command::new("tar").current_dir(root).args(&args).env("COPYFILE_DISABLE", "1")
+    std::fs::create_dir_all(&extra).map_err(|e| e.to_string())?;
+    std::fs::write(extra.join(".superci-removed"), removed.join("\n") + "\n").map_err(|e| e.to_string())?;
+    let list = tar_of(&extra, &[b".superci-removed".to_vec()], false);
+    let _ = std::fs::remove_dir_all(&extra);
+    raw.extend(list?);
+    let mut gz = Command::new("gzip").arg("-c").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().map_err(|e| format!("gzip: {e}"))?;
+    let mut stdin = gz.stdin.take().ok_or("gzip took no input")?;
+    let writer = std::thread::spawn(move || stdin.write_all(&raw));
+    let out = gz.wait_with_output().map_err(|e| format!("gzip: {e}"))?;
+    let _ = writer.join();
+    if !out.status.success() { return Err("gzip failed".into()) }
+    Ok(out.stdout)
+}
+
+fn tar_of(root: &Path, files: &[Vec<u8>], compress: bool) -> Result<Vec<u8>> {
+    let files: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
+    let args = [if compress { "-czf" } else { "-cf" }, "-", "--no-xattrs", "--null", "-T", "-"];
+    let mut tar = Command::new("tar").current_dir(root).args(args).env("COPYFILE_DISABLE", "1")
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("tar: {e}"))?;
     let list: Vec<u8> = files.iter().flat_map(|f| f.iter().copied().chain([0])).collect();
     let mut stdin = tar.stdin.take().ok_or("tar took no input")?;
     let writer = std::thread::spawn(move || stdin.write_all(&list));
     let out = tar.wait_with_output().map_err(|e| format!("tar: {e}"))?;
     let _ = writer.join();
-    let _ = std::fs::remove_dir_all(&extra);
     if !out.status.success() { return Err(format!("tar: {}", String::from_utf8_lossy(&out.stderr).trim())) }
     Ok(out.stdout)
 }
