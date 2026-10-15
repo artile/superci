@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.1 — unreleased
+## 0.19.1 — 2026-10-15
 - A GitHub job's page shows its lines while it runs. GitHub gives a job's log only once it has ended; its machine now sends what the runner writes of each step as it goes (every two seconds, in the pieces the runner writes them), kept in the control plane's bucket until GitHub's own log is there. A step that writes little shows its lines when it ends.
 - Runs from a computer send only what changed since the working tree this computer last sent whole (kept in the control plane's bucket as a base): a few files' worth instead of the whole tree, for an agent that runs the tests after each edit. The machine puts the base in place, then the changes, and removes what was removed. A base gone (the bucket keeps it up to a month), or changes of half the tree or more, and the whole tree is sent again.
 - A job's log is given up to 4 MB (1 MB before) by `superci jobs retrieve --bytes` and the dashboard, and a GitHub job's Raw log comes whole, from GitHub itself, whatever its size.
