@@ -174,6 +174,10 @@ impl Config {
 pub struct Cache {
     /// Whether the jobs' indexes are complete (once they are, they stay so).
     indexed: std::cell::Cell<bool>,
+    /// Runners' links known to be a job's (`rjob:<token>`), until when; and a count for posts of lines in one
+    /// millisecond (see `ControlPlane::lines_in`).
+    runner_links: RefCell<HashMap<String, u64>>,
+    lines_seq: std::cell::Cell<u64>,
     installed: RefCell<Option<(bool, u64)>>,
     creds: RefCell<Option<Credentials>>,
     tokens: RefCell<HashMap<u64, (String, u64)>>,
@@ -3085,6 +3089,27 @@ impl<'a> ControlPlane<'a> {
         Ok(out)
     }
 
+    /// A post of a job's lines from its runner (see `runner_service::feed`), kept under when it came (to the
+    /// millisecond, then a count): its step and where in that step's log it begins. Only for a runner's link known
+    /// to be a job's (asked of the store once per runtime, then remembered).
+    async fn lines_in(&self, token: &str, sub: &str, req: &Request) -> Result<Response> {
+        let now = self.clock.now_ms();
+        let known = self.cache.runner_links.borrow().get(token).is_some_and(|until| *until > now);
+        if !known {
+            if self.store.get(&format!("rjob:{token}")).await?.is_none() { return Ok(nothing_here()) }
+            self.cache.runner_links.borrow_mut().insert(token.to_string(), now + 3_600_000);
+        }
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        let lines: Vec<String> = body["value"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
+        if !lines.is_empty() {
+            let seq = self.cache.lines_seq.get().wrapping_add(1) % 1000;
+            self.cache.lines_seq.set(seq);
+            let step = body["stepId"].as_str().map(str::to_string).or_else(|| sub.split('?').next().unwrap_or(sub).trim_end_matches('/').rsplit('/').next().map(str::to_string));
+            self.store.put_until(&format!("rline:{token}:{now:013}{seq:03}"), serde_json::json!({ "step": step, "start": body["startLine"], "lines": lines }).to_string(), now + crate::runner_service::KEPT_MS).await?;
+        }
+        Ok(Response::new(200, "application/json", ""))
+    }
+
     /// A piece of what a GitHub job's runner wrote as it went (`file`, a page of its log; `at`, where in it): in the
     /// bucket where there is one (the store keeps where), else in the store. Gone after two days.
     async fn keep_live(&self, id: &str, file: &str, at: u64, body: &[u8], plane_url: &str, now: u64) -> Result<()> {
@@ -3528,6 +3553,9 @@ impl<'a> ControlPlane<'a> {
         let rest = url.path().trim_start_matches("/runner/");
         let (token, sub) = rest.split_once('/').unwrap_or((rest, ""));
         if token.len() < 16 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Ok(nothing_here()) }
+        // A job's lines as its runner writes them: kept at once, nothing else read or written (a run that prints
+        // fast sends a hundred lines at a time, one post after another, and waits for each).
+        if req.method == "POST" && sub.contains("TimeLineWebConsoleLog/") { return self.lines_in(token, sub, req).await }
         let key = format!("rjob:{token}");
         let Some(before) = get_json::<crate::runner_service::HandedJob>(self.store, &key).await? else { return Ok(nothing_here()) };
         if sub == "superci/checkout.tar.gz" {
