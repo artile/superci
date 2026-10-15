@@ -59,5 +59,6 @@ fn the_cloudflare_control_plane_answers_with_its_keys_and_keeps_a_run_from_a_com
     let runs = json(&bare, &agent, &["runs", "list"]).1;
     assert_eq!(runs["runs"].as_array().map(Vec::len), Some(1), "{runs} {said}");
     let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&bare);
     let _ = std::fs::remove_dir_all(&dir);
 }
