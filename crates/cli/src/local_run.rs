@@ -219,7 +219,11 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
                 let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&log={n}")).with_header("authorization", &format!("Bearer {key}"));
                 block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text())
             };
-            for line in logs[i].take(j, st["over"] == true && over_at.is_some_and(|t| t.elapsed().as_secs() > 15), &fetch) {
+            let pages = |step: &str| -> Option<String> {
+                let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&step={step}")).with_header("authorization", &format!("Bearer {key}"));
+                block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text())
+            };
+            for line in logs[i].take(j, st["over"] == true && over_at.is_some_and(|t| t.elapsed().as_secs() > 15), &fetch, &pages) {
                 if line.starts_with("##[endgroup]") { continue }
                 say(&format!("{}{mark}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(&line)))
             }
@@ -360,7 +364,7 @@ struct Lines {
 impl Lines {
     /// What to print now from the job's latest status (`j`: its new posts and its steps). `give_up`: the run is over
     /// and a step's log has not come: what is held is printed as it is. `fetch`: a step's whole log by its number.
-    fn take(&mut self, j: &Value, give_up: bool, fetch: &dyn Fn(u64) -> Option<String>) -> Vec<String> {
+    fn take(&mut self, j: &Value, give_up: bool, fetch: &dyn Fn(u64) -> Option<String>, pages: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
         for p in j["posts"].as_array().into_iter().flatten() {
             let lines = p["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
             self.held.push((p["step"].as_str().map(str::to_string), p["start"].as_u64(), lines));
@@ -379,10 +383,18 @@ impl Lines {
             let s = *s;
             if self.done.contains(id) { continue }
             let shown = self.shown.entry(id.to_string()).or_insert(0);
-            // What was sent of it as it went, while it follows on from what is out.
+            // What was sent of it as it went, while it follows on from what is out; past a gap (the runner drops lines
+            // that come faster than it sends them), what its machine sent of the step's pages fills it, and on.
             let mut rest = vec![];
+            let mut filled = false;
             for (step, start, lines) in self.held.drain(..) {
                 if step.as_deref() != Some(id) { rest.push((step, start, lines)); continue }
+                if let (Some(st), false) = (start, filled) {
+                    if st > *shown + 1 {
+                        filled = true;
+                        if let Some(text) = pages(id) { for l in text.lines().skip(*shown as usize) { out.push(without_time(l).to_string()); *shown += 1 } }
+                    }
+                }
                 match start {
                     Some(start) if start <= *shown + 1 => for (k, line) in lines.into_iter().enumerate() { if start + k as u64 > *shown { out.push(line); *shown = start + k as u64 } },
                     Some(_) => {}
@@ -454,14 +466,21 @@ mod tests {
         let none = |_: u64| None;
         // Step a sends line 1, then 4 (2 and 3 were dropped); b's first line comes before a's log does.
         let j = json!({ "posts": [post("a", 1, &["a1"]), post("a", 4, &["a4"]), post("b", 1, &["b1"])], "steps": [step("a", 1, "inProgress", None), step("b", 2, "pending", None)] });
-        assert_eq!(l.take(&j, false, &none), ["a1"], "after a gap, nothing more of a until its log; b waits for a");
+        assert_eq!(l.take(&j, false, &none, &|_| None), ["a1"], "after a gap and no pages, nothing more of a until its log; b waits for a");
         let j = json!({ "posts": [], "steps": [step("a", 1, "completed", Some(1)), step("b", 2, "inProgress", None)] });
-        assert_eq!(l.take(&j, false, &logs), ["a2", "a3", "a4", "b1"], "the rest of a from its log, its time taken off; then b");
+        assert_eq!(l.take(&j, false, &logs, &|_| None), ["a2", "a3", "a4", "b1"], "the rest of a from its log, its time taken off; then b");
         let j = json!({ "posts": [post("b", 2, &["b2"])], "steps": [step("a", 1, "completed", Some(1)), step("b", 2, "completed", Some(2))] });
-        assert_eq!(l.take(&j, false, &logs), ["b2"]);
+        assert_eq!(l.take(&j, false, &logs, &|_| None), ["b2"]);
         assert!(l.complete());
         // An older control plane: its lines as they come.
-        assert_eq!(Lines::default().take(&json!({ "lines": ["x", "y"] }), false, &none), ["x", "y"]);
+        assert_eq!(Lines::default().take(&json!({ "lines": ["x", "y"] }), false, &none, &|_| None), ["x", "y"]);
+        // Past a gap, its pages so far fill it, and the step's lines go on as they come.
+        let mut l = Lines::default();
+        let pages = |s: &str| (s == "a").then(|| "2026-10-15T11:00:49.1Z a1\n2026-10-15T11:00:49.2Z a2\n2026-10-15T11:00:49.3Z a3\n".to_string());
+        let j = json!({ "posts": [post("a", 1, &["a1"]), post("a", 5, &["a5"])], "steps": [step("a", 1, "inProgress", None)] });
+        assert_eq!(l.take(&j, false, &none, &pages), ["a1", "a2", "a3"], "a gap filled from the pages as far as they go");
+        let j = json!({ "posts": [post("a", 4, &["a4", "a5", "a6"])], "steps": [step("a", 1, "inProgress", None)] });
+        assert_eq!(l.take(&j, false, &none, &pages), ["a4", "a5", "a6"], "and on from where they end");
     }
 
     #[test]

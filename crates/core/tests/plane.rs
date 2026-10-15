@@ -3349,7 +3349,7 @@ fn a_run_from_a_computer_gets_its_machine_and_its_runner_takes_the_job_from_the_
     assert!(!clouds.calls.borrow().iter().any(|c| c.1.contains("generate-jitconfig")), "GitHub is not asked for a runner");
     let record: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{run_id}")]).unwrap();
     let job_id: u64 = record["jobs"][0]["job_id"].as_str().unwrap().parse().unwrap();
-    assert!(job_id > 1 << 62 && job(&store, job_id)["provider"] == "local" && job(&store, job_id)["state"] == "launched" && job(&store, job_id)["name"] == "The test job");
+    assert!(job_id > 1 << 52 && job_id < 1 << 53 && job(&store, job_id)["provider"] == "local" && job(&store, job_id)["state"] == "launched" && job(&store, job_id)["name"] == "The test job");
     // Its checkout: the action that puts the tree in place, and the tree in its parts, as uploaded.
     let checkout = run(Request::new("GET", &format!("{server}/superci/checkout.tar.gz")));
     assert_eq!((checkout.status, &checkout.body[..2]), (200, &[0x1f, 0x8b][..]));

@@ -3100,6 +3100,35 @@ impl<'a> ControlPlane<'a> {
         Ok(())
     }
 
+    /// What a job's runner has written so far of one step (its pages: `<timeline>_<step>_<n>.log`), as the step's log
+    /// will be: none, when its machine sent none.
+    async fn step_pages(&self, id: &str, step: &str) -> Result<Option<String>> {
+        use base64::Engine;
+        if step.is_empty() || !step.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') { return Ok(None) }
+        let marks: Vec<(String, String)> = self.store.list(&format!("glive:{id}:")).await?.into_iter().filter(|(k, _)| k.contains(&format!("_{step}_"))).collect();
+        if marks.is_empty() { return Ok(None) }
+        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
+        let mut creds = None;
+        let mut out = vec![];
+        for (k, v) in &marks {
+            let rest = k.strip_prefix(&format!("glive:{id}:")).unwrap_or_default();
+            match v.trim_matches('"').strip_prefix("s3:") {
+                Some(r) => {
+                    let region = r.split(':').next().unwrap_or_default();
+                    if creds.is_none() { if let Some(a) = self.aws_connection().await?.filter(|a| a.connected) { creds = Some(self.aws_creds(&plane_url, &a).await?) } }
+                    let Some(c) = &creds else { continue };
+                    let (file, at) = (rest.split(':').next().unwrap_or_default(), rest.split(':').nth(1).unwrap_or_default());
+                    let got = aws::s3(self.http, "GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &format!("live/{id}/{file}-{at}")), region, c, vec![], &[], self.clock.now_ms()).await?;
+                    if got.status < 300 { out.extend(got.body) }
+                }
+                None => out.extend(base64::engine::general_purpose::STANDARD.decode(v.trim_matches('"')).map_err(|e| e.to_string())?),
+            }
+        }
+        // (Only whole lines: the last may still be being written.)
+        let text = String::from_utf8_lossy(&out).into_owned();
+        Ok(Some(match text.rfind('\n') { Some(i) => text[..=i].to_string(), None => String::new() }))
+    }
+
     /// What a GitHub job's runner wrote as it went, its last `want` bytes or so: each page in order (by the time its
     /// first line was written), its pieces one after another.
     async fn live_log(&self, id: &str, want: usize) -> Result<Vec<u8>> {
@@ -3164,10 +3193,16 @@ impl<'a> ControlPlane<'a> {
         steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
         let posts: Vec<(Option<String>, Vec<String>)> = self.store.list(&format!("rline:{token}:")).await?.into_iter().map(|(_, v)| { let (step, _, lines) = crate::runner_service::feed(&v); (step, lines) }).collect();
         let mut out = vec![];
+        let job_id = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.map(|h| h.job_id).unwrap_or(0);
         for s in steps {
             let text = match s["log"].as_u64() {
                 Some(n) => String::from_utf8_lossy(&self.log_text(token, n).await?).into_owned(),
-                None => posts.iter().filter(|(step, _)| step.as_deref() == s["id"].as_str()).flat_map(|(_, l)| l.iter().cloned()).collect::<Vec<_>>().join("\n"),
+                // Still going: what its machine sent of its pages (whole), else the lines the runner sent as it went
+                // (it drops some when they come fast).
+                None => match self.step_pages(&job_id.to_string(), s["id"].as_str().unwrap_or_default()).await? {
+                    Some(text) if !text.is_empty() => text,
+                    _ => posts.iter().filter(|(step, _)| step.as_deref() == s["id"].as_str()).flat_map(|(_, l)| l.iter().cloned()).collect::<Vec<_>>().join("\n"),
+                },
             };
             out.push(serde_json::json!({ "name": s["name"], "state": s["state"], "result": s["result"], "start": s["start"], "finish": s["finish"], "text": text }));
         }
@@ -3177,10 +3212,11 @@ impl<'a> ControlPlane<'a> {
     /// A run's job's log: each step's whole log in order, where the runner sent them; else the lines it sent as it went.
     async fn local_log(&self, token: &str) -> Result<Vec<u8>> {
         let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
-        let mut steps: Vec<&serde_json::Value> = handed.steps.iter().filter(|s| s["log"].as_u64().is_some()).collect();
-        steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
+        // Each step's: its whole log once sent, else what its machine sent of it so far.
         let mut out = vec![];
-        for s in steps { out.extend(self.log_text(token, s["log"].as_u64().unwrap_or(0)).await?); if !out.ends_with(b"\n") { out.push(b'\n') } }
+        if !handed.steps.is_empty() {
+            for s in self.local_steps(token).await? { out.extend(s["text"].as_str().unwrap_or_default().as_bytes()); if !out.ends_with(b"\n") && !out.is_empty() { out.push(b'\n') } }
+        }
         if !out.is_empty() { return Ok(out) }
         let mut lines = vec![];
         for (_, v) in self.store.list(&format!("rline:{token}:")).await? { lines.extend(crate::runner_service::feed(&v).2) }
@@ -3232,7 +3268,7 @@ impl<'a> ControlPlane<'a> {
             }
         }
         if instances.len() > 64 { return Ok(Response::text(400, &format!("{} jobs: a run from a computer runs 64 at most", instances.len()))) }
-        let run_id = local_id(now);
+        let run_id = local_id();
         // Its jobs' cache: the repository's entries, as GitHub's jobs keep them when GitHub knows it here.
         let (ns, default_branch) = match self.repository_of(&r.repository).await { Some((id, default)) => (format!("gh{id}"), default), None => (cache::local_ns(&r.repository), "main".to_string()) };
         let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
@@ -3306,9 +3342,8 @@ impl<'a> ControlPlane<'a> {
                     jobs[i]["needs_said"] = serde_json::Value::Object(needs);
                     if runs {
                         // (Reserved here, started once the record says so: see above.)
-                        let now = self.clock.now_ms();
                         jobs[i]["state"] = "started".into();
-                        jobs[i]["job_id"] = local_id(now).to_string().into();
+                        jobs[i]["job_id"] = local_id().to_string().into();
                         jobs[i]["token"] = crate::crypto::random_token(24).into();
                         start.push(i);
                     } else {
@@ -3439,6 +3474,12 @@ impl<'a> ControlPlane<'a> {
         let Some(id) = path.trim_start_matches("/runs/").trim_end_matches("/log").parse::<u64>().ok() else { return Ok(nothing_here()) };
         let Some(run) = get_json::<serde_json::Value>(self.store, &format!("run:{id}")).await? else { return Ok(nothing_here()) };
         let q = |k: &str| url.query_pairs().find(|(n, _)| n == k).and_then(|(_, v)| v.parse::<u64>().ok());
+        // A step still going (`step`): what its machine sent of its pages so far, whole lines only.
+        let step = url.query_pairs().find(|(k, _)| k == "step").map(|(_, v)| v.into_owned());
+        if let (Some(i), Some(step)) = (q("job"), step) {
+            let Some(job) = run["jobs"][i as usize]["job_id"].as_str() else { return Ok(nothing_here()) };
+            return Ok(match self.step_pages(job, &step).await? { Some(t) => Response::new(200, "text/plain; charset=utf-8", t.into_bytes()), None => nothing_here() })
+        }
         let (Some(i), Some(n)) = (q("job"), q("log")) else { return Ok(Response::text(400, "say which job and which log")) };
         let Some(token) = run["jobs"][i as usize]["token"].as_str() else { return Ok(nothing_here()) };
         Ok(Response::new(200, "text/plain; charset=utf-8", self.log_text(token, n).await?))
@@ -4344,11 +4385,12 @@ impl<'a> ControlPlane<'a> {
     }
 }
 
-/// An id for a run from a computer or one of its jobs: above every id GitHub or GitLab gives, ordered by time, with a
-/// million random ones in each millisecond so that runs started together never share one.
-fn local_id(now: u64) -> u64 {
-    let r = crate::crypto::random_bytes(4);
-    (1u64 << 62) + now * 1_000_000 + u32::from_le_bytes([r[0], r[1], r[2], r[3]]) as u64 % 1_000_000
+/// An id for a run from a computer or one of its jobs: above every id GitHub or GitLab gives (2^52 and up), and
+/// below 2^53, so a number in JavaScript holds it whole (GitHub's actions print a run's id from one); one of 2^52 at
+/// random, so runs started together never share one.
+fn local_id() -> u64 {
+    let r = crate::crypto::random_bytes(8);
+    (1u64 << 52) | (u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]) & ((1u64 << 52) - 1))
 }
 
 /// Where a part of a run's working tree is kept in the bucket.
