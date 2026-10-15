@@ -49,7 +49,7 @@ const AGAIN: [&str; 6] = ["ThrottlingException", "ProvisionedThroughputExceededE
 /// the table's time to live) when it has one. Before 0.19.0 every record was in the one partition `s`: until those
 /// are moved (`migrate`, a little at each sweep; then `layout` says so), what is not found in its own is looked for
 /// there too.
-struct Dynamo<'a> { http: &'a Blocking, table: String, region: String, old: std::cell::Cell<Option<bool>> }
+struct Dynamo<'a> { http: &'a dyn Http, table: String, region: String, old: std::cell::Cell<Option<bool>> }
 
 /// The partition a key is kept in: its kind.
 fn part(key: &str) -> &str { key.split(':').next().unwrap_or(key) }
@@ -400,5 +400,121 @@ fn main() {
             let Some(what) = next else { break };
             if let Err(e) = block_on(plane.later(&url, &what)) { eprintln!("superci: {what}: {e}") }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The DynamoDB store against a stand-in for DynamoDB's own API (its calls and answers as AWS gives them, kept in
+    //! memory): what every store promises, the partitions it keeps records in, ends, and moving the layout before
+    //! 0.19.0 over while it is read.
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    /// DynamoDB in memory: items by (partition, key), with the calls the store makes. It answers a page of two items at
+    /// a time (so the store pages), leaves some keys of a batch for later the first time, and says it is throttled
+    /// once in a while (so the store asks again).
+    #[derive(Default)]
+    struct FakeDynamo { items: RefCell<BTreeMap<(String, String), Value>>, calls: RefCell<u64>, unprocessed_once: RefCell<bool> }
+
+    #[async_trait(?Send)]
+    impl Http for FakeDynamo {
+        async fn send(&self, r: Request) -> io::Result<Response> {
+            let n = { let mut c = self.calls.borrow_mut(); *c += 1; *c };
+            let op = r.header("x-amz-target").unwrap_or_default().trim_start_matches("DynamoDB_20120810.").to_string();
+            let fail = |kind: &str| Ok(Response::new(400, "application/x-amz-json-1.0", json!({ "__type": format!("com.amazonaws.dynamodb.v20120810#{kind}"), "message": kind }).to_string()));
+            if n % 13 == 0 { return fail("ThrottlingException") }
+            let b: Value = serde_json::from_slice(&r.body).unwrap_or_default();
+            let key = |k: &Value| (k["p"]["S"].as_str().unwrap_or_default().to_string(), k["k"]["S"].as_str().unwrap_or_default().to_string());
+            let ok = |v: Value| Ok(Response::new(200, "application/x-amz-json-1.0", v.to_string()));
+            let mut items = self.items.borrow_mut();
+            match op.as_str() {
+                "GetItem" => ok(match items.get(&key(&b["Key"])) { Some(i) => json!({ "Item": i }), None => json!({}) }),
+                "PutItem" => {
+                    let at = key(&b["Item"]);
+                    let held = items.get(&at);
+                    let allowed = match b["ConditionExpression"].as_str() {
+                        Some("attribute_not_exists(k)") => held.is_none(),
+                        Some("v = :was") => held.is_some_and(|h| h["v"] == b["ExpressionAttributeValues"][":was"]),
+                        _ => true,
+                    };
+                    if !allowed { return fail("ConditionalCheckFailedException") }
+                    items.insert(at, b["Item"].clone());
+                    ok(json!({}))
+                }
+                "DeleteItem" => { items.remove(&key(&b["Key"])); ok(json!({})) }
+                "Query" => {
+                    let vals = &b["ExpressionAttributeValues"];
+                    let (p, prefix) = (vals[":p"]["S"].as_str().unwrap_or_default(), vals[":k"]["S"].as_str().unwrap_or(""));
+                    let mut hits: Vec<Value> = items.iter().filter(|((ip, ik), _)| ip == p && ik.starts_with(prefix)).map(|(_, i)| i.clone()).collect();
+                    if b["ScanIndexForward"] == false { hits.reverse() }
+                    let after = b["ExclusiveStartKey"]["k"]["S"].as_str().map(str::to_string);
+                    let forward = b["ScanIndexForward"] != false;
+                    let start = after.map(|a| hits.iter().position(|i| i["k"]["S"].as_str() == Some(a.as_str())).map(|x| x + 1).unwrap_or(0)).unwrap_or(0);
+                    let page = b["Limit"].as_u64().unwrap_or(2).min(2) as usize;
+                    let shown: Vec<Value> = hits.iter().skip(start).take(page).cloned().collect();
+                    let more = start + page < hits.len();
+                    let _ = forward;
+                    ok(if more { json!({ "Items": shown, "LastEvaluatedKey": { "p": { "S": p }, "k": shown.last().unwrap()["k"] } }) } else { json!({ "Items": shown }) })
+                }
+                "BatchGetItem" => {
+                    let table = b["RequestItems"].as_object().unwrap().keys().next().unwrap().clone();
+                    let keys = b["RequestItems"][&table]["Keys"].as_array().cloned().unwrap_or_default();
+                    let first = !*self.unprocessed_once.borrow();
+                    *self.unprocessed_once.borrow_mut() = true;
+                    let (now, later) = if first && keys.len() > 1 { keys.split_at(1) } else { keys.split_at(keys.len()) };
+                    let found: Vec<Value> = now.iter().filter_map(|k| items.get(&key(k)).cloned()).collect();
+                    ok(json!({ "Responses": { &table: found }, "UnprocessedKeys": if later.is_empty() { json!({}) } else { json!({ &table: { "Keys": later } }) } }))
+                }
+                other => panic!("a call the store does not make: {other}"),
+            }
+        }
+    }
+
+    fn store(fake: &FakeDynamo) -> Dynamo<'_> { Dynamo { http: fake, table: "superci-plane-t".into(), region: "us-east-1".into(), old: std::cell::Cell::new(None) } }
+
+    #[test]
+    fn it_keeps_each_kind_of_record_in_a_partition_of_its_own_and_does_what_every_store_does() {
+        let fake = FakeDynamo::default();
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
+        let s = store(&fake);
+        block_on(s.put("job:1", "one".into())).unwrap();
+        block_on(s.put("job:2", "two".into())).unwrap();
+        block_on(s.put("job:3", "three".into())).unwrap();
+        block_on(s.put("live:2", String::new())).unwrap();
+        assert!(fake.items.borrow().contains_key(&("job".to_string(), "job:1".to_string())) && fake.items.borrow().contains_key(&("live".to_string(), "live:2".to_string())));
+        assert_eq!(block_on(s.get("job:2")).unwrap().as_deref(), Some("two"));
+        assert_eq!(block_on(s.list("job:")).unwrap().len(), 3, "every page of it");
+        assert_eq!(block_on(s.list_last("job:", 2)).unwrap().iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["job:2", "job:3"]);
+        assert_eq!(block_on(s.get_many(&["job:3".into(), "job:9".into(), "job:1".into()])).unwrap(), [Some("three".to_string()), None, Some("one".to_string())], "what a batch left for later is asked again");
+        assert!(!block_on(s.put_if_absent("job:1", "again".into())).unwrap() && block_on(s.put_if_absent("job:4", "four".into())).unwrap());
+        assert!(!block_on(s.swap("job:1", Some("not this"), "x".into())).unwrap() && block_on(s.swap("job:1", Some("one"), "uno".into())).unwrap());
+        block_on(s.put_until("rline:t:1", "lines".into(), 1_790_000_000_000)).unwrap();
+        assert_eq!(fake.items.borrow()[&("rline".to_string(), "rline:t:1".to_string())]["x"]["N"], "1790000000", "its end in seconds, for the table's time to live");
+        block_on(s.delete("job:4")).unwrap();
+        assert_eq!(block_on(s.get("job:4")).unwrap(), None);
+        assert!(block_on(s.migrate(10)).unwrap(), "nothing of an earlier layout");
+    }
+
+    #[test]
+    fn records_of_the_layout_before_are_read_where_they_are_and_moved_over_a_little_at_a_time() {
+        let fake = FakeDynamo::default();
+        let old = |k: &str, v: &str| (("s".to_string(), k.to_string()), json!({ "p": { "S": "s" }, "k": { "S": k }, "v": { "S": v } }));
+        fake.items.borrow_mut().extend([old("job:1", "one"), old("job:2", "two"), old("job:3", "three"), old("hello:1", "h")]);
+        let s = store(&fake);
+        // Read as they are, before anything moved; a write over one goes to its own partition.
+        assert_eq!(block_on(s.get("job:2")).unwrap().as_deref(), Some("two"));
+        assert_eq!(block_on(s.list("job:")).unwrap().len(), 3);
+        assert!(!block_on(s.put_if_absent("job:1", "x".into())).unwrap(), "one in the old partition is there");
+        assert!(block_on(s.swap("job:3", Some("three"), "tres".into())).unwrap(), "written in its own partition, the old one gone");
+        assert!(fake.items.borrow().contains_key(&("job".to_string(), "job:3".to_string())) && !fake.items.borrow().contains_key(&("s".to_string(), "job:3".to_string())));
+        // Moved a few at each sweep, never over what was written since; then the layout says so.
+        assert!(!block_on(s.migrate(2)).unwrap());
+        while !block_on(s.migrate(2)).unwrap() {}
+        assert!(!fake.items.borrow().keys().any(|(p, _)| p == "s"), "nothing left in the old partition");
+        assert_eq!(block_on(s.get("job:3")).unwrap().as_deref(), Some("tres"));
+        assert_eq!(block_on(s.get("hello:1")).unwrap().as_deref(), Some("h"));
+        assert_eq!(fake.items.borrow()[&("layout".to_string(), "layout".to_string())]["v"]["S"], "kinds");
     }
 }
