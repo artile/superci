@@ -126,7 +126,7 @@ pub enum Status { #[default] Success, Failure, Cancelled }
 /// The contexts an expression reads (`needs`, `matrix`, `github`, …), by name, and how the job stands.
 pub struct Contexts<'a> { pub values: &'a serde_json::Map<String, Value>, pub status: Status }
 
-fn truthy(v: &Value) -> bool {
+pub fn truthy(v: &Value) -> bool {
     match v { Value::Null => false, Value::Bool(b) => *b, Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()), Value::String(s) => !s.is_empty(), _ => true }
 }
 

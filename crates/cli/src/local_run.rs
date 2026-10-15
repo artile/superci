@@ -186,8 +186,19 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         }
     };
     let reference = git(&root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_else(|_| "refs/heads/main".into());
+    // The workflows its jobs call (`uses: ./.github/workflows/x.yml`), from the working tree as it is.
+    let mut called = serde_json::Map::new();
+    if let Ok(wf) = superci_core::workflow::parse(&text) {
+        for (_, j) in wf.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default() {
+            let Some(p) = j.get("uses").and_then(|u| u.text()).and_then(|u| u.strip_prefix("./")).filter(|p| !p.contains('@')) else { continue };
+            if called.contains_key(p) { continue }
+            let file = root.join(p);
+            let t = std::fs::read_to_string(&file).map_err(|e| format!("{p}, which a job calls: {e}"))?;
+            called.insert(p.to_string(), t.into());
+        }
+    }
     let body = json!({ "workflow": text, "path": path, "job": job, "repository": repository(&root), "ref": reference, "sha": git(&root, &["rev-parse", "HEAD"]).unwrap_or_default(),
-        "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts, "layered": layered });
+        "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts, "layered": layered, "called": called });
     let made = call("POST", "/runs", body.to_string().into_bytes())?;
     let run = made["run_id"].as_str().unwrap_or_default().to_string();
     if how.detach {

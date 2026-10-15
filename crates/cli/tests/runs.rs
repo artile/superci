@@ -212,3 +212,111 @@ fn a_failed_runs_tests_are_read_from_its_log_names_files_errors_and_counts() {
     let said = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "retrieve", &run, "--tests"]).output().unwrap().stdout).into_owned();
     assert!(said.contains("Tests: 1 failed, 41 passed (vitest)") && said.contains("✗ sums > adds two numbers  (src/sum.test.ts)") && said.contains("AssertionError: expected 3 to be 4"), "{said}");
 }
+
+/// A checkout with these files, committed.
+fn checkout_with(files: &[(&str, &str)]) -> std::path::PathBuf {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!("superci-e2e-files-{}-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst), superci_core_free_id()));
+    for (p, text) in files { let f = dir.join(p); std::fs::create_dir_all(f.parent().unwrap()).unwrap(); std::fs::write(f, text).unwrap(); }
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    dir
+}
+
+/// A runner's context data as plain JSON (`{t: 2, d: [{k, v}]}` a mapping, `{t: 1, a: […]}` a list).
+fn plain(v: &serde_json::Value) -> serde_json::Value {
+    match v["t"].as_u64() {
+        Some(2) => serde_json::Value::Object(v["d"].as_array().into_iter().flatten().map(|e| (e["k"].as_str().unwrap_or_default().to_string(), plain(&e["v"]))).collect()),
+        Some(1) => serde_json::Value::Array(v["a"].as_array().into_iter().flatten().map(plain).collect()),
+        _ => v.clone(),
+    }
+}
+
+/// The runner of the job shown as `name`, once it is started.
+fn runner_of(served: &superci_testkit::Served, run: &str, name: &str) -> Runner {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(r) = Runner::of_job(served, run, name) { return r }
+        let names: Vec<String> = served.store.under(&format!("run:{run}")).into_iter().next().map(|(_, r)| r["jobs"].as_array().into_iter().flatten().map(|j| format!("{}:{}", j["name"], j["state"])).collect()).unwrap_or_default();
+        assert!(std::time::Instant::now() < end, "no job {name} started: {names:?}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_job_that_calls_a_workflow_of_the_repository_runs_its_jobs_with_their_inputs_and_secrets_and_gives_its_outputs_on() {
+    let served = serve(|_| {});
+    let dir = checkout_with(&[
+        (".github/workflows/ci.yml", "jobs:\n  build:\n    uses: ./.github/workflows/build.yml\n    with:\n      target: web\n    secrets: inherit\n  after:\n    needs: build\n    runs-on: superci\n    steps:\n      - run: echo ${{ needs.build.outputs.artifact }}\n"),
+        (".github/workflows/build.yml", "on:\n  workflow_call:\n    inputs:\n      target:\n        type: string\n        required: true\n      fast:\n        type: boolean\n        default: true\n    outputs:\n      artifact:\n        value: ${{ jobs.compile.outputs.name }}\njobs:\n  compile:\n    runs-on: superci\n    outputs:\n      name: ${{ steps.c.outputs.name }}\n    steps:\n      - id: c\n        run: echo \"name=${{ inputs.target }}-bundle\" >> $GITHUB_OUTPUT\n  test:\n    needs: compile\n    runs-on: superci\n    steps:\n      - run: echo testing ${{ needs.compile.outputs.name }}\n"),
+    ]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach", "--secret=DEPLOY_TOKEN=s3cret-value"]).output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    // The called workflow's first job: its inputs (given and by default), and the run's secrets (inherited).
+    let compile = runner_of(&served, &run, "build / compile");
+    let message = compile.handed(&served);
+    assert_eq!(plain(&message["contextData"]["inputs"]), serde_json::json!({ "target": "web", "fast": true }));
+    assert_eq!(message["variables"]["DEPLOY_TOKEN"], serde_json::json!({ "value": "s3cret-value", "isSecret": true }));
+    compile.take();
+    compile.finish_with("succeeded", &[("name", "web-bundle")]);
+    // Its next job, after it: what it needs named as in its own workflow.
+    let test = runner_of(&served, &run, "build / test");
+    assert_eq!(plain(&test.handed(&served)["contextData"]["needs"])["compile"]["outputs"]["name"], "web-bundle");
+    test.take();
+    test.finish("succeeded");
+    // The job that needs the call: its result, and the called workflow's output made of its jobs'.
+    let after = runner_of(&served, &run, "after");
+    let needs = plain(&after.handed(&served)["contextData"]["needs"]);
+    assert_eq!((needs["build"]["result"].as_str(), needs["build"]["outputs"]["artifact"].as_str()), (Some("success"), Some("web-bundle")), "{needs}");
+    after.take();
+    after.finish("succeeded");
+}
+
+#[test]
+fn a_matrix_made_by_an_expression_is_read_once_the_job_it_needs_has_ended() {
+    let served = serve(|_| {});
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  setup:\n    runs-on: superci\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo 'shards=[1,2,3]' >> $GITHUB_OUTPUT\n  test:\n    needs: setup\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.setup.outputs.shards) }}\n        os: [linux]\n    steps:\n      - run: echo shard ${{ matrix.shard }}\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let setup = runner_of(&served, &run, "setup");
+    setup.take();
+    setup.finish_with("succeeded", &[("shards", "[1,2,3]")]);
+    // Three jobs of it, each its combination.
+    for shard in 1..=3 {
+        let r = runner_of(&served, &run, &format!("test ({shard}, linux)"));
+        assert_eq!(plain(&r.handed(&served)["contextData"]["matrix"]), serde_json::json!({ "shard": shard as f64, "os": "linux" }));
+        r.take();
+        r.finish("succeeded");
+    }
+}
+
+#[test]
+fn a_job_that_may_fail_lets_the_run_go_on_and_one_past_its_timeout_is_ended() {
+    let served = serve(|_| {});
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  flaky:\n    runs-on: superci\n    continue-on-error: true\n    steps:\n      - run: exit 1\n  after:\n    needs: flaky\n    runs-on: superci\n    timeout-minutes: 1\n    steps:\n      - run: sleep 600\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    // It fails; as on GitHub, the job that needs it sees a success and runs.
+    let flaky = runner_of(&served, &run, "flaky");
+    flaky.take();
+    flaky.finish("failed");
+    let after = runner_of(&served, &run, "after");
+    assert_eq!(plain(&after.handed(&served)["contextData"]["needs"])["flaky"]["result"], "success");
+    let record = served.store.under(&format!("run:{run}"))[0].1.clone();
+    let flaky_said = record["jobs"].as_array().unwrap().iter().find(|j| j["name"] == "flaky").unwrap().clone();
+    assert_eq!((flaky_said["result"].as_str(), flaky_said["failed"].as_bool()), (Some("success"), Some(true)), "{flaky_said}");
+    // It runs past its minute: the upkeep ends it, and says why.
+    after.take();
+    after.steps(&[("eeeeeeee-0000-0000-0000-000000000005", "Run sleep 600", 1, "inProgress", None, None)]);
+    served.later(30_000);
+    served.upkeep();
+    assert!(served.store.under("job:").iter().all(|(_, j)| j["error"].as_str().is_none_or(|e| !e.contains("timeout-minutes"))), "not yet");
+    served.later(60_000);
+    served.upkeep();
+    let ended = served.store.under("job:").into_iter().map(|(_, j)| j).find(|j| j["name"] == "after").unwrap();
+    assert_eq!((ended["state"].as_str(), ended["error"].as_str()), (Some("failed"), Some("it ran past its timeout-minutes (1), and its machine was ended")), "{ended}");
+    let record = served.store.under(&format!("run:{run}"))[0].1.clone();
+    assert_eq!(record["jobs"].as_array().unwrap().iter().find(|j| j["name"] == "after").unwrap()["result"], "failure");
+}

@@ -3,6 +3,9 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.6 — unreleased
+- Runs from a computer run a job that calls a workflow of the repository (`uses: ./.github/workflows/x.yml`) as GitHub does: its jobs (`caller / job`), with the inputs and secrets the caller gives (`with:`, `secrets: inherit` or named), and its outputs for the jobs that need the caller. (One of another repository is not run from a computer yet.)
+- A matrix made by an expression (`${{ fromJSON(needs.setup.outputs.matrix) }}`) is read once the jobs it needs have ended, as on GitHub.
+- A job's `timeout-minutes` ends it once it has run that long, and its `continue-on-error` lets the run go on when it fails (the jobs that need it see a success, as on GitHub).
 - Runs from a computer read YAML anchors and aliases in workflow files, as GitHub Actions does; a merge key (`<<`) is refused, as GitHub Actions refuses it.
 - `superci runs retrieve ID --tests` (and `superci jobs retrieve ID --tests`): each failed job's tests, read from its whole log: the tests that failed, each with its file and error, how many passed, failed and were skipped, and where its artifacts are. It reads what Vitest, Jest, Playwright, pytest, cargo and Go print. For a coding agent: what failed, without reading the log.
 - A large log's page is quick: a step's lines are drawn when it is opened, 2,000 at a time (Show more), search looks through the log itself and shows the lines that hold the words, and a finished job's log is kept for its next opens.

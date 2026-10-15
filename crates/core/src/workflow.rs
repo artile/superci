@@ -279,35 +279,51 @@ pub fn job_parts(workflow: &Node, path: &str, job: &str, ids: &mut dyn FnMut() -
 }
 
 /// A value of a matrix as GitHub reads it: a number, `true`, `null` as such, else text.
-fn matrix_value(n: &Node) -> std::result::Result<Value, String> {
+/// What reads an expression of a matrix (a scalar written with `${{ }}`): its value, once the jobs the job needs have
+/// ended (none: the matrix is not read yet).
+pub type Reader<'a> = Option<&'a dyn Fn(&str) -> std::result::Result<Value, String>>;
+
+fn matrix_value(n: &Node, read: Reader) -> std::result::Result<Value, String> {
     match n {
         Node::Scalar { text, plain, line, .. } => {
-            if text.contains("${{") { return Err(format!("line {line}: a matrix made by an expression is not run here yet")) }
+            if text.contains("${{") { return read.ok_or_else(|| format!("line {line}: a matrix made by an expression is read once the jobs it needs have ended"))?(text) }
             if !*plain { return Ok(Value::String(text.clone())) }
             Ok(match text.as_str() { "true" => json!(true), "false" => json!(false), "null" | "~" | "" => Value::Null, t => t.parse::<f64>().map(|f| json!(f)).unwrap_or_else(|_| json!(t)) })
         }
-        Node::Seq { items, .. } => items.iter().map(matrix_value).collect::<std::result::Result<Vec<_>, _>>().map(Value::Array),
-        Node::Map { pairs, .. } => pairs.iter().map(|(k, v)| Ok((k.text().unwrap_or_default().to_string(), matrix_value(v)?))).collect::<std::result::Result<serde_json::Map<_, _>, String>>().map(Value::Object),
+        Node::Seq { items, .. } => items.iter().map(|i| matrix_value(i, read)).collect::<std::result::Result<Vec<_>, _>>().map(Value::Array),
+        Node::Map { pairs, .. } => pairs.iter().map(|(k, v)| Ok((k.text().unwrap_or_default().to_string(), matrix_value(v, read)?))).collect::<std::result::Result<serde_json::Map<_, _>, String>>().map(Value::Object),
     }
+}
+
+/// Whether a job's matrix is made, in whole or in part, by an expression (`${{ fromJSON(needs.a.outputs.m) }}`): it
+/// is read once the jobs it needs have ended (`matrix_with`).
+pub fn matrix_later(job: &Node) -> bool {
+    fn has(n: &Node) -> bool { match n { Node::Scalar { text, .. } => text.contains("${{"), Node::Seq { items, .. } => items.iter().any(has), Node::Map { pairs, .. } => pairs.iter().any(|(_, v)| has(v)) } }
+    job.get("strategy").and_then(|s| s.get("matrix")).is_some_and(has)
 }
 
 /// A job's matrix: every combination its `strategy.matrix` makes, with `exclude` taken out and `include` added as
 /// GitHub adds it (to each combination it does not change, else as one of its own). None: the job has no matrix.
-pub fn matrix(job: &Node) -> std::result::Result<Option<Vec<serde_json::Map<String, Value>>>, String> {
-    let Some(m) = job.get("strategy").and_then(|s| s.get("matrix")) else { return Ok(None) };
-    if let Node::Scalar { line, .. } = m { return Err(format!("line {line}: a matrix made by an expression is not run here yet")) }
+pub fn matrix(job: &Node) -> std::result::Result<Option<Vec<serde_json::Map<String, Value>>>, String> { matrix_with(job, None) }
+
+/// The same, its expressions read by `read`.
+pub fn matrix_with(job: &Node, read: Reader) -> std::result::Result<Option<Vec<serde_json::Map<String, Value>>>, String> {
+    let Some(node) = job.get("strategy").and_then(|s| s.get("matrix")) else { return Ok(None) };
+    let Value::Object(m) = matrix_value(node, read)? else { return Err("the matrix is not a mapping".into()) };
+    // (In the order its keys are written, as GitHub makes the combinations.)
+    let order: Vec<String> = match node { Node::Map { pairs, .. } => pairs.iter().filter_map(|(k, _)| k.text().map(str::to_string)).collect(), _ => m.keys().cloned().collect() };
     let mut combos: Vec<serde_json::Map<String, Value>> = vec![serde_json::Map::new()];
     let mut keys = vec![];
-    for (k, v) in m.pairs() {
-        let key = k.text().unwrap_or_default().to_string();
+    for key in &order {
+        let Some(v) = m.get(key) else { continue };
         if key == "include" || key == "exclude" { continue }
-        let Value::Array(values) = matrix_value(v)? else { return Err(format!("the matrix's {key} is not a list")) };
+        let Value::Array(values) = v else { return Err(format!("the matrix's {key} is not a list")) };
         keys.push(key.clone());
         combos = combos.into_iter().flat_map(|c| { let key = key.clone(); values.iter().map(move |v| { let mut c = c.clone(); c.insert(key.clone(), v.clone()); c }) }).collect();
     }
     if keys.is_empty() { combos.clear() }
     let entries = |name: &str| -> std::result::Result<Vec<serde_json::Map<String, Value>>, String> {
-        match m.get(name) { Some(n) => match matrix_value(n)? { Value::Array(a) => Ok(a.into_iter().filter_map(|v| v.as_object().cloned()).collect()), _ => Err(format!("the matrix's {name} is not a list")) }, None => Ok(vec![]) }
+        match m.get(name) { Some(Value::Array(a)) => Ok(a.iter().filter_map(|v| v.as_object().cloned()).collect()), Some(Value::Null) | None => Ok(vec![]), Some(_) => Err(format!("the matrix's {name} is not a list")) }
     };
     for ex in entries("exclude")? { combos.retain(|c| !ex.iter().all(|(k, v)| c.get(k) == Some(v))) }
     let original = combos.len();
@@ -320,6 +336,19 @@ pub fn matrix(job: &Node) -> std::result::Result<Option<Vec<serde_json::Map<Stri
     }
     Ok(Some(combos))
 }
+
+/// Whether a workflow may be called by another (`on: workflow_call`, in any of its forms).
+pub fn callable(workflow: &Node) -> bool {
+    match workflow.get("on").or_else(|| workflow.get("true")) {
+        Some(Node::Scalar { text, .. }) => text == "workflow_call",
+        Some(Node::Seq { items, .. }) => items.iter().any(|i| i.text() == Some("workflow_call")),
+        Some(m @ Node::Map { .. }) => m.get("workflow_call").is_some(),
+        None => false,
+    }
+}
+
+/// A called workflow's `on.workflow_call` part (its inputs, secrets and outputs), when written as a mapping.
+pub fn call_part(workflow: &Node) -> Option<&Node> { workflow.get("on").or_else(|| workflow.get("true")).and_then(|o| o.get("workflow_call")) }
 
 /// The jobs a job needs, by name.
 pub fn needs(job: &Node) -> Vec<String> {
@@ -371,7 +400,12 @@ mod tests {
         assert_eq!(shown, [r#"{"node":20.0,"os":"linux"}"#, r#"{"extra":"yes","node":22.0,"os":"linux"}"#, r#"{"extra":"yes","node":22.0,"os":"mac"}"#, r#"{"node":24.0,"os":"linux"}"#]);
         assert_eq!(needs(&job), ["a", "b"]);
         assert!(matrix(&parse("runs-on: x").unwrap()).unwrap().is_none());
-        assert!(matrix(&parse("strategy:\n  matrix: ${{ fromJSON(needs.a.outputs.m) }}").unwrap()).is_err());
+        let later = parse("strategy:\n  matrix: ${{ fromJSON(needs.a.outputs.m) }}").unwrap();
+        assert!(matrix(&later).is_err() && matrix_later(&later));
+        // Read once the jobs it needs have ended: what the expression gives, made into combinations as any matrix.
+        let read = |_: &str| Ok(serde_json::json!({ "os": ["linux", "mac"], "include": [{ "os": "linux", "big": true }] }));
+        let m = matrix_with(&later, Some(&read)).unwrap().unwrap();
+        assert_eq!(serde_json::to_string(&m).unwrap(), r#"[{"big":true,"os":"linux"},{"os":"mac"}]"#);
     }
 
     #[test]

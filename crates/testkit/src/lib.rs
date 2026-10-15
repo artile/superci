@@ -399,4 +399,23 @@ impl Runner {
     pub fn log(&self, n: u64, text: &str) -> u16 { self.post(&format!("/Logfiles/scope/hub/plan/{n}"), text.as_bytes().to_vec()) }
     /// The job is over.
     pub fn finish(&self, result: &str) -> u16 { self.post("/FinishJob/scope/hub/plan", json!({ "result": result }).to_string().into_bytes()) }
+
+    /// The job is over, with its outputs (as its `outputs:` made them).
+    pub fn finish_with(&self, result: &str, outputs: &[(&str, &str)]) -> u16 {
+        let outputs: serde_json::Map<String, Value> = outputs.iter().map(|(k, v)| (k.to_string(), json!({ "value": v }))).collect();
+        self.post("/FinishJob/scope/hub/plan", json!({ "result": result, "outputs": outputs }).to_string().into_bytes())
+    }
+
+    /// The runner of the job of run `run` shown as `name` (`build / compile`, `test (2)`), once it is started.
+    pub fn of_job(served: &Served, run: &str, name: &str) -> Option<Runner> {
+        let r = served.store.under(&format!("run:{run}")).into_iter().next()?.1;
+        let token = r["jobs"].as_array()?.iter().find(|j| j["name"] == name && j["token"].is_string())?["token"].as_str()?.to_string();
+        Some(Runner { at: format!("{}/runner/{token}/_apis/v1", served.url) })
+    }
+
+    /// What the runner was handed for its job (its message: steps, contexts).
+    pub fn handed(&self, served: &Served) -> Value {
+        let token = self.at.split("/runner/").nth(1).and_then(|r| r.split('/').next()).unwrap_or_default();
+        served.store.under(&format!("rjob:{token}")).into_iter().next().map(|(_, v)| v["message"].clone()).unwrap_or_default()
+    }
 }

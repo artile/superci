@@ -855,6 +855,96 @@ fn capacity_of(cloud: &str) -> Capacity {
 
 fn active(j: &Job) -> bool { ["launching", "launched", "running"].contains(&j.state.as_str()) }
 
+/// A run from a computer's jobs a name stands for: the job of that name (each combination of its matrix), or all the
+/// jobs of the workflow a job of that name calls.
+fn of_job<'a>(jobs: &'a [serde_json::Value], n: &str) -> Vec<&'a serde_json::Value> { jobs.iter().filter(|j| j["key"] == n || j["call"] == n).collect() }
+
+/// The workflows a run's jobs call, read.
+fn called_workflows(run: &serde_json::Value) -> std::result::Result<std::collections::BTreeMap<String, crate::workflow::Node>, String> {
+    run["called"].as_object().into_iter().flatten().map(|(p, t)| Ok((p.clone(), crate::workflow::parse(t.as_str().unwrap_or_default()).map_err(|e| format!("{p}: {e}"))?))).collect()
+}
+
+/// A job of the run's own workflow, by its key.
+fn run_wf_job(run: &serde_json::Value, key: &str) -> Option<crate::workflow::Node> {
+    crate::workflow::parse(run["workflow"].as_str().unwrap_or_default()).ok()?.get("jobs")?.get(key).cloned()
+}
+
+/// A text of a workflow read with contexts: a whole `${{ }}` its value, else the text with each replaced.
+fn read_text(text: &str, c: &crate::expression::Contexts) -> std::result::Result<serde_json::Value, String> {
+    let t = text.trim();
+    match t.strip_prefix("${{").and_then(|x| x.strip_suffix("}}")).filter(|x| !x.contains("${{")) {
+        Some(inner) => crate::expression::evaluate(inner.trim(), c),
+        None => crate::expression::interpolate(text, c).map(serde_json::Value::String),
+    }
+}
+
+/// What the jobs a job needs say (`needs.<name>.result`, `.outputs`), how they went together, and whether all went
+/// well. A call stands for its jobs, and gives the outputs its workflow's `on.workflow_call.outputs` make of
+/// theirs; within a called workflow (`call`), its own jobs are named as there.
+fn needs_said(jobs: &[serde_json::Value], needed: &[String], call: Option<&str>, called: &std::collections::BTreeMap<String, crate::workflow::Node>, wf: &crate::workflow::Node)
+    -> std::result::Result<(serde_json::Map<String, serde_json::Value>, crate::expression::Status, bool), String> {
+    let _ = wf;
+    let mut needs = serde_json::Map::new();
+    let (mut status, mut all_good) = (crate::expression::Status::Success, true);
+    for n in needed {
+        let of = of_job(jobs, n);
+        let results: Vec<&str> = of.iter().map(|j| j["result"].as_str().unwrap_or("skipped")).collect();
+        let result = if results.contains(&"failure") { "failure" } else if results.contains(&"cancelled") { "cancelled" } else if results.iter().all(|r| *r == "skipped") { "skipped" } else { "success" };
+        if result == "failure" { status = crate::expression::Status::Failure }
+        if result == "cancelled" && status == crate::expression::Status::Success { status = crate::expression::Status::Cancelled }
+        all_good &= result == "success";
+        let mut outputs = serde_json::Map::new();
+        if let Some(source) = of.iter().find(|j| j["call"] == n.as_str()).and_then(|j| j["source"].as_str()) {
+            // Its workflow's outputs, from its jobs' (`jobs.<name>.outputs.<output>`).
+            let mut theirs = serde_json::Map::new();
+            for j in &of {
+                let k = j["job_key"].as_str().unwrap_or_default();
+                let entry = theirs.entry(k.to_string()).or_insert_with(|| serde_json::json!({ "result": j["result"], "outputs": {} }));
+                if j["result"] == "failure" { entry["result"] = "failure".into() }
+                for (o, v) in j["outputs"].as_object().into_iter().flatten() { entry["outputs"][o] = v.clone(); }
+            }
+            let values: serde_json::Map<String, serde_json::Value> = [("jobs".to_string(), serde_json::Value::Object(theirs))].into_iter().collect();
+            let c = crate::expression::Contexts { values: &values, status: crate::expression::Status::Success };
+            for (o, def) in called.get(source).and_then(crate::workflow::call_part).and_then(|p| p.get("outputs")).map(|o| o.pairs().to_vec()).unwrap_or_default() {
+                let (Some(name), Some(value)) = (o.text(), def.get("value").and_then(|v| v.text())) else { continue };
+                outputs.insert(name.to_string(), crate::expression::text(&read_text(value, &c).unwrap_or_default()).into());
+            }
+        } else {
+            for j in &of { for (k, v) in j["outputs"].as_object().into_iter().flatten() { outputs.insert(k.clone(), v.clone()); } }
+        }
+        let name = call.and_then(|c| n.strip_prefix(&format!("{c}/"))).unwrap_or(n);
+        needs.insert(name.to_string(), serde_json::json!({ "result": result, "outputs": outputs }));
+    }
+    Ok((needs, status, all_good))
+}
+
+/// A called workflow's inputs: each one's default, then what the caller gives (`with:`), read with the caller's
+/// contexts, as the input's type says (boolean, number, string). One required and not given is refused.
+fn call_inputs(part: Option<&crate::workflow::Node>, with: Option<&crate::workflow::Node>, c: &crate::expression::Contexts) -> std::result::Result<serde_json::Value, String> {
+    let defs = part.and_then(|p| p.get("inputs"));
+    let kind = |name: &str| defs.and_then(|d| d.get(name)).and_then(|d| d.get("type")).and_then(|t| t.text()).unwrap_or("string").to_string();
+    let typed = |v: serde_json::Value, kind: &str| match (kind, &v) {
+        ("boolean", serde_json::Value::String(s)) => serde_json::Value::Bool(s == "true"),
+        ("number", serde_json::Value::String(s)) => s.trim().parse::<f64>().map(|f| serde_json::json!(f)).unwrap_or(v),
+        ("string", v2) if !v2.is_string() => crate::expression::text(v2).into(),
+        _ => v,
+    };
+    let mut inputs = serde_json::Map::new();
+    for (k, d) in defs.map(|d| d.pairs().to_vec()).unwrap_or_default() {
+        let Some(name) = k.text() else { continue };
+        if let Some(def) = d.get("default").and_then(|n| n.text()) { inputs.insert(name.to_string(), typed(read_text(def, c)?, &kind(name))); }
+    }
+    for (k, v) in with.map(|w| w.pairs().to_vec()).unwrap_or_default() {
+        let (Some(name), Some(text)) = (k.text(), v.text()) else { continue };
+        inputs.insert(name.to_string(), typed(read_text(text, c)?, &kind(name)));
+    }
+    for (k, d) in defs.map(|d| d.pairs().to_vec()).unwrap_or_default() {
+        let Some(name) = k.text() else { continue };
+        if d.get("required").and_then(|r| r.text()) == Some("true") && !inputs.contains_key(name) { return Err(format!("the called workflow's input {name} is required, and not given")) }
+    }
+    Ok(serde_json::Value::Object(inputs))
+}
+
 pub struct ControlPlane<'a> {
     pub store: &'a dyn Store,
     pub http: &'a dyn Http,
@@ -3378,7 +3468,9 @@ impl<'a> ControlPlane<'a> {
         #[derive(Deserialize)]
         struct NewRun { workflow: String, path: String, #[serde(default)] job: Option<String>, repository: String, #[serde(default, rename = "ref")] reference: String,
             #[serde(default)] sha: String, #[serde(default)] actor: String, #[serde(default)] event_name: String, #[serde(default)] secrets: Vec<(String, String)>,
-            #[serde(default)] vars: Vec<(String, String)>, #[serde(default)] tree: Option<String>, #[serde(default)] parts: u32, #[serde(default)] layered: bool }
+            #[serde(default)] vars: Vec<(String, String)>, #[serde(default)] tree: Option<String>, #[serde(default)] parts: u32, #[serde(default)] layered: bool,
+            /// The workflows its jobs call (`uses: ./.github/workflows/x.yml`), by path, as the working tree has them.
+            #[serde(default)] called: std::collections::BTreeMap<String, String> }
         let r: NewRun = match serde_json::from_slice(&req.body) { Ok(r) => r, Err(e) => return Ok(Response::text(400, &format!("not a run: {e}"))) };
         let wf = match crate::workflow::parse(&r.workflow) { Ok(w) => w, Err(e) => return Ok(Response::text(400, &e)) };
         let jobs = wf.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default();
@@ -3404,12 +3496,37 @@ impl<'a> ControlPlane<'a> {
         let mut instances = vec![];
         for name in names.iter().filter(|n| wanted.contains(n)) {
             let job = wf.get("jobs").and_then(|j| j.get(name)).cloned().unwrap_or(crate::workflow::Node::Scalar { text: String::new(), plain: true, line: 0, col: 0 });
-            if job.get("uses").is_some() { return Ok(Response::text(400, &format!("the job {name} calls another workflow; a run from a computer runs jobs with steps of their own yet"))) }
-            let combos = match crate::workflow::matrix(&job) { Ok(Some(c)) => c.into_iter().map(serde_json::Value::Object).collect::<Vec<_>>(), Ok(None) => vec![serde_json::Value::Null], Err(e) => return Ok(Response::text(400, &format!("the job {name}: {e}"))) };
+            // A call of another workflow of this repository: its jobs, each a job of the run (`caller / job`), after
+            // the jobs the caller needs, with the inputs and secrets the caller gives (see `advance_run`).
+            if let Some(uses) = job.get("uses").and_then(|u| u.text()) {
+                let Some(path) = uses.strip_prefix("./").filter(|p| !p.contains('@')) else {
+                    return Ok(Response::text(400, &format!("the job {name} calls {uses}: a workflow of another repository is not run from a computer yet (one of this repository, ./.github/workflows/…, is)")))
+                };
+                let Some(text) = r.called.get(path) else { return Ok(Response::text(400, &format!("the job {name} calls {uses}, which was not sent with the run (update SuperCI on this computer)"))) };
+                let called = match crate::workflow::parse(text) { Ok(w) => w, Err(e) => return Ok(Response::text(400, &format!("{path}: {e}"))) };
+                if !crate::workflow::callable(&called) { return Ok(Response::text(400, &format!("the job {name} calls {path}, which is not a workflow that may be called (on: workflow_call)"))) }
+                if job.get("strategy").and_then(|s| s.get("matrix")).is_some() { return Ok(Response::text(400, &format!("the job {name} calls a workflow with a matrix: not run from a computer yet"))) }
+                for (ck, cj) in called.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default() {
+                    let cname = ck.text().unwrap_or_default().to_string();
+                    if cj.get("uses").is_some() { return Ok(Response::text(400, &format!("{path}'s job {cname} calls a workflow in turn: not run from a computer yet"))) }
+                    let internal: Vec<String> = crate::workflow::needs(&cj).iter().map(|n| format!("{name}/{n}")).collect();
+                    let later = crate::workflow::matrix_later(&cj);
+                    let combos = if later { vec![serde_json::Value::Null] } else { match crate::workflow::matrix(&cj) { Ok(Some(c)) => c.into_iter().map(serde_json::Value::Object).collect::<Vec<_>>(), Ok(None) => vec![serde_json::Value::Null], Err(e) => return Ok(Response::text(400, &format!("{path}'s job {cname}: {e}"))) } };
+                    let total = combos.len();
+                    for (index, matrix) in combos.into_iter().enumerate() {
+                        instances.push(serde_json::json!({ "key": format!("{name}/{cname}"), "job_key": cname, "source": path, "call": name, "index": index, "total": total, "matrix": matrix,
+                            "needs": internal, "wait": crate::workflow::needs(&job), "state": "pending", "matrix_later": later }));
+                    }
+                }
+                continue;
+            }
+            // A matrix made by an expression is read once the jobs the job needs have ended.
+            let later = crate::workflow::matrix_later(&job);
+            let combos = if later { vec![serde_json::Value::Null] } else { match crate::workflow::matrix(&job) { Ok(Some(c)) => c.into_iter().map(serde_json::Value::Object).collect::<Vec<_>>(), Ok(None) => vec![serde_json::Value::Null], Err(e) => return Ok(Response::text(400, &format!("the job {name}: {e}"))) } };
             if combos.is_empty() { continue }
             let total = combos.len();
             for (index, matrix) in combos.into_iter().enumerate() {
-                instances.push(serde_json::json!({ "key": name, "index": index, "total": total, "matrix": matrix, "needs": crate::workflow::needs(&job), "state": "pending" }));
+                instances.push(serde_json::json!({ "key": name, "index": index, "total": total, "matrix": matrix, "needs": crate::workflow::needs(&job), "state": "pending", "matrix_later": later }));
             }
         }
         if instances.len() > 64 { return Ok(Response::text(400, &format!("{} jobs: a run from a computer runs 64 at most", instances.len()))) }
@@ -3417,7 +3534,7 @@ impl<'a> ControlPlane<'a> {
         // Its jobs' cache: the repository's entries, as GitHub's jobs keep them when GitHub knows it here.
         let (ns, default_branch) = match self.repository_of(&r.repository).await { Some((id, default)) => (format!("gh{id}"), default), None => (cache::local_ns(&r.repository), "main".to_string()) };
         let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
-            "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances,
+            "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances, "called": r.called,
             "cache": { "ns": ns, "default_branch": default_branch } });
         put_json(self.store, &format!("run:{run_id}"), &run).await?;
         if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
@@ -3444,61 +3561,120 @@ impl<'a> ControlPlane<'a> {
                 let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?;
                 let record = get_json::<Job>(self.store, &format!("job:{id}")).await?;
                 let said = handed.as_ref().and_then(|h| h.result.clone());
-                let over = record.as_ref().is_some_and(|r| r.ended_ms.is_some() || ["failed", "swept", "cancelled", "orphan"].contains(&r.state.as_str()));
+                let mut over = record.as_ref().is_some_and(|r| r.ended_ms.is_some() || ["failed", "swept", "cancelled", "orphan"].contains(&r.state.as_str()));
+                // Past its `timeout-minutes`: its machine ended, and it fails, saying so (as GitHub ends it).
+                if let (None, false, Some(limit), Some(mut rec)) = (&said, over, j["timeout_ms"].as_u64(), record.clone()) {
+                    let now = self.clock.now_ms();
+                    if rec.started_ms.or(rec.launched_ms).is_some_and(|at| now.saturating_sub(at) > limit) {
+                        self.stop_machine(plane_url, &rec).await;
+                        rec.state = "failed".into();
+                        rec.error = Some(format!("it ran past its timeout-minutes ({}), and its machine was ended", limit / 60_000));
+                        rec.ended_ms.get_or_insert(now);
+                        self.keep(&format!("job:{id}"), &rec).await?;
+                        over = true;
+                    }
+                }
                 if said.is_none() && !over { continue }
                 let result = match said.as_deref() { Some("succeeded") => "success", Some("cancelled" | "canceled") => "cancelled", Some("skipped") => "skipped", _ => "failure" };
+                // A job that may fail (`continue-on-error`): failed itself, a success to the jobs that need it and the run.
+                let result = if result == "failure" && j["continue_on_error"] == true { j["failed"] = true.into(); "success" } else { result };
                 let outputs: serde_json::Map<String, serde_json::Value> = handed.as_ref().and_then(|h| h.outputs.clone()).and_then(|o| o.as_object().cloned()).unwrap_or_default()
                     .into_iter().map(|(k, v)| (k, v.get("value").cloned().unwrap_or(v))).collect();
                 j["state"] = "done".into(); j["result"] = result.into(); j["outputs"] = outputs.into();
                 changed = true;
             }
-            // Each job whose needs have ended: started, or skipped.
+            // Each job whose needs have ended: started, or skipped. (A job of a called workflow also waits for what its
+            // caller needs, `wait`; its `needs` are its own workflow's, by their names there.)
+            let called = called_workflows(&run)?;
             let mut start = vec![];
             loop {
                 let mut moved = false;
+                let mut expanded = false;
                 for i in 0..jobs.len() {
                     if jobs[i]["state"] != "pending" { continue }
-                    let needed: Vec<String> = jobs[i]["needs"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(str::to_string)).collect();
-                    let of = |n: &str| jobs.iter().filter(|j| j["key"] == n).collect::<Vec<_>>();
-                    if needed.iter().any(|n| of(n).iter().any(|j| j["state"] != "done")) { continue }
-                    let mut needs = serde_json::Map::new();
-                    let mut status = crate::expression::Status::Success;
-                    let mut all_good = true;
-                    for n in &needed {
-                        let results: Vec<&str> = of(n).iter().map(|j| j["result"].as_str().unwrap_or("skipped")).collect();
-                        let result = if results.contains(&"failure") { "failure" } else if results.contains(&"cancelled") { "cancelled" } else if results.iter().all(|r| *r == "skipped") { "skipped" } else { "success" };
-                        if result == "failure" { status = crate::expression::Status::Failure }
-                        if result == "cancelled" && status == crate::expression::Status::Success { status = crate::expression::Status::Cancelled }
-                        all_good &= result == "success";
-                        let mut outputs = serde_json::Map::new();
-                        for j in of(n) { for (k, v) in j["outputs"].as_object().into_iter().flatten() { outputs.insert(k.clone(), v.clone()); } }
-                        needs.insert(n.clone(), serde_json::json!({ "result": result, "outputs": outputs }));
+                    let list = |k: &str| jobs[i][k].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(str::to_string)).collect::<Vec<_>>();
+                    let (needed, wait) = (list("needs"), list("wait"));
+                    if needed.iter().chain(wait.iter()).any(|n| of_job(&jobs, n).iter().any(|j| j["state"] != "done")) { continue }
+                    let call = jobs[i]["call"].as_str().map(str::to_string);
+                    let source = jobs[i]["source"].as_str().map(str::to_string);
+                    let own = match &source { Some(p) => called.get(p).ok_or_else(|| format!("{p} is not in the run"))?, None => &wf };
+                    let key_name = jobs[i]["job_key"].as_str().or(jobs[i]["key"].as_str()).unwrap_or_default().to_string();
+                    let job = own.get("jobs").and_then(|j| j.get(&key_name));
+                    let (needs, status, all_good) = needs_said(&jobs, &needed, call.as_deref(), &called, &wf)?;
+                    // A called workflow's job: its caller's `if` first (by default, if what the caller needs went well),
+                    // then its inputs, from what the caller gives.
+                    if let Some(caller) = &call {
+                        let (caller_needs, caller_status, caller_good) = needs_said(&jobs, &wait, None, &called, &wf)?;
+                        let caller_job = wf.get("jobs").and_then(|j| j.get(caller));
+                        let caller_values = self.run_contexts(&run, &serde_json::json!({}), &caller_needs);
+                        let cc = crate::expression::Contexts { values: &caller_values, status: caller_status };
+                        let caller_runs = match caller_job.and_then(|j| j.get("if")).and_then(|n| n.text()) { Some(cond) => crate::expression::holds(cond, &cc).map_err(|e| format!("the job {caller}'s if: {e}"))?, None => caller_good };
+                        if !caller_runs { jobs[i]["state"] = "done".into(); jobs[i]["result"] = "skipped".into(); jobs[i]["name"] = format!("{caller} / {key_name}").into(); moved = true; continue }
+                        let part = source.as_ref().and_then(|p| called.get(p)).and_then(crate::workflow::call_part);
+                        jobs[i]["inputs"] = call_inputs(part, caller_job.and_then(|j| j.get("with")), &cc)?;
                     }
-                    let key_name = jobs[i]["key"].as_str().unwrap_or_default().to_string();
-                    let job = wf.get("jobs").and_then(|j| j.get(&key_name));
                     let values = self.run_contexts(&run, &jobs[i], &needs);
+                    // A matrix made by an expression, read now: the job's combinations, each a job of the run.
+                    if jobs[i]["matrix_later"] == true {
+                        let c = crate::expression::Contexts { values: &values, status };
+                        let read = |text: &str| -> std::result::Result<serde_json::Value, String> {
+                            let t = text.trim();
+                            match t.strip_prefix("${{").and_then(|x| x.strip_suffix("}}")).filter(|x| !x.contains("${{")) { Some(inner) => crate::expression::evaluate(inner.trim(), &c), None => crate::expression::interpolate(t, &c).map(serde_json::Value::String) }
+                        };
+                        let combos = job.map(|j| crate::workflow::matrix_with(j, Some(&read))).transpose().map_err(|e| format!("the job {key_name}'s matrix: {e}"))?.flatten().unwrap_or_default();
+                        let template = jobs[i].clone();
+                        jobs.remove(i);
+                        if combos.is_empty() {
+                            // (As GitHub, which fails the run: a matrix of nothing runs nothing.)
+                            let mut failed = template.clone();
+                            for (k, v) in [("state", serde_json::json!("done")), ("result", "failure".into()), ("name", format!("{key_name} (its matrix has no combinations)").into()), ("matrix_later", false.into())] { failed[k] = v }
+                            jobs.insert(i, failed);
+                        }
+                        let total = combos.len();
+                        for (n, m) in combos.into_iter().enumerate() {
+                            let mut one = template.clone();
+                            for (k, v) in [("matrix", serde_json::Value::Object(m)), ("index", n.into()), ("total", total.into()), ("matrix_later", false.into())] { one[k] = v }
+                            jobs.insert(i + n, one);
+                        }
+                        moved = true;
+                        expanded = true;
+                        break;
+                    }
                     let c = crate::expression::Contexts { values: &values, status };
                     let runs = match job.and_then(|j| j.get("if")).and_then(|n| n.text()) {
                         Some(cond) => crate::expression::holds(cond, &c).map_err(|e| format!("the job {key_name}'s if: {e}"))?,
                         None => all_good,
                     };
                     let name = self.instance_name(job, &jobs[i], &values)?;
-                    jobs[i]["name"] = name.into();
+                    jobs[i]["name"] = match &call { Some(caller) => format!("{caller} / {name}"), None => name }.into();
                     jobs[i]["needs_said"] = serde_json::Value::Object(needs);
                     if runs {
+                        // Its `timeout-minutes` and `continue-on-error`, read now (either may be an expression).
+                        if let Some(t) = job.and_then(|j| j.get("timeout-minutes")).and_then(|n| n.text()) {
+                            let minutes = crate::expression::text(&read_text(t, &c)?).trim().parse::<f64>().map_err(|_| format!("the job {key_name}'s timeout-minutes is not a number"))?;
+                            jobs[i]["timeout_ms"] = ((minutes * 60_000.0) as u64).into();
+                        }
+                        if let Some(t) = job.and_then(|j| j.get("continue-on-error")).and_then(|n| n.text()) {
+                            jobs[i]["continue_on_error"] = crate::expression::truthy(&read_text(t, &c)?).into();
+                        }
                         // (Reserved here, started once the record says so: see above.)
                         jobs[i]["state"] = "started".into();
                         jobs[i]["job_id"] = local_id().to_string().into();
-                        jobs[i]["token"] = crate::crypto::random_token(24).into();
-                        start.push(i);
+                        let token = crate::crypto::random_token(24);
+                        jobs[i]["token"] = token.clone().into();
+                        start.push(token);
                     } else {
                         jobs[i]["state"] = "done".into(); jobs[i]["result"] = "skipped".into();
                     }
                     moved = true;
                 }
+                let _ = expanded;
                 if !moved { break }
                 changed = true;
             }
+            // The jobs to start: those reserved in this pass, by their tokens (a matrix made into its jobs moves the
+            // others' places).
+            let start: Vec<usize> = jobs.iter().enumerate().filter(|(_, j)| j["token"].as_str().is_some_and(|t| start.iter().any(|s| s == t))).map(|(i, _)| i).collect();
             if !changed { return Ok(()) }
             // A run all over keeps no secret.
             if jobs.iter().all(|j| j["state"] == "done") { run["secrets"] = serde_json::json!([]) }
@@ -3521,7 +3697,7 @@ impl<'a> ControlPlane<'a> {
         let mut c = serde_json::Map::new();
         c.insert("github".into(), serde_json::json!({ "event_name": run["event_name"].as_str().filter(|e| !e.is_empty()).unwrap_or("push"), "repository": run["repository"], "ref": reference, "sha": run["sha"], "actor": run["actor"] }));
         c.insert("vars".into(), vars.into());
-        c.insert("inputs".into(), serde_json::json!({}));
+        c.insert("inputs".into(), if job["inputs"].is_object() { job["inputs"].clone() } else { serde_json::json!({}) });
         c.insert("matrix".into(), job["matrix"].clone());
         c.insert("strategy".into(), serde_json::json!({ "fail-fast": true, "job-index": job["index"], "job-total": job["total"], "max-parallel": job["total"] }));
         c.insert("needs".into(), serde_json::Value::Object(needs.clone()));
@@ -3530,11 +3706,18 @@ impl<'a> ControlPlane<'a> {
 
     /// A job's name as shown: its `name:` (with its expressions read), else its key, with its matrix's values.
     fn instance_name(&self, job: Option<&crate::workflow::Node>, inst: &serde_json::Value, values: &serde_json::Map<String, serde_json::Value>) -> std::result::Result<String, String> {
-        let key = inst["key"].as_str().unwrap_or_default();
+        // (A called workflow's job by its key there.)
+        let key = inst["job_key"].as_str().or(inst["key"].as_str()).unwrap_or_default();
         let c = crate::expression::Contexts { values, status: crate::expression::Status::Success };
         if let Some(n) = job.and_then(|j| j.get("name")).and_then(|n| n.text()) { return crate::expression::interpolate(n, &c) }
         Ok(match inst["matrix"].as_object().filter(|m| !m.is_empty()) {
-            Some(m) => format!("{key} ({})", m.values().map(crate::expression::text).collect::<Vec<_>>().join(", ")),
+            Some(m) => {
+                // Its values in the order the matrix's keys are written, as GitHub names it (then what `include` added).
+                let written: Vec<String> = job.and_then(|j| j.get("strategy")).and_then(|s| s.get("matrix")).map(|n| n.pairs().iter().filter_map(|(k, _)| k.text().map(str::to_string)).filter(|k| k != "include" && k != "exclude").collect()).unwrap_or_default();
+                let mut keys: Vec<&String> = written.iter().filter(|k| m.contains_key(k.as_str())).collect();
+                keys.extend(m.keys().filter(|k| !written.contains(k)));
+                format!("{key} ({})", keys.iter().map(|k| crate::expression::text(&m[k.as_str()])).collect::<Vec<_>>().join(", "))
+            }
             None => key.to_string(),
         })
     }
@@ -3556,8 +3739,26 @@ impl<'a> ControlPlane<'a> {
     /// Starts one job of a run from a computer: its message (with its matrix, strategy and needs), its record, and
     /// its machine, as any job's.
     async fn start_instance(&self, plane_url: &str, run_id: u64, run: &serde_json::Value, inst: &serde_json::Value, secrets: &[(String, String)], wf: &crate::workflow::Node) -> std::result::Result<(), String> {
-        let (key_name, token) = (inst["key"].as_str().unwrap_or_default(), inst["token"].as_str().unwrap_or_default());
+        let (key_name, token) = (inst["job_key"].as_str().or(inst["key"].as_str()).unwrap_or_default(), inst["token"].as_str().unwrap_or_default());
         let job_id: u64 = inst["job_id"].as_str().and_then(|i| i.parse().ok()).ok_or("a job without its id")?;
+        // A job of a called workflow: that file's, and the secrets its caller gives it (all of the run's with
+        // `secrets: inherit`, those it names, or none).
+        let source = inst["source"].as_str();
+        let own_text = match source { Some(p) => run["called"][p].as_str().ok_or_else(|| format!("{p} is not in the run"))?.to_string(), None => run["workflow"].as_str().unwrap_or_default().to_string() };
+        let own = match source { Some(_) => crate::workflow::parse(&own_text)?, None => wf.clone() };
+        let wf = &own;
+        let secrets: Vec<(String, String)> = match inst["call"].as_str().and_then(|c| run_wf_job(run, c)).and_then(|j| j.get("secrets").cloned()) {
+            Some(crate::workflow::Node::Scalar { text, .. }) if text == "inherit" => secrets.to_vec(),
+            Some(m @ crate::workflow::Node::Map { .. }) => {
+                let mut values = self.run_contexts(run, &serde_json::json!({}), &serde_json::Map::new());
+                values.insert("secrets".into(), serde_json::Value::Object(secrets.iter().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect()));
+                let c = crate::expression::Contexts { values: &values, status: crate::expression::Status::Success };
+                m.pairs().iter().filter_map(|(k, v)| Some((k.text()?.to_string(), crate::expression::interpolate(v.text()?, &c).ok()?))).collect()
+            }
+            _ if inst["call"].is_string() => vec![],
+            _ => secrets.to_vec(),
+        };
+        let secrets = &secrets[..];
         let job = wf.get("jobs").and_then(|j| j.get(key_name));
         let needs = inst["needs_said"].as_object().cloned().unwrap_or_default();
         let values = self.run_contexts(run, inst, &needs);
@@ -3569,7 +3770,7 @@ impl<'a> ControlPlane<'a> {
         let repository = run["repository"].as_str().unwrap_or_default().to_string();
         let reference = run["ref"].as_str().filter(|r| !r.is_empty()).unwrap_or("refs/heads/main").to_string();
         let actor = run["actor"].as_str().unwrap_or_default();
-        let path = run["path"].as_str().unwrap_or_default().to_string();
+        let path = source.map(str::to_string).unwrap_or_else(|| run["path"].as_str().unwrap_or_default().to_string());
         let github = serde_json::json!({ "event_name": run["event_name"].as_str().filter(|e| !e.is_empty()).unwrap_or("push"), "event": {}, "repository": repository,
             "repository_owner": repository.split('/').next().unwrap_or_default(), "ref": reference, "ref_name": reference.rsplit('/').next().unwrap_or_default(),
             "ref_type": if reference.starts_with("refs/tags/") { "tag" } else { "branch" }, "sha": run["sha"], "actor": actor, "triggering_actor": actor,
@@ -3584,9 +3785,9 @@ impl<'a> ControlPlane<'a> {
         let secs = now / 1000;
         for (k, v) in [("iss", serde_json::json!(plane_url)), ("aud", "superci-cache".into()), ("sub", format!("run:{run_id}").into()), ("iat", secs.into()), ("exp", (secs + (self.machine_minutes("aws") as u64 + 60) * 60).into())] { claims[k] = v }
         let access_token = self.identity().await?.signing.jwt(&claims)?;
-        let given = crate::runner_service::Given { workflow: run["workflow"].as_str().unwrap_or_default(), path: &path, job: key_name, secrets, vars: &vars, github, service: &service,
+        let given = crate::runner_service::Given { workflow: &own_text, path: &path, job: key_name, secrets, vars: &vars, github, service: &service,
             access_token: &access_token, ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
-            strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone() };
+            strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone(), inputs: inst["inputs"].clone() };
         let message = crate::runner_service::job_message(&given)?;
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, layered: run["layered"] == true, at_ms: now, job_id, ..Default::default() }).await?;
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),

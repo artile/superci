@@ -34,7 +34,7 @@ pub fn serve(workflow: &str, job: &str, port: u16, root: &str, secrets: &[(Strin
         "sha": "0000000000000000000000000000000000000000", "actor": "superci", "triggering_actor": "superci", "workflow": "local", "run_id": "1", "run_number": "1", "run_attempt": "1",
         "server_url": "https://github.com", "api_url": "https://api.github.com", "graphql_url": "https://api.github.com/graphql", "job": job, "retention_days": "1" });
     let service = format!("{root}/");
-    let given = Given { workflow: &text, path: &path, job, secrets, vars, github, service: &service, access_token: &access_token(now), ids: Ids::new(1), matrix: serde_json::Value::Null, strategy: serde_json::Value::Null, needs: serde_json::Value::Null, display: None };
+    let given = Given { workflow: &text, path: &path, job, secrets, vars, github, service: &service, access_token: &access_token(now), ids: Ids::new(1), matrix: serde_json::Value::Null, strategy: serde_json::Value::Null, needs: serde_json::Value::Null, display: None, inputs: serde_json::Value::Null };
     let message = job_message(&given)?;
     let store = Memory::default();
     block_on(store.put("rjob:local", serde_json::to_string(&HandedJob { message, ..Default::default() }).unwrap()))?;

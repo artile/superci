@@ -79,6 +79,8 @@ pub struct Given<'a> {
     pub strategy: Value,
     pub needs: Value,
     pub display: Option<String>,
+    /// A called workflow's inputs (`{name: value}`; null for a job of the workflow run itself).
+    pub inputs: Value,
 }
 
 /// The ids a job's message carries (GUIDs; the runner puts some of them in the paths of its calls).
@@ -146,7 +148,7 @@ pub fn job_message(g: &Given) -> Result<Value> {
     let needs = if g.needs.is_object() { g.needs.clone() } else { json!({}) };
     let strategy = if g.strategy.is_object() { g.strategy.clone() } else { json!({ "fail-fast": true, "job-index": 0, "job-total": 1, "max-parallel": 1 }) };
     m["contextData"] = json!({
-        "github": context(&g.github), "inputs": { "t": 2 }, "vars": context(&Value::Object(vars)),
+        "github": context(&g.github), "inputs": if g.inputs.is_object() { context(&g.inputs) } else { json!({ "t": 2 }) }, "vars": context(&Value::Object(vars)),
         "needs": context(&needs), "matrix": if g.matrix.is_null() { Value::Null } else { context(&g.matrix) }, "strategy": context(&strategy),
     });
     m["workspace"] = json!({});

@@ -3349,7 +3349,7 @@ fn the_runners_calls_for_a_job_are_answered_as_its_service_answers_them() {
     let store = Mem::default();
     let given = Given { workflow: include_str!("fixtures/runner/three.yml"), path: ".github/workflows/ci.yml", job: "test", secrets: &[("A_SECRET".into(), "hunter2.hunter2".into())],
         vars: &[("A_VAR".into(), "fromcli".into())], github: serde_json::json!({ "event_name": "push", "repository": "acme/app", "ref": "refs/heads/main" }),
-        service: "https://plane.example/runner/abc/", access_token: &access_token(1_790_000_000_000), ids: Ids::new(4), matrix: serde_json::Value::Null, strategy: serde_json::Value::Null, needs: serde_json::Value::Null, display: None };
+        service: "https://plane.example/runner/abc/", access_token: &access_token(1_790_000_000_000), ids: Ids::new(4), matrix: serde_json::Value::Null, strategy: serde_json::Value::Null, needs: serde_json::Value::Null, display: None, inputs: serde_json::Value::Null };
     let message = job_message(&given).unwrap();
     // (Every part GitHub's own message has, but GitHub's own bookkeeping.)
     let github: serde_json::Value = serde_json::from_str(include_str!("fixtures/runner/record.github.json")).unwrap();
