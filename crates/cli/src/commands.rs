@@ -25,10 +25,10 @@ const HELP: &[(&str, &str, &str)] = &[
         "It also asks Cloudflare to end its sign-in, and the control plane to forget this machine's key. Your control plane\nand runners keep working."),
     ("status", "  superci status                    The control plane in use: where, its version, whether jobs can run.",
         "With --json: the control plane, and under \"status\" everything it says of itself (repositories, runner providers,\nlimits, the latest jobs)."),
-    ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N] [--out=FILE]",
-        "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job: how its start went step by step (what AWS was asked and answered, when its machine booted, when\n          its runner listened), and the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, four million at most). --out=FILE: its whole log into FILE, whatever its size. GitHub keeps a job's log once the job has ended."),
-    ("runs", "  superci runs list\n  superci runs retrieve ID\n  superci runs create --workflow=FILE [--job=NAME] [--quiet] [--detach]\n  superci runs wait ID [--quiet]",
-        "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again).\ncreate    Runs a workflow's job from this computer, as GitHub would run it, on a machine as any job here: the working\n          tree as it is (what git tracks, and new files it does not ignore), with nothing pushed. --workflow=FILE runs its\n          jobs (each combination of a matrix a job of its own, each job once those it needs have ended); --job=NAME\n          runs that job and those it needs. --event=push|pull_request (push unless given), and what GitHub would give\n          it and cannot here: --secret=NAME=VALUE and --var=NAME=VALUE, as often as needed. It waits for the run and\n          prints its jobs' lines, then each step's result and time and what its machines cost; it fails when the run does.\n          --quiet: each step's result, and the last lines of one that failed, not every line (for a coding agent).\n          --detach: says the run's id and ends; `superci runs wait ID` follows it.\nwait      Follows a run from a computer to its end, as create does.\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
+    ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N] [--out=FILE] [--tests]",
+        "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job: how its start went step by step (what AWS was asked and answered, when its machine booted, when\n          its runner listened), and the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, four million at most). --out=FILE: its whole log into FILE, whatever its size. GitHub keeps a job's log once the job has ended.\n          --tests: its tests instead, from its whole log: the ones that failed, each with its file and error, and how many\n          passed, failed and were skipped (what Vitest, Jest, Playwright, pytest, cargo and Go say in their output)."),
+    ("runs", "  superci runs list\n  superci runs retrieve ID [--tests]\n  superci runs create --workflow=FILE [--job=NAME] [--quiet] [--detach]\n  superci runs wait ID [--quiet]",
+        "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again). --tests: each failed job's tests too,\n          from its whole log: the ones that failed, with their files and errors, and where its artifacts are.\ncreate    Runs a workflow's job from this computer, as GitHub would run it, on a machine as any job here: the working\n          tree as it is (what git tracks, and new files it does not ignore), with nothing pushed. --workflow=FILE runs its\n          jobs (each combination of a matrix a job of its own, each job once those it needs have ended); --job=NAME\n          runs that job and those it needs. --event=push|pull_request (push unless given), and what GitHub would give\n          it and cannot here: --secret=NAME=VALUE and --var=NAME=VALUE, as often as needed. It waits for the run and\n          prints its jobs' lines, then each step's result and time and what its machines cost; it fails when the run does.\n          --quiet: each step's result, and the last lines of one that failed, not every line (for a coding agent).\n          --detach: says the run's id and ends; `superci runs wait ID` follows it.\nwait      Follows a run from a computer to its end, as create does.\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
     ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
@@ -139,7 +139,7 @@ fn usage<T>(say: impl Into<String>) -> Result<T> { Err(Fail::Usage(say.into())) 
 pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
-const SWITCHES: [&str; 13] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach"];
+const SWITCHES: [&str; 14] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach", "tests"];
 const VALUES: [&str; 47] = ["period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
@@ -301,6 +301,44 @@ fn given_key() -> Option<(String, String)> {
 
 /// What a command that looks reads: the control plane, and the key it is read with. With a key given by name: that
 /// control plane, with no sign-in. Else the one in use, with this machine's key.
+/// A job that failed: its runner ran it and it failed, or it never ran.
+fn failed_job(j: &Value) -> bool { j["conclusion"] == "failure" || ["failed", "swept", "orphan"].contains(&j["state"].as_str().unwrap_or_default()) }
+
+/// What a job's whole log says of its tests (`test_results`), and where its artifacts are: a run from a computer's
+/// by name (`superci artifacts retrieve`), a code host's at its run's page.
+fn job_tests(v: &PlaneView, key: &str, j: &Value) -> Value {
+    let mut tests = match crate::dashboard::whole_log(v.plane.url(), key, j) {
+        Ok(log) => serde_json::to_value(crate::test_results::read(&String::from_utf8_lossy(&log))).unwrap_or_default(),
+        Err(e) => return json!({ "error": e }),
+    };
+    if j["provider"] == "local" {
+        let run = j["run_id"].as_u64().unwrap_or_default();
+        if let Ok(got) = crate::cloudflare::plane_get(v.plane.url(), key, &format!("/runs/{run}/artifacts")) {
+            let names: Vec<Value> = got["artifacts"].as_array().into_iter().flatten().filter_map(|a| a["name"].as_str().map(|n| json!({ "name": n, "fetch": format!("superci artifacts retrieve {n} --run={run}") }))).collect();
+            if !names.is_empty() { tests["artifacts"] = names.into() }
+        }
+    } else if j["provider"].as_str().unwrap_or_default().is_empty() && j["run_id"].as_u64().is_some_and(|r| r > 0) {
+        tests["artifacts_at"] = format!("https://github.com/{}/actions/runs/{}#artifacts", j["repo"].as_str().unwrap_or_default(), j["run_id"]).into();
+    }
+    tests
+}
+
+/// A job's tests as a person reads them: the counts, then each failure with the first lines of its error.
+fn tests_lines(t: &Value, indent: &str) -> Vec<String> {
+    if let Some(e) = t["error"].as_str() { return vec![format!("{indent}Its log could not be read: {e}")] }
+    let runners: Vec<&str> = t["runners"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
+    if runners.is_empty() { return vec![format!("{indent}No test results in its log (none of Vitest, Jest, Playwright, pytest, cargo or Go said any).")] }
+    let n = |k: &str| t[k].as_u64().unwrap_or(0);
+    let mut out = vec![format!("{indent}Tests: {} failed, {} passed{} ({})", n("failed"), n("passed"), if n("skipped") > 0 { format!(", {} skipped", n("skipped")) } else { String::new() }, runners.join(", "))];
+    for f in t["failures"].as_array().into_iter().flatten() {
+        out.push(format!("{indent}✗ {}{}", f["name"].as_str().unwrap_or_default(), f["file"].as_str().map(|p| format!("  ({p})")).unwrap_or_default()));
+        for l in f["error"].as_str().unwrap_or_default().lines().filter(|l| !l.trim().is_empty()).take(3) { out.push(format!("{indent}    {l}")) }
+    }
+    for a in t["artifacts"].as_array().into_iter().flatten() { out.push(format!("{indent}Artifact {}: `{}`", a["name"].as_str().unwrap_or_default(), a["fetch"].as_str().unwrap_or_default())) }
+    if let Some(at) = t["artifacts_at"].as_str() { out.push(format!("{indent}Its artifacts: {at}")) }
+    out
+}
+
 fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
     let Some((url, key)) = given_key() else {
         let v = d.current()?.ok_or(NO_PLANE)?;
@@ -380,6 +418,13 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 std::fs::write(out, &log).map_err(|e| format!("{out}: {e}"))?;
                 return Ok(Done { said: vec![format!("Its whole log ({}, {} lines) is in {out}.", crate::dashboard::size_words(log.len() as u64), log.iter().filter(|b| **b == b'\n').count())], data: json!({ "job": words, "out": out, "bytes": log.len() }) })
             }
+            // Its tests, from its whole log (see `test_results`), instead of the end of its log.
+            if args.has("tests") {
+                let tests = job_tests(&v, &key, &j);
+                let mut said = vec![job_line(&words), words["link"].as_str().unwrap_or_default().to_string()];
+                said.extend(tests_lines(&tests, "  "));
+                return Ok(Done { said, data: json!({ "job": words, "tests": tests }) })
+            }
             let mut path = format!("/job/log?id={id}&bytes={}", args.get("bytes").unwrap_or("200000"));
             if j["provider"] == "gitlab" { path += &format!("&gl={}", j["gitlab"].as_str().unwrap_or_default()) }
             let got = crate::cloudflare::plane_get(v.plane.url(), &key, &path)
@@ -451,16 +496,25 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let id = w(2);
             if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return usage("Say which: `superci runs retrieve ID` (ids are in `superci runs list`).") }
             let mut d = signed_in();
-            let v = view(&mut d)?;
+            let (v, key) = look(&mut d)?;
             let of: Vec<Value> = runs(&v).iter().filter(|r| r["id"].as_u64().is_some_and(|n| n.to_string() == id)).map(run_words).collect();
             if of.is_empty() { return Err("That run is not among the latest this control plane keeps (ids are in `superci runs list`).".into()) }
             let jobs = v.jobs();
             let (mut said, mut data) = (vec![], vec![]);
             for r in of.iter().rev() {
-                let its: Vec<Value> = jobs.iter().filter(|j| j["run_id"] == r["id"] && j["attempt"].as_u64().filter(|a| *a > 0) == r["attempt"].as_u64()).map(job_words).collect();
+                let raw: Vec<&Value> = jobs.iter().filter(|j| j["run_id"] == r["id"] && j["attempt"].as_u64().filter(|a| *a > 0) == r["attempt"].as_u64()).collect();
+                let mut its: Vec<Value> = raw.iter().map(|j| job_words(j)).collect();
                 said.push(run_line(r));
                 said.push(r["link"].as_str().unwrap_or_default().to_string());
-                said.extend(its.iter().map(|j| format!("  {}", job_line(j))));
+                for (j, words) in raw.iter().zip(its.iter_mut()) {
+                    said.push(format!("  {}", job_line(words)));
+                    // Its tests, from its whole log: the failed jobs' (a passed job's would only say that).
+                    if args.has("tests") && failed_job(j) {
+                        let tests = job_tests(&v, &key, j);
+                        said.extend(tests_lines(&tests, "    "));
+                        words["tests"] = tests;
+                    }
+                }
                 let mut r = r.clone();
                 r["job_list"] = its.into();
                 data.push(r);

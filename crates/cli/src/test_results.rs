@@ -1,0 +1,245 @@
+//! A job's tests, read from its log: what each common test runner says of the tests that failed (their names, files
+//! and errors) and of how many passed, failed and were skipped. For `superci runs retrieve --tests` and `superci jobs
+//! retrieve --tests`, so that a coding agent learns what failed without reading megabytes of log.
+//!
+//! Each runner is known by its own lines: Vitest (` FAIL  file > suite > name`, ` Tests  2 failed | 9 passed`), Jest
+//! (`● suite › name`, `Tests:  2 failed, 9 passed, 11 total`), Playwright (`1) [chromium] › file:12:5 › name`,
+//! `2 failed`), pytest (`FAILED file::name - error`, `== 2 failed, 9 passed in 1.2s ==`), cargo
+//! (`test name ... FAILED`, `test result: FAILED. 9 passed; 2 failed; 1 ignored`) and Go (`--- FAIL: TestName`).
+use serde::Serialize;
+
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct Tests {
+    /// The test runners found in the log.
+    pub runners: Vec<&'static str>,
+    pub passed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub failures: Vec<Failure>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Failure {
+    pub runner: &'static str,
+    /// The test, as its runner names it (suite and name).
+    pub name: String,
+    /// Its file (and line), when the runner says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// What it failed with: the first lines its runner printed of it.
+    pub error: String,
+}
+
+/// At most this many failures are kept (their error at most `ERROR_LINES` lines, `ERROR_CHARS` characters).
+const MOST: usize = 200;
+const ERROR_LINES: usize = 12;
+const ERROR_CHARS: usize = 2000;
+
+/// A log line as text: without its time (GitHub's), GitLab's stream mark, colour codes and carriage returns.
+fn plain(raw: &str) -> String {
+    let r = raw.trim_start_matches('\u{feff}');
+    let b = r.as_bytes();
+    let r = if b.len() > 20 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) { r.find("Z ").filter(|at| *at < 40).map(|at| &r[at + 2..]).unwrap_or(r) } else { r };
+    let b = r.as_bytes();
+    let r = if b.len() >= 4 && b[..2].iter().all(u8::is_ascii_digit) && (b[2] == b'O' || b[2] == b'E') && (b[3] == b' ' || b[3] == b'+') { r[3..].trim_start_matches('+').trim_start_matches(' ') } else { r };
+    let mut out = String::with_capacity(r.len());
+    let mut chars = r.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') { chars.next(); for n in chars.by_ref() { if n.is_ascii_alphabetic() { break } } continue }
+        if c != '\r' { out.push(c) }
+    }
+    out.trim_end().to_string()
+}
+
+/// The number before `word` in a summary (`2 failed`), or 0.
+fn count(text: &str, word: &str) -> u64 {
+    let words: Vec<&str> = text.split(|c: char| c.is_whitespace() || c == ',' || c == '|' || c == ';' || c == '(' || c == ')').filter(|w| !w.is_empty()).collect();
+    words.windows(2).filter(|w| w[1].trim_end_matches('.') == word).filter_map(|w| w[0].parse::<u64>().ok()).sum()
+}
+
+/// The lines after `from` that tell of a failure, up to where the next one (or the end of the list) begins.
+fn error_after(lines: &[String], from: usize, stop: impl Fn(&str) -> bool) -> String {
+    let mut out: Vec<&str> = vec![];
+    for l in lines.iter().skip(from) {
+        if stop(l) { break }
+        let t = l.trim();
+        if t.is_empty() && out.is_empty() { continue }
+        if t.is_empty() && out.last().is_some_and(|p| p.trim().is_empty()) { break }
+        out.push(l.as_str());
+        if out.len() == ERROR_LINES { break }
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) { out.pop(); }
+    let indent = out.iter().filter(|l| !l.trim().is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+    let text = out.iter().map(|l| l.get(indent..).unwrap_or(l.trim_start())).collect::<Vec<_>>().join("\n");
+    text.chars().take(ERROR_CHARS).collect()
+}
+
+/// What a job's log says of its tests (nothing found: no runners, no counts).
+pub fn read(log: &str) -> Tests {
+    let lines: Vec<String> = log.lines().map(plain).collect();
+    let mut t = Tests::default();
+    let mut runner = |t: &mut Tests, name: &'static str| if !t.runners.contains(&name) { t.runners.push(name) };
+    let push = |t: &mut Tests, f: Failure| if t.failures.len() < MOST && !t.failures.iter().any(|g| g.runner == f.runner && g.name == f.name) { t.failures.push(f) };
+    let playwright = lines.iter().any(|l| l.trim_start().starts_with("Running ") && l.contains(" using ") && l.contains("worker"));
+    for (i, l) in lines.iter().enumerate() {
+        let s = l.trim_start();
+        // Vitest: its list of failures (` FAIL  file > suite > name`), then its summary.
+        if let Some(rest) = s.strip_prefix("FAIL ").map(str::trim_start).filter(|r| r.contains(" > ")) {
+            let (file, name) = rest.split_once(" > ").unwrap();
+            if file.contains(".test.") || file.contains(".spec.") || file.contains('/') {
+                runner(&mut t, "vitest");
+                let error = error_after(&lines, i + 1, |n| { let n = n.trim_start(); (n.starts_with("FAIL ") && n.contains(" > ")) || n.starts_with("⎯⎯") || n.starts_with("Test Files") });
+                push(&mut t, Failure { runner: "vitest", name: name.trim().to_string(), file: Some(file.trim().to_string()), error });
+                continue;
+            }
+        }
+        if let Some(rest) = s.strip_prefix("Tests ").filter(|r| !r.starts_with(':') && (r.contains(" passed") || r.contains(" failed")) && r.contains('(')) {
+            runner(&mut t, "vitest");
+            (t.passed, t.failed, t.skipped) = (t.passed + count(rest, "passed"), t.failed + count(rest, "failed"), t.skipped + count(rest, "skipped") + count(rest, "todo"));
+            continue;
+        }
+        // Jest: `● suite › name` and its error, then `Tests:  2 failed, 9 passed, 11 total`.
+        if let Some(name) = s.strip_prefix("● ").filter(|n| !n.starts_with("Console") && !n.starts_with("Test suite failed to run")) {
+            runner(&mut t, "jest");
+            let error = error_after(&lines, i + 1, |n| n.trim_start().starts_with("● ") || n.trim_start().starts_with("Test Suites:"));
+            push(&mut t, Failure { runner: "jest", name: name.trim().to_string(), file: None, error });
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("Tests:") {
+            runner(&mut t, "jest");
+            (t.passed, t.failed, t.skipped) = (t.passed + count(rest, "passed"), t.failed + count(rest, "failed"), t.skipped + count(rest, "skipped") + count(rest, "todo"));
+            continue;
+        }
+        // Playwright: `1) [chromium] › tests/a.spec.ts:12:5 › name ───`, then its summary lines.
+        if playwright {
+            if let Some((n, rest)) = s.split_once(") [").filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
+                let _ = n;
+                let parts: Vec<&str> = rest.split(" › ").collect();
+                if parts.len() >= 3 {
+                    runner(&mut t, "playwright");
+                    let project = parts[0].trim_end_matches(']');
+                    let file = parts[1].trim();
+                    let name = parts[2..].join(" › ").trim_end_matches(|c: char| c == '─' || c.is_whitespace()).to_string();
+                    let summary = |n: &str| { let w: Vec<&str> = n.split_whitespace().collect(); w.len() >= 2 && w[0].parse::<u64>().is_ok() && ["passed", "failed", "flaky", "skipped", "interrupted", "did"].contains(&w[1]) };
+                    let error = error_after(&lines, i + 1, |n| { let n = n.trim_start(); summary(n) || n.split_once(") [").is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit())) });
+                    push(&mut t, Failure { runner: "playwright", name: format!("[{project}] {name}"), file: Some(file.to_string()), error });
+                    continue;
+                }
+            }
+            let words: Vec<&str> = s.split_whitespace().collect();
+            if words.len() >= 2 && words[0].parse::<u64>().is_ok() && ["passed", "failed", "flaky", "skipped", "interrupted", "did"].contains(&words[1]) && words.len() <= 4 {
+                runner(&mut t, "playwright");
+                let n = words[0].parse::<u64>().unwrap_or(0);
+                match words[1] { "passed" | "flaky" => t.passed += n, "failed" | "interrupted" => t.failed += n, "skipped" => t.skipped += n, _ => {} }
+                continue;
+            }
+        }
+        // pytest: `FAILED file::name - error`, and its `== 2 failed, 9 passed in 1.2s ==`.
+        if let Some(rest) = s.strip_prefix("FAILED ").or_else(|| s.strip_prefix("ERROR ")).filter(|r| r.contains("::")) {
+            runner(&mut t, "pytest");
+            let (test, error) = rest.split_once(" - ").unwrap_or((rest, ""));
+            let (file, name) = test.split_once("::").unwrap();
+            push(&mut t, Failure { runner: "pytest", name: name.trim().to_string(), file: Some(file.trim().to_string()), error: error.trim().chars().take(ERROR_CHARS).collect() });
+            continue;
+        }
+        if s.starts_with('=') && s.ends_with('=') && s.contains(" in ") && (s.contains(" passed") || s.contains(" failed") || s.contains(" error")) && !s.contains("short test summary") {
+            runner(&mut t, "pytest");
+            (t.passed, t.failed, t.skipped) = (t.passed + count(s, "passed"), t.failed + count(s, "failed") + count(s, "error") + count(s, "errors"), t.skipped + count(s, "skipped"));
+            continue;
+        }
+        // cargo: `test name ... FAILED`, its `---- name stdout ----` block, and `test result: …`.
+        if let Some(name) = s.strip_prefix("test ").and_then(|r| r.strip_suffix(" ... FAILED")) {
+            runner(&mut t, "cargo");
+            let block = lines.iter().position(|b| b.trim() == format!("---- {name} stdout ----"));
+            let error = block.map(|b| error_after(&lines, b + 1, |n| n.trim_start().starts_with("---- ") || n.trim() == "failures:")).unwrap_or_default();
+            push(&mut t, Failure { runner: "cargo", name: name.to_string(), file: None, error });
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("test result: ") {
+            runner(&mut t, "cargo");
+            (t.passed, t.failed, t.skipped) = (t.passed + count(rest, "passed"), t.failed + count(rest, "failed"), t.skipped + count(rest, "ignored"));
+            continue;
+        }
+        // Go: `--- FAIL: TestName (0.01s)` and the lines indented under it; `--- PASS:`, `--- SKIP:` counted.
+        if let Some(rest) = s.strip_prefix("--- FAIL: ") {
+            runner(&mut t, "go");
+            t.failed += 1;
+            let name = rest.split(" (").next().unwrap_or(rest).trim().to_string();
+            let depth = l.len() - s.len();
+            let error = error_after(&lines, i + 1, |n| { let d = n.len() - n.trim_start().len(); !n.trim().is_empty() && d <= depth });
+            push(&mut t, Failure { runner: "go", name, file: None, error });
+            continue;
+        }
+        if s.starts_with("--- PASS: ") { runner(&mut t, "go"); t.passed += 1; continue }
+        if s.starts_with("--- SKIP: ") { runner(&mut t, "go"); t.skipped += 1; continue }
+    }
+    // (Failures listed but no summary seen: counted from the list.)
+    if t.failed < t.failures.len() as u64 { t.failed = t.failures.len() as u64 }
+    t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vitest_s_failures_and_counts() {
+        let log = "2026-10-15T10:00:01.0000000Z  ❯ src/sum.test.ts (3 tests | 1 failed) 12ms\n\
+                   2026-10-15T10:00:01.0000000Z    × sums > adds two numbers 5ms\n\
+                   2026-10-15T10:00:02.0000000Z ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯\n\
+                   2026-10-15T10:00:02.0000000Z \n\
+                   2026-10-15T10:00:02.0000000Z \u{1b}[31m FAIL \u{1b}[39m src/sum.test.ts > sums > adds two numbers\n\
+                   2026-10-15T10:00:02.0000000Z AssertionError: expected 3 to be 4 // Object.is equality\n\
+                   2026-10-15T10:00:02.0000000Z \n\
+                   2026-10-15T10:00:02.0000000Z - Expected\n\
+                   2026-10-15T10:00:02.0000000Z + Received\n\
+                   2026-10-15T10:00:02.0000000Z ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯\n\
+                   2026-10-15T10:00:02.0000000Z  Test Files  1 failed | 4 passed (5)\n\
+                   2026-10-15T10:00:02.0000000Z       Tests  1 failed | 41 passed | 2 skipped (44)";
+        let t = read(log);
+        assert_eq!((t.runners.clone(), t.passed, t.failed, t.skipped), (vec!["vitest"], 41, 1, 2));
+        assert_eq!((t.failures[0].name.as_str(), t.failures[0].file.as_deref()), ("sums > adds two numbers", Some("src/sum.test.ts")));
+        assert!(t.failures[0].error.starts_with("AssertionError: expected 3 to be 4") && t.failures[0].error.contains("+ Received"), "{}", t.failures[0].error);
+    }
+
+    #[test]
+    fn jest_s_failures_and_counts() {
+        let log = "  ● Cart › totals the items\n\n    expect(received).toBe(expected) // Object.is equality\n\n    Expected: 30\n    Received: 20\n\n      at Object.<anonymous> (src/cart.test.js:12:20)\n\n  ● Console\n\n    console.log\n      hi\n\nTest Suites: 1 failed, 2 passed, 3 total\nTests:       1 failed, 1 skipped, 17 passed, 19 total";
+        let t = read(log);
+        assert_eq!((t.runners.clone(), t.passed, t.failed, t.skipped), (vec!["jest"], 17, 1, 1));
+        assert_eq!(t.failures.len(), 1, "the console is no failure");
+        assert_eq!(t.failures[0].name, "Cart › totals the items");
+        assert!(t.failures[0].error.starts_with("expect(received).toBe(expected)") && t.failures[0].error.contains("Received: 20"), "{}", t.failures[0].error);
+    }
+
+    #[test]
+    fn playwright_s_failures_and_counts() {
+        let log = "Running 12 tests using 4 workers\n\n  1) [chromium] › tests/login.spec.ts:14:5 › login › shows an error for a wrong password ─────────\n\n    Error: expect(locator).toBeVisible() failed\n\n    Locator: getByText('Wrong password')\n    Expected: visible\n\n  2) [webkit] › tests/cart.spec.ts:8:3 › adds to cart ──────\n\n    TimeoutError: page.click: Timeout 5000ms exceeded.\n\n  2 failed\n    [chromium] › tests/login.spec.ts:14:5 › login › shows an error for a wrong password\n  1 flaky\n  9 passed (41.2s)";
+        let t = read(log);
+        assert_eq!((t.runners.clone(), t.passed, t.failed), (vec!["playwright"], 10, 2));
+        assert_eq!((t.failures[0].name.as_str(), t.failures[0].file.as_deref()), ("[chromium] login › shows an error for a wrong password", Some("tests/login.spec.ts:14:5")));
+        assert!(t.failures[0].error.starts_with("Error: expect(locator).toBeVisible() failed") && !t.failures[0].error.contains("TimeoutError"), "{}", t.failures[0].error);
+        assert_eq!(t.failures[1].error, "TimeoutError: page.click: Timeout 5000ms exceeded.");
+    }
+
+    #[test]
+    fn pytest_cargo_and_go_failures_and_counts() {
+        let py = read("=========================== short test summary info ============================\nFAILED tests/test_api.py::test_login - AssertionError: assert 401 == 200\nERROR tests/test_db.py::test_migrate - ConnectionRefusedError\n=================== 1 failed, 30 passed, 2 skipped, 1 error in 4.21s ===================");
+        assert_eq!((py.runners.clone(), py.passed, py.failed, py.skipped), (vec!["pytest"], 30, 2, 2));
+        assert_eq!((py.failures[0].name.as_str(), py.failures[0].file.as_deref(), py.failures[0].error.as_str()), ("test_login", Some("tests/test_api.py"), "AssertionError: assert 401 == 200"));
+
+        let cargo = read("test store::reads_back ... ok\ntest store::writes ... FAILED\n\nfailures:\n\n---- store::writes stdout ----\n\nthread 'store::writes' panicked at src/store.rs:40:9:\nassertion `left == right` failed\n  left: 1\n right: 2\n\nfailures:\n    store::writes\n\ntest result: FAILED. 12 passed; 1 failed; 2 ignored; 0 measured; 0 filtered out");
+        assert_eq!((cargo.runners.clone(), cargo.passed, cargo.failed, cargo.skipped), (vec!["cargo"], 12, 1, 2));
+        assert!(cargo.failures[0].name == "store::writes" && cargo.failures[0].error.starts_with("thread 'store::writes' panicked at src/store.rs:40:9:") && cargo.failures[0].error.contains("right: 2"), "{:?}", cargo.failures[0]);
+
+        let go = read("=== RUN   TestSum\n--- PASS: TestSum (0.00s)\n=== RUN   TestDiv\n    div_test.go:12: expected 2, got 0\n--- FAIL: TestDiv (0.00s)\n    div_test.go:14: division by zero\n--- SKIP: TestSlow (0.00s)\nFAIL\nFAIL\texample.com/calc\t0.012s");
+        assert_eq!((go.runners.clone(), go.passed, go.failed, go.skipped), (vec!["go"], 1, 1, 1));
+        assert_eq!((go.failures[0].name.as_str(), go.failures[0].error.as_str()), ("TestDiv", "div_test.go:14: division by zero"));
+    }
+
+    #[test]
+    fn a_log_without_tests_says_none() {
+        let t = read("Run make build\ncompiling…\nDone in 3s");
+        assert_eq!(t, Tests::default());
+    }
+}

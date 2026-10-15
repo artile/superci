@@ -190,3 +190,25 @@ fn a_job_that_runs_past_its_longest_time_is_ended_by_the_upkeep_and_the_run_with
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(!out.status.success() && said.contains("failure (it ran past its longest time (6 hours), and its machine was ended)"), "{said}");
 }
+
+#[test]
+fn a_failed_runs_tests_are_read_from_its_log_names_files_errors_and_counts() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+    let run = run_of(&served);
+    let vitest: Vec<String> = [" ❯ src/sum.test.ts (3 tests | 1 failed) 12ms", "⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯", "", " FAIL  src/sum.test.ts > sums > adds two numbers",
+        "AssertionError: expected 3 to be 4 // Object.is equality", "", "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯", " Test Files  1 failed | 4 passed (5)", "      Tests  1 failed | 41 passed (42)"].iter().map(|s| s.to_string()).collect();
+    play(&served, &run, &vitest, "failed");
+    let _ = cli.wait_with_output();
+    // As a coding agent asks: the failed test, its file and error, and the counts.
+    let o = superci(&served, &dir, &["runs", "retrieve", &run, "--tests", "--json"]).output().unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
+    let tests = &got["runs"][0]["job_list"][0]["tests"];
+    assert_eq!((tests["runners"][0].as_str(), tests["failed"].as_u64(), tests["passed"].as_u64()), (Some("vitest"), Some(1), Some(41)), "{got}");
+    assert_eq!((tests["failures"][0]["name"].as_str(), tests["failures"][0]["file"].as_str()), (Some("sums > adds two numbers"), Some("src/sum.test.ts")));
+    assert!(tests["failures"][0]["error"].as_str().unwrap().starts_with("AssertionError: expected 3 to be 4"));
+    // As a person reads it.
+    let said = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "retrieve", &run, "--tests"]).output().unwrap().stdout).into_owned();
+    assert!(said.contains("Tests: 1 failed, 41 passed (vitest)") && said.contains("✗ sums > adds two numbers  (src/sum.test.ts)") && said.contains("AssertionError: expected 3 to be 4"), "{said}");
+}
