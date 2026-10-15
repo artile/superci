@@ -131,6 +131,8 @@ impl Runner {
         let _ = s.read_to_string(&mut out);
         out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0)
     }
+    /// It takes the job (asks for its message, as a runner does once it listens).
+    pub fn take(&self) -> u16 { self.post("/Message/1", Vec::new()) }
     /// Each step's record: (id, name, order, state, result, its log's number).
     pub fn steps(&self, steps: &[(&str, &str, u64, &str, Option<&str>, Option<u64>)]) -> u16 {
         let value: Vec<Value> = steps.iter().map(|(id, name, order, state, result, log)| json!({ "id": id, "type": "Task", "name": name, "order": order, "state": state, "result": result,

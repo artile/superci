@@ -307,7 +307,8 @@ fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
         named_is(v.plane.plane_id(), v.plane.url(), &v.plane.place())?;
         return Ok((v, d.key().to_string()))
     };
-    if !url.starts_with("https://") { return usage("SUPERCI_PLANE is the control plane's address, starting with https:// (`superci status` says it).") }
+    // (Or one served on this computer, as tests serve one.)
+    if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1:") { return usage("SUPERCI_PLANE is the control plane's address, starting with https:// (`superci status` says it).") }
     let health = crate::cloudflare::health(&url).ok_or("The control plane at SUPERCI_PLANE did not answer.")?;
     let v = crate::view::plane_view(&Plane::Seen { url, plane_id: health["plane"].as_str().unwrap_or_default().to_string() }, Some(&key));
     if v.status.is_none() { return Err("The control plane did not take SUPERCI_KEY: it has ended, was revoked, or is another control plane's (keys that only read need control plane 0.11.0 or newer).".into()) }
