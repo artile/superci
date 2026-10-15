@@ -449,6 +449,8 @@ const LIVE_AFTER_MS: u64 = 30 * 60_000;
 const RUNNER_KEPT_MS: u64 = MAX_JOB_MINUTES as u64 * 60_000 + 86_400_000;
 /// Where it is said that the jobs' indexes are complete.
 const INDEXED: &str = "indexed";
+/// Set once the runs of jobs counted before runs were are counted (`recount_runs`).
+const RUNS_COUNTED: &str = "runs-counted";
 /// How long a day's totals are kept.
 const DAY_KEPT_MS: u64 = 400 * 86_400_000;
 
@@ -2310,6 +2312,28 @@ impl<'a> ControlPlane<'a> {
         Ok(true)
     }
 
+    /// Counts the runs of jobs counted before runs were (0.19.6), `budget` jobs at a time (where it got to is kept),
+    /// once: each run once, by the same mark its jobs counted from now on use, in the hour of its first job.
+    async fn recount_runs(&self, budget: usize) -> Result<bool> {
+        if self.store.get(RUNS_COUNTED).await?.is_some() { return Ok(true) }
+        let now = self.clock.now_ms();
+        let after = self.store.get("runs-count-at").await?.unwrap_or_default();
+        let mut jobs: Vec<(String, Job)> = self.store.list("job:").await?.into_iter().filter(|(k, _)| *k > after).filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).collect();
+        jobs.sort_by(|a, b| a.0.cmp(&b.0));
+        for (done, (key, j)) in jobs.iter().enumerate() {
+            if done == budget { self.store.put("runs-count-at", key.clone()).await?; return Ok(false) }
+            // (Only what the days kept hold: a job counted, of a run, recent enough.)
+            if j.counted_usd.is_none() || j.run_id == 0 || j.at_ms + DAY_KEPT_MS < now { continue }
+            if self.store.put_if_absent(&run_mark(j), String::new()).await? {
+                self.store.put_until(&run_mark(j), String::new(), j.at_ms + JOB_KEPT_MS).await?;
+                self.count(j, &Hour { runs: 1, ..Default::default() }).await?;
+            }
+        }
+        self.store.put(RUNS_COUNTED, now.to_string()).await?;
+        self.store.delete("runs-count-at").await?;
+        Ok(true)
+    }
+
     async fn keep(&self, key: &str, job: &Job) -> Result<()> {
         // (Written over exactly what was read, see `Store::swap`: changed in between, it is read and weighed again.)
         for _ in 0..4 {
@@ -3805,6 +3829,8 @@ impl<'a> ControlPlane<'a> {
         let (mut active, mut waiting) = (0, 0);
         // The jobs still cared for, once the indexes are built from the jobs kept before them (a batch at a time).
         let _ = self.reindex(150).await;
+        // (And the runs of jobs counted before runs were, once the indexes are there.)
+        if self.indexed().await { let _ = self.recount_runs(150).await; }
         let kept: Vec<(String, String)> = self.live_jobs().await?.into_iter().map(|(k, j)| (k, serde_json::to_string(&j).unwrap_or_default())).collect();
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.

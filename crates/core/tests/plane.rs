@@ -2677,6 +2677,41 @@ fn a_job_run_again_after_a_reclaim_goes_back_on_spot_when_the_on_demand_limit_ca
 }
 
 #[test]
+fn runs_are_counted_once_each_and_those_of_jobs_counted_before_are_counted_by_the_upkeep() {
+    let (store, wakes, cache, clouds) = (Mem::default(), Wakes::default(), Cache::default(), FakeClouds::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runs = || store.0.borrow().iter().filter(|(k, _)| k.starts_with("day:")).map(|(_, v)| serde_json::from_str::<serde_json::Value>(v).unwrap()["hours"].as_array().unwrap().iter().map(|h| h["runs"].as_u64().unwrap_or(0)).sum::<u64>()).sum::<u64>();
+    // Three jobs: two of acme/app's run, one of acme/site's.
+    for (id, repo) in [(31, "acme/app"), (32, "acme/app"), (33, "acme/site")] {
+        let runner = format!("superci-{PLANE_ID}-{id}");
+        run(job_event("queued", id, repo, None));
+        run(job_event("in_progress", id, repo, Some(&runner)));
+        run(job_event("completed", id, repo, Some(&runner)));
+    }
+    assert_eq!(runs(), 2, "each run once");
+    // As a control plane before runs were counted left them: its jobs counted, its runs not.
+    store.0.borrow_mut().retain(|k, _| !k.starts_with("counted-run:"));
+    for (_, v) in store.0.borrow_mut().iter_mut().filter(|(k, _)| k.starts_with("day:")) {
+        let mut d: serde_json::Value = serde_json::from_str(v).unwrap();
+        for h in d["hours"].as_array_mut().unwrap() { h["runs"] = 0.into() }
+        *v = d.to_string();
+    }
+    assert_eq!(runs(), 0);
+    // The upkeep counts them, once (a second sweep adds nothing).
+    clock.0.set(clock.0.get() + 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(runs(), 2);
+    clock.0.set(clock.0.get() + 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(runs(), 2);
+}
+
+#[test]
 fn a_job_sent_on_demand_by_the_spot_limit_notes_when_machines_just_ended_still_counted() {
     // Spot machines until `full` (the account's spot limit used up); on-demand ones always.
     let full = std::cell::Cell::new(false);

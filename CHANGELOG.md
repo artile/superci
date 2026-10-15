@@ -5,7 +5,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 ## 0.19.6 — unreleased
 - An AWS sign-in that AWS does not finish (seen when the account is changed on its page midway) says so plainly, with the way back to the dashboard to sign in again, instead of AWS's raw error.
 - When the control plane's cloud sign-in has ended (AWS ends one after 12 hours), the update card's button signs in first and comes back, instead of an Update that stops on "Sign in with AWS first".
-- Runs first in the dashboard: Overview lists the latest runs, and its first figure counts runs, with their jobs beside it (from a control plane on 0.19.6; jobs until it is updated). The sidebar's Jobs is Runs, its Runs tab first.
+- Runs first in the dashboard: Overview lists the latest runs, and its first figure counts runs, with their jobs beside it (from a control plane on 0.19.6, which also counts the runs of the jobs it kept from before, once, in its upkeep; jobs until it is updated). The sidebar's Jobs is Runs, its Runs tab first.
 - A job sent on-demand by the AWS account's spot limit says when machines SuperCI had just ended still counted ("machines AWS was still ending count too"): AWS counts a machine for a minute or two after its job ends.
 
 ## 0.19.5 — 2026-10-15
