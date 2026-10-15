@@ -101,7 +101,11 @@ pub fn part(link: &str, path: &str) -> (u16, String) {
 
 /// A page's words, without its markup.
 pub fn words(html: &str) -> String {
-    let html = html.split("<style").next().unwrap_or(html);
+    // (Without its styles and scripts.)
+    let mut html = html.to_string();
+    for (open, close) in [("<style", "</style>"), ("<script", "</script>")] {
+        while let Some(a) = html.find(open) { let b = html[a..].find(close).map(|b| a + b + close.len()).unwrap_or(html.len()); html.replace_range(a..b, " "); }
+    }
     let mut out = String::new();
     let mut tag = false;
     for c in html.chars() {

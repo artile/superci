@@ -59,7 +59,7 @@ fn record(r: &Request, status: u16, body: &[u8]) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) { let _ = f.write_all(format!("{line}\n").as_bytes()); }
 }
 
-/// In a debug build with `SUPERCI_STAND_IN=URL`: what is asked of AWS, GitHub's API and where GitHub keeps logs, goes to a
+/// In a debug build with `SUPERCI_STAND_IN=URL`: what is asked of AWS, GitHub's API, where GitHub keeps logs, and gitlab.com, goes to a
 /// stand-in for them there instead (`superci_testkit`'s), as `URL/<the host>/<path>`.
 #[cfg(debug_assertions)]
 fn to_stand_in(mut r: Request) -> Request {
@@ -72,7 +72,7 @@ fn to_stand_in(mut r: Request) -> Request {
 pub fn stand_in(url: &str) -> String {
     #[cfg(debug_assertions)]
     if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
-        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com")) {
+        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h == "gitlab.com")) {
             return format!("{}/{rest}", at.trim_end_matches('/'));
         }
     }

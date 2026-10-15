@@ -5,6 +5,8 @@
 //! against the control plane as it runs, offline.
 pub mod github;
 pub use github::GitHub;
+pub mod gitlab;
+pub use gitlab::GitLab;
 #[cfg(unix)]
 mod browser;
 #[cfg(unix)]
@@ -65,7 +67,7 @@ impl Timer for NoTimer { async fn wake_in(&self, _ms: u64) -> io::Result<()> { O
 /// A control plane served on this computer: its address, its store, its machines, AWS as it finds it (its settings
 /// are SSM parameters there, `/superci/testplane0001/…`, read on every request), and a key with which the dashboard
 /// and the CLI reach it (and one for coding agents, which may also start runs).
-pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub github: GitHub, pub key: String, pub run_key: String, clock: Now }
+pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub github: GitHub, pub gitlab: GitLab, pub key: String, pub run_key: String, clock: Now }
 
 impl Served {
     /// Moves the control plane's time on by `ms`.
@@ -82,6 +84,21 @@ impl Served {
         let host = self.url.trim_start_matches("http://");
         let mut s = TcpStream::connect(host).unwrap();
         s.write_all(format!("POST /webhook HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\nx-github-event: workflow_job\r\nx-hub-signature-256: {signature}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+        s.write_all(&body).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0)
+    }
+
+    /// A GitLab connection, as the dashboard leaves it (`GitLab`).
+    pub fn connect_gitlab(&self) { self.aws.put(&format!("/superci/{PLANE}/GITLAB"), &GitLab::connection().to_string()) }
+
+    /// A job event of GitLab's (`GitLab::pending`, `running`, `finish`), with the webhook's secret: the control
+    /// plane's answer.
+    pub fn gitlab_webhook(&self, body: Vec<u8>) -> u16 {
+        let host = self.url.trim_start_matches("http://");
+        let mut s = TcpStream::connect(host).unwrap();
+        s.write_all(format!("POST /gitlab/webhook HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\nx-gitlab-event: Job Hook\r\nx-gitlab-token: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", gitlab::HOOK_SECRET, body.len()).as_bytes()).unwrap();
         s.write_all(&body).unwrap();
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
@@ -133,7 +150,8 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
             let _ = answer(&plane, &u, stream);
         }
     });
-    Served { url, store, machines, aws, github, key, run_key, clock }
+    let gitlab = github.gitlab.clone();
+    Served { url, store, machines, aws, github, gitlab, key, run_key, clock }
 }
 
 /// A request as it arrived: method, target, headers, body.
@@ -214,7 +232,9 @@ impl Aws {
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             if !target.split('/').nth(1).unwrap_or_default().ends_with(".amazonaws.com") {
                 let gh = a.github.lock().unwrap().clone().unwrap_or_default();
-                let res = block_on(superci_core::io::Http::send(&gh, Request::new(&method, &format!("https:/{target}")).with_body(body))).unwrap();
+                let mut req = Request::new(&method, &format!("https:/{target}")).with_body(body);
+                for (k, v) in &headers { if !k.eq_ignore_ascii_case("host") { req = req.with_header(k, v) } }
+                let res = block_on(superci_core::io::Http::send(&gh, req)).unwrap();
                 let _ = write(stream, res.status, &res.headers, &res.body);
                 continue;
             }

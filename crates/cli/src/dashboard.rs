@@ -5672,7 +5672,7 @@ const ICON_JOBS: &str = r#"<svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 1
 fn gitlab_check(url: &str, token: &str) -> Result<String> {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(20))).build().into();
     let get = |path: &str| -> Result<serde_json::Value> {
-        let mut r = agent.get(&format!("{url}/api/v4{path}")).header("private-token", token).call().map_err(|e| format!("could not reach {url}: {e}"))?;
+        let mut r = agent.get(&crate::aws::stand_in(&format!("{url}/api/v4{path}"))).header("private-token", token).call().map_err(|e| format!("could not reach {url}: {e}"))?;
         let status = r.status().as_u16();
         let v: serde_json::Value = r.body_mut().read_json().unwrap_or_default();
         if status == 401 { return Err("the token is not valid (or has expired)".into()) }

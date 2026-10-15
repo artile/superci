@@ -30,7 +30,7 @@ struct Hub {
 }
 
 #[derive(Clone, Default)]
-pub struct GitHub { hub: Arc<Mutex<Hub>>, pub asked: Arc<Mutex<Vec<String>>>, pub unanswered: Arc<Mutex<Vec<String>>> }
+pub struct GitHub { hub: Arc<Mutex<Hub>>, pub asked: Arc<Mutex<Vec<String>>>, pub unanswered: Arc<Mutex<Vec<String>>>, /** gitlab.com, beside it. */ pub gitlab: crate::GitLab }
 
 fn fixture(name: &str) -> Value {
     serde_json::from_str(match name {
@@ -41,7 +41,7 @@ fn fixture(name: &str) -> Value {
     }).unwrap()
 }
 
-fn iso(ms: u64) -> String {
+pub(crate) fn iso(ms: u64) -> String {
     let (secs, days) = (ms / 1000, ms / 86_400_000);
     // (Days since 1970 to a date: Howard Hinnant's civil_from_days.)
     let z = days as i64 + 719_468;
@@ -235,6 +235,7 @@ impl GitHub {
 #[async_trait(?Send)]
 impl Http for GitHub {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        if let Some(answer) = self.gitlab.answer(&r) { return Ok(answer) }
         self.asked.lock().unwrap().push(format!("{} {}", r.method, r.url));
         Ok(self.answer(&r).unwrap_or_else(|| {
             self.unanswered.lock().unwrap().push(format!("{} {}", r.method, r.url));

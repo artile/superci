@@ -1,0 +1,91 @@
+{
+ "id": 17193885756,
+ "status": "failed",
+ "stage": "rebase",
+ "name": "rebase on main",
+ "ref": "main",
+ "tag": false,
+ "coverage": null,
+ "allow_failure": true,
+ "created_at": "2026-10-15T08:15:39.903Z",
+ "started_at": "2026-10-15T08:19:05.673Z",
+ "finished_at": "2026-10-15T08:20:48.625Z",
+ "erased_at": null,
+ "duration": 102.951294,
+ "queued_duration": 3.171785,
+ "user": {
+  "id": 1,
+  "username": "mona",
+  "public_email": null,
+  "name": "Mona Lisa",
+  "state": "active",
+  "locked": false,
+  "avatar_url": "https://www.gravatar.com/avatar/00000000000000000000000000000000?s=80&d=identicon",
+  "web_url": "https://gitlab.com/mona",
+  "created_at": "2026-01-01T00:00:00.000Z",
+  "bio": "",
+  "location": "",
+  "linkedin": "",
+  "twitter": "",
+  "discord": "",
+  "website_url": "",
+  "github": "",
+  "job_title": "",
+  "pronouns": null,
+  "organization": "",
+  "bot": false,
+  "work_information": null,
+  "followers": 0,
+  "following": 0,
+  "local_time": null
+ },
+ "commit": {
+  "id": "3842c417d50f394c40a1a2dc20dfa05d776cf31a",
+  "short_id": "3842c417",
+  "created_at": "2026-10-15T08:15:33.000+00:00",
+  "parent_ids": [
+   "a6d55557a976c2d0fd50bc86c568fe210f671d4e"
+  ],
+  "title": "Make the tests faster",
+  "message": "Make the tests faster\n",
+  "author_name": "Mona Lisa",
+  "author_email": "mona@example.com",
+  "authored_date": "2026-10-15T08:15:33.000+00:00",
+  "committer_name": "Mona Lisa",
+  "committer_email": "mona@example.com",
+  "committed_date": "2026-10-15T08:15:33.000+00:00",
+  "web_url": "https://gitlab.com/acme/app/-/commit/3842c417d50f394c40a1a2dc20dfa05d776cf31a"
+ },
+ "pipeline": {
+  "id": 2949881220,
+  "iid": 53241,
+  "project_id": 250833,
+  "sha": "3842c417d50f394c40a1a2dc20dfa05d776cf31a",
+  "ref": "main",
+  "status": "success",
+  "source": "push",
+  "created_at": "2026-10-15T08:15:39.739Z",
+  "updated_at": "2026-10-15T08:20:50.065Z",
+  "web_url": "https://gitlab.com/acme/app/-/pipelines/2949881220"
+ },
+ "failure_reason": "script_failure",
+ "web_url": "https://gitlab.com/acme/app/-/jobs/17193885756",
+ "project": {
+  "ci_job_token_scope_enabled": false
+ },
+ "artifacts": [
+  {
+   "file_type": "trace",
+   "size": 13853,
+   "filename": "job.log",
+   "file_format": null
+  }
+ ],
+ "runner": null,
+ "runner_manager": null,
+ "artifacts_expire_at": null,
+ "archived": false,
+ "tag_list": [
+  "functions-pilot-linux-amd64"
+ ]
+}
