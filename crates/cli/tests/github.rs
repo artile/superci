@@ -241,3 +241,33 @@ fn a_finished_jobs_page_shows_its_whole_log_however_large() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_jobs_steps_run_side_by_side_show_their_own_lines_once_its_run_has_ended() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let id = ran(&served, "success");
+    // GitHub's steps and run logs for a job with background steps and a parallel group (a probe on GitHub). Its own
+    // log has their lines mixed: "two" after the next step's heading.
+    served.github.set_steps(id, serde_json::from_str(include_str!("../fixtures/github/parallel-steps.json")).unwrap());
+    let (mut child, link) = dashboard(&home);
+    let lines = |view: &serde_json::Value, name: &str| -> Vec<String> {
+        let s = view["steps"].as_array().unwrap().iter().find(|s| s["name"] == name).unwrap_or_else(|| panic!("{name}: {view}"));
+        s["lines"].as_array().unwrap().iter().map(|l| l[2].as_str().unwrap().to_string()).collect()
+    };
+    // While its run goes on (GitHub keeps a run's logs once it has ended): its lines as they came, and said so.
+    let (_, view) = part(&link, &format!("/job/view?id={id}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap();
+    assert_eq!(view["mixed"], true, "{view}");
+    // Its run ended: each step's own lines, from its run's logs (not the view kept from before).
+    served.github.run_ended(id, include_bytes!("../fixtures/github/run-logs.zip").to_vec());
+    let (_, view) = part(&link, &format!("/job/view?id={id}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap();
+    assert_eq!(view.get("mixed"), None, "{view}");
+    assert_eq!(lines(&view, "Run echo two; sleep 2").last().map(String::as_str), Some("two"));
+    assert_eq!(lines(&view, "Run echo while they run").last().map(String::as_str), Some("while they run"));
+    assert!(lines(&view, "Parallel group").iter().any(|l| l.contains("First: Succeeded")), "{view}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

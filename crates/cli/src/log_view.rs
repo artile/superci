@@ -36,9 +36,56 @@ fn local(got: &Value) -> Vec<Step> {
     }).collect()
 }
 
+/// Whether a job of GitHub's ran steps side by side (`background`, `parallel`): one began before an earlier one ended.
+/// Its log then has their lines mixed, and only its run's logs, a file for each step, tell them apart.
+pub fn side_by_side(steps: &Value) -> bool {
+    let mut ended = 0;
+    steps.as_array().into_iter().flatten().any(|s| {
+        let (began, end) = (s["started_at"].as_str().and_then(seconds), s["completed_at"].as_str().and_then(seconds));
+        let earlier = began.is_some_and(|b| b < ended);
+        ended = ended.max(end.unwrap_or_default());
+        earlier
+    })
+}
+
+/// Each step's own log, by its number, from its run's logs (GitHub's zip: a folder for each job, named as the job is
+/// with a slash made `_` and what else a file name cannot hold left out, as `build / x: "y"` is `build _ x y`; in it
+/// `3_Run make.txt` for its third step). Nothing when the job's folder is not there.
+pub fn step_logs(zip: &[u8], job: &str) -> Option<Value> {
+    let folder: String = job.chars().filter(|c| !":*?\"<>|".contains(*c)).map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
+    let mut out = serde_json::Map::new();
+    for (name, data) in zip_files(zip).ok()? {
+        let Some(file) = name.strip_prefix(&format!("{folder}/")) else { continue };
+        let Some((n, _)) = file.split_once('_').filter(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) else { continue };
+        out.insert(n.to_string(), String::from_utf8_lossy(&data).trim_start_matches('\u{feff}').to_string().into());
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+/// A zip's files, read in memory: each one's name and what it holds.
+fn zip_files(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let u16at = |i: usize| data.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize).ok_or("cut short");
+    let u32at = |i: usize| data.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).ok_or("cut short");
+    // Its end record: in the last 64 KB (and 22 bytes), the last that says so.
+    let end = (data.len().saturating_sub(65_557)..data.len().saturating_sub(21)).rev().find(|&i| data[i..i + 4] == [0x50, 0x4b, 0x05, 0x06]).ok_or("not a zip")?;
+    let (count, mut at) = (u16at(end + 10)?, u32at(end + 16)?);
+    let mut out = vec![];
+    for _ in 0..count {
+        if data.get(at..at + 4) != Some(&[0x50, 0x4b, 0x01, 0x02][..]) { return Err("a damaged directory".into()) }
+        let (method, packed) = (u16at(at + 10)?, u32at(at + 20)?);
+        let (n, e, c, local) = (u16at(at + 28)?, u16at(at + 30)?, u16at(at + 32)?, u32at(at + 42)?);
+        let name = String::from_utf8_lossy(data.get(at + 46..at + 46 + n).ok_or("cut short")?).into_owned();
+        at += 46 + n + e + c;
+        let from = local + 30 + u16at(local + 26)? + u16at(local + 28)?;
+        let raw = data.get(from..from + packed).ok_or("cut short")?;
+        out.push((name, match method { 0 => raw.to_vec(), 8 => miniz_oxide::inflate::decompress_to_vec(raw).map_err(|e| format!("{e:?}"))?, m => return Err(format!("packed as {m}")) }));
+    }
+    Ok(out)
+}
+
 /// A job of GitHub's: its steps as GitHub has them, and each line of its log (once it has ended) in the step that was
 /// going when it was written. A step begins at its time: a line of that very second goes to it only from the step's
-/// heading on (GitHub's times are whole seconds).
+/// heading on (GitHub's times are whole seconds). With each step's own log (`step_logs`, by its number): its lines.
 fn github(got: &Value, log: &str) -> Vec<Step> {
     let given = got["steps"].as_array().cloned().unwrap_or_default();
     let secs = |v: &Value| v.as_str().and_then(seconds);
@@ -52,6 +99,13 @@ fn github(got: &Value, log: &str) -> Vec<Step> {
     }).collect();
     if steps.is_empty() {
         return if log.trim().is_empty() { vec![] } else { vec![Step { name: "Log".into(), state: "success".into(), ms: None, lines: log.lines().map(line).collect() }] }
+    }
+    if let Some(own) = got["step_logs"].as_object() {
+        for (s, g) in steps.iter_mut().zip(&given) {
+            let text = g["number"].as_u64().and_then(|n| own.get(&n.to_string())).and_then(Value::as_str).unwrap_or_default();
+            s.0.lines = text.lines().map(line).collect();
+        }
+        return steps.into_iter().map(|(s, _)| s).collect()
     }
     let mut at = 0;
     for raw in log.lines() {
@@ -232,6 +286,33 @@ mod tests {
         let v = view(&json!({ "provider": "" }), &got, false);
         let counts: Vec<usize> = v["steps"].as_array().unwrap().iter().map(|s| s["lines"].as_array().unwrap().len()).collect();
         assert_eq!(counts, [1, 2, 2, 1], "{v}");
+    }
+
+    #[test]
+    fn steps_run_side_by_side_get_their_own_lines_from_their_runs_logs() {
+        // GitHub's steps and run logs for a job with background steps, waits and a parallel group (a probe on GitHub;
+        // its checkout's lines cut, as they name the repository), and the folders it makes for `build / x: "y" (a)`.
+        let steps: Value = serde_json::from_str(include_str!("../fixtures/github/parallel-steps.json")).unwrap();
+        let zip = include_bytes!("../fixtures/github/run-logs.zip");
+        assert!(side_by_side(&steps));
+        assert!(!side_by_side(&json!([{ "started_at": "2026-10-15T22:00:50Z", "completed_at": "2026-10-15T22:00:51Z" }, { "started_at": "2026-10-15T22:00:51Z", "completed_at": "2026-10-15T22:00:53Z" }])), "one after another");
+        let own = step_logs(zip, "test").unwrap();
+        let v = view(&json!({ "provider": "" }), &json!({ "steps": steps, "step_logs": own, "log": "" }), false);
+        let of = |name: &str| -> Vec<String> {
+            let s = v["steps"].as_array().unwrap().iter().find(|s| s["name"] == name).unwrap_or_else(|| panic!("{name}: {v}"));
+            s["lines"].as_array().unwrap().iter().map(|l| l[2].as_str().unwrap().to_string()).filter(|l| !l.contains("shell:") && !l.contains("36;1m")).collect()
+        };
+        // In the job's log "two" comes after "Run echo while they run"'s heading, and "first" inside the checkout's.
+        assert_eq!(of("Run echo two; sleep 2").last().map(String::as_str), Some("two"));
+        assert_eq!(of("Run echo while they run").last().map(String::as_str), Some("while they run"));
+        assert_eq!(of("First").last().map(String::as_str), Some("first"));
+        assert!(of("Parallel group").iter().any(|l| l.contains("Finished waiting for background step(s).")));
+        assert_eq!(v["steps"][0]["lines"].as_array().map(Vec::len), Some(0), "a step whose file is not there has none");
+        // A job's folder, named as GitHub names it.
+        let b = step_logs(zip, "build / x: \"y\" (b)").unwrap();
+        assert_eq!(b.as_object().map(|o| o.len()), Some(3));
+        assert!(b["3"].as_str().unwrap().contains("second"));
+        assert!(step_logs(zip, "nowhere").is_none() && step_logs(b"not a zip", "test").is_none());
     }
 
     #[test]

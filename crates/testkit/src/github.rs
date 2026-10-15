@@ -22,6 +22,8 @@ const LOGS_AT: &str = "https://productionresultssa0.blob.core.windows.net/action
 struct Hub {
     jobs: BTreeMap<u64, Value>,
     logs: BTreeMap<u64, String>,
+    /// Each run's logs, once it has ended (GitHub's zip: a folder for each job, a file for each step).
+    run_logs: BTreeMap<u64, Vec<u8>>,
     /// The runners registered (each machine's, by the control plane): id to name.
     runners: BTreeMap<u64, String>,
     next: u64,
@@ -141,11 +143,22 @@ impl GitHub {
         self.event("completed", id)
     }
 
+    /// Its steps as GitHub has them now (their names, numbers and times), for a job that ran some side by side.
+    pub fn set_steps(&self, id: u64, steps: Value) { self.hub.lock().unwrap().jobs.get_mut(&id).unwrap()["steps"] = steps }
+
+    /// Its run ended, with these logs (GitHub keeps a run's logs, each step's apart, once the whole run has ended).
+    pub fn run_ended(&self, id: u64, zip: Vec<u8>) {
+        let mut h = self.hub.lock().unwrap();
+        let run = h.jobs[&id]["run_id"].as_u64().unwrap();
+        h.run_logs.insert(run, zip);
+    }
+
     fn answer(&self, r: &Request) -> Option<Response> {
         let url = url::Url::parse(&r.url).ok()?;
         let path = url.path().to_string();
         let ok = |status: u16, v: Value| Some(Response::new(status, "application/json; charset=utf-8", v.to_string()));
         if r.url.starts_with(LOGS_AT) {
+            if let Some(run) = path.rsplit('/').next()?.strip_prefix("run-") { return self.hub.lock().unwrap().run_logs.get(&run.parse().ok()?).map(|z| Response::new(200, "application/zip", z.clone())) }
             let id: u64 = path.rsplit('/').next()?.parse().ok()?;
             return self.hub.lock().unwrap().logs.get(&id).map(|l| Response::new(200, "text/plain", l.clone()));
         }
@@ -199,6 +212,11 @@ impl GitHub {
             // Its repository, runs and jobs (in the shape recorded).
             ("GET", ["repos", o, n]) if format!("{o}/{n}") == REPO => { drop(h); ok(200, self.repo()) }
             ("GET", ["repos", o, n, "actions", "jobs", id]) if format!("{o}/{n}") == REPO => h.jobs.get(&id.parse().ok()?).cloned().map(|j| Response::new(200, "application/json", j.to_string())),
+            ("GET", ["repos", o, n, "actions", "runs", run, "logs"] | ["repos", o, n, "actions", "runs", run, "attempts", _, "logs"]) if format!("{o}/{n}") == REPO => {
+                let run: u64 = run.parse().ok()?;
+                if !h.run_logs.contains_key(&run) { return ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/actions/workflow-runs#download-workflow-run-attempt-logs", "status": "404" })) }
+                Some(Response::new(302, "text/plain", "").with_header("location", &format!("{LOGS_AT}/run-{run}")))
+            }
             ("GET", ["repos", o, n, "actions", "jobs", id, "logs"]) if format!("{o}/{n}") == REPO => {
                 let id: u64 = id.parse().ok()?;
                 if !h.logs.contains_key(&id) { return ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/actions/workflow-jobs#download-job-logs-for-a-workflow-run", "status": "404" })) }

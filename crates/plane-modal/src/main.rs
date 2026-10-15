@@ -80,7 +80,9 @@ impl Containers for Sandboxes<'_> {
     async fn stop(&self, id: &str) -> io::Result<()> { self.0.ask(json!({ "op": "sandbox_stop", "id": id })).map(|_| ()) }
 }
 
-struct Blocking(ureq::Agent);
+/// The client: one that follows redirects, and one that gives them back as they are (asked of a request for where
+/// GitHub keeps a log: the link is the answer, not what is there).
+struct Blocking(ureq::Agent, ureq::Agent);
 
 #[async_trait(?Send)]
 impl Http for Blocking {
@@ -88,7 +90,7 @@ impl Http for Blocking {
         let mut builder = ureq::http::Request::builder().method(r.method.as_str()).uri(r.url.as_str());
         for (k, v) in &r.headers { builder = builder.header(k.as_str(), v.as_str()) }
         let request = builder.body(r.body.clone()).map_err(|e| e.to_string())?;
-        let mut response = self.0.run(request).map_err(|e| format!("{} {}: {e}", r.method, r.url))?;
+        let mut response = if r.no_follow { &self.1 } else { &self.0 }.run(request).map_err(|e| format!("{} {}: {e}", r.method, r.url))?;
         let headers = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect();
         Ok(Response { status: response.status().as_u16(), headers, body: response.body_mut().read_to_vec().map_err(|e| e.to_string())? })
     }
@@ -111,7 +113,8 @@ fn config(secrets: &Value) -> Config {
 
 fn main() {
     let bridge = Bridge { input: RefCell::new(std::io::stdin().lock()), output: RefCell::new(std::io::stdout()) };
-    let http = Blocking(ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(25))).build().into());
+    let agent = |redirects: u32| ureq::Agent::config_builder().http_status_as_error(false).max_redirects(redirects).timeout_global(Some(Duration::from_secs(25))).build().into();
+    let http = Blocking(agent(10), agent(0));
     let cache = Cache::default();
     while let Some(msg) = bridge.read() {
         let config = config(&msg["secrets"]);

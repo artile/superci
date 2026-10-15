@@ -187,7 +187,18 @@ pub async fn installation_token(http: &dyn Http, app: &App, installation_id: u64
 /// minute, to be fetched without the token); a client that follows by itself arrives with the log.
 /// Where GitHub keeps a job's whole log: a link of its own, good for a minute or so (any size, nothing through here).
 pub async fn job_log_link(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<String> {
-    let ask = Request::new("GET", &format!("{api}/repos/{repo}/actions/jobs/{job_id}/logs"))
+    logs_link(http, &format!("{api}/repos/{repo}/actions/jobs/{job_id}/logs"), token).await
+}
+
+/// Where GitHub keeps the logs of a run's attempt (all of them: the latest), as a zip with a folder for each job and a
+/// file for each step in it, named by the step's number and name: how steps run side by side are told apart.
+pub async fn run_logs_link(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64, attempt: Option<u32>) -> Result<String> {
+    let at = attempt.map(|n| format!("/attempts/{n}")).unwrap_or_default();
+    logs_link(http, &format!("{api}/repos/{repo}/actions/runs/{run_id}{at}/logs"), token).await
+}
+
+async fn logs_link(http: &dyn Http, url: &str, token: &str) -> Result<String> {
+    let ask = Request::new("GET", url)
         .with_header("accept", "application/vnd.github+json").with_header("user-agent", "superci-plane").with_header("x-github-api-version", "2022-11-28")
         .with_header("authorization", &format!("Bearer {token}")).without_following();
     let r = http.send(ask).await?;

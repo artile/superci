@@ -5,6 +5,8 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 ## 0.19.6 — unreleased
 - Runs from a computer run a job that calls a workflow of the repository (`uses: ./.github/workflows/x.yml`) as GitHub does: its jobs (`caller / job`), with the inputs and secrets the caller gives (`with:`, `secrets: inherit` or named), and its outputs for the jobs that need the caller. (One of another repository is not run from a computer yet.)
 - Runs from a computer run steps side by side as GitHub does: `background: true`, `wait`, `wait-all`, `cancel` and `parallel` groups, refused where GitHub refuses them.
+- A GitHub job whose steps ran side by side shows each step's own lines on its page, from its run's logs once the run has ended (until then its lines are in the order they came, and the page says so).
+- On AWS and Modal control planes, a job's Raw log opens GitHub's own link again, whatever its size.
 - A matrix made by an expression (`${{ fromJSON(needs.setup.outputs.matrix) }}`) is read once the jobs it needs have ended, as on GitHub.
 - A job's `timeout-minutes` ends it once it has run that long, and its `continue-on-error` lets the run go on when it fails (the jobs that need it see a success, as on GitHub).
 - Runs from a computer read YAML anchors and aliases in workflow files, as GitHub Actions does; a merge key (`<<`) is refused, as GitHub Actions refuses it.

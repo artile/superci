@@ -11,8 +11,8 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// Asked of one request only (a job's log): a redirect is given back as it is, not followed, so the caller goes
-    /// on to another site without this request's credentials. A runtime whose client already drops credentials on
-    /// the way to another site may follow anyway; the caller takes either answer.
+    /// on to another site without this request's credentials (and a link is answered with the link, not with what
+    /// is there). Every runtime gives it back as it is.
     pub no_follow: bool,
 }
 

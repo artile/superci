@@ -17,11 +17,13 @@ use superci_core::plane::{Cache, Config, ControlPlane};
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
-fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(25))).build().into()
+fn agent(redirects: u32) -> ureq::Agent {
+    ureq::Agent::config_builder().http_status_as_error(false).max_redirects(redirects).timeout_global(Some(Duration::from_secs(25))).build().into()
 }
 
-struct Blocking(ureq::Agent);
+/// The client: one that follows redirects, and one that gives them back as they are (asked of a request for where
+/// GitHub keeps a log: the link is the answer, not what is there).
+struct Blocking(ureq::Agent, ureq::Agent);
 
 #[async_trait(?Send)]
 impl Http for Blocking {
@@ -29,7 +31,7 @@ impl Http for Blocking {
         let mut builder = ureq::http::Request::builder().method(r.method.as_str()).uri(r.url.as_str());
         for (k, v) in &r.headers { builder = builder.header(k.as_str(), v.as_str()) }
         let request = builder.body(r.body.clone()).map_err(|e| e.to_string())?;
-        let mut response = self.0.run(request).map_err(|e| format!("{} {}: {e}", r.method, r.url))?;
+        let mut response = if r.no_follow { &self.1 } else { &self.0 }.run(request).map_err(|e| format!("{} {}: {e}", r.method, r.url))?;
         let headers = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect();
         Ok(Response { status: response.status().as_u16(), headers, body: response.body_mut().read_to_vec().map_err(|e| e.to_string())? })
     }
@@ -314,7 +316,7 @@ fn response(r: Response) -> Value {
 fn main() {
     let api = std::env::var("AWS_LAMBDA_RUNTIME_API").expect("runs in AWS Lambda");
     let region = std::env::var("AWS_REGION").unwrap_or_default();
-    let (http, runtime) = (Blocking(agent()), ureq::Agent::from(ureq::Agent::config_builder().http_status_as_error(false).build()));
+    let (http, runtime) = (Blocking(agent(10), agent(0)), ureq::Agent::from(ureq::Agent::config_builder().http_status_as_error(false).build()));
     let table = std::env::var("TABLE").unwrap_or_default();
     let plane_id = std::env::var("PLANE_ID").unwrap_or_default();
     let function = std::env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or_default();

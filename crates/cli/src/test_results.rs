@@ -78,7 +78,7 @@ fn error_after(lines: &[String], from: usize, stop: impl Fn(&str) -> bool) -> St
 pub fn read(log: &str) -> Tests {
     let lines: Vec<String> = log.lines().map(plain).collect();
     let mut t = Tests::default();
-    let mut runner = |t: &mut Tests, name: &'static str| if !t.runners.contains(&name) { t.runners.push(name) };
+    let runner = |t: &mut Tests, name: &'static str| if !t.runners.contains(&name) { t.runners.push(name) };
     let push = |t: &mut Tests, f: Failure| if t.failures.len() < MOST && !t.failures.iter().any(|g| g.runner == f.runner && g.name == f.name) { t.failures.push(f) };
     let playwright = lines.iter().any(|l| l.trim_start().starts_with("Running ") && l.contains(" using ") && l.contains("worker"));
     for (i, l) in lines.iter().enumerate() {
