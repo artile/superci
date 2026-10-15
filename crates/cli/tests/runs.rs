@@ -142,3 +142,51 @@ fn with_a_key_for_coding_agents_what_ran_is_read_and_a_jobs_whole_log_is_kept_in
     assert!((1..=5).all(|n| text.contains(&format!("line {n}"))), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_machine_that_never_begins_its_job_is_started_again_twice_then_the_run_fails_saying_why() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml"])
+        .env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    while served.machines.0.lock().unwrap().is_empty() { std::thread::sleep(std::time::Duration::from_millis(50)) }
+    // Its runner never takes the job. Within three minutes that is waited for; after, its machine is started anew.
+    served.later(60_000);
+    served.upkeep();
+    assert_eq!(served.machines.0.lock().unwrap().len(), 1);
+    for starts in [2, 3] {
+        served.later(4 * 60_000);
+        served.upkeep();
+        assert_eq!(served.machines.0.lock().unwrap().len(), starts);
+    }
+    served.later(4 * 60_000);
+    served.upkeep();
+    let job = served.store.under("job:").into_iter().next().unwrap().1;
+    assert_eq!((job["state"].as_str(), job["error"].as_str()), (Some("failed"), Some("Cloudflare did not start a machine for it, three times")), "{job}");
+    // The run from this computer ends with it.
+    let out = cli.wait_with_output().unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success() && said.contains("did not start a machine for it, three times"), "{said}");
+}
+
+#[test]
+fn a_job_that_runs_past_its_longest_time_is_ended_by_the_upkeep_and_the_run_with_it() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    runner.take();
+    runner.steps(&[("cccccccc-0000-0000-0000-000000000003", "Run make test", 1, "inProgress", None, None)]);
+    // Within its longest time (6 hours here, and 5 minutes more), it runs on.
+    served.later(6 * 3_600_000);
+    served.upkeep();
+    assert_eq!(served.store.under("job:")[0].1["state"], "running");
+    served.later(10 * 60_000);
+    served.upkeep();
+    let job = served.store.under("job:")[0].1.clone();
+    assert_eq!(job["state"], "swept", "{job}");
+    let out = cli.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success() && said.contains("failure (it ran past its longest time (6 hours), and its machine was ended)"), "{said}");
+}

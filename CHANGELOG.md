@@ -9,6 +9,8 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - Windows machines say how their start went (boot, start-up script, the runner), try the runner's addresses at GitHub before starting it, and send its lines as they are written, as Linux machines do.
 - AWS's limit on CPUs at once is asked for more of from one button, with spot and on-demand apart, each with its limit now.
 - `superci projects list` without GitLab says so; amounts with nothing spent say 0, not -0.
+- A run from a computer says why a job failed when no machine began it ("Cloudflare did not start a machine for it, three times"), and a job ended for running past its longest time says so, there, in `superci jobs retrieve` and in the dashboard.
+- Saving the default machine returns to Workflows, where it is set. `superci runners update CLOUD --enabled=false` is refused for a provider other than aws-on-demand (it did nothing): another is removed with `superci runners delete CLOUD`.
 
 ## 0.19.3 — 2026-10-15
 - `superci runs create` no longer goes quiet: after a burst of lines GitHub's runner did not send as fast as they came, 0.19.0 waited for the step to end before it printed more of it, minutes for a long step. What was dropped is now filled from what the machine sends of the step's own log every two seconds, and the lines go on as they come; the few the runner still holds come when the step ends, said as such.

@@ -234,7 +234,8 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 ("launching", _) => "asking for its machine".to_string(),
                 ("launched", _) => format!("its machine is starting ({})", j["machine"].as_str().unwrap_or("")),
                 ("running", _) => "running".to_string(),
-                (_, Some(r)) => format!("ended: {r}"),
+                // (With the control plane's word for why, when the job ended without its runner: no machine began it.)
+                (_, Some(r)) => match j["error"].as_str().filter(|e| !e.is_empty()) { Some(e) => format!("ended: {r}: {e}"), None => format!("ended: {r}") },
                 (other, _) => other.to_string(),
             };
             if !state.is_empty() && state != last[i] { say(&format!("{mark}{}{}", &state[..1].to_uppercase(), &state[1..])); last[i] = state }
@@ -265,7 +266,8 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             let usd: f64 = jobs.iter().filter_map(|j| j["usd"].as_f64()).sum::<f64>() + 0.0;
             for (i, j) in jobs.iter().enumerate() {
                 say(&format!("{}{} ({}{}{}): {}", crate::commands::JOB_LINE, j["name"].as_str().unwrap_or("job"), j["machine"].as_str().unwrap_or("no machine"),
-                    j["took_ms"].as_u64().map(|ms| format!(", {}", span(ms / 1000))).unwrap_or_default(), j["usd"].as_f64().map(|u| format!(", ${u:.3}")).unwrap_or_default(), j["result"].as_str().unwrap_or("?")));
+                    j["took_ms"].as_u64().map(|ms| format!(", {}", span(ms / 1000))).unwrap_or_default(), j["usd"].as_f64().map(|u| format!(", ${u:.3}")).unwrap_or_default(),
+                    match (j["result"].as_str().unwrap_or("?"), j["error"].as_str().filter(|e| !e.is_empty())) { (r, Some(e)) => format!("{r} ({e})"), (r, None) => r.to_string() }));
                 let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
                 steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
                 for s in steps {

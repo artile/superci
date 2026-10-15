@@ -56,8 +56,12 @@ impl Containers for Machines {
     async fn stop(&self, _id: &str) -> io::Result<()> { Ok(()) }
 }
 
-struct Now;
-impl Clock for Now { fn now_ms(&self) -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) } }
+fn system_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
+
+/// The control plane's time: this computer's, moved on by the test (`Served::later`).
+#[derive(Clone, Default)]
+struct Now(Arc<std::sync::atomic::AtomicU64>);
+impl Clock for Now { fn now_ms(&self) -> u64 { system_ms() + self.0.load(std::sync::atomic::Ordering::SeqCst) } }
 struct NoTimer;
 #[async_trait(?Send)]
 impl Timer for NoTimer { async fn wake_in(&self, _ms: u64) -> io::Result<()> { Ok(()) } }
@@ -65,7 +69,22 @@ impl Timer for NoTimer { async fn wake_in(&self, _ms: u64) -> io::Result<()> { O
 /// A control plane served on this computer: its address, its store, its machines, AWS as it finds it (its settings
 /// are SSM parameters there, `/superci/testplane0001/…`, read on every request), and a key with which the dashboard
 /// and the CLI reach it (and one for coding agents, which may also start runs).
-pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub key: String, pub run_key: String }
+pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub key: String, pub run_key: String, clock: Now }
+
+impl Served {
+    /// Moves the control plane's time on by `ms`.
+    pub fn later(&self, ms: u64) { self.clock.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst); }
+
+    /// Its upkeep, as its cloud runs it every minute (`ControlPlane::alarm`).
+    pub fn upkeep(&self) {
+        let host = self.url.trim_start_matches("http://");
+        let mut s = TcpStream::connect(host).unwrap();
+        s.write_all(format!("POST /__testkit/upkeep HTTP/1.1\r\nhost: {host}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    }
+}
 
 /// The control plane's id, and the AWS account and region it is in.
 pub const PLANE: &str = "testplane0001";
@@ -83,7 +102,8 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &key);
     aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
     aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "on");
-    let (s, m, a, u) = (store.clone(), machines.clone(), aws.clone(), url.clone());
+    let clock = Now::default();
+    let (s, m, a, u, c) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone());
     std::thread::spawn(move || {
         let cache = Cache::default();
         block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
@@ -94,11 +114,11 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
             config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
             config.read_settings(&settings);
             configure(&mut config);
-            let plane = ControlPlane { store: &s, http: &Nowhere, clock: &Now, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
+            let plane = ControlPlane { store: &s, http: &Nowhere, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let _ = answer(&plane, &u, stream);
         }
     });
-    Served { url, store, machines, aws, key, run_key }
+    Served { url, store, machines, aws, key, run_key, clock }
 }
 
 /// A request as it arrived: method, target, headers, body.
@@ -133,6 +153,9 @@ fn write(mut out: TcpStream, status: u16, headers: &[(String, String)], body: &[
 /// One request on its connection, answered by the control plane, then the connection closed.
 fn answer(plane: &ControlPlane, base: &str, stream: TcpStream) -> std::io::Result<()> {
     let (method, target, headers, body) = read(&stream)?;
+    if target == "/__testkit/upkeep" {
+        return match block_on(plane.alarm()) { Ok(()) => write(stream, 200, &[], b"ok"), Err(e) => write(stream, 500, &[], e.as_bytes()) };
+    }
     let mut req = Request::new(&method, &format!("{base}{target}")).with_body(body);
     for (k, v) in headers { req = req.with_header(&k, &v) }
     let res = block_on(plane.handle(req));
@@ -183,7 +206,7 @@ impl Aws {
     pub fn put(&self, name: &str, value: &str) {
         let mut p = self.params.lock().unwrap();
         let version = p.get(name).map(|(_, v, _)| v + 1).unwrap_or(1);
-        p.insert(name.to_string(), (value.to_string(), version, Now.now_ms()));
+        p.insert(name.to_string(), (value.to_string(), version, system_ms()));
     }
 
     /// A control plane's settings, by name, as it reads them (`/superci/<id>/<NAME>`).

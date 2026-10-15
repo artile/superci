@@ -165,3 +165,46 @@ fn runners_limits_the_cache_and_keys_are_set_and_read_back() {
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_run_its_job_and_the_control_plane_are_read_signed_in() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    common::played(&served, &home.join("checkout"));
+    let text = |args: &[&str]| { let o = superci(&home, args); assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr)); String::from_utf8_lossy(&o.stdout).into_owned() };
+    let run = json(&home, &["runs", "list"]).1["runs"][0].clone();
+    let (run_id, job_id) = (run["id"].to_string(), run["job_ids"][0].to_string());
+
+    // The run, with its jobs.
+    let got = json(&home, &["runs", "retrieve", &run_id]).1;
+    let one = &got["runs"][0];
+    assert_eq!((one["state"].as_str(), one["run"].as_str(), one["job_list"][0]["job"].as_str(), one["job_list"][0]["ended"].as_str()), (Some("passed"), Some(".github/workflows/ci.yml"), Some("tests"), Some("passed")), "{got}");
+    let said = text(&["runs", "retrieve", &run_id]);
+    assert!(said.contains(".github/workflows/ci.yml") && said.contains("tests") && said.contains("passed"), "{said}");
+    // Its job, with how its start went and its log (its last 1,000 bytes at least: here all of it).
+    let job = json(&home, &["jobs", "retrieve", &job_id, "--bytes=200"]).1;
+    assert_eq!(job["job"]["start"]["steps"].as_array().map(Vec::len), Some(2), "{job}");
+    let log = job["log"].as_str().unwrap_or_default();
+    assert!(job["truncated"] == false && log.contains("test 1 passed") && log.contains("test 12 passed"), "{job}");
+    let said = text(&["jobs", "retrieve", &job_id]);
+    assert!(said.contains("its machine was asked for") && said.contains("test 1 passed") && said.contains("test 12 passed"), "{said}");
+
+    // Signed in: the control planes of the account, the images jobs run on in each region, the order of providers.
+    let planes = json(&home, &["planes", "list"]).1;
+    assert_eq!((planes["control_planes"][0]["id"].as_str(), planes["control_planes"][0]["in_use"].as_bool()), (Some("testplane0001"), Some(true)), "{planes}");
+    assert!(text(&["planes", "list"]).contains("AWS · 111111111111 · us-east-1"));
+    let images = json(&home, &["images", "list"]).1;
+    let published: Vec<&str> = images["images"].as_array().unwrap().iter().filter(|i| i["published"] == true).filter_map(|i| i["region"].as_str()).collect();
+    assert!(published.contains(&"us-east-1") && !published.contains(&"ca-central-1"), "{images}");
+    assert!(text(&["images", "list"]).contains("us-east-1"));
+    assert_eq!(json(&home, &["runners", "order", "cloudflare"]).1["order"], serde_json::json!(["cloudflare"]));
+    let status = json(&home, &["status"]).1;
+    assert_eq!(status["signed_in"], "AWS account 111111111111");
+    assert!(text(&["status"]).contains("AWS account 111111111111"));
+    // Usage by week, said to a person.
+    assert_eq!(json(&home, &["usage", "retrieve", "--period=week"]).1["usage"]["jobs"], 1);
+    let said = text(&["usage", "retrieve", "--period=week"]);
+    assert!(said.contains('1'), "{said}");
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
+}
