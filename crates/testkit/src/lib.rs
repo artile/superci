@@ -67,7 +67,7 @@ impl Timer for NoTimer { async fn wake_in(&self, _ms: u64) -> io::Result<()> { O
 /// A control plane served on this computer: its address, its store, its machines, AWS as it finds it (its settings
 /// are SSM parameters there, `/superci/testplane0001/…`, read on every request), and a key with which the dashboard
 /// and the CLI reach it (and one for coding agents, which may also start runs).
-pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub github: GitHub, pub gitlab: GitLab, pub key: String, pub run_key: String, clock: Now }
+pub struct Served { pub plane: String, pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub github: GitHub, pub gitlab: GitLab, pub key: String, pub run_key: String, clock: Now }
 
 impl Served {
     /// Moves the control plane's time on by `ms`.
@@ -77,7 +77,7 @@ impl Served {
     pub fn now_ms(&self) -> u64 { self.clock.now_ms() }
 
     /// SuperCI's App for the organization `acme`, as the dashboard leaves it once made and installed (`GitHub`).
-    pub fn connect_github(&self) { self.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &GitHub::app().to_string()) }
+    pub fn connect_github(&self) { self.aws.put(&format!("/superci/{}/GITHUB_APP", self.plane), &GitHub::app().to_string()) }
 
     /// A webhook GitHub sends (`GitHub::queue`, `start`, `finish`), as it sends it: the control plane's answer.
     pub fn webhook(&self, (body, signature): (Vec<u8>, String)) -> u16 {
@@ -91,7 +91,7 @@ impl Served {
     }
 
     /// A GitLab connection, as the dashboard leaves it (`GitLab`).
-    pub fn connect_gitlab(&self) { self.aws.put(&format!("/superci/{PLANE}/GITLAB"), &GitLab::connection().to_string()) }
+    pub fn connect_gitlab(&self) { self.aws.put(&format!("/superci/{}/GITLAB", self.plane), &GitLab::connection().to_string()) }
 
     /// A job event of GitLab's (`GitLab::pending`, `running`, `finish`), with the webhook's secret: the control
     /// plane's answer.
@@ -122,7 +122,10 @@ pub const ACCOUNT: &str = "111111111111";
 pub const REGION: &str = "us-east-1";
 
 /// Serves a control plane with machines of its own (`containers`), `configure`d further by the test.
-pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
+pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served { serve_as(PLANE, configure) }
+
+/// The same, with this id (a second control plane beside the first).
+pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (store, machines, aws) = (Shared::default(), Machines::default(), Aws::serve());
@@ -131,17 +134,17 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     *aws.github.lock().unwrap() = Some(github.clone());
     let (key, run_key) = ("dashboard-key-for-tests-0001".to_string(), "superci_run_0123456789abcdef0123456789abcdef".to_string());
     // Its keys, as a deploy and `superci keys create agent --runs` leave them.
-    aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &key);
-    aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
-    aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "on");
+    aws.put(&format!("/superci/{plane}/DASHBOARD_KEY_4102444800_TEST"), &key);
+    aws.put(&format!("/superci/{plane}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
+    aws.put(&format!("/superci/{plane}/CONTAINERS"), "on");
     let clock = Now::default();
-    let (s, m, a, u, c, g) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone());
+    let (s, m, a, u, c, g, id) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), plane.to_string());
     std::thread::spawn(move || {
         let cache = Cache::default();
         block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
         for stream in listener.incoming().flatten() {
-            let mut config = Config::new(PLANE.into());
-            let settings = a.settings(PLANE);
+            let mut config = Config::new(id.clone());
+            let settings = a.settings(&id);
             // (Its machines are its own containers, as a Cloudflare or Modal control plane's are: on until removed.)
             config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
             config.read_settings(&settings);
@@ -151,7 +154,7 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
         }
     });
     let gitlab = github.gitlab.clone();
-    Served { url, store, machines, aws, github, gitlab, key, run_key, clock }
+    Served { plane: plane.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock }
 }
 
 /// A request as it arrived: method, target, headers, body.
@@ -209,7 +212,9 @@ pub struct Aws {
     pub unanswered: Arc<Mutex<Vec<String>>>,
     /// What a real account answered for the rest (`fixtures/aws/settings/dashboard.jsonl`: what the dashboard asks of
     /// AWS when signed in), and the address its control plane's stands in for (`http://plane.test`).
-    pub recorded: Arc<Vec<Value>>,
+    pub recorded: Arc<Mutex<Vec<Value>>>,
+    /// How many of each recorded call's answers were given (several of the same call are answered in their order).
+    replayed: Arc<Mutex<BTreeMap<String, usize>>>,
     pub plane_url: Arc<Mutex<String>>,
     /// Where what is not AWS's goes (GitHub's logs).
     pub github: Arc<Mutex<Option<GitHub>>>,
@@ -225,7 +230,7 @@ impl Aws {
     pub fn serve() -> Aws {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let recorded = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
-        let aws = Aws { url: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), recorded: Arc::new(recorded), ..Default::default() };
+        let aws = Aws { url: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), recorded: Arc::new(Mutex::new(recorded)), ..Default::default() };
         let a = aws.clone();
         std::thread::spawn(move || for stream in listener.incoming().flatten() {
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
@@ -238,11 +243,24 @@ impl Aws {
                 let _ = write(stream, res.status, &res.headers, &res.body);
                 continue;
             }
-            let (status, answer) = a.handle(&method, &format!("https:/{target}"), &header("x-amz-target"), &String::from_utf8_lossy(&body));
-            let kind = if answer.starts_with('<') { "text/xml" } else { "application/x-amz-json-1.1" };
-            let _ = write(stream, status, &[("content-type".into(), kind.into())], answer.as_bytes());
+            let (status, mut said, answer) = a.handle_full(&method, &format!("https:/{target}"), &header("x-amz-target"), &String::from_utf8_lossy(&body));
+            if !said.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) { said.push(("content-type".into(), if answer.starts_with('<') { "text/xml" } else { "application/x-amz-json-1.1" }.into())) }
+            let _ = write(stream, status, &said, answer.as_bytes());
         });
         aws
+    }
+
+    /// What a real account answered in a situation (`fixtures/aws/planes/update.jsonl`, …), answered first from now
+    /// on, with what stood for something there replaced by what it is here (a control plane's id, its address).
+    pub fn replaying(&self, recording: &str, replace: &[(&str, &str)]) {
+        let mut all = self.recorded.lock().unwrap();
+        // (Each answer marked with its recording's place: the newest recording's answers come first.)
+        let newest = all.iter().filter_map(|r| r["recording"].as_u64()).max().unwrap_or(0) + 1;
+        let mut r: Vec<Value> = recording.lines().filter_map(|l| serde_json::from_str::<Value>(&replace.iter().fold(l.to_string(), |l, (from, to)| l.replace(from, to))).ok())
+            .map(|mut v| { v["recording"] = newest.into(); v }).collect();
+        r.extend(all.drain(..));
+        *all = r;
+        self.replayed.lock().unwrap().clear();
     }
 
     /// A parameter written as the dashboard writes one.
@@ -259,23 +277,37 @@ impl Aws {
     }
 
     /// One exchange: `url` is AWS's own (`https://ssm.us-east-1.amazonaws.com/`).
-    pub fn handle(&self, method: &str, url: &str, target: &str, asked: &str) -> (u16, String) {
-        let (status, answer) = match self.answer(url, target, asked) {
-            (400, a) if a["__type"] == "SuperCITestkitUnknown" => self.replay(url, target, asked).unwrap_or((400, a.to_string())),
-            (status, a) => (status, a.to_string()),
+    pub fn handle(&self, method: &str, url: &str, target: &str, asked: &str) -> (u16, String) { let (s, _, a) = self.handle_full(method, url, target, asked); (s, a) }
+
+    /// The same, with the answer's headers.
+    pub fn handle_full(&self, method: &str, url: &str, target: &str, asked: &str) -> (u16, Vec<(String, String)>, String) {
+        let (status, headers, answer) = match self.answer(url, target, asked) {
+            (400, a) if a["__type"] == "SuperCITestkitUnknown" => self.replay(method, url, target, asked).unwrap_or((400, vec![], a.to_string())),
+            (status, a) => (status, vec![], a.to_string()),
         };
         if status == 400 && answer.contains("SuperCITestkitUnknown") { self.unanswered.lock().unwrap().push(format!("{target} {url} {}", asked.chars().take(200).collect::<String>())) }
         self.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": target, "asked": asked, "status": status, "answer": answer }));
-        (status, answer)
+        (status, headers, answer)
     }
 
     /// The recorded answer to the same request, else to the same action at the same address.
-    fn replay(&self, url: &str, target: &str, asked: &str) -> Option<(u16, String)> {
-        let at = |r: &&Value| r["url"] == url && r["target"] == target;
-        let found = self.recorded.iter().find(|r| at(r) && r["asked"] == asked)
-            .or_else(|| self.recorded.iter().find(|r| at(r) && action(r["target"].as_str().unwrap_or_default(), r["asked"].as_str().unwrap_or_default()) == action(target, asked)))?;
+    fn replay(&self, method: &str, url: &str, target: &str, asked: &str) -> Option<(u16, Vec<(String, String)>, String)> {
+        let recorded = self.recorded.lock().unwrap();
+        let at = |r: &&Value| r["url"] == url && r["target"] == target && r["method"] == method;
+        // The same call (exactly, else the same action at the same address), the next of its answers in their order.
+        let same: Vec<&Value> = recorded.iter().filter(|r| at(r) && r["asked"] == asked).collect();
+        let same: Vec<&Value> = if same.is_empty() { recorded.iter().filter(|r| at(r) && action(r["target"].as_str().unwrap_or_default(), r["asked"].as_str().unwrap_or_default()) == action(target, asked)).collect() } else { same };
+        // Of the newest recording that has it.
+        let newest = same.iter().filter_map(|r| r["recording"].as_u64()).max().unwrap_or(0);
+        let same: Vec<&Value> = same.into_iter().filter(|r| r["recording"].as_u64().unwrap_or(0) == newest).collect();
+        let key = format!("{method} {url} {target} {}", action(target, asked));
+        let mut given = self.replayed.lock().unwrap();
+        let n = given.entry(key).or_insert(0);
+        let found = same.get(*n).or(same.last())?;
+        *n += 1;
         let answer = found["answer"].as_str()?.replace("http://plane.test", &self.plane_url.lock().unwrap());
-        Some((found["status"].as_u64()? as u16, answer))
+        let headers = found["headers"].as_array().into_iter().flatten().filter_map(|h| Some((h[0].as_str()?.to_string(), h[1].as_str()?.to_string()))).collect();
+        Some((found["status"].as_u64()? as u16, headers, answer))
     }
 
     fn answer(&self, url: &str, target: &str, asked: &str) -> (u16, Value) {
@@ -298,6 +330,12 @@ impl Aws {
                 None => not_found(),
             },
             "AmazonSSM.DeleteParameter" => match self.params.lock().unwrap().remove(&name) { Some(_) => (200, json!({})), None => not_found() },
+            "AmazonSSM.DeleteParameters" => {
+                let mut p = self.params.lock().unwrap();
+                let (mut gone, mut not) = (vec![], vec![]);
+                for n in a["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) { if p.remove(n).is_some() { gone.push(n) } else { not.push(n) } }
+                (200, json!({ "DeletedParameters": gone, "InvalidParameters": not }))
+            }
             "AmazonSSM.GetParametersByPath" => {
                 let path = a["Path"].as_str().unwrap_or_default();
                 let p = self.params.lock().unwrap();

@@ -37,21 +37,23 @@ impl Http for Blocking {
         let headers: Vec<(String, String)> = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect();
         let body = response.body_mut().read_to_vec().map_err(|e| e.to_string())?;
         #[cfg(debug_assertions)]
-        record(&r, status, &body);
+        record(&r, status, &headers, &body);
         Ok(Response { status, headers, body })
     }
 }
 
 /// In a debug build with `SUPERCI_RECORD=FILE`: every exchange with AWS is appended to that file, a line each (the
-/// address, what was asked, the status and the whole answer), to make test fixtures of what a real account answers.
+/// address, what was asked, the status, the answer's telling headers and the whole answer), to make test fixtures of what a real account answers.
 /// No header is kept (the credentials are in them), nor a sign-in's exchange. The answers name the account: they are
 /// sanitized before they are kept anywhere (`scripts/sanitize-recording.py`).
 #[cfg(debug_assertions)]
-fn record(r: &Request, status: u16, body: &[u8]) {
+fn record(r: &Request, status: u16, headers: &[(String, String)], body: &[u8]) {
     let Some(file) = std::env::var_os("SUPERCI_RECORD").filter(|f| !f.is_empty()) else { return };
     if r.url.contains("signin.") || r.url.contains("/oauth") { return }
     let target = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-amz-target")).map(|(_, v)| v.clone()).unwrap_or_default();
-    let line = serde_json::json!({ "method": r.method, "url": r.url, "target": target, "asked": String::from_utf8_lossy(&r.body), "status": status, "answer": String::from_utf8_lossy(body) });
+    // (Of the answer's headers, those that say something: what kind of error, where to, which version.)
+    let said: Vec<(&String, &String)> = headers.iter().filter(|(k, _)| ["x-amzn-errortype", "location", "etag", "content-type", "content-range"].contains(&k.to_ascii_lowercase().as_str())).map(|(k, v)| (k, v)).collect();
+    let line = serde_json::json!({ "method": r.method, "url": r.url, "target": target, "asked": String::from_utf8_lossy(&r.body), "status": status, "headers": said, "answer": String::from_utf8_lossy(body) });
     use std::io::Write;
     // (One line at a time: questions are asked side by side.)
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());

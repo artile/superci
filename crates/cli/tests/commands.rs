@@ -208,3 +208,49 @@ fn a_run_its_job_and_the_control_plane_are_read_signed_in() {
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn the_control_plane_is_updated_as_aws_answered_a_real_account() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    // (The recording's control plane is this one.)
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && said.contains(&format!("Updated to {}", env!("CARGO_PKG_VERSION"))), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    // Its new function went up; its role, table, address and schedule were checked.
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
+    assert!(asked.iter().any(|a| a.starts_with("PUT https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0001/code")), "{asked:?}");
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn another_control_plane_is_deleted_as_aws_answered_a_real_account_and_the_one_in_use_is_not() {
+    // The one in use, and another beside it in the same account (as the recording had them).
+    let served = serve(|_| {});
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let listed = json(&home, &["planes", "list"]).1;
+    let ids: Vec<&str> = listed["control_planes"].as_array().unwrap().iter().filter_map(|p| p["id"].as_str()).collect();
+    assert!(ids.contains(&"testplane0001") && ids.contains(&"testplane0002"), "{listed}");
+    // The one in use is not deleted: that is stopping SuperCI.
+    let o = superci(&home, &["planes", "delete", "testplane0001", "--confirm"]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("in use"), "{}", String::from_utf8_lossy(&o.stderr));
+    let (code, refused) = json(&home, &["planes", "delete", "testplane0002"]);
+    assert!(code != 0 && refused["error"].as_str().unwrap().contains("--confirm"), "{refused}");
+    let o = superci(&home, &["planes", "delete", "testplane0002", "--confirm"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && said.contains("Deleted"), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    // Its settings are gone from SSM, its function, table and role from AWS; the one in use keeps its own.
+    assert!(served.aws.settings("testplane0002").is_empty(), "{:?}", served.aws.settings("testplane0002"));
+    assert!(!served.aws.settings(superci_testkit::PLANE).is_empty());
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap(), a["asked"].as_str().unwrap().chars().take(80).collect::<String>())).collect();
+    for gone in ["DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0002", "superci-plane-testplane0002\"}", "Action=DeleteRole&Version=2010-05-08&RoleName=superci-plane-testplane0002"] {
+        assert!(asked.iter().any(|a| a.contains(gone)), "{gone}: {asked:?}");
+    }
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
+}
