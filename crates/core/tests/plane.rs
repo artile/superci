@@ -2677,6 +2677,36 @@ fn a_job_run_again_after_a_reclaim_goes_back_on_spot_when_the_on_demand_limit_ca
 }
 
 #[test]
+fn a_job_sent_on_demand_by_the_spot_limit_notes_when_machines_just_ended_still_counted() {
+    // Spot machines until `full` (the account's spot limit used up); on-demand ones always.
+    let full = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| (full.get() && body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| aws_refuses("MaxSpotInstanceCountExceeded")));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let runner = |job: u64| format!("superci-{PLANE_ID}-{job}");
+    // A spot machine's job ends; a moment later the spot limit refuses the next one, which goes on-demand at once.
+    run(job_event("queued", 21, "acme/app", None));
+    assert_eq!(job(&store, 21).get("on_demand"), None);
+    run(job_event("in_progress", 21, "acme/app", Some(&runner(21))));
+    run(concluded(21, &runner(21), "success"));
+    full.set(true);
+    clock.0.set(clock.0.get() + 10_000);
+    run(job_event("queued", 22, "acme/app", None));
+    let j = job(&store, 22);
+    assert_eq!((j["state"].as_str(), j["on_demand"].as_bool(), j["spot_ending"].as_bool()), (Some("launched"), Some(true), Some(true)), "{j}");
+    // Two minutes on, nothing of its own is still being ended: the limit alone refused it.
+    clock.0.set(clock.0.get() + 130_000);
+    run(job_event("queued", 23, "acme/app", None));
+    let j = job(&store, 23);
+    assert_eq!((j["on_demand"].as_bool(), j.get("spot_ending")), (Some(true), None), "{j}");
+}
+
+#[test]
 fn at_the_aws_accounts_limit_a_job_waits_for_one_of_its_own_to_end_and_fails_plainly_when_it_can_never_fit() {
     // While `full`, AWS refuses every launch for the account's limits: spot for its spot limit, on-demand for its own.
     let full = std::cell::Cell::new(true);

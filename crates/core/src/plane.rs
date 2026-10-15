@@ -324,6 +324,9 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub no_spot: bool,
     /// Run again after AWS took its spot machine back (GitHub's new attempt of the job, or GitLab's retry).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub after_reclaim: bool,
+    /// Refused spot at the account's limit while machines SuperCI had just ended still counted there (AWS counts a
+    /// machine until it has ended it, a minute or two after its job).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub spot_ending: bool,
     /// Kept off spot machines, and the account's on-demand limit did not let its machine start: asked on a spot
     /// machine again, whatever kept it off them (and kept there: it waits for one rather than for that limit).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub spot_again: bool,
@@ -2130,6 +2133,17 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// The jobs the sweep still cares for (see `needs_care`), each with its key, as they are kept now.
+    /// Whether a job refused spot at the account's limit in a region where SuperCI ended a spot machine in the last two
+    /// minutes (AWS still counts one while it ends it).
+    async fn spot_ending(&self, job: &Job) -> bool {
+        let Some(said) = job.spot_refused.as_deref() else { return false };
+        let limited: Vec<&str> = said.split("; ").filter(|a| a.contains("MaxSpotInstanceCountExceeded")).filter_map(|a| a.split(':').next()).collect();
+        if limited.is_empty() { return false }
+        let now = self.clock.now_ms();
+        self.live_jobs().await.unwrap_or_default().iter().any(|(_, j)| j.job_id != job.job_id && j.cloud == "aws" && !j.on_demand
+            && j.region.as_deref().is_some_and(|r| limited.contains(&r)) && j.ended_ms.is_some_and(|e| now.saturating_sub(e) < 120_000))
+    }
+
     async fn live_jobs(&self) -> Result<Vec<(String, Job)>> {
         let now = self.clock.now_ms();
         if !self.indexed().await {
@@ -2454,6 +2468,7 @@ impl<'a> ControlPlane<'a> {
                             answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.aws_regions(&a).first().cloned().unwrap_or_default()));
                             quota_only = false;
                             job.spot_refused = Some(answers.join("; ").chars().take(300).collect());
+                            job.spot_ending = self.spot_ending(job).await;
                             return Ok(Tried::NoRoom)
                         }
                         let creds = self.aws_creds(plane_url, &a).await?;
@@ -2587,6 +2602,7 @@ impl<'a> ControlPlane<'a> {
                         let Some((region, machine, private)) = launched else {
                             // No region has room: what the regions said of spot goes with the job, down the order.
                             if !answers.is_empty() && tried_spot { job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
+                            job.spot_ending = self.spot_ending(job).await;
                             return Ok(Tried::NoRoom)
                         };
                         if !on_demand { job.spot_refused = None }
@@ -2653,6 +2669,7 @@ impl<'a> ControlPlane<'a> {
             // Out of time with spot machines refused: the next try starts below them.
             if out_of_time {
                 if !answers.is_empty() && !job.spot_again { job.no_spot = true; job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
+                job.spot_ending = self.spot_ending(job).await;
                 last = format!("{last} (out of time for more tries)");
             }
             let (machine_id, machine_type) = match started {

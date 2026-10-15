@@ -931,7 +931,7 @@ fn off_spot(j: &serde_json::Value) -> Option<(String, Option<String>)> {
     if said.contains("RequestLimitExceeded") { return Some(("On-demand: AWS refused the spot request for its rate (many machines asked for at once)".into(), None)) }
     let limited = said.split("; ").find(|a| a.contains("MaxSpotInstanceCountExceeded")).and_then(|a| a.split(':').next());
     Some(match limited {
-        Some(region) => (format!("On-demand: your AWS spot limit in {} was reached", region_short(region)), Some(region.to_string())),
+        Some(region) => (format!("On-demand: your AWS spot limit in {} was reached{}", region_short(region), if j["spot_ending"] == true { " (machines AWS was still ending count too)" } else { "" }), Some(region.to_string())),
         None => ("On-demand: AWS had no spot machine for it".into(), None),
     })
 }
@@ -6508,6 +6508,13 @@ mod tests {
     /// An AWS account that does not allow everything (here a project of AWS's new sign-up, as one really answered):
     /// the set-up page says what it allows and whose rule that is, offers no region it cannot use, and a deploy to
     /// one is refused in plain words before anything is made.
+    #[test]
+    fn a_job_sent_on_demand_by_the_spot_limit_says_when_machines_still_ending_counted() {
+        let j = |ending: bool| serde_json::json!({ "cloud": "aws", "on_demand": true, "spot_refused": "us-east-1: MaxSpotInstanceCountExceeded: Max spot instance count exceeded", "spot_ending": ending });
+        assert_eq!(off_spot(&j(true)).unwrap().0, "On-demand: your AWS spot limit in N. Virginia was reached (machines AWS was still ending count too)");
+        assert_eq!(off_spot(&j(false)).unwrap().0, "On-demand: your AWS spot limit in N. Virginia was reached");
+    }
+
     #[test]
     fn a_restricted_aws_account_is_said_and_only_what_it_allows_is_offered() {
         let mut d = Dashboard::new();
