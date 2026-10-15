@@ -239,7 +239,8 @@ impl Aws {
         std::thread::spawn(move || for stream in listener.incoming().flatten() {
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
-            if !target.split('/').nth(1).unwrap_or_default().ends_with(".amazonaws.com") {
+            let host = target.split('/').nth(1).unwrap_or_default().to_string();
+            if !host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com") {
                 let gh = a.github.lock().unwrap().clone().unwrap_or_default();
                 let mut req = Request::new(&method, &format!("https:/{target}")).with_body(body);
                 for (k, v) in &headers { if !k.eq_ignore_ascii_case("host") { req = req.with_header(k, v) } }
@@ -323,6 +324,11 @@ impl Aws {
         let one = |name: &str, (value, version, ms): &(String, u64, u64), decrypt: bool| json!({ "ARN": format!("arn:aws:ssm:{region}:{ACCOUNT}:parameter{name}"), "DataType": "text", "LastModifiedDate": at(*ms),
             "Name": name, "Type": "SecureString", "Value": if decrypt { value.clone() } else { "EXAMPLECIPHERTEXT".to_string() }, "Version": version });
         let name = a["Name"].as_str().unwrap_or_default().to_string();
+        // AWS's sign-in refusing its last step, as it answered a real one whose account was changed on its page
+        // midway (15 October 2026).
+        if url.contains(".signin.aws.amazon.com/v1/token") {
+            return (400, json!({ "error": "INVALID_REQUEST", "message": "The request is missing a required parameter, includes an invalid parameter value, or is otherwise malformed." }))
+        }
         match target {
             "AmazonSSM.PutParameter" => {
                 if self.params.lock().unwrap().contains_key(&name) && a["Overwrite"] != true { return (400, json!({ "__type": "ParameterAlreadyExists" })) }

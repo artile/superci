@@ -48,3 +48,22 @@ fn each_page_shows_what_the_control_plane_has() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn an_aws_sign_in_that_aws_does_not_finish_says_so_and_leads_back_to_the_dashboard() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let (mut child, link) = dashboard(&home);
+    // Signing in: AWS's page, with the state it comes back with.
+    let (_, to, page) = common::post(&link, "/aws/signin", &[("next", "?p=overview")]);
+    let at = if to.is_empty() { page } else { to };
+    let state = at.split("state=").nth(1).and_then(|r| r.split(['&', '"']).next()).expect("a state").to_string();
+    // AWS comes back, and then refuses its last step.
+    let (status, _, refused) = common::get(&link, &format!("/oauth/callback?code=a-code-from-aws&state={state}"));
+    let said = words(&refused);
+    assert!(status == 400 && said.contains("AWS did not finish the sign-in") && said.contains("is otherwise malformed") && said.contains("Back to the dashboard") && !said.contains("Something went wrong"), "{status} {said}");
+    assert!(refused.contains(r#"href="http://localhost:"#) && refused.contains("?p=overview"), "back to where it was: {refused}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

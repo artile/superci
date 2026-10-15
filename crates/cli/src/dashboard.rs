@@ -2361,7 +2361,17 @@ impl Dashboard {
             ("GET", "/oauth/callback") if self.aws_pending.as_ref().is_some_and(|p| safe_eq(q("state").as_bytes(), p.state.as_bytes())) => {
                 let pending = self.aws_pending.take().unwrap();
                 if !q("error").is_empty() { return Ok(message(400, "AWS sign-in was not completed", &esc(q("error")))) }
-                let session = aws::exchange(pending, q("code"))?;
+                // AWS refused its last step (seen when the account was changed on its page midway): said plainly,
+                // with the way back to the dashboard, where signing in again goes on. (This page is at 127.0.0.1,
+                // which a browser holds apart from the dashboard's localhost: a link, not a form.)
+                let session = match aws::exchange(pending, q("code")) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let said = e.split("\"message\":\"").nth(1).and_then(|m| m.split('"').next()).unwrap_or(&e).trim_end_matches('.').to_string();
+                        return Ok(document(400, "SuperCI", &format!(r#"<div class="wait"><div>{MARK}<h1>AWS did not finish the sign-in</h1><p>It refused its last step ({}). This can happen when the account is changed on its page midway. Signing in again from the dashboard works.</p><p style="margin-top:18px"><a class="button primary" href="{}">Back to the dashboard</a></p></div></div>"#,
+                            esc(&said), esc(&self.back_url(&self.return_to))), None))
+                    }
+                };
                 println!("Signed in to AWS account {}.", session.account_id);
                 self.add_account(session);
                 Ok(back_to("Signed in with AWS", "Looking for SuperCI in your account…", &self.back_url(&self.return_to)))

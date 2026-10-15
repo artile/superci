@@ -74,7 +74,7 @@ fn to_stand_in(mut r: Request) -> Request {
 pub fn stand_in(url: &str) -> String {
     #[cfg(debug_assertions)]
     if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
-        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h == "gitlab.com")) {
+        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".signin.aws.amazon.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h == "gitlab.com")) {
             return format!("{}/{rest}", at.trim_end_matches('/'));
         }
     }
