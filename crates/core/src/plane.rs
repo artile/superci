@@ -3137,7 +3137,10 @@ impl<'a> ControlPlane<'a> {
         let text_of = |e: &str| e.trim_start_matches('\u{feff}').get(29..).unwrap_or_default().to_string();
         let mut files: Vec<Vec<String>> = pages.iter().map(|(_, b)| {
             let mut entries: Vec<String> = vec![];
-            for l in String::from_utf8_lossy(b).lines().filter(|l| !l.is_empty()) {
+            // (A page's last line, while it is still being written, waits until it is whole.)
+            let text = String::from_utf8_lossy(b);
+            let whole = if text.ends_with('\n') { &text[..] } else { text.rsplit_once('\n').map(|(w, _)| w).unwrap_or("") };
+            for l in whole.lines().filter(|l| !l.is_empty()) {
                 match entries.last_mut() { Some(e) if !timed(l) => { e.push('\n'); e.push_str(l) } _ => entries.push(l.to_string()) }
             }
             entries
