@@ -294,9 +294,29 @@ impl Capacity {
 
 /// EC2 instance types for a machine, best first (fallbacks for when one has no spot capacity): the smallest size with
 /// enough CPU in the family with enough memory per CPU (c: 2 GB, m: 4 GB, r: 8 GB), current generation first.
+/// The sizes an EC2 family has, by CPUs, as AWS lists them (DescribeInstanceTypes, 15 October 2026): all have 2 to
+/// 64 CPUs; above, they differ (c8a has no 128, c7a has, c7g ends at 64, c6id at 128). A request that names a type
+/// that does not exist is refused whole.
+pub fn aws_family_sizes(family: &str) -> Vec<(u32, &'static str)> {
+    const UP_TO_64: [(u32, &str); 7] = [(2, "large"), (4, "xlarge"), (8, "2xlarge"), (16, "4xlarge"), (32, "8xlarge"), (48, "12xlarge"), (64, "16xlarge")];
+    let more: &[(u32, &'static str)] = match family {
+        "c7g" | "m7g" | "r7g" | "c7gd" | "m7gd" | "r7gd" => &[],
+        "c7a" | "m7a" | "r7a" | "c8id" | "m8id" | "r8id" => &[(96, "24xlarge"), (128, "32xlarge"), (192, "48xlarge")],
+        "c6id" | "m6id" | "r6id" => &[(96, "24xlarge"), (128, "32xlarge")],
+        _ => &[(96, "24xlarge"), (192, "48xlarge")],
+    };
+    UP_TO_64.iter().chain(more).copied().collect()
+}
+
+/// The CPUs of an EC2 type, by its size (`c8a.48xlarge`: 192; `xlarge` is 4, `Nxlarge` 4N). None for one not named
+/// so (a bare-metal type, a container's size).
+pub fn aws_type_cpus(machine_type: &str) -> Option<u32> {
+    let size = machine_type.split_once('.')?.1;
+    match size { "medium" => Some(1), "large" => Some(2), "xlarge" => Some(4), s => s.strip_suffix("xlarge")?.parse::<u32>().ok().map(|n| n * 4) }
+}
+
 pub fn aws_instance_types(s: &Spec) -> Vec<String> {
     if let Some(gpu) = s.gpu.as_deref() { return aws_gpu_types(gpu, s) }
-    const SIZES: [(u32, &str); 9] = [(2, "large"), (4, "xlarge"), (8, "2xlarge"), (16, "4xlarge"), (32, "8xlarge"), (48, "12xlarge"), (64, "16xlarge"), (96, "24xlarge"), (192, "48xlarge")];
     let arm = s.arch() == "arm64";
     let cpu = s.cpu.unwrap_or(4);
     let ram = s.ram().unwrap_or(if s.cpu.is_none() { 8 } else { cpu * 4 });
@@ -307,7 +327,7 @@ pub fn aws_instance_types(s: &Spec) -> Vec<String> {
     if !s.families.is_empty() {
         return s.families.iter().filter_map(|f| {
             let per_cpu = FAMILIES.iter().find(|(name, _)| name == f)?.1;
-            let (_, size) = SIZES.iter().find(|(c, _)| *c >= cpu && s.ram_gb.is_none_or(|r| c * per_cpu >= r))?;
+            let (_, size) = aws_family_sizes(f).into_iter().find(|(c, _)| *c >= cpu && s.ram_gb.is_none_or(|r| c * per_cpu >= r))?;
             Some(format!("{f}.{size}"))
         }).collect()
     }
@@ -317,9 +337,11 @@ pub fn aws_instance_types(s: &Spec) -> Vec<String> {
         (true, false) => [(2, ["c8id", "c6id"]), (4, ["m8id", "m6id"]), (8, ["r8id", "r6id"])],
         (true, true) => [(2, ["c8gd", "c7gd"]), (4, ["m8gd", "m7gd"]), (8, ["r8gd", "r7gd"])],
     };
+    // (Each family at its own smallest size that fits: one may have a size another lacks.)
     for (per_cpu, families) in families {
-        let Some((c, size)) = SIZES.iter().find(|(c, _)| *c >= cpu && c * per_cpu >= ram) else { continue };
-        for f in families { out.push((*c, per_cpu, format!("{f}.{size}"))) }
+        for f in families {
+            if let Some((c, size)) = aws_family_sizes(f).into_iter().find(|(c, _)| *c >= cpu && c * per_cpu >= ram) { out.push((c, per_cpu, format!("{f}.{size}"))) }
+        }
     }
     // The fewest CPUs first (what is paid for), then the least memory.
     out.sort_by_key(|(c, per_cpu, _)| (*c, *per_cpu));
@@ -483,6 +505,14 @@ mod tests {
     fn instance_types_fit() {
         // The standard machine (unset size): 4 CPU, 8 GB, as before.
         assert_eq!(aws_instance_types(&Spec::default())[0], "c8a.xlarge");
+        // Above 64 CPUs, each family's own sizes: 128 is c7a's (c8a has none), then 192; arm64 has no 7th-generation
+        // size above 64, and none asks for a type that does not exist.
+        let big = |l: &str| aws_instance_types(&Spec::parse(l, "superci").unwrap().unwrap());
+        assert_eq!(big("superci/cpu=128")[..3], ["m7a.32xlarge", "r7a.32xlarge", "m8a.48xlarge"].map(String::from));
+        assert_eq!(big("superci/cpu=128/family=c8a"), ["c8a.48xlarge"], "a family without the size: its next");
+        assert_eq!(big("superci/cpu=96/arch=arm64"), ["m8g.24xlarge", "r8g.24xlarge", "c8g.48xlarge"].map(String::from));
+        assert!(big("superci/cpu=192/scratch=localdisk").iter().all(|t| !t.starts_with("c6id") && !t.starts_with("m6id") && !t.starts_with("r6id")));
+        assert_eq!((aws_type_cpus("c8a.48xlarge"), aws_type_cpus("c7a.32xlarge"), aws_type_cpus("m8g.large"), aws_type_cpus("c8a.metal-48xl"), aws_type_cpus("4cpu-12gb")), (Some(192), Some(128), Some(2), None, None));
         let t = aws_instance_types(&Spec { cpu: Some(8), ..Default::default() });
         assert_eq!(t[0], "m8a.2xlarge"); // 32 GB: 4 per CPU
         let t = aws_instance_types(&Spec { cpu: Some(2), ram_gb: Some(16), arch: Some("arm64".into()), ..Default::default() });

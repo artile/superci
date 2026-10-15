@@ -2707,6 +2707,8 @@ impl<'a> ControlPlane<'a> {
             job.state = "launched".into();
             job.launched_ms = Some(self.clock.now_ms());
             job.machine_id = Some(machine_id);
+            // Its CPUs are the machine's (AWS may give a larger size than asked when the family has no such size).
+            if let Some(c) = crate::spec::aws_type_cpus(&machine_type) { job.cpu = Some(c) }
             job.machine_type = Some(machine_type);
             // Its job ended at its code host while the machine was being asked for (cancelled before any runner took
             // it): the machine it has just been given is ended at once, not left for a sweep to find idle.

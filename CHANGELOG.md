@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.5 — unreleased
+- A job on AWS says the CPUs of the machine it got: one that asked for 128 on c8a (which has no 128-CPU size) got a 192-CPU c8a.48xlarge, and said 128.
+- AWS machines above 64 CPUs are asked in each family's own sizes: the 128-CPU size where a family has it (c7a, m7a, r7a, and the families with a local disk), and no size a family lacks (c7g, m7g and r7g end at 64; c6id, m6id and r6id at 128).
+
 ## 0.19.4 — 2026-10-15
 - A finished job's page shows its whole log, whatever its size: a GitHub job's from GitHub, a run from a computer's from the bucket. It read only the last 1 MB, so a large log's first steps looked empty. A log that is still cut (a running job's, or one from a control plane older than 0.19.1) says so.
 - `superci jobs retrieve ID --out=FILE` says when the control plane gave only the end of a log, instead of keeping that as the whole.
