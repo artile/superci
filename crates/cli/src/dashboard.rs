@@ -1213,9 +1213,10 @@ impl Dashboard {
     /// The control plane in use, read for a command: with the kept key when its control plane has it (no cloud is
     /// asked), else after looking in the clouds signed in to. None: signed in, and no control plane found.
     pub fn current(&mut self) -> Result<Option<PlaneView>> {
-        // Signed in nowhere: only what is left of a sign-in AWS ended can still be read (with the kept key).
+        // Signed in nowhere: the control plane kept here is still reached with this computer's key (a sign-in that
+        // ended, or was made elsewhere, leaves it as it was).
         let only_reading = self.signed_in_as().is_none();
-        if only_reading && !(self.any_ended() && self.kept_plane.is_some()) { return Err(NOT_SIGNED_IN.into()) }
+        if only_reading && !(self.kept_plane.is_some() && (self.any_ended() || !self.keyed.is_empty())) { return Err(NOT_SIGNED_IN.into()) }
         // The one named, when it is known here; with none named, the kept one only when no other is known (with
         // several known, which of them are live is asked first, below).
         let known = match view::named() {

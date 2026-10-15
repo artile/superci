@@ -391,11 +391,13 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let Some(workflow) = args.get("workflow") else { return usage("Say which workflow: `superci runs create --workflow=.github/workflows/ci.yml` (and --job=NAME when it has several jobs).") };
             let pairs = |flag: &str| args.all(flag).iter().map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or(format!("--{flag} is NAME=VALUE"))).collect::<std::result::Result<Vec<_>, String>>();
             let (secrets, vars) = match (pairs("secret"), pairs("var")) { (Ok(s), Ok(v)) => (s, v), (Err(e), _) | (_, Err(e)) => return usage(e) };
-            // With a key for coding agents (SUPERCI_PLANE, SUPERCI_KEY), no sign-in is needed; else this session's
-            // (each control plane is handed a key of its own, made from it).
+            // With a key for coding agents (SUPERCI_PLANE, SUPERCI_KEY), no sign-in is needed; else this computer's key
+            // with the control plane it is kept for (each control plane is handed a key of its own, made from it). A
+            // cloud sign-in is needed only to find a control plane, or to hand it the key again: a run needs neither,
+            // so it goes on when AWS has ended its sign-in or another account is signed in.
             let (url, key) = match given_key() {
                 Some((url, key)) => (url, key),
-                None => { let d = ready()?; let plane = in_use(&d)?; (plane.url().to_string(), crate::cloudflare::plane_key(d.key(), plane.url())) }
+                None => { let mut d = signed_in(); let (v, key) = look(&mut d)?; (v.plane.url().to_string(), crate::cloudflare::plane_key(&key, v.plane.url())) }
             };
             Ok(crate::local_run::create(&url, &key, workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, steps)?)
         }
