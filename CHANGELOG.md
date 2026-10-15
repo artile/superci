@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.2 — unreleased
+## 0.19.2 — 2026-10-15
 - `superci runs create` and `superci caches delete` go on when SuperCI's cloud sign-in has ended, or another account is signed in: they need only this computer's key with the control plane it is kept for, as looking at jobs, runs, usage and artifacts already did. (AWS ends its sign-in after twelve hours, and when you sign out of the AWS console to sign in to another account.) Changing a control plane's settings still needs a sign-in to the cloud account it runs in, and says so.
 
 ## 0.19.1 — 2026-10-15
