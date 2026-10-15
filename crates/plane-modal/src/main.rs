@@ -15,7 +15,7 @@ use futures::executor::block_on;
 use serde_json::{json, Value};
 
 use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer, Work};
-use superci_core::plane::{Agent, Cache, Config, ControlPlane};
+use superci_core::plane::{Cache, Config, ControlPlane};
 use superci_core::spec::Size;
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
@@ -100,33 +100,12 @@ impl Clock for SystemClock { fn now_ms(&self) -> u64 { now_ms() } }
 /// The control plane's settings: its id and label (from the deploy), the rest from the dashboard's Dict.
 fn config(secrets: &Value) -> Config {
     let var = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
-    let secret = |n: &str| secrets[n].as_str();
     let mut c = Config::new(var("PLANE_ID").unwrap_or_default());
     if let Some(v) = var("LABEL") { c.label = v.to_ascii_lowercase() }
-    if let Some(v) = secret("LABELS") { c.set_labels(v) }
-    if let Some(v) = secret("NAME") { c.set_name(v) }
     c.own_cloud = "modal".into();
-    c.containers = secret("CONTAINERS") == Some("on");
-    c.app = secret("GITHUB_APP").and_then(|v| serde_json::from_str(v).ok());
-    // One entry for each further organization's GitHub App: GITHUB_APP_<its id> (emptied when it is removed).
-    c.more_apps = secrets.as_object().into_iter().flatten().filter(|(n, _)| n.starts_with("GITHUB_APP_"))
-        .filter_map(|(_, v)| serde_json::from_str::<superci_core::github::App>(v.as_str()?).ok())
-        .filter(|a| c.app.as_ref().is_none_or(|f| f.id != a.id)).collect();
-    c.agents = secret("AGENTS").and_then(|v| serde_json::from_str::<Vec<Agent>>(v).ok()).unwrap_or_default();
-    c.routing = secret("ROUTING").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
-    c.gitlab = secret("GITLAB").and_then(|v| serde_json::from_str(v).ok());
-    // One entry for each further GitLab connection: GITLAB_<its name> (emptied when it is removed).
-    c.more_gitlabs = secrets.as_object().into_iter().flatten().filter(|(n, _)| n.starts_with("GITLAB_"))
-        .filter_map(|(_, v)| serde_json::from_str::<superci_core::gitlab::GitLab>(v.as_str()?).ok()).filter(|g| superci_core::gitlab::valid_id(&g.id)).collect();
-    c.move_token = secret("MOVE_TOKEN").map(str::to_string);
-    if let Some(l) = secret("CF_LOCATION") { c.cloudflare_location = l.to_string() }
-    c.cloudflare_image = secret("CF_IMAGE").and_then(superci_core::plane::image_address);
-    c.machine = secret("MACHINE").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
-    // One entry per dashboard session: DASHBOARD_KEY_<expires, unix seconds>_<random>.
-    c.dashboard_keys = secrets.as_object().into_iter().flatten()
-        .filter_map(|(n, v)| Some((n.strip_prefix("DASHBOARD_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.as_str()?.to_string()))).collect();
-    // One entry per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
-    c.read_keys = secrets.as_object().into_iter().flatten().filter_map(|(n, v)| superci_core::plane::read_key(n, v.as_str()?)).collect();
+    c.containers = secrets["CONTAINERS"].as_str() == Some("on");
+    let all: Vec<(String, String)> = secrets.as_object().into_iter().flatten().filter_map(|(n, v)| Some((n.clone(), v.as_str()?.to_string()))).collect();
+    c.read_settings(&all);
     c
 }
 

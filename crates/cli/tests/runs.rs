@@ -1,7 +1,6 @@
 //! `superci runs create` as it runs, against a control plane served on this computer (`superci_testkit`), the test
 //! playing the machine's runner: the working tree sent, every line of the job printed once and in order (what the
 //! runner dropped as it went, from the step's whole log), and how the run ended.
-use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use superci_testkit::{serve, Runner};
 
@@ -24,7 +23,7 @@ fn a_run_from_a_computer_prints_every_line_once_in_order_and_ends_with_how_each_
     let served = serve(|_| {});
     let dir = checkout();
     let home = dir.join(".home");
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml"])
+    let cli = Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml"])
         .env("SUPERCI_HOME", &home).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     // The machine started; its runner (played here) takes the job.
     let run = loop {

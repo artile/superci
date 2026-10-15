@@ -112,6 +112,35 @@ impl Config {
         if let Some(first) = set.first().cloned() { self.label = first; self.more_labels = set.split_off(1); }
     }
 
+    /// The settings the dashboard keeps in the control plane's own cloud (SSM parameters on AWS, a Dict on Modal),
+    /// by name. An empty value is one taken away.
+    pub fn read_settings(&mut self, all: &[(String, String)]) {
+        let get = |n: &str| all.iter().find(|(k, v)| k == n && !v.is_empty()).map(|(_, v)| v.as_str());
+        let named = |prefix: &'static str| all.iter().filter(move |(k, v)| k.starts_with(prefix) && !v.is_empty());
+        if let Some(v) = get("LABELS") { self.set_labels(v) }
+        if let Some(v) = get("NAME") { self.set_name(v) }
+        let app: Option<crate::github::App> = get("GITHUB_APP").and_then(|v| serde_json::from_str(v).ok());
+        // One for each further organization's GitHub App: GITHUB_APP_<its id>.
+        self.more_apps = named("GITHUB_APP_").filter_map(|(_, v)| serde_json::from_str::<crate::github::App>(v).ok()).filter(|a| app.as_ref().is_none_or(|f| f.id != a.id)).collect();
+        self.app = app;
+        self.agents = get("AGENTS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+        self.routing = get("ROUTING").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+        self.gitlab = get("GITLAB").and_then(|v| serde_json::from_str(v).ok());
+        // One for each further GitLab connection: GITLAB_<its name>.
+        self.more_gitlabs = named("GITLAB_").filter_map(|(_, v)| serde_json::from_str::<crate::gitlab::GitLab>(v).ok()).filter(|g| crate::gitlab::valid_id(&g.id)).collect();
+        self.machine = get("MACHINE").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+        // One per dashboard session: DASHBOARD_KEY_<expires, unix seconds>_<random>.
+        self.dashboard_keys = named("DASHBOARD_KEY_").filter_map(|(n, v)| Some((n.strip_prefix("DASHBOARD_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.clone()))).collect();
+        // One per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
+        self.read_keys = named("READ_KEY_").filter_map(|(n, v)| read_key(n, v)).collect();
+        self.move_token = get("MOVE_TOKEN").map(str::to_string);
+        if let Some(l) = get("CF_LOCATION") { self.cloudflare_location = l.to_string() }
+        self.cloudflare_image = get("CF_IMAGE").and_then(image_address);
+        self.aws_regions = get("AWS_REGIONS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+        self.aws_networks = get("AWS_NETWORKS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+        self.aws_runners_off = get("AWS_RUNNERS") == Some("off");
+    }
+
     /// What it is called: SuperCI, unless given a name of its own.
     pub fn name(&self) -> &str { self.name.as_deref().unwrap_or("SuperCI") }
 

@@ -66,3 +66,49 @@ fn what_the_control_plane_has_is_read_with_the_kept_key() {
     assert_eq!(json(&home, &["name", "retrieve"]).1["name"], "SuperCI");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// What a change asked of AWS, as the dashboard asks it (`fixtures/aws/settings`: recorded from a real account).
+fn recorded(name: &str) -> serde_json::Value {
+    let line: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(format!("{}/fixtures/aws/settings/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
+    serde_json::from_str(line["asked"].as_str().unwrap()).unwrap()
+}
+
+#[test]
+fn changes_are_written_where_the_control_plane_reads_them_and_it_answers_with_them() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let asked = |n: usize| { let a = served.aws.asked.lock().unwrap(); serde_json::from_str::<serde_json::Value>(a[a.len() - n]["asked"].as_str().unwrap()).unwrap() };
+    let ok = |args: &[&str]| { let (code, v) = json(&home, &[args, &["--confirm"]].concat()); assert_eq!(code, 0, "{args:?}: {v}"); v };
+
+    // Its name: asked of AWS exactly as the real change was, and read back from the control plane.
+    ok(&["name", "update", "Recorded"]);
+    assert_eq!(asked(1), recorded("01-name"));
+    assert_eq!(json(&home, &["name", "retrieve"]).1["name"], "Recorded");
+    // A label more, then taken away.
+    ok(&["labels", "create", "recorded"]);
+    let (labels, real) = (asked(1), recorded("03-label"));
+    assert_eq!((&labels["Name"], &labels["Type"], &labels["Overwrite"]), (&real["Name"], &real["Type"], &real["Overwrite"]));
+    assert_eq!(labels["Value"], r#"["recorded","superci"]"#);
+    assert_eq!(json(&home, &["labels", "list"]).1["labels"], serde_json::json!(["recorded", "superci"]));
+    ok(&["labels", "delete", "recorded"]);
+    assert_eq!(json(&home, &["labels", "list"]).1["labels"], serde_json::json!(["superci"]));
+    // The largest machine a label may ask for.
+    ok(&["limits", "update", "--max-cpu=16"]);
+    let (routing, real) = (asked(1), recorded("05-limits"));
+    assert_eq!((&routing["Name"], &routing["Type"]), (&real["Name"], &real["Type"]));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(routing["Value"].as_str().unwrap()).unwrap()["max_cpu"], 16);
+    assert_eq!(json(&home, &["limits", "retrieve"]).1["max_cpu"], 16);
+    // The default machine.
+    ok(&["machine", "update", "--cpu=8"]);
+    assert_eq!(asked(1), recorded("07-machine"));
+    assert_eq!(json(&home, &["machine", "retrieve"]).1["machine"], serde_json::json!({ "cpu": 8 }));
+    ok(&["machine", "update", "--cpu=default"]);
+    assert_eq!(json(&home, &["machine", "retrieve"]).1["machine"], serde_json::json!({}));
+    // With --dry-run, what it would do, and nothing done.
+    let before = served.aws.asked.lock().unwrap().len();
+    let (code, would) = json(&home, &["name", "update", "Other", "--dry-run"]);
+    assert_eq!((code, would["dry_run"].as_bool(), would["would"].as_str(), would["form"]["to"].as_str()), (0, Some(true), Some("call it Other"), Some("/name")), "{would}");
+    assert_eq!((served.aws.asked.lock().unwrap().len(), json(&home, &["name", "retrieve"]).1["name"].as_str()), (before, Some("Recorded")));
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
+}

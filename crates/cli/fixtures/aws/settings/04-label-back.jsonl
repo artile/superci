@@ -1,0 +1,1 @@
+{"answer":"{\"Tier\":\"Standard\",\"Version\":5}","asked":"{\"Name\":\"/superci/testplane0001/LABELS\",\"Overwrite\":true,\"Type\":\"SecureString\",\"Value\":\"[\\\"myci\\\",\\\"superci\\\"]\"}","method":"POST","status":200,"target":"AmazonSSM.PutParameter","url":"https://ssm.us-east-1.amazonaws.com/"}

@@ -1,7 +1,13 @@
 //! A SuperCI control plane served on this computer for tests (`serve`), its own code end to end: a store in memory
 //! the test can look into, stand-ins for the clouds (a machine is a container that starts at once and does nothing
-//! more), and a runner (`Runner`) that does what GitHub's runner does on a machine, by the same calls. So the CLI and
-//! the dashboard are tested as they run, against the control plane as it runs, offline.
+//! more; AWS's SSM, where the dashboard keeps the control plane's settings, `Aws`), and a runner (`Runner`) that does
+//! what GitHub's runner does on a machine, by the same calls. So the CLI and the dashboard are tested as they run,
+//! against the control plane as it runs, offline.
+#[cfg(unix)]
+mod browser;
+#[cfg(unix)]
+pub use browser::Browser;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -56,33 +62,44 @@ struct NoTimer;
 #[async_trait(?Send)]
 impl Timer for NoTimer { async fn wake_in(&self, _ms: u64) -> io::Result<()> { Ok(()) } }
 
-/// A control plane served on this computer: its address, its store, its machines, and a key with which the dashboard
+/// A control plane served on this computer: its address, its store, its machines, AWS as it finds it (its settings
+/// are SSM parameters there, `/superci/testplane0001/…`, read on every request), and a key with which the dashboard
 /// and the CLI reach it (and one for coding agents, which may also start runs).
-pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub key: String, pub run_key: String }
+pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub key: String, pub run_key: String }
+
+/// The control plane's id, and the AWS account and region it is in.
+pub const PLANE: &str = "testplane0001";
+pub const ACCOUNT: &str = "111111111111";
+pub const REGION: &str = "us-east-1";
 
 /// Serves a control plane with machines of its own (`containers`), `configure`d further by the test.
-pub fn serve(configure: impl FnOnce(&mut Config) + Send + 'static) -> Served {
+pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (store, machines) = (Shared::default(), Machines::default());
+    let (store, machines, aws) = (Shared::default(), Machines::default(), Aws::serve());
+    *aws.plane_url.lock().unwrap() = url.clone();
     let (key, run_key) = ("dashboard-key-for-tests-0001".to_string(), "superci_run_0123456789abcdef0123456789abcdef".to_string());
-    let (s, m, k, rk, u) = (store.clone(), machines.clone(), key.clone(), run_key.clone(), url.clone());
+    // Its keys, as a deploy and `superci keys create agent --runs` leave them.
+    aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &key);
+    aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
+    let (s, m, a, u) = (store.clone(), machines.clone(), aws.clone(), url.clone());
     std::thread::spawn(move || {
-        let mut config = Config::new("testplane0001".into());
-        config.containers = true;
-        config.dashboard_keys = vec![(u64::MAX, k)];
-        config.read_keys = vec![superci_core::plane::read_key("READ_KEY_4102444800_AGENT", &format!("{}:runs", superci_core::crypto::sha256_hex(rk.as_bytes()))).unwrap()];
-        configure(&mut config);
         let cache = Cache::default();
-        let plane = ControlPlane { store: &s, http: &Nowhere, clock: &Now, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
         block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
-        for stream in listener.incoming().flatten() { let _ = answer(&plane, &u, stream); }
+        for stream in listener.incoming().flatten() {
+            let mut config = Config::new(PLANE.into());
+            config.containers = true;
+            config.read_settings(&a.settings(PLANE));
+            configure(&mut config);
+            let plane = ControlPlane { store: &s, http: &Nowhere, clock: &Now, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
+            let _ = answer(&plane, &u, stream);
+        }
     });
-    Served { url, store, machines, key, run_key }
+    Served { url, store, machines, aws, key, run_key }
 }
 
-/// One request on its connection, answered by the control plane, then the connection closed.
-fn answer(plane: &ControlPlane, base: &str, stream: TcpStream) -> std::io::Result<()> {
+/// A request as it arrived: method, target, headers, body.
+fn read(stream: &TcpStream) -> std::io::Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
     let mut r = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     r.read_line(&mut line)?;
@@ -100,14 +117,132 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream) -> std::io::Resul
     }
     let mut body = vec![0; len];
     r.read_exact(&mut body)?;
+    Ok((method, target, headers, body))
+}
+
+fn write(mut out: TcpStream, status: u16, headers: &[(String, String)], body: &[u8]) -> std::io::Result<()> {
+    let mut head = format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n", body.len());
+    for (k, v) in headers { if !k.eq_ignore_ascii_case("content-length") { head.push_str(&format!("{k}: {v}\r\n")) } }
+    out.write_all(format!("{head}\r\n").as_bytes())?;
+    out.write_all(body)
+}
+
+/// One request on its connection, answered by the control plane, then the connection closed.
+fn answer(plane: &ControlPlane, base: &str, stream: TcpStream) -> std::io::Result<()> {
+    let (method, target, headers, body) = read(&stream)?;
     let mut req = Request::new(&method, &format!("{base}{target}")).with_body(body);
     for (k, v) in headers { req = req.with_header(&k, &v) }
     let res = block_on(plane.handle(req));
-    let mut out = stream;
-    let mut head = format!("HTTP/1.1 {} X\r\ncontent-length: {}\r\nconnection: close\r\n", res.status, res.body.len());
-    for (k, v) in &res.headers { if !k.eq_ignore_ascii_case("content-length") { head.push_str(&format!("{k}: {v}\r\n")) } }
-    out.write_all(format!("{head}\r\n").as_bytes())?;
-    out.write_all(&res.body)
+    write(stream, res.status, &res.headers, &res.body)
+}
+
+/// AWS as SuperCI's calls find it (the CLI and the dashboard reach it with `SUPERCI_AWS_AT` set to `url`): SSM's
+/// parameters, kept and answered for exactly as SSM does (its answers recorded from a real account are
+/// `crates/cli/fixtures/aws/settings/ssm.jsonl`, and a test holds this to them). Each exchange is kept, in the shape
+/// of a recording (`asked`); what it has no answer for is answered with an error that names it, and kept apart
+/// (`unanswered`), so a test sees what it reached that is not stood in for yet.
+#[derive(Clone, Default)]
+pub struct Aws {
+    pub url: String,
+    /// Each parameter: its value, version, and when it was written last (milliseconds).
+    pub params: Arc<Mutex<BTreeMap<String, (String, u64, u64)>>>,
+    pub asked: Arc<Mutex<Vec<Value>>>,
+    pub unanswered: Arc<Mutex<Vec<String>>>,
+    /// What a real account answered for the rest (`fixtures/aws/settings/dashboard.jsonl`: what the dashboard asks of
+    /// AWS when signed in), and the address its control plane's stands in for (`http://plane.test`).
+    pub recorded: Arc<Vec<Value>>,
+    pub plane_url: Arc<Mutex<String>>,
+}
+
+/// What a request asks AWS to do: its target (JSON APIs) or its Action (query APIs).
+fn action(target: &str, asked: &str) -> String {
+    if !target.is_empty() { return target.to_string() }
+    asked.split('&').find_map(|kv| kv.strip_prefix("Action=")).unwrap_or_default().to_string()
+}
+
+impl Aws {
+    pub fn serve() -> Aws {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let recorded = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let aws = Aws { url: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), recorded: Arc::new(recorded), ..Default::default() };
+        let a = aws.clone();
+        std::thread::spawn(move || for stream in listener.incoming().flatten() {
+            let Ok((method, target, headers, body)) = read(&stream) else { continue };
+            let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
+            let (status, answer) = a.handle(&method, &format!("https:/{target}"), &header("x-amz-target"), &String::from_utf8_lossy(&body));
+            let kind = if answer.starts_with('<') { "text/xml" } else { "application/x-amz-json-1.1" };
+            let _ = write(stream, status, &[("content-type".into(), kind.into())], answer.as_bytes());
+        });
+        aws
+    }
+
+    /// A parameter written as the dashboard writes one.
+    pub fn put(&self, name: &str, value: &str) {
+        let mut p = self.params.lock().unwrap();
+        let version = p.get(name).map(|(_, v, _)| v + 1).unwrap_or(1);
+        p.insert(name.to_string(), (value.to_string(), version, Now.now_ms()));
+    }
+
+    /// A control plane's settings, by name, as it reads them (`/superci/<id>/<NAME>`).
+    pub fn settings(&self, plane: &str) -> Vec<(String, String)> {
+        let prefix = format!("/superci/{plane}/");
+        self.params.lock().unwrap().iter().filter_map(|(k, (v, _, _))| Some((k.strip_prefix(&prefix)?.to_string(), v.clone()))).filter(|(k, _)| !k.contains('/')).collect()
+    }
+
+    /// One exchange: `url` is AWS's own (`https://ssm.us-east-1.amazonaws.com/`).
+    pub fn handle(&self, method: &str, url: &str, target: &str, asked: &str) -> (u16, String) {
+        let (status, answer) = match self.answer(url, target, asked) {
+            (400, a) if a["__type"] == "SuperCITestkitUnknown" => self.replay(url, target, asked).unwrap_or((400, a.to_string())),
+            (status, a) => (status, a.to_string()),
+        };
+        if status == 400 && answer.contains("SuperCITestkitUnknown") { self.unanswered.lock().unwrap().push(format!("{target} {url} {}", asked.chars().take(200).collect::<String>())) }
+        self.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": target, "asked": asked, "status": status, "answer": answer }));
+        (status, answer)
+    }
+
+    /// The recorded answer to the same request, else to the same action at the same address.
+    fn replay(&self, url: &str, target: &str, asked: &str) -> Option<(u16, String)> {
+        let at = |r: &&Value| r["url"] == url && r["target"] == target;
+        let found = self.recorded.iter().find(|r| at(r) && r["asked"] == asked)
+            .or_else(|| self.recorded.iter().find(|r| at(r) && action(r["target"].as_str().unwrap_or_default(), r["asked"].as_str().unwrap_or_default()) == action(target, asked)))?;
+        let answer = found["answer"].as_str()?.replace("http://plane.test", &self.plane_url.lock().unwrap());
+        Some((found["status"].as_u64()? as u16, answer))
+    }
+
+    fn answer(&self, url: &str, target: &str, asked: &str) -> (u16, Value) {
+        let a: Value = serde_json::from_str(asked).unwrap_or_default();
+        let region = url.split('.').nth(1).unwrap_or(REGION).to_string();
+        let not_found = || (400, json!({ "__type": "ParameterNotFound" }));
+        // (SSM's time: seconds, with milliseconds.)
+        let at = |ms: u64| Value::from(ms as f64 / 1000.0);
+        let one = |name: &str, (value, version, ms): &(String, u64, u64), decrypt: bool| json!({ "ARN": format!("arn:aws:ssm:{region}:{ACCOUNT}:parameter{name}"), "DataType": "text", "LastModifiedDate": at(*ms),
+            "Name": name, "Type": "SecureString", "Value": if decrypt { value.clone() } else { "EXAMPLECIPHERTEXT".to_string() }, "Version": version });
+        let name = a["Name"].as_str().unwrap_or_default().to_string();
+        match target {
+            "AmazonSSM.PutParameter" => {
+                if self.params.lock().unwrap().contains_key(&name) && a["Overwrite"] != true { return (400, json!({ "__type": "ParameterAlreadyExists" })) }
+                self.put(&name, a["Value"].as_str().unwrap_or_default());
+                (200, json!({ "Tier": "Standard", "Version": self.params.lock().unwrap()[&name].1 }))
+            }
+            "AmazonSSM.GetParameter" => match self.params.lock().unwrap().get(&name) {
+                Some(p) => (200, json!({ "Parameter": one(&name, p, a["WithDecryption"] == true) })),
+                None => not_found(),
+            },
+            "AmazonSSM.DeleteParameter" => match self.params.lock().unwrap().remove(&name) { Some(_) => (200, json!({})), None => not_found() },
+            "AmazonSSM.GetParametersByPath" => {
+                let path = a["Path"].as_str().unwrap_or_default();
+                let p = self.params.lock().unwrap();
+                let under: Vec<Value> = p.iter().filter(|(k, _)| k.strip_prefix(path).is_some_and(|rest| a["Recursive"] == true || !rest.contains('/'))).map(|(k, v)| one(k, v, a["WithDecryption"] == true)).collect();
+                let from: usize = a["NextToken"].as_str().and_then(|t| t.strip_prefix("next-")).and_then(|n| n.parse().ok()).unwrap_or(0);
+                let max = a["MaxResults"].as_u64().unwrap_or(10) as usize;
+                let page: Vec<Value> = under.iter().skip(from).take(max).cloned().collect();
+                let mut out = json!({ "Parameters": page });
+                if from + max < under.len() { out["NextToken"] = json!(format!("next-{}", from + max)) }
+                (200, out)
+            }
+            _ => (400, json!({ "__type": "SuperCITestkitUnknown", "message": format!("the test kit's AWS has no answer for {target} at {url}") })),
+        }
+    }
 }
 
 /// GitHub's runner on a machine, played by the test: what it says of a job's steps, its lines as it writes them, each

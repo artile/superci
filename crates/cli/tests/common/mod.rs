@@ -27,10 +27,29 @@ pub fn home(served: &Served) -> std::path::PathBuf {
     home
 }
 
-/// The CLI run in `home`'s workspace.
-pub fn superci(home: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_superci")).args(args).env("SUPERCI_HOME", home).env_remove("SUPERCI_PLANE").env_remove("SUPERCI_KEY").output().unwrap()
+/// The same, signed in to the control plane's AWS account too (so it may change it), its AWS being the test kit's
+/// stand-in.
+pub fn signed_in(served: &Served) -> std::path::PathBuf {
+    let home = home(served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["aws"] = serde_json::json!({ "region": "us-east-1", "account_id": "111111111111", "who": "arn:aws:sts::111111111111:assumed-role/Admin/someone",
+        "creds": { "access_key_id": "ASIAEXAMPLE", "secret_access_key": "example", "session_token": "example", "expires_at_ms": 4102444800000u64 },
+        "refresh_token": "", "dpop": { "private_b64": "", "kid": "" } });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    home
 }
+
+/// The CLI or the dashboard, in `home`'s workspace (with its stand-in for AWS, if it has one).
+fn command(home: &std::path::Path) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_superci"));
+    c.env("SUPERCI_HOME", home).env_remove("SUPERCI_PLANE").env_remove("SUPERCI_KEY").env("SUPERCI_AWS_AT", std::fs::read_to_string(home.join("aws-at")).unwrap_or_default());
+    c
+}
+
+/// The CLI run in `home`'s workspace.
+pub fn superci(home: &std::path::Path, args: &[&str]) -> Output { command(home).args(args).output().unwrap() }
 
 /// The CLI's answer with `--json`, and how it ended.
 pub fn json(home: &std::path::Path, args: &[&str]) -> (i32, serde_json::Value) {
@@ -62,7 +81,7 @@ pub fn played(served: &Served, dir: &std::path::Path) {
 /// A dashboard on this computer for `home`'s workspace, and its link (with the key that opens it).
 pub fn dashboard(home: &std::path::Path) -> (std::process::Child, String) {
     let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_superci")).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_HOME", home).env("SUPERCI_PORT", port.to_string())
+    let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
         .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
     let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");

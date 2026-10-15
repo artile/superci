@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use superci_core::aws::{self, Credentials};
 use superci_core::io::{self, Clock, Http, Request, Response, Store, Timer};
-use superci_core::plane::{Agent, Cache, Config, ControlPlane};
+use superci_core::plane::{Cache, Config, ControlPlane};
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
@@ -281,39 +281,16 @@ impl Secrets {
         self.at = Some(Instant::now());
         Ok(())
     }
-    fn get(&self, name: &str) -> Option<&str> { self.values.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str()) }
 }
 
 fn config(secrets: &Secrets, account_id: &str) -> Config {
     let var = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
     let mut c = Config::new(var("PLANE_ID").unwrap_or_default());
     if let Some(v) = var("LABEL") { c.label = v.to_ascii_lowercase() }
-    if let Some(v) = secrets.get("LABELS") { c.set_labels(v) }
-    if let Some(v) = secrets.get("NAME") { c.set_name(v) }
     if let Some(v) = var("INSTANCE_TYPES") { c.instance_types = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect() }
-    c.app = secrets.get("GITHUB_APP").and_then(|v| serde_json::from_str(v).ok());
-    // One parameter for each further organization's GitHub App: GITHUB_APP_<its id>.
-    c.more_apps = secrets.values.iter().filter(|(n, _)| n.starts_with("GITHUB_APP_")).filter_map(|(_, v)| serde_json::from_str::<superci_core::github::App>(v).ok())
-        .filter(|a| c.app.as_ref().is_none_or(|f| f.id != a.id)).collect();
-    c.agents = secrets.get("AGENTS").and_then(|v| serde_json::from_str::<Vec<Agent>>(v).ok()).unwrap_or_default();
-    c.routing = secrets.get("ROUTING").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
-    c.gitlab = secrets.get("GITLAB").and_then(|v| serde_json::from_str(v).ok());
-    // One parameter for each further GitLab connection: GITLAB_<its name>.
-    c.more_gitlabs = secrets.values.iter().filter(|(n, _)| n.starts_with("GITLAB_")).filter_map(|(_, v)| serde_json::from_str::<superci_core::gitlab::GitLab>(v).ok())
-        .filter(|g| superci_core::gitlab::valid_id(&g.id)).collect();
-    c.machine = secrets.get("MACHINE").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
-    // One parameter per dashboard session: DASHBOARD_KEY_<expires, unix seconds>_<random>.
-    c.dashboard_keys = secrets.values.iter().filter_map(|(n, v)| Some((n.strip_prefix("DASHBOARD_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.clone()))).collect();
-    // One parameter per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
-    c.read_keys = secrets.values.iter().filter_map(|(n, v)| superci_core::plane::read_key(n, v)).collect();
-    c.move_token = secrets.get("MOVE_TOKEN").map(str::to_string);
-    if let Some(l) = secrets.get("CF_LOCATION") { c.cloudflare_location = l.to_string() }
-    c.cloudflare_image = secrets.get("CF_IMAGE").and_then(superci_core::plane::image_address);
-    c.aws_regions = secrets.get("AWS_REGIONS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
-    c.aws_networks = secrets.get("AWS_NETWORKS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+    c.read_settings(&secrets.values);
     c.aws_own = Some((account_id.to_string(), var("RUNNER_REGION").or(var("AWS_REGION")).unwrap_or_default()));
     c.aws_own_creds = Some(own_credentials());
-    c.aws_runners_off = secrets.get("AWS_RUNNERS") == Some("off");
     c
 }
 

@@ -1,21 +1,8 @@
 //! The dashboard against a control plane served on this computer (`superci_testkit`), a run played to its end first:
-//! each page as the dashboard's own page fetches it, and the pages headless Chrome draws once their scripts have run
-//! (what a person sees; skipped where no Chrome is installed).
+//! each page as the dashboard's own page fetches it (`browser.rs` uses them in Chrome).
 mod common;
 use common::{dashboard, home, part, played, words};
-use std::process::Command;
 use superci_testkit::serve;
-
-fn chrome() -> Option<String> {
-    ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
-        .iter().find(|p| std::path::Path::new(p).exists()).map(|p| p.to_string())
-}
-
-/// A page as a browser draws it, its scripts given time to run.
-fn page(chrome: &str, link: &str, home: &std::path::Path) -> String {
-    let out = Command::new(chrome).args(["--headless=new", "--disable-gpu", "--no-first-run", "--virtual-time-budget=8000", &format!("--user-data-dir={}", home.join("chrome").display()), "--dump-dom", link]).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
 
 #[test]
 fn each_page_shows_what_the_control_plane_has() {
@@ -58,27 +45,6 @@ fn each_page_shows_what_the_control_plane_has() {
     assert!(status == 200 && raw.lines().count() == 12 && raw.trim_end().ends_with("test 12 passed\u{1b}[0m"), "{raw}");
     // A job not asked well.
     assert_eq!(part(&link, "/job/view?id=x1").0, 400);
-    let _ = child.kill();
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[test]
-fn the_overview_and_a_jobs_page_as_chrome_draws_them() {
-    let Some(chrome) = chrome() else { eprintln!("no Chrome here: skipped"); return };
-    let served = serve(|_| {});
-    let home = home(&served);
-    played(&served, &home.join("checkout"));
-    let (mut child, link) = dashboard(&home);
-    let main_of = |p: &str| p.split("<main").nth(1).unwrap_or(p).chars().take(6000).collect::<String>();
-    // The Overview: the usage of the last day, its period switch, and the job.
-    let overview = page(&chrome, &link, &home);
-    assert!(overview.contains("<h2>Usage</h2>") && overview.contains("24 hours") && overview.contains("30 days") && overview.contains("Passed"), "{}", main_of(&overview));
-    // The job's page: its log read by the page itself, in steps, its lines in colour. (Each Chrome run starts without
-    // the last one's cookie: the link carries the key, and names the page.)
-    let job = served.store.under("job:").into_iter().next().unwrap().1["job_id"].as_u64().unwrap();
-    let shown = page(&chrome, &format!("{link}&p=job&id={job}"), &home);
-    assert!(shown.contains("Its log") && shown.contains("lstep success") && shown.contains("Run make test"), "{}", main_of(&shown));
-    assert!(shown.contains(r#"<span class="a32">test 12 passed</span>"#), "its lines in colour");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

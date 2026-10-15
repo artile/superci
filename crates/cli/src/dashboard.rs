@@ -1931,7 +1931,8 @@ impl Dashboard {
         for (found, (_, account_id)) in aws_found.into_iter().zip(aws) {
             looked.push(format!("aws:{account_id}"));
             for f in found? {
-                if !f.url.starts_with("https://") { continue }
+                // (Only over HTTPS; and in a debug build, a test's control plane on this computer.)
+                if !(f.url.starts_with("https://") || (cfg!(debug_assertions) && f.url.starts_with("http://127.0.0.1:"))) { continue }
                 if f.lambda.is_some() { there.push(f.plane_id.clone()) }
                 let found = match f.lambda {
                     Some((region, label)) => Plane::Aws { account_id: account_id.clone(), region, url: f.url, plane_id: f.plane_id, label },

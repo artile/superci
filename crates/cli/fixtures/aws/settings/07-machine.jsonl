@@ -1,0 +1,1 @@
+{"answer":"{\"Tier\":\"Standard\",\"Version\":3}","asked":"{\"Name\":\"/superci/testplane0001/MACHINE\",\"Overwrite\":true,\"Type\":\"SecureString\",\"Value\":\"{\\\"cpu\\\":8}\"}","method":"POST","status":200,"target":"AmazonSSM.PutParameter","url":"https://ssm.us-east-1.amazonaws.com/"}

@@ -27,6 +27,8 @@ impl Blocking {
 #[async_trait::async_trait(?Send)]
 impl Http for Blocking {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        #[cfg(debug_assertions)]
+        let r = to_stand_in(r);
         let mut builder = ureq::http::Request::builder().method(r.method.as_str()).uri(r.url.as_str());
         for (k, v) in &r.headers { builder = builder.header(k.as_str(), v.as_str()) }
         let request = builder.body(r.body.clone()).map_err(|e| e.to_string())?;
@@ -55,6 +57,18 @@ fn record(r: &Request, status: u16, body: &[u8]) {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) { let _ = f.write_all(format!("{line}\n").as_bytes()); }
+}
+
+/// In a debug build with `SUPERCI_AWS_AT=URL`: what is asked of AWS goes to a stand-in for it there instead
+/// (`superci_testkit`'s), as `URL/<AWS's host>/<path>`.
+#[cfg(debug_assertions)]
+fn to_stand_in(mut r: Request) -> Request {
+    let Some(at) = std::env::var("SUPERCI_AWS_AT").ok().filter(|a| !a.is_empty()) else { return r };
+    if let Some(rest) = r.url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com"))) {
+        r.url = format!("{}/{rest}", at.trim_end_matches('/'));
+        r.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
+    }
+    r
 }
 
 /// How an error starts when AWS says a sign-in is over (see `Session::credentials`).
