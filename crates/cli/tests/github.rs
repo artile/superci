@@ -219,6 +219,25 @@ fn a_finished_jobs_page_shows_its_whole_log_however_large() {
     let step = view["steps"].as_array().unwrap().iter().find(|s| s["name"] == "Run make test").unwrap();
     let lines = step["lines"].as_array().unwrap();
     assert_eq!((lines.len(), lines[1][2].as_str(), lines[40_000][2].as_str()), (40_001, Some("test 1 of the suite passed in good time"), Some("test 40000 of the suite passed in good time")));
+    // In Chrome: nothing of it drawn until a step is opened, then its first 2,000 lines and a way to more; search
+    // finds a line far down without drawing the step whole.
+    if let Some(mut b) = Browser::open(1300, 900) {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait("document.querySelector('details.lstep')");
+        assert_eq!(b.eval("document.querySelectorAll('.ll').length"), 0);
+        b.click("details.lstep summary", "Run make test");
+        b.wait("document.querySelectorAll('.ll').length === 2000");
+        assert_eq!(b.text(".ll-more"), "Show 4,000 more of 38,001 lines");
+        b.click(".ll-more", "");
+        b.wait("document.querySelectorAll('.ll').length === 6000");
+        assert_eq!(b.eval("document.querySelectorAll('.ll')[5999].querySelector('.ln').textContent"), "6000", "each line its number");
+        b.fill("[data-log-search]", "test 39999 of");
+        b.wait("document.querySelectorAll('.ll.hit').length === 1");
+        assert_eq!((b.text(".ll.hit .lx"), b.eval("document.querySelectorAll('.ll').length")), ("test 39999 of the suite passed in good time".to_string(), serde_json::json!(1)));
+        // Cleared: the step as it was opened (6,000 lines shown).
+        b.fill("[data-log-search]", "");
+        b.wait("document.querySelectorAll('.ll').length === 6000");
+    }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

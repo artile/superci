@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.6 — unreleased
+- A large log's page is quick: a step's lines are drawn when it is opened, 2,000 at a time (Show more), search looks through the log itself and shows the lines that hold the words, and a finished job's log is kept for its next opens.
 - An AWS sign-in that AWS does not finish (seen when the account is changed on its page midway) says so plainly, with the way back to the dashboard to sign in again, instead of AWS's raw error.
 - When the control plane's cloud sign-in has ended (AWS ends one after 12 hours), the update card's button signs in first and comes back, instead of an Update that stops on "Sign in with AWS first".
 - Runs first in the dashboard: Overview lists the latest runs, and its first figure counts runs, with their jobs beside it (from a control plane on 0.19.6, which also counts the runs of the jobs it kept from before, once, in its upkeep; jobs until it is updated). The sidebar's Jobs is Runs, its Runs tab first.

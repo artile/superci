@@ -85,7 +85,8 @@ fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     // A step that passed is closed; opened, its lines, in colour.
     b.click("details.lstep summary", "");
     b.wait("document.querySelector('details.lstep').open");
-    assert_eq!(b.eval("document.querySelectorAll('details.lstep .ll').length"), 12);
+    // (Its lines are drawn once it is open, not before.)
+    b.wait("document.querySelectorAll('details.lstep .ll').length === 12");
     assert_eq!(b.eval("document.querySelector('details.lstep .ll:last-child .lx').innerHTML"), r#"<span class="a32">test 12 passed</span>"#);
     // Searching keeps the lines that hold the words.
     b.fill("[data-log-search]", "test 12");
