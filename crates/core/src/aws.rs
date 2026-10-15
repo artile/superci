@@ -1406,6 +1406,7 @@ mod tests {
         let script = with_cache(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
         let script = compact(&script);
         assert!(script.contains("wait $g") && script.len() < 16_384, "{} bytes", script.len());
+        assert_eq!((script.matches("&live=").count(), script.matches("&log=runner").count()), (1, 1), "each part of what the machine says, once");
         println!("{} bytes with a 10,000-character configuration", script.len());
     }
 
