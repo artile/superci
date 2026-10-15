@@ -36,6 +36,7 @@ fn fixture(name: &str) -> Value {
     serde_json::from_str(match name {
         "repo" => include_str!("../fixtures/github/repo.json"),
         "run" => include_str!("../fixtures/github/run.json"),
+        "org" => include_str!("../fixtures/github/org.json"),
         _ => include_str!("../fixtures/github/job.json"),
     }).unwrap()
 }
@@ -165,6 +166,16 @@ impl GitHub {
             ("POST", ["app", "installations", id, "access_tokens"]) if *id == INSTALLATION.to_string() => ok(201, json!({ "token": "ghs_16C7e42F292c6912E7710c838347Ae178B4a", "expires_at": "2099-01-01T00:00:00Z",
                 "permissions": permissions, "repository_selection": "all" })),
             ("GET", ["app", "hook", "deliveries"]) => ok(200, json!([])),
+            // Who a name is, and the App made from the dashboard's manifest (docs.github.com/rest/apps/apps#create-a-github-app-from-a-manifest).
+            ("GET", ["users", OWNER]) => ok(200, fixture("org")),
+            ("GET", ["users", _]) => ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/users/users#get-a-user", "status": "404" })),
+            ("POST", ["app-manifests", _, "conversions"]) => {
+                let app = Self::app();
+                ok(201, json!({ "id": APP_ID, "slug": "superci-acme", "node_id": "A_kwDOAAAA", "owner": account, "name": "SuperCI acme", "description": null,
+                    "external_url": "https://superci.dev", "html_url": "https://github.com/apps/superci-acme", "created_at": "2026-10-15T10:00:00Z", "updated_at": "2026-10-15T10:00:00Z",
+                    "permissions": permissions, "events": ["workflow_job"], "client_id": "Iv1.8a61f9b3a7aba766", "client_secret": "1726be1638095a19edd134c77bde3aa2ece1e5d8",
+                    "webhook_secret": WEBHOOK_SECRET, "pem": app["pem"] }))
+            }
             ("PATCH", ["app", "hook", "config"]) => ok(200, json!({ "content_type": "json", "insecure_ssl": "0", "url": serde_json::from_slice::<Value>(&r.body).ok()?["url"] })),
             ("GET", ["installation", "repositories"]) => { drop(h); ok(200, json!({ "total_count": 1, "repository_selection": "all", "repositories": [self.repo()] })) }
             // A runner for one job (docs.github.com/rest/actions/self-hosted-runners).

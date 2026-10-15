@@ -161,3 +161,35 @@ fn a_webhook_not_signed_by_the_app_is_refused() {
     assert_eq!(served.webhook((body, format!("sha256={}", "0".repeat(64)))), 401);
     assert!(served.machines.0.lock().unwrap().is_empty() && served.store.under("job:").is_empty());
 }
+
+#[test]
+fn github_is_connected_from_repositories_and_its_jobs_then_run() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    // Repositories → Create its App: a form that takes the App's manifest to GitHub, for the organization named.
+    let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "acme")]);
+    assert_eq!(status, 200, "{}", words(&form));
+    assert!(form.contains("https://github.com/organizations/acme/settings/apps/new?state="), "{form}");
+    let state = form.split("state=").nth(1).unwrap().split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap().to_string();
+    let manifest = form.split("name=\"manifest\" value=\"").nth(1).unwrap().split('"').next().unwrap().replace("&quot;", "\"").replace("&amp;", "&");
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    assert_eq!((manifest["hook_attributes"]["url"].as_str(), manifest["default_events"][0].as_str()), (Some(format!("{}/webhook", served.url).as_str()), Some("workflow_job")), "{manifest}");
+    // GitHub made it and comes back with its code: the App goes into the control plane's settings, then GitHub's
+    // page to install it.
+    let (status, to, _) = common::get(&link, &format!("/github/callback?code=a1b2c3d4e5f6&state={state}"));
+    assert_eq!((status, to.as_str()), (303, "https://github.com/apps/superci-acme/installations/new"));
+    let kept: serde_json::Value = serde_json::from_str(&served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "GITHUB_APP").unwrap().1).unwrap();
+    assert_eq!((kept["id"].as_u64(), kept["owner"].as_str(), kept["owner_is_org"].as_bool()), (Some(1001), Some("acme"), Some(true)));
+    // A code that is not this tab's is refused.
+    assert_eq!(common::get(&link, "/github/callback?code=a1b2c3d4e5f6&state=other").0, 400);
+    // Installed: back here, and Repositories shows acme.
+    assert_eq!(common::get(&link, "/github/installed").0, 200);
+    let (_, repos) = part(&link, "/?p=repos&fragment=1");
+    assert!(words(&repos).contains("acme"), "{}", words(&repos));
+    // Its jobs run.
+    ran(&served, "success");
+    assert!(unanswered(&served).is_empty(), "{:?}", unanswered(&served));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

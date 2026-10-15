@@ -5720,7 +5720,7 @@ fn github_owner(host: Option<&str>, login: &str) -> Result<Owner> { github_owner
 
 fn github_owner_at(api: &str, host: Option<&str>, login: &str) -> Result<Owner> {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(15))).build().into();
-    let asked = agent.get(&format!("{api}/users/{login}")).header("accept", "application/vnd.github+json").header("user-agent", "superci-cli").call();
+    let asked = agent.get(&crate::aws::stand_in(&format!("{api}/users/{login}"))).header("accept", "application/vnd.github+json").header("user-agent", "superci-cli").call();
     let mut r = match (asked, host) {
         (Ok(r), Some(_)) if [401, 403, 404].contains(&r.status().as_u16()) => return Ok(Owner { org: true, login: login.to_string() }),
         (Ok(r), _) => r,
@@ -6316,7 +6316,7 @@ fn wait_online(url: &str) {
 fn convert_manifest_code(api: &str, host: Option<&str>, code: &str) -> Result<github::App> {
     if code.len() < 8 || code.len() > 100 || !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { return Err("invalid manifest code".into()) }
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
-    let mut r = agent.post(&format!("{api}/app-manifests/{code}/conversions"))
+    let mut r = agent.post(&crate::aws::stand_in(&format!("{api}/app-manifests/{code}/conversions")))
         .header("accept", "application/vnd.github+json").header("user-agent", "superci-cli").send_empty().map_err(|e| e.to_string())?;
     let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
     if r.status().as_u16() >= 300 { return Err(format!("GitHub: {} {}", r.status(), text.chars().take(200).collect::<String>())) }

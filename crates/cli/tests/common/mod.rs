@@ -109,3 +109,25 @@ pub fn words(html: &str) -> String {
     }
     out.replace("&#39;", "'").replace("&amp;", "&").split_whitespace().collect::<Vec<_>>().join(" ")
 }
+
+/// A form of the dashboard's own pages sent (`fields`), as a browser sends it: status, where it leads, and the body.
+pub fn post(link: &str, path: &str, fields: &[(&str, &str)]) -> (u16, String, String) {
+    let (base, key) = link.split_once("/?k=").unwrap();
+    let port = base.rsplit(':').next().unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
+    let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields).finish();
+    let mut r = agent.post(&format!("{base}{path}")).header("cookie", &format!("superci_local_{port}={key}")).header("sec-fetch-site", "same-origin")
+        .header("content-type", "application/x-www-form-urlencoded").send(body).unwrap();
+    let to = r.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    (r.status().as_u16(), to, r.body_mut().read_to_string().unwrap_or_default())
+}
+
+/// The same for a page reached with a GET, with where it leads.
+pub fn get(link: &str, path: &str) -> (u16, String, String) {
+    let (base, key) = link.split_once("/?k=").unwrap();
+    let port = base.rsplit(':').next().unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
+    let mut r = agent.get(&format!("{base}{path}")).header("cookie", &format!("superci_local_{port}={key}")).header("sec-fetch-site", "same-origin").call().unwrap();
+    let to = r.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    (r.status().as_u16(), to, r.body_mut().read_to_string().unwrap_or_default())
+}
