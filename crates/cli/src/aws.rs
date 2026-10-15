@@ -59,16 +59,24 @@ fn record(r: &Request, status: u16, body: &[u8]) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) { let _ = f.write_all(format!("{line}\n").as_bytes()); }
 }
 
-/// In a debug build with `SUPERCI_AWS_AT=URL`: what is asked of AWS goes to a stand-in for it there instead
-/// (`superci_testkit`'s), as `URL/<AWS's host>/<path>`.
+/// In a debug build with `SUPERCI_STAND_IN=URL`: what is asked of AWS, and of where GitHub keeps logs, goes to a
+/// stand-in for them there instead (`superci_testkit`'s), as `URL/<the host>/<path>`.
 #[cfg(debug_assertions)]
 fn to_stand_in(mut r: Request) -> Request {
-    let Some(at) = std::env::var("SUPERCI_AWS_AT").ok().filter(|a| !a.is_empty()) else { return r };
-    if let Some(rest) = r.url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com"))) {
-        r.url = format!("{}/{rest}", at.trim_end_matches('/'));
-        r.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("host"));
-    }
+    let to = stand_in(&r.url);
+    if to != r.url { r.url = to; r.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("host")); }
     r
+}
+
+/// An outside address, or (in a debug build with `SUPERCI_STAND_IN`) the stand-in's for it.
+pub fn stand_in(url: &str) -> String {
+    #[cfg(debug_assertions)]
+    if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
+        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".blob.core.windows.net"))) {
+            return format!("{}/{rest}", at.trim_end_matches('/'));
+        }
+    }
+    url.to_string()
 }
 
 /// How an error starts when AWS says a sign-in is over (see `Session::credentials`).

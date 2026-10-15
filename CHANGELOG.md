@@ -10,6 +10,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - AWS's limit on CPUs at once is asked for more of from one button, with spot and on-demand apart, each with its limit now.
 - `superci projects list` without GitLab says so; amounts with nothing spent say 0, not -0.
 - A run from a computer says why a job failed when no machine began it ("Cloudflare did not start a machine for it, three times"), and a job ended for running past its longest time says so, there, in `superci jobs retrieve` and in the dashboard.
+- A job that ran and failed is no longer said to have not started, on the Jobs page and on its page.
 - Saving the default machine returns to Workflows, where it is set. `superci runners update CLOUD --enabled=false` is refused for a provider other than aws-on-demand (it did nothing): another is removed with `superci runners delete CLOUD`.
 
 ## 0.19.3 — 2026-10-15

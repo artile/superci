@@ -664,7 +664,7 @@ fn job_table(jobs: &[serde_json::Value]) -> String {
         let runner = if runner.is_empty() { r#"<span class="faint">—</span>"#.to_string() } else { format!("{}<span>{}</span>", logo(&runner_logo, 16), esc(&runner)) };
         let took = duration(j);
         let cost = job_cost(j).filter(|c| *c > 0.0).map(|c| cost_text(j, c)).unwrap_or_default();
-        let why = if kind == "bad" || state == "waiting" { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&plain_reason(j))) }
+        let why = if (kind == "bad" || state == "waiting") && !plain_reason(j).is_empty() { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&plain_reason(j))) }
             else { off_spot(j).map(|(why, _)| format!(r#"<small class="jt-why open">{}</small>"#, esc(&why)))
                 // (Or that its machine was not the first choice: quietly, it is no fault.)
                 .or_else(|| choice_said(j).map(|said| format!(r#"<small class="jt-why held">{}</small>"#, esc(&said)))).unwrap_or_default() };
@@ -955,6 +955,8 @@ fn plain_reason(j: &serde_json::Value) -> String {
             "swept" => "Its machine never started the job".into(),
             "orphan" => "Its machine was lost".into(),
             "waiting" => "Waiting for a free runner".into(),
+            // It ran: its steps say how it went (a failed one in its log).
+            "done" | "running" => String::new(),
             _ => "It did not start".into(),
         }
     };
@@ -3957,7 +3959,7 @@ mark();load()})();</script>"#;
         let link = job_link(&j);
         let at = if link.is_empty() { r#"<small class="faint">Run from a computer: it has no page at GitHub.</small>"#.to_string() }
             else { format!(r#"<a class="button secondary sm" href="{}" target="_blank" rel="noopener">{}On {} ›</a>"#, esc(&link), crate::logos::bare(if j["provider"] == "gitlab" { "gitlab" } else { "github" }, 15), if j["provider"] == "gitlab" { "GitLab" } else { "GitHub" }) };
-        let why = { let w = plain_reason(&j); if kind == "bad" || j["state"] == "waiting" { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&w)) } else { String::new() } };
+        let why = { let w = plain_reason(&j); if (kind == "bad" || j["state"] == "waiting") && !w.is_empty() { format!(r#"<small class="jt-why {kind}">{}</small>"#, esc(&w)) } else { String::new() } };
         // The run it is of: its page here, named as the Runs tab names it.
         let jobs: Vec<serde_json::Value> = v.jobs().iter().map(|x| with_hosts(v, x)).collect();
         let run = runs_of(&jobs).into_iter().find(|r| r["repo"] == j["repo"] && r["id"] == j["run_id"] && r["job_ids"].as_array().is_some_and(|ids| ids.contains(&j["job_id"])));
@@ -5382,7 +5384,7 @@ fn fetch_all(urls: &[String]) -> Result<Vec<u8>> {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(600))).build().into();
     let mut out = vec![];
     for u in urls {
-        let mut r = agent.get(u).call().map_err(|e| e.to_string())?;
+        let mut r = agent.get(&crate::aws::stand_in(u)).call().map_err(|e| e.to_string())?;
         if r.status().as_u16() >= 300 { return Err(format!("the bucket answered {} for a piece", r.status())) }
         out.extend(r.body_mut().with_config().limit(u64::MAX).read_to_vec().map_err(|e| e.to_string())?);
     }

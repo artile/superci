@@ -3,6 +3,8 @@
 //! more; AWS's SSM, where the dashboard keeps the control plane's settings, `Aws`), and a runner (`Runner`) that does
 //! what GitHub's runner does on a machine, by the same calls. So the CLI and the dashboard are tested as they run,
 //! against the control plane as it runs, offline.
+pub mod github;
+pub use github::GitHub;
 #[cfg(unix)]
 mod browser;
 #[cfg(unix)]
@@ -16,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::executor::block_on;
 use serde_json::{json, Value};
-use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer, Work};
+use superci_core::io::{self, Clock, Containers, Request, Store, Timer, Work};
 use superci_core::plane::{Cache, Config, ControlPlane};
 
 /// A store in memory, shared with the test.
@@ -40,12 +42,6 @@ impl Shared {
     }
 }
 
-/// Every other service answers that it is not there (a test that needs one gives it its own answers).
-struct Nowhere;
-#[async_trait(?Send)]
-impl Http for Nowhere {
-    async fn send(&self, r: Request) -> io::Result<Response> { Ok(Response::new(404, "text/plain", format!("not here: {} {}", r.method, r.url))) }
-}
 
 /// Machines: each starts at once, its runner given to the test to play (see `Runner`).
 #[derive(Clone, Default)]
@@ -69,11 +65,28 @@ impl Timer for NoTimer { async fn wake_in(&self, _ms: u64) -> io::Result<()> { O
 /// A control plane served on this computer: its address, its store, its machines, AWS as it finds it (its settings
 /// are SSM parameters there, `/superci/testplane0001/…`, read on every request), and a key with which the dashboard
 /// and the CLI reach it (and one for coding agents, which may also start runs).
-pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub key: String, pub run_key: String, clock: Now }
+pub struct Served { pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub github: GitHub, pub key: String, pub run_key: String, clock: Now }
 
 impl Served {
     /// Moves the control plane's time on by `ms`.
     pub fn later(&self, ms: u64) { self.clock.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst); }
+
+    /// The control plane's time now.
+    pub fn now_ms(&self) -> u64 { self.clock.now_ms() }
+
+    /// SuperCI's App for the organization `acme`, as the dashboard leaves it once made and installed (`GitHub`).
+    pub fn connect_github(&self) { self.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &GitHub::app().to_string()) }
+
+    /// A webhook GitHub sends (`GitHub::queue`, `start`, `finish`), as it sends it: the control plane's answer.
+    pub fn webhook(&self, (body, signature): (Vec<u8>, String)) -> u16 {
+        let host = self.url.trim_start_matches("http://");
+        let mut s = TcpStream::connect(host).unwrap();
+        s.write_all(format!("POST /webhook HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\nx-github-event: workflow_job\r\nx-hub-signature-256: {signature}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+        s.write_all(&body).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0)
+    }
 
     /// Its upkeep, as its cloud runs it every minute (`ControlPlane::alarm`).
     pub fn upkeep(&self) {
@@ -97,13 +110,15 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (store, machines, aws) = (Shared::default(), Machines::default(), Aws::serve());
     *aws.plane_url.lock().unwrap() = url.clone();
+    let github = GitHub::default();
+    *aws.github.lock().unwrap() = Some(github.clone());
     let (key, run_key) = ("dashboard-key-for-tests-0001".to_string(), "superci_run_0123456789abcdef0123456789abcdef".to_string());
     // Its keys, as a deploy and `superci keys create agent --runs` leave them.
     aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &key);
     aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
     aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "on");
     let clock = Now::default();
-    let (s, m, a, u, c) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone());
+    let (s, m, a, u, c, g) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone());
     std::thread::spawn(move || {
         let cache = Cache::default();
         block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
@@ -114,11 +129,11 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
             config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
             config.read_settings(&settings);
             configure(&mut config);
-            let plane = ControlPlane { store: &s, http: &Nowhere, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
+            let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let _ = answer(&plane, &u, stream);
         }
     });
-    Served { url, store, machines, aws, key, run_key, clock }
+    Served { url, store, machines, aws, github, key, run_key, clock }
 }
 
 /// A request as it arrived: method, target, headers, body.
@@ -162,7 +177,7 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream) -> std::io::Resul
     write(stream, res.status, &res.headers, &res.body)
 }
 
-/// AWS as SuperCI's calls find it (the CLI and the dashboard reach it with `SUPERCI_AWS_AT` set to `url`): SSM's
+/// AWS as SuperCI's calls find it (the CLI and the dashboard reach it with `SUPERCI_STAND_IN` set to `url`; what they ask of other hosts there, GitHub's stand-in answers): SSM's
 /// parameters, kept and answered for exactly as SSM does (its answers recorded from a real account are
 /// `crates/cli/fixtures/aws/settings/ssm.jsonl`, and a test holds this to them). Each exchange is kept, in the shape
 /// of a recording (`asked`); what it has no answer for is answered with an error that names it, and kept apart
@@ -178,6 +193,8 @@ pub struct Aws {
     /// AWS when signed in), and the address its control plane's stands in for (`http://plane.test`).
     pub recorded: Arc<Vec<Value>>,
     pub plane_url: Arc<Mutex<String>>,
+    /// Where what is not AWS's goes (GitHub's logs).
+    pub github: Arc<Mutex<Option<GitHub>>>,
 }
 
 /// What a request asks AWS to do: its target (JSON APIs) or its Action (query APIs).
@@ -195,6 +212,12 @@ impl Aws {
         std::thread::spawn(move || for stream in listener.incoming().flatten() {
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
+            if !target.split('/').nth(1).unwrap_or_default().ends_with(".amazonaws.com") {
+                let gh = a.github.lock().unwrap().clone().unwrap_or_default();
+                let res = block_on(superci_core::io::Http::send(&gh, Request::new(&method, &format!("https:/{target}")).with_body(body))).unwrap();
+                let _ = write(stream, res.status, &res.headers, &res.body);
+                continue;
+            }
             let (status, answer) = a.handle(&method, &format!("https:/{target}"), &header("x-amz-target"), &String::from_utf8_lossy(&body));
             let kind = if answer.starts_with('<') { "text/xml" } else { "application/x-amz-json-1.1" };
             let _ = write(stream, status, &[("content-type".into(), kind.into())], answer.as_bytes());
