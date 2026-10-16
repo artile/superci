@@ -181,3 +181,41 @@ fn a_run_from_a_computers_artifacts_and_nx_and_bazels_outputs_go_through_the_con
     assert_eq!(call(port, "GET", "/bazel/main/ac/0f1e", &[], b"").0, 404);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn gitlabs_runner_cache_is_kept_for_the_job_its_runner_runs_and_read_by_its_branch() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+    });
+    served.connect_gitlab();
+    // A GitLab job of acme/app, its runner made for it, running (as GitLab told).
+    let (id, pending) = served.gitlab.pending("test", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(pending) < 300);
+    let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let dir = std::env::temp_dir().join(format!("superci-cache-plane-gl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let start = |link: &str| Ends(std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
+        .env("SUPERCI_CACHE_PLANE", format!("{}/cache/{link}", served.url)).env("SUPERCI_STAND_IN", &served.aws.url)
+        .env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string()).stderr(std::process::Stdio::null()).spawn().unwrap());
+    let runner = served.store.under("glrunner:").into_iter().next().map(|(k, _)| k.trim_start_matches("glrunner:").to_string()).expect("its runner");
+    let link = "machine-cache-link-000000000005";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": format!("gl:{runner}") }).to_string());
+    let _ends = start(link);
+    for _ in 0..100 { if TcpStream::connect(("127.0.0.1", port)).is_ok() { break } std::thread::sleep(std::time::Duration::from_millis(20)) }
+    let key = "/superci/gl/project/380/deps-protected/cache.zip?X-Amz-Signature=x";
+    // Before its job has begun on the runner: GitLab is asked which job it runs (none yet): nothing kept.
+    assert_eq!(call(port, "PUT", key, &[], b"zip bytes").0, 500);
+    // Its job running: kept for its branch, and read back (whole, and its head).
+    assert!(served.gitlab_webhook(served.gitlab.running(id, served.now_ms())) < 300);
+    assert_eq!(call(port, "GET", key, &[], b"").0, 404);
+    assert_eq!(call(port, "PUT", key, &[], b"zip bytes").0, 200);
+    assert_eq!(call(port, "GET", key, &[], b"").2, b"zip bytes");
+    let (status, head, _) = call(port, "HEAD", key, &[], b"");
+    assert!(status == 200 && head.contains("etag"), "{status} {head}");
+    assert_eq!(call(port, "DELETE", key, &[], b"").0, 405);
+    // The cache's list: the project by its path, as GitLab has it.
+    let kept: Vec<String> = served.store.under("cachename:").into_iter().map(|(_, v)| v.to_string()).collect();
+    assert!(kept.iter().any(|n| n.contains("acme/app")), "{kept:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
