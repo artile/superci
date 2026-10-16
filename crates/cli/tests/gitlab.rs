@@ -233,3 +233,44 @@ fn gitlab_jobs_cancelled_at_each_point_end_here_too_and_one_on_a_spot_machine_aw
     assert_eq!((j["state"].as_str(), j["error"].as_str()), (Some("failed"), Some("AWS took back its spot machine; run again, off spot machines")), "{j}");
     assert!(served.gitlab.asked.lock().unwrap().iter().any(|x| x.ends_with(&format!("/jobs/{e}/retry"))), "{:?}", served.gitlab.asked.lock().unwrap());
 }
+
+#[test]
+fn a_failed_gitlab_jobs_log_with_times_streams_and_nested_sections_is_shown_in_its_steps() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    let home = signed_in(&served);
+    let (id, pending) = served.gitlab.pending("e2e", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(pending) < 300);
+    assert!(served.gitlab_webhook(served.gitlab.running(id, served.now_ms())) < 300);
+    // A runner with times on (each line its time and stream, "00O" out, "01E" error, "+" a line's rest): a section
+    // whose heading comes on the next line, one inside another, and the script's, after which the job failed.
+    let t = |n: u32, stream: &str, text: &str| format!("2026-10-15T10:00:{n:02}.123456Z {stream} {text}");
+    let log = [
+        t(0, "00O", "\u{1b}[0KRunning with gitlab-runner 19.4.1"),
+        t(1, "00O", "\u{1b}[0Ksection_start:1760522401:prepare_executor\r\u{1b}[0K"),
+        t(1, "00O+", "\u{1b}[0K\u{1b}[36;1mPreparing the \"docker\" executor\u{1b}[0;m"),
+        t(2, "00O", "Using Docker executor with image node:22 ..."),
+        t(3, "00O", "\u{1b}[0Ksection_end:1760522403:prepare_executor\r\u{1b}[0K"),
+        t(4, "00O", "\u{1b}[0Ksection_start:1760522404:step_script\r\u{1b}[0K\u{1b}[36;1mExecuting \"step_script\" stage\u{1b}[0;m"),
+        t(5, "00O", "\u{1b}[0Ksection_start:1760522405:install[collapsed=true]\r\u{1b}[0K\u{1b}[1mnpm ci\u{1b}[0m"),
+        t(6, "00O", "added 312 packages"),
+        t(7, "00O", "\u{1b}[0Ksection_end:1760522407:install\r\u{1b}[0K"),
+        t(8, "01E", "WARNING: a deprecated option"),
+        t(9, "01E", "\u{1b}[31m2 tests failed\u{1b}[0m\u{7}"),
+        t(9, "00O", "\u{1b}[2Kprogress\u{1b}[1Gdone"),
+        t(10, "00O", "\u{1b}[0Ksection_end:1760522410:step_script\r\u{1b}[0K"),
+        t(10, "01E", "\u{1b}[31;1mERROR: Job failed: exit code 1\u{1b}[0;m"),
+    ].join("\n");
+    assert!(served.gitlab_webhook(served.gitlab.finish(id, "failed", &log, served.now_ms())) < 300);
+    let (mut child, link) = dashboard(&home);
+    let (_, view) = part(&link, &format!("/job/view?id={id}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap_or_else(|_| panic!("{view}"));
+    let steps: Vec<(String, String)> = view["steps"].as_array().unwrap().iter().map(|s| (s["name"].as_str().unwrap_or_default().to_string(), s["state"].as_str().unwrap_or_default().to_string())).collect();
+    let named = |n: &str| steps.iter().find(|(name, _)| name == n).map(|(_, s)| s.clone()).unwrap_or_else(|| panic!("no step {n}: {steps:?}"));
+    assert_eq!(named("Preparing the \"docker\" executor"), "success", "the heading on the next line names it");
+    assert_eq!(named("Executing \"step_script\" stage"), "failure", "{steps:?}");
+    let text = view.to_string();
+    assert!(text.contains("npm ci") && text.contains("added 312 packages") && text.contains("2 tests failed") && !text.contains("00O") && !text.contains("01E"), "{text}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
