@@ -180,9 +180,12 @@ impl Session {
     /// The credentials in hand are taken as over (AWS said so): the next use renews them, or finds the sign-in ended.
     pub fn expire(&mut self) { self.creds.expires_at_ms = 0 }
 
+    /// The credentials in hand end within two minutes: the next use renews them.
+    pub fn due(&self) -> bool { self.creds.expires_at_ms < now_ms() + 120_000 }
+
     /// Credentials good for at least two more minutes, renewing them when needed.
     pub fn credentials(&mut self) -> Result<Credentials> {
-        if self.creds.expires_at_ms < now_ms() + 120_000 {
+        if self.due() {
             let v = token_call(&self.region, &self.dpop, serde_json::json!({ "clientId": CLIENT_ID, "grantType": "refresh_token", "refreshToken": self.refresh_token }))
                 // AWS answering that the sign-in is over (its refresh token lasts as long as the console session, twelve
                 // hours at most) is said as that; AWS not answering leaves the sign-in as it is.
@@ -622,6 +625,9 @@ pub fn connected_planes(creds: &Credentials) -> Result<Vec<FoundPlane>> {
 #[cfg(test)]
 impl Session {
     /// A sign-in that never reaches AWS, for rendering pages in tests.
+    /// The same, its credentials good until `expires_at_ms` (renewed, say, by another SuperCI).
+    pub fn for_test_until(account_id: &str, expires_at_ms: u64) -> Self { let mut s = Self::for_test(account_id); s.creds.expires_at_ms = expires_at_ms; s.refresh_token = format!("renewed-{expires_at_ms}"); s }
+
     pub fn for_test(account_id: &str) -> Self {
         Session { region: "us-east-1".into(), account_id: account_id.into(), who: String::new(), refresh_token: String::new(), dpop: SigningKeyStore::generate(),
             creds: Credentials { access_key_id: String::new(), secret_access_key: String::new(), session_token: None, expires_at_ms: 0 } }

@@ -1861,7 +1861,27 @@ impl Dashboard {
         }
     }
 
+    /// The AWS sign-ins due to be renewed, renewed by one SuperCI at a time, as Cloudflare's (see `cf_client`): with the
+    /// folder's lock held the file is read again (another one may have just renewed them, and AWS takes a refresh token
+    /// once: a second renewal with it is refused, and was taken for the sign-in's end), and what was renewed is written
+    /// before the lock is let go.
+    fn aws_renewed(&mut self) {
+        let due = |d: &Dashboard| d.aws.iter().chain(d.aws_others.iter()).any(|s| s.due());
+        if !due(self) { return }
+        let Some(store) = self.store.clone() else { return };
+        let _held = store.renewing();
+        self.take_in();
+        if !due(self) { return }
+        if let Some(s) = self.aws.as_mut().filter(|s| s.due()) {
+            if let Err(e) = s.credentials() { if e.starts_with(aws::ENDED) { (self.aws, self.aws_ended, self.views) = (None, true, None) } }
+        }
+        // (Another account's that AWS no longer renews: left out, as the one in hand is.)
+        self.aws_others.retain_mut(|s| !s.due() || !s.credentials().is_err_and(|e| e.starts_with(aws::ENDED)));
+        self.keep();
+    }
+
     fn aws_creds(&mut self) -> Result<superci_core::aws::Credentials> {
+        self.aws_renewed();
         match self.aws.as_mut().ok_or("Sign in with AWS first.")?.credentials() {
             // Over on AWS's side (they last twelve hours at most): forgotten here, so the pages ask for it again.
             Err(e) if e.starts_with(aws::ENDED) => { self.aws = None; self.aws_ended = true; self.views = None; Err(format!("{}. Sign in with AWS again.", aws::ENDED)) }
@@ -2091,6 +2111,8 @@ impl Dashboard {
     }
 
     fn handle(&mut self, req: &Req) -> Result<Response> {
+        // (What a page or an action does with AWS uses credentials renewed one SuperCI at a time.)
+        self.aws_renewed();
         let q = |n: &str| req.query.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str()).unwrap_or("");
         // Back to the dashboard after a sign-in elsewhere: a same-site navigation, so the page's cookie goes along
         // (a plain redirect at the end of another site's redirect chain would count as cross-site and lose it).
@@ -7750,6 +7772,28 @@ mod tests {
         d.take_in();
         d.keep();
         assert!(d.modal.is_none() && d.cf.is_none() && d.aws.is_none() && !store.path().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_aws_sign_in_another_superci_renewed_a_moment_ago_is_taken_not_renewed_again() {
+        // Two SuperCIs with the same AWS sign-in, its credentials due. One renewed it (AWS takes its refresh token
+        // once) and wrote it; the other, about to renew, reads the file again under the lock and uses that one, asking
+        // AWS nothing (a second renewal would be refused, and was taken for the sign-in's end).
+        let dir = std::env::temp_dir().join(format!("superci-renew-{}", random_token(6)));
+        let store = Store::at(&dir);
+        store.write(&crate::store::Kept { aws: Some(aws::Session::for_test("111111111111")), ..Default::default() }).unwrap();
+        let mut d = Dashboard::signed_in(Some(store.clone()));
+        d.keep();
+        assert!(d.aws.as_ref().is_some_and(|a| a.due()));
+        let mut other = store.read();
+        let until = now_ms() + 3_600_000;
+        other.aws = Some(aws::Session::for_test_until("111111111111", until));
+        store.write(&other).unwrap();
+        d.aws_renewed();
+        assert!(d.aws.as_ref().is_some_and(|a| !a.due()) && !d.aws_ended, "the renewed one, taken in");
+        let (_, creds) = d.aws_account("").unwrap();
+        assert_eq!(creds.expires_at_ms, until);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

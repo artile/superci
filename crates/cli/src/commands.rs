@@ -731,6 +731,26 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             };
             Ok(Done { data: json!({ "answer": said }), said: vec![said] })
         }
+        // (Links signed with this workspace's AWS sign-in, an hour long, for paths in a bucket: `superci debug presign
+        // METHOD REGION BUCKET PREFIX PIECES` writes {path: link} for index.json, meta.tar.zst, layers.sqsh and p/000000…
+        // to stdout, for trying things on a machine that has no sign-in.)
+        #[cfg(debug_assertions)]
+        ("debug", "presign") => {
+            let mut d = signed_in();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
+            let (method, region, bucket, prefix) = (w(2), w(3), w(4), w(5).trim_matches('/'));
+            let pieces: u32 = w(6).parse().map_err(|_| "PIECES is a number")?;
+            let mut paths: Vec<String> = ["index.json", "hot.json", "meta.tar.zst", "layers.sqsh", "image-reader", "baseline.txt"].iter().map(|s| s.to_string()).collect();
+            paths.extend((0..pieces).map(|i| format!("p/{i:06}")));
+            let mut out = serde_json::Map::new();
+            for p in paths {
+                let link = superci_core::aws::presign(method, &superci_core::aws::s3_url(bucket, region, &format!("{prefix}/{p}")), &creds, region, 3600, now)?;
+                out.insert(p, link.into());
+            }
+            println!("{}", serde_json::Value::Object(out));
+            Ok(Done { said: vec![], data: json!({}) })
+        }
         // (A signed call to an AWS service that speaks REST, S3 among them: `superci debug rest REGION SERVICE METHOD URL
         // [FILE]`, FILE being the body.)
         #[cfg(debug_assertions)]

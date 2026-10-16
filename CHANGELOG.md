@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.10
+- An AWS sign-in is renewed by one SuperCI at a time, as Cloudflare's already was: several commands at once (agents in parallel) each renewed it, AWS took the first renewal and refused the rest, and those took it for the sign-in's end and signed everything out.
 - A run from a computer sends what changed since that folder's last run, and says so ("Sending what changed since this folder's last run, 3 minutes ago: 2 files, 0 removed"): each run's changes are kept as a layer on the last run's, eight at most, then all of it again. It sent what changed since the folder's first run, which grew with every edit and read as wrong both ways.
 - A run from a computer's checkout on a macOS machine unpacks what changed since a run before: macOS's tar refused how it was asked.
 
