@@ -72,3 +72,85 @@ fn a_cloudflare_control_plane_is_deployed_given_its_containers_shown_and_deleted
     assert!(served.aws.unanswered.lock().unwrap().iter().all(|u| !u.contains("cloudflare.com") || u.ends_with("/workers/scripts/superci/secrets")), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_cloudflare_control_plane_gets_modals_runners_then_everything_moves_to_a_modal_one_as_both_answered() {
+    // The workspace's control plane in AWS, serving GitHub (the one in use); a Cloudflare one and a Modal one beside it,
+    // each served here, reading its settings where its cloud keeps them (the Worker's secrets, the settings Dict).
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = serve_as("cfplane00002", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00002/CONTAINERS");
+    let aws = served.aws.clone();
+    let md = serve_as("mdplane00002", move |c| {
+        let settings = aws.modal_plane_settings();
+        c.read_settings(&settings);
+        c.own_cloud = "modal".into();
+        c.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+    });
+    md.aws.params.lock().unwrap().remove("/superci/mdplane00002/CONTAINERS");
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00002.modal.run".into(), md.url.clone());
+    // (The Modal runner agent's health, which the dashboard waits for once it is deployed: answered by a server here.)
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-runners-cfplane00002.modal.run".into(), md.url.clone());
+    let home = common::signed_in(&served);
+    with_cloudflare(&home);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let step = |name: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/move/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    let run = |id: &str, args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", id).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    step("01-deploy-cf");
+    let (ok, said) = run("cfplane00002", &["planes", "create", "cloudflare"]);
+    assert!(ok && said.contains("The control plane is running: https://superci.acme.workers.dev"), "{said}");
+    step("02-deploy-modal");
+    let (ok, said) = run("mdplane00002", &["planes", "create", "modal"]);
+    assert!(ok && said.contains("The control plane is running: https://acmeorg--superci-plane-mdplane00002.modal.run"), "{said}");
+    // The Cloudflare one: its own containers, and Modal's sandboxes through a runner agent deployed in Modal.
+    step("03-cf-containers");
+    let (ok, said) = run("", &["runners", "create", "cloudflare", "--plane=cfplane00002"]);
+    assert!(ok && said.contains("cloudflare runs jobs now."), "{said}");
+    step("04-cf-modal-agent");
+    let (ok, said) = run("", &["runners", "create", "modal", "--plane=cfplane00002"]);
+    assert!(ok && said.contains("Deploying the Modal runner agent") && said.contains("modal runs jobs now."), "{said}");
+    let agents = served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == "AGENTS").map(|(_, v)| v).unwrap_or_default();
+    assert!(agents.contains("\"cloud\":\"modal\"") && agents.contains("acmeorg--superci-runners-cfplane00002"), "{agents}");
+    let (ok, said) = run("", &["runners", "list", "--plane=cfplane00002"]);
+    assert!(ok && said.contains("1. cloudflare") && said.contains("2. modal"), "{said}");
+    step("06-dashboard");
+    let (_child, link) = common::dashboard(&home);
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); words(&part(&link, "/?p=runners&c=cfplane00002&fragment=1").1) }).find(|p| p.contains("Modal") && !p.contains("Reading your control plane")).unwrap_or_default();
+    assert!(page.contains("Cloudflare") && page.contains("Modal"), "{page}");
+    drop(_child);
+    // Everything moved to the Modal one: its settings and history, then its runners (Cloudflare's through an agent
+    // deployed for it, Modal's its own sandboxes), then the switch; the Cloudflare one says where it went.
+    step("07-move");
+    let (ok, said) = run("", &["planes", "move", "mdplane00002", "--plane=cfplane00002"]);
+    assert!(ok && said.contains("Bringing your runner providers") && said.contains("Moved."), "{said}");
+    assert!(served.aws.modal_plane_settings().iter().any(|(k, v)| k == "AGENTS" && v.contains("\"cloud\":\"cloudflare\"")), "{:?}", served.aws.modal_plane_settings());
+    assert!(served.aws.modal_plane_settings().iter().any(|(k, v)| k == "CONTAINERS" && v == "on"));
+    assert_eq!(cf.store.under("moved_to").len(), 1);
+    step("08-after-move");
+    let (ok, said) = run("", &["runners", "list", "--plane=mdplane00002"]);
+    assert!(ok && said.contains("1. modal") && said.contains("2. cloudflare"), "{said}");
+    // The Cloudflare agent taken out of the Modal one; then both deleted (with what was made for each).
+    step("09-md-remove-cf");
+    let (ok, said) = run("", &["runners", "delete", "cloudflare", "--plane=mdplane00002", "--confirm"]);
+    assert!(ok && said.contains("Removed Cloudflare."), "{said}");
+    step("10-delete-cf");
+    let (ok, said) = run("", &["planes", "delete", "cfplane00002", "--confirm"]);
+    assert!(ok && said.contains("Deleted Cloudflare · Acme."), "{said}");
+    step("11-delete-md");
+    let (ok, said) = run("", &["planes", "delete", "mdplane00002", "--confirm"]);
+    assert!(ok && said.contains("Deleted Modal · acmeorg."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}

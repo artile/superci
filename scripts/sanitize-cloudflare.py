@@ -6,9 +6,11 @@
 As `sanitize-recording.py`, and for Cloudflare: the account's id and name, its workers.dev subdomain (each given with
 -r), every other 32-hex id (namespaces, tags, etags) by a stand-in, the secrets written to a Worker and the container
 registry's credentials blanked, and Workers that are not a control plane's or a runner agent's left out of a listing.
+Modal's calls in the same recording (protobuf, in base64) get only the replacements of the same length (as in
+`sanitize-modal.py`; one of another length found there stops it), and Modal's session token is blanked.
 Look through the result before keeping it.
 """
-import json, re, sys, importlib.util
+import json, re, sys, base64, importlib.util
 
 spec = importlib.util.spec_from_file_location("aws_sanitize", __file__.replace("sanitize-cloudflare.py", "sanitize-recording.py"))
 aws_sanitize = importlib.util.module_from_spec(spec)
@@ -61,7 +63,28 @@ def main():
         path, name = recording.rsplit(":", 1)
         with open(f"{out}/{name}.jsonl", "w") as to:
             for line in open(path):
-                x = tidy(json.loads(line))
+                x = json.loads(line)
+                if "api.modal.com" in x["url"]:
+                    answer = json.loads(x["answer"])
+                    if x["url"].endswith("/AuthTokenGet") and "answers" in answer:
+                        answer["answers"] = [base64.b64encode(b"\x0a\x09(removed)").decode()]
+                    out_answers = []
+                    for a in answer.get("answers", []):
+                        b = base64.b64decode(a)
+                        for real, stand_in in more:
+                            if real.encode() in b and len(real) != len(stand_in):
+                                sys.exit(f"{real} is in Modal's answer, and {stand_in} is not of its length")
+                            b = b.replace(real.encode(), stand_in.encode())
+                        out_answers.append(base64.b64encode(b).decode())
+                    if "answers" in answer:
+                        answer["answers"] = out_answers
+                    if "error" in answer:
+                        for real, stand_in in more:
+                            answer["error"] = answer["error"].replace(real, stand_in)
+                    x["answer"] = json.dumps(answer, separators=(",", ":"))
+                    to.write(json.dumps(x, separators=(",", ":"), sort_keys=True) + "\n")
+                    continue
+                x = tidy(x)
                 for k in ("url", "target", "asked", "answer"):
                     for real, stand_in in more:
                         x[k] = x[k].replace(real, stand_in)
