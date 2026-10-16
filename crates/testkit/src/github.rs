@@ -76,6 +76,9 @@ impl GitHub {
     /// Whether the App was uninstalled.
     pub fn uninstalled(&self) -> bool { self.hub.lock().unwrap().uninstalled }
 
+    /// An object taken out of its bucket (as the bucket's own rule removes old ones).
+    pub fn remove_object(&self, key: &str) { self.hub.lock().unwrap().objects.remove(key); }
+
     /// The buckets' objects' keys (`bucket/key`) and sizes.
     pub fn objects(&self) -> Vec<(String, usize)> { self.hub.lock().unwrap().objects.iter().map(|(k, v)| (k.clone(), v.len())).collect() }
 

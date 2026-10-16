@@ -587,6 +587,15 @@ fn a_second_run_from_the_same_checkout_sends_only_what_changed_on_top_of_the_tre
     let (base, changed) = (part(0), part(1));
     assert!(base.contains("big.txt") && base.contains("soon gone") && base.contains("one\n"), "the base as it was");
     assert!(changed.contains("small.txt") && changed.contains("two\n") && !changed.contains("big.txt") && changed.contains(".superci-removed") && changed.contains("gone.txt\n"), "{changed}");
+    // Most of the tree changed: all of it again, kept as the next base.
+    std::fs::write(dir.join("big.txt"), big.replace("stays", "moved")).unwrap();
+    let (said, _) = run();
+    assert!(said.contains("Sending the working tree (") && !said.contains("what changed"), "{said}");
+    // The base kept gone from the bucket (its own rule removes old ones): all of it again.
+    for (k, _) in served.github.objects().into_iter().filter(|(k, _)| k.contains("/bases/")) { served.github.remove_object(&k) }
+    std::fs::write(dir.join("small.txt"), "three\n").unwrap();
+    let (said, _) = run();
+    assert!(said.contains("Sending the working tree (") && !said.contains("what changed"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -749,6 +758,18 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
     assert!(keep("report", &report)["id"].as_u64().is_some());
     keep("notes", b"plain words, not a zip");
     keep("evil", &zip_of(&[("../outside.txt", b"x")]));
+    // Zips as other tools make them: a folder's own entry, a file deflated (one stored block), packed in a way not
+    // known, a damaged directory, zip64's markers, a name from the root or with a drive, and two bytes only.
+    let with_method = |method: u16, data: &[u8]| { let mut z = zip_of(&[("f.txt", data)]); z[8] = method as u8; let cd = z.len() - 22 - (46 + 5); z[cd + 10] = method as u8; z };
+    let deflated = [&[1u8, 5, 0, 0xfa, 0xff][..], b"hello"].concat();
+    let mut damaged = zip_of(&[("a.txt", b"a")]);
+    let cd = damaged.len() - 22 - (46 + 5);
+    damaged[cd + 2] = 0;
+    let mut zip64 = zip_of(&[("a.txt", b"a")]);
+    let end = zip64.len() - 22;
+    zip64[end + 10] = 0xff; zip64[end + 11] = 0xff;
+    for (name, bytes) in [("folders", zip_of(&[("site/", b""), ("site/a.html", b"<p>a</p>")])), ("deflated", with_method(8, &deflated)), ("odd", with_method(99, b"?????")),
+        ("damaged", damaged), ("zip64", zip64), ("rooted", zip_of(&[("/etc/x", b"x")])), ("drive", zip_of(&[("c:x", b"x")])), ("tiny", b"PK".to_vec())] { keep(name, &bytes); }
     assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "report" })).0, 409);
     assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "a/b:c" })).0, 400);
     assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "none", "names": ["p00000"] })).0, 404);
@@ -756,7 +777,7 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
     assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "late" })).1["ok"], true);
     assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "late", "names": [] })).0, 400);
     assert_eq!(cache("artifact-finish", serde_json::json!({ "token": token, "name": "none", "pieces": [] })).0, 404);
-    assert_eq!(cache("artifacts", serde_json::json!({ "token": token })).1["artifacts"].as_array().map(Vec::len), Some(3));
+    assert_eq!(cache("artifacts", serde_json::json!({ "token": token })).1["artifacts"].as_array().map(Vec::len), Some(11), "(the three, and the eight as other tools make them)");
     assert_eq!(cache("artifact-get", serde_json::json!({ "token": token, "name": "report" })).1["size"], report.len());
     assert_eq!(cache("artifact-get", serde_json::json!({ "token": token, "name": "none" })).0, 404);
     // From the computer: listed, and each fetched: the zip unpacked, the file kept as it is, the bad zip refused.
@@ -782,6 +803,15 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
     assert!(status == 200 && zip.contains("data/results.json") && zip.len() == report.len(), "{status} {}", zip.len());
     for bad in ["/run/artifact?run=x&name=report", "/run/artifact?run=1&name="] { assert_eq!(common::part(&link, bad).0, 400, "{bad}") }
     let _ = child.kill();
+    for (name, want, ok) in [("folders", "1 file", true), ("deflated", "1 file", true), ("tiny", "1 file", true), ("odd", "f.txt is packed in a way this does not know (99)", false), ("damaged", "a damaged directory", false),
+        ("zip64", "over 4 GB (zip64)", false), ("rooted", "a name outside its folder: /etc/x", false), ("drive", "a name outside its folder: c:x", false)] {
+        let to = out.join(name);
+        let (done, said) = cli(&["artifacts", "retrieve", name, &format!("--run={run}"), &format!("--out={}", to.display())]);
+        assert!(done == ok && said.contains(want), "{name}: {said}");
+    }
+    assert_eq!(std::fs::read_to_string(out.join("folders/site/a.html")).unwrap(), "<p>a</p>");
+    assert_eq!(std::fs::read_to_string(out.join("deflated/f.txt")).unwrap(), "hello");
+    assert_eq!(std::fs::read(out.join("tiny/tiny")).unwrap(), b"PK");
     // Deleted by the job; gone from the bucket.
     assert_eq!(cache("artifact-delete", serde_json::json!({ "token": token, "name": "notes" })).1["ok"], true);
     assert_eq!(cache("artifact-delete", serde_json::json!({ "token": token, "name": "notes" })).0, 404);
