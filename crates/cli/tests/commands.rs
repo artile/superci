@@ -366,6 +366,12 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
 
     // With a key that only reads (an agent's, elsewhere): what looks works, what changes is refused.
     let made = json(&home, &["keys", "create", "reader"]).1;
+    // A key's name, how long it lasts, one there already, one not there: each said, nothing written.
+    for (args, said) in [(&["keys", "create", "ci-2"][..], "A key's name is letters and digits"), (&["keys", "create", "abcdefghijklmnopqrstuvwxyz"], "A key's name is letters and digits"),
+        (&["keys", "create", "bot", "--days=400"], "from 1 to 366 days"), (&["keys", "create", "reader"], "There is a key named reader already"), (&["keys", "delete", "nobody", "--confirm"], "There is no key named nobody")] {
+        let (code, v) = json(&home, args);
+        assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains(said), "{args:?}: {code} {v}");
+    }
     let (plane, key) = (made["env"]["SUPERCI_PLANE"].as_str().unwrap().to_string(), made["env"]["SUPERCI_KEY"].as_str().unwrap().to_string());
     let bare = common::temp("reader-home");
     let as_reader = |args: &[&str]| {
