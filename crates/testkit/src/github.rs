@@ -29,6 +29,8 @@ struct Hub {
     next: u64,
     /// `acme/app` is public (anyone can open a pull request that runs code there).
     public: bool,
+    /// S3's objects, by bucket and key (`bucket/key`), as the control plane's buckets keep them.
+    objects: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone, Default)]
@@ -60,6 +62,12 @@ pub(crate) fn iso(ms: u64) -> String {
 impl GitHub {
     /// Makes `acme/app` public, or private again.
     pub fn set_public(&self, public: bool) { self.hub.lock().unwrap().public = public }
+
+    /// An object put in a bucket (`bucket/key`), as the control plane's deploy leaves its program there.
+    pub fn put_object(&self, key: &str, bytes: &[u8]) { self.hub.lock().unwrap().objects.insert(key.to_string(), bytes.to_vec()); }
+
+    /// The buckets' objects' keys (`bucket/key`) and sizes.
+    pub fn objects(&self) -> Vec<(String, usize)> { self.hub.lock().unwrap().objects.iter().map(|(k, v)| (k.clone(), v.len())).collect() }
 
     fn repo(&self) -> Value {
         let mut r = fixture("repo");
@@ -161,6 +169,19 @@ impl GitHub {
             if let Some(run) = path.rsplit('/').next()?.strip_prefix("run-") { return self.hub.lock().unwrap().run_logs.get(&run.parse().ok()?).map(|z| Response::new(200, "application/zip", z.clone())) }
             let id: u64 = path.rsplit('/').next()?.parse().ok()?;
             return self.hub.lock().unwrap().logs.get(&id).map(|l| Response::new(200, "text/plain", l.clone()));
+        }
+        // S3, at `<bucket>.s3.<region>.amazonaws.com` (a link signed or a call signed alike): put, read, and asked of.
+        if let Some(bucket) = url.host_str().and_then(|h| h.strip_suffix(".amazonaws.com")).and_then(|h| h.split_once(".s3.")).map(|(b, _)| b.to_string()) {
+            let key = format!("{bucket}/{}", path.trim_start_matches('/'));
+            let mut h = self.hub.lock().unwrap();
+            let missing = || Response::new(404, "application/xml", format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>{}</Key></Error>", path.trim_start_matches('/')));
+            return Some(match r.method.as_str() {
+                "PUT" => { h.objects.insert(key, r.body.clone()); Response::new(200, "application/xml", "") }
+                "HEAD" => if h.objects.contains_key(&key) { Response::new(200, "application/octet-stream", "") } else { Response::new(404, "application/xml", "") },
+                "GET" => h.objects.get(&key).map(|b| Response::new(200, "application/octet-stream", b.clone())).unwrap_or_else(missing),
+                "DELETE" => { h.objects.remove(&key); Response::new(204, "application/xml", "") }
+                _ => return None,
+            })
         }
         if url.host_str() != Some("api.github.com") { return None }
         let permissions = json!({ "actions": "write", "metadata": "read", "organization_self_hosted_runners": "write" });

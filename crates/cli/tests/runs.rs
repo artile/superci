@@ -513,3 +513,140 @@ fn a_called_workflows_required_input_not_given_is_said_and_nothing_runs() {
     assert!(served.machines.0.lock().unwrap().is_empty(), "no machine started");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A plain GET on this computer (the control plane, or the stand-in for S3): its status, its `location`, its body.
+fn fetch(url: &str) -> (u16, String, Vec<u8>) {
+    use std::io::{Read, Write};
+    let u = url.trim_start_matches("http://");
+    let (host, rest) = u.split_once('/').unwrap_or((u, ""));
+    let mut s = std::net::TcpStream::connect(host).unwrap();
+    s.write_all(format!("GET /{rest} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n").as_bytes()).unwrap();
+    let mut out = vec![];
+    let _ = s.read_to_end(&mut out);
+    let at = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(out.len());
+    let head = String::from_utf8_lossy(&out[..at]).to_string();
+    let location = head.lines().find_map(|l| l.strip_prefix("location: ").or_else(|| l.strip_prefix("Location: "))).unwrap_or_default().to_string();
+    (head.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0), location, out.get(at + 4..).unwrap_or_default().to_vec())
+}
+
+/// What a gzipped tar holds, unpacked as text (its headers name its files; small files' text follows).
+fn gunzipped(bytes: &[u8]) -> String {
+    // (macOS tar pads what it gzips with zeros, which gzip warns of.)
+    let mut gz = Command::new("gzip").arg("-dc").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    { use std::io::Write; gz.stdin.take().unwrap().write_all(bytes).unwrap(); }
+    String::from_utf8_lossy(&gz.wait_with_output().unwrap().stdout).replace('\0', " ")
+}
+
+#[test]
+fn a_second_run_from_the_same_checkout_sends_only_what_changed_on_top_of_the_tree_kept_in_the_bucket() {
+    // A control plane with its own AWS account, whose bucket is ready (its cache program is there), machines its containers.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+    });
+    let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    let big: String = (0..4000).map(|n| format!("line {n} of a file that stays as it is\n")).collect();
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n"), ("big.txt", &big), ("small.txt", "one\n"), ("gone.txt", "soon gone\n")]);
+    assert!(Command::new("git").current_dir(&dir).args(["remote", "add", "origin", "git@github.com:acme/app.git"]).status().unwrap().success());
+    let home = common::temp("runs-base");
+    let run = || {
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_HOME", &home).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{said}");
+        // ("Run ID of … started.")
+        let id = said.lines().find_map(|l| l.strip_prefix("Run ")).and_then(|l| l.split_whitespace().next()).unwrap_or_default().to_string();
+        (said, id)
+    };
+    // The first: all of it, into the bucket, kept there as the base for the next.
+    let (said, first) = run();
+    assert!(said.contains("Sending the working tree (") && !said.contains("part"), "{said}");
+    let kept: Vec<String> = served.github.objects().into_iter().map(|(k, _)| k).filter(|k| k.contains("/bases/")).collect();
+    assert_eq!(kept.len(), 1, "{:?}", served.github.objects());
+    // The run is of the repository its checkout's origin is on GitHub.
+    assert_eq!(served.store.under(&format!("run:{first}"))[0].1["repository"], "acme/app");
+    // The second, after a file changed and one removed: only those, on top of the base.
+    std::fs::write(dir.join("small.txt"), "two\n").unwrap();
+    std::fs::remove_file(dir.join("gone.txt")).unwrap();
+    let (said, second) = run();
+    assert!(said.contains("Sending what changed in the working tree (1 file, 1 removed,"), "{said}");
+    // Its machine's checkout: the base first, then what changed and what was removed.
+    let runner = loop { if let Some(r) = Runner::of_job(&served, &second, "tests") { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let tree = runner.at.trim_end_matches("/_apis/v1").to_string() + "/superci/tree";
+    let part = |n: u32| {
+        let (status, link, _) = fetch(&format!("{tree}?part={n}"));
+        assert_eq!(status, 302, "part {n}");
+        let (status, _, bytes) = fetch(&format!("{}/{}", served.aws.url, link.trim_start_matches("https://")));
+        assert_eq!(status, 200, "{link}");
+        gunzipped(&bytes)
+    };
+    let (base, changed) = (part(0), part(1));
+    assert!(base.contains("big.txt") && base.contains("soon gone") && base.contains("one\n"), "the base as it was");
+    assert!(changed.contains("small.txt") && changed.contains("two\n") && !changed.contains("big.txt") && changed.contains(".superci-removed") && changed.contains("gone.txt\n"), "{changed}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn what_a_run_from_a_computer_cannot_start_or_follow_is_said() {
+    let served = serve(|_| {});
+    let said = |dir: &std::path::Path, args: &[&str]| { let o = superci(&served, dir, args).output().unwrap(); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    // Not in a git checkout.
+    let bare = common::temp("runs-bare");
+    std::fs::create_dir_all(bare.join(".github/workflows")).unwrap();
+    std::fs::write(bare.join(".github/workflows/ci.yml"), "jobs:\n  t:\n    runs-on: superci\n    steps:\n      - run: make\n").unwrap();
+    let (ok, out) = said(&bare, &["runs", "create", "--workflow=.github/workflows/ci.yml"]);
+    assert!(!ok && out.contains("Run it in a git checkout"), "{out}");
+    // A workflow that is not there; one whose job calls a workflow that is not there.
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  build:\n    uses: ./.github/workflows/build.yml\n  again:\n    uses: ./.github/workflows/build.yml\n  other:\n    uses: acme/shared/.github/workflows/x.yml@main\n")]);
+    let (ok, out) = said(&dir, &["runs", "create", "--workflow=.github/workflows/nope.yml"]);
+    assert!(!ok && out.contains(".github/workflows/nope.yml:"), "{out}");
+    let (ok, out) = said(&dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]);
+    assert!(!ok && out.contains(".github/workflows/build.yml, which a job calls:"), "{out}");
+    assert!(served.machines.0.lock().unwrap().is_empty(), "no machine started");
+    // Following: a run named wrong, and one that is not there.
+    let (ok, out) = said(&dir, &["runs", "wait", "abc"]);
+    assert!(!ok && out.contains("Say which run: `superci runs wait ID`"), "{out}");
+    let (ok, out) = said(&dir, &["runs", "wait", "999"]);
+    assert!(!ok && out.contains("No run 999 among this control plane's runs from a computer"), "{out}");
+    // Its artifacts: of a run that is not there; one a run does not have.
+    let (ok, out) = said(&dir, &["artifacts", "list", "--run=999"]);
+    assert!(!ok && out.contains("No such run among this control plane's runs from a computer"), "{out}");
+    let real = checkout();
+    let o = superci(&served, &real, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let (ok, out) = said(&real, &["artifacts", "list", &format!("--run={run}")]);
+    assert!(ok && out.contains("No artifacts"), "{out}");
+    let (ok, out) = said(&real, &["artifacts", "retrieve", "report", &format!("--run={run}")]);
+    assert!(!ok && out.contains("The run has no artifact report."), "{out}");
+    for d in [bare, dir, real] { let _ = std::fs::remove_dir_all(d); }
+}
+
+#[test]
+fn a_steps_lines_that_came_late_are_printed_from_its_log_without_the_runners_times_and_others_as_they_are() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).spawn().unwrap();
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let a = "dddddddd-0000-0000-0000-000000000004";
+    runner.take();
+    runner.steps(&[(a, "Run make test", 1, "inProgress", None, None)]);
+    runner.lines(a, 1, &["first".to_string()]);
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+    // Its whole log: the first line with the runner's time (and the mark a log begins with), then lines that only
+    // look like times: digits with no dash, a date with no time, letters, a time with nothing after it near.
+    let log = ["\u{feff}2026-10-15T10:00:01.0000000Z first", "12345678901234567890123 counted", "2026-10-15 a date, no time, then more", "abcd-ef-ghTxxxxxxxxxxxx letters", "2026-10-15T10:00:02.0000000Zno space after the time at all here", "short"].join("\n");
+    runner.log(1, &log);
+    runner.steps(&[(a, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+    runner.finish("succeeded");
+    let out = cli.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    for l in ["12345678901234567890123 counted", "2026-10-15 a date, no time, then more", "abcd-ef-ghTxxxxxxxxxxxx letters", "2026-10-15T10:00:02.0000000Zno space after the time at all here", "short"] {
+        assert!(said.lines().any(|s| s.trim_end().ends_with(l)), "{l:?} as it is in:\n{said}");
+    }
+    assert_eq!(said.lines().filter(|s| s.trim_end().ends_with("first")).count(), 1, "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

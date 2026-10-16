@@ -240,7 +240,8 @@ impl Aws {
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
-            if !host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com") {
+            // (S3's objects are kept by GitHub's stand-in, which the control plane reaches AWS through.)
+            if (!host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com")) || host.contains(".s3.") {
                 let gh = a.github.lock().unwrap().clone().unwrap_or_default();
                 let mut req = Request::new(&method, &format!("https:/{target}")).with_body(body);
                 for (k, v) in &headers { if !k.eq_ignore_ascii_case("host") { req = req.with_header(k, v) } }
