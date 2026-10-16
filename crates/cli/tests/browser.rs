@@ -118,7 +118,7 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     b.goto(&link);
     b.wait(&shows("Usage"));
     b.click("nav a", "Runners");
-    b.wait(&shows("Runner providers"));
+    b.wait(r#"document.querySelector('button[aria-label="Cloudflare settings"]') !== null"#);
 
     // Its settings: jobs at once, money a month, where its containers start.
     b.click(r#"button[aria-label="Cloudflare settings"]"#, "");
@@ -169,7 +169,8 @@ fn a_runner_provider_is_taken_out_of_the_order_and_put_back_and_awss_on_demand_m
     b.goto(&link);
     b.wait(&shows("Usage"));
     b.click("nav a", "Runners");
-    b.wait(&shows("Runner providers"));
+    // (Its heading shows while the control plane is still read: its providers are what to wait for.)
+    b.wait(r#"document.querySelector('ol.pools [data-cloud="cloudflare"]') !== null"#);
     // Dragged: Cloudflare to the top, and saved.
     b.eval(r#"(() => { const list = document.querySelector('ol.pools'), moved = list.querySelector('[data-cloud="cloudflare"]'), first = list.querySelector('.pool'), dt = new DataTransfer();
         moved.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
@@ -178,7 +179,7 @@ fn a_runner_provider_is_taken_out_of_the_order_and_put_back_and_awss_on_demand_m
     b.wait("document.getElementById('order-note').textContent.includes('Order saved')");
     assert_eq!(order().as_array().map(|o| o.iter().map(|p| p["cloud"].clone()).collect::<Vec<_>>()), Some(vec![serde_json::json!("cloudflare"), serde_json::json!("aws"), serde_json::json!("aws-on-demand")]));
     b.goto(&format!("{link}&p=runners"));
-    b.wait(&shows("Runner providers"));
+    b.wait(r#"document.querySelector('button[aria-label="AWS on-demand settings"]') !== null"#);
     // AWS on-demand's settings, like AWS spot's: its regions (here N. Virginia, where the control plane is set up).
     b.click(r#"button[aria-label="AWS on-demand settings"]"#, "");
     b.wait("document.getElementById('pool-2').open");
