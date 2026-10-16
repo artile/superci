@@ -8,6 +8,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - The cache's list names a run from a computer's repository (it showed an id such as `local-f34a…`), and `superci caches delete --repo=` takes that name.
 - `superci jobs retrieve ID --tests` says where a job's artifacts are when its log has no test results too.
 - An organization removed on Repositories says there what is left to do on GitHub (delete its App): it was said only on another page.
+- After a move to another control plane, the dashboard stopped answering on its Control planes page (it waited for itself); it shows where everything moved.
 
 ## 0.19.6 — 2026-10-16
 - A run from a computer whose job's spot machine AWS took back starts that job again at once, off spot machines, and goes on (it failed before, though its job said it would run again).

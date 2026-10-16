@@ -475,6 +475,13 @@ fn awss_runners_are_removed_and_added_again_from_the_dashboard_their_role_and_ne
     let (status, to, said) = common::post(&link, "/runners/aws-own", &[]);
     assert!(status == 303 && to.contains("p=runners"), "{status} {}", common::words(&said));
     assert_eq!(setting("AWS_RUNNERS").as_deref(), Some("on"));
+    // Its role given the permissions it lacks (a newer version's), and told so; a control plane not known here refused.
+    let puts = || served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().starts_with("Action=PutRolePolicy")).count();
+    let before = puts();
+    let (status, to, _) = common::post(&link, "/permissions/aws", &[("plane", superci_testkit::PLANE)]);
+    assert!(status == 303 && to.contains("#permissions") && puts() > before, "{status} {to}");
+    let (status, _, said) = common::post(&link, "/permissions/aws", &[("plane", "nowhere00000")]);
+    assert!(status >= 400 && common::words(&said).contains("Which control plane?"), "{status}");
     // Removed with its part in AWS: the machines' policy, then their network (as AWS answered a real deletion).
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
     let (status, _, _) = common::post(&link, "/runners/remove", &[("cloud", "aws")]);
@@ -552,6 +559,42 @@ fn a_control_plane_is_deployed_to_aws_from_the_dashboard_as_aws_answered_a_real_
     // Its settings written for it (the key the dashboard reads it with among them).
     let settings = served.aws.settings("deployplane1");
     assert!(settings.iter().any(|(k, _)| k.starts_with("DASHBOARD_KEY_")), "{:?}", settings.iter().map(|(k, _)| k).collect::<Vec<_>>());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn everything_moves_to_another_control_plane_from_the_dashboard_and_the_old_one_says_where() {
+    // The one in use, with GitHub's App and a job it ran; another in the same account (as a deploy leaves one),
+    // reading its settings where the dashboard writes them.
+    let served = serve(|_| {});
+    served.connect_github();
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
+    assert_eq!(served.webhook(served.github.finish(id, "success", "ok", served.now_ms())), 202);
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    // (Its runners stay with it: nothing to bring along.)
+    served.aws.put(&format!("/superci/{}/CONTAINERS", superci_testkit::PLANE), "off");
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = common::dashboard(&home);
+    // (Found in the account, on Control planes.)
+    assert!((0..60).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&new.url) }), "the other one found");
+    let (status, _, said) = common::post(&link, "/plane/move", &[("plane", "nowhere00000")]);
+    assert!(status >= 400 && common::words(&said).contains("That control plane is not known here"), "{status}");
+    let (status, _, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert_eq!(status, 303, "{}", common::words(&said));
+    // The old one passes on what still reaches it; the new one, in use, has GitHub's App and the history.
+    let moved = (0..120).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); served.store.under("moved_to").len() == 1 && new.store.under("standby").is_empty() && !new.store.under("claimed_at").is_empty() });
+    let (_, page) = common::part(&link, "/?p=planes&fragment=1");
+    assert!(moved, "{}", common::words(&page));
+    assert!(served.aws.settings("testplane0002").iter().any(|(k, _)| k == "GITHUB_APP"));
+    assert!(!new.store.under(&format!("job:{id}")).is_empty(), "the job it ran came along");
+    let health: serde_json::Value = ureq::get(&format!("{}/health", served.url)).call().unwrap().body_mut().read_json().unwrap();
+    assert_eq!(health["moved_to"].as_str(), Some(new.url.as_str()), "{health}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

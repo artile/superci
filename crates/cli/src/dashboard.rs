@@ -4552,13 +4552,17 @@ mark();load()})();</script>"#;
         rows.push_str(&more_clouds(&PLANE_SOON));
 
         // How the last move ended, when something stayed behind; what the last delete did.
-        let moving = lock(&self.moving).as_ref().is_some_and(|m| m.result.is_none());
-        let ended = match lock(&self.moving).as_ref().and_then(|m| m.result.as_ref()) {
-            Some(Ok(left)) => {
-                let to = lock(&self.moving).as_ref().and_then(|m| views.iter().find(|v| v.plane.plane_id() == m.to)).map(|v| provider_name(v.plane.cloud())).unwrap_or("the new control plane");
-                format!(r#"<div class="notice">{}<span>Moved to {to}: GitHub and GitLab send their jobs there now.{}</span></div>"#, icon("check"), esc(&left.iter().map(|l| format!(" {l}")).collect::<String>()))
-            }
-            _ => String::new(),
+        // (Its state read once: locked again while held, it would wait for itself.)
+        let (moving, ended) = {
+            let m = lock(&self.moving);
+            let ended = match m.as_ref().map(|m| (m, m.result.as_ref())) {
+                Some((m, Some(Ok(left)))) => {
+                    let to = views.iter().find(|v| v.plane.plane_id() == m.to).map(|v| provider_name(v.plane.cloud())).unwrap_or("the new control plane");
+                    format!(r#"<div class="notice">{}<span>Moved to {to}: GitHub and GitLab send their jobs there now.{}</span></div>"#, icon("check"), esc(&left.iter().map(|l| format!(" {l}")).collect::<String>()))
+                }
+                _ => String::new(),
+            };
+            (m.as_ref().is_some_and(|m| m.result.is_none()), ended)
         };
         let ended = match &self.flash { Some(f) => format!(r#"{ended}<div class="notice">{}<span>{}</span></div>"#, icon("check"), esc(f)), None => ended };
         let (perms, perm_dialogs) = if v.online { self.permissions_card(v) } else { (String::new(), String::new()) };

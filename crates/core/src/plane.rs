@@ -1146,7 +1146,8 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/leave") if self.dashboard(&req) => self.leave(&plane_url).await,
             ("POST", "/move/away") if self.dashboard(&req) => {
                 let to = serde_json::from_slice::<serde_json::Value>(&req.body).unwrap_or_default()["to"].as_str().unwrap_or_default().to_string();
-                if !to.starts_with("https://") { return Ok(Response::text(400, "where to?")) }
+                // (One on this computer too, in a debug build: the tests'.)
+                if !(to.starts_with("https://") || (cfg!(debug_assertions) && to.starts_with("http://127.0.0.1:"))) { return Ok(Response::text(400, "where to?")) }
                 put_json(self.store, "moved_to", &to).await?;
                 Ok(Response::json(&serde_json::json!({ "moved_to": to })))
             }
