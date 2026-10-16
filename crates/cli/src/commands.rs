@@ -461,7 +461,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 Some((url, key)) => (url, key),
                 None => { let mut d = signed_in(); let (v, key) = look(&mut d)?; (v.plane.url().to_string(), crate::cloudflare::plane_key(&key, v.plane.url())) }
             };
-            if args.has("dry-run") { println!("Would cancel run {id}: its jobs not started end, and a running one is told to stop. Nothing was changed."); return Ok(Done { said: vec![], data: json!({ "dry_run": true, "would": format!("cancel run {id}") }) }) }
+            if args.has("dry-run") { return Ok(Done { said: vec![format!("Would cancel run {id}: its jobs not started end, and a running one is told to stop. Nothing was changed.")], data: json!({ "dry_run": true, "would": format!("cancel run {id}") }) }) }
             let got = crate::cloudflare::plane_post(&url, &key, &format!("/runs/{id}/cancel"), &json!({})).map_err(|e| if e.contains("404") { format!("No run {id} here (a newer control plane cancels runs: `superci planes update`; ids are in `superci runs list`).") } else { e })?;
             if let Some(e) = got["error"].as_str() { return Err(e.to_string().into()) }
             let said = if got["github"] == true { format!("GitHub cancels run {id}: its running jobs stop, and their machines end with them.") }

@@ -301,3 +301,72 @@ fn the_order_takes_providers_out_and_puts_them_back_and_each_of_awss_has_its_own
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let settings = || served.aws.settings(superci_testkit::PLANE);
+    let before = settings();
+    // What a command needs and is not given: said, as a usage error (exit 2).
+    for (args, said) in [
+        (&["limits", "update"][..], "Say what to change: `superci limits update"),
+        (&["caches", "update"], "Say what to change: `superci caches update"),
+        (&["caches", "update", "--enabled=maybe"], "--enabled is true or false"),
+        (&["caches", "delete"], "Say whose"),
+        (&["keys", "create"], "Give it a name"),
+        (&["keys", "create", "agent", "--days=many"], "--days is a number of days"),
+        (&["keys", "create", "agent", "--runs", "--max-cpu=8"], "A key has no limits of its own"),
+        (&["keys", "delete"], "Say which: `superci keys delete NAME`"),
+        (&["accounts", "update", "gcp", "--monthly-usd=5"], "Say which cloud's"),
+        (&["accounts", "update", "aws"], "Say what to change: `superci accounts update aws"),
+        (&["accounts", "update", "aws", "--aws-budget=maybe"], "--aws-budget is none, emails, stops or lift"),
+        (&["deliveries", "retrieve", "x1"], "Say which: `superci deliveries retrieve ID`"),
+        (&["runs", "cancel", "x1"], "Say which: `superci runs cancel ID`"),
+        (&["runs", "retrieve", "x1"], "Say which: `superci runs retrieve ID`"),
+        (&["artifacts", "list"], "Say which run: --run=ID"),
+        (&["artifacts", "list", "--run=x1"], "Say which run: --run=ID"),
+        (&["artifacts", "retrieve", "--run=12"], "Say which artifact"),
+        (&["usage", "retrieve", "--period=year"], "--period is day, week or month"),
+    ] {
+        let (code, v) = json(&home, args);
+        assert!(code == 2 && v["error"].as_str().unwrap_or_default().contains(said), "{args:?}: {code} {v}");
+    }
+    // What deletes needs --confirm; with --dry-run, what it would do, and nothing done.
+    let (code, v) = json(&home, &["caches", "delete", "--repo=acme/app"]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("--confirm"), "{v}");
+    for (args, would) in [
+        (&["caches", "delete", "--repo=acme/app", "--confirm", "--dry-run"][..], "take every cache entry of acme/app out"),
+        (&["caches", "delete", "node-modules-1", "--repo=acme/app", "--scope=refs/heads/main", "--confirm", "--dry-run"], "take the cache entry node-modules-1 of acme/app out"),
+        (&["keys", "create", "bot", "--dry-run"], "make a key named bot that only reads, good for 30 days"),
+        (&["keys", "create", "bot", "--runs", "--days=7", "--dry-run"], "make a key named bot that reads and starts runs from a computer, good for 7 days"),
+        (&["keys", "delete", "agent", "--dry-run"], "end the key named agent"),
+        (&["accounts", "update", "aws", "--monthly-usd=50", "--aws-budget=none", "--dry-run"], "no budget in AWS itself"),
+        (&["runs", "cancel", "12", "--dry-run"], "cancel run 12"),
+    ] {
+        let (code, v) = json(&home, args);
+        assert!(code == 0 && v["dry_run"] == true && v["would"].as_str().unwrap_or_default().contains(would), "{args:?}: {code} {v}");
+    }
+    // A run not among those kept; deliveries GitHub has (none here).
+    let (code, v) = json(&home, &["runs", "retrieve", "999"]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("not among the latest"), "{v}");
+    let (code, v) = json(&home, &["deliveries", "list"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(settings(), before, "nothing changed");
+
+    // With a key that only reads (an agent's, elsewhere): what looks works, what changes is refused.
+    let made = json(&home, &["keys", "create", "reader"]).1;
+    let (plane, key) = (made["env"]["SUPERCI_PLANE"].as_str().unwrap().to_string(), made["env"]["SUPERCI_KEY"].as_str().unwrap().to_string());
+    let bare = common::temp("reader-home");
+    let as_reader = |args: &[&str]| {
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).args(args).arg("--json").env("SUPERCI_HOME", &bare).env("SUPERCI_PLANE", &plane).env("SUPERCI_KEY", &key).output().unwrap();
+        (o.status.code().unwrap_or(-1), serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_default())
+    };
+    let (code, v) = as_reader(&["jobs", "list"]);
+    assert_eq!(code, 0, "{v}");
+    let (code, v) = as_reader(&["caches", "delete", "--repo=acme/app", "--confirm"]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("only reads"), "{v}");
+    let _ = std::fs::remove_dir_all(&bare);
+    let _ = std::fs::remove_dir_all(&home);
+}
