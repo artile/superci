@@ -808,6 +808,14 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
     let (status, zip) = common::part(&link, &format!("/run/artifact?run={run}&name=report"));
     assert!(status == 200 && zip.contains("data/results.json") && zip.len() == report.len(), "{status} {}", zip.len());
     for bad in ["/run/artifact?run=x&name=report", "/run/artifact?run=1&name="] { assert_eq!(common::part(&link, bad).0, 400, "{bad}") }
+    // One whose name a file's cannot have, downloaded under a name it can.
+    keep("test results (unit)", &zip_of(&[("r.txt", b"ok")]));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let (base, key) = link.split_once("/?k=").unwrap();
+    let port = base.rsplit(':').next().unwrap();
+    let r = agent.get(&format!("{base}/run/artifact?run={run}&name=test%20results%20%28unit%29")).header("cookie", &format!("superci_local_{port}={key}")).header("sec-fetch-site", "same-origin").call().unwrap();
+    let disposition = r.headers().get("content-disposition").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    assert!(disposition.contains("test_results__unit_.zip"), "{} {disposition}", r.status());
     let _ = child.kill();
     for (name, want, ok) in [("folders", "1 file", true), ("deflated", "1 file", true), ("tiny", "1 file", true), ("odd", "f.txt is packed in a way this does not know (99)", false), ("damaged", "a damaged directory", false),
         ("zip64", "over 4 GB (zip64)", false), ("rooted", "a name outside its folder: /etc/x", false), ("drive", "a name outside its folder: c:x", false)] {

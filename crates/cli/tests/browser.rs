@@ -418,7 +418,8 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
     assert!(setting("AWS_NETWORKS").unwrap().contains("subnet-00000000000000002"));
 
     // A new order: each provider once, and only ones it has (as a page made up would say).
-    for fields in [&[("action", "order"), ("cloud_0", "aws"), ("cloud_1", "aws")][..], &[("action", "order"), ("cloud_0", "nowhere")]] {
+    for fields in [&[("action", "order"), ("cloud_0", "aws"), ("cloud_1", "aws")][..], &[("action", "order"), ("cloud_0", "nowhere")],
+        &[("action", "order"), ("cloud_0", "aws"), ("out_0", "aws")], &[("action", "order"), ("cloud_0", "aws"), ("out_0", "elsewhere")]] {
         let (status, _, said) = common::post(&link, "/routing", fields);
         assert!(status == 400 && common::words(&said).contains("Unknown provider"), "{fields:?}: {status}");
     }

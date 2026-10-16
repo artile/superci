@@ -180,6 +180,11 @@ fn github_is_connected_from_repositories_and_its_jobs_then_run() {
     let manifest = form.split("name=\"manifest\" value=\"").nth(1).unwrap().split('"').next().unwrap().replace("&quot;", "\"").replace("&amp;", "&");
     let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
     assert_eq!((manifest["hook_attributes"]["url"].as_str(), manifest["default_events"][0].as_str()), (Some(format!("{}/webhook", served.url).as_str()), Some("workflow_job")), "{manifest}");
+    // A code that is no code GitHub gives (too short, too long, with what codes have not) is not taken to GitHub.
+    for code in ["abc", &"a".repeat(101), "a1b2c3d4%21%21"] {
+        let (status, _, said) = common::get(&link, &format!("/github/callback?code={code}&state={state}"));
+        assert!(status >= 400 && words(&said).contains("invalid manifest code"), "{code}: {status} {}", words(&said));
+    }
     // GitHub made it and comes back with its code: the App goes into the control plane's settings, then GitHub's
     // page to install it.
     let (status, to, _) = common::get(&link, &format!("/github/callback?code=a1b2c3d4e5f6&state={state}"));
