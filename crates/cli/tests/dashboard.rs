@@ -1,7 +1,7 @@
 //! The dashboard against a control plane served on this computer (`superci_testkit`), a run played to its end first:
 //! each page as the dashboard's own page fetches it (`browser.rs` uses them in Chrome).
 mod common;
-use common::{dashboard, home, part, played, words};
+use common::{dashboard, home, json, part, played, signed_in, words};
 use superci_testkit::serve;
 
 #[test]
@@ -64,6 +64,59 @@ fn an_aws_sign_in_that_aws_does_not_finish_says_so_and_leads_back_to_the_dashboa
     let said = words(&refused);
     assert!(status == 400 && said.contains("AWS did not finish the sign-in") && said.contains("is otherwise malformed") && said.contains("Back to the dashboard") && !said.contains("Something went wrong"), "{status} {said}");
     assert!(refused.contains(r#"href="http://localhost:"#) && refused.contains("?p=overview"), "back to where it was: {refused}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn what_the_dashboard_is_given_is_checked_each_part_on_its_own_and_a_refusal_changes_nothing() {
+    // With Cloudflare's own containers: a GitHub job running there (for removing a provider that runs one).
+    let served = serve(|c| c.containers = true);
+    served.connect_github();
+    let home = signed_in(&served);
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
+    let (mut child, link) = dashboard(&home);
+    let said = |r: (u16, String)| (r.0, words(&r.1));
+
+    // An artifact: a run's id in digits, and a name.
+    for q in ["/run/artifact?run=&name=a", "/run/artifact?run=12a&name=a", "/run/artifact?run=12&name="] {
+        let (status, page) = said(part(&link, q));
+        assert!(status == 400 && page.contains("Which artifact?"), "{q}: {status} {page}");
+    }
+    // A job's log: its id in digits, and a GitLab connection's name as one is written.
+    for q in ["/job/view?id=", "/job/view?id=1x", "/job/view?id=1&gl=Not-This"] {
+        let (status, page) = said(part(&link, q));
+        assert!(status == 400 && page.contains("Which job?"), "{q}: {status} {page}");
+    }
+    assert_eq!(part(&link, &format!("/job/view?id={id}")).0, 200, "its own");
+
+    // GitLab's address: https, and no spaces; a connection named that is not here.
+    for (url, which, refused) in [("http://gitlab.com", "new", "GitLab's address starts with https://"), ("https://git lab.com", "new", "GitLab's address starts with https://"), ("https://gitlab.com", "gnope", "That GitLab is not connected here")] {
+        let (status, _, page) = common::post(&link, "/gitlab/connect", &[("which", which), ("url", url), ("token", superci_testkit::gitlab::TOKEN)]);
+        assert!(status == 400 && words(&page).contains(refused), "{url} {which}: {status} {}", words(&page));
+    }
+    assert!(served.aws.settings(superci_testkit::PLANE).iter().all(|(k, _)| k != "GITLAB"), "nothing connected");
+
+    // Removing a provider: for the control plane it was shown for; one of the known; and not under a running job
+    // unless that job is to be stopped too.
+    let (status, _, page) = common::post(&link, "/runners/remove", &[("plane", "otherplane01"), ("cloud", "cloudflare")]);
+    assert!(status == 409 && words(&page).contains("Another control plane is in use now"), "{status} {}", words(&page));
+    let (status, _, page) = common::post(&link, "/runners/remove", &[("plane", superci_testkit::PLANE), ("cloud", "nowhere")]);
+    assert!(status == 400 && words(&page).contains("Unknown provider"), "{status} {}", words(&page));
+    let (status, _, page) = common::post(&link, "/runners/remove", &[("plane", superci_testkit::PLANE), ("cloud", "cloudflare")]);
+    assert!(status == 409 && words(&page).contains("1 job is running on Cloudflare"), "{status} {}", words(&page));
+    assert!(served.aws.settings(superci_testkit::PLANE).iter().any(|(k, v)| k == "CONTAINERS" && v == "on"), "still there");
+
+    // A key's name: letters and digits, 24 at most; and its days, 1 to 366.
+    let keys = || json(&home, &["keys", "list"]).1["keys"].as_array().map(Vec::len);
+    let before = keys();
+    for (args, refused) in [(&["keys", "create", "agent-1"][..], "letters and digits"), (&["keys", "create", "abcdefghijklmnopqrstuvwxy"], "letters and digits"), (&["keys", "create", "agent", "--days=0"], "1 to 366 days"), (&["keys", "create", "agent", "--days=367"], "1 to 366 days")] {
+        let (code, v) = json(&home, args);
+        assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains(refused), "{args:?}: {v}");
+    }
+    assert_eq!(keys(), before, "no key made");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
