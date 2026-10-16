@@ -664,6 +664,11 @@ fn with_two_live_control_planes_a_command_or_a_change_says_which_one_it_is_for()
     assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains("testplane0002"), "{v}");
     let (code, v) = json(&home, &["planes", "allow", "--dry-run", "--plane=nowhere00000"]);
     assert!(code != 0, "{v}");
+    // Listed, both live (a listing asks for none to be named).
+    let (code, planes) = json(&home, &["planes", "list"]);
+    assert!(code == 0 && planes["control_planes"].as_array().unwrap().iter().filter(|p| p["live"] == true).count() == 2, "{planes}");
+    let o = superci(&home, &["planes", "list"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("testplane0002"), "{}", String::from_utf8_lossy(&o.stdout));
     // Once both are known here, a command that reads names one too.
     let (code, v) = json(&home, &["jobs", "list"]);
     assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("Name one"), "{v}");
