@@ -322,6 +322,8 @@ fn a_workspace_is_made_from_the_switcher_switched_to_and_removed_from_its_settin
     b.goto(&link);
     b.wait(&shows("Usage"));
     // A new one, from the switcher: named, it opens on its own first screen; its folder is kept on this computer.
+    // (Its rows come with the page's live part: on a slow machine a moment after the page itself.)
+    b.wait("[...document.querySelectorAll('#side-switch a')].some(a => a.textContent.includes('New workspace'))");
     b.eval("document.querySelector('details.brand-menu').open = true");
     b.click("#side-switch a", "New workspace…");
     b.wait("document.getElementById('new-workspace').open");
