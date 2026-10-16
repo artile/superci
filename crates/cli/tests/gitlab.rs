@@ -182,3 +182,54 @@ fn github_and_gitlab_jobs_side_by_side_are_each_shown_with_their_own_host_and_ru
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn gitlab_jobs_cancelled_at_each_point_end_here_too_and_one_on_a_spot_machine_aws_took_back_is_run_again() {
+    // Room for one job at a time on its containers, so a second one waits.
+    let served = serve(|c| { c.routing.order = vec![superci_core::plane::Pool { max_jobs: Some(1), ..superci_core::plane::Pool::of("cloudflare") }]; });
+    served.connect_gitlab();
+    let state = |id: u64| served.store.under(&format!("job:gl{id}")).into_iter().next().map(|(_, j)| j).unwrap_or_default();
+    let now = || served.now_ms();
+    // Cancelled while its runner runs it: over here, its runner removed.
+    let (a, pending) = served.gitlab.pending("lint", &["superci"], now());
+    assert!(served.gitlab_webhook(pending) < 300);
+    // A second while the first has the only room: it waits; cancelled, it ends here without a machine.
+    let (b, pending) = served.gitlab.pending("docs", &["superci"], now());
+    assert!(served.gitlab_webhook(pending) < 300);
+    assert_eq!(state(b)["state"], "waiting", "{}", state(b));
+    assert!(served.gitlab_webhook(served.gitlab.finish(b, "canceled", "", now())) < 300);
+    assert_eq!(state(b)["state"], "cancelled", "{}", state(b));
+    assert!(served.gitlab_webhook(served.gitlab.running(a, now())) < 300);
+    let runners_before = served.gitlab.asked.lock().unwrap().iter().filter(|x| x.starts_with("DELETE https://gitlab.com/api/v4/runners/")).count();
+    assert!(served.gitlab_webhook(served.gitlab.finish(a, "canceled", "", now())) < 300);
+    assert_eq!((state(a)["state"].as_str(), state(a)["conclusion"].as_str()), (Some("cancelled"), Some("cancelled")), "{}", state(a));
+    assert_eq!(served.gitlab.asked.lock().unwrap().iter().filter(|x| x.starts_with("DELETE https://gitlab.com/api/v4/runners/")).count(), runners_before + 1);
+    // Cancelled before its runner took it: its machine is left to end (no job on it).
+    let (c, pending) = served.gitlab.pending("build", &["superci"], now());
+    assert!(served.gitlab_webhook(pending) < 300);
+    assert_eq!(state(c)["state"], "launched", "{}", state(c));
+    assert!(served.gitlab_webhook(served.gitlab.finish(c, "canceled", "", now())) < 300);
+    assert_eq!(state(c)["state"], "orphan", "{}", state(c));
+    // Cancelled before its first word came here (GitLab's events arrive side by side): its start, behind, starts nothing.
+    let machines = served.machines.0.lock().unwrap().len();
+    let (d, late) = served.gitlab.pending("deploy", &["superci"], now());
+    assert!(served.gitlab_webhook(served.gitlab.finish(d, "canceled", "", now())) < 300);
+    assert!(served.gitlab_webhook(late) < 300);
+    assert_eq!(served.machines.0.lock().unwrap().len(), machines, "no machine for it");
+    // On a spot machine AWS took back, it failed: run again (GitLab makes a new job of it), off spot machines.
+    served.upkeep();
+    let (e, pending) = served.gitlab.pending("test", &["superci"], now());
+    assert!(served.gitlab_webhook(pending) < 300);
+    assert!(served.gitlab_webhook(served.gitlab.running(e, now())) < 300);
+    {
+        let key = format!("job:gl{e}");
+        let mut m = served.store.0.lock().unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap();
+        j["interrupted"] = serde_json::json!(true);
+        m.insert(key, j.to_string());
+    }
+    assert!(served.gitlab_webhook(served.gitlab.finish(e, "failed", "", now())) < 300);
+    let j = state(e);
+    assert_eq!((j["state"].as_str(), j["error"].as_str()), (Some("failed"), Some("AWS took back its spot machine; run again, off spot machines")), "{j}");
+    assert!(served.gitlab.asked.lock().unwrap().iter().any(|x| x.ends_with(&format!("/jobs/{e}/retry"))), "{:?}", served.gitlab.asked.lock().unwrap());
+}
