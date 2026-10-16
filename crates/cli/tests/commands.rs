@@ -370,3 +370,36 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
     let _ = std::fs::remove_dir_all(&bare);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn the_aws_accounts_own_budget_is_made_raised_made_to_stop_lifted_and_removed_as_aws_answered() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    // Each step answered as a real account answered it (`fixtures/aws/budget`, its control plane's id this one's).
+    let step = |file: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/aws/budget/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[("abcdefghijkl", superci_testkit::PLANE)]);
+    let ok = |args: &[&str]| { let (code, v) = json(&home, args); assert_eq!(code, 0, "{args:?}: {v}"); v };
+    let refused = |args: &[&str]| { let (code, v) = json(&home, args); assert_ne!(code, 0, "{args:?}: {v}"); v["error"].as_str().unwrap_or_default().to_string() };
+    // Refused before AWS is asked: a budget with no monthly limit, an address that is none, nothing to lift.
+    assert!(refused(&["accounts", "update", "aws", "--aws-budget=emails", "--email=someone@example.com"]).contains("A budget in AWS needs the monthly limit"));
+    assert!(refused(&["accounts", "update", "aws", "--monthly-usd=100", "--aws-budget=emails", "--email=not an address"]).contains("That is no email address"));
+    assert!(refused(&["accounts", "update", "aws", "--monthly-usd=100", "--aws-budget=lift"]).contains("There is no budget in AWS to lift"));
+    // Made, with AWS's emails at 80% and 100%.
+    step("02-emails.jsonl");
+    let made = ok(&["accounts", "update", "aws", "--monthly-usd=100", "--aws-budget=emails", "--email=someone@example.com"]);
+    assert_eq!((made["monthly_usd"].as_f64(), made["aws_budget"].as_str()), (Some(100.0), Some("emails")), "{made}");
+    // The limit raised: the budget kept in step, unasked.
+    step("04-raise.jsonl");
+    assert_eq!(ok(&["accounts", "update", "aws", "--monthly-usd=120"])["aws_budget"], "emails");
+    // Made to stop new machines at the limit (AWS knew the new role only after some seconds).
+    step("06-stop.jsonl");
+    assert_eq!(ok(&["accounts", "update", "aws", "--aws-budget=stops"])["aws_budget"], "stops");
+    // The rule taken off the control plane's role; then all of it removed.
+    step("08-lift.jsonl");
+    ok(&["accounts", "update", "aws", "--aws-budget=lift"]);
+    step("09-remove.jsonl");
+    let gone = ok(&["accounts", "update", "aws", "--aws-budget=none"]);
+    assert_eq!((gone["aws_budget"].as_str(), gone["monthly_usd"].as_f64()), (None, Some(120.0)), "{gone}");
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().filter_map(|a| a["target"].as_str().map(str::to_string)).filter(|t| t.starts_with("AWSBudget")).collect();
+    assert!(asked.iter().any(|t| t.ends_with("CreateBudget")) && asked.iter().any(|t| t.ends_with("DeleteBudget")), "{asked:?}");
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+}
