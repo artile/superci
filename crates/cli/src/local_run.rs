@@ -531,8 +531,13 @@ struct Lines {
     held: Vec<(Option<String>, Option<u64>, Vec<String>)>,
     /// The last line printed of each step, and the steps whose lines are all out.
     shown: std::collections::HashMap<String, u64>,
-    /// Lines of a step not had yet when later ones came (first and last), printed once its whole log comes.
-    missing: std::collections::HashMap<String, Vec<(u64, u64)>>,
+    /// Where each step's printed lines stand in its log: the first line of the post they follow on from (a post says
+    /// its first line's number) and how many were printed since. The runner leaves empty lines out of what it sends
+    /// but counts them, so only the step's log says which line the last one printed was (`end_in`).
+    anchor: std::collections::HashMap<String, (u64, u64)>,
+    /// Lines of a step perhaps not had when later ones came (where the lines before stood, as `anchor`, and the
+    /// last line before the post that came next), printed once its whole log comes, if they were not empty.
+    missing: std::collections::HashMap<String, Vec<(u64, u64, u64)>>,
     done: std::collections::HashSet<String>,
     /// Steps known (from the run's status): no steps, no order to keep (an older control plane).
     steps: usize,
@@ -560,8 +565,10 @@ impl Lines {
             let s = *s;
             if self.done.contains(id) { continue }
             let shown = self.shown.entry(id.to_string()).or_insert(0);
-            // What was sent of it as it went, while it follows on from what is out; past a gap (the runner drops lines
-            // that come faster than it sends them), what its machine sent of the step's pages fills it, and on.
+            let anchor = self.anchor.entry(id.to_string()).or_insert((1, 0));
+            // What was sent of it as it went, while it follows on from what is out; past what may be a gap (the
+            // runner drops lines that come faster than it sends them, and empty lines always), what its machine sent
+            // of the step's pages fills it, and on.
             let mut rest = vec![];
             let mut filled = false;
             for (step, start, lines) in self.held.drain(..) {
@@ -569,20 +576,26 @@ impl Lines {
                 if let (Some(st), false) = (start, filled) {
                     if st > *shown + 1 {
                         filled = true;
-                        if let Some(text) = pages(id) { for l in text.lines().skip(*shown as usize) { out.push(without_time(l).to_string()); *shown += 1 } }
+                        if let Some(text) = pages(id) {
+                            let all: Vec<&str> = text.lines().collect();
+                            let from = end_in(&all, *anchor) as usize;
+                            for l in all.iter().skip(from) { out.push(without_time(l).to_string()) }
+                            if all.len() > from { *shown = all.len() as u64; *anchor = (*shown + 1, 0) }
+                        }
                     }
                 }
                 match start {
-                    Some(start) if start <= *shown + 1 => for (k, line) in lines.into_iter().enumerate() { if start + k as u64 > *shown { out.push(line); *shown = start + k as u64 } },
-                    // Still a gap (the runner keeps the last of a page until it is full or the step ends): said, and
-                    // on with what comes; what is missing follows once the step's whole log is here.
+                    Some(start) if start <= *shown + 1 => for (k, line) in lines.into_iter().enumerate() { if start + k as u64 > *shown { out.push(line); *shown = start + k as u64; anchor.1 += 1 } },
+                    // Perhaps a gap (the runner keeps the last of a page until it is full or the step ends), perhaps
+                    // only empty lines left out: on with what comes; what was missing, if anything, follows once the
+                    // step's whole log is here.
                     Some(start) => {
-                        self.missing.entry(id.to_string()).or_default().push((*shown + 1, start - 1));
-                        out.push(format!("··· {} of this step {} when it ends", which(*shown + 1, start - 1), if *shown + 1 == start - 1 { "follows" } else { "follow" }));
+                        self.missing.entry(id.to_string()).or_default().push((anchor.0, anchor.1, start - 1));
                         *shown = start + lines.len() as u64 - 1;
+                        *anchor = (start, lines.len() as u64);
                         out.extend(lines);
                     }
-                    None => { *shown += lines.len() as u64; out.extend(lines) }
+                    None => { *shown += lines.len() as u64; anchor.1 += lines.len() as u64; out.extend(lines) }
                 }
             }
             self.held = rest;
@@ -593,11 +606,18 @@ impl Lines {
             match s["log"].as_u64().and_then(fetch) {
                 Some(text) => {
                     let all: Vec<&str> = text.lines().collect();
-                    for (a, b) in self.missing.remove(id).unwrap_or_default() {
+                    for (start, printed, b) in self.missing.remove(id).unwrap_or_default() {
+                        // From the line after the last one printed, without the empty lines at either end.
+                        let mut a = end_in(&all, (start, printed)) + 1;
+                        let mut b = b.min(all.len() as u64);
+                        while a <= b && blank(all[a as usize - 1]) { a += 1 }
+                        while b >= a && blank(all[b as usize - 1]) { b -= 1 }
+                        if a > b { continue }
                         out.push(format!("··· {} of this step, which came late:", which(a, b)));
-                        out.extend(all.iter().skip(a as usize - 1).take((b + 1 - a) as usize).map(|l| without_time(l).to_string()));
+                        out.extend(all[a as usize - 1..b as usize].iter().map(|l| without_time(l).to_string()));
                     }
-                    out.extend(all.iter().skip(*shown as usize).map(|l| without_time(l).to_string()));
+                    let anchor = self.anchor.get(id).copied().unwrap_or((1, 0));
+                    out.extend(all.iter().skip(end_in(&all, anchor) as usize).map(|l| without_time(l).to_string()));
                 }
                 None if give_up => {
                     let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held).into_iter().partition(|(step, _, _)| step.as_deref() == Some(id));
@@ -626,6 +646,20 @@ fn start_line(record: &Value) -> String {
 }
 
 fn span(s: u64) -> String { if s < 60 { format!("{s} s") } else { format!("{}m {}s", s / 60, s % 60) } }
+
+/// The number of the last line printed of a step, in its log (`all`): `printed` lines on from line `start`, the
+/// empty ones not counted (the runner does not send them). As many lines on when the log has fewer.
+fn end_in(all: &[&str], (start, printed): (u64, u64)) -> u64 {
+    let mut seen = 0;
+    if printed == 0 { return start - 1 }
+    for (k, l) in all.iter().enumerate().skip(start as usize - 1) {
+        if !blank(l) { seen += 1; if seen == printed { return k as u64 + 1 } }
+    }
+    start + printed - 1
+}
+
+/// A log's line with nothing after its time.
+fn blank(l: &str) -> bool { without_time(&format!("{} ", l.trim_end())).trim().is_empty() }
 
 /// Lines of a step by their numbers: "line 4", "lines 7–8".
 fn which(a: u64, b: u64) -> String { if a == b { format!("line {a}") } else { format!("lines {a}–{b}") } }
@@ -678,7 +712,7 @@ mod tests {
         let none = |_: u64| None;
         // Step a sends line 1, then 4 (2 and 3 were dropped); b's first line comes before a's log does.
         let j = json!({ "posts": [post("a", 1, &["a1"]), post("a", 4, &["a4"]), post("b", 1, &["b1"])], "steps": [step("a", 1, "inProgress", None), step("b", 2, "pending", None)] });
-        assert_eq!(l.take(&j, false, &none, &|_| None), ["a1", "··· lines 2–3 of this step follow when it ends", "a4"], "past a gap with no pages, said and on; b waits for a");
+        assert_eq!(l.take(&j, false, &none, &|_| None), ["a1", "a4"], "past a gap with no pages, on; b waits for a");
         let j = json!({ "posts": [], "steps": [step("a", 1, "completed", Some(1)), step("b", 2, "inProgress", None)] });
         assert_eq!(l.take(&j, false, &logs, &|_| None), ["··· lines 2–3 of this step, which came late:", "a2", "a3", "b1"], "what a missed, from its log, its time taken off; then b");
         let j = json!({ "posts": [post("b", 2, &["b2"])], "steps": [step("a", 1, "completed", Some(1)), step("b", 2, "completed", Some(2))] });
@@ -690,15 +724,21 @@ mod tests {
         let mut l = Lines::default();
         let pages = |s: &str| (s == "a").then(|| "2026-10-15T11:00:49.1Z a1\n2026-10-15T11:00:49.2Z a2\n2026-10-15T11:00:49.3Z a3\n".to_string());
         let j = json!({ "posts": [post("a", 1, &["a1"]), post("a", 5, &["a5"])], "steps": [step("a", 1, "inProgress", None)] });
-        assert_eq!(l.take(&j, false, &none, &pages), ["a1", "a2", "a3", "··· line 4 of this step follows when it ends", "a5"], "a gap filled from the pages as far as they go, then said");
+        assert_eq!(l.take(&j, false, &none, &pages), ["a1", "a2", "a3", "a5"], "a gap filled from the pages as far as they go");
         let j = json!({ "posts": [post("a", 4, &["a4", "a5", "a6"])], "steps": [step("a", 1, "inProgress", None)] });
         assert_eq!(l.take(&j, false, &none, &pages), ["a6"], "and on, none twice");
         // A gap the pages do not reach yet: said, and on; its lines once the step's whole log is here.
         let j = json!({ "posts": [post("a", 9, &["a9"])], "steps": [step("a", 1, "inProgress", None)] });
-        assert_eq!(l.take(&j, false, &none, &pages), ["··· lines 7–8 of this step follow when it ends", "a9"]);
+        assert_eq!(l.take(&j, false, &none, &pages), ["a9"]);
         let whole = |_: u64| Some((1..=10).map(|n| format!("2026-10-15T11:00:49.1Z a{n}")).collect::<Vec<_>>().join("\n"));
         let j = json!({ "posts": [], "steps": [step("a", 1, "completed", Some(1))] });
         assert_eq!(l.take(&j, false, &whole, &pages), ["··· line 4 of this step, which came late:", "a4", "··· lines 7–8 of this step, which came late:", "a7", "a8", "a10"]);
+        // The runner leaves empty lines out of a post but counts them: no line twice, none said missing, inside a
+        // post or between two (lines 3 and 5 empty), and the rest from the log after the last one printed.
+        let mut l = Lines::default();
+        let log = |_: u64| Some(["a1", "a2", "", "a4", "", "a6", "a7", "", "a9"].iter().map(|t| format!("2026-10-16T19:55:31.2107257Z {t}")).collect::<Vec<_>>().join("\n"));
+        let j = json!({ "posts": [post("a", 1, &["a1", "a2", "a4"]), post("a", 6, &["a6"]), post("a", 7, &["a7"])], "steps": [step("a", 1, "completed", Some(1))] });
+        assert_eq!(l.take(&j, false, &log, &|_| None), ["a1", "a2", "a4", "a6", "a7", "", "a9"]);
     }
 
     #[test]

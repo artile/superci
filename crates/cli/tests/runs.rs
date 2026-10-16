@@ -51,11 +51,11 @@ fn a_run_from_a_computer_prints_every_line_once_in_order_and_ends_with_how_each_
     let out = cli.wait_with_output().unwrap();
     let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{said}");
-    // Every line once, in the order printed: 1-3 as they came, the gap said, 7-8, then 4-6 once the step ended.
+    // Every line once, in the order printed: 1-3 as they came, 7-8, then 4-6 once the step ended, said as late.
     let printed: Vec<&str> = said.lines().map(str::trim).collect();
     let at = |s: &str| printed.iter().position(|l| l.ends_with(s)).unwrap_or_else(|| panic!("no {s:?} in:\n{said}"));
     for n in 1..=8 { assert_eq!(printed.iter().filter(|l| l.ends_with(&line(n))).count(), 1, "{n} once:\n{said}") }
-    assert!(at(&line(3)) < at("lines 4–6 of this step follow when it ends") && at("follow when it ends") < at(&line(7)) && at(&line(8)) < at("which came late:") && at("which came late:") < at(&line(4)), "{said}");
+    assert!(at(&line(3)) < at(&line(7)) && at(&line(8)) < at("lines 4–6 of this step, which came late:") && at("which came late:") < at(&line(4)) && !said.contains("when it ends"), "{said}");
     // How it ended: each step, then the run.
     let has = |s: &str| printed.iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("no {s:?} in:\n{said}"));
     assert!(has("✓ Run make 7 s") < has("✓ Run make test 7 s") && said.contains("The run ended: success"), "{said}");
