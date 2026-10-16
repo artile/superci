@@ -3598,6 +3598,15 @@ impl<'a> ControlPlane<'a> {
                     }
                 }
                 if said.is_none() && !over { continue }
+                // AWS took its spot machine back, and it did not pass anyway: started again, off spot machines, once
+                // (as a GitHub job is run again; here this control plane is the one that runs it).
+                if record.as_ref().is_some_and(|r| r.interrupted) && said.as_deref() != Some("succeeded") && j["off_spot"] != true {
+                    j["state"] = "pending".into();
+                    j["off_spot"] = true.into();
+                    if let Some(o) = j.as_object_mut() { o.remove("job_id"); o.remove("token"); }
+                    changed = true;
+                    continue
+                }
                 let result = match said.as_deref() { Some("succeeded") => "success", Some("cancelled" | "canceled") => "cancelled", Some("skipped") => "skipped", _ => "failure" };
                 // A job that may fail (`continue-on-error`): failed itself, a success to the jobs that need it and the run.
                 let result = if result == "failure" && j["continue_on_error"] == true { j["failed"] = true.into(); "success" } else { result };
@@ -3814,7 +3823,7 @@ impl<'a> ControlPlane<'a> {
         let message = crate::runner_service::job_message(&given)?;
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, layered: run["layered"] == true, at_ms: now, job_id, ..Default::default() }).await?;
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),
-            local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), ..Default::default() };
+            local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), no_spot: inst["off_spot"] == true, ..Default::default() };
         if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(()) }
         self.indexes(&job_key(&job), &job, true, None).await?;
         self.start_soon(plane_url, &mut job).await
@@ -3981,11 +3990,16 @@ impl<'a> ControlPlane<'a> {
             // AWS took its spot machine back: the job it was running is run again once its run has finished (GitHub
             // runs nothing again before), on an on-demand machine. Not one that passed anyway (the notice came as
             // it ended).
+            // (A run from a computer's is started again by its run, at once: see `advance_run`.)
             if j.interrupted && j.rerun.is_none() && !matches!(ev.conclusion.as_deref(), Some("success" | "skipped" | "neutral")) {
                 j.state = "failed".into();
-                j.error = Some("AWS took back its spot machine; the job is run again, off spot machines once its run has finished".into());
-                j.rerun = Some(Rerun { job_id, run_id: ev.run_id, repo: ev.repo.clone(), name: ev.name.clone(), state: "pending".into(), at_ms: self.clock.now_ms() });
-                self.timer.wake_in(60_000).await?;
+                if j.provider == "local" {
+                    j.error = Some("AWS took back its spot machine; the job is started again, off spot machines".into());
+                } else {
+                    j.error = Some("AWS took back its spot machine; the job is run again, off spot machines once its run has finished".into());
+                    j.rerun = Some(Rerun { job_id, run_id: ev.run_id, repo: ev.repo.clone(), name: ev.name.clone(), state: "pending".into(), at_ms: self.clock.now_ms() });
+                    self.timer.wake_in(60_000).await?;
+                }
             }
             self.settle(plane_url, &mut j).await;
             self.keep(&format!("job:{}", j.job_id), &j).await?;

@@ -382,3 +382,33 @@ fn overviews_period_and_the_runs_and_jobs_tabs_switch_in_the_browser() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_job_whose_spot_machine_aws_took_back_is_started_again_off_spot_and_the_run_goes_on() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+    let run = run_of(&served);
+    let first = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let token = |served: &superci_testkit::Served| served.store.under(&format!("run:{run}"))[0].1["jobs"][0]["token"].as_str().unwrap_or_default().to_string();
+    let was = token(&served);
+    first.take();
+    first.steps(&[("eeeeeeee-0000-0000-0000-000000000005", "Run make", 1, "inProgress", None, None)]);
+    // AWS takes its spot machine back (its machine said so, with its link: here, noted on its job), and the runner
+    // ends the job as failed.
+    let key = served.store.under("job:").into_iter().map(|(k, _)| k).find(|k| !k.contains(':') || k.starts_with("job:")).unwrap();
+    { let mut m = served.store.0.lock().unwrap(); let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap(); j["interrupted"] = true.into(); m.insert(key.clone(), j.to_string()); }
+    first.finish("failed");
+    // Started again, on a machine of its own off spot machines: a new job of the run, and the first said so.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while token(&served) == was || token(&served).is_empty() { assert!(std::time::Instant::now() < end, "not started again: {}", served.store.under(&format!("run:{run}"))[0].1); std::thread::sleep(std::time::Duration::from_millis(50)) }
+    let first_job = served.store.under(&key)[0].1.clone();
+    assert!(first_job["error"].as_str().unwrap_or_default().contains("started again, off spot machines") && first_job.get("rerun").is_none(), "{first_job}");
+    let again = served.store.under("job:").into_iter().find(|(k, _)| *k != key).map(|(_, j)| j).unwrap();
+    assert_eq!(again["no_spot"], true, "{again}");
+    play(&served, &run, &["ok".to_string()], "succeeded");
+    let out = cli.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && said.contains("The run ended: success"), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.6 — unreleased
+- A run from a computer whose job's spot machine AWS took back starts that job again at once, off spot machines, and goes on (it failed before, though its job said it would run again).
 - Runners is one list in order: AWS spot, AWS on-demand, Cloudflare and Modal are alike rows, each with jobs at once, a monthly budget and where it starts machines (AWS's on-demand machines now have regions of their own, like its spot ones). Any row can be taken out of the order and put back, its settings kept; `superci runners order` takes out the ones it does not name. The accounts (AWS's own network, Cloudflare's image, removing one) are under Clouds.
 - Runs from a computer run a job that calls a workflow of the repository (`uses: ./.github/workflows/x.yml`) as GitHub does: its jobs (`caller / job`), with the inputs and secrets the caller gives (`with:`, `secrets: inherit` or named), and its outputs for the jobs that need the caller. (One of another repository is not run from a computer yet.)
 - Runs from a computer run steps side by side as GitHub does: `background: true`, `wait`, `wait-all`, `cancel` and `parallel` groups, refused where GitHub refuses them.
