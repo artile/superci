@@ -455,3 +455,56 @@ fn github_jobs_reach_the_cache_with_githubs_own_token_each_branch_in_its_own_sco
     let (_, listed) = json(&home, &["caches", "list"]);
     assert_eq!(listed["repos"], serde_json::json!([]), "{listed}");
 }
+
+#[test]
+fn the_runs_page_says_how_each_run_stands_how_long_it_took_and_the_job_it_waited_for() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let now = served.now_ms();
+    // Runs of acme/app as the control plane keeps their jobs: (run, attempt, workflow, each job's name, state,
+    // conclusion, minutes from queued to started and to ended).
+    type Job<'a> = (&'a str, &'a str, Option<&'a str>, u64, u64);
+    let runs: Vec<(u64, u64, &str, Vec<Job>)> = vec![
+        (9001, 1, "Build", vec![("lint", "done", Some("success"), 0, 1), ("e2e", "done", Some("success"), 2, 7)]),
+        (9002, 1, "Tests", vec![("unit", "done", Some("failure"), 0, 2), ("types", "done", Some("success"), 0, 1)]),
+        (9003, 1, "Deploy", vec![("ship", "done", Some("cancelled"), 0, 1)]),
+        (9004, 1, "Docs", vec![("pages", "done", Some("skipped"), 0, 0), ("site", "done", Some("success"), 0, 1)]),
+        (9005, 1, "Nightly", vec![("sweep", "done", None, 0, 3)]),
+        (9006, 2, "Retry", vec![("flaky", "done", Some("success"), 0, 1)]),
+        (9007, 1, "", vec![("old", "done", Some("success"), 0, 1)]),
+        (9008, 1, "Live", vec![("long", "running", None, 0, 0)]),
+    ];
+    for (i, (run, attempt, workflow, jobs)) in runs.iter().enumerate() {
+        for (name, state, conclusion, started, ended) in jobs {
+            let (id, queued) = served.github.queue(name, "superci", now);
+            assert_eq!(served.webhook(queued), 202);
+            let key = format!("job:{id}");
+            let mut m = served.store.0.lock().unwrap();
+            let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap();
+            let at = now - (10 - i as u64) * 3_600_000;
+            for (k, v) in [("run_id", serde_json::json!(run)), ("attempt", serde_json::json!(attempt)), ("workflow", serde_json::json!(workflow)), ("name", serde_json::json!(name)), ("state", serde_json::json!(state)),
+                ("conclusion", serde_json::json!(conclusion)), ("at_ms", serde_json::json!(at)), ("started_ms", serde_json::json!(at + started * 60_000))] { j[k] = v }
+            if *state == "done" { j["ended_ms"] = serde_json::json!(at + ended * 60_000) }
+            m.insert(key, j.to_string());
+        }
+    }
+    let (mut child, link) = dashboard(&home);
+    let (_, page) = part(&link, "/?p=runs&fragment=1");
+    let said = words(&page);
+    let row = |run: u64| { let at = page.find(&format!("id={run}&amp;")).unwrap_or_else(|| panic!("no run {run}: {said}")); let end = page[at..].find("</a>").map(|e| at + e).unwrap_or(page.len()); words(&page[at..end]) };
+    // How each stands: passed (skipped jobs too), failed, cancelled, done without a word of how, running.
+    for (run, word) in [(9001, "Passed"), (9002, "Failed"), (9003, "Cancelled"), (9004, "Passed"), (9005, "Done"), (9008, "Running")] { assert!(row(run).contains(word), "{run} {word}: {}", row(run)) }
+    // The job a run of several waited for, and how long it waited for its machine; a run of one says none.
+    assert!(row(9001).contains("Last to end: e2e, 5m after 2m waiting for a machine") && row(9001).contains("7m"), "{}", row(9001));
+    assert!(row(9002).contains("Last to end: unit, 2m") && !row(9002).contains("waiting for a machine"), "{}", row(9002));
+    assert!(!row(9003).contains("Last to end"), "{}", row(9003));
+    // A second attempt says so; a run with no workflow's name goes by its repository.
+    assert!(row(9006).contains("Retry") && row(9006).contains("attempt 2"), "{}", row(9006));
+    assert!(row(9007).contains("app acme"), "{}", row(9007));
+    // A run's own page: its jobs, and GitHub's page of that attempt.
+    let (_, run) = part(&link, "/?p=run&repo=acme%2Fapp&id=9006&attempt=2&fragment=1");
+    assert!(run.contains("https://github.com/acme/app/actions/runs/9006/attempts/2") && words(&run).contains("flaky"), "{}", words(&run));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
