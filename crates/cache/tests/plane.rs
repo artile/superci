@@ -118,3 +118,66 @@ fn githubs_cache_client_and_turbo_save_and_restore_through_the_control_plane_and
     assert_eq!((kept[&hash]["size"].as_u64(), kept[&hash]["taskDurationMs"].as_u64(), kept["nope"].is_null()), (Some(13), Some(4200), true), "{kept}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_run_from_a_computers_artifacts_and_nx_and_bazels_outputs_go_through_the_control_plane() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+    });
+    // A run from a computer (as `superci runs create` asks for one), its job on a machine whose link is this one.
+    let workflow = "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make\n";
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let made: serde_json::Value = serde_json::from_str(&agent.post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key))
+        .send(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "local/app", "ref": "refs/heads/main" }).to_string()).unwrap().body_mut().read_to_string().unwrap()).unwrap();
+    let run = made["run_id"].as_str().unwrap().to_string();
+    let record = served.store.under(&format!("run:{run}"))[0].1.clone();
+    let job_token = record["jobs"][0]["token"].as_str().unwrap().to_string();
+    let token = served.store.under(&format!("rjob:{job_token}"))[0].1["message"]["resources"]["endpoints"][0]["authorization"]["parameters"]["AccessToken"].as_str().unwrap().to_string();
+    let runner = served.store.under("job:").into_iter().find(|(_, j)| j["run_id"].to_string() == run).unwrap().1["runner"].as_str().unwrap().to_string();
+    let link = "machine-cache-link-000000000004";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": runner }).to_string());
+    let dir = std::env::temp_dir().join(format!("superci-cache-plane-local-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let _ends = Ends(std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
+        .env("SUPERCI_CACHE_PLANE", format!("{}/cache/{link}", served.url)).env("SUPERCI_STAND_IN", &served.aws.url)
+        .env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string()).stderr(std::process::Stdio::null()).spawn().unwrap());
+    for _ in 0..100 { if TcpStream::connect(("127.0.0.1", port)).is_ok() { break } std::thread::sleep(std::time::Duration::from_millis(20)) }
+    let path = |url: &str| url.split_once(&format!(":{port}")).unwrap().1.to_string();
+    let artifacts = |op: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let (status, _, b) = call(port, "POST", &format!("/twirp/github.actions.results.api.v1.ArtifactService/{op}"), &[("authorization", &format!("Bearer {token}")), ("content-type", "application/json")], body.to_string().as_bytes());
+        (status, serde_json::from_slice(&b).unwrap_or_default())
+    };
+    // `upload-artifact`: made, its blocks uploaded (as Azure's client puts them), finished; listed, fetched, deleted.
+    let (_, made) = artifacts("CreateArtifact", serde_json::json!({ "name": { "value": "report" }, "version": 4 }));
+    let upload = path(made["signed_upload_url"].as_str().unwrap_or_else(|| panic!("{made}")));
+    let join = if upload.contains('?') { '&' } else { '?' };
+    for (id, part) in [("YmxvY2sx", &b"first-"[..]), ("YmxvY2sy", &b"second"[..])] { assert_eq!(call(port, "PUT", &format!("{upload}{join}comp=block&blockid={id}"), &[], part).0, 201) }
+    let list = b"<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><Latest>YmxvY2sx</Latest><Latest>YmxvY2sy</Latest></BlockList>";
+    assert_eq!(call(port, "PUT", &format!("{upload}{join}comp=blocklist"), &[], list).0, 201);
+    let (_, done) = artifacts("FinalizeArtifact", serde_json::json!({ "name": "report", "size": "12" }));
+    assert!(done["ok"] == true && done["artifact_id"].as_str().is_some(), "{done}");
+    assert_eq!(artifacts("CreateArtifact", serde_json::json!({ "name": "report" })).0, 409);
+    assert_eq!(artifacts("FinalizeArtifact", serde_json::json!({ "name": "never" })).0, 400);
+    let (_, listed) = artifacts("ListArtifacts", serde_json::json!({ "name_filter": "report" }));
+    assert_eq!((listed["artifacts"][0]["name"].as_str(), listed["artifacts"][0]["size"].as_str()), (Some("report"), Some("12")), "{listed}");
+    assert_eq!(artifacts("ListArtifacts", serde_json::json!({ "id_filter": "1" })).1["artifacts"], serde_json::json!([]));
+    let (_, signed) = artifacts("GetSignedArtifactURL", serde_json::json!({ "name": "report" }));
+    assert_eq!(call(port, "GET", &path(signed["signed_url"].as_str().unwrap()), &[], b"").2, b"first-second");
+    assert_eq!(artifacts("GetSignedArtifactURL", serde_json::json!({ "name": "none" })).0, 404);
+    assert_eq!(artifacts("DeleteArtifact", serde_json::json!({ "name": "report" })).1["ok"], true);
+    assert_eq!(artifacts("DeleteArtifact", serde_json::json!({ "name": "report" })).0, 404);
+    assert_eq!(artifacts("MigrateArtifact", serde_json::json!({})).0, 501);
+    // A cache call GitHub's client makes that SuperCI does not stand in for: said, nothing sent on (not GitHub's job).
+    let (status, _, said) = call(port, "POST", "/twirp/github.actions.results.api.v1.CacheService/DeleteCacheEntry", &[("authorization", &format!("Bearer {token}"))], b"{}");
+    assert!(status == 501 && String::from_utf8_lossy(&said).contains("unimplemented"), "{status}");
+    // Nx and Bazel, for the machine's job (a run from a computer's own scope).
+    assert_eq!(call(port, "PUT", "/v1/cache/nx1", &[("authorization", "Bearer superci")], b"nx tar").0, 200);
+    assert_eq!(call(port, "PUT", "/v1/cache/nx1", &[("authorization", "Bearer superci")], b"nx tar").0, 409);
+    assert_eq!(call(port, "GET", "/v1/cache/nx1", &[("authorization", "Bearer superci")], b"").2, b"nx tar");
+    assert_eq!(call(port, "PUT", "/bazel/main/cas/0f1e", &[], b"content").0, 200);
+    assert_eq!(call(port, "GET", "/bazel/main/cas/0f1e", &[], b"").2, b"content");
+    assert_eq!(call(port, "GET", "/bazel/main/ac/0f1e", &[], b"").0, 404);
+    let _ = std::fs::remove_dir_all(&dir);
+}
