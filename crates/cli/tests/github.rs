@@ -655,3 +655,32 @@ fn a_running_github_jobs_lines_as_its_machine_sends_them_are_read_before_github_
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+fn what_github_says_of_the_events_it_sent_is_read_and_one_it_could_not_deliver_is_sent_again_once() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let id = ran(&served, "success");
+    // Listed, newest first: each event, its action, and what the control plane answered.
+    let o = superci(&home, &["deliveries", "list"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && said.contains("workflow_job") && said.contains("queued") && said.contains("completed") && said.contains("202"), "{said}");
+    // One whole: where it was sent, the job it was of, and the answer.
+    let (_, listed) = json(&home, &["deliveries", "list"]);
+    let first = listed[0]["deliveries"].as_array().unwrap().last().unwrap()["id"].as_u64().unwrap();
+    let o = superci(&home, &["deliveries", "retrieve", &first.to_string()]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && said.contains(&format!("sent to {}/webhook", served.url)) && said.contains(&format!("job {id} test")) && said.contains("answer:"), "{said}");
+    let o = superci(&home, &["deliveries", "retrieve", "1"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("GitHub would not say"), "{}", String::from_utf8_lossy(&o.stdout));
+    // One GitHub could not deliver (the control plane was restarting): asked to be sent again, once.
+    let (other, queued) = served.github.queue("lint", "superci", served.now_ms());
+    served.github.delivered(&queued.0, 0, "", &format!("{}/webhook", served.url), served.now_ms());
+    let failed = served.github.redelivered().len();
+    served.upkeep();
+    served.later(120_000);
+    served.upkeep();
+    let asked = served.github.redelivered();
+    assert_eq!(asked.len(), failed + 1, "{asked:?} (job {other})");
+}

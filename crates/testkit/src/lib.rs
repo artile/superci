@@ -91,7 +91,10 @@ impl Served {
         s.write_all(&body).unwrap();
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
-        out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0)
+        let status = out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+        // (Kept among the App's deliveries, as GitHub keeps each.)
+        self.github.delivered(&body, status, out.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or_default(), &format!("{}/webhook", self.url), self.clock.now_ms());
+        status
     }
 
     /// A GitLab connection, as the dashboard leaves it (`GitLab`).

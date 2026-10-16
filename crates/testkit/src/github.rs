@@ -33,6 +33,10 @@ struct Hub {
     jwks_asked: u64,
     /// The App was uninstalled.
     uninstalled: bool,
+    /// Each event delivered to the App's webhook, as GitHub keeps them (docs.github.com/rest/apps/webhooks), newest last;
+    /// and the deliveries asked to be sent again.
+    deliveries: Vec<Value>,
+    attempts: Vec<u64>,
     /// S3's objects, by bucket and key (`bucket/key`), as the control plane's buckets keep them.
     objects: BTreeMap<String, Vec<u8>>,
 }
@@ -75,6 +79,22 @@ impl GitHub {
 
     /// Whether the App was uninstalled.
     pub fn uninstalled(&self) -> bool { self.hub.lock().unwrap().uninstalled }
+
+    /// An event delivered (`body`) to `url`, and what was answered (status 0: GitHub could not reach it), as GitHub
+    /// keeps it among the App's deliveries.
+    pub fn delivered(&self, body: &[u8], status: u16, answer: &str, url: &str, now_ms: u64) {
+        let payload: Value = serde_json::from_slice(body).unwrap_or_default();
+        let mut h = self.hub.lock().unwrap();
+        let id = 40_000_000_000 + h.deliveries.len() as u64 + 1;
+        h.deliveries.push(json!({ "id": id, "guid": format!("0b989ba4-242f-11e5-81e1-{id:012x}"), "delivered_at": iso(now_ms), "redelivery": false, "duration": 0.27,
+            "status": if status == 0 { "Invalid HTTP Response: 503".to_string() } else if status < 300 { "OK".to_string() } else { format!("Invalid HTTP Response: {status}") }, "status_code": status,
+            "event": "workflow_job", "action": payload["action"], "installation_id": INSTALLATION, "repository_id": payload["repository"]["id"], "throttled_at": null, "url": url,
+            "request": { "headers": { "X-GitHub-Event": "workflow_job", "Content-Type": "application/json" }, "payload": payload },
+            "response": { "headers": { "Content-Type": "application/json" }, "payload": answer } }));
+    }
+
+    /// The deliveries asked to be sent again.
+    pub fn redelivered(&self) -> Vec<u64> { self.hub.lock().unwrap().attempts.clone() }
 
     /// An object taken out of its bucket (as the bucket's own rule removes old ones).
     pub fn remove_object(&self, key: &str) { self.hub.lock().unwrap().objects.remove(key); }
@@ -245,7 +265,10 @@ impl GitHub {
                 "permissions": permissions, "repository_selection": "all" })),
             // The App uninstalled (docs.github.com/rest/apps/apps#delete-an-installation-for-the-authenticated-app).
             ("DELETE", ["app", "installations", id]) if *id == INSTALLATION.to_string() => { h.uninstalled = true; Some(Response::new(204, "text/plain", "")) }
-            ("GET", ["app", "hook", "deliveries"]) => ok(200, json!([])),
+            // The App's deliveries: newest first, each without what was sent and answered; one whole; sent again.
+            ("GET", ["app", "hook", "deliveries"]) => ok(200, Value::Array(h.deliveries.iter().rev().map(|d| { let mut d = d.clone(); if let Some(o) = d.as_object_mut() { o.remove("request"); o.remove("response"); } d }).collect())),
+            ("GET", ["app", "hook", "deliveries", id]) => match h.deliveries.iter().find(|d| d["id"].to_string() == *id) { Some(d) => ok(200, d.clone()), None => ok(404, json!({ "message": "Not Found", "status": "404" })) },
+            ("POST", ["app", "hook", "deliveries", id, "attempts"]) => { let id: u64 = id.parse().ok()?; h.attempts.push(id); ok(202, json!({})) }
             // The runner image maker's public list of builds, as GitHub served it (`fixtures/aws/public/image-list.jsonl`).
             ("GET", ["repos", "runs-on", "runner-images-for-aws", "releases"]) => {
                 let recorded: Value = serde_json::from_str(include_str!("../../cli/fixtures/aws/public/image-list.jsonl").lines().next()?).ok()?;
