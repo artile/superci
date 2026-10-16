@@ -145,7 +145,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 14] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach", "tests"];
-const VALUES: [&str; 47] = ["period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 48] = ["user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -716,16 +716,22 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let config = superci_core::plane::Config::new(plane_id.clone());
             use superci_core::aws;
             use futures::executor::block_on;
-            let (image, image_gb) = block_on(aws::latest_image_sized(&http, region, &creds, &config.image_owner, &config.image_name, now()))?;
+            // (`--image=NAME-*`: another image of its owner's; `--user-data=FILE`: a start script of one's own, the machine
+            // left to it (it ends itself), for a bench experiment.)
+            let image_name = args.get("image").unwrap_or(&config.image_name).to_string();
+            let script = match args.get("user-data") { Some(f) => std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?, None => "#!/bin/bash\npoweroff\n".to_string() };
+            let keep = args.has("user-data");
+            let (image, image_gb) = block_on(aws::latest_image_sized(&http, region, &creds, &config.image_owner, &image_name, now()))?;
             let network = block_on(aws::find_network(&http, region, &creds, &plane_id, now()))?;
             let types = block_on(aws::offered_types(&http, region, &creds, &types, now())).unwrap_or(types);
             let tags = vec![("Name".to_string(), "superci-probe".to_string()), ("superci-plane".to_string(), plane_id.clone()), ("superci-job".to_string(), "1".to_string()), ("superci-repo".to_string(), "acme/app".to_string())];
-            let launch = aws::Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: "#!/bin/bash\npoweroff\n", disk_gb: image_gb.max(20), disk_mibs: 125, disk_iops: 3000, tags: &tags, spot, os: "linux",
+            let launch = aws::Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &script, disk_gb: args.get("disk").and_then(|d| d.parse().ok()).unwrap_or(0).max(image_gb).max(20), disk_mibs: 125, disk_iops: 3000, tags: &tags, spot, os: "linux",
                 clock: None, skip: &[], avoid: &[], timer: None, jitter_ms: 0, fleet: spot };
             let mut told = aws::Told::default();
             let started = block_on(aws::run_instance(&http, &creds, &launch, now(), &mut told));
             if let Some(name) = told.template_left.take() { let _ = block_on(aws::delete_template(&http, region, &creds, &name, now())); }
             let said = match &started {
+                Ok(m) if keep => format!("started {} ({} in {}) from {image}, left to its script", m.id, m.kind, m.zone),
                 Ok(m) => { let ended = block_on(aws::terminate_instance(&http, region, &creds, &m.id, now())); format!("started {} ({} in {}), ended: {ended:?}; asked {:?}", m.id, m.kind, m.zone, told.asked) }
                 Err(e) => format!("not started: {e}; refused {:?}", told.refused),
             };

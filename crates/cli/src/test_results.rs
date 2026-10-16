@@ -148,9 +148,19 @@ fn listed(s: &str) -> Option<(char, String, String)> {
         _ => return None,
     };
     if !file.chars().last().is_some_and(|c| c.is_ascii_digit()) { return None }
-    // (Without its time, and a retry's mark.)
+    // (Without its time and a retry's mark, as Playwright adds them: "(2.1s)", "(345ms)", "(1.2m)", "(retry #1)".
+    // Nothing else in brackets: "(legacy feed)" is the test's own title.)
     let mut title = title.trim().to_string();
-    for _ in 0..2 { if title.ends_with(')') { if let Some(at) = title.rfind(" (") { title.truncate(at) } } }
+    let added = |inner: &str| {
+        let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.') && s.bytes().next().is_some_and(|b| b.is_ascii_digit());
+        inner.strip_prefix("retry #").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            || ["ms", "s", "m", "h"].iter().any(|u| inner.strip_suffix(u).is_some_and(num))
+    };
+    for _ in 0..2 {
+        let Some(open) = title.rfind(" (").filter(|_| title.ends_with(')')) else { break };
+        if !added(&title[open + 2..title.len() - 1]) { break }
+        title.truncate(open);
+    }
     Some((mark, match project { Some(p) => format!("[{p}] {title}"), None => title }, file.trim().to_string()))
 }
 
@@ -428,6 +438,17 @@ mod tests {
         // A note said once, however many processes say it.
         let t = read("Error: No tests found\n[a] Error: No tests found\n[a] Error: No tests found");
         assert_eq!(t.notes.len(), 2);
+    }
+
+    #[test]
+    fn a_titles_own_brackets_are_kept_and_only_a_real_failure_is_one() {
+        // Two tests alike but for their bracketed end, one of which really failed: each its own line, and the failed
+        // one a failure (not "failed as expected", which only a test marked to fail is).
+        let log = "Running 3 tests using 1 worker\n  ✓  1 [chromium] › e2e/feed.spec.ts:4:3 › shows the feed (legacy feed) (1.2s)\n  ✓  2 [chromium] › e2e/feed.spec.ts:9:3 › shows the feed (business feed) (845ms)\n  ✘  3 [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (FINDING #25) (2.0m)\n  ✘  4 [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (FINDING #25) (retry #1) (1.9m)\n\n  1) [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (FINDING #25) ───\n\n    Error: expected 1, got 2\n\n  1 failed\n  2 passed (4.1m)";
+        let t = read(log);
+        let ran: Vec<(&str, &str)> = t.ran.iter().map(|r| (r.name.as_str(), r.outcome)).collect();
+        assert_eq!(ran, [("[chromium] shows the feed (legacy feed)", "passed"), ("[chromium] shows the feed (business feed)", "passed"), ("[chromium] keeps the order (FINDING #25)", "failed")]);
+        assert_eq!((t.failed, t.failures[0].name.as_str()), (1, "[chromium] keeps the order (FINDING #25)"));
     }
 
     #[test]
