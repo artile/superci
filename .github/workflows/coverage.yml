@@ -1,0 +1,43 @@
+name: Coverage
+
+# The tests, measured by supercov: lines, branches and MC/DC, each test's own. Run by hand (Actions → Coverage).
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: The build's tools (cargo-zigbuild, worker-build)
+        run: cargo install --locked cargo-zigbuild worker-build
+      - name: Build
+        run: ./build.sh
+      - name: The tests, measured
+        # (In supercov's own copy of the repository: what ./build.sh built is found in this one.)
+        env:
+          SUPERCI_BUILT: ${{ github.workspace }}
+        run: npx -y supercov@4.12.1 -- cargo test --workspace
+      - name: What the tests reach
+        if: always()
+        run: |
+          npx -y supercov@4.12.1 runs latest
+          npx -y supercov@4.12.1 runs latest gaps
+          npx -y supercov@4.12.1 runs latest file crates/cli/src/dashboard.rs --group decision --sort missing --limit 80
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: .supercov/runs
+          include-hidden-files: true
