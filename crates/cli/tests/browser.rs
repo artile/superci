@@ -312,3 +312,39 @@ fn the_default_machine_is_picked_on_workflows_and_the_workspace_renamed_in_setti
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_workspace_is_made_from_the_switcher_switched_to_and_removed_from_its_settings() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    // A new one, from the switcher: named, it opens on its own first screen; its folder is kept on this computer.
+    b.eval("document.querySelector('details.brand-menu').open = true");
+    b.click("#side-switch a", "New workspace…");
+    b.wait("document.getElementById('new-workspace').open");
+    b.fill("#new-workspace input[name=name]", "Globex");
+    b.click("#new-workspace button", "Create workspace");
+    b.wait("new URLSearchParams(location.search).get('w') === 'globex'");
+    b.wait(&shows("Where is your control plane?"));
+    assert!(home.join("workspaces/globex").exists());
+    // Back to the one before, from the switcher: its own pages, nothing of Globex's.
+    b.eval("document.querySelector('details.brand-menu').open = true");
+    b.wait(r#"document.querySelector('#side-switch a.space[href*="w=default"]') !== null"#);
+    b.eval(r#"document.querySelector('#side-switch a.space[href*="w=default"]').click()"#);
+    b.wait("new URLSearchParams(location.search).get('w') === 'default'");
+    b.wait(&shows("Usage"));
+    // Globex removed from its settings: forgotten on this computer, nothing deleted in any cloud.
+    b.goto(&format!("{}&w=globex&p=settings", link.split("&w=").next().unwrap()));
+    b.wait(r#"[...document.querySelectorAll('main button')].some(x => x.textContent === 'Remove')"#);
+    b.eval(r#"[...document.querySelectorAll('main button')].find(x => x.textContent === 'Remove').click()"#);
+    b.wait("document.getElementById('remove-workspace').open");
+    b.click("#remove-workspace button.danger", "Remove from this computer");
+    let gone = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while home.join("workspaces/globex").exists() && std::time::Instant::now() < gone { std::thread::sleep(std::time::Duration::from_millis(100)) }
+    assert!(!home.join("workspaces/globex").exists() && home.join("workspaces/default/sign-ins.json").exists());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
