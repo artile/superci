@@ -246,6 +246,11 @@ impl GitHub {
             // The App uninstalled (docs.github.com/rest/apps/apps#delete-an-installation-for-the-authenticated-app).
             ("DELETE", ["app", "installations", id]) if *id == INSTALLATION.to_string() => { h.uninstalled = true; Some(Response::new(204, "text/plain", "")) }
             ("GET", ["app", "hook", "deliveries"]) => ok(200, json!([])),
+            // The runner image maker's public list of builds, as GitHub served it (`fixtures/aws/public/image-list.jsonl`).
+            ("GET", ["repos", "runs-on", "runner-images-for-aws", "releases"]) => {
+                let recorded: Value = serde_json::from_str(include_str!("../../cli/fixtures/aws/public/image-list.jsonl").lines().next()?).ok()?;
+                Some(Response::new(recorded["status"].as_u64()? as u16, "application/json; charset=utf-8", recorded["answer"].as_str()?.to_string()))
+            }
             // Who a name is, and the App made from the dashboard's manifest (docs.github.com/rest/apps/apps#create-a-github-app-from-a-manifest).
             ("GET", ["users", OWNER]) => ok(200, fixture("org")),
             ("GET", ["users", _]) => ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/users/users#get-a-user", "status": "404" })),

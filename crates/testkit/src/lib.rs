@@ -297,9 +297,15 @@ impl Aws {
 
     /// The same, with the answer's headers.
     pub fn handle_full(&self, method: &str, url: &str, target: &str, asked: &str) -> (u16, Vec<(String, String)>, String) {
-        let (status, headers, answer) = match self.answer(url, target, asked) {
-            (400, a) if a["__type"] == "SuperCITestkitUnknown" => self.replay(method, url, target, asked).unwrap_or((400, vec![], a.to_string())),
-            (status, a) => (status, vec![], a.to_string()),
+        // (AWS's own public parameters, `/aws/service/…`, are not the account's: as a recording has them.)
+        let public = target == "AmazonSSM.GetParameter" && asked.contains("\"/aws/service/");
+        let recorded = if public { self.replay(method, url, target, asked) } else { None };
+        let (status, headers, answer) = match recorded {
+            Some(r) => r,
+            None => match self.answer(url, target, asked) {
+                (400, a) if a["__type"] == "SuperCITestkitUnknown" => self.replay(method, url, target, asked).unwrap_or((400, vec![], a.to_string())),
+                (status, a) => (status, vec![], a.to_string()),
+            },
         };
         if status == 400 && answer.contains("SuperCITestkitUnknown") { self.unanswered.lock().unwrap().push(format!("{target} {url} {}", asked.chars().take(200).collect::<String>())) }
         self.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": target, "asked": asked, "status": status, "answer": answer }));

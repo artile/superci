@@ -484,3 +484,36 @@ fn awss_runners_are_removed_and_added_again_from_the_dashboard_their_role_and_ne
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn an_aws_accounts_look_is_said_by_the_cli_and_on_add_runners_as_aws_answered_each_kind_of_account() {
+    // Each kind as a real account answered (`fixtures/aws/…/look.jsonl`): what the CLI says, and what Add runners shows.
+    let cases = [
+        ("classic/look", include_str!("../fixtures/aws/classic/look.jsonl"), "Kind          open: nothing SuperCI does is refused",
+            &["Nothing SuperCI does there is refused", "64 on-demand · 96 spot", "Not in Canada, Stockholm, which this account may also use", "Copy into Canada"][..]),
+        ("project-activated/look", include_str!("../fixtures/aws/project-activated/look.jsonl"), "Kind          an AWS project (AWS's new sign-up): it works in eu-north-1 only, with spot machines",
+            &["A project of AWS's new sign-up: it works in Stockholm only", "The other 11 are refused. By its AWS organization (policy p-example1)", "16 on-demand · 32 spot", "Runner image In Stockholm", "Managed from account 222222222222"]),
+        ("project-paid/look", include_str!("../fixtures/aws/project-paid/look.jsonl"), "Kind          an AWS project (AWS's new sign-up): it works in eu-north-1 only, and spot machines are refused",
+            &["AWS keeps it to Stockholm and allows it no spot machines, so jobs run on on-demand machines", "Spot machines Not allowed By its AWS organization (policy p-example2)", "5 on-demand · 5 spot",
+                "Not in Stockholm No job can start there until it is copied in", "Managed from account 222222222222"]),
+    ];
+    for (name, recording, said, shown) in cases {
+        let served = serve(|_| {});
+        let home = common::signed_in(&served);
+        served.aws.replaying(recording, &[]);
+        let o = superci(&home, &["accounts", "retrieve", "aws"]);
+        let text = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success() && text.contains(said), "{name}: {text}{}", String::from_utf8_lossy(&o.stderr));
+        let (mut child, link) = common::dashboard(&home);
+        // (Looked at in the background once signed in: shown when it is in.)
+        let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=add-runners&fragment=1").1) }).find(|p| p.contains("AWS account aws 111111111111") && !p.contains("Looking")).unwrap_or_default();
+        for want in shown { assert!(page.contains(want), "{name}: no {want:?} in {page}") }
+        // Looked at again when asked (on the page's next view).
+        let before = served.aws.asked.lock().unwrap().len();
+        let (status, _, _) = common::post(&link, "/aws/look", &[]);
+        assert!(status < 400, "{name}: {status}");
+        assert!((0..40).any(|_| { common::part(&link, "/?p=add-runners&fragment=1"); std::thread::sleep(std::time::Duration::from_millis(100)); served.aws.asked.lock().unwrap().len() > before }), "{name}: looked again");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
