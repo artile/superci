@@ -748,3 +748,29 @@ fn a_personal_accounts_app_registers_its_runners_in_the_repository_and_its_manif
     let (status, _, said) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "nobody-here")]);
     assert!(status == 400 && words(&said).contains("There is no GitHub organization or user named nobody-here"), "{status} {}", words(&said));
 }
+
+#[test]
+fn a_github_jobs_lines_go_to_the_step_that_was_going_and_a_step_of_the_same_second_from_its_own_first_line() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
+    let t = |s: u32, text: &str| format!("2026-10-15T10:00:{s:02}.5000000Z {text}");
+    let log = [t(0, "##[group]Set up job"), t(0, "Current runner version: '2.329.0'"), t(1, "##[endgroup]"), t(1, "set up, still"), t(1, "##[group]Run make test"), t(2, "test 1 passed"),
+        t(3, "Post job cleanup."), t(3, "removing the checkout"), t(3, "Cleaning up orphan processes")].join("\n");
+    assert_eq!(served.webhook(served.github.finish(id, "success", &log, served.now_ms())), 202);
+    let step = |n: u64, name: &str, from: u32, to: u32| serde_json::json!({ "name": name, "status": "completed", "conclusion": "success", "number": n,
+        "started_at": format!("2026-10-15T10:00:{from:02}Z"), "completed_at": format!("2026-10-15T10:00:{to:02}Z") });
+    served.github.set_steps(id, serde_json::json!([step(1, "Set up job", 0, 1), step(2, "Run make test", 1, 3), step(3, "Post Run actions/checkout@v5", 3, 3), step(4, "Complete job", 3, 4)]));
+    let (_child, link) = dashboard(&home);
+    let (_, view) = part(&link, &format!("/job/view?id={id}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap_or_else(|_| panic!("{view}"));
+    let lines = |name: &str| view["steps"].as_array().unwrap().iter().find(|s| s["name"] == name).map(|s| s["lines"].to_string()).unwrap_or_else(|| panic!("no {name}: {view}"));
+    // A line of the second a step began goes to it only from its heading on.
+    assert!(lines("Set up job").contains("set up, still") && !lines("Set up job").contains("test 1 passed"), "{}", lines("Set up job"));
+    assert!(lines("Run make test").contains("test 1 passed") && !lines("Run make test").contains("removing the checkout"), "{}", lines("Run make test"));
+    assert!(lines("Post Run actions/checkout@v5").contains("removing the checkout"), "{}", lines("Post Run actions/checkout@v5"));
+    assert!(lines("Complete job").contains("Cleaning up orphan processes"), "{}", lines("Complete job"));
+}
