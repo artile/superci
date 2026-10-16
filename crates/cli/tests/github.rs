@@ -684,3 +684,24 @@ fn what_github_says_of_the_events_it_sent_is_read_and_one_it_could_not_deliver_i
     let asked = served.github.redelivered();
     assert_eq!(asked.len(), failed + 1, "{asked:?} (job {other})");
 }
+
+#[test]
+fn usage_says_what_jobs_cost_beside_githubs_runners_how_many_did_not_run_and_the_wait_for_a_machine() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    // A job that waited half a minute for its machine and ran ten minutes; one asking for what nothing here runs.
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    served.later(30_000);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
+    served.later(600_000);
+    assert_eq!(served.webhook(served.github.finish(id, "success", &github_log(), served.now_ms())), 202);
+    let (_, refused) = served.github.queue("gpu", "superci/gpu=h100", served.now_ms());
+    assert_eq!(served.webhook(refused), 202);
+    let (code, v) = json(&home, &["usage", "retrieve", "--period=day"]);
+    assert_eq!(code, 0, "{v}");
+    let o = superci(&home, &["usage", "retrieve"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("2 jobs, 1 ran, 1 did not") && said.contains("saved") && said.contains("Median wait for a machine: 30 s"), "{said}");
+}
