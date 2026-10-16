@@ -3336,6 +3336,8 @@ mark();load()})();</script>"#;
                 _ => None,
             }
         };
+        // (Read now, or what was kept: only a reading made now is kept, as of now.)
+        let fresh = cached.is_none();
         let (views, modal, quotas, looked) = match cached { Some(v) => (v, None, HashMap::new(), None), None => std::thread::scope(|s| {
             let handles: Vec<_> = planes.iter().map(|(p, keyed)| { let key = key.clone(); s.spawn(move || view::plane_view(p, keyed.then_some(key.as_str()))) }).collect();
             let looking = look_creds.as_ref().map(|(creds, _)| s.spawn(move || {
@@ -3381,7 +3383,10 @@ mark();load()})();</script>"#;
                 d.set_about(about);
             });
         }
-        d.views = if complete { Some((views.clone(), now_ms())) } else { None };
+        // A reading made now is kept, as of now. One shown from what was kept stays as old as it is (else a page
+        // asked for every second or two would keep it young forever, and it would never be read again), and does
+        // not replace one read in the background meanwhile.
+        if fresh { d.views = if complete { Some((views.clone(), now_ms())) } else { None } }
         Dashboard::measure(shared, &mut d);
         d.check_permissions();
         // The page shows, and changes, the control plane in use.

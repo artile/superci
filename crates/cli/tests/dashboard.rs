@@ -120,3 +120,26 @@ fn what_the_dashboard_is_given_is_checked_each_part_on_its_own_and_a_refusal_cha
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_page_asked_for_often_still_shows_what_happened_a_few_seconds_ago() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    // Read once, with no jobs yet.
+    assert!(!words(&part(&link, "/?p=jobs&fragment=1").1).contains("build"));
+    // A job starts; the page is asked for every half second (several tabs, or a page that looks often).
+    let (id, queued) = served.github.queue("build", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
+    let (began, mut shown) = (std::time::Instant::now(), false);
+    while began.elapsed() < std::time::Duration::from_secs(15) {
+        if words(&part(&link, "/?p=jobs&fragment=1").1).contains("build") { shown = true; break }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(shown, "the new job not shown after 15 s of asking every half second");
+    assert!(began.elapsed() < std::time::Duration::from_secs(8), "shown only after {:?}", began.elapsed());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

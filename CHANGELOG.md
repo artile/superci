@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.7 — unreleased
+- A dashboard page asked for often (several tabs open, say) shows what changed within seconds: it showed the reading it had when the page was first opened, for as long as it was asked for every second or two.
 - `superci runs cancel ID`, and Cancel run on a run's page: a run from a computer stops as GitHub's Cancel stops one (its jobs not started end; a running one's runner is told to stop, with five minutes for its steps, then its machine ends); a GitHub run is cancelled by GitHub, asked with your App's token.
 
 ## 0.19.6 — 2026-10-16
