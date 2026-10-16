@@ -3747,6 +3747,22 @@ fn a_machine_keeps_githubs_cache_in_its_regions_bucket_as_its_jobs_token_allows(
     assert_eq!(json(&removed)["removed"], 2, "main's, and the one the pull request began");
     assert!(http.clouds.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1.contains("/c/gh77/") && c.1.ends_with("/b1")), "its pieces deleted from the bucket");
     assert_eq!(call("lookup", serde_json::json!({ "token": pr, "key": "deps-1", "version": v })).1["hit"], false);
+    // A repository with nothing kept takes nothing out; one named by its namespace (as kept) is found by it.
+    let delete = |repo: &str| json(&dash(Request::new("POST", &format!("{PLANE_URL}/caches/delete")).with_body(serde_json::json!({ "repo": repo }).to_string())))["removed"].clone();
+    assert_eq!(delete("acme/nothing"), 0);
+    assert_eq!(delete("gh77"), 1, "what is left of it (deps-2's entry, the pull request's)");
+    for ns in ["gl1-5", "local-abc"] { assert_eq!(delete(ns), 0, "{ns}") }
+}
+
+#[test]
+fn a_label_asking_for_more_than_allowed_is_said_so() {
+    let routing = superci_core::plane::Routing::default();
+    let spec = |cpu: Option<u32>, ram: Option<u32>| superci_core::spec::Spec { cpu, ram_gb: ram, ..Default::default() };
+    assert!(routing.too_large(&spec(Some(32), Some(256))).is_none());
+    assert_eq!(routing.too_large(&spec(Some(33), None)).as_deref(), Some("it asks for 33 CPUs; the most allowed is 32 (set in the dashboard)"));
+    assert_eq!(routing.too_large(&spec(None, Some(257))).as_deref(), Some("it asks for 257 GB of memory; the most allowed is 256 GB (set in the dashboard)"));
+    let small = superci_core::plane::Routing { max_cpu: Some(8), ..Default::default() };
+    assert!(small.too_large(&spec(None, Some(65))).is_some() && small.too_large(&spec(Some(8), Some(64))).is_none());
 }
 
 #[test]
