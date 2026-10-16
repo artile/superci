@@ -511,3 +511,29 @@ fn the_runs_page_says_how_each_run_stands_how_long_it_took_and_the_job_it_waited
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_github_job_cancelled_while_it_waits_for_room_or_before_its_first_word_came_starts_nothing() {
+    // Room for one job at a time on its containers.
+    let served = serve(|c| { c.routing.order = vec![superci_core::plane::Pool { max_jobs: Some(1), ..superci_core::plane::Pool::of("cloudflare") }]; });
+    served.connect_github();
+    let state = |id: u64| served.store.under(&format!("job:{id}")).into_iter().next().map(|(_, j)| j).unwrap_or_default();
+    let (a, queued) = served.github.queue("lint", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    // A second waits for the room the first has; cancelled, it ends here, and the upkeep starts nothing for it.
+    let (b, queued) = served.github.queue("docs", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(state(b)["state"], "waiting", "{}", state(b));
+    assert_eq!(served.webhook(served.github.cancel(b, served.now_ms())), 202);
+    assert_eq!(state(b)["state"], "cancelled", "{}", state(b));
+    assert_eq!(served.webhook(served.github.start(a)), 202);
+    assert_eq!(served.webhook(served.github.finish(a, "success", &github_log(), served.now_ms())), 202);
+    served.upkeep();
+    assert_eq!(served.machines.0.lock().unwrap().len(), 1, "only the first's machine");
+    // Its end came before its queued event (GitHub sends a job's events side by side): the queued one starts nothing.
+    let (c, late) = served.github.queue("deploy", "superci", served.now_ms());
+    assert_eq!(served.webhook(served.github.cancel(c, served.now_ms())), 202);
+    served.webhook(late);
+    assert!(!["launching", "launched", "running"].contains(&state(c)["state"].as_str().unwrap_or_default()), "{}", state(c));
+    assert_eq!(served.machines.0.lock().unwrap().len(), 1, "no machine for it");
+}
