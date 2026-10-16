@@ -537,3 +537,40 @@ fn a_github_job_cancelled_while_it_waits_for_room_or_before_its_first_word_came_
     assert!(!["launching", "launched", "running"].contains(&state(c)["state"].as_str().unwrap_or_default()), "{}", state(c));
     assert_eq!(served.machines.0.lock().unwrap().len(), 1, "no machine for it");
 }
+
+#[test]
+fn a_job_past_a_spend_limit_fails_saying_which_limit_and_one_under_them_starts() {
+    // $80 spent today on Cloudflare's containers (the only provider); a job queued past each limit.
+    let refused = |set: fn(&mut superci_core::plane::Routing)| -> serde_json::Value {
+        let served = serve(move |c| { c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")]; set(&mut c.routing) });
+        served.connect_github();
+        let now = served.now_ms();
+        {
+            let mut m = served.store.0.lock().unwrap();
+            m.insert("job:999".into(), serde_json::json!({ "job_id": 999, "run_id": 1, "repo": "acme/app", "state": "done", "cloud": "cloudflare", "at_ms": now - 60_000, "started_ms": now - 50_000, "ended_ms": now - 10_000, "cost_usd": 80.0, "installation_id": 1, "seen_in_progress": true }).to_string());
+            m.insert(format!("day:{:06}", now / 86_400_000), serde_json::json!({ "spend": { "cloudflare": 80.0 }, "hours": [] }).to_string());
+        }
+        let (id, queued) = served.github.queue("test", "superci", now);
+        served.webhook(queued);
+        // (It fails at GitHub with the reason: a small machine's runner takes it and says why.)
+        let j = served.store.under(&format!("job:{id}")).into_iter().next().map(|(_, j)| j).unwrap_or_default();
+        assert!(j["state"] == "failed" && j["failed_fast"] == true, "{j}");
+        j
+    };
+    let said = |j: &serde_json::Value| format!("{} {}", j["state"], j["error"]);
+    let j = refused(|r| r.monthly_usd = Some(60.0));
+    assert!(said(&j).contains("reached its limit of $60 a month ($80.00 spent on machines)"), "{}", said(&j));
+    let j = refused(|r| r.daily_usd = Some(50.0));
+    assert!(said(&j).contains("reached its limit of $50 a day ($80.00 spent on machines today)"), "{}", said(&j));
+    let j = refused(|r| r.order[0].monthly_usd = Some(40.0));
+    assert!(said(&j).contains("Cloudflare reached its $40 a month"), "{}", said(&j));
+    let j = refused(|r| r.order[0].off = true);
+    assert!(said(&j).contains("Cloudflare is turned off"), "{}", said(&j));
+    // Under each: it starts.
+    let served = serve(|c| { c.routing.order = vec![superci_core::plane::Pool { monthly_usd: Some(500.0), ..superci_core::plane::Pool::of("cloudflare") }]; c.routing.monthly_usd = Some(1000.0); c.routing.daily_usd = Some(900.0); });
+    served.connect_github();
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    served.webhook(queued);
+    let j = served.store.under(&format!("job:{id}")).into_iter().next().map(|(_, j)| j).unwrap_or_default();
+    assert!(j["state"] == "launched" && j["failed_fast"].is_null(), "{j}");
+}
