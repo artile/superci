@@ -6198,13 +6198,16 @@ fn respond(hub: &Hub, req: &Req) -> Response {
     carry(answer, &name)
 }
 
-/// A redirect to one of the dashboard's own pages, with its workspace named in the address.
+/// A redirect within the dashboard (a page, a cloud's sign-in page), with its workspace named in the address. Not
+/// another site's, nor the list of workspaces (it is no workspace's).
 fn carry(mut answer: Response, workspace: &str) -> Response {
     for (_, v) in answer.headers.iter_mut().filter(|(k, _)| k == "location") {
-        if v != "/" && !v.starts_with("/?") { continue }
-        let query = v.trim_start_matches('/').trim_start_matches('?').to_string();
-        if query.split('&').any(|kv| kv.starts_with("w=")) { continue }
-        *v = format!("/?{query}{}w={workspace}", if query.is_empty() { "" } else { "&" });
+        if !v.starts_with('/') || v.starts_with("//") { continue }
+        // (A part of the page it leads to, `#…`, stays at the end.)
+        let (before, hash) = v.split_once('#').map(|(b, h)| (b.to_string(), format!("#{h}"))).unwrap_or((v.clone(), String::new()));
+        let (path, query) = before.split_once('?').map(|(p, q)| (p.to_string(), q.to_string())).unwrap_or((before.clone(), String::new()));
+        if path == "/workspaces" || query.split('&').any(|kv| kv.starts_with("w=")) { continue }
+        *v = format!("{path}?{query}{}w={workspace}{hash}", if query.is_empty() { "" } else { "&" });
     }
     answer
 }
@@ -6521,6 +6524,19 @@ mod tests {
     /// Two companies on one computer: each workspace has its own sign-ins and its own pages, a page's address says
     /// which it is of, and nothing that changes something picks one by itself.
     #[test]
+    fn a_redirect_within_the_dashboard_carries_its_workspace() {
+        let to = |at: &str| carry(Response::redirect(at), "acme").headers.iter().find(|(k, _)| k == "location").map(|(_, v)| v.clone()).unwrap_or_default();
+        assert_eq!(to("/?p=runners"), "/?p=runners&w=acme");
+        assert_eq!(to("/"), "/?w=acme");
+        assert_eq!(to("/connect/cloudflare"), "/connect/cloudflare?w=acme");
+        assert_eq!(to("/?p=planes#aws-account"), "/?p=planes&w=acme#aws-account");
+        assert_eq!(to("/?p=runners&w=globex"), "/?p=runners&w=globex");
+        assert_eq!(to("/workspaces"), "/workspaces");
+        assert_eq!(to("https://github.com/settings"), "https://github.com/settings");
+        assert_eq!(to("//example.com/"), "//example.com/");
+    }
+
+    #[test]
     fn workspaces_are_worlds_of_their_own() {
         let root = std::env::temp_dir().join(format!("superci-hub-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
         Store::under(&root, "acme").write(&Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme-team".into() }), ..Default::default() }).unwrap();
@@ -6543,6 +6559,12 @@ mod tests {
         assert!(page.contains(r#"<form method="post" action="/aws/signin"><input type="hidden" name="w" value="acme">"#), "{page}");
         let (status, to, said) = ask("POST", "/aws/signin", &[], "w=acme&next=");
         assert!(status == 303 && to.contains("signin.aws.amazon.com"), "{status} {to} {said}");
+        // `superci login cloudflare --workspace=acme` (and modal): its tab goes on to that cloud's page, in acme.
+        lock(&hub.board("acme")).task = Some(Task::Login(Some("cloudflare")));
+        let (status, to, _) = ask("GET", "/", &[("w", "acme")], "");
+        assert!((300..400).contains(&status) && to.starts_with("/connect/cloudflare") && to.contains("w=acme"), "{status} {to}");
+        let (status, _, said) = ask("GET", "/connect/cloudflare", &[("w", "acme")], "");
+        assert!(!said.contains("Which workspace?"), "{status} {said}");
         lock(&hub.board("acme")).task = None;
         // Each has its own dashboard, from its own folder: nothing of acme is in globex.
         assert_eq!(lock(&hub.board("acme")).signed_in_as().as_deref(), Some("Modal workspace acme-team"));
