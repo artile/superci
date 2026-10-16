@@ -261,6 +261,16 @@ pub struct Launch<'a> {
     /// Whether the spot pools left after the first has no machine may be asked in one request (see `fleet`). Not
     /// where the role lately had no permission for it: they are asked one by one, as before.
     pub fleet: bool,
+    /// A second disk of SuperCI's own beside the job's (GB, MiB a second): the layer store's working space, so it uses
+    /// neither the job's disk nor its memory. None: no second disk.
+    pub store_disk: Option<(u32, u32)>,
+}
+
+/// The machine's disks: the job's, and the layer store's own when asked for (`Launch::store_disk`).
+fn disks(l: &Launch<'_>) -> serde_json::Value {
+    let mut d = vec![serde_json::json!({ "DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": l.disk_gb, "VolumeType": "gp3", "Throughput": l.disk_mibs, "Iops": l.disk_iops, "DeleteOnTermination": "true" } })];
+    if let Some((gb, mibs)) = l.store_disk { d.push(serde_json::json!({ "DeviceName": "/dev/sdf", "Ebs": { "VolumeSize": gb, "VolumeType": "gp3", "Throughput": mibs, "Iops": 3000, "DeleteOnTermination": "true" } })) }
+    serde_json::Value::Array(d)
 }
 
 /// What a launch was told on the way to its machine (or to none): each pool AWS had no room in (type, zone, AWS's
@@ -379,7 +389,7 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
             "ImageId": l.image, "InstanceType": t, "MinCount": 1, "MaxCount": 1, "UserData": b64(compact(&l.user_data).as_bytes()),
             "InstanceInitiatedShutdownBehavior": "terminate",
             "MetadataOptions": { "HttpTokens": "required" },
-            "BlockDeviceMapping": [{ "DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": l.disk_gb, "VolumeType": "gp3", "Throughput": l.disk_mibs, "Iops": l.disk_iops, "DeleteOnTermination": "true" } }],
+            "BlockDeviceMapping": disks(l),
             "TagSpecification": [{ "ResourceType": "instance", "Tag": l.tags.iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect::<Vec<_>>() }],
         });
         if l.spot { params["InstanceMarketOptions"] = serde_json::json!({ "MarketType": "spot", "SpotOptions": { "SpotInstanceType": "one-time", "InstanceInterruptionBehavior": "terminate" } }); }
@@ -438,7 +448,7 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
     let tags = |t: &[(String, String)]| t.iter().map(|(k, v)| serde_json::json!({ "Key": k, "Value": v })).collect::<Vec<_>>();
     let mut data = serde_json::json!({
         "ImageId": l.image, "UserData": b64(compact(&l.user_data).as_bytes()), "InstanceInitiatedShutdownBehavior": "terminate", "MetadataOptions": { "HttpTokens": "required" },
-        "BlockDeviceMapping": [{ "DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": l.disk_gb, "VolumeType": "gp3", "Throughput": l.disk_mibs, "Iops": l.disk_iops, "DeleteOnTermination": "true" } }],
+        "BlockDeviceMapping": disks(l),
         "TagSpecification": [{ "ResourceType": "instance", "Tag": tags(l.tags) }],
     });
     if let Some(n) = l.network.filter(|n| !n.subnets.is_empty()) {

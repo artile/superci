@@ -126,7 +126,7 @@ mod aws_live {
         let types = ["c7a.large".to_string(), "m7a.large".into(), "c7i.large".into()];
         let tags = [("superci".to_string(), "leaktest".to_string())];
         let start = Instant::now();
-        let aws::Started { id, kind, .. } = block_on(aws::run_instance(&http(), &c, &Launch { region, network: None, image: &image, types: &types, user_data: &user_data, disk_gb: 30, disk_mibs: 125, disk_iops: 3000, clock: None, skip: &[], tags: &tags, spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: false }, now_ms(), &mut superci_core::aws::Told::default())).unwrap();
+        let aws::Started { id, kind, .. } = block_on(aws::run_instance(&http(), &c, &Launch { region, network: None, image: &image, types: &types, user_data: &user_data, disk_gb: 30, disk_mibs: 125, disk_iops: 3000, clock: None, skip: &[], tags: &tags, spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: false, store_disk: None }, now_ms(), &mut superci_core::aws::Told::default())).unwrap();
         eprintln!("launched {id} ({kind}) in {region}, bound 3 min");
         let mut online = false;
         let ended = watch("machine", start, Duration::from_secs(10 * 60), || {

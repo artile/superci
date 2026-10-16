@@ -2683,7 +2683,7 @@ impl<'a> ControlPlane<'a> {
                             let cache_runner = if gitlab { format!("gl:{}", gitlab::local(&job.gitlab, job.runner_id.unwrap_or_default())) } else { name.clone() };
                             let user_data = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), &creds, plane_url, &cache_runner, now).await;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
-                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet };
+                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: None };
                             let mut told = aws::Told::default();
                             let machine = aws::run_instance(self.http, &creds, &launch, now, &mut told).await;
                             if let Some(e) = told.fleet_refused.take() {
@@ -3039,7 +3039,7 @@ impl<'a> ControlPlane<'a> {
                             let network = match self.network(&region, &creds, self.clock.now_ms()).await { Ok(n) => n, Err(e) => { started = Err(e); continue } };
                             for spot in markets {
                                 started = aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, clock: None, skip: &[], tags: &tags, spot: *spot, os: "linux",
-                                    avoid: &[], timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet: false }, self.clock.now_ms(), &mut aws::Told::default()).await.map(|_| ());
+                                    avoid: &[], timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet: false, store_disk: None }, self.clock.now_ms(), &mut aws::Told::default()).await.map(|_| ());
                                 if started.is_ok() { break 'regions }
                             }
                         }

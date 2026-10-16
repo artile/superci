@@ -2927,7 +2927,7 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
         });
         let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
         let launch = Launch { region: "us-east-1", network: Some(&network), image: "ami-new", types: &types, user_data: "#!/bin/bash\necho job\n", disk_gb: 120, disk_mibs: 1000, disk_iops: 4000, clock: Some(&FixedClock), skip: &[], tags: &tags,
-            spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet };
+            spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet, store_disk: None };
         let mut told = Told::default();
         let machine = block_on(run_instance(&clouds, &creds, &launch, 1_790_000_000_000, &mut told));
         (machine.map(|m| (m.id, m.kind, m.zone)), told, clouds.0)
@@ -2996,7 +2996,7 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
     });
     let types: Vec<String> = ["m8a.8xlarge", "r8a.8xlarge", "m7a.8xlarge", "r7a.8xlarge"].map(String::from).to_vec();
     let launch = Launch { region: "us-east-1", network: Some(&network), image: "ami-new", types: &types, user_data: "#!/bin/bash\n", disk_gb: 60, disk_mibs: 125, disk_iops: 3000, clock: Some(&FixedClock), skip: &[], tags: &tags,
-        spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: true };
+        spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: true, store_disk: None };
     let mut told = Told::default();
     let machine = block_on(run_instance(&clouds, &creds, &launch, 1_790_000_000_000, &mut told)).map(|m| (m.kind, m.zone));
     assert_eq!(machine, Ok(("r7a.8xlarge".to_string(), "us-east-1b".to_string())));
@@ -3019,7 +3019,7 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
     });
     let types: Vec<String> = ["m8a.large", "c8a.large", "m8a.xlarge", "c8a.xlarge"].map(String::from).to_vec();
     let launch = Launch { region: "us-east-1", network: Some(&network), image: "ami-new", types: &types, user_data: "#!/bin/bash\n", disk_gb: 60, disk_mibs: 125, disk_iops: 3000, clock: Some(&FixedClock), skip: &[], tags: &tags,
-        spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: true };
+        spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: true, store_disk: None };
     let _ = block_on(run_instance(&clouds, &creds, &launch, 1_790_000_000_000, &mut Told::default()));
     let fleets = calls_of(&clouds.0, "CreateFleet");
     assert_eq!((fleets.len(), kinds(&fleets[0]).0, kinds(&fleets[1]).0), (2, vec!["c8a.large".to_string(), "m8a.large".to_string()], vec!["c8a.xlarge".to_string(), "m8a.xlarge".to_string()]));

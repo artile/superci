@@ -145,7 +145,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 14] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach", "tests"];
-const VALUES: [&str; 48] = ["user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 50] = ["header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -749,7 +749,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let types = block_on(aws::offered_types(&http, region, &creds, &types, now())).unwrap_or(types);
             let tags = vec![("Name".to_string(), "superci-probe".to_string()), ("superci-plane".to_string(), plane_id.clone()), ("superci-job".to_string(), "1".to_string()), ("superci-repo".to_string(), "acme/app".to_string())];
             let launch = aws::Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &script, disk_gb: args.get("disk").and_then(|d| d.parse().ok()).unwrap_or(0).max(image_gb).max(20), disk_mibs: 125, disk_iops: 3000, tags: &tags, spot, os: "linux",
-                clock: None, skip: &[], avoid: &[], timer: None, jitter_ms: 0, fleet: spot };
+                clock: None, skip: &[], avoid: &[], timer: None, jitter_ms: 0, fleet: spot, store_disk: args.get("extra-disk").and_then(|v| v.split_once(':')).and_then(|(g, m)| Some((g.parse().ok()?, m.parse().ok()?))) };
             let mut told = aws::Told::default();
             let started = block_on(aws::run_instance(&http, &creds, &launch, now(), &mut told));
             if let Some(name) = told.template_left.take() { let _ = block_on(aws::delete_template(&http, region, &creds, &name, now())); }
@@ -788,7 +788,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
             let body = if w(6).is_empty() { vec![] } else { std::fs::read(w(6)).map_err(|e| format!("{}: {e}", w(6)))? };
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
-            let headers = vec![("x-amz-content-sha256".to_string(), superci_core::crypto::sha256_hex(&body))];
+            let mut headers = vec![("x-amz-content-sha256".to_string(), superci_core::crypto::sha256_hex(&body))];
+            // (`--header=NAME:VALUE`, signed with the rest: `X-Amz-Invocation-Type:Event`, say.)
+            for h in args.all("header") { if let Some((k, v)) = h.split_once(':') { headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string())) } }
             let signed = superci_core::aws::sigv4(w(4), w(5), &headers, &body, &creds, w(2), w(3), &superci_core::aws::amz_date(now))?;
             let mut r = superci_core::io::Request::new(w(4), w(5)).with_body(body);
             r.headers = signed;
