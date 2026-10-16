@@ -98,8 +98,25 @@ fn tar_of(root: &Path, files: &[Vec<u8>], compress: bool) -> Result<Vec<u8>> {
 }
 
 /// What this computer last kept as a base for a repository's runs on a control plane: its name and each file's hash.
+/// Each run's changes are kept as a layer on what came before: at most this many layers, then all of it again.
+const MOST_LAYERS: usize = 8;
+
+/// What this computer kept of a repository's last run on a control plane: the whole tree it sent once (`name`) and
+/// what each run since sent on top of it (`layers`), each file's hash as of that last run, and when it was.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Base { name: String, files: std::collections::BTreeMap<String, (String, u64)> }
+struct Base {
+    name: String,
+    #[serde(default)] layers: Vec<String>,
+    files: std::collections::BTreeMap<String, (String, u64)>,
+    #[serde(default)] at_ms: u64,
+}
+
+/// How long ago, for a person: "2 minutes ago", "3 hours ago", "yesterday or before".
+fn ago(ms: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let m = now.saturating_sub(ms) / 60_000;
+    match m { 0 => "just now".into(), 1 => "a minute ago".into(), 2..=59 => format!("{m} minutes ago"), 60..=119 => "an hour ago".into(), 120..=1439 => format!("{} hours ago", m / 60), _ => "a day or more ago".into() }
+}
 
 fn base_path(plane: &str, root: &Path) -> Option<std::path::PathBuf> {
     let key = superci_core::crypto::sha256_hex(format!("{plane}\n{}", root.display()).as_bytes());
@@ -149,17 +166,24 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     // Into the bucket: at once, or while the run's machine starts when the control plane can have the machine wait
     // for it (`later`: it says so); then the base is kept, when it was one.
     let mut pending: Option<(String, Vec<u8>, bool)> = None;
-    if let Some(base) = &kept {
+    // What changed since this folder's last run, as a layer on what that run had (kept for the next run's), while
+    // that is less than half of the tree and the layers are few.
+    let mut layer: Option<String> = None;
+    if let Some(base) = kept.as_ref().filter(|b| b.layers.len() < MOST_LAYERS) {
         let changed: Vec<Vec<u8>> = files.iter().filter(|f| { let p = String::from_utf8_lossy(f); base.files.get(p.as_ref()) != now.get(p.as_ref()) }).cloned().collect();
         let removed: Vec<String> = base.files.keys().filter(|p| !now.contains_key(*p)).cloned().collect();
         let (some, all) = (changed.iter().map(|f| now.get(String::from_utf8_lossy(f).as_ref()).map(|h| h.1).unwrap_or(0)).sum::<u64>(), now.values().map(|h| h.1).sum::<u64>());
         if some * 2 < all.max(1) {
-            let asked = call("POST", &format!("/runs/tree?id={tree}&part=1&link=1&later=1&base={}", base.name), vec![])?;
+            let chain: Vec<String> = std::iter::once(base.name.clone()).chain(base.layers.iter().cloned()).collect();
+            let name = format!("l{}", &superci_core::crypto::sha256_hex(format!("{}\n{}", chain.join(","), serde_json::to_string(&now).unwrap_or_default()).as_bytes())[..40]);
+            let asked = call("POST", &format!("/runs/tree?id={tree}&part=0&link=1&later=1&base={}&layer={name}", chain.join(",")), vec![])?;
             if let (Some(link), true) = (asked["url"].as_str(), asked["base"] == true) {
                 let packed = pack_files(&root, &changed, &removed)?;
-                say(&format!("Sending what changed in the working tree ({} file{}, {} removed, {} KB packed)", changed.len(), if changed.len() == 1 { "" } else { "s" }, removed.len(), packed.len().div_ceil(1000)));
-                if asked["later"] == true { pending = Some((link.to_string(), packed, false)) } else { put(link, packed)? }
-                sent = Some((2, true));
+                let since = if base.at_ms > 0 { format!(", {}", ago(base.at_ms)) } else { String::new() };
+                say(&format!("Sending what changed since this folder's last run{since}: {} file{}, {} removed ({} KB packed)", changed.len(), if changed.len() == 1 { "" } else { "s" }, removed.len(), packed.len().div_ceil(1000)));
+                if asked["later"] == true { pending = Some((link.to_string(), packed, true)) } else { put(link, packed)? }
+                sent = Some((asked["parts"].as_u64().unwrap_or(2) as u32, true));
+                layer = Some(name);
             }
         }
     }
@@ -172,9 +196,15 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     let link = asked["url"].as_str().map(str::to_string);
     let most = if link.is_some() || sent.is_some() { MOST_IN_BUCKET } else { MOST };
     if packed.len() > most { return Err(format!("The working tree is {} MB packed; a run from a computer takes {} MB at most.", packed.len() / 1_000_000, most / 1_000_000)) }
+    // Kept once what was sent is there: the whole tree as a new base, or the chain with this run's layer on it.
     let keep_base = |name: &str, now: &std::collections::BTreeMap<String, (String, u64)>| if let Some(at) = &kept_at {
+        let at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        let next = match (&layer, &kept) {
+            (Some(l), Some(b)) => Base { name: b.name.clone(), layers: b.layers.iter().cloned().chain([l.clone()]).collect(), files: now.clone(), at_ms },
+            _ => Base { name: name.to_string(), layers: vec![], files: now.clone(), at_ms },
+        };
         let _ = std::fs::create_dir_all(at.parent().unwrap_or(Path::new(".")));
-        let _ = std::fs::write(at, serde_json::to_vec(&Base { name: name.to_string(), files: now.clone() }).unwrap_or_default());
+        let _ = std::fs::write(at, serde_json::to_vec(&next).unwrap_or_default());
     };
     let (parts, layered) = match (&link, sent) {
         (_, Some(sent)) => sent,
@@ -190,6 +220,8 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
             (parts, false)
         }
     };
+    // (A layer sent at once: kept now.)
+    if layer.is_some() && pending.is_none() { keep_base(&name, &now) }
     let reference = git(&root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_else(|_| "refs/heads/main".into());
     // The workflows its jobs call (`uses: ./.github/workflows/x.yml`), from the working tree as it is.
     let mut called = serde_json::Map::new();

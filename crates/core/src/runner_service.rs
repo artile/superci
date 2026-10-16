@@ -190,8 +190,8 @@ pub fn checkout_action(tree: &str, parts: u32, layered: bool) -> String {
         fetch() {{ local tries=0 waited=0 rc said code size total asked; while :; do rc=0; said=$(curl -q -sSL --connect-timeout 10 --speed-limit 20000 --speed-time 10 -o "$t/$1" -w "%{{http_code}} %{{size_download}} %{{time_total}} %{{time_redirect}}" "{tree}?part=$1") || rc=$?; read -r code size total asked <<< "$said"; [ $rc = 0 ] || code="curl error $rc"; case "$code" in 200) echo "Part $1: $size bytes in $total s ($asked s of it the control plane's answer)"; return 0;; 425) [ $waited = 0 ] && echo "Part $1: waiting for the computer to finish sending it"; waited=$((waited + 1)); [ $waited -ge 600 ] && {{ echo "::error::The computer did not finish sending the working tree in ten minutes."; return 1; }}; sleep 1; continue;; esac; tries=$((tries + 1)); [ $tries -ge 5 ] && {{ echo "::error::Part $1 of the working tree could not be fetched (last: $code)."; return 1; }}; echo "Part $1: asked again ($tries; $code)"; sleep 1; done; }}
         pids=(); for part in $(seq 0 {last}); do fetch "$part" & pids+=($!); done; for p in "${{pids[@]}}"; do wait "$p"; done; fetched=$SECONDS"#, last = parts.saturating_sub(1));
     let unpack = if layered {
-        // Each archive on the one before; then what was removed since the base.
-        format!("for part in $(seq 0 {}); do tar -xzi -f \"$t/$part\"; done; if [ -f .superci-removed ]; then tr '\\n' '\\0' < .superci-removed | xargs -0 -r rm -f --; rm -f .superci-removed; fi", parts.saturating_sub(1))
+        // Each archive on the one before, and what was removed by it, in turn.
+        format!("for part in $(seq 0 {}); do tar -xz --ignore-zeros -f \"$t/$part\"; if [ -f .superci-removed ]; then tr '\\n' '\\0' < .superci-removed | xargs -0 -r rm -f --; rm -f .superci-removed; fi; done", parts.saturating_sub(1))
     } else {
         format!("for part in $(seq 0 {}); do cat \"$t/$part\"; done | tar -xz", parts.saturating_sub(1))
     };
@@ -426,7 +426,7 @@ mod tests {
     fn the_checkout_is_an_action_the_runner_can_unpack() {
         let gz = checkout_tarball("https://plane.example/runner/abc/superci/tree", 3, false);
         let layered = checkout_action("https://plane.example/runner/abc/superci/tree", 2, true);
-        assert!(layered.contains(r#"for part in $(seq 0 1); do tar -xzi -f "$t/$part"; done"#) && layered.contains("xargs -0 -r rm -f --") && layered.contains(r"tr '\n' '\0' < .superci-removed"), "{layered}");
+        assert!(layered.contains(r#"for part in $(seq 0 1); do tar -xz --ignore-zeros -f "$t/$part"; if [ -f .superci-removed ]"#) && layered.contains("xargs -0 -r rm -f --") && layered.contains(r"tr '\n' '\0' < .superci-removed"), "{layered}");
         assert_eq!(&gz[..3], &[0x1f, 0x8b, 8]);
         // (Unpacked by the system's own tar, as the runner does.)
         let dir = std::env::temp_dir().join(format!("superci-checkout-{}", guid()));
@@ -437,6 +437,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(ok && action.contains("using: composite") && action.contains("for part in $(seq 0 2); do fetch \"$part\" &") && action.contains("  fetch-depth:\n    required: false"), "{action}");
         assert!(action.contains("SUPERCI_PATH: ${{ inputs.path }}"));
+    }
+
+    /// A layered checkout run by bash: a base, then each run's changes in turn, each with what it removed; a file
+    /// removed by one layer and back in the next is there, as on the computer.
+    #[test]
+    fn layers_are_laid_down_in_turn_each_with_what_it_removed() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("superci-layers-{}", guid()));
+        let (work, tmp) = (dir.join("work"), dir.join("tmp"));
+        for d in [&work, &tmp] { std::fs::create_dir_all(d).unwrap() }
+        // An archive of these files (and a list of removed paths after it, as the computer packs a layer).
+        let pack = |files: &[(&str, &str)], removed: &[&str]| {
+            let src = dir.join(format!("src-{}", guid()));
+            std::fs::create_dir_all(&src).unwrap();
+            for (p, t) in files { std::fs::write(src.join(p), t).unwrap() }
+            let mut names: Vec<String> = files.iter().map(|(p, _)| p.to_string()).collect();
+            if !removed.is_empty() { std::fs::write(src.join(".superci-removed"), removed.join("\n") + "\n").unwrap(); names.push(".superci-removed".into()) }
+            let raw = std::process::Command::new("tar").arg("-cf").arg("-").args(&names).current_dir(&src).output().unwrap().stdout;
+            let mut gz = std::process::Command::new("gzip").arg("-c").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+            gz.stdin.take().unwrap().write_all(&raw).unwrap();
+            gz.wait_with_output().unwrap().stdout
+        };
+        let parts = vec![pack(&[("a.txt", "one\n"), ("gone.txt", "first\n")], &[]), pack(&[("a.txt", "two\n")], &["gone.txt"]), pack(&[("gone.txt", "back\n")], &[])];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = parts.clone();
+        std::thread::spawn(move || for stream in listener.incoming() {
+            let (mut stream, parts) = (stream.unwrap(), served.clone());
+            std::thread::spawn(move || {
+                let mut asked = vec![0u8; 4096];
+                let n = stream.read(&mut asked).unwrap_or(0);
+                let path = String::from_utf8_lossy(&asked[..n]).lines().next().unwrap_or_default().split(' ').nth(1).unwrap_or_default().to_string();
+                let body = path.strip_prefix("/tree?part=").and_then(|p| p.parse::<usize>().ok()).and_then(|p| parts.get(p).cloned()).unwrap_or_default();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(&body);
+            });
+        });
+        let action = checkout_action(&format!("http://127.0.0.1:{port}/tree"), parts.len() as u32, true);
+        let script: String = action.split("run: |\n").nth(1).unwrap().lines().map(|l| l.strip_prefix("        ").unwrap_or(l)).collect::<Vec<_>>().join("\n");
+        let out = std::process::Command::new("bash").args(["-c", &script]).env("GITHUB_WORKSPACE", &work).env("RUNNER_TEMP", &tmp).env("SUPERCI_PATH", "").env("SUPERCI_REPOSITORY", "").env("GITHUB_REPOSITORY", "acme/app").output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        let read = |p: &str| std::fs::read_to_string(work.join(p)).ok();
+        let (a, gone, marker) = (read("a.txt"), read("gone.txt"), work.join(".superci-removed").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{said}");
+        assert_eq!((a.as_deref(), gone.as_deref(), marker), (Some("two\n"), Some("back\n"), false), "{said}");
     }
 
     /// The checkout's script run by bash, as the runner runs it, against a control plane that sends each part on to

@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.10
+- A run from a computer sends what changed since that folder's last run, and says so ("Sending what changed since this folder's last run, 3 minutes ago: 2 files, 0 removed"): each run's changes are kept as a layer on the last run's, eight at most, then all of it again. It sent what changed since the folder's first run, which grew with every edit and read as wrong both ways.
+- A run from a computer's checkout on a macOS machine unpacks what changed since a run before: macOS's tar refused how it was asked.
+
 ## 0.19.9 — 2026-10-16
 - Docker on AWS machines pulls sixteen of an image's layers at once (it pulled three): a stack of many images, as a local Supabase's, is pulled sooner. Its own settings stay.
 - `superci runs create` and `runs wait` say what each job's tests came to at the end with or without `--quiet`, and when a test runner ran no tests (a run that passed having run nothing said so only with `--quiet` or `--tests`).

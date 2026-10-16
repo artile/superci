@@ -807,7 +807,7 @@ fn a_second_run_from_the_same_checkout_sends_only_what_changed_on_top_of_the_tre
     std::fs::write(dir.join("small.txt"), "two\n").unwrap();
     std::fs::remove_file(dir.join("gone.txt")).unwrap();
     let (said, second) = run();
-    assert!(said.contains("Sending what changed in the working tree (1 file, 1 removed,"), "{said}");
+    assert!(said.contains("Sending what changed since this folder's last run, just now: 1 file, 1 removed ("), "{said}");
     // Its machine's checkout: the base first, then what changed and what was removed.
     let runner = loop { if let Some(r) = Runner::of_job(&served, &second, "tests") { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
     let tree = runner.at.trim_end_matches("/_apis/v1").to_string() + "/superci/tree";
@@ -831,6 +831,23 @@ fn a_second_run_from_the_same_checkout_sends_only_what_changed_on_top_of_the_tre
     served.store.0.lock().unwrap().remove(&format!("rtree-later:{tree_id}"));
     assert!(base.contains("big.txt") && base.contains("soon gone") && base.contains("one\n"), "the base as it was");
     assert!(changed.contains("small.txt") && changed.contains("two\n") && !changed.contains("big.txt") && changed.contains(".superci-removed") && changed.contains("gone.txt\n"), "{changed}");
+    // The next: only what changed since that run (the file removed then, back now), as a layer on that run's.
+    std::fs::write(dir.join("gone.txt"), "back\n").unwrap();
+    let (said, third) = run();
+    assert!(said.contains("since this folder's last run, just now: 1 file, 0 removed ("), "{said}");
+    let runner = loop { if let Some(r) = Runner::of_job(&served, &third, "tests") { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let tree = runner.at.trim_end_matches("/_apis/v1").to_string() + "/superci/tree";
+    let part = |n: u32| {
+        let (status, link, _) = fetch(&format!("{tree}?part={n}"));
+        assert_eq!(status, 302, "part {n}");
+        gunzipped(&fetch(&format!("{}/{}", served.aws.url, link.trim_start_matches("https://"))).2)
+    };
+    let (base_again, first_layer, second_layer) = (part(0), part(1), part(2));
+    assert!(base_again == base && first_layer == changed, "the base and the layer before, as they were");
+    assert!(second_layer.contains("gone.txt") && second_layer.contains("back\n") && !second_layer.contains("small.txt"), "{second_layer}");
+    let token = runner.at.trim_end_matches("/_apis/v1").rsplit('/').next().unwrap().to_string();
+    let handed = served.store.under(&format!("rjob:{token}"))[0].1.clone();
+    assert_eq!((handed["parts"].as_u64(), handed["layered"].as_bool()), (Some(3), Some(true)), "three parts, each on the one before");
     // Most of the tree changed: all of it again, kept as the next base.
     std::fs::write(dir.join("big.txt"), big.replace("stays", "moved")).unwrap();
     let (said, _) = run();
@@ -844,7 +861,7 @@ fn a_second_run_from_the_same_checkout_sends_only_what_changed_on_top_of_the_tre
     std::fs::write(dir.join("small.txt"), "four\n").unwrap();
     std::fs::write(dir.join("new.txt"), "new\n").unwrap();
     let (said, _) = run();
-    assert!(said.contains("Sending what changed in the working tree (2 files, 0 removed,"), "{said}");
+    assert!(said.contains("Sending what changed since this folder's last run, just now: 2 files, 0 removed ("), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&home);
 }

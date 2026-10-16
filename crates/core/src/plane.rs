@@ -3239,6 +3239,23 @@ impl<'a> ControlPlane<'a> {
             let bucket = cache::bucket(&self.config.plane_id, &region);
             let named = |n: &String| (8..=80).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_alphanumeric());
             let _ = self.store.put_if_absent(&format!("rtree-at:{id}"), now.to_string()).await;
+            // What changed since the computer's last run (`layer`, kept under its name for the next run's), on what
+            // that run had: a base and the layers since (`base`, in order, each kept before). Its machine lays each
+            // down on the one before.
+            if let (Some(layer), Some(chain)) = (q.get("layer").filter(|n| named(n)), q.get("base")) {
+                let chain: Vec<&str> = chain.split(',').collect();
+                if chain.is_empty() || chain.len() > 16 || !chain.iter().all(|n| named(&n.to_string())) { return Ok(Response::text(400, "say which base and layers")) }
+                for (i, name) in chain.iter().enumerate() {
+                    let kept = format!("bases/{name}.tar.gz");
+                    let there = aws::s3(self.http, "HEAD", &aws::s3_url(&bucket, &region, &kept), &region, &creds, vec![], &[], now).await.is_ok_and(|r| r.status == 200);
+                    if !there { return Ok(Response::json(&serde_json::json!({ "url": null, "base": false }))) }
+                    self.store.put(&format!("rtree-s3:{id}:{i:05}"), format!("{region}|{kept}")).await?;
+                }
+                let n = chain.len();
+                let object = format!("bases/{layer}.tar.gz");
+                self.store.put(&format!("rtree-s3:{id}:{n:05}"), format!("{region}|{object}")).await?;
+                return Ok(Response::json(&serde_json::json!({ "url": aws::presign("PUT", &aws::s3_url(&bucket, &region, &object), &creds, &region, cache::LINK_SECONDS, now)?, "base": true, "parts": n + 1, "later": later })))
+            }
             // A tree the computer keeps as a base for later runs' (`keep`): in the bucket under its name, kept there
             // as long as the bucket keeps anything; or only what changed since one kept before (`base`), on top of it.
             let object = match (q.get("keep").filter(|n| named(n)), q.get("base").filter(|n| named(n))) {
