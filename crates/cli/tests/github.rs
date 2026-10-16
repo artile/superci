@@ -603,3 +603,46 @@ fn a_further_organization_is_removed_from_the_dashboard_its_app_uninstalled_and_
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_running_github_jobs_lines_as_its_machine_sends_them_are_read_before_github_has_its_log() {
+    // Without a bucket (kept in the store), and with one (kept there).
+    for bucket in [false, true] {
+        let served = serve(move |c| {
+            if bucket { (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX })); }
+            c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+        });
+        if bucket { served.github.put_object(&format!("{}/{}", superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1"), superci_core::cache::program_key("x86_64")), b"program") }
+        served.connect_github();
+        let home = signed_in(&served);
+        let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+        assert_eq!(served.webhook(queued), 202);
+        assert_eq!(served.webhook(served.github.start(id)), 202);
+        // (Its machine's own link back, as the control plane writes one into an AWS machine's start-up script.)
+        let hello = "machine-link-0123456789ab".to_string();
+        let runner = {
+            let key = format!("job:{id}");
+            let mut m = served.store.0.lock().unwrap();
+            let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap();
+            j["hello"] = serde_json::json!(hello);
+            m.insert(key, j.to_string());
+            j["runner"].as_str().unwrap().to_string()
+        };
+        // Its runner's pages of a step's log, as its machine sends them (the second from where the first ended).
+        let step = "aaaaaaaa-0000-0000-0000-000000000001";
+        let first = "2026-10-15T10:00:01.0000000Z ##[group]Run make test\n2026-10-15T10:00:02.0000000Z test 1 passed\n";
+        let second = "2026-10-15T10:00:03.0000000Z test 2 passed\n";
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        for (at, page) in [(0, first), (first.len(), second)] {
+            let r = agent.post(&format!("{}/hello?runner={runner}&t={hello}&live=timeline_{step}_1.log&at={at}", served.url)).send(page).unwrap();
+            assert_eq!(r.status().as_u16(), 200);
+        }
+        // A link not its own is not taken.
+        assert_eq!(agent.post(&format!("{}/hello?runner={runner}&t=not-its-link-at-all&live=x_1.log", served.url)).send("x").unwrap().status().as_u16(), 404);
+        assert_eq!(served.github.objects().iter().filter(|(k, _)| k.contains("/live/")).count(), if bucket { 2 } else { 0 }, "{:?}", served.github.objects());
+        let o = superci(&home, &["jobs", "retrieve", &id.to_string()]);
+        let said = String::from_utf8_lossy(&o.stdout);
+        assert!(o.status.success() && said.contains("test 1 passed") && said.contains("test 2 passed"), "bucket {bucket}: {said}{}", String::from_utf8_lossy(&o.stderr));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
