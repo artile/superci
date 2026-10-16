@@ -443,3 +443,44 @@ fn superci_is_stopped_from_the_dashboard_github_and_gitlab_let_go_of_and_its_con
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn awss_runners_are_removed_and_added_again_from_the_dashboard_their_role_and_networks_deleted_as_aws_answered() {
+    // A control plane in AWS whose own account runs jobs, with Cloudflare's containers beside (the test kit's).
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = common::signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let setting = |n: &str| served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    let page = || common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    // Refused: a provider that is not one; a dialog shown for another control plane.
+    let (status, _, said) = common::post(&link, "/runners/remove", &[("cloud", "gcp")]);
+    assert!(status == 400 && common::words(&said).contains("Unknown provider"), "{status}");
+    let (status, _, said) = common::post(&link, "/runners/remove", &[("cloud", "aws"), ("plane", "anotherplane1")]);
+    assert!(status == 409 && common::words(&said).contains("Another control plane is in use now"), "{status}");
+    // Removed from SuperCI only: forgotten here, what is left in AWS said.
+    let (status, _, _) = common::post(&link, "/runners/remove", &[("cloud", "aws"), ("only", "on")]);
+    assert_eq!(status, 303);
+    assert_eq!(setting("AWS_RUNNERS").as_deref(), Some("off"));
+    assert!(page().contains("Removed AWS. Left: in AWS account 111111111111: the role superci-plane-testplane0001's machines policy"), "{}", page());
+    // Added again: its role given the machines' policy again (as AWS answered a real deploy), and on.
+    served.aws.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    let (status, to, said) = common::post(&link, "/runners/aws-own", &[]);
+    assert!(status == 303 && to.contains("p=runners"), "{status} {}", common::words(&said));
+    assert_eq!(setting("AWS_RUNNERS").as_deref(), Some("on"));
+    // Removed with its part in AWS: the machines' policy, then their network (as AWS answered a real deletion).
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    let (status, _, _) = common::post(&link, "/runners/remove", &[("cloud", "aws")]);
+    assert_eq!(status, 303);
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| a["asked"].as_str().unwrap_or_default().chars().take(60).collect()).collect();
+    for done in ["Action=PutRolePolicy", "Action=DeleteRolePolicy", "Action=DeleteVpc&"] { assert!(asked.iter().any(|a| a.starts_with(done)), "{done}: {asked:?}") }
+    assert!(page().contains("Removed AWS.") && !page().contains("Left:"), "{}", page());
+    // Cloudflare's containers, its own: switched off.
+    let (status, _, _) = common::post(&link, "/runners/remove", &[("cloud", "cloudflare")]);
+    assert_eq!(status, 303);
+    assert_eq!(setting("CONTAINERS").as_deref(), Some("off"));
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
