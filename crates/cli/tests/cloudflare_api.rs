@@ -42,6 +42,9 @@ fn a_cloudflare_control_plane_is_deployed_given_its_containers_shown_and_deleted
     step("03-use");
     let (ok, said) = run(&["planes", "list"]);
     assert!(ok && said.contains("cfplane00001") && said.contains("Cloudflare · Acme"), "{said}");
+    // One control plane per Cloudflare account: a second is refused.
+    let (ok, said) = run(&["planes", "create", "cloudflare"]);
+    assert!(!ok && said.contains("Your control plane is in this Cloudflare account already"), "{said}");
     let (ok, said) = run(&["status", "--plane=cfplane00001"]);
     assert!(ok && said.contains("Control plane Cloudflare · Acme") && said.contains("https://superci.acme.workers.dev"), "{said}");
     // Its own containers: the image prepared, the container application made, switched on.
