@@ -349,6 +349,14 @@ fn each_jobs_row_says_where_it_ran_and_why_in_plain_words() {
         (serde_json::json!({ "state": "failed", "cloud": "", "error": format!("waiting: {}", "x".repeat(130)) }), &"…"),
         (serde_json::json!({ "state": "swept", "cloud": "aws", "error": null }), "Its machine never started the job"),
         (serde_json::json!({ "state": "orphan", "cloud": "aws", "error": null }), "Its machine was lost"),
+        // Kept off on-demand before its cloud is said; a RAM disk at more than AWS's own speed; spot again, but on
+        // an on-demand machine after all, or on Cloudflare (neither said to be on spot again).
+        (serde_json::json!({ "state": "launching", "cloud": "", "spot_again": true }), "On a spot machine again"),
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "r8a.4xlarge", "cpu": 16, "ramdisk": true, "disk_mibs": 1000 }), "16 CPU · r8a.4xlarge · 1000 MiB/s disk · RAM disk"),
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "on_demand": true, "spot_again": true, "after_reclaim": true }), "4 CPU · c8a.xlarge · on-demand"),
+        (serde_json::json!({ "state": "done", "cloud": "cloudflare", "machine_type": "4cpu-12gb", "spot_again": true }), "4 CPU · 12 GB"),
+        (serde_json::json!({ "state": "done", "cloud": "cloudflare", "machine_type": "2cpu-8gb", "on_demand": true }), "2 CPU · 8 GB"),
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "c8a.large", "cpu": 2, "on_demand": true }), "2 CPU · c8a.large · on-demand"),
     ];
     for (fields, _) in &cases {
         let (id, queued) = served.github.queue("test", "superci", served.now_ms());
@@ -363,6 +371,8 @@ fn each_jobs_row_says_where_it_ran_and_why_in_plain_words() {
     let (_, page) = part(&link, "/?p=jobs&fragment=1");
     let said = words(&page);
     for (_, want) in &cases { assert!(said.contains(want), "no {want:?} in: {said}") }
+    assert_eq!(said.matches("On a spot machine again").count(), 2, "{said}");
+    assert_eq!(said.matches("run again after AWS took back its spot machine").count(), 2, "{said}");
     // The spot limit reached in the last day: said once above the jobs, with where to ask AWS for more.
     assert!(said.contains("in the last day ran on on-demand machines, at about twice the price: your AWS account's spot limit in N. Virginia was reached") && page.contains("servicequotas"), "{said}");
     let _ = child.kill();
