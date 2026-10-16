@@ -134,14 +134,57 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     b.wait("document.getElementById('pool-0').open");
     assert_eq!(b.eval("[document.querySelector('#pool-0 input[name=max]').value, document.querySelector('#pool-0 input[name=usd]').value, document.querySelector('#pool-0 select[name=location]').value]"), serde_json::json!(["5", "30", "weur"]));
 
-    // Removed, from the same dialog: no job goes there from then.
-    b.click("#pool-0 button.danger", "Remove");
-    b.wait("document.getElementById('pool-remove-0').open");
-    b.click("#pool-remove-0 button.danger", "");
+    b.click("#pool-0 button.secondary", "Cancel");
+
+    // Removed, from its account's dialog under Clouds: no job goes there from then.
+    b.click(r#"button[aria-label="Cloudflare account settings"]"#, "");
+    b.wait("document.getElementById('pool-100').open");
+    b.click("#pool-100 button.danger", "Remove");
+    b.wait("document.getElementById('pool-remove-100').open");
+    b.click("#pool-remove-100 button.danger", "");
     until("its containers off", || setting("CONTAINERS").as_deref() == Some("off"));
     b.wait(&shows("Removed Cloudflare"));
     assert!(pool().is_null(), "{}", pool());
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_runner_provider_is_taken_out_of_the_order_and_put_back_and_awss_on_demand_machines_get_their_own_regions() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A control plane whose own AWS account runs jobs, with Cloudflare's containers: AWS spot, AWS on-demand, Cloudflare.
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    let order = || setting("ROUTING").and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok()).map(|r| r["order"].clone()).unwrap_or_default();
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runners");
+    b.wait(&shows("Runner providers"));
+    // AWS on-demand's settings, like AWS spot's: its regions (here N. Virginia, where the control plane is set up).
+    b.click(r#"button[aria-label="AWS on-demand settings"]"#, "");
+    b.wait("document.getElementById('pool-1').open");
+    assert_eq!(b.eval("[...document.querySelectorAll('#pool-1 .rg')].map(r => r.dataset.region)"), serde_json::json!(["us-east-1"]));
+    b.fill("#pool-1 input[name=max]", "3");
+    b.click("#pool-1 button.primary", "Save");
+    until("on-demand's limit and regions", || order().as_array().is_some_and(|o| o.iter().any(|p| p["cloud"] == "aws-on-demand" && p["max_jobs"] == 3 && p["regions"] == serde_json::json!(["us-east-1"]))));
+    b.wait(&shows("Runner providers"));
+    // Taken out from its dialog: out of the order, said below it; nothing deleted.
+    b.click(r#"button[aria-label="AWS on-demand settings"]"#, "");
+    b.wait("document.getElementById('pool-1').open");
+    b.click("#pool-1 button.secondary", "Take out of the order");
+    until("on-demand taken out", || order().as_array().is_some_and(|o| o.iter().any(|p| p["cloud"] == "aws-on-demand" && p["off"] == true && p["max_jobs"] == 3)));
+    b.wait(&shows("Taken out of the order"));
+    assert_eq!(b.eval(r#"document.querySelector('li.pool[data-cloud="aws-on-demand"]') === null"#), serde_json::json!(true));
+    // Put back: at the end of the order, its settings as they were.
+    b.click(".limits.out button.chip", "Put back");
+    until("on-demand put back", || order().as_array().is_some_and(|o| o.last().is_some_and(|p| p["cloud"] == "aws-on-demand" && p.get("off").is_none() && p["max_jobs"] == 3)));
+    b.wait(r#"document.querySelector('li.pool[data-cloud="aws-on-demand"]') !== null"#);
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

@@ -779,7 +779,7 @@ fn gpus_and_windows_get_their_own_images_types_and_prices() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     // A GPU: the image with NVIDIA's drivers, T4 machines first.
@@ -815,7 +815,7 @@ fn a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.agents = vec![Agent { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = vec![Pool { off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=any")));
     let launch = clouds.calls.borrow().iter().find(|c| c.1 == "https://runners.acme.workers.dev/launch").cloned().expect("agent launch");
@@ -831,7 +831,7 @@ fn an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise(
     config.app = Some(app());
     config.containers = true;
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None }, Pool { off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=l4")));
     let j = job(&store, 1);
@@ -849,7 +849,7 @@ fn the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it() 
     config.app = Some(app());
     config.containers = true;
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None }, Pool { off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let run = |r: Request| block_on(plane.handle(r));
 
@@ -885,7 +885,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.containers = true;
-    config.routing.order = vec![Pool { off: false, cloud: "cloudflare".into(), max_jobs: Some(1), monthly_usd: None }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "cloudflare".into(), max_jobs: Some(1), monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let run = |r: Request| block_on(plane.handle(r));
 
@@ -909,7 +909,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: Some(1.0) }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: Some(1.0) }];
     let store = Mem::default();
     store.0.borrow_mut().insert("job:50".into(), serde_json::json!({ "job_id": 50, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_996_400_000u64, "ended_ms": 1_790_000_000_000u64,
         "installation_id": 42, "cloud": "aws", "usd_per_hour": 2.0, "seen_in_progress": true }).to_string());
@@ -919,7 +919,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     assert_eq!((job(&store, 51)["state"].as_str(), job(&store, 51)["on_demand"].as_bool()), (Some("launched"), Some(true)), "{}", job(&store, 51));
     assert_eq!(field(launches(&clouds).last().unwrap(), "InstanceMarketOptions.MarketType"), "");
     // With on-demand turned off there is nothing below: it fails with why.
-    config.routing.order.push(Pool { off: true, cloud: "aws-on-demand".into(), max_jobs: None, monthly_usd: None });
+    config.routing.order.push(Pool { regions: vec![], off: true, cloud: "aws-on-demand".into(), max_jobs: None, monthly_usd: None });
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(job_event("queued", 52, "acme/app", None)));
     let e = job(&store, 52)["error"].as_str().unwrap().to_string();
@@ -1863,7 +1863,7 @@ fn with_no_spot_machine_the_job_goes_to_the_next_place_in_the_order() {
     config.containers = true;
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
-    config.routing.order = ["aws", "cloudflare", "aws-on-demand"].iter().map(|c| Pool { off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
+    config.routing.order = ["aws", "cloudflare", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let run = |r: Request| block_on(plane.handle(r));
     // The standard machine fits Cloudflare: the job runs there, and no on-demand machine is asked for.
@@ -1887,6 +1887,31 @@ fn with_no_spot_machine_the_job_goes_to_the_next_place_in_the_order() {
 }
 
 #[test]
+fn each_place_of_awss_starts_its_machines_in_its_own_regions() {
+    // Spot machines in Ohio only (none there now), on-demand ones in N. Virginia only.
+    let clouds = With(FakeClouds::default(), |_: &Request, body: &str| (body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| aws_refuses("InsufficientInstanceCapacity")));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
+    let mut spot = Pool::of("aws");
+    spot.regions = vec!["us-east-2".into()];
+    let mut on_demand = Pool::of("aws-on-demand");
+    on_demand.regions = vec!["us-east-1".into(), "eu-north-1".into()];
+    config.routing.order = vec![spot, on_demand];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(webhook("queued", None)));
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["on_demand"].as_bool(), j["spot_refused"].as_str()), (Some("launched"), Some(true), Some("us-east-2: InsufficientInstanceCapacity")), "{j}");
+    let regions: Vec<(String, String)> = clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances"))
+        .map(|c| (c.1.split('.').nth(1).unwrap_or_default().to_string(), if c.2.contains("MarketType=spot") { "spot".to_string() } else { "on-demand".to_string() })).collect();
+    assert!(regions.iter().all(|(r, kind)| (kind == "spot" && r == "us-east-2") || (kind == "on-demand" && r == "us-east-1")), "{regions:?}");
+    // (A region of its own the control plane is not set up in, Stockholm here, is passed over.)
+    assert!(regions.iter().any(|(_, kind)| kind == "on-demand") && !regions.iter().any(|(r, _)| r == "eu-north-1"));
+}
+
+#[test]
 fn with_on_demand_turned_off_and_nothing_else_in_the_order_the_job_waits_for_a_spot_machine() {
     let no_spot = std::cell::Cell::new(true);
     let clouds = With(FakeClouds::default(), |_: &Request, body: &str| (no_spot.get() && body.contains("Action=RunInstances") && body.contains("MarketType=spot")).then(|| aws_refuses("InsufficientInstanceCapacity")));
@@ -1894,7 +1919,7 @@ fn with_on_demand_turned_off_and_nothing_else_in_the_order_the_job_waits_for_a_s
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.order = vec![Pool { off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }, Pool { off: true, cloud: "aws-on-demand".into(), max_jobs: None, monthly_usd: None }];
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: true, cloud: "aws-on-demand".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     // No spot machine, and on-demand is off: the job waits (it does not fail), however many times it is tried.
     block_on(plane.handle(webhook("queued", None)));
@@ -1928,7 +1953,7 @@ fn a_provider_that_cannot_start_the_machine_sends_the_job_to_the_next_in_the_ord
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.agents = vec![Agent { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = ["cloudflare", "aws", "aws-on-demand"].iter().map(|c| Pool { off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
+    config.routing.order = ["cloudflare", "aws", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     // The job starts on AWS (a spot machine) at once: it does not wait on Cloudflare.
@@ -1966,7 +1991,7 @@ fn a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fa
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.agents = vec![Agent { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
-    config.routing.order = ["modal", "aws", "aws-on-demand"].iter().map(|c| Pool { off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
+    config.routing.order = ["modal", "aws", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/gpu=any")));
     let j = job(&store, 7);

@@ -716,14 +716,23 @@ fn matches_repo(pattern: &str, repo: &str) -> bool {
         || pattern.strip_suffix("/*").is_some_and(|owner| repo.split('/').next().is_some_and(|o| o.eq_ignore_ascii_case(owner)))
 }
 
-/// A place in the order, with its limits: jobs at once, and spend this month (USD, estimated as on the dashboard).
+/// A place in the order (AWS's spot machines, its on-demand ones, Cloudflare, Modal), each with the same settings:
+/// jobs at once, spend this month (USD, estimated as on the dashboard), and for AWS's the regions its machines start
+/// in, in order.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Pool {
     pub cloud: String,
-    /// Turned off in the dashboard: it takes no jobs (only `AWS_ON_DEMAND` can be, the others are removed instead).
+    /// Taken out of the order: it takes no jobs, and its settings are kept for when it is put back.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub off: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub max_jobs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub monthly_usd: Option<f64>,
+    /// AWS's: the regions its machines start in, in order (the next when one has no room). None: all of the regions
+    /// the control plane is set up in (`Config::aws_regions`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub regions: Vec<String>,
+}
+
+impl Pool {
+    pub fn of(cloud: &str) -> Pool { Pool { regions: vec![], off: false, cloud: cloud.to_string(), max_jobs: None, monthly_usd: None } }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1877,6 +1886,14 @@ impl<'a> ControlPlane<'a> {
         if self.config.aws_regions.is_empty() { vec![a.region.clone()] } else { self.config.aws_regions.clone() }
     }
 
+    /// The regions a place of AWS's (its spot machines, its on-demand ones) starts machines in, in order: its own, of
+    /// those the control plane is set up in; else all of those.
+    fn place_regions(&self, a: &AwsConnection, place: &str) -> Vec<String> {
+        let all = self.aws_regions(a);
+        let own: Vec<String> = self.config.routing.pool(place).map(|p| p.regions.iter().filter(|r| all.contains(r)).cloned().collect()).unwrap_or_default();
+        if own.is_empty() { all } else { own }
+    }
+
     /// The current machine image in a region for a machine (Linux x64 or arm64, Linux with NVIDIA's drivers for GPUs,
     /// Windows), with its disk's size (looked up at most every six hours).
     async fn image(&self, region: &str, spec: &Spec, creds: &Credentials, now: u64) -> Result<(String, u32)> {
@@ -2604,7 +2621,7 @@ impl<'a> ControlPlane<'a> {
                         // for each job (it would refuse each one, a second lost every time): the job goes on down the
                         // order. Not longer: once its owner changes that rule, jobs are on spot within ten minutes.
                         if !on_demand && self.store.get(SPOT_NOT_ALLOWED_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000) {
-                            answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.aws_regions(&a).first().cloned().unwrap_or_default()));
+                            answers.push(format!("{}: {SPOT_NOT_ALLOWED}", self.place_regions(&a, &place).first().cloned().unwrap_or_default()));
                             quota_only = false;
                             job.spot_refused = Some(answers.join("; ").chars().take(300).collect());
                             job.spot_ending = self.spot_ending(job).await;
@@ -2636,8 +2653,8 @@ impl<'a> ControlPlane<'a> {
                             aws::with_hello_windows(user_data.clone(), &format!("{plane_url}/hello?runner={name}&t={token}")).unwrap_or(user_data)
                         } else { user_data };
                         let mut launched = None;
-                        // The regions in order: the next when this one has no room (capacity or quota) for any of the types.
-                        for region in &self.aws_regions(&a) {
+                        // Its regions in order: the next when this one has no room (capacity or quota) for any of the types.
+                        for region in &self.place_regions(&a, &place) {
                             if self.clock.now_ms().saturating_sub(began) > LAUNCH_BUDGET_MS { return Ok(Tried::OutOfTime) }
                             let said = |what: &str| format!("{region}{}: {what}", if on_demand { " on-demand" } else { "" });
                             let (image, image_gb) = match self.image(region, &spec, &creds, now).await { Ok(i) => i, Err(e) => { last = said(&e); continue } };

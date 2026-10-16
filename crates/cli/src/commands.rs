@@ -31,8 +31,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again). --tests: each failed job's tests too,\n          from its whole log: the ones that failed, with their files and errors, and where its artifacts are.\ncreate    Runs a workflow's job from this computer, as GitHub would run it, on a machine as any job here: the working\n          tree as it is (what git tracks, and new files it does not ignore), with nothing pushed. --workflow=FILE runs its\n          jobs (each combination of a matrix a job of its own, each job once those it needs have ended); --job=NAME\n          runs that job and those it needs. --event=push|pull_request (push unless given), and what GitHub would give\n          it and cannot here: --secret=NAME=VALUE and --var=NAME=VALUE, as often as needed. It waits for the run and\n          prints its jobs' lines, then each step's result and time and what its machines cost; it fails when the run does.\n          --quiet: each step's result, and the last lines of one that failed, not every line (for a coding agent).\n          --detach: says the run's id and ends; `superci runs wait ID` follows it.\nwait      Follows a run from a computer to its end, as create does.\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
         "list      Every control plane found in the clouds signed in to. One is in use at a time.\ncreate    Puts a control plane in a cloud you are signed in to. Nothing else is needed first.\nupdate    Brings the control plane in use (or the one named) to this program's version.\nmove      Moves to another control plane you created: settings, history and runner providers go along, then\n          GitHub and GitLab are switched over. No job is lost.\nallow     Gives its AWS role what this version asks for (the dashboard's Control plane → Permissions → Allow).\ndelete    Deletes one that is not in use, with what was made for it in its cloud."),
-    ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none] [--enabled=true|false]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
-        "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's limits: jobs at once, dollars a month (`none` lifts one). --enabled: aws-on-demand only.\n          --regions and --networks are AWS's (a network of your own per region; give --networks once per region),\n          --location and --image Cloudflare's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal. A job goes to the first that can run it and is\n          within its limits; when one cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
+    ("runners", "  superci runners list\n  superci runners create aws [--region=us-east-1] | cloudflare [--account=ID] | modal\n  superci runners update CLOUD [--max-jobs=N|none] [--monthly-usd=N|none]\n                               [--regions=a,b,c] [--networks=\"REGION subnet-… sg-… [private]\"|none]\n                               [--location=enam|weur|auto|…] [--image=https://…|none]\n  superci runners order CLOUD...\n  superci runners delete CLOUD --confirm [--only-here] [--stop-jobs]",
+        "list      Runner providers in order, with their limits.\ncreate    Lets a cloud you are signed in to run jobs. --region: where AWS machines start, for a control plane that\n          is not in AWS itself.\nupdate    A provider's settings: jobs at once, dollars a month (`none` lifts one), and where it starts machines:\n          --regions for aws and aws-on-demand (each its own, in order), --location for cloudflare. --networks (AWS's,\n          a network of your own per region; give it once per region) and --image (Cloudflare's) are the account's.\norder     aws (its spot machines), aws-on-demand, cloudflare, modal: the ones named, in that order; any not named is\n          taken out (its settings kept). A job goes to the first that can run it and is within its limits; when one\n          cannot start it, to the next.\ndelete    Takes it out and deletes what SuperCI made for it there. --only-here: forgets it without deleting its\n          part (for when you cannot sign in there). --stop-jobs: also when jobs are running on it."),
     ("labels", "  superci labels list\n  superci labels create NAME\n  superci labels delete NAME --confirm",
         "The labels workflows name in `runs-on`: a list, `superci` alone unless you add others. A workflow may name any\nof them (`runs-on: acmeci`, `acmeci/cpu=8`).\n\ncreate    Adds NAME to the list: 2 to 24 lowercase letters and digits. It becomes the one shown in examples.\ndelete    Stops answering to NAME: jobs that still name it wait for a runner that never comes. The last one stays."),
     ("name", "  superci name retrieve\n  superci name update NAME",
@@ -936,36 +936,37 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if args.words.len() < 3 { return usage("Say the order: `superci runners order aws aws-on-demand cloudflare`.") }
             let mut d = signed_in();
             let now = view(&mut d)?.order();
-            // The places named, first; any other connected one after them, as it was.
-            let mut order: Vec<String> = args.words[2..].to_vec();
+            // The places named, in that order; every other one is taken out of the order (its settings kept).
+            let order: Vec<String> = args.words[2..].to_vec();
             if let Some(unknown) = order.iter().find(|c| !now.iter().any(|p| p.cloud == **c)) { return usage(format!("{unknown} is not one of your runner providers ({}).", now.iter().map(|p| p.cloud.clone()).collect::<Vec<_>>().join(", "))) }
-            for p in now { if !order.contains(&p.cloud) { order.push(p.cloud) } }
-            let names: Vec<String> = (0..order.len()).map(|i| format!("cloud_{i}")).collect();
+            let out: Vec<String> = now.iter().map(|p| p.cloud.clone()).filter(|c| !order.contains(c)).collect();
+            let names: Vec<String> = (0..order.len()).map(|i| format!("cloud_{i}")).chain((0..out.len()).map(|i| format!("out_{i}"))).collect();
             let mut fields: Vec<(&str, String)> = vec![field("action", "order")];
-            for (name, cloud) in names.iter().zip(&order) { fields.push((name, cloud.clone())) }
+            for (name, cloud) in names.iter().zip(order.iter().chain(&out)) { fields.push((name, cloud.clone())) }
             to_set(&mut d)?;
-            apply!(d, args, format!("set the order to {}", order.join(", ")), "/routing", &fields);
-            Ok(Done { said: vec![format!("Order: {}.", order.join(", "))], data: json!({ "ok": true, "order": order }) })
+            apply!(d, args, format!("set the order to {}{}", order.join(", "), if out.is_empty() { String::new() } else { format!(" (taking out {})", out.join(", ")) }), "/routing", &fields);
+            let mut said = vec![format!("Order: {}.", order.join(", "))];
+            if !out.is_empty() { said.push(format!("Taken out: {}.", out.join(", "))) }
+            Ok(Done { said, data: json!({ "ok": true, "order": order, "taken_out": out }) })
         }
         ("runners", "update") => {
             let cloud = w(2);
             let mut d = signed_in();
             let order = view(&mut d)?.order();
             let Some(pool) = order.iter().find(|p| p.cloud == cloud) else { return usage(format!("Say which: `superci runners update CLOUD …`, one of {}.", order.iter().map(|p| p.cloud.clone()).collect::<Vec<_>>().join(", "))) };
-            // (Only AWS's on-demand machines are turned off; another provider is removed.)
-            if args.has("enabled") && cloud != superci_core::plane::AWS_ON_DEMAND { return usage(format!("--enabled is for aws-on-demand only. To stop using {cloud}: `superci runners delete {cloud}`.")) }
+            if args.has("enabled") { return usage(format!("The order says what is used: `superci runners order …` without {cloud} takes it out, with it puts it back.")) }
+            if args.has("regions") && superci_core::plane::account_of(cloud) != "aws" { return usage("--regions is for aws and aws-on-demand.") }
             // The form's fields as they stand, with what was given in their place (the page sends them all).
             let limit = |flag: &str, now: Option<String>| match args.get(flag) { Some("none") => String::new(), Some(v) => v.to_string(), None => now.unwrap_or_default() };
             let regions: Vec<String> = args.get("regions").map(|r| r.split(',').map(|r| r.trim().to_string()).filter(|r| !r.is_empty()).collect()).unwrap_or_default();
             let names: Vec<String> = (0..regions.len()).map(|i| format!("region_{i}")).collect();
             let mut fields: Vec<(&str, String)> = vec![field("action", "pool"), field("cloud", cloud), field("current", order.iter().map(|p| p.cloud.clone()).collect::<Vec<_>>().join(",")),
                 field("max", limit("max-jobs", pool.max_jobs.map(|n| n.to_string()))), field("usd", limit("monthly-usd", pool.monthly_usd.map(|n| n.to_string())))];
-            if truth(args, "enabled")?.unwrap_or(!pool.off) { fields.push(field("on", "on")) }
             for (name, region) in names.iter().zip(&regions) { fields.push((name, region.clone())) }
             if args.has("networks") { fields.push(field("networks", args.all("networks").into_iter().filter(|n| *n != "none").collect::<Vec<_>>().join("\n"))) }
             if let Some(location) = args.get("location") { fields.push(field("location", location)) }
             if let Some(image) = args.get("image") { fields.push(field("image", if image == "none" { "" } else { image })) }
-            let given: Vec<String> = ["max-jobs", "monthly-usd", "enabled", "regions", "networks", "location", "image"].iter().filter(|f| args.has(f)).map(|f| format!("--{f}={}", args.get(f).unwrap_or_default())).collect();
+            let given: Vec<String> = ["max-jobs", "monthly-usd", "regions", "networks", "location", "image"].iter().filter(|f| args.has(f)).map(|f| format!("--{f}={}", args.get(f).unwrap_or_default())).collect();
             if given.is_empty() { return usage(format!("Say what to change: `superci runners update {cloud} --max-jobs=20` (see `superci help runners`).")) }
             to_set(&mut d)?;
             apply!(d, args, format!("update {cloud}: {}", given.join(" ")), "/routing", &fields);
@@ -1357,10 +1358,16 @@ fn machine_words(m: &Value) -> String {
 fn runners_of(d: &mut Dashboard) -> Result<Done> {
     let view = view(d)?;
     let st = view.status.clone().unwrap_or_default();
-    let order: Vec<Value> = view.order().into_iter().map(|p| json!({ "cloud": p.cloud, "off": p.off, "max_jobs": p.max_jobs, "monthly_usd": p.monthly_usd,
+    let pools = view.order();
+    let order: Vec<Value> = pools.iter().map(|p| json!({ "cloud": p.cloud, "taken_out": p.off, "max_jobs": p.max_jobs, "monthly_usd": p.monthly_usd,
+        "regions": if superci_core::plane::account_of(&p.cloud) == "aws" { json!(view.pool_regions(p)) } else { Value::Null },
         "running": st["active"][&p.cloud].as_u64().unwrap_or(0), "spent_usd": st["spend"][&p.cloud].as_f64().unwrap_or(0.0) })).collect();
-    let mut said: Vec<String> = order.iter().enumerate().map(|(i, p)| format!("{}. {:<14} {}{}{}", i + 1, p["cloud"].as_str().unwrap_or_default(), if p["off"] == true { "off  " } else { "" },
-        p["max_jobs"].as_u64().map(|n| format!("up to {n} jobs at once  ")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()).trim_end().to_string()).collect();
+    let line = |p: &Value| [p["regions"].as_array().map(|r| format!("in {}", r.iter().filter_map(|r| r.as_str()).collect::<Vec<_>>().join(", "))).unwrap_or_default(),
+        p["max_jobs"].as_u64().map(|n| format!("up to {n} jobs at once")).unwrap_or_default(), p["monthly_usd"].as_f64().map(|n| format!("up to ${n} a month")).unwrap_or_default()]
+        .into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join("  ");
+    let mut said: Vec<String> = order.iter().filter(|p| p["taken_out"] != true).enumerate().map(|(i, p)| format!("{}. {:<14} {}", i + 1, p["cloud"].as_str().unwrap_or_default(), line(p)).trim_end().to_string()).collect();
+    let out: Vec<&str> = order.iter().filter(|p| p["taken_out"] == true).filter_map(|p| p["cloud"].as_str()).collect();
+    if !out.is_empty() { said.push(format!("Taken out of the order: {} (`superci runners order` with it named puts it back).", out.join(", "))) }
     if said.is_empty() { said.push("No runner provider yet: `superci runners create aws` (or cloudflare, or modal).".into()) }
     let machine = serde_json::to_value(view.machine()).unwrap_or_default();
     // (By the label workflows name here: the first of the control plane's.)

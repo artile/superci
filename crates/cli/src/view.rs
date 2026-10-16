@@ -116,10 +116,17 @@ impl PlaneView {
         let mut order: Vec<_> = routing.order.into_iter().filter(|p| places.contains(&p.cloud)).collect();
         for c in places {
             if order.iter().any(|p| p.cloud == c) { continue }
-            let new = Pool { off: false, cloud: c.clone(), max_jobs: None, monthly_usd: None };
+            let new = Pool { regions: vec![], off: false, cloud: c.clone(), max_jobs: None, monthly_usd: None };
             match order.iter().position(|p| p.cloud == "aws") { Some(at) if c == AWS_ON_DEMAND => order.insert(at + 1, new), _ => order.push(new) }
         }
         order
+    }
+    /// The regions a place of AWS's starts its machines in, in order: its own, of those the control plane is set up
+    /// in; else all of those.
+    pub fn pool_regions(&self, pool: &superci_core::plane::Pool) -> Vec<String> {
+        let all = self.aws_regions();
+        let own: Vec<String> = pool.regions.iter().filter(|r| all.contains(r)).cloned().collect();
+        if own.is_empty() { all } else { own }
     }
     /// The regions AWS machines go to, in order (older control planes: the connection's one).
     pub fn aws_regions(&self) -> Vec<String> {

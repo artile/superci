@@ -3061,32 +3061,61 @@ impl Dashboard {
                         routing.public_repos.retain(|p| p.ends_with("/*"));
                         for r in chosen { if !routing.public_repos.iter().any(|p| p.eq_ignore_ascii_case(&r)) { routing.public_repos.push(r) } }
                     }
-                    // A new order (dragged), each pool keeping its limits.
+                    // A new order (dragged; or the CLI's): each place named in it is in the order, in that order, keeping its
+                    // settings; one named as taken out (`out_N`) is taken out; one not named at all stays as it was, after them.
                     "order" => {
                         let mut order = vec![];
                         for i in 0..64 {
                             let cloud = field(&format!("cloud_{i}"));
                             if cloud.is_empty() { break }
                             if !pool_name_ok(&cloud) || order.iter().any(|p: &Pool| p.cloud == cloud) { return Ok(message(400, "Unknown provider", "")) }
-                            order.push(routing.pool(&cloud).cloned().unwrap_or(Pool { off: false, cloud, max_jobs: None, monthly_usd: None }));
+                            let mut p = routing.pool(&cloud).cloned().unwrap_or(Pool::of(&cloud));
+                            p.off = false;
+                            order.push(p);
                         }
+                        for i in 0..64 {
+                            let cloud = field(&format!("out_{i}"));
+                            if cloud.is_empty() { break }
+                            if !pool_name_ok(&cloud) || order.iter().any(|p: &Pool| p.cloud == cloud) { return Ok(message(400, "Unknown provider", "")) }
+                            let mut p = routing.pool(&cloud).cloned().unwrap_or(Pool::of(&cloud));
+                            p.off = true;
+                            order.push(p);
+                        }
+                        if order.iter().all(|p| p.off) { return Ok(message(400, "Keep one provider in the order", "With none, no job could start.")) }
+                        for p in &routing.order { if !order.iter().any(|o| o.cloud == p.cloud) { order.push(p.clone()) } }
                         routing.order = order;
                         // The order replaces the one default cloud from before.
                         routing.default = None;
                     }
-                    // One pool's settings: jobs at once, dollars a month. The order shown (`current`) is kept as it was.
-                    "pool" => {
+                    // A place taken out of the order (its settings kept, nothing deleted anywhere), or put back, at its end.
+                    "take_out" | "put_back" => {
                         let cloud = field("cloud");
                         if !pool_name_ok(&cloud) { return Ok(message(400, "Unknown provider", "")) }
-                        let mut order: Vec<Pool> = field("current").split(',').filter(|c| pool_name_ok(c))
-                            .map(|c| routing.pool(c).cloned().unwrap_or(Pool { off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None })).collect();
-                        if !order.iter().any(|p| p.cloud == cloud) { order.push(Pool { off: false, cloud: cloud.clone(), max_jobs: None, monthly_usd: None }) }
+                        let mut order = order_as_shown(&routing, &field("current"));
+                        let Some(at) = order.iter().position(|p| p.cloud == cloud) else { return Ok(message(400, "Unknown provider", "")) };
+                        let mut p = order.remove(at);
+                        p.off = field("action") == "take_out";
+                        if p.off && order.iter().all(|o| o.off) { return Ok(message(400, "Keep one provider in the order", "With none, no job could start. Put another back first.")) }
+                        // Back at the end of the order (before those taken out); out, among those taken out.
+                        let end = order.iter().position(|o| o.off).unwrap_or(order.len());
+                        order.insert(if p.off { order.len() } else { end }, p);
+                        routing.order = order;
+                        routing.default = None;
+                    }
+                    // A place's settings (jobs at once, a monthly budget, where it starts machines), or an account's
+                    // (AWS's own network, Cloudflare's image). The order shown (`current`) is kept as it was.
+                    "pool" | "account" => {
+                        let cloud = field("cloud");
+                        if !pool_name_ok(&cloud) { return Ok(message(400, "Unknown provider", "")) }
+                        let account = superci_core::plane::account_of(&cloud).to_string();
+                        let mut order = order_as_shown(&routing, &field("current"));
+                        if !order.iter().any(|p| p.cloud == cloud) { order.push(Pool::of(&cloud)) }
                         // Checked whole before anything changes (a form refused halfway would leave half of it set).
                         let want_image = if cloud == "cloudflare" && form_has("image") {
                             let image = field("image").trim().to_string();
                             Some(if image.is_empty() { None } else { Some(superci_core::plane::image_address(&image).ok_or("The image's address must start with https:// and be a plain address")?) })
                         } else { None };
-                        let want_networks = if cloud == "aws" && form_has("networks") { Some(match given_networks(&field("networks")) { Ok(n) => n, Err(e) => return Ok(message(400, "Check your networks", &esc(&e))) }) } else { None };
+                        let want_networks = if account == "aws" && form_has("networks") { Some(match given_networks(&field("networks")) { Ok(n) => n, Err(e) => return Ok(message(400, "Check your networks", &esc(&e))) }) } else { None };
                         // AWS: networks of the account's own, by region. Looked up with the account's sign-in when
                         // there is one, so a wrong id is said here, not on the first job.
                         if let Some(networks) = want_networks {
@@ -3105,8 +3134,10 @@ impl Dashboard {
                                 self.shown(&plane, |s| s["aws_networks"] == want)?;
                             }
                         }
-                        // AWS's regions, in order (the next when one has no spot capacity left).
-                        if cloud == "aws" && !field("region_0").is_empty() {
+                        // An AWS place's regions, in order (the next when one has no room). The control plane is set up in
+                        // all the regions of AWS's places (a network in each, where its machines are looked for): the
+                        // other place's are kept as they are now, so changing one place's leaves the other's alone.
+                        if field("action") == "pool" && account == "aws" && !field("region_0").is_empty() {
                             let mut regions: Vec<String> = vec![];
                             for i in 0..REGIONS.len() {
                                 let r = field(&format!("region_{i}"));
@@ -3114,21 +3145,26 @@ impl Dashboard {
                                 if !REGIONS.contains(&r.as_str()) { return Ok(message(400, "Choose a region from the list", "")) }
                                 regions.push(r);
                             }
-                            let want = serde_json::to_value(&regions).map_err(|e| e.to_string())?;
-                            let have = cloudflare::status(plane.url(), &self.status_key).map(|s| s["aws_regions"].clone()).unwrap_or_default();
-                            if have != want {
-                                // Signed in to its account: its own network in each, first (else Permissions asks for it).
-                                let account = cloudflare::status(plane.url(), &self.status_key).and_then(|s| s["aws"]["account_id"].as_str().map(str::to_string));
-                                let given = cloudflare::status(plane.url(), &self.status_key).map(|s| s["aws_networks"].clone()).unwrap_or_default();
-                                let own: Vec<String> = regions.iter().filter(|r| given.get(r.as_str()).is_none()).cloned().collect();
-                                if account.as_ref().is_some_and(|a| self.hold_account(a)) { aws::make_networks(&self.aws_creds()?, plane.plane_id(), &own)?; }
+                            let st = cloudflare::status(plane.url(), &self.status_key).unwrap_or_default();
+                            let have_all: Vec<String> = st["aws_regions"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect();
+                            for p in order.iter_mut().filter(|p| superci_core::plane::account_of(&p.cloud) == "aws") {
+                                if p.cloud == cloud { p.regions = regions.clone() } else if p.regions.is_empty() { p.regions = have_all.clone() }
+                            }
+                            let mut all: Vec<String> = vec![];
+                            for p in order.iter().filter(|p| superci_core::plane::account_of(&p.cloud) == "aws") { for r in &p.regions { if !all.contains(r) { all.push(r.clone()) } } }
+                            let want = serde_json::to_value(&all).map_err(|e| e.to_string())?;
+                            if st["aws_regions"] != want {
+                                // Signed in to its account: its own network in each new one, first (else Permissions asks for it).
+                                let account_id = st["aws"]["account_id"].as_str().map(str::to_string);
+                                let own: Vec<String> = all.iter().filter(|r| st["aws_networks"].get(r.as_str()).is_none() && !have_all.contains(r)).cloned().collect();
+                                if account_id.as_ref().is_some_and(|a| self.hold_account(a)) && !own.is_empty() { aws::make_networks(&self.aws_creds()?, plane.plane_id(), &own)?; }
                                 self.put_secret(&plane, "AWS_REGIONS", &want.to_string())?;
                                 self.shown(&plane, |s| s["aws_regions"] == want)?;
                             }
                         }
                         // Cloudflare's location (where its containers start).
                         let location = field("location");
-                        if cloud == "cloudflare" && CF_LOCATIONS.iter().any(|(k, _)| *k == location) {
+                        if field("action") == "pool" && cloud == "cloudflare" && CF_LOCATIONS.iter().any(|(k, _)| *k == location) {
                             let have = cloudflare::status(plane.url(), &self.status_key).and_then(|s| s["cloudflare_location"].as_str().map(str::to_string));
                             if have.as_deref() != Some(location.as_str()) {
                                 self.put_secret(&plane, "CF_LOCATION", &location)?;
@@ -3144,11 +3180,11 @@ impl Dashboard {
                                 self.shown(&plane, move |s| s["cloudflare_image"].as_str().map(str::to_string) == w)?;
                             }
                         }
-                        for p in order.iter_mut().filter(|p| p.cloud == cloud) {
-                            // AWS on-demand can be turned off (the others are removed instead).
-                            p.off = cloud == AWS_ON_DEMAND && field("on") != "on";
-                            p.max_jobs = field("max").parse().ok().filter(|n| *n > 0 && *n <= 999);
-                            p.monthly_usd = field("usd").parse::<f64>().ok().filter(|n| *n > 0.0 && n.is_finite());
+                        if field("action") == "pool" {
+                            for p in order.iter_mut().filter(|p| p.cloud == cloud) {
+                                p.max_jobs = field("max").parse().ok().filter(|n| *n > 0 && *n <= 999);
+                                p.monthly_usd = field("usd").parse::<f64>().ok().filter(|n| *n > 0.0 && n.is_finite());
+                            }
                         }
                         routing.order = order;
                         routing.default = None;
@@ -3741,7 +3777,7 @@ mark();load()})();</script>"#;
             let account = aws_account(v);
             let signed_in: Vec<&str> = [("aws", self.aws.iter().chain(&self.aws_others).any(|a| Some(&a.account_id) == account.as_ref())), ("modal", self.modal.is_some()), ("cloudflare", self.cf.is_some())]
                 .into_iter().filter(|(_, yes)| *yes).map(|(c, _)| c).collect();
-            format!("{}{}", pools_card(v, &self.quotas, self.cf_month, self.modal_month.as_ref(), &signed_in, self.aws_look()), spending_card(v, self.budget_lifted.get(v.plane.plane_id()).copied().unwrap_or(0)))
+            format!("{}{}{}", pools_card(v, &self.quotas, self.cf_month, self.modal_month.as_ref(), self.aws_look()), clouds_card(v, &signed_in), spending_card(v, self.budget_lifted.get(v.plane.plane_id()).copied().unwrap_or(0)))
         };
         let note = match &self.flash { Some(f) => format!(r#"<div class="notice">{}<span>{}</span></div>"#, icon("check"), esc(f)), None => String::new() };
         format!(r#"<div class="bar"><h1 class="page-title">Runners</h1>{add}</div>{note}<div class="cards">{body}</div>"#)
@@ -4707,7 +4743,7 @@ fn provider_connected(status: &serde_json::Value, cloud: &str) -> bool {
 /// Removing a runner provider, confirmed: what is deleted where (the control plane and sign-ins stay), its running jobs,
 /// and the sign-in that needs; or removing it from SuperCI only.
 fn remove_dialog(v: &PlaneView, cloud: &str, i: usize, signed_in: &[&str]) -> String {
-    let (logo_key, name, _) = pool_text(v, cloud);
+    let (logo_key, name) = (cloud.to_string(), cloud_name(cloud).to_string());
     let id = v.plane.plane_id();
     let st = v.status.clone().unwrap_or_default();
     let own = st["containers"] == true && st["own_cloud"].as_str().unwrap_or("cloudflare") == cloud;
@@ -5037,25 +5073,36 @@ fn setup_step(n: u8, state: &str, title: String, body: String) -> String {
 /// What a step of Set up waits for.
 fn setup_locked(what: &str) -> String { format!(r#"<div class="locked-note">{}Needs {what} first</div>"#, icon("lock")) }
 
-/// A pool as shown: its logo key, its name, and what it starts.
-fn pool_text(v: &PlaneView, pool: &str) -> (String, String, String) {
-    let what = match pool {
-        "aws" => {
-            let regions = v.aws_regions();
-            let at = match regions.split_first() {
-                Some((first, [])) => format!(" · {}", region_short(first)),
-                Some((first, rest)) => format!(" · {}, then {}", region_short(first), rest.iter().map(|r| region_short(r)).collect::<Vec<_>>().join(", ")),
-                None => String::new(),
-            };
-            format!("Spot machines of any size · x64, arm64{at}")
-        }
-        AWS_ON_DEMAND => "On-demand machines · one per job, never interrupted".into(),
-        "cloudflare" => "Containers sized per job · up to 4 CPU, 12 GB, x64".into(),
-        "modal" => "Sandboxes · up to 64 CPU, x64".into(),
-        _ => String::new(),
+/// The order as a page showed it (`current`: every place, taken out ones too, by name), each with its stored settings,
+/// and any stored place the page did not show after them.
+fn order_as_shown(routing: &Routing, current: &str) -> Vec<Pool> {
+    let mut order: Vec<Pool> = vec![];
+    for c in current.split(',').filter(|c| pool_name_ok(c)) { if !order.iter().any(|p| p.cloud == c) { order.push(routing.pool(c).cloned().unwrap_or(Pool::of(c))) } }
+    for p in &routing.order { if !order.iter().any(|o| o.cloud == p.cloud) { order.push(p.clone()) } }
+    order
+}
+
+/// Regions as a row says them: the first, then the others.
+fn regions_text(regions: &[String]) -> String {
+    match regions.split_first() {
+        Some((first, [])) => region_short(first).to_string(),
+        Some((first, rest)) => format!("{}, then {}", region_short(first), rest.iter().map(|r| region_short(r)).collect::<Vec<_>>().join(", ")),
+        None => String::new(),
+    }
+}
+
+/// A place in the order as shown: its logo key, its name, and what it starts and where.
+fn pool_text(v: &PlaneView, pool: &Pool) -> (String, String, String) {
+    let at = |p: &Pool| { let r = regions_text(&v.pool_regions(p)); if r.is_empty() { r } else { format!(" · {r}") } };
+    let (name, what) = match pool.cloud.as_str() {
+        "aws" => ("AWS spot".to_string(), format!("Spot machines of any size · x64, arm64{}", at(pool))),
+        AWS_ON_DEMAND => ("AWS on-demand".to_string(), format!("On-demand machines of any size, never taken back · x64, arm64{}", at(pool))),
+        "cloudflare" => (cloud_name("cloudflare").to_string(), "Containers sized per job · up to 4 CPU, 12 GB, x64".into()),
+        "modal" => (cloud_name("modal").to_string(), "Sandboxes · up to 64 CPU, x64".into()),
+        c => (cloud_name(c).to_string(), String::new()),
     };
     // AWS's on-demand machines carry AWS's logo.
-    (if pool == AWS_ON_DEMAND { "aws" } else { pool }.into(), cloud_name(pool).to_string(), what)
+    (superci_core::plane::account_of(&pool.cloud).to_string(), name, what)
 }
 
 /// What each pool can run, for the machine picker: its capacity (the largest machine, systems, standard machine and
@@ -5072,17 +5119,63 @@ fn pool_caps(pool: &str) -> serde_json::Value {
 const ICON_GEAR: &str = r#"<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></svg>"#;
 const ICON_GRIP: &str = r#"<svg viewBox="0 0 24 24"><circle cx="9" cy="6" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="18" r="1.4"/></svg>"#;
 
-/// The runner pools, in order: each starts a runner per job; a job goes to the first that can run its machine and has
-/// room. Rows are dragged to reorder; each has its settings (limits) in a dialog.
-fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Option<(f64, f64)>, modal_month: Option<&modal::Month>, signed_in: &[&str], look: Option<&aws::Look>) -> String {
+/// An AWS place's regions, in order, as its settings edit them: the regions the account may use, each with what the
+/// account allows there (spot's: how many spot CPUs), and where the runner image is not yet.
+fn regions_field(v: &PlaneView, p: &Pool, quotas: &HashMap<String, Result<u32>>, look: Option<&aws::Look>) -> String {
+    let spot = p.cloud == "aws";
+    let list = v.pool_regions(p);
+    let best = closest(Some(v));
+    let row = |r: &str| {
+        let quota = match quotas.get(r) { Some(Ok(n)) if spot => format!(" · up to {n} spot CPUs"), _ => String::new() };
+        let quota = if r == "us-east-1" { format!("{quota} · {best}") } else { quota };
+        format!(r#"<li class="rg" draggable="true" data-region="{r}" data-name="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span><span class="rg-main"><strong>{}</strong><small>{r}{quota}</small></span><button type="button" class="icon-btn" aria-label="Remove {}" onclick="superciRegionRemove(this)"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></li>"#,
+            esc(region_name(r)), esc(region_name(r)), esc(region_name(r)))
+    };
+    let rows = list.iter().map(|r| row(r)).collect::<String>();
+    // (A region the account cannot use is shown, and cannot be chosen: why is said beside it.)
+    let more = REGIONS.iter().filter(|r| !list.iter().any(|l| l == *r)).map(|r| match region_unusable(look, r) {
+        Some(why) => format!(r#"<option value="{r}" disabled>{} · {r} · {why}</option>"#, region_name(r)),
+        None => format!(r#"<option value="{r}">{} · {r}{}</option>"#, region_name(r), if *r == "us-east-1" { format!(" · {best}") } else { String::new() }),
+    }).collect::<String>();
+    // A region the account may use and the runner image is not in: where it is copied in.
+    let image_first = match look.map(|l| l.regions_without_image()).filter(|w| !w.is_empty()) {
+        Some(without) => format!(r#" The runner image is not in {} yet: <a href="/?p=planes#aws-account">copy it in</a> under Control plane, then add the region here."#, esc(&without.iter().map(|r| region_short(r)).collect::<Vec<_>>().join(", "))),
+        None => String::new(),
+    };
+    let quota = if !spot { String::new() } else {
+        let total: u32 = list.iter().filter_map(|r| quotas.get(r).and_then(|q| q.as_ref().ok())).sum();
+        let low = list.iter().find(|r| matches!(quotas.get(*r), Some(Ok(n)) if *n < 16));
+        match (total, low) {
+            (0, _) => String::new(),
+            (n, Some(r)) => format!(r#" Your account may run {n} spot CPUs at once in these. <a href="{}" target="_blank" rel="noopener">Request more in {} ↗</a>"#, esc(&superci_core::aws::spot_quota_link(r)), region_short(r)),
+            (n, None) => format!(" Your account may run up to {n} spot CPUs at once in these ({} of 4 CPU).", jobs_word(n / 4)),
+        }
+    };
+    let next = if spot { "when it has no spot machine left" } else { "when it has no room" };
+    format!(r#"<div class="field"><span>Regions</span><ol class="rg-list" data-regions>{rows}</ol><select class="rg-add" aria-label="Add a region" onchange="superciRegionAdd(this)"><option value="">+ Add a region…</option>{more}</select><small>Machines start in the first; {next}, in the next. Drag to reorder.{quota}{image_first}</small></div>"#)
+}
+
+/// The places jobs go, in order: each starts a fresh runner per job; a job goes to the first that can run its machine
+/// and has room. Every row is alike (AWS's spot machines, its on-demand ones, Cloudflare, Modal): dragged to reorder,
+/// with its settings in a dialog (jobs at once, a monthly budget, where it starts machines), and taken out of the order
+/// there; one taken out is listed below the order with a way to put it back.
+fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Option<(f64, f64)>, modal_month: Option<&modal::Month>, look: Option<&aws::Look>) -> String {
     let order = v.order();
     let jobs = v.jobs();
     let current = order.iter().map(|p| p.cloud.as_str()).collect::<Vec<_>>().join(",");
+    let shown = order.iter().filter(|p| !p.off).map(|p| p.cloud.as_str()).collect::<Vec<_>>().join(",");
     let mut rows = String::new();
     let mut dialogs = String::new();
+    let mut out = String::new();
+    let close = r#"<button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>"#;
     for (i, p) in order.iter().enumerate() {
-        let (logo_key, name, what) = pool_text(v, &p.cloud);
-        let on_demand = p.cloud == AWS_ON_DEMAND;
+        let (logo_key, name, what) = pool_text(v, p);
+        // Taken out: a line below the order, with the way back in.
+        if p.off {
+            out.push_str(&format!(r#"<div class="limit"><span class="limit-text"><strong>{}</strong><small>Taken out of the order: no job goes to it. Its settings are kept.</small></span><form method="post" action="/routing" class="limit-do"><input type="hidden" name="action" value="put_back"><input type="hidden" name="cloud" value="{}"><input type="hidden" name="current" value="{}"><button class="chip">Put back</button></form></div>"#,
+                esc(&name), esc(&p.cloud), esc(&current)));
+            continue
+        }
         // AWS's spot machines in an account that may start none (its organization's rule, or its sign-in's): said
         // on the row and in its settings, in "ready"'s place. Its jobs go on down the order.
         let no_spot = match look.and_then(|l| l.spot.as_ref()).filter(|_| p.cloud == "aws") {
@@ -5090,73 +5183,31 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
             _ => None,
         };
         let what = match no_spot { Some(whose) => format!("Spot machines are not allowed by {whose}: its jobs go to the next provider in the order"), None => what };
-        let state = if p.off { pill("open", "off") } else if no_spot.is_some() { pill("open", "not allowed") } else { pill("good", "ready") };
+        let state = if no_spot.is_some() { pill("open", "not allowed") } else { pill("good", "ready") };
         let spent = v.spend(&p.cloud);
         let mut limits = vec![];
         if let Some(n) = p.max_jobs { limits.push(format!("{n} at once")) }
         if let Some(cap) = p.monthly_usd { limits.push(format!("{} of {}", usd(spent), usd(cap))) }
         let mut limits = limits.iter().map(|l| format!(r#"<span class="lim">{}</span>"#, esc(l))).collect::<String>();
         limits.push_str(&month_text(&p.cloud, spent, p.monthly_usd.is_none(), cf_month, modal_month));
-        let tag = "";
-        rows.push_str(&format!(r#"<li class="pool" draggable="true" data-cloud="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span>{}<span class="pool-main"><strong>{}{tag}</strong><small>{}</small></span><span class="pool-now">{limits}{state}</span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{i}').showModal()">{ICON_GEAR}</button></li>"#,
+        rows.push_str(&format!(r#"<li class="pool" draggable="true" data-cloud="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span>{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{limits}{state}</span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{i}').showModal()">{ICON_GEAR}</button></li>"#,
             esc(&p.cloud), logo(&logo_key, 32), esc(&name), esc(&what), esc(&name)));
-        // Its settings.
+        // Its settings, alike for every row: jobs at once, a monthly budget, and where it starts machines.
         let value = |n: Option<String>| n.map(|n| format!(r#" value="{n}""#)).unwrap_or_default();
-        let budget = {
-            format!(r#"<label class="field"><span>Monthly budget</span><span class="money">$<input type="number" name="usd" min="1" step="1" placeholder="No limit"{}></span><small>{} this month. At the budget, jobs go to the next provider.</small></label>"#,
-                value(p.monthly_usd.map(|n| format!("{n:.0}"))), usd(spent))
-        };
-        // AWS: its regions, in order.
-        let regions = if p.cloud == "aws" && v.status.as_ref().is_some_and(|s| s.get("aws_regions").is_some()) {
-            let list = v.aws_regions();
-            let best = closest(Some(v));
-            let row = |r: &str| {
-                let quota = match quotas.get(r) { Some(Ok(n)) => format!(" · up to {n} spot CPUs"), _ => String::new() };
-                let quota = if r == "us-east-1" { format!("{quota} · {best}") } else { quota };
-                format!(r#"<li class="rg" draggable="true" data-region="{r}" data-name="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span><span class="rg-main"><strong>{}</strong><small>{r}{quota}</small></span><button type="button" class="icon-btn" aria-label="Remove {}" onclick="superciRegionRemove(this)"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></li>"#,
-                    esc(region_name(r)), esc(region_name(r)), esc(region_name(r)))
-            };
-            let rows = list.iter().map(|r| row(r)).collect::<String>();
-            // (A region the account cannot use is shown, and cannot be chosen: why is said beside it.)
-            let more = REGIONS.iter().filter(|r| !list.iter().any(|l| l == *r)).map(|r| match region_unusable(look, r) {
-                Some(why) => format!(r#"<option value="{r}" disabled>{} · {r} · {why}</option>"#, region_name(r)),
-                None => format!(r#"<option value="{r}">{} · {r}{}</option>"#, region_name(r), if *r == "us-east-1" { format!(" · {best}") } else { String::new() }),
-            }).collect::<String>();
-            // A region the account may use and the runner image is not in: where it is copied in.
-            let image_first = match look.map(|l| l.regions_without_image()).filter(|w| !w.is_empty()) {
-                Some(without) => format!(r#" The runner image is not in {} yet: <a href="/?p=planes#aws-account">copy it in</a> under Control plane, then add the region here."#, esc(&without.iter().map(|r| region_short(r)).collect::<Vec<_>>().join(", "))),
-                None => String::new(),
-            };
-            let total: u32 = list.iter().filter_map(|r| quotas.get(r).and_then(|q| q.as_ref().ok())).sum();
-            let low = list.iter().find(|r| matches!(quotas.get(*r), Some(Ok(n)) if *n < 16));
-            let quota = match (total, low) {
-                (0, _) => String::new(),
-                (n, Some(r)) => format!(r#" Your account may run {n} spot CPUs at once in these. <a href="{}" target="_blank" rel="noopener">Request more in {} ↗</a>"#, esc(&superci_core::aws::spot_quota_link(r)), region_short(r)),
-                (n, None) => format!(" Your account may run up to {n} spot CPUs at once in these ({} of 4 CPU).", jobs_word(n / 4)),
-            };
-            // A network of the account's own, by region (a control plane that knows of them).
-            let networks = match v.status.as_ref().filter(|s| s.get("aws_networks").is_some()) {
-                Some(st) => { let text = given_networks_text(st); format!(r#"<details class="field-more"{}><summary>Your own network</summary><label class="field"><textarea name="networks" rows="3" spellcheck="false" placeholder="us-east-1 subnet-0abc… subnet-0def… sg-0123… private">{}</textarea><small>One line a region: its subnets and security groups. Machines there start in your network, so jobs reach what it reaches. Add <code>private</code> for subnets with no public addresses (they need a NAT to reach GitHub). Regions not listed use the network SuperCI made.</small></label></details>"#, if text.is_empty() { "" } else { " open" }, esc(&text)) }
-                None => String::new(),
-            };
-            format!(r#"<div class="field"><span>Regions</span><ol class="rg-list" data-regions>{rows}</ol><select class="rg-add" aria-label="Add a region" onchange="superciRegionAdd(this)"><option value="">+ Add a region…</option>{more}</select><small>Machines start in the first; when it has no spot capacity left, in the next. Drag to reorder.{quota}{image_first}</small></div>{networks}"#)
-        } else if p.cloud == "cloudflare" && v.status.as_ref().is_some_and(|s| s.get("cloudflare_location").is_some()) {
-            // Cloudflare: where its containers start.
-            let current = v.status.as_ref().and_then(|s| s["cloudflare_location"].as_str().map(str::to_string)).unwrap_or_else(|| "enam".into());
-            let best = closest(Some(v));
-            let opts = CF_LOCATIONS.iter().map(|(k, name)| format!(r#"<option value="{k}"{}>{name}{}</option>"#, if *k == current { " selected" } else { "" }, if *k == "enam" { format!(" · {best}") } else { String::new() })).collect::<String>();
-            let image = v.status.as_ref().and_then(|s| s["cloudflare_image"].as_str().map(str::to_string)).unwrap_or_default();
-            format!(r#"<label class="field"><span>Location</span><select name="location">{opts}</select><small>Where its containers start. Cloudflare places each one; this is the area it starts in.</small></label><label class="field"><span>GitHub's full image (experimental)</span><input type="url" name="image" value="{}" placeholder="https://… (empty: the small image)"><small>Jobs then run inside GitHub's own runner image, with everything it has, loaded from this address as it is read and checked piece by piece (an address as <code>image-reader pack</code> names it). Empty: GitHub's small runner image, with few tools.</small></label>"#, esc(&image))
-        } else { String::new() };
-        let at_once_note = "When this many run, the next job goes to the next provider (or waits).";
-        // AWS on-demand is part of AWS: turned off here, removed with AWS.
-        let (switch, remove_button, remove) = if on_demand {
-            (format!(r#"<label class="check"><input type="checkbox" name="on"{}> Use on-demand machines</label>"#, if p.off { "" } else { " checked" }), String::new(), String::new())
-        } else {
-            (String::new(), format!(r#"<button type="button" class="button danger sm" style="margin-right:auto" onclick="this.closest('dialog').close();document.getElementById('pool-remove-{i}').showModal()">Remove…</button>"#), remove_dialog(v, &p.cloud, i, signed_in))
-        };
-        dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body" onsubmit="superciRegions(this)"><input type="hidden" name="action" value="pool"><input type="hidden" name="cloud" value="{}"><input type="hidden" name="current" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><label class="field"><span>Jobs at once</span><input type="number" name="max" min="1" max="999" placeholder="{}"{}><small>{at_once_note}</small></label>{budget}{regions}{switch}<div class="dlg-foot">{remove_button}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>{remove}"#,
-            esc(&p.cloud), esc(&current), logo(&logo_key, 36), esc(&name), esc(&what), "No limit", value(p.max_jobs.map(|n| n.to_string()))));
+        let budget = format!(r#"<label class="field"><span>Monthly budget</span><span class="money">$<input type="number" name="usd" min="1" step="1" placeholder="No limit"{}></span><small>{} this month. At the budget, jobs go to the next provider.</small></label>"#,
+            value(p.monthly_usd.map(|n| format!("{n:.0}"))), usd(spent));
+        let place = if superci_core::plane::account_of(&p.cloud) == "aws" && v.status.as_ref().is_some_and(|s| s.get("aws_regions").is_some()) { regions_field(v, p, quotas, look) }
+            else if p.cloud == "cloudflare" && v.status.as_ref().is_some_and(|s| s.get("cloudflare_location").is_some()) {
+                // Cloudflare: where its containers start.
+                let current = v.status.as_ref().and_then(|s| s["cloudflare_location"].as_str().map(str::to_string)).unwrap_or_else(|| "enam".into());
+                let best = closest(Some(v));
+                let opts = CF_LOCATIONS.iter().map(|(k, name)| format!(r#"<option value="{k}"{}>{name}{}</option>"#, if *k == current { " selected" } else { "" }, if *k == "enam" { format!(" · {best}") } else { String::new() })).collect::<String>();
+                format!(r#"<label class="field"><span>Location</span><select name="location">{opts}</select><small>Where its containers start. Cloudflare places each one; this is the area it starts in.</small></label>"#)
+            } else { String::new() };
+        // (Taking it out keeps its settings; nothing is deleted anywhere.)
+        let take_out = r#"<button type="button" class="button secondary sm" style="margin-right:auto" onclick="var f=this.form;f.elements.action.value='take_out';f.requestSubmit()">Take out of the order</button>"#;
+        dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body" onsubmit="superciRegions(this)"><input type="hidden" name="action" value="pool"><input type="hidden" name="cloud" value="{}"><input type="hidden" name="current" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div><label class="field"><span>Jobs at once</span><input type="number" name="max" min="1" max="999" placeholder="No limit"{}><small>When this many run, the next job goes to the next provider (or waits).</small></label>{budget}{place}<div class="dlg-foot">{take_out}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
+            esc(&p.cloud), esc(&current), logo(&logo_key, 36), esc(&name), esc(&what), value(p.max_jobs.map(|n| n.to_string()))));
     }
     let waiting: Vec<&serde_json::Value> = jobs.iter().filter(|j| j["state"] == "waiting").collect();
     let waiting = match waiting.as_slice() {
@@ -5174,7 +5225,45 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
     // Rules by repository from before (a workflow now picks a provider in its label): shown, so nothing steers jobs unseen.
     let rules = v.routing().rules.iter().map(|r| format!(r#"<form method="post" action="/routing" class="rule"><input type="hidden" name="action" value="remove"><input type="hidden" name="repo" value="{}"><span class="note"><code>{}</code> only uses {} (a rule from before; a workflow can say <code>runs-on: {}/provider={}</code> instead)</span><button class="chip">Remove</button></form>"#,
         esc(&r.repo), esc(&r.repo), esc(cloud_name(&r.cloud)), esc(&v.label()), esc(&r.cloud))).collect::<String>();
-    format!(r#"<section class="card"><div class="card-head"><h2>Runner providers</h2><span class="order-note" id="order-note" aria-live="polite"></span></div><p class="note">Each provider starts a fresh runner for every job. A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next. When all are full, it waits. Drag to reorder.</p>{waiting}<ol class="pools" data-order="{}">{rows}</ol>{rules}{dialogs}</section>"#, esc(&current))
+    format!(r#"<section class="card"><div class="card-head"><h2>Runner providers</h2><span class="order-note" id="order-note" aria-live="polite"></span></div><p class="note">Each provider starts a fresh runner for every job. A job goes to the first that can run its machine and has room; when that one cannot start it (no spot machine, a failure), to the next. When all are full, it waits. Drag to reorder.</p>{waiting}<ol class="pools" data-order="{}">{rows}</ol>{}{rules}{dialogs}</section>"#, esc(&shown), if out.is_empty() { String::new() } else { format!(r#"<div class="limits out">{out}</div>"#) })
+}
+
+/// The cloud accounts jobs run in, each with what belongs to the account rather than to a place in the order: AWS's
+/// own network by region, Cloudflare's runner image, and removing it (which deletes what SuperCI made there).
+fn clouds_card(v: &PlaneView, signed_in: &[&str]) -> String {
+    let close = r#"<button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>"#;
+    let st = v.status.clone().unwrap_or_default();
+    let (mut rows, mut dialogs) = (String::new(), String::new());
+    for (i, cloud) in v.clouds().iter().enumerate() {
+        let name = cloud_name(cloud).to_string();
+        let (title, what, field) = match cloud.as_str() {
+            "aws" => {
+                let account = aws_account(v).map(|a| format!("AWS account {a}")).unwrap_or_else(|| name.clone());
+                let own: Vec<String> = st["aws_networks"].as_object().map(|n| n.keys().map(|r| region_short(r).to_string()).collect()).unwrap_or_default();
+                let what = format!("Set up in {} · {}", regions_text(&v.aws_regions()).replace(", then", ","), if own.is_empty() { "networks SuperCI made".to_string() } else { format!("your own network in {}", own.join(", ")) });
+                let field = if st.get("aws_networks").is_some() {
+                    let text = given_networks_text(&st);
+                    format!(r#"<label class="field"><span>Your own network</span><textarea name="networks" rows="3" spellcheck="false" placeholder="us-east-1 subnet-0abc… subnet-0def… sg-0123… private">{}</textarea><small>One line a region: its subnets and security groups. Machines there start in your network, so jobs reach what it reaches. Add <code>private</code> for subnets with no public addresses (they need a NAT to reach GitHub). Regions not listed use the network SuperCI made.</small></label>"#, esc(&text))
+                } else { String::new() };
+                (account, what, field)
+            }
+            "cloudflare" => {
+                let image = st["cloudflare_image"].as_str().unwrap_or_default().to_string();
+                let field = if st.get("cloudflare_location").is_some() { format!(r#"<label class="field"><span>GitHub's full image (experimental)</span><input type="url" name="image" value="{}" placeholder="https://… (empty: the small image)"><small>Jobs then run inside GitHub's own runner image, with everything it has, loaded from this address as it is read and checked piece by piece (an address as <code>image-reader pack</code> names it). Empty: GitHub's small runner image, with few tools.</small></label>"#, esc(&image)) } else { String::new() };
+                (name.clone(), if image.is_empty() { "GitHub's small runner image".into() } else { "GitHub's full image (experimental)".to_string() }, field)
+            }
+            _ => (name.clone(), "Its runner agent starts the sandboxes".to_string(), String::new()),
+        };
+        let n = 100 + i;
+        rows.push_str(&format!(r#"<li class="pool still">{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now"></span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{n}').showModal()">{ICON_GEAR}</button></li>"#,
+            logo(cloud, 32), esc(&title), esc(&what), esc(&if title.contains("account") { title.clone() } else { format!("{title} account") })));
+        let remove = format!(r#"<button type="button" class="button danger sm" style="margin-right:auto" onclick="this.closest('dialog').close();document.getElementById('pool-remove-{n}').showModal()">Remove…</button>"#);
+        let save = if field.is_empty() { String::new() } else { r#"<button class="button primary sm">Save</button>"#.to_string() };
+        dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{n}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="account"><input type="hidden" name="cloud" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div>{field}<div class="dlg-foot">{remove}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button>{save}</div></form></dialog>{}"#,
+            esc(cloud), logo(cloud, 36), esc(&title), esc(&what), remove_dialog(v, cloud, n, signed_in)));
+    }
+    if rows.is_empty() { return String::new() }
+    format!(r#"<section class="card"><div class="card-head"><h2>Clouds</h2></div><p class="note">The accounts your runners start machines in. Removing one deletes what SuperCI made there.</p><ol class="pools">{rows}</ol>{dialogs}</section>"#)
 }
 
 /// A look at an AWS account with all the pages say of it: what it allows (`aws::look_at`), where a copy of the
@@ -5359,7 +5448,7 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         let opts = opts.iter().map(|(val, text)| format!(r#"<option value="{val}"{}>{text}</option>"#, if current == Some(*val) { " selected" } else { "" })).collect::<String>();
         format!(r#"<label class="field"><span>{label}</span><select name="{name}">{}{opts}</select></label>"#, if first.is_empty() { String::new() } else { format!(r#"<option value="">{first}</option>"#) })
     };
-    let pools = || v.order().iter().filter(|p| p.cloud != AWS_ON_DEMAND).map(|p| { let (key, name, _) = pool_text(v, &p.cloud); format!(r#"<span class="fit" data-caps="{}">{}{}<small data-size></small></span>"#, esc(&pool_caps(&p.cloud).to_string()), logo(&key, 18), esc(&name)) }).collect::<String>();
+    let pools = || v.order().iter().filter(|p| p.cloud != AWS_ON_DEMAND).map(|p| { let (key, name) = (p.cloud.clone(), cloud_name(&p.cloud).to_string()); format!(r#"<span class="fit" data-caps="{}">{}{}<small data-size></small></span>"#, esc(&pool_caps(&p.cloud).to_string()), logo(&key, 18), esc(&name)) }).collect::<String>();
     // The disk's speed on AWS: by the machine's size unless set (what AWS includes, at no extra price, or a number).
     let speed = m.disk_mibs.map(|s| s.to_string());
     let custom = speed.clone().filter(|s| !["125", "250", "500", "1000"].contains(&s.as_str())).map(|s| (s.clone(), format!("{s} MiB/s")));
@@ -7127,13 +7216,14 @@ mod tests {
         let view = PlaneView { plane, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(status.clone()) };
         let html = d.render("runners", &[view.clone()], None);
         preview("runners-remove", &html);
-        // In the order: AWS, its on-demand machines (no removal of their own: they go with AWS), Cloudflare, Modal.
-        assert!(!html.contains(r#"id="pool-remove-1""#));
-        let dialog = |cloud: &str| { let i = ["aws", "aws-on-demand", "cloudflare", "modal"].iter().position(|c| *c == cloud).unwrap(); let start = html.find(&format!(r#"id="pool-remove-{i}""#)).unwrap(); html[start..start + html[start..].find("</dialog>").unwrap()].to_string() };
+        // Removing is the cloud's (under Clouds, a row each: AWS, Cloudflare, Modal), not a place's in the order:
+        // AWS's spot and on-demand rows are only taken out of the order.
+        assert!(html.contains("<h2>Clouds</h2>") && html.matches(r#"action="/runners/remove""#).count() == 3 && html.matches("Take out of the order").count() == 4);
+        let dialog = |cloud: &str| { let i = 100 + ["aws", "cloudflare", "modal"].iter().position(|c| *c == cloud).unwrap(); let start = html.find(&format!(r#"id="pool-remove-{i}""#)).unwrap(); html[start..start + html[start..].find("</dialog>").unwrap()].to_string() };
         // Each names the control plane it is for (another may be in use by the time it is sent).
         assert_eq!(html.matches(r#"action="/runners/remove""#).count(), html.matches(r#"<input type="hidden" name="plane" value="p1"><input type="hidden" name="cloud""#).count());
         // Each provider's settings open its removal, which says what goes where; the control plane and sign-ins stay.
-        assert!(html.contains("document.getElementById('pool-remove-0').showModal()") && html.contains("Your control plane and your sign-ins stay"));
+        assert!(html.contains("document.getElementById('pool-remove-100').showModal()") && html.contains("Your control plane and your sign-ins stay"));
         let aws = dialog("aws");
         assert!(aws.contains("Remove AWS?") && aws.contains("The role superci-plane-p1 and its identity provider, in account 123456789012"));
         // Not signed in to AWS: a sign-in to delete them, or removing it from SuperCI only.
@@ -7260,7 +7350,9 @@ mod tests {
         assert!(at(r#"data-cloud="cloudflare""#) < at(r#"data-cloud="aws""#) && at(r#"data-cloud="aws""#) < at(r#"data-cloud="modal""#) && !html.contains("machine:m1"));
         // AWS's on-demand machines are a place of their own, right under its spot machines until moved.
         assert!(html.contains(r#"<ol class="pools" data-order="cloudflare,aws,aws-on-demand,modal">"#) && html.contains(r#"draggable="true""#));
-        assert!(html.contains("<strong>AWS on-demand</strong><small>On-demand machines · one per job, never interrupted</small>") && html.contains(r#"<input type="checkbox" name="on" checked> Use on-demand machines"#));
+        // Alike rows: each says what it starts and where (AWS's two, their regions), each dialog with the same settings.
+        assert!(html.contains("<strong>AWS spot</strong><small>Spot machines of any size · x64, arm64 · N. Virginia, then Ohio</small>") && html.contains("<strong>AWS on-demand</strong><small>On-demand machines of any size, never taken back · x64, arm64 · N. Virginia, then Ohio</small>"), "{html}");
+        assert!(!html.contains("Use on-demand machines") && html.matches("data-regions").count() == 2 && html.matches("Take out of the order").count() == 4);
         assert!(html.contains("when that one cannot start it (no spot machine, a failure), to the next"));
         // Limits show only where set; settings are in each pool's dialog.
         assert!(html.contains(">10 at once<") && html.contains(">$12.40 of $50.00<") && !html.contains("No cap"));
@@ -7268,19 +7360,21 @@ mod tests {
         assert!(html.contains(r#"name="current" value="cloudflare,aws,aws-on-demand,modal""#));
         // One entry for AWS in the machine picker.
         assert_eq!(html.matches(r#"<span class="fit" data-caps="[]""#).count(), 0);
-        // Turned off, it says so, where the order has it (here: last), with its switch off.
+        // Taken out: not in the order, said below it with a way to put it back.
         let mut off = view.clone();
         off.status.as_mut().unwrap()["routing"]["order"] = serde_json::json!([{ "cloud": "aws" }, { "cloud": "cloudflare" }, { "cloud": "aws-on-demand", "off": true }]);
         let html_off = d.render("runners", &[off], None);
         preview("runners-on-demand-off", &html_off);
-        assert!(html_off.contains(r#"data-order="aws,cloudflare,aws-on-demand,modal""#) && html_off.contains(r#"<span class="pill open"><i></i>Off</span>"#) && html_off.contains(r#"<input type="checkbox" name="on"> Use on-demand machines"#));
+        assert!(html_off.contains(r#"<ol class="pools" data-order="aws,cloudflare,modal">"#) && !html_off.contains(r#"data-cloud="aws-on-demand""#), "{html_off}");
+        assert!(html_off.contains(r#"<strong>AWS on-demand</strong><small>Taken out of the order: no job goes to it. Its settings are kept.</small></span><form method="post" action="/routing" class="limit-do"><input type="hidden" name="action" value="put_back"><input type="hidden" name="cloud" value="aws-on-demand"><input type="hidden" name="current" value="aws,cloudflare,aws-on-demand,modal"><button class="chip">Put back</button>"#), "{html_off}");
         assert!(!html.contains("1 running") && html.contains("Cloudflare runs 10 at once") && !html.contains("Exceptions"));
         // AWS's regions, in order, in its dialog (the next when one has no spot capacity).
         assert!(html.contains("x64, arm64 · N. Virginia, then Ohio") && html.contains(r#"<li class="rg" draggable="true" data-region="us-east-1""#)
             && html.find(r#"data-region="us-east-1""#).unwrap() < html.find(r#"data-region="us-east-2""#).unwrap() && html.contains(r#"<option value="us-west-2">US West (Oregon) · us-west-2</option>"#) && !html.contains(r#"<option value="us-east-1">"#));
         assert!(!html.contains("Default machine"), "machines are on Workflows");
         // AWS: a network of your own, by region, as it is set.
-        assert!(html.contains(r#"<summary>Your own network</summary>"#) && html.contains(">us-east-2 subnet-0aaaaaaaa sg-0cccccccc private</textarea>"));
+        // (The account's, under Clouds.)
+        assert!(html.contains(r#"<span>Your own network</span>"#) && html.contains(">us-east-2 subnet-0aaaaaaaa sg-0cccccccc private</textarea>") && html.contains("your own network in Ohio"));
         // Cloudflare's location, as set (here: Cloudflare chooses); the area near the code hosts marked, and AWS's region.
         assert!(html.contains(r#"<option value="auto" selected>Automatic: Cloudflare chooses</option>"#) && html.contains("Eastern North America · closest to GitHub</option>"));
         assert!(html.contains("us-east-1 · closest to GitHub</small>"));

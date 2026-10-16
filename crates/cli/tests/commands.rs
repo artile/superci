@@ -124,11 +124,13 @@ fn runners_limits_the_cache_and_keys_are_set_and_read_back() {
     let runners = ok(&["runners", "update", "cloudflare", "--max-jobs=20", "--monthly-usd=50", "--location=weur"]);
     assert_eq!((runners["order"][0]["max_jobs"].as_u64(), runners["order"][0]["monthly_usd"].as_f64(), runners["cloudflare_location"].as_str()), (Some(20), Some(50.0), Some("weur")), "{runners}");
     assert_eq!(routing()["order"][0], serde_json::json!({ "cloud": "cloudflare", "max_jobs": 20, "monthly_usd": 50.0 }));
-    // (Only AWS's on-demand machines are turned off: another provider is removed.)
+    // (What is used is the order's to say, for every provider alike.)
     let (code, off) = json(&home, &["runners", "update", "cloudflare", "--enabled=false"]);
-    assert!(code == 2 && off["error"].as_str().unwrap().contains("superci runners delete cloudflare"), "{off}");
+    assert!(code == 2 && off["error"].as_str().unwrap().contains("superci runners order"), "{off}");
+    let (code, regions) = json(&home, &["runners", "update", "cloudflare", "--regions=us-east-1"]);
+    assert!(code == 2 && regions["error"].as_str().unwrap().contains("aws and aws-on-demand"), "{regions}");
     let back = ok(&["runners", "update", "cloudflare", "--max-jobs=none", "--monthly-usd=none"]);
-    assert_eq!((back["order"][0]["off"].as_bool(), back["order"][0]["max_jobs"].as_u64()), (Some(false), None), "{back}");
+    assert_eq!((back["order"][0]["taken_out"].as_bool(), back["order"][0]["max_jobs"].as_u64()), (Some(false), None), "{back}");
     let (code, wrong) = json(&home, &["runners", "update", "nowhere", "--max-jobs=2"]);
     assert!(code == 2 && wrong["error"].as_str().unwrap().contains("one of cloudflare"), "{wrong}");
 
@@ -252,5 +254,50 @@ fn another_control_plane_is_deleted_as_aws_answered_a_real_account_and_the_one_i
         assert!(asked.iter().any(|a| a.contains(gone)), "{gone}: {asked:?}");
     }
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_order_takes_providers_out_and_puts_them_back_and_each_of_awss_has_its_own_regions() {
+    // A control plane whose own AWS account runs jobs (its spot and on-demand machines), with Cloudflare's containers.
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = common::signed_in(&served);
+    let text = |args: &[&str]| { let o = superci(&home, args); String::from_utf8_lossy(&o.stdout).to_string() };
+    // The order: the providers named, in that order; the others taken out (kept, and put back by naming them).
+    let order = json(&home, &["runners", "order", "cloudflare"]).1;
+    assert_eq!((order["order"].clone(), order["taken_out"].clone()), (serde_json::json!(["cloudflare"]), serde_json::json!(["aws", "aws-on-demand"])), "{order}");
+    assert!(text(&["runners", "list"]).contains("Taken out of the order: aws, aws-on-demand"));
+    let order = json(&home, &["runners", "order", "aws", "cloudflare", "aws-on-demand"]).1;
+    assert_eq!((order["order"].clone(), order["taken_out"].clone()), (serde_json::json!(["aws", "cloudflare", "aws-on-demand"]), serde_json::json!([])), "{order}");
+    // AWS's on-demand machines in regions of their own (here: N. Virginia, where the control plane is set up already).
+    let listed = json(&home, &["runners", "update", "aws-on-demand", "--regions=us-east-1"]).1;
+    let on_demand = listed["order"].as_array().unwrap().iter().find(|p| p["cloud"] == "aws-on-demand").cloned().unwrap_or_default();
+    assert_eq!((on_demand["regions"].clone(), on_demand["taken_out"].as_bool()), (serde_json::json!(["us-east-1"]), Some(false)), "{listed}");
+    assert!(text(&["runners", "list"]).contains("aws-on-demand  in us-east-1"));
+    // Not one left in the order: refused (no job could start).
+    let (code, none) = json(&home, &["runners", "order", "nowhere"]);
+    assert_eq!(code, 2, "{none}");
+    // In the dashboard: its rows, AWS's two alike; each one's Take out, and Put back (to the end of the order).
+    let (mut child, link) = common::dashboard(&home);
+    let routing = || serde_json::from_str::<serde_json::Value>(&served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or("{}".into())).unwrap();
+    let (_, page) = common::part(&link, "/?p=runners&fragment=1");
+    assert!(page.contains("<strong>AWS spot</strong>") && page.contains("<strong>AWS on-demand</strong>") && page.contains("<h2>Clouds</h2>") && page.matches("data-regions").count() == 2, "{}", common::words(&page));
+    let current = "aws,cloudflare,aws-on-demand";
+    let (status, to, said) = common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "aws"), ("current", current)]);
+    assert!(status == 303 && to.contains("p=runners"), "{status} {said}");
+    assert_eq!(routing()["order"], serde_json::json!([{ "cloud": "cloudflare" }, { "cloud": "aws-on-demand", "regions": ["us-east-1"] }, { "cloud": "aws", "off": true, "regions": ["us-east-1"] }]), "(spot's regions kept as they were when on-demand's were set)");
+    let (_, page) = common::part(&link, "/?p=runners&fragment=1");
+    assert!(common::words(&page).contains("AWS spot Taken out of the order") && !page.contains(r#"data-cloud="aws""#), "{}", common::words(&page));
+    common::post(&link, "/routing", &[("action", "put_back"), ("cloud", "aws"), ("current", "cloudflare,aws-on-demand,aws")]);
+    assert_eq!(routing()["order"], serde_json::json!([{ "cloud": "cloudflare" }, { "cloud": "aws-on-demand", "regions": ["us-east-1"] }, { "cloud": "aws", "regions": ["us-east-1"] }]));
+    // The last one in the order is not taken out.
+    common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "aws"), ("current", "cloudflare,aws-on-demand,aws")]);
+    common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "aws-on-demand"), ("current", "cloudflare,aws-on-demand,aws")]);
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "cloudflare"), ("current", "cloudflare,aws-on-demand,aws")]);
+    assert!(status == 400 && said.contains("Keep one provider in the order"), "{status} {said}");
+    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
