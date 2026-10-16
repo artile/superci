@@ -523,3 +523,35 @@ fn an_aws_accounts_look_is_said_by_the_cli_and_on_add_runners_as_aws_answered_ea
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+fn a_control_plane_is_deployed_to_aws_from_the_dashboard_as_aws_answered_a_real_account() {
+    // The workspace's control plane, and the new one the deploy brings up (its address, as AWS gave it).
+    let served = serve(|_| {});
+    let new = superci_testkit::serve_as("deployplane1", |_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", "deployplane1"), ("http://new-plane.test", &new.url)]);
+    let (mut child, link) = common::dashboard(&home);
+    // A region not in the list is refused before anything is made.
+    let (status, _, said) = common::post(&link, "/plane/aws", &[("region", "mars-1")]);
+    assert!(status == 400 && common::words(&said).contains("Choose a region from the list"), "{status}");
+    // Deployed (the same id as the recording's, as a try after a stop reuses its first's).
+    let (status, _, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "deployplane1")]);
+    assert_eq!(status, 303);
+    let listed = (0..120).find_map(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let (_, page) = common::part(&link, "/?p=planes&fragment=1");
+        let w = common::words(&page);
+        (w.contains(&new.url) && w.contains("Move here")).then_some(w)
+    });
+    let (_, plane_page) = common::part(&link, "/?p=plane&fragment=1");
+    assert!(listed.is_some(), "{}", common::words(&plane_page));
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
+    assert!(asked.iter().any(|a| a == "POST https://lambda.us-east-1.amazonaws.com/2015-03-31/functions"), "{asked:?}");
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    // Its settings written for it (the key the dashboard reads it with among them).
+    let settings = served.aws.settings("deployplane1");
+    assert!(settings.iter().any(|(k, _)| k.starts_with("DASHBOARD_KEY_")), "{:?}", settings.iter().map(|(k, _)| k).collect::<Vec<_>>());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
