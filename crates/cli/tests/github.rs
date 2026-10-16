@@ -445,6 +445,17 @@ fn github_jobs_reach_the_cache_with_githubs_own_token_each_branch_in_its_own_sco
         let (status, said) = post("lookup", serde_json::json!({ "token": t, "key": "deps-main", "version": version }));
         assert_eq!((status, said["why"].as_str()), (403, Some(why)), "{said}");
     }
+    // Versions GitHub's client would not send, a token whose repository is no number, a save finished with no
+    // pieces, a machine's link too short: refused.
+    for v in ["".to_string(), "a-b".to_string(), "c".repeat(129)] {
+        assert_eq!(post("begin", serde_json::json!({ "token": main, "key": "deps-v", "version": v })).0, 400, "{v:?}");
+    }
+    let odd = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "abc", "ac": "[]", "exp": exp }));
+    assert_eq!(post("lookup", serde_json::json!({ "token": odd, "key": "deps-main", "version": version })).1["why"], "a token without its repository");
+    assert_eq!(post("begin", serde_json::json!({ "token": main, "key": "deps-empty", "version": version })).1["ok"], true);
+    assert!(post("finish", serde_json::json!({ "token": main, "key": "deps-empty", "version": version, "pieces": [] })).0 >= 400);
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    assert_eq!(agent.post(&format!("{}/cache/short/lookup", served.url)).send("{}").unwrap().status().as_u16(), 404);
     // GitHub's keys were asked for once, and kept.
     assert_eq!(served.github.jwks_asked(), 1);
     // The cache's list: the repository by its name, as GitHub has it; its entries by scope; a branch's taken out.
