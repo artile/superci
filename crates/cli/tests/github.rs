@@ -293,5 +293,18 @@ fn a_github_run_is_cancelled_from_the_cli_by_github_and_its_running_jobs_machine
     // A run nobody here knows: said so.
     let o = superci(&home, &["runs", "cancel", "12345"]);
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("No run 12345 here"), "{}", String::from_utf8_lossy(&o.stderr));
+    // Another run, cancelled from the dashboard (its page's Cancel run): GitHub is asked the same way, and the page
+    // is shown again.
+    let (other, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(other)), 202);
+    let run = served.github.job(other)["run_id"].as_u64().unwrap().to_string();
+    let (mut child, link) = dashboard(&home);
+    let (status, to, said) = common::post(&link, "/run/cancel", &[("id", &run), ("repo", "acme/app"), ("attempt", "1")]);
+    assert!(status == 303 && to.starts_with(&format!("/?p=run&repo=acme%2Fapp&id={run}&attempt=1")), "{status} {to} {}", words(&said));
+    assert!(served.github.asked.lock().unwrap().iter().any(|a| a == &format!("POST https://api.github.com/repos/acme/app/actions/runs/{run}/cancel")));
+    let (status, _, said) = common::post(&link, "/run/cancel", &[("id", "not-a-run")]);
+    assert!(status == 400 && words(&said).contains("Which run?"), "{status}");
+    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
