@@ -16,6 +16,9 @@ pub struct Tests {
     pub failed: u64,
     pub skipped: u64,
     pub failures: Vec<Failure>,
+    /// What a runner said of the tests as a whole that a count does not: that none matched what was asked, say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -32,8 +35,8 @@ pub struct Failure {
 
 /// At most this many failures are kept (their error at most `ERROR_LINES` lines, `ERROR_CHARS` characters).
 const MOST: usize = 200;
-const ERROR_LINES: usize = 12;
-const ERROR_CHARS: usize = 2000;
+const ERROR_LINES: usize = 40;
+const ERROR_CHARS: usize = 6000;
 
 /// A log line as text: without its time (GitHub's), GitLab's stream mark, colour codes and carriage returns.
 fn plain(raw: &str) -> String {
@@ -103,8 +106,19 @@ pub fn read(log: &str) -> Tests {
         for r in one.runners { if !t.runners.contains(&r) { t.runners.push(r) } }
         (t.passed, t.failed, t.skipped) = (t.passed + one.passed, t.failed + one.failed, t.skipped + one.skipped);
         for f in one.failures { if t.failures.len() < MOST { t.failures.push(f) } }
+        for n in one.notes { if !t.notes.contains(&n) { t.notes.push(n) } }
     }
     t
+}
+
+/// A runner's word that it ran no test because none matched (its runner, and the note), from one of its lines.
+fn none_matched(s: &str) -> Option<(&'static str, &'static str)> {
+    if s.starts_with("Error: No tests found") { return Some(("playwright", "Playwright found no test to run: a `file:line` must be the first line of a test (or of a describe), and a name given must match one.")) }
+    if s.starts_with("No test files found, exiting with code") || s.starts_with("No test files found.") { return Some(("vitest", "Vitest found no test file matching what was asked.")) }
+    if s.starts_with("No test suite found in file") { return Some(("vitest", "Vitest found a file with no tests in it.")) }
+    if s.starts_with("No tests found, exiting with code") { return Some(("jest", "Jest found no test matching what was asked.")) }
+    if s.starts_with("ERROR: not found:") || (s.starts_with('=') && s.contains(" no tests ran in ")) { return Some(("pytest", "pytest found no test matching what was asked.")) }
+    None
 }
 
 fn read_lines(lines: &[String]) -> Tests {
@@ -114,6 +128,11 @@ fn read_lines(lines: &[String]) -> Tests {
     let playwright = lines.iter().any(|l| l.trim_start().starts_with("Running ") && l.contains(" using ") && l.contains("worker"));
     for (i, l) in lines.iter().enumerate() {
         let s = l.trim_start();
+        if let Some((name, note)) = none_matched(s) {
+            runner(&mut t, name);
+            if !t.notes.iter().any(|n| n == note) { t.notes.push(note.to_string()) }
+            continue;
+        }
         // Vitest: its list of failures (` FAIL  file > suite > name`), then its summary.
         if let Some(rest) = s.strip_prefix("FAIL ").map(str::trim_start).filter(|r| r.contains(" > ")) {
             let (file, name) = rest.split_once(" > ").unwrap();
@@ -269,6 +288,16 @@ mod tests {
     }
 
     #[test]
+    fn a_runner_that_found_no_test_matching_says_so() {
+        let t = read("[slot 1] Running 0 tests using 0 workers\n[slot 1] Error: No tests found.\n[slot 1] Make sure that arguments are regular expressions matching test files.");
+        assert_eq!((t.runners.clone(), t.failed, t.notes.len()), (vec!["playwright"], 0, 1));
+        assert!(t.notes[0].starts_with("Playwright found no test to run: a `file:line` must be the first line of a test"));
+        assert_eq!(read("No test files found, exiting with code 1").notes, ["Vitest found no test file matching what was asked."]);
+        assert_eq!(read("No tests found, exiting with code 1\nRun with `--passWithNoTests` to exit with code 0").runners, ["jest"]);
+        assert_eq!(read("============================ no tests ran in 0.01s =============================").runners, ["pytest"]);
+    }
+
+    #[test]
     fn a_log_without_tests_says_none() {
         let t = read("Run make build\ncompiling…\nDone in 3s");
         assert_eq!(t, Tests::default());
@@ -294,6 +323,9 @@ mod tests {
         assert_eq!((t.runners.clone(), t.passed, t.failed), (vec!["vitest", "playwright"], 1915 + 30 + 27, 1));
         assert_eq!((t.failures[0].name.as_str(), t.failures[0].file.as_deref()), ("[chromium] billing › shows the invoice", Some("e2e/billing.spec.ts:21:3")));
         assert_eq!(t.failures[0].error, "Error: expect(locator).toHaveText(expected) failed\nExpected: \"Invoice\"");
+        // (A test that failed whole: its error is kept whole, not its first lines.)
+        let long = read(&format!("Running 1 test using 1 worker\n  1) [chromium] › a.spec.ts:3:1 › x ───\n\n    Error: expect(received).toEqual(expected)\n\n{}\n  1 failed", (1..=30).map(|n| format!("    - line {n}")).collect::<Vec<_>>().join("\n")));
+        assert!(long.failures[0].error.ends_with("- line 30"), "{}", long.failures[0].error);
         // (Playwright's own project in front of a line is no process's mark.)
         assert_eq!(marked("[chromium] › a.spec.ts:1:1 › x"), ("", "[chromium] › a.spec.ts:1:1 › x"));
     }

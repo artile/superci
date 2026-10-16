@@ -3441,6 +3441,9 @@ impl<'a> ControlPlane<'a> {
     /// Links to the pieces of a run's job's whole log, step after step: none when any is kept in the store.
     async fn log_links(&self, token: &str) -> Result<Option<Vec<String>>> {
         let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
+        // (A step that ran without a whole log of its own: none, so that the log is given whole with what its machine
+        // sent of that step; links would leave it out.)
+        if handed.steps.iter().any(|s| s["type"] != "Job" && s["log"].as_u64().is_none() && !["skipped", "cancelled"].contains(&s["result"].as_str().unwrap_or_default()) && s["state"] != "pending") { return Ok(None) }
         let mut steps: Vec<&serde_json::Value> = handed.steps.iter().filter(|s| s["type"] != "Job" && s["log"].as_u64().is_some()).collect();
         steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
         let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(None) };
@@ -3950,7 +3953,16 @@ impl<'a> ControlPlane<'a> {
         let step = url.query_pairs().find(|(k, _)| k == "step").map(|(_, v)| v.into_owned());
         if let (Some(i), Some(step)) = (q("job"), step) {
             let Some(job) = run["jobs"][i as usize]["job_id"].as_str() else { return Ok(nothing_here()) };
-            return Ok(match self.step_pages(job, &step).await? { Some(t) => Response::new(200, "text/plain; charset=utf-8", t.into_bytes()), None => nothing_here() })
+            // (None sent, and `lines` asked: the lines its runner sent of it as it went, some dropped.)
+            let text = match self.step_pages(job, &step).await? {
+                Some(t) if !t.is_empty() => Some(t),
+                _ if url.query_pairs().all(|(k, _)| k != "lines") => None,
+                _ => match run["jobs"][i as usize]["token"].as_str() {
+                    Some(token) => { let lines: Vec<String> = self.store.list(&format!("rline:{token}:")).await?.into_iter().map(|(_, v)| crate::runner_service::feed(&v)).filter(|(s, _, _)| s.as_deref() == Some(step.as_str())).flat_map(|(_, _, l)| l).collect(); (!lines.is_empty()).then(|| lines.join("\n")) }
+                    None => None,
+                },
+            };
+            return Ok(match text { Some(t) => Response::new(200, "text/plain; charset=utf-8", t.into_bytes()), None => nothing_here() })
         }
         let (Some(i), Some(n)) = (q("job"), q("log")) else { return Ok(Response::text(400, "say which job and which log")) };
         let Some(token) = run["jobs"][i as usize]["token"].as_str() else { return Ok(nothing_here()) };

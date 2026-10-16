@@ -1404,6 +1404,9 @@ exec > >(tee /var/log/superci.log > /dev/console) 2>&1
 "#, bound!(), r#"
 {grow}# As GitHub's Ubuntu runners: unprivileged user namespaces (Chromium's sandbox).
 sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+# The ports a job's own servers listen on in 50000-59999 (Supabase's 54321-54329, say) are never handed out to the
+# connections the machine opens (Linux hands those out from 32768-60999): one found its port taken now and then.
+sysctl -w net.ipv4.ip_local_reserved_ports=50000-59999 > /dev/null || true
 # Docker as on GitHub's runners: the runner's user may use it (the image leaves it to root), and it starts now,
 # beside the runner, not at a job's first use of it (services, container jobs, docker steps).
 usermod -aG docker runner 2>/dev/null || true
@@ -1677,6 +1680,8 @@ mod tests {
         // Docker is the job's to use on a Linux machine, as on GitHub's runners: its user is let in before the runner starts.
         let linux = runner_user_data_for(&gh, 70, "linux", None).unwrap();
         assert!(linux.find("usermod -aG docker runner").unwrap() < linux.find("sudo -u runner").unwrap() && linux.contains("systemctl start docker"));
+        // (Its job's servers' ports kept from the machine's own connections, before Docker or the runner opens any.)
+        assert!(linux.find("sysctl -w net.ipv4.ip_local_reserved_ports=50000-59999").unwrap() < linux.find("systemctl start docker").unwrap());
         // Linux: GitHub's runner is interrupted, GitLab's ended; a failing runner watches nothing.
         let linux = runner_user_data_for(&gh, 70, "linux", Some(link)).unwrap();
         assert!(linux.contains(&format!("-X POST '{link}'")) && linux.contains("--retry 4") && linux.contains("pkill -INT -f Runner.Listener"));

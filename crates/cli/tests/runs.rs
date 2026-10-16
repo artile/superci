@@ -61,6 +61,8 @@ fn a_run_from_a_computer_prints_every_line_once_in_order_and_ends_with_how_each_
     assert!(has("✓ Run make 7 s") < has("✓ Run make test 7 s") && said.contains("The run ended: success"), "{said}");
     // Once it ran, how its start went (where the time from sending it to its first step went).
     assert!(has("Running (started in ") < has(&line(1)) && said.contains("its machine was asked for "), "{said}");
+    // Its end said after its lines, the late ones too.
+    assert!(at(&line(4)) < has("Ended: success"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -222,7 +224,8 @@ fn a_failed_runs_tests_are_read_from_its_log_names_files_errors_and_counts() {
     // Quiet, the failed step's tests are said, though its last lines are the teardown's.
     let out = cli.wait_with_output().unwrap();
     let quiet = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(quiet.contains("✗ [chromium] shows the invoice (e2e/billing.spec.ts:21:3): Error: expect(locator).toHaveText(expected) failed") && quiet.contains("✗ sums > adds two numbers (src/sum.test.ts)"), "{quiet}");
+    assert!(quiet.contains("✗ [chromium] shows the invoice (e2e/billing.spec.ts:21:3)\n        Error: expect(locator).toHaveText(expected) failed") && quiet.contains("✗ sums > adds two numbers (src/sum.test.ts)"), "{quiet}");
+    assert!(quiet.contains("Tests: 2 failed, 45 passed (vitest, playwright)"), "{quiet}");
     // As a coding agent asks: the failed test, its file and error, and the counts.
     let o = superci(&served, &dir, &["runs", "retrieve", &run, "--tests", "--json"]).output().unwrap();
     let got: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
@@ -233,6 +236,57 @@ fn a_failed_runs_tests_are_read_from_its_log_names_files_errors_and_counts() {
     // As a person reads it.
     let said = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "retrieve", &run, "--tests"]).output().unwrap().stdout).into_owned();
     assert!(said.contains("Tests: 2 failed, 45 passed (vitest, playwright)") && said.contains("✗ [chromium] shows the invoice  (e2e/billing.spec.ts:21:3)") && said.contains("✗ sums > adds two numbers  (src/sum.test.ts)") && said.contains("AssertionError: expected 3 to be 4"), "{said}");
+}
+
+#[test]
+fn a_step_with_no_log_of_its_own_still_gives_its_tests_and_quiet_says_each_failure_whole_and_the_counts() {
+    // A control plane with its own AWS account (logs into its bucket); a step whose whole log never came.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+    });
+    let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).env("SUPERCI_STAND_IN", &served.aws.url).spawn().unwrap();
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let (a, b) = ("aaaaaaaa-0000-0000-0000-000000000001", "bbbbbbbb-0000-0000-0000-000000000002");
+    runner.take();
+    runner.steps(&[(a, "Run make", 1, "inProgress", None, None), (b, "Run the tests", 2, "pending", None, None)]);
+    runner.log(1, "2026-10-16T10:00:01.0000000Z built");
+    runner.steps(&[(a, "Run make", 1, "completed", Some("succeeded"), Some(1)), (b, "Run the tests", 2, "inProgress", None, None)]);
+    let diff: Vec<String> = (1..=20).map(|n| format!("[slot 1]       - expected line {n}")).collect();
+    let lines: Vec<String> = ["[slot 1] Running 3 tests using 1 worker", "[slot 1]   1) [chromium] › e2e/settings.spec.ts:9:3 › saves ───", "[slot 1]", "[slot 1]     Error: expect(received).toEqual(expected)"].iter().map(|s| s.to_string())
+        .chain(diff).chain(["[slot 1]   1 failed", "[slot 1]   2 passed (3.1s)"].iter().map(|s| s.to_string())).collect();
+    runner.lines(b, 1, &lines);
+    runner.steps(&[(a, "Run make", 1, "completed", Some("succeeded"), Some(1)), (b, "Run the tests", 2, "completed", Some("failed"), None)]);
+    runner.finish("failed");
+    let out = cli.wait_with_output().unwrap();
+    let quiet = String::from_utf8_lossy(&out.stdout).into_owned();
+    // Quiet: the failure with its whole error, and what the tests came to.
+    assert!(quiet.contains("✗ [chromium] saves (e2e/settings.spec.ts:9:3)") && quiet.contains("Error: expect(received).toEqual(expected)") && quiet.contains("- expected line 20"), "{quiet}");
+    assert!(quiet.contains("Tests: 1 failed, 2 passed (playwright)"), "{quiet}");
+    // Its tests read from the job's whole log, the step with no log of its own in it.
+    let o = superci(&served, &dir, &["runs", "retrieve", &run, "--tests", "--json"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
+    let tests = &got["runs"][0]["job_list"][0]["tests"];
+    assert_eq!((tests["failed"].as_u64(), tests["passed"].as_u64(), tests["failures"][0]["file"].as_str()), (Some(1), Some(2), Some("e2e/settings.spec.ts:9:3")), "{got}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_run_whose_test_runner_found_no_test_says_so() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+    let run = run_of(&served);
+    play(&served, &run, &["Running 0 tests using 0 workers".to_string(), "Error: No tests found.".to_string(), "Make sure that arguments are regular expressions matching test files.".to_string()], "failed");
+    let quiet = String::from_utf8_lossy(&cli.wait_with_output().unwrap().stdout).into_owned();
+    assert!(quiet.contains("Tests: 0 failed, 0 passed (playwright)") && quiet.contains("Playwright found no test to run: a `file:line` must be the first line of a test"), "{quiet}");
+    let said = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "retrieve", &run, "--tests"]).output().unwrap().stdout).into_owned();
+    assert!(said.contains("Playwright found no test to run"), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A checkout with these files, committed.

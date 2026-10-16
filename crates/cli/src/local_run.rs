@@ -267,6 +267,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
     };
     let (mut after, mut last): (Vec<u64>, Vec<String>) = (vec![], vec![]);
     let mut logs: Vec<Lines> = vec![];
+    let mut ended_at: Vec<Option<std::time::Instant>> = vec![];
     let mut over_at: Option<std::time::Instant> = None;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -276,6 +277,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
         after.resize(jobs.len(), 0);
         last.resize(jobs.len(), String::new());
         logs.resize_with(jobs.len(), Lines::default);
+        ended_at.resize(jobs.len(), None);
         let several = jobs.len() > 1;
         for (i, j) in jobs.iter().enumerate() {
             let name = j["name"].as_str().unwrap_or_default();
@@ -291,12 +293,17 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 (_, Some(r)) => match j["error"].as_str().filter(|e| !e.is_empty()) { Some(e) => format!("ended: {r}: {e}"), None => format!("ended: {r}") },
                 (other, _) => other.to_string(),
             };
-            if !state.is_empty() && state != last[i] {
+            // (Its end is said after its lines: once each step's are out, or 15 seconds after it ended at most.)
+            let ended = j["result"].is_string() && state != "skipped";
+            if ended && ended_at[i].is_none() { ended_at[i] = Some(std::time::Instant::now()) }
+            let give_up = ended_at[i].is_some_and(|t| t.elapsed().as_secs() > 15) || (st["over"] == true && over_at.is_some_and(|t| t.elapsed().as_secs() > 15));
+            let said_state = |say: &mut dyn FnMut(&str), state: String, last: &mut String| if !state.is_empty() && state != *last {
                 // Running: how its start went, in a line (where the time from sending it to its first step went).
                 let start = if state == "running" { start_line(&j["start"]) } else { String::new() };
                 say(&format!("{mark}{}{}{start}", &state[..1].to_uppercase(), &state[1..]));
-                last[i] = state
-            }
+                *last = state
+            };
+            if !ended { said_state(say, state.clone(), &mut last[i]) }
             // Its lines as GitHub shows them (a group's heading is a line, its end is nothing), each step's whole: what
             // the runner sent as it went while nothing is missing, then the rest from the step's own log once it ends
             // (the runner drops lines it cannot send as fast as they come).
@@ -308,10 +315,11 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&step={step}")).with_header("authorization", &format!("Bearer {key}"));
                 block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text())
             };
-            for line in logs[i].take(j, st["over"] == true && over_at.is_some_and(|t| t.elapsed().as_secs() > 15), &fetch, &pages) {
+            for line in logs[i].take(j, give_up, &fetch, &pages) {
                 if line.starts_with("##[endgroup]") || how.quiet { continue }
                 say(&format!("{}{mark}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(&line)))
             }
+            if ended && (logs[i].complete() || give_up) { said_state(say, state, &mut last[i]) }
             after[i] = j["next"].as_u64().unwrap_or(after[i]);
         }
         // Over: once every step's lines are out (its log may come a moment after), or a little later at most.
@@ -328,21 +336,37 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     match (j["result"].as_str().unwrap_or("?"), j["error"].as_str().filter(|e| !e.is_empty())) { (r, Some(e)) => format!("{r} ({e})"), (r, None) => r.to_string() }));
                 let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
                 steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
+                // Quiet, each step's whole log is read for its tests (its own log, else what its machine sent of it).
+                let step_text = |s: &Value| -> String {
+                    let at = match s["log"].as_u64() { Some(n) => format!("log={n}"), None => format!("step={}&lines=1", s["id"].as_str().unwrap_or_default()) };
+                    let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&{at}")).with_header("authorization", &format!("Bearer {key}"));
+                    block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text()).unwrap_or_default()
+                };
+                let mut all = String::new();
                 for s in steps {
                     let mark = match s["result"].as_str() { Some("succeeded") => "✓", Some("failed") => "✗", Some("skipped") | Some("cancelled") => "–", _ => "·" };
                     let time = match (s["start"].as_str().and_then(crate::log_view::seconds), s["finish"].as_str().and_then(crate::log_view::seconds)) { (Some(a), Some(b)) => format!(" {}", span(b.saturating_sub(a))), _ => String::new() };
                     say(&format!("{}  {mark} {}{time}", crate::commands::JOB_LINE, s["name"].as_str().unwrap_or("step")));
-                    if how.quiet && s["result"] == "failed" {
-                        let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&log={}", s["log"].as_u64().unwrap_or(0))).with_header("authorization", &format!("Bearer {key}"));
-                        let text = block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text()).unwrap_or_default();
-                        // The tests it failed (where its last lines may be another's, or a teardown's), then those lines.
-                        let tests = crate::test_results::read(&text);
-                        for f in &tests.failures {
-                            say(&format!("{}    ✗ {}{}: {}", crate::commands::JOB_LINE, f.name, f.file.as_deref().map(|p| format!(" ({p})")).unwrap_or_default(), f.error.lines().next().unwrap_or("")));
+                    if !how.quiet || ["skipped", "cancelled"].contains(&s["result"].as_str().unwrap_or_default()) { continue }
+                    let text = step_text(s);
+                    if s["result"] == "failed" {
+                        // The tests it failed, each with its whole error (its last lines may be another's, or a
+                        // teardown's), then those lines.
+                        for f in &crate::test_results::read(&text).failures {
+                            say(&format!("{}    ✗ {}{}", crate::commands::JOB_LINE, f.name, f.file.as_deref().map(|p| format!(" ({p})")).unwrap_or_default()));
+                            for l in f.error.lines() { say(&format!("{}        {l}", crate::commands::JOB_LINE)) }
                         }
                         let lines: Vec<&str> = text.lines().collect();
                         for l in &lines[lines.len().saturating_sub(40)..] { say(&format!("{}    {}", crate::commands::JOB_LINE, without_time(l))) }
                     }
+                    all.push_str(&text);
+                    all.push('\n');
+                }
+                // What its tests came to, passed or not, and what a runner said of them as a whole.
+                let tests = crate::test_results::read(&all);
+                if !tests.runners.is_empty() {
+                    say(&format!("{}  Tests: {} failed, {} passed{} ({})", crate::commands::JOB_LINE, tests.failed, tests.passed, if tests.skipped > 0 { format!(", {} skipped", tests.skipped) } else { String::new() }, tests.runners.join(", ")));
+                    for n in &tests.notes { say(&format!("{}  {n}", crate::commands::JOB_LINE)) }
                 }
             }
             let said = format!("The run ended: {result}, {} after it was {}, ${usd:.3} of machines.", span(took), if sent_here { "sent" } else { "followed from here" });

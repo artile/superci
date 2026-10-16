@@ -337,8 +337,9 @@ fn tests_lines(t: &Value, indent: &str) -> Vec<String> {
         else { format!("{indent}Tests: {} failed, {} passed{} ({})", n("failed"), n("passed"), if n("skipped") > 0 { format!(", {} skipped", n("skipped")) } else { String::new() }, runners.join(", ")) }];
     for f in t["failures"].as_array().into_iter().flatten() {
         out.push(format!("{indent}✗ {}{}", f["name"].as_str().unwrap_or_default(), f["file"].as_str().map(|p| format!("  ({p})")).unwrap_or_default()));
-        for l in f["error"].as_str().unwrap_or_default().lines().filter(|l| !l.trim().is_empty()).take(3) { out.push(format!("{indent}    {l}")) }
+        for l in f["error"].as_str().unwrap_or_default().lines() { out.push(format!("{indent}    {l}")) }
     }
+    for n in t["notes"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) { out.push(format!("{indent}{n}")) }
     if let Some(note) = t["note"].as_str() { out.push(format!("{indent}{note}")) }
     for a in t["artifacts"].as_array().into_iter().flatten() { out.push(format!("{indent}Artifact {}: `{}`", a["name"].as_str().unwrap_or_default(), a["fetch"].as_str().unwrap_or_default())) }
     if let Some(at) = t["artifacts_at"].as_str() { out.push(format!("{indent}Its artifacts: {at}")) }
