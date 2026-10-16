@@ -78,8 +78,13 @@ pub fn played(served: &Served, dir: &std::path::Path) {
     let _ = cli.wait_with_output();
 }
 
+/// A dashboard running for a test: ended when the test ends, a failed one too (`kill` ends it sooner).
+pub struct Dashboard(std::process::Child);
+impl Dashboard { pub fn kill(&mut self) -> std::io::Result<()> { self.0.kill() } }
+impl Drop for Dashboard { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+
 /// A dashboard on this computer for `home`'s workspace, and its link (with the key that opens it).
-pub fn dashboard(home: &std::path::Path) -> (std::process::Child, String) {
+pub fn dashboard(home: &std::path::Path) -> (Dashboard, String) {
     let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
     let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
         .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -87,7 +92,7 @@ pub fn dashboard(home: &std::path::Path) -> (std::process::Child, String) {
     let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
     // (What it prints later is read too: a closed pipe would end it.)
     std::thread::spawn(move || lines.for_each(drop));
-    (child, link)
+    (Dashboard(child), link)
 }
 
 /// What the dashboard answers for `path`, as its own page asks (with the cookie its link set): status and body.
