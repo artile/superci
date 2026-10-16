@@ -51,6 +51,9 @@ fn a_github_job_runs_on_its_machine_and_is_read_with_its_log_in_the_cli() {
     let (code, saved) = json(&home, &["jobs", "retrieve", &id.to_string(), &format!("--out={}", out.display())]);
     assert_eq!(code, 0, "{saved}");
     assert_eq!(std::fs::read_to_string(&out).unwrap(), github_log());
+    // What its log says of tests (none of the runners' that are read), and where its artifacts are: at GitHub.
+    let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &id.to_string(), "--tests"]).stdout).into_owned();
+    assert!(said.contains("No test results in its log") && said.contains(&format!("Its artifacts: https://github.com/acme/app/actions/runs/{}#artifacts", job["run_id"])), "{said}");
     // The App, its installation and what it may do.
     let connections = json(&home, &["connections", "list"]).1;
     assert_eq!(connections["github"][0]["owner"].as_str().or(connections["installations"][0]["account"].as_str()), Some("acme"), "{connections}");

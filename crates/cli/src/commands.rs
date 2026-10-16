@@ -327,9 +327,10 @@ fn job_tests(v: &PlaneView, key: &str, j: &Value) -> Value {
 fn tests_lines(t: &Value, indent: &str) -> Vec<String> {
     if let Some(e) = t["error"].as_str() { return vec![format!("{indent}Its log could not be read: {e}")] }
     let runners: Vec<&str> = t["runners"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
-    if runners.is_empty() { return vec![format!("{indent}No test results in its log (none of Vitest, Jest, Playwright, pytest, cargo or Go said any).")] }
     let n = |k: &str| t[k].as_u64().unwrap_or(0);
-    let mut out = vec![format!("{indent}Tests: {} failed, {} passed{} ({})", n("failed"), n("passed"), if n("skipped") > 0 { format!(", {} skipped", n("skipped")) } else { String::new() }, runners.join(", "))];
+    // (Its artifacts are said either way.)
+    let mut out = vec![if runners.is_empty() { format!("{indent}No test results in its log (none of Vitest, Jest, Playwright, pytest, cargo or Go said any).") }
+        else { format!("{indent}Tests: {} failed, {} passed{} ({})", n("failed"), n("passed"), if n("skipped") > 0 { format!(", {} skipped", n("skipped")) } else { String::new() }, runners.join(", ")) }];
     for f in t["failures"].as_array().into_iter().flatten() {
         out.push(format!("{indent}✗ {}{}", f["name"].as_str().unwrap_or_default(), f["file"].as_str().map(|p| format!("  ({p})")).unwrap_or_default()));
         for l in f["error"].as_str().unwrap_or_default().lines().filter(|l| !l.trim().is_empty()).take(3) { out.push(format!("{indent}    {l}")) }
