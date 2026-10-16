@@ -9,6 +9,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - `superci jobs retrieve ID --tests` says where a job's artifacts are when its log has no test results too.
 - An organization removed on Repositories says there what is left to do on GitHub (delete its App): it was said only on another page.
 - After a move to another control plane, the dashboard stopped answering on its Control planes page (it waited for itself); it shows where everything moved.
+- When AWS refuses a sign-in's last step (an account changed on its page midway), its page has Sign in again, which starts over signed out of AWS first (it sent you back to the dashboard).
 
 ## 0.19.6 — 2026-10-16
 - A run from a computer whose job's spot machine AWS took back starts that job again at once, off spot machines, and goes on (it failed before, though its job said it would run again).

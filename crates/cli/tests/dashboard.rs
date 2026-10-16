@@ -50,7 +50,7 @@ fn each_page_shows_what_the_control_plane_has() {
 }
 
 #[test]
-fn an_aws_sign_in_that_aws_does_not_finish_says_so_and_leads_back_to_the_dashboard() {
+fn an_aws_sign_in_that_aws_does_not_finish_says_so_and_its_button_signs_in_again() {
     let served = serve(|_| {});
     let home = home(&served);
     std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
@@ -62,8 +62,12 @@ fn an_aws_sign_in_that_aws_does_not_finish_says_so_and_leads_back_to_the_dashboa
     // AWS comes back, and then refuses its last step.
     let (status, _, refused) = common::get(&link, &format!("/oauth/callback?code=a-code-from-aws&state={state}"));
     let said = words(&refused);
-    assert!(status == 400 && said.contains("AWS did not finish the sign-in") && said.contains("is otherwise malformed") && said.contains("Back to the dashboard") && !said.contains("Something went wrong"), "{status} {said}");
-    assert!(refused.contains(r#"href="http://localhost:"#) && refused.contains("?p=overview"), "back to where it was: {refused}");
+    assert!(status == 400 && said.contains("AWS did not finish the sign-in") && said.contains("is otherwise malformed") && said.contains("Sign in again") && !said.contains("Something went wrong"), "{status} {said}");
+    // Its button: on the dashboard's own address, signing in again (signed out of AWS first), then back where it was.
+    let again = refused.split("class=\"button primary\" href=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().replace("&amp;", "&");
+    assert!(again.starts_with("http://localhost:") && again.contains("/aws/again?next=") && again.contains("p%3Doverview"), "{again}");
+    let (status, to, _) = common::get(&link, &again[again.find("/aws/again").unwrap()..]);
+    assert!(status == 303 && to.contains("logout") && to.contains("state%3D"), "{status} {to}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

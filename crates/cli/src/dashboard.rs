@@ -2378,14 +2378,14 @@ impl Dashboard {
                 let pending = self.aws_pending.take().unwrap();
                 if !q("error").is_empty() { return Ok(message(400, "AWS sign-in was not completed", &esc(q("error")))) }
                 // AWS refused its last step (seen when the account was changed on its page midway): said plainly,
-                // with the way back to the dashboard, where signing in again goes on. (This page is at 127.0.0.1,
-                // which a browser holds apart from the dashboard's localhost: a link, not a form.)
+                // with a button that signs in again (signed out of AWS first). (This page is at 127.0.0.1, which a
+                // browser holds apart from the dashboard's localhost: a link there, not a form.)
                 let session = match aws::exchange(pending, q("code")) {
                     Ok(s) => s,
                     Err(e) => {
                         let said = e.split("\"message\":\"").nth(1).and_then(|m| m.split('"').next()).unwrap_or(&e).trim_end_matches('.').to_string();
-                        return Ok(document(400, "SuperCI", &format!(r#"<div class="wait"><div>{MARK}<h1>AWS did not finish the sign-in</h1><p>It refused its last step ({}). This can happen when the account is changed on its page midway. Signing in again from the dashboard works.</p><p style="margin-top:18px"><a class="button primary" href="{}">Back to the dashboard</a></p></div></div>"#,
-                            esc(&said), esc(&self.back_url(&self.return_to))), None))
+                        return Ok(document(400, "SuperCI", &format!(r#"<div class="wait"><div>{MARK}<h1>AWS did not finish the sign-in</h1><p>It refused its last step ({}). This can happen when the account is changed on its page midway. Signing in again works.</p><p style="margin-top:18px"><a class="button primary" href="{}">Sign in again</a></p></div></div>"#,
+                            esc(&said), esc(&self.back_url(&format!("aws/again?next={}", url::form_urlencoded::byte_serialize(self.return_to.as_bytes()).collect::<String>())))), None))
                     }
                 };
                 println!("Signed in to AWS account {}.", session.account_id);
@@ -2402,6 +2402,15 @@ impl Dashboard {
                 self.cf_accounts.clear();
                 self.looked_cf = false;
                 Ok(back_to("Signed in with Cloudflare", "Looking for SuperCI in your accounts…", &self.back_url(&self.return_to)))
+            }
+            // Signing in again after AWS refused a sign-in's last step (its page's button): as the dashboard's Sign in,
+            // signed out of AWS first.
+            ("GET", "/aws/again") => {
+                self.return_to = safe_return(q("next"));
+                let (link, pending) = aws::authorize("us-east-1", &format!("http://127.0.0.1:{}/oauth/callback", self.port()));
+                self.aws_pending = Some(pending);
+                self.aws_asked_ms = now_ms();
+                Ok(Response::redirect(&aws::signed_out_first(&link)))
             }
             ("POST", "/aws/signin") => {
                 self.return_to = safe_return(&field("next"));
