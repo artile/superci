@@ -5093,8 +5093,8 @@ fn change_html(text: &str) -> String {
 const PAGE_JS: &str = r#"<script>document.addEventListener('click',function(e){document.querySelectorAll('details.menu[open]').forEach(function(d){if(!d.contains(e.target))d.open=false})});
 (function(){var sm=HTMLDialogElement.prototype.showModal;HTMLDialogElement.prototype.showModal=function(){sm.call(this);if(!this.querySelector('[autofocus]')){this.setAttribute('tabindex','-1');this.focus()}}})();
 
-function superciFit(k,c,r,d,arch,os,gpu){var cpu=c||k.std_cpu,ram=r||(c?Math.min(c*k.ram_per_cpu,k.max_ram_gb):k.std_ram_gb);ram=Math.max(ram,cpu*k.min_ram_per_cpu);var disk=d||k.std_disk_gb,gs=k.gpus||[];
-var ok=cpu<=k.max_cpu&&ram<=k.max_ram_gb&&disk<=k.max_disk_gb&&k.arch.indexOf(arch)>=0&&k.os.indexOf(os)>=0&&!(os==='windows'&&arch!=='x64');
+function superciFit(k,c,r,d,arch,os,gpu,img){var cpu=c||k.std_cpu,ram=r||(c?Math.min(c*k.ram_per_cpu,k.max_ram_gb):k.std_ram_gb);ram=Math.max(ram,cpu*k.min_ram_per_cpu);var disk=d||k.std_disk_gb,gs=k.gpus||[];
+var ok=cpu<=k.max_cpu&&ram<=k.max_ram_gb&&disk<=k.max_disk_gb&&k.arch.indexOf(arch)>=0&&k.os.indexOf(os)>=0&&!(os==='windows'&&arch!=='x64')&&!(img&&(k.images||[]).indexOf(img)<0);
 var g=!gpu?'':gpu==='gpu'?gs[0]:gs.indexOf(gpu)>=0?gpu:null;if(gpu&&(!g||os==='windows'||arch!=='x64'))ok=false;
 return !ok?null:k.ram_per_cpu?{cpu:cpu,ram:ram,gpu:g}:{cpu:k.max_cpu,ram:k.max_ram_gb,gpu:g}}
 function superciPrompt(){var d=document.getElementById('agent-prompt');if(!d)return;superciPromptUpdate(d);d.showModal()}
@@ -5110,10 +5110,12 @@ document.addEventListener('input',function(e){if(e.target.name==='own_url')super
 document.addEventListener('click',function(e){var cp=e.target.closest&&e.target.closest('[data-copy]');if(!cp)return;var d=cp.closest('dialog'),t=d.superciText,er=d.querySelector('.prompt-copy-error');
 navigator.clipboard.writeText(t).then(function(){if(t!==d.superciText)return;cp.classList.add('is-copied');cp.querySelector('svg').outerHTML='<svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4 10 4 4 8-8"/></svg>';cp.querySelector('span').textContent='Copied'},function(){er.hidden=false;er.textContent='Copy failed. Select the prompt and copy it manually.'})});
 function superciPick(f){var d=JSON.parse(f.dataset.default),label=f.dataset.mode==='label',g=function(n){var e=f.elements[n];return !e?'':e.type==='checkbox'?(e.checked&&!e.disabled):e.value};
-var cpu=+g('cpu')||0,ram=+g('ram')||0,disk=+g('disk')||0,arch=g('arch'),os=g('os'),gpu=g('gpu'),od=g('nospot');
-if(label){var parts=[];if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(od)parts.push('spot=false');f.querySelector('[data-label]').textContent=f.dataset.base+(parts.length?'/'+parts.join('/'):'');
-ram=ram||(cpu?0:d.ram);cpu=cpu||d.cpu;disk=disk||d.disk;arch=arch||d.arch;os=os||d.os}
-f.querySelectorAll('.fit').forEach(function(x){var got=null;JSON.parse(x.dataset.caps).some(function(k){got=superciFit(k,cpu,ram,disk,arch,os,gpu);return got});x.classList.toggle('no',!got);var s=x.querySelector('[data-size]');if(s)s.textContent=got?got.cpu+' CPU · '+got.ram+' GB'+(got.gpu?' · '+got.gpu.toUpperCase():''):''})}
+var cpu=+g('cpu')||0,ram=+g('ram')||0,disk=+g('disk')||0,arch=g('arch'),os=g('os'),gpu=g('gpu'),od=g('nospot'),img=g('image');
+// (An Ubuntu is for Linux: no choice while the machine is Windows.)
+var ie=f.elements.image,win=(os||(label?d.os:os))==='windows';if(ie)ie.disabled=win;if(win)img='';
+if(label){var parts=[];if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(img)parts.push('image='+img);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(od)parts.push('spot=false');f.querySelector('[data-label]').textContent=f.dataset.base+(parts.length?'/'+parts.join('/'):'');
+ram=ram||(cpu?0:d.ram);cpu=cpu||d.cpu;disk=disk||d.disk;arch=arch||d.arch;os=os||d.os;if(!img&&!win)img=d.image||''}
+f.querySelectorAll('.fit').forEach(function(x){var got=null;JSON.parse(x.dataset.caps).some(function(k){got=superciFit(k,cpu,ram,disk,arch,os,gpu,img);return got});x.classList.toggle('no',!got);var s=x.querySelector('[data-size]');if(s)s.textContent=got?got.cpu+' CPU · '+got.ram+' GB'+(got.gpu?' · '+got.gpu.toUpperCase():''):''})}
 (function(){var dragged=null;
 window.superciRegions=function(f){f.querySelectorAll('input[data-rg]').forEach(function(i){i.remove()});f.querySelectorAll('.rg').forEach(function(li,n){var x=document.createElement('input');x.type='hidden';x.name='region_'+n;x.value=li.dataset.region;x.setAttribute('data-rg','');f.appendChild(x)})};
 window.superciRegionRemove=function(b){var li=b.closest('.rg'),list=li.parentNode;if(list.querySelectorAll('.rg').length<2)return;var sel=list.parentNode.querySelector('.rg-add'),o=document.createElement('option');o.value=li.dataset.region;o.textContent=li.dataset.name+' · '+li.dataset.region;sel.appendChild(o);li.remove()};
@@ -5505,6 +5507,9 @@ fn ago_words(ms: u64) -> String {
 }
 
 /// the label picker, a dialog of its own: it names only what differs from the default.
+/// The Ubuntus a machine can run, as the dialogs offer them.
+const UBUNTU_CHOICES: [(&str, &str); 2] = [("ubuntu26", "26.04 (Docker 29)"), ("ubuntu24", "24.04 (Docker 28)")];
+
 fn machines_card(v: &PlaneView) -> (String, String) {
     let m = v.machine();
     let base = esc(&v.label());
@@ -5525,14 +5530,14 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     let custom = speed.clone().filter(|s| !["125", "250", "500", "1000"].contains(&s.as_str())).map(|s| (s.clone(), format!("{s} MiB/s")));
     let mut speeds: Vec<(&str, &str)> = vec![("125", "Standard, 125 MiB/s"), ("250", "250 MiB/s"), ("500", "500 MiB/s"), ("1000", "1,000 MiB/s")];
     if let Some((val, text)) = &custom { speeds.push((val, text)) }
-    let default = serde_json::json!({ "cpu": m.cpu.unwrap_or(0), "ram": m.ram_gb.unwrap_or(0), "disk": m.disk_gb.unwrap_or(0), "arch": m.arch(), "os": m.os(), "ondemand": m.on_demand() });
+    let default = serde_json::json!({ "cpu": m.cpu.unwrap_or(0), "ram": m.ram_gb.unwrap_or(0), "disk": m.disk_gb.unwrap_or(0), "arch": m.arch(), "os": m.os(), "image": m.image, "ondemand": m.on_demand() });
     // The default: what it is, in words, and its dialog.
     let mut parts = vec![m.cpu.map(|c| format!("{c} CPU")).unwrap_or_else(|| "Each provider's standard size".into())];
     if let Some(r) = m.ram_gb { parts.push(format!("{r} GB")) }
     if let Some(d) = m.disk_gb { parts.push(format!("{d} GB disk")) }
     match m.disk_mibs { Some(superci_core::spec::DISK_MIBS_INCLUDED) => parts.push("standard disk speed".into()), Some(s) => parts.push(format!("{s} MiB/s disk")), None => {} }
     parts.push(m.arch().into());
-    parts.push(match m.os() { "windows" => "Windows".into(), "macos" => "macOS".into(), _ => "Linux".into() });
+    parts.push(match (m.os(), m.image.as_deref()) { ("windows", _) => "Windows".into(), ("macos", _) => "macOS".into(), (_, Some("ubuntu26")) => "Ubuntu 26.04".into(), (_, Some("ubuntu24")) => "Ubuntu 24.04".into(), _ => "Linux".into() });
     parts.push(if m.on_demand() { "no spot machines".into() } else { "spot".into() });
     // (What only a command sets for every job: where its files are kept, its machine families, its provider.)
     if let Some(scratch) = m.scratch.as_deref() { parts.push(if scratch == "ramdisk" { "RAM disk".into() } else { "local disk".into() }) }
@@ -5542,7 +5547,9 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         esc(&default.to_string()),
         select("cpu", "CPU", "Provider's standard", &CPUS, m.cpu), select("ram", "Memory", "4 GB per CPU", &RAMS, m.ram_gb), select("disk", "Disk", "Provider's standard", &DISKS, m.disk_gb),
         choice("disk-speed", "Disk speed (AWS)", "By machine size", &speeds, speed.as_deref()),
-        choice("arch", "Architecture", "", &[("x64", "x64"), ("arm64", "arm64")], Some(m.arch())), choice("os", "System", "", &[("linux", "Linux"), ("windows", "Windows")], Some(m.os())),
+        choice("arch", "Architecture", "", &[("x64", "x64"), ("arm64", "arm64")], Some(m.arch())),
+        // (Beside the system: which Ubuntu, unset as GitHub's `ubuntu-latest` is.)
+        format!("{}{}", choice("os", "System", "", &[("linux", "Linux"), ("windows", "Windows")], Some(m.os())), choice("image", "Ubuntu", "As ubuntu-latest", &UBUNTU_CHOICES, m.image.as_deref())),
         // (What the dialog does not show is kept as it is.)
         m.pairs().iter().filter(|(key, _)| ["disk-iops", "gpu", "family", "scratch", "provider"].contains(key)).map(|(key, value)| format!(r#"<input type="hidden" name="{key}" value="{}">"#, esc(value))).collect::<String>(),
         if m.on_demand() { " checked" } else { "" }, pools());
@@ -5553,7 +5560,8 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     let picker = format!(r#"<dialog class="dlg wide" id="label-picker" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Choose a machine</strong><small>Pick what differs from the default; its label names only that.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><form class="picker" data-mode="label" data-base="{base}" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)" onsubmit="return false"><div class="picker-fields">{}{}{}{}{}{}<label class="check"><input type="checkbox" name="nospot"{od_default}> No spot machines</label></div><div class="label-out"><code><span class="k">runs-on:</span> <span class="hl" data-label>{base}</span></code><button type="button" class="chip" onclick="var b=this;navigator.clipboard.writeText('runs-on: '+b.closest('form').querySelector('[data-label]').textContent).then(function(){{b.textContent='Copied'}},function(){{}})">Copy</button></div><div class="fits"><span class="note">Runs on</span>{}</div></form></div></dialog>"#,
         esc(&default.to_string()),
         select("cpu", "CPU", "Default", &CPUS, None), select("ram", "Memory", "Default", &RAMS, None), select("disk", "Disk", "Default", &DISKS, None),
-        choice("arch", "Architecture", "Default", &[("x64", "x64"), ("arm64", "arm64")], None), choice("os", "System", "Default", &[("linux", "Linux"), ("windows", "Windows")], None),
+        choice("arch", "Architecture", "Default", &[("x64", "x64"), ("arm64", "arm64")], None),
+        format!("{}{}", choice("os", "System", "Default", &[("linux", "Linux"), ("windows", "Windows")], None), choice("image", "Ubuntu", "Default", &UBUNTU_CHOICES, None)),
         choice("gpu", "GPU", "None", &[("gpu", "Any (least costly)"), ("t4", "T4"), ("l4", "L4"), ("a10g", "A10G"), ("l40s", "L40S"), ("a100", "A100"), ("h100", "H100"), ("h200", "H200"), ("b200", "B200")], None), pools());
     (format!(r#"<section class="card dm-card">{default_row}{dialog}</section>"#), picker)
 }
@@ -7499,7 +7507,7 @@ mod tests {
         assert!(html.matches(r#"<label class="check"><input type="checkbox" name="nospot"> No spot machines</label>"#).count() == 2 && !html.contains("ondemand\"") && !html.contains("On-demand only"), "{html}");
         // The picker writes a label as key=value pairs after its name.
         let shell = String::from_utf8(Dashboard::page("workflows").body).unwrap();
-        assert!(shell.contains("if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(od)parts.push('spot=false');") && shell.contains("f.dataset.base+(parts.length?'/'+parts.join('/'):'')"), "the script");
+        assert!(shell.contains("if(cpu)parts.push('cpu='+cpu);if(ram)parts.push('ram='+ram);if(disk)parts.push('disk='+disk);if(arch)parts.push('arch='+arch);if(os)parts.push('os='+os);if(img)parts.push('image='+img);if(gpu)parts.push('gpu='+(gpu==='gpu'?'any':gpu));if(od)parts.push('spot=false');") && shell.contains("f.dataset.base+(parts.length?'/'+parts.join('/'):'')"), "the script");
         assert!(html.contains("<code>superci/cpu=8</code>, <code>superci/arch=arm64</code> or <code>superci/cpu=16/ram=64</code>"));
         // The picker starts at Default for everything (the label is plain), each field naming only what is picked.
         assert!(html.contains(r#"data-mode="label""#) && html.contains(r#"<option value="">Default</option>"#) && html.contains(r#"<span class="hl" data-label>superci</span>"#));

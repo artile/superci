@@ -16,6 +16,9 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub arch: Option<String>,
     /// "linux", "windows" or "macos".
     #[serde(default, skip_serializing_if = "Option::is_none")] pub os: Option<String>,
+    /// Which Ubuntu a Linux machine runs, as GitHub's runners: "ubuntu26" (26.04, Docker 29) or "ubuntu24" (24.04,
+    /// Docker 28). Unset: as `ubuntu-latest` is (see `ubuntu`).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub image: Option<String>,
     /// One GPU: by name (one of `GPUS`), or "any" (each place's least costly).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub gpu: Option<String>,
     /// Only this provider ("aws", "cloudflare", "modal"): `provider=aws`.
@@ -36,10 +39,17 @@ pub struct Spec {
 }
 
 /// What a label can say: its keys, in the order they are written when a label is made from a machine.
-pub const KEYS: [&str; 12] = ["cpu", "ram", "disk", "disk-speed", "disk-iops", "arch", "os", "gpu", "family", "scratch", "provider", "spot"];
+pub const KEYS: [&str; 13] = ["cpu", "ram", "disk", "disk-speed", "disk-iops", "arch", "os", "image", "gpu", "family", "scratch", "provider", "spot"];
+
+/// The Ubuntu images a Linux machine can run.
+pub const UBUNTUS: [&str; 2] = ["ubuntu26", "ubuntu24"];
+
+/// When a machine that says no image runs Ubuntu 26.04: as GitHub's `ubuntu-latest` does once its move is done
+/// (2026-11-19, 00:00 UTC; announced in actions/runner-images#14748). Before, 24.04.
+pub const UBUNTU_26_FROM_MS: u64 = 1_795_046_400_000;
 
 /// How a label is written, for a job whose label is not understood.
-const HOW: &str = "A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, gpu, family, scratch, provider, spot";
+const HOW: &str = "A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, image, gpu, family, scratch, provider, spot";
 
 /// The AWS machine families a label may name: what a job's CPUs come from (compute, general, memory), AMD and arm64,
 /// and those with a local NVMe disk. Each with its memory for each CPU (GB).
@@ -130,6 +140,7 @@ impl Spec {
             "disk-iops" => self.disk_iops = Some(number("IOPS", DISK_IOPS_INCLUDED, 80_000)?),
             "arch" => self.arch = Some(one_of(&["x64", "arm64"])?),
             "os" => self.os = Some(one_of(&["linux", "windows", "macos"])?),
+            "image" => self.image = Some(one_of(&UBUNTUS)?),
             "gpu" => self.gpu = Some(if value == "any" { value.to_string() } else { one_of(&GPUS).map_err(|_| format!("gpu is any, or one of {}, not “{value}”", GPUS.join(", ")))? }),
             "family" => {
                 let named: Vec<String> = value.split('+').map(str::to_string).collect();
@@ -150,6 +161,7 @@ impl Spec {
         let (arm, local) = (|f: &String| f.contains('g'), |f: &String| f.ends_with('d'));
         if let (Some(a), Some(b)) = (self.families.iter().find(|f| arm(f)), self.families.iter().find(|f| !arm(f))) { return Err(format!("{a} machines are arm64 and {b} machines are x64: a job runs on one or the other")) }
         if let (Some(f), Some(arch)) = (self.families.first(), self.arch.as_deref()) { if arm(f) != (arch == "arm64") { return Err(format!("{f} machines are {}, and the label says arch={arch}", if arm(f) { "arm64" } else { "x64" })) } }
+        if let (Some(i), true) = (&self.image, self.os() != "linux") { return Err(format!("image={i} is an Ubuntu for Linux machines, and the label says os={}", self.os())) }
         if !self.families.is_empty() && self.gpu.is_some() { return Err("a GPU's machine family follows the GPU: say gpu or family, not both".into()) }
         if self.scratch.as_deref() == Some("localdisk") { if let Some(f) = self.families.iter().find(|f| !local(f)) { return Err(format!("{f} machines have no local disk: name a family that has one (m8id, c8id, r8id; m8gd on arm64), or leave family out")) } }
         Ok(())
@@ -166,7 +178,7 @@ impl Spec {
     pub fn pairs(&self) -> Vec<(&'static str, String)> {
         let n = |v: Option<u32>| v.map(|n| n.to_string());
         [("cpu", n(self.cpu)), ("ram", n(self.ram_gb)), ("disk", n(self.disk_gb)), ("disk-speed", n(self.disk_mibs)), ("disk-iops", n(self.disk_iops)), ("arch", self.arch.clone()), ("os", self.os.clone()),
-            ("gpu", self.gpu.clone()), ("family", Some(self.families.join("+")).filter(|f| !f.is_empty())), ("scratch", self.scratch.clone()), ("provider", self.cloud.clone()), ("spot", self.spot.map(|s| s.to_string()))]
+            ("image", self.image.clone()), ("gpu", self.gpu.clone()), ("family", Some(self.families.join("+")).filter(|f| !f.is_empty())), ("scratch", self.scratch.clone()), ("provider", self.cloud.clone()), ("spot", self.spot.map(|s| s.to_string()))]
             .into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
     }
 
@@ -179,6 +191,8 @@ impl Spec {
             // architecture or system with it (a default of arm64 does not make `os=windows` Windows on arm64).
             arch: self.arch.clone().or_else(|| default.arch.clone().filter(|_| self.os.is_none() && self.gpu.is_none())),
             os: self.os.clone().or_else(|| default.os.clone().filter(|_| self.arch.is_none() && self.gpu.is_none())),
+            // (Not the default's Ubuntu for a label that names another system.)
+            image: self.image.clone().or_else(|| default.image.clone().filter(|_| self.os.as_deref().is_none_or(|o| o == "linux"))),
             gpu: self.gpu.clone().or_else(|| default.gpu.clone()),
             cloud: self.cloud.clone().or_else(|| default.cloud.clone()), spot: self.spot.or(default.spot),
             disk_mibs: self.disk_mibs.or(default.disk_mibs), disk_iops: self.disk_iops.or(default.disk_iops),
@@ -196,6 +210,8 @@ impl Spec {
     pub fn ramdisk(&self) -> bool { self.scratch.as_deref() == Some("ramdisk") }
     pub fn localdisk(&self) -> bool { self.scratch.as_deref() == Some("localdisk") }
     pub fn os(&self) -> &str { self.os.as_deref().unwrap_or("linux") }
+    /// The Ubuntu a Linux machine runs: as asked, else as `ubuntu-latest` is at `now_ms` (see `UBUNTU_26_FROM_MS`).
+    pub fn ubuntu(&self, now_ms: u64) -> &str { self.image.as_deref().unwrap_or(if now_ms >= UBUNTU_26_FROM_MS { "ubuntu26" } else { "ubuntu24" }) }
     /// Memory: as asked, else 4 GB per CPU.
     pub fn ram(&self) -> Option<u32> { self.ram_gb.or(self.cpu.map(|c| c * 4)) }
 
@@ -207,6 +223,7 @@ impl Spec {
         if let Some(d) = self.disk_gb { parts.push(format!("{d} GB disk")) }
         if self.arch.is_some() { parts.push(self.arch().to_string()) }
         if self.os.is_some() { parts.push(self.os().to_string()) }
+        match self.image.as_deref() { Some("ubuntu26") => parts.push("Ubuntu 26.04".into()), Some("ubuntu24") => parts.push("Ubuntu 24.04".into()), _ => {} }
         match self.gpu.as_deref() { Some("any") => parts.push("a GPU".into()), Some(g) => parts.push(format!("{} GPU", g.to_uppercase())), None => {} }
         if self.on_demand() { parts.push("no spot machines".into()) }
         match self.disk_mibs { Some(DISK_MIBS_INCLUDED) => parts.push("standard disk speed".into()), Some(m) => parts.push(format!("{m} MiB/s disk")), None => {} }
@@ -224,6 +241,8 @@ impl Spec {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Capacity {
     pub max_cpu: u32, pub max_ram_gb: u32, pub max_disk_gb: u32, pub arch: Vec<String>, pub os: Vec<String>, pub on_demand: bool,
+    /// The Ubuntu images it can start (a label's `image`).
+    pub images: Vec<String>,
     pub std_cpu: u32, pub std_ram_gb: u32, pub std_disk_gb: u32,
     /// Memory for each CPU asked for when the label names no memory (up to the most it has); 0: none promised.
     pub ram_per_cpu: u32,
@@ -257,6 +276,7 @@ impl Capacity {
         if disk > self.max_disk_gb { return Err(format!("at most {} GB disk", self.max_disk_gb)) }
         if !self.arch.iter().any(|a| a == s.arch()) { return Err(format!("{} only", self.arch.join(", "))) }
         if !self.os.iter().any(|o| o == s.os()) { return Err(format!("{} only", self.os.join(", "))) }
+        if let Some(i) = s.image.as_deref().filter(|i| !self.images.iter().any(|x| x == i)) { return Err(format!("no {i} image (only {})", self.images.join(", "))) }
         if s.on_demand() && !self.on_demand { return Err("spot machines only".into()) }
         if !s.families.is_empty() && !self.scratch { return Err("no AWS machine families".into()) }
         if s.scratch.is_some() && !self.scratch { return Err(format!("no {}", if s.ramdisk() { "RAM disk" } else { "machines with a local disk to ask for" })) }
@@ -281,14 +301,14 @@ impl Capacity {
 
     /// AWS: any size EC2 has, x64 and arm64, Linux and Windows, spot or on-demand; standard 4 CPU, 8 GB, 60 GB disk.
     /// GPUs: NVIDIA T4 (g4dn), L4 (g6), A10G (g5), L40S (g6e), one per machine.
-    pub fn aws() -> Self { Capacity { max_cpu: 192, max_ram_gb: 1536, max_disk_gb: 16_000, arch: vec!["x64".into(), "arm64".into()], os: vec!["linux".into(), "windows".into()], on_demand: true,
+    pub fn aws() -> Self { Capacity { max_cpu: 192, max_ram_gb: 1536, max_disk_gb: 16_000, arch: vec!["x64".into(), "arm64".into()], os: vec!["linux".into(), "windows".into()], on_demand: true, images: vec!["ubuntu26".into(), "ubuntu24".into()],
         std_cpu: 4, std_ram_gb: 8, std_disk_gb: 60, ram_per_cpu: 4, min_ram_per_cpu: 0, gpus: ["t4", "l4", "a10g", "l40s"].map(String::from).to_vec(), scratch: true } }
     /// Cloudflare containers, sized per job: 1 to 4 CPU, at least 3 GB per CPU, up to 12 GB and 20 GB disk, x64. CPU is
     /// billed only while used, so the standard machine is the largest: 4 CPU, 12 GB, 20 GB.
-    pub fn cloudflare() -> Self { Capacity { max_cpu: 4, max_ram_gb: 12, max_disk_gb: 20, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true,
+    pub fn cloudflare() -> Self { Capacity { max_cpu: 4, max_ram_gb: 12, max_disk_gb: 20, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true, images: vec!["ubuntu24".into()],
         std_cpu: 4, std_ram_gb: 12, std_disk_gb: 20, ram_per_cpu: 4, min_ram_per_cpu: 3, gpus: vec![], scratch: false } }
     /// Modal sandboxes (non-preemptible, x64); standard 2 CPU, 8 GB; any of Modal's GPUs, one per sandbox.
-    pub fn modal() -> Self { Capacity { max_cpu: 64, max_ram_gb: 336, max_disk_gb: 512, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true,
+    pub fn modal() -> Self { Capacity { max_cpu: 64, max_ram_gb: 336, max_disk_gb: 512, arch: vec!["x64".into()], os: vec!["linux".into()], on_demand: true, images: vec!["ubuntu24".into()],
         std_cpu: 2, std_ram_gb: 8, std_disk_gb: 64, ram_per_cpu: 4, min_ram_per_cpu: 0, gpus: GPUS.map(String::from).to_vec(), scratch: false } }
 }
 
@@ -375,6 +395,26 @@ mod tests {
     }
 
     #[test]
+    fn the_ubuntu_follows_ubuntu_latest_unless_asked() {
+        let parse = |l: &str| Spec::parse(l, "superci").unwrap();
+        let (before, after) = (UBUNTU_26_FROM_MS - 1, UBUNTU_26_FROM_MS);
+        assert_eq!((parse("superci").unwrap().ubuntu(before), parse("superci").unwrap().ubuntu(after)), ("ubuntu24", "ubuntu26"));
+        assert_eq!((parse("superci/image=ubuntu24").unwrap().ubuntu(after), parse("superci/image=ubuntu26").unwrap().ubuntu(before)), ("ubuntu24", "ubuntu26"));
+        assert_eq!(parse("superci/image=ubuntu26/cpu=8").unwrap().label("superci"), "superci/cpu=8/image=ubuntu26");
+        assert_eq!(parse("superci/image=ubuntu22").unwrap_err(), "image is ubuntu26 or ubuntu24, not “ubuntu22” (runs-on: superci/image=ubuntu22)");
+        assert!(parse("superci/os=windows/image=ubuntu26").unwrap_err().contains("an Ubuntu for Linux machines"));
+        // The default machine's Ubuntu comes along, unless the label names another system.
+        let default = Spec { image: Some("ubuntu24".into()), ..Default::default() };
+        assert_eq!((parse("superci/cpu=4").unwrap().or(&default).image.as_deref(), parse("superci/os=windows").unwrap().or(&default).image.as_deref()), (Some("ubuntu24"), None));
+        assert_eq!(parse("superci/image=ubuntu26").unwrap().or(&default).image.as_deref(), Some("ubuntu26"));
+        // Only AWS has 26.04 yet; Cloudflare's and Modal's containers say so.
+        let s = parse("superci/image=ubuntu26").unwrap();
+        assert!(Capacity::aws().fit(&s).is_ok());
+        assert_eq!(Capacity::cloudflare().fit(&s).unwrap_err(), "no ubuntu26 image (only ubuntu24)");
+        assert!(Capacity::modal().fit(&parse("superci/image=ubuntu24").unwrap()).is_ok());
+    }
+
+    #[test]
     fn labels() {
         assert_eq!(Spec::parse("superci", "superci"), Some(Ok(Spec::default())));
         assert_eq!(Spec::parse("ubuntu-latest", "superci"), None);
@@ -387,7 +427,7 @@ mod tests {
         // What is not understood says so, with how a label is written: a key that is none, a value out of range or
         // not one of its words, a pair with no "=", a key said twice.
         let err = |label: &str| Spec::parse(label, "superci").unwrap().unwrap_err();
-        assert!(err("superci/cores=8").starts_with("“cores” is not a key a label has. A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, gpu, family, scratch, provider, spot"), "{}", err("superci/cores=8"));
+        assert!(err("superci/cores=8").starts_with("“cores” is not a key a label has. A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, image, gpu, family, scratch, provider, spot"), "{}", err("superci/cores=8"));
         assert_eq!(err("superci/cpu=500"), "cpu is a number of CPUs from 1 to 192, not “500” (runs-on: superci/cpu=500)");
         assert_eq!(err("superci/arch=arm"), "arch is x64 or arm64, not “arm” (runs-on: superci/arch=arm)");
         assert!(err("superci/cpu=8/ondemand").starts_with("“ondemand” in runs-on: superci/cpu=8/ondemand is not a key=value."));

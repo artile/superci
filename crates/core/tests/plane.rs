@@ -860,6 +860,13 @@ fn gpus_and_windows_get_their_own_images_types_and_prices() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&jit.2).unwrap()["work_folder"], "_work");
     assert!(clouds.clouds.calls.borrow().iter().any(|c| c.2.contains("Action=DescribeSpotPriceHistory") && c.2.contains("ProductDescription.1=Windows")));
     assert_eq!(job(&store, 2)["disk_gb"], 100);
+    // Which Ubuntu: as asked (26.04 here, before GitHub's `ubuntu-latest` moves), for x64, arm64 and a GPU alike.
+    let images = |n: u64, label: &str| { run(labelled("queued", n, "acme/app", None, label)); assert_eq!(job(&store, n)["state"], "launched", "{label}");
+        clouds.clouds.calls.borrow().iter().rev().find(|c| c.2.contains("Action=DescribeImages")).map(|c| c.2.clone()).unwrap() };
+    assert!(images(3, "superci/image=ubuntu26").contains("ubuntu26-full-x64"));
+    assert!(images(4, "superci/image=ubuntu26/arch=arm64").contains("ubuntu26-full-arm64"));
+    assert!(images(5, "superci/image=ubuntu26/gpu=any").contains("ubuntu26-gpu-x64"));
+    assert!(images(6, "superci").contains("ubuntu24-full-x64"), "unset: 24.04 until 2026-11-19");
 }
 
 #[test]

@@ -1902,10 +1902,12 @@ impl<'a> ControlPlane<'a> {
     /// The current machine image in a region for a machine (Linux x64 or arm64, Linux with NVIDIA's drivers for GPUs,
     /// Windows), with its disk's size (looked up at most every six hours).
     async fn image(&self, region: &str, spec: &Spec, creds: &Credentials, now: u64) -> Result<(String, u32)> {
-        let base = &self.config.image_name;
-        let pattern = if spec.os() == "windows" { base.replace("-ubuntu24-full-", "-windows25-full-") }
-            else if spec.gpu.is_some() { base.replace("-ubuntu24-full-", "-ubuntu24-gpu-") }
-            else if spec.arch() == "arm64" { base.replace("-x64-", "-arm64-") } else { base.clone() };
+        // The Ubuntu asked for, else as GitHub's `ubuntu-latest` is now (24.04, 26.04 from 2026-11-19).
+        let ubuntu = spec.ubuntu(now);
+        let base = self.config.image_name.replace("ubuntu24", ubuntu);
+        let pattern = if spec.os() == "windows" { base.replace(&format!("-{ubuntu}-full-"), "-windows25-full-") }
+            else if spec.gpu.is_some() { base.replace(&format!("-{ubuntu}-full-"), &format!("-{ubuntu}-gpu-")) }
+            else if spec.arch() == "arm64" { base.replace("-x64-", "-arm64-") } else { base };
         let key = format!("{region}/{pattern}");
         if let Some((id, _)) = self.cache.image.borrow().get(&key).filter(|(_, until)| *until > now) { if let Some((id, gb)) = id.split_once(' ') { return Ok((id.to_string(), gb.parse().unwrap_or(0))) } }
         let (id, gb) = aws::latest_image_sized(self.http, region, creds, &self.config.image_owner, &pattern, now).await?;
