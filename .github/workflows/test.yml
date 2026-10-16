@@ -40,3 +40,24 @@ jobs:
         run: |
           SUPERCI_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
           "$RUNNER_TEMP/bin/superci" --version
+
+  # superci-layers against containerd's own conformance suites for snapshotters and content stores (as root: the
+  # snapshotter suite mounts overlays), directly and through containerd's metadata layer.
+  layers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: crates/layers/conformance/go.mod
+          cache-dependency-path: crates/layers/conformance/go.sum
+      - name: superci-layers
+        run: cargo build -p superci-layers
+      - name: containerd's suites
+        working-directory: crates/layers/conformance
+        run: |
+          go test -c -o conformance.test .
+          sudo SUPERCI_LAYERS="$GITHUB_WORKSPACE/target/debug/superci-layers" ./conformance.test -test.count=1 -test.v

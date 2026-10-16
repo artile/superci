@@ -1,0 +1,35 @@
+[package]
+name = "superci-layers"
+description = "A SuperCI machine's image layers: containerd's snapshotter and content store, with the layers SuperCI keeps mounted as they are instead of pulled and unpacked"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "superci-layers"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+prost = "0.14"
+prost-types = "0.14"
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "channel"] }
+tonic-prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time", "fs", "io-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+redb = "4"
+regex = "1"
+libc = "0.2"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.5"
+
+[build-dependencies]
+protox = "0.10"
+tonic-prost-build = "0.14"
