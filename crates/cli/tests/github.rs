@@ -365,9 +365,12 @@ fn each_jobs_row_says_where_it_ran_and_why_in_plain_words() {
         (serde_json::json!({ "state": "done", "cloud": "cloudflare", "machine_type": "4cpu-12gb", "spot_again": true }), "4 CPU · 12 GB"),
         (serde_json::json!({ "state": "done", "cloud": "cloudflare", "machine_type": "2cpu-8gb", "on_demand": true }), "2 CPU · 8 GB"),
         (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "c8a.large", "cpu": 2, "on_demand": true }), "2 CPU · c8a.large · on-demand"),
+        (serde_json::json!({ "state": "waiting", "cloud": "", "error": "waiting: Cloudflare runs 2 at once" }), "Cloudflare runs 2 at once"),
     ];
+    let mut ids = vec![];
     for (fields, _) in &cases {
         let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+        ids.push(id);
         assert_eq!(served.webhook(queued), 202);
         let key = format!("job:{id}");
         let mut m = served.store.0.lock().unwrap();
@@ -381,6 +384,11 @@ fn each_jobs_row_says_where_it_ran_and_why_in_plain_words() {
     for (_, want) in &cases { assert!(said.contains(want), "no {want:?} in: {said}") }
     assert_eq!(said.matches("On a spot machine again").count(), 2, "{said}");
     assert_eq!(said.matches("run again after AWS took back its spot machine").count(), 2, "{said}");
+    // A job's own page says why it failed, or why it waits.
+    for (i, want) in [(7, "Cloudflare did not start its container"), (cases.len() - 1, "Cloudflare runs 2 at once")] {
+        let (_, page) = part(&link, &format!("/?p=job&id={}&fragment=1", ids[i]));
+        assert!(words(&page).contains(want), "{want}: {}", words(&page));
+    }
     // The spot limit reached in the last day: said once above the jobs, with where to ask AWS for more.
     assert!(said.contains("in the last day ran on on-demand machines, at about twice the price: your AWS account's spot limit in N. Virginia was reached") && page.contains("servicequotas"), "{said}");
     let _ = child.kill();
