@@ -3087,6 +3087,7 @@ impl Dashboard {
                     "public_remove" => { let repo = field("repo"); routing.public_repos.retain(|r| *r != repo) }
                     // The cache: on or off, what a repository keeps, how long an entry may go unused.
                     "cache_on" => routing.cache.off = field("on") != "on",
+                    "cache_layers" => routing.cache.layers = field("on") == "on",
                     "cache_size" => {
                         let Some(gb) = field("size_gb").parse::<u32>().ok().filter(|g| (1..=10_000).contains(g)) else { return Ok(message(400, "From 1 to 10,000 GB", "What one repository keeps in the cache at most.")) };
                         routing.cache.size_gb = Some(gb).filter(|g| *g != superci_core::cache::SIZE_GB);

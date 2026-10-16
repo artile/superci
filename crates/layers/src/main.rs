@@ -17,12 +17,20 @@ pub mod meta;
 pub mod mount;
 pub mod overlay;
 pub mod server;
+pub mod setup;
 pub mod store;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 const HELP: &str = "superci-layers: containerd's snapshotter and content store for a SuperCI machine, on one socket.
+
+  superci-layers setup --index-url=URL [--disk=auto|none|DEVICE] [--root=DIR]
+                  at a machine's start: checks, then Docker on this service; on anything that fails, Docker as it
+                  comes (it never fails the start)
+  superci-layers off
+                  Docker as it comes again
+  superci-layers [--root=…] …  the service itself:
 
   --root=DIR          its own files: snapshots, labels (/var/lib/superci-layers)
   --content=DIR       containerd's content folder (/var/lib/containerd/io.containerd.content.v1.content)
@@ -76,6 +84,24 @@ fn notify_ready() {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    match argv.get(1).map(String::as_str) {
+        Some("off") => std::process::exit(setup::off()),
+        Some("setup") => {
+            let mut o = setup::Options { index_url: String::new(), disk: "auto".into(), root: "/var/lib/superci-layers".into() };
+            for arg in &argv[2..] {
+                match arg.split_once('=') {
+                    Some(("--index-url", v)) => o.index_url = v.into(),
+                    Some(("--disk", v)) => o.disk = v.into(),
+                    Some(("--root", v)) => o.root = v.into(),
+                    _ => { eprintln!("{arg:?} is not understood\n\n{HELP}"); std::process::exit(2) }
+                }
+            }
+            if o.index_url.is_empty() { eprintln!("setup takes --index-url\n\n{HELP}"); std::process::exit(2) }
+            std::process::exit(setup::setup(&o));
+        }
+        _ => {}
+    }
     let a = match args() { Ok(a) => a, Err(e) => { eprintln!("{e}"); std::process::exit(2) } };
     let open = || -> error::Result<store::Layers> {
         let overlay = overlay::Overlay::open(&a.root.join("overlay"), !a.sync_remove)?;

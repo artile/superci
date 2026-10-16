@@ -3772,6 +3772,85 @@ fn a_label_asking_for_more_than_allowed_is_said_so() {
     assert!(small.too_large(&spec(None, Some(65))).is_some() && small.too_large(&spec(Some(8), Some(64))).is_none());
 }
 
+/// A bucket with this version's `superci-cache` and `superci-layers`, and the layer store's index.
+struct WithLayers { clouds: FakeClouds }
+#[async_trait(?Send)]
+impl Http for WithLayers {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        let bucket = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/");
+        if r.method == "HEAD" && (r.url == format!("{bucket}{}", superci_core::cache::program_key("x86_64")) || r.url == format!("{bucket}{}", superci_core::cache::layers_key("x86_64"))) {
+            return Ok(Response::new(200, "application/octet-stream", ""));
+        }
+        if r.method == "GET" && r.url == format!("{bucket}{}", superci_core::cache::LAYERS_INDEX) {
+            assert!(r.header("authorization").is_some_and(|a| a.contains("/us-east-1/s3/aws4_request")));
+            let index = serde_json::json!({ "layers": {
+                "sha256:aaa": { "size": 100, "erofs": { "key": "layers/aaa.erofs", "size": 200, "digest": "sha256:eee" }, "blob": { "key": "layers/aaa.blob" }, "usage": { "size": 4096, "inodes": 3 } },
+                "sha256:bbb": { "size": 10, "erofs": { "key": "layers/bbb.erofs", "size": 20 }, "blob": { "key": "layers/bbb.blob" } } } });
+            return Ok(Response::new(200, "application/json", index.to_string()));
+        }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn the_layer_store_switches_ubuntu_26_machines_to_superci_layers_with_a_disk_of_its_own() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithLayers { clouds: FakeClouds::default() };
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.cache.layers = true;
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    // Ubuntu 26.04 (its Docker keeps images in containerd): superci-layers before the runner, the store's disk, in its price.
+    run(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26"));
+    let launch = launches(&http.clouds).pop().expect("a machine");
+    let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
+    assert!(script.contains("curl -fsSm60 --retry 2 $c/layers|bash>>/var/log/superci-layers.log 2>&1") && script.find("$c/layers|bash").unwrap() < script.find("cd /home/runner && ").unwrap(), "{script}");
+    assert_eq!((field(&launch, "BlockDeviceMapping.2.DeviceName"), field(&launch, "BlockDeviceMapping.2.Ebs.VolumeSize"), field(&launch, "BlockDeviceMapping.2.Ebs.Throughput")), ("/dev/sdf".to_string(), "20".to_string(), "500".to_string()));
+    let j = job(&store, 1);
+    assert_eq!(j["layers"], true);
+    let store_disk = superci_core::plane::store_disk_usd_per_hour(superci_core::aws::disk_gb_month("us-east-1"), true);
+    assert!(store_disk > 0.01 && store_disk < 0.03, "{store_disk}");
+    // Its link: the script, the program, the index with links to its files (and again for some).
+    let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let get = |p: &str| run(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/{p}")));
+    let s = get("layers");
+    let body = String::from_utf8(s.body.clone()).unwrap();
+    assert!(s.status == 200 && body.contains(&format!("'{PLANE_URL}/cache/{link}/layers-program'")) && body.contains(&format!("$f setup --index-url='{PLANE_URL}/cache/{link}/layers.json'")), "{body}");
+    let p = get("layers-program");
+    assert!(p.status == 302 && p.header("location").unwrap().contains(&format!("/superci/layers-{}-x86_64?X-Amz-", superci_core::plane::VERSION)));
+    let index = json(&get("layers.json"));
+    let a = &index["layers"]["sha256:aaa"];
+    assert!(a["erofs"]["url"].as_str().unwrap().contains("/layers/aaa.erofs?X-Amz-") && a["blob"]["url"].as_str().unwrap().contains("/layers/aaa.blob?X-Amz-"), "{index}");
+    assert_eq!((a["size"].as_u64(), a["erofs"]["size"].as_u64(), a["erofs"]["digest"].as_str(), a["usage"]["inodes"].as_u64()), (Some(100), Some(200), Some("sha256:eee"), Some(3)));
+    assert_eq!(index["refresh"]["url"], format!("{PLANE_URL}/cache/{link}/layers-links"));
+    let again = json(&run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/layers-links")).with_body(r#"{"digests": ["sha256:bbb"]}"#)));
+    assert_eq!(again["layers"].as_object().unwrap().keys().collect::<Vec<_>>(), ["sha256:bbb"]);
+    assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/cache/someone-elses-link-here/layers.json"))).status, 404);
+    // Ubuntu 24.04 (Docker 28): as before, no store, no second disk.
+    run(labelled("queued", 2, "acme/app", None, "superci/image=ubuntu24"));
+    let launch = launches(&http.clouds).pop().unwrap();
+    assert!(!String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap().contains("$c/layers") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
+    assert_eq!(job(&store, 2)["layers"], serde_json::Value::Null);
+}
+
+#[test]
+fn the_layer_store_is_off_unless_turned_on() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithLayers { clouds: FakeClouds::default() };
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26")));
+    let launch = launches(&http.clouds).pop().expect("a machine");
+    let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
+    assert!(script.contains("superci-cache") && !script.contains("$c/layers") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
+    let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    assert_eq!(block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/layers.json")))).status, 404);
+}
+
 #[test]
 fn a_cache_turned_off_leaves_jobs_to_githubs() {
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());

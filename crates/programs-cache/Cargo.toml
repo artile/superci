@@ -1,0 +1,15 @@
+[package]
+name = "superci-programs-cache"
+description = "superci-cache, built for AWS machines (Linux by architecture, and Windows), for the superci program to carry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://superci.dev"
+build = "build.rs"
+# On crates.io it carries what `./build.sh` built (embedded/, filled by scripts/crates-publish.sh): a crate of its
+# own, as everything the program carries is more than one crate may be (10 MB).
+include = ["src/**", "embedded/**", "build.rs", "Cargo.toml"]
+
+[lib]
+path = "src/lib.rs"

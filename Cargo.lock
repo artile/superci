@@ -1914,6 +1914,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "superci-core",
+ "superci-programs-cache",
+ "superci-programs-layers",
+ "superci-programs-planes",
  "superci-testkit",
  "tokio",
  "tonic",
@@ -2011,6 +2014,18 @@ dependencies = [
  "superci-core",
  "ureq",
 ]
+
+[[package]]
+name = "superci-programs-cache"
+version = "0.19.12"
+
+[[package]]
+name = "superci-programs-layers"
+version = "0.19.12"
+
+[[package]]
+name = "superci-programs-planes"
+version = "0.19.12"
 
 [[package]]
 name = "superci-runners-cloudflare"

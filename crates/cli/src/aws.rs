@@ -245,7 +245,7 @@ pub fn give_runner_role(creds: &Credentials, account_id: &str, plane_id: &str, r
 }
 
 /// `superci-cache` for AWS machines (Linux by architecture, and Windows), put in each region's cache bucket.
-const CACHE_PROGRAMS: [(&str, &[u8]); 3] = [("x86_64", include_bytes!(env!("SUPERCI_CACHE_X86_64"))), ("aarch64", include_bytes!(env!("SUPERCI_CACHE_AARCH64"))), ("x86_64-windows", include_bytes!(env!("SUPERCI_CACHE_WINDOWS")))];
+const CACHE_PROGRAMS: [(&str, &[u8]); 3] = superci_programs_cache::CACHE;
 
 /// The control plane's own network in each region (`aws::make_network`), the regions at once, and its cache bucket
 /// there with this version's `superci-cache` (see `superci_core::cache`). Without the bucket (an account that may
@@ -268,8 +268,12 @@ fn make_cache(http: &Blocking, region: &str, creds: &Credentials, plane_id: &str
     for (arch, program) in CACHE_PROGRAMS {
         futures::executor::block_on(aws::put_once(http, region, creds, plane_id, &superci_core::cache::program_key(arch), program, now_ms()))?;
     }
+    for (arch, program) in superci_programs_layers::LAYERS {
+        futures::executor::block_on(aws::put_once(http, region, creds, plane_id, &superci_core::cache::layers_key(arch), program, now_ms()))?;
+    }
     Ok(())
 }
+
 
 /// Removes the control plane's machines, networks and cache buckets in these regions (all SuperCI offers, when it is deleted). A
 /// region the account's organization keeps it out of has nothing of the control plane's (nothing could be made

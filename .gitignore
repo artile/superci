@@ -8,3 +8,4 @@ node_modules/
 .DS_Store
 __pycache__/
 crates/cli/embedded/
+crates/programs-*/embedded/

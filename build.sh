@@ -18,6 +18,8 @@ cp target/x86_64-unknown-linux-musl/release/superci-plane crates/plane-modal/bui
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p superci-cache
 cargo zigbuild --release --target aarch64-unknown-linux-musl -p superci-cache
 cargo zigbuild --release --target x86_64-pc-windows-gnu -p superci-cache
+cargo zigbuild --release --target x86_64-unknown-linux-musl -p superci-layers
+cargo zigbuild --release --target aarch64-unknown-linux-musl -p superci-layers
 # The image reader (Linux x86_64), published beside an image for Cloudflare's containers.
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p image-reader
 cargo build --release -p superci

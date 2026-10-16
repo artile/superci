@@ -9,10 +9,7 @@ use serde_json::{json, Value};
 
 use crate::Result;
 
-const WORKER_JS: &[u8] = include_bytes!(env!("SUPERCI_WORKER_JS"));
-const WORKER_WASM: &[u8] = include_bytes!(env!("SUPERCI_WORKER_WASM"));
-const RUNNERS_JS: &[u8] = include_bytes!(env!("SUPERCI_RUNNERS_JS"));
-const RUNNERS_WASM: &[u8] = include_bytes!(env!("SUPERCI_RUNNERS_WASM"));
+use superci_programs_planes::{RUNNERS_JS, RUNNERS_WASM, WORKER_JS, WORKER_WASM};
 const API: &str = "https://api.cloudflare.com/client/v4";
 const COMPATIBILITY_DATE: &str = "2026-09-01";
 /// Durable Object classes: PlaneObject since v1; Runner (containers of one size) v2; JobRunner (containers sized per

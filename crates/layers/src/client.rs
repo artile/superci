@@ -14,20 +14,23 @@ use tonic::transport::{Channel, Endpoint};
 const LEASE_FOR: Duration = Duration::from_secs(3600);
 const LEASE_USED_FOR: Duration = Duration::from_secs(45 * 60);
 
+/// A gRPC channel to a Unix socket (containerd's).
+pub async fn channel(socket: &std::path::Path) -> Result<Channel, String> {
+    let path = socket.to_path_buf();
+    Endpoint::try_from("http://containerd").map_err(|e| e.to_string())?
+        .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+            let p = path.clone();
+            async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tokio::net::UnixStream::connect(p).await?)) }
+        }))
+        .await.map_err(|e| format!("containerd at {}: {e}", socket.display()))
+}
+
 pub struct Containerd { socket: PathBuf, leases: Mutex<HashMap<String, (String, Instant)>> }
 
 impl Containerd {
     pub fn new(socket: PathBuf) -> Self { Containerd { socket, leases: Mutex::new(HashMap::new()) } }
 
-    async fn channel(&self) -> Result<Channel, String> {
-        let path = self.socket.clone();
-        Endpoint::try_from("http://containerd").map_err(|e| e.to_string())?
-            .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
-                let p = path.clone();
-                async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tokio::net::UnixStream::connect(p).await?)) }
-            }))
-            .await.map_err(|e| format!("containerd at {}: {e}", self.socket.display()))
-    }
+    async fn channel(&self) -> Result<Channel, String> { channel(&self.socket).await }
 
     fn with_namespace<T>(msg: T, namespace: &str, lease: Option<&str>) -> Result<tonic::Request<T>, String> {
         let mut r = tonic::Request::new(msg);

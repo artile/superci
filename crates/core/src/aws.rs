@@ -1241,7 +1241,7 @@ const SCRATCH: &str = r#"scratch=/mnt/superci; mkdir -p "$scratch"
 MOUNT_SCRATCH
 if mountpoint -q "$scratch"; then
   systemctl stop docker.socket docker containerd > /dev/null 2>&1 || true
-  for d in /var/lib/docker /var/lib/containerd /home/runner/work /tmp; do mkdir -p "$d" "$scratch$d"; mount --bind "$scratch$d" "$d"; done
+  for d in /var/lib/docker /var/lib/containerd /var/lib/superci-layers /home/runner/work /tmp; do mkdir -p "$d" "$scratch$d"; mount --bind "$scratch$d" "$d"; done
   chmod 1777 /tmp; chown runner: /home/runner/work 2>/dev/null || true
   df -h "$scratch" | tail -n 1
 fi
@@ -1315,6 +1315,29 @@ pub fn with_cache(script: String, plane: &str) -> Result<String> {
     Ok(format!("{before}{}{RUNNER}{after}", CACHE.replace("PLANE_LINK", plane)))
 }
 
+/// What `with_layers` adds after the cache's part (its `$c`) and before the runner: `superci-layers` fetched and
+/// Docker switched to it (see its `setup`: checked first, and Docker as it comes on anything that fails). Before
+/// the runner, as it starts Docker again; a second or two.
+/// (The control plane's own script for it: a line here, where AWS takes 16 KB of start-up script.)
+const LAYERS: &str = r#"# Docker's image layers from this control plane's layer store, through superci-layers (Docker as it comes on anything that fails).
+curl -fsSm60 --retry 2 $c/layers|bash>>/var/log/superci-layers.log 2>&1
+"#;
+
+/// What a machine's link answers at `layers` (see `LAYERS`): `superci-layers` fetched from its `layers-program`,
+/// then its `setup` with the index at `layers.json`.
+pub fn layers_script(link: &str) -> String {
+    format!("f=/usr/local/bin/superci-layers\ncurl -fsSL --retry 2 -m 60 -o $f '{link}/layers-program' && chmod 755 $f && $f setup --index-url='{link}/layers.json'\n")
+}
+
+/// A Linux machine's start-up script, with the cache's part already (`with_cache`, `with_cache_gitlab`), with
+/// `superci-layers` too.
+pub fn with_layers(script: String) -> Result<String> {
+    let runner = if script.contains("export GL_URL=") { "export GL_URL=" } else { "cd /home/runner && " };
+    if !script.contains("c='https://") { return Err("no cache link in the start-up script".into()) }
+    let (before, after) = script.split_once(runner).ok_or("no runner in the start-up script")?;
+    Ok(format!("{before}{LAYERS}{runner}{after}"))
+}
+
 /// The same for a GitLab job's machine: GitLab's runner keeps its cache in "S3" at `superci-cache` here (path-style,
 /// keys that are no secret: the program answers only what the control plane lets the job on this machine do).
 const CACHE_GITLAB: &str = r#"# GitLab's cache in this control plane's own bucket, through superci-cache (it holds no keys).
@@ -1367,11 +1390,12 @@ pub fn with_hello(script: String, url: &str) -> Result<String> {
     Ok(format!("{before}{said}{runner}{after}"))
 }
 
-/// A Linux start-up script as a machine is given it: without its lines that only explain (they are said here, and
-/// AWS takes 16,384 bytes at most). A Windows one as it is.
+/// A Linux start-up script as a machine is given it: without its lines that only explain and its indentation (they
+/// are said here, and AWS takes 16,384 bytes at most). A Windows one as it is.
 pub fn compact(script: &str) -> String {
     if !script.starts_with("#!/bin/bash") { return script.to_string() }
-    script.lines().filter(|l| !l.trim_start().starts_with("# ")).map(|l| format!("{l}\n")).collect()
+    // (Its indentation too: nothing in these scripts is a here-document, where it would count.)
+    script.lines().filter(|l| !l.trim_start().starts_with("# ")).map(|l| format!("{}\n", l.trim_start())).collect()
 }
 
 /// The addresses at GitHub a runner with this just-in-time configuration reaches first (its service, and the
@@ -1456,8 +1480,9 @@ mod tests {
         let script = runner_user_data_for(&crate::io::Work::GitHub { jit }, 360, "linux", Some("https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/interrupted?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken")).unwrap();
         let script = with_hello(with_scratch(script, false), "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/hello?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken").unwrap();
         let script = with_cache(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
+        let script = with_layers(script).unwrap();
         let script = compact(&script);
-        assert!(script.contains("wait $g") && script.len() < 16_384, "{} bytes", script.len());
+        assert!(script.contains("wait $g") && script.contains("curl -fsSm60 --retry 2 $c/layers|bash") && script.len() < 16_384, "{} bytes", script.len());
         assert_eq!((script.matches("&live=").count(), script.matches("&log=runner").count()), (1, 1), "each part of what the machine says, once");
         println!("{} bytes with a 10,000-character configuration", script.len());
     }
@@ -1662,7 +1687,7 @@ mod tests {
         // A fast place for a job's files, when its label asks: memory, or the machine's own NVMe disk, mounted before
         // Docker and the runner start, with Docker's files, the work folder and /tmp bound from it.
         let ram = with_scratch(script.clone(), true);
-        assert!(ram.contains(r#"mount -t tmpfs -o size=75% tmpfs "$scratch""#) && !ram.contains("Instance Storage") && ram.contains("for d in /var/lib/docker /var/lib/containerd /home/runner/work /tmp;"), "{ram}");
+        assert!(ram.contains(r#"mount -t tmpfs -o size=75% tmpfs "$scratch""#) && !ram.contains("Instance Storage") && ram.contains("for d in /var/lib/docker /var/lib/containerd /var/lib/superci-layers /home/runner/work /tmp;"), "{ram}");
         assert!(ram.find("growpart").unwrap() < ram.find("tmpfs").unwrap() && ram.find("mount --bind").unwrap() < ram.find("systemctl restart docker").unwrap() && ram.find("mount --bind").unwrap() < ram.find("./run.sh").unwrap());
         // Without it, the machine's own NVMe disk when it has one: found, formatted and mounted; nothing on a machine without.
         let local = with_scratch(script.clone(), false);

@@ -23,6 +23,12 @@ use crate::spec::{aws_instance_types, disk_speed, Capacity, Size, Spec, DISK_IOP
 pub const AUDIENCE: &str = "superci";
 /// How long a job's machine lives in a cloud, in minutes: the longest a job may run as set (six hours unless set),
 /// never more than that cloud lets a machine live.
+/// The layer store's own disk of a machine that has one, an hour (its size, and its speed above what AWS includes).
+pub fn store_disk_usd_per_hour(gb_month: f64, layers: bool) -> f64 {
+    if !layers { return 0.0 }
+    aws::extras_usd_per_hour(gb_month, cache::STORE_DISK.0, cache::STORE_DISK.1, DISK_IOPS_INCLUDED, false)
+}
+
 pub fn job_minutes(set: Option<u32>, cloud: &str) -> u32 { set.unwrap_or(MAX_JOB_MINUTES).clamp(1, max_minutes(cloud)) }
 
 /// The longest a cloud lets a machine live, in minutes. AWS sets no limit, so there it is the longest GitHub lets a
@@ -274,6 +280,9 @@ pub struct Job {
     /// Its disk's speed, when above what AWS includes (MiB a second, IOPS): counted in its price.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
+    /// Its machine has Docker's layers from the layer store, on a disk of the store's own (`cache::STORE_DISK`: in
+    /// its price).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub layers: bool,
     /// How its start went, to see where a slow one lost its time. When GitHub made the job (ms; `at_ms` is when this
     /// control plane heard of it). Every request to AWS for its machine, in order (see `Ask`; the last two dozen). The
     /// link its machine says its own part with (`hello`); what it said is kept apart from this record (see
@@ -1232,8 +1241,11 @@ impl<'a> ControlPlane<'a> {
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
             (_, p) if p.starts_with("/runner/") => self.for_runner(&req, &plane_url, &url).await,
             // A machine's `superci-cache` (with the link only it has), for a job's cache.
+            ("POST", p) if p.starts_with("/cache/") && p.ends_with("/layers-links") => self.layers_route(&plane_url, p, Some(&req)).await,
             ("POST", p) if p.starts_with("/cache/") => self.cache_route(&req, &plane_url, p).await,
             ("GET", p) if p.starts_with("/cache/") && p.ends_with("/program") => self.cache_program(&plane_url, p).await,
+            // Its `superci-layers`: the script that switches Docker to it, the program, the index (and its links again).
+            ("GET", p) if p.starts_with("/cache/") && (p.ends_with("/layers") || p.ends_with("/layers-program") || p.ends_with("/layers.json")) => self.layers_route(&plane_url, p, None).await,
             // The cache's entries (by repository, or one repository's), and taking some out.
             ("GET", "/caches") if self.reader(&req) => self.caches(&url).await,
             ("POST", "/caches/delete") if self.dashboard(&req) => self.caches_delete(&req, &plane_url).await,
@@ -2163,7 +2175,7 @@ impl<'a> ControlPlane<'a> {
         self.note_permission("aws", "Prices", &disk).await;
         let gb_month = disk.unwrap_or_else(|_| aws::disk_gb_month(&region));
         if let Ok(machine) = machine {
-            j.cost_usd = Some(machine + aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) * hours);
+            j.cost_usd = Some(machine + (aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) + store_disk_usd_per_hour(gb_month, j.layers)) * hours);
             j.cost_from = Some("prices".into());
         }
     }
@@ -2683,9 +2695,12 @@ impl<'a> ControlPlane<'a> {
                             // GitHub's cache, kept in this region's bucket, for a Linux machine of a GitHub job.
                             // (A GitLab job's machine is known by its runner's id: the job that runner takes is its own.)
                             let cache_runner = if gitlab { format!("gl:{}", gitlab::local(&job.gitlab, job.runner_id.unwrap_or_default())) } else { name.clone() };
-                            let user_data = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), &creds, plane_url, &cache_runner, now).await;
+                            // Docker's layers from the layer store: on the Ubuntu whose Docker keeps its images in containerd.
+                            let layers = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26";
+                            let (user_data, layers) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), layers, &creds, plane_url, &cache_runner, now).await;
+                            job.layers = layers;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
-                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: None };
+                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: layers.then_some(cache::STORE_DISK) };
                             let mut told = aws::Told::default();
                             let machine = aws::run_instance(self.http, &creds, &launch, now, &mut told).await;
                             if let Some(e) = told.fleet_refused.take() {
@@ -2774,7 +2789,7 @@ impl<'a> ControlPlane<'a> {
                         let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.ok() }
                             else { aws::spot_price(self.http, &region, Some(&machine.zone), &creds, &machine.kind, spec.os(), now).await.ok() };
                         let cpu = job.cpu.unwrap_or(4);
-                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private));
+                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers));
                         job.region = Some(region);
                         job.zone = Some(machine.zone).filter(|z| !z.is_empty());
                         job.disk_gb = Some(disk_gb);
@@ -4610,17 +4625,64 @@ impl<'a> ControlPlane<'a> {
 
     /// A machine's start-up script with `superci-cache` in it, when its region's bucket is ready, with the machine's
     /// own link to this control plane (until its longest job ends; its `program` sends it on to the bucket).
-    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, creds: &Credentials, plane_url: &str, runner: &str, now: u64) -> String {
+    /// With `layers` (its Ubuntu's Docker keeps images in containerd), `superci-layers` too when the layer store is
+    /// on and its program is in the bucket: the second value says so (the machine then gets the store's disk).
+    #[allow(clippy::too_many_arguments)]
+    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, layers: bool, creds: &Credentials, plane_url: &str, runner: &str, now: u64) -> (String, bool) {
         // Which build of the program: by architecture, and Windows' of its own.
         let arch = match (os, arch) { ("windows", _) => "x86_64-windows", (_, "arm64") => "aarch64", _ => "x86_64" };
-        if !["linux", "windows"].contains(&os) { return user_data }
+        if !["linux", "windows"].contains(&os) { return (user_data, false) }
         // (Turned off in the dashboard: jobs use GitHub's cache.)
-        if self.config.routing.cache.off || !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return user_data }
+        if self.config.routing.cache.off || !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return (user_data, false) }
         let token = crate::crypto::random_token(18);
         let until = now + (self.machine_minutes("aws") as u64 + 30) * 60_000;
-        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string() }).await.is_err() { return user_data }
+        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string() }).await.is_err() { return (user_data, false) }
         let link = format!("{plane_url}/cache/{token}");
-        if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data)
+        let with = if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data);
+        let layers = layers && os == "linux" && self.config.routing.cache.layers && self.layers_ready(region, arch, creds, now).await;
+        match layers.then(|| aws::with_layers(with.clone())) { Some(Ok(w)) => (w, true), _ => (with, false) }
+    }
+
+    /// Whether a region's bucket has this version's `superci-layers` for an architecture (looked at as `cache_ready`).
+    async fn layers_ready(&self, region: &str, arch: &str, creds: &Credentials, now: u64) -> bool {
+        let at = format!("layers {region} {arch}");
+        if let Some((ready, _)) = self.cache.cache_ready.borrow().get(&at).filter(|(_, until)| *until > now) { return *ready }
+        let url = aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &cache::layers_key(arch));
+        let ready = matches!(aws::s3(self.http, "HEAD", &url, region, creds, vec![], &[], now).await, Ok(r) if r.status == 200);
+        self.cache.cache_ready.borrow_mut().insert(at, (ready, now + 600_000));
+        ready
+    }
+
+    /// A machine's `superci-layers` (with its link): `layers` the script that fetches and runs it, `layers-program`
+    /// on to this version's program in its region's bucket, `layers.json` the layer store's index with signed links to
+    /// its files, and `layers-links` (`{"digests": [...]}`) the same for those layers again (links run out).
+    async fn layers_route(&self, plane_url: &str, path: &str, req: Option<&Request>) -> Result<Response> {
+        let now = self.clock.now_ms();
+        let (token, what) = path.trim_start_matches("/cache/").split_once('/').unwrap_or_default();
+        let Some(machine) = cache::machine(self.store, token, now).await? else { return Ok(nothing_here()) };
+        if !self.config.routing.cache.layers { return Ok(nothing_here()) }
+        let link = format!("{plane_url}/cache/{token}");
+        if what == "layers" { return Ok(Response::new(200, "text/x-shellscript", aws::layers_script(&link))) }
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(nothing_here()) };
+        let creds = self.aws_creds(plane_url, &a).await?;
+        let bucket = cache::bucket(&self.config.plane_id, &machine.region);
+        if what == "layers-program" {
+            let url = aws::s3_url(&bucket, &machine.region, &cache::layers_key(&machine.arch));
+            return Ok(Response::redirect(&aws::presign("GET", &url, &creds, &machine.region, 600, now)?).with_status(302));
+        }
+        let got = aws::s3(self.http, "GET", &aws::s3_url(&bucket, &machine.region, cache::LAYERS_INDEX), &machine.region, &creds, vec![], &[], now).await?;
+        if got.status == 404 { return Ok(Response::json(&serde_json::json!({ "layers": {} }))) }
+        if got.status != 200 { return Err(format!("the layer store's index: S3 answered {}", got.status).into()) }
+        #[derive(serde::Deserialize)]
+        struct Stored { #[serde(default)] layers: std::collections::BTreeMap<String, cache::StoredLayer> }
+        let stored: Stored = serde_json::from_slice(&got.body).map_err(|e| format!("the layer store's index: {e}"))?;
+        let wanted: Option<Vec<String>> = match req {
+            Some(r) => Some(serde_json::from_slice::<serde_json::Value>(&r.body).ok().and_then(|b| b["digests"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).take(500).collect())).unwrap_or_default()),
+            None => None,
+        };
+        let sign = |key: &str| aws::presign("GET", &aws::s3_url(&bucket, &machine.region, key), &creds, &machine.region, cache::LINK_SECONDS, now).map_err(|e| e.to_string());
+        let index = cache::machine_index(&stored.layers, wanted.as_deref(), &sign, &format!("{link}/layers-links"))?;
+        Ok(Response::json(&index))
     }
 
     /// What the job on a machine may do in the cache, asked without a token (see `cache::branch_access`): a GitHub

@@ -10,7 +10,8 @@ readme = "../../README.md"
 keywords = ["ci", "github-actions", "gitlab", "runners", "aws"]
 categories = ["command-line-utilities", "development-tools"]
 build = "build.rs"
-# The crate on crates.io carries what `./build.sh` built (embedded/, filled by scripts/crates-publish.sh).
+# What `./build.sh` built is in the superci-programs-* crates; this one carries the changelog (embedded/, filled by
+# scripts/crates-publish.sh).
 include = ["src/**", "embedded/**", "build.rs", "Cargo.toml"]
 
 [[bin]]
@@ -19,6 +20,9 @@ path = "src/main.rs"
 
 [dependencies]
 superci-core = { path = "../core", version = "=0.19.12" }
+superci-programs-planes = { path = "../programs-planes", version = "=0.19.12" }
+superci-programs-cache = { path = "../programs-cache", version = "=0.19.12" }
+superci-programs-layers = { path = "../programs-layers", version = "=0.19.12" }
 url.workspace = true
 miniz_oxide = "0.9"
 ureq = { version = "3", features = ["json"] }

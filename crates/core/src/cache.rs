@@ -31,12 +31,14 @@ pub const BUCKET_DAYS: u32 = MAX_AGE_DAYS + 2;
 fn entry_end(e: &Entry) -> u64 { e.made + BUCKET_DAYS as u64 * 86_400_000 }
 
 /// The cache as set (Settings → Cache, `superci caches update`): on unless `off`; `size_gb` a repository keeps at
-/// most; `days` an entry may go unused (none: the defaults).
+/// most; `days` an entry may go unused (none: the defaults); `layers`, Docker's image layers served from the
+/// bucket's layer store on Ubuntu 26.04 machines (`superci-layers`; off unless turned on, while it is tried).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub off: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub size_gb: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub days: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub layers: bool,
 }
 
 impl Settings {
@@ -64,6 +66,46 @@ pub fn bucket(plane_id: &str, region: &str) -> String { format!("superci-plane-{
 
 /// Where `superci-cache` for an architecture (`x86_64`, `aarch64`, `x86_64-windows`) of this version is in each bucket.
 pub fn program_key(arch: &str) -> String { format!("superci/cache-{}-{arch}", crate::plane::VERSION) }
+
+/// Where `superci-layers` for an architecture (`x86_64`, `aarch64`) of this version is in each bucket.
+pub fn layers_key(arch: &str) -> String { format!("superci/layers-{}-{arch}", crate::plane::VERSION) }
+
+/// The layer store's own index in a region's bucket: each layer by its blob's digest, with its files' keys there.
+pub const LAYERS_INDEX: &str = "layers/index.json";
+
+/// The disk a machine keeps the layer store's files on (GB, MiB a second): beside its own, only when the store is on.
+pub const STORE_DISK: (u32, u32) = (20, 500);
+
+/// A layer as the bucket's index keeps it (see `superci-layers`'s index, which has links where this has keys).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredLayer {
+    pub size: u64,
+    pub erofs: StoredFile,
+    pub blob: StoredFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub usage: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredFile {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub digest: Option<String>,
+}
+
+/// The index a machine is given: each layer with signed links for its files instead of their keys (`link` signs a
+/// key), and where to have them signed again. Only the `wanted` digests when said.
+pub fn machine_index(stored: &std::collections::BTreeMap<String, StoredLayer>, wanted: Option<&[String]>, link: &dyn Fn(&str) -> std::result::Result<String, String>, refresh: &str) -> std::result::Result<serde_json::Value, String> {
+    let mut layers = serde_json::Map::new();
+    for (d, l) in stored {
+        if wanted.is_some_and(|w| !w.contains(d)) { continue }
+        let mut erofs = serde_json::json!({ "url": link(&l.erofs.key)?, "size": l.erofs.size.unwrap_or(0) });
+        if let Some(digest) = &l.erofs.digest { erofs["digest"] = digest.clone().into() }
+        let mut entry = serde_json::json!({ "size": l.size, "erofs": erofs, "blob": { "url": link(&l.blob.key)? } });
+        if let Some(u) = &l.usage { entry["usage"] = u.clone() }
+        layers.insert(d.clone(), entry);
+    }
+    Ok(serde_json::json!({ "layers": layers, "refresh": { "url": refresh, "token": "" } }))
+}
 
 /// One scope: a branch's caches (GitHub's `refs/heads/main`, `refs/pull/5/merge`), and whether the job may write there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

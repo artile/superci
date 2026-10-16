@@ -145,7 +145,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 14] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach", "tests"];
-const VALUES: [&str; 50] = ["header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 51] = ["layers", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -602,7 +602,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("caches", operation @ ("retrieve" | "list" | "update" | "delete")) => {
             let pick = |d: &Dashboard| -> Result<(String, String)> { Ok(match given_key() { Some(k) => k, None => { let p = in_use(d)?; (p.url().to_string(), d.key().to_string()) } }) };
             if operation == "update" {
-                if !args.has("enabled") && !args.has("size-gb") && !args.has("days") { return usage("Say what to change: `superci caches update --size-gb=50` (see `superci help caches`).") }
+                if !args.has("enabled") && !args.has("size-gb") && !args.has("days") && !args.has("layers") { return usage("Say what to change: `superci caches update --size-gb=50` (see `superci help caches`).") }
                 let mut d = signed_in();
                 to_set(&mut d)?;
                 in_use(&d)?;
@@ -612,6 +612,11 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 }
                 if let Some(gb) = args.get("size-gb") { apply!(d, args, format!("let each repository keep {gb} GB in the cache"), "/routing", &[field("action", "cache_size"), field("size_gb", gb)]); }
                 if let Some(days) = args.get("days") { apply!(d, args, format!("let a cache entry go unused for {days} days"), "/routing", &[field("action", "cache_days"), field("days", days)]); }
+                // (Docker's layers from the layer store on Ubuntu 26.04 machines: not in the help while it is tried.)
+                if let Some(l) = args.get("layers") {
+                    let on = match l { "true" => true, "false" => false, _ => return usage("--layers is true or false.") };
+                    apply!(d, args, if on { "serve Docker's layers from the layer store on Ubuntu 26.04 machines".to_string() } else { "let Docker pull its layers as it always has".to_string() }, "/routing", &[field("action", "cache_layers"), field("on", if on { "on" } else { "off" })]);
+                }
             }
             if operation == "delete" {
                 let Some(repo) = args.get("repo") else { return usage("Say whose: `superci caches delete --repo=OWNER/NAME [KEY] --confirm`.") };
