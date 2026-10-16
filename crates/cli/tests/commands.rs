@@ -642,3 +642,45 @@ fn the_first_control_plane_deployed_in_a_named_workspace_is_called_what_the_work
     assert!(named, "{:?}", account.settings("deployplane1").iter().map(|(k, _)| k).collect::<Vec<_>>());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn with_two_live_control_planes_a_command_or_a_change_says_which_one_it_is_for() {
+    // Two control planes in the account, each serving GitHub (two CIs, side by side).
+    let served = serve(|_| {});
+    served.connect_github();
+    // (The other reads its settings in the account, where the dashboard writes them.)
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    served.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    // A command for a control plane names one; with none named it says so and names them; one named that is not
+    // there stops it.
+    let (code, v) = json(&home, &["planes", "allow", "--dry-run"]);
+    let error = v["error"].as_str().unwrap_or_default().to_string();
+    assert!(code != 0 && error.contains("2 control planes are live here. Name one") && error.contains("testplane0002"), "{v}");
+    let (code, v) = json(&home, &["planes", "allow", "--dry-run", "--plane=testplane0002"]);
+    assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains("testplane0002"), "{v}");
+    let (code, v) = json(&home, &["planes", "allow", "--dry-run", "--plane=nowhere00000"]);
+    assert!(code != 0, "{v}");
+    // Once both are known here, a command that reads names one too.
+    let (code, v) = json(&home, &["jobs", "list"]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("Name one"), "{v}");
+    assert_eq!(json(&home, &["jobs", "list", "--plane=testplane0001"]).0, 0);
+    // The dashboard: a change on no control plane's page is refused; on one's page it is that one's; a page of one
+    // not known here is said.
+    let (_child, link) = common::dashboard(&home);
+    // (Both listed, each to open.)
+    assert!((0..40).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=planes&fragment=1").1).matches("Open").count() >= 2 }));
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
+    assert!(status == 409 && common::words(&said).contains("Which control plane?"), "{status} {}", common::words(&said));
+    let (status, _, _) = common::post(&link, "/routing?c=testplane0002", &[("action", "max_cpu"), ("max_cpu", "16")]);
+    assert_eq!(status, 303);
+    let routing: serde_json::Value = serde_json::from_str(&served.aws.settings("testplane0002").into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default()).unwrap_or_default();
+    assert_eq!(routing["max_cpu"], 16, "{routing}");
+    assert!(served.aws.settings(superci_testkit::PLANE).iter().all(|(k, _)| k != "ROUTING"), "the other one's unchanged");
+    let (status, _, said) = common::post(&link, "/routing?c=nowhere00000", &[("action", "max_cpu"), ("max_cpu", "16")]);
+    assert!(status == 404 && common::words(&said).contains("That control plane is not known here"), "{status}");
+    let _ = std::fs::remove_dir_all(&home);
+}
