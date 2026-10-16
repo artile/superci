@@ -140,3 +140,45 @@ fn a_gitlab_job_asking_for_windows_or_only_modal_is_said_to_have_nowhere_to_run(
     }
     assert!(served.machines.0.lock().unwrap().is_empty(), "no machine started");
 }
+
+#[test]
+fn github_and_gitlab_jobs_side_by_side_are_each_shown_with_their_own_host_and_runs() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let home = signed_in(&served);
+    // A GitLab job that failed, a GitHub job that passed.
+    let gl = ran(&served, "failed");
+    let (gh, queued) = served.github.queue("build", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(gh)), 202);
+    assert_eq!(served.webhook(served.github.finish(gh, "success", "2026-10-15T10:00:00.1000000Z ok", served.now_ms())), 202);
+    let (mut child, link) = dashboard(&home);
+    // Overview: the minutes as both code hosts bill them.
+    let (_, page) = part(&link, "/?p=overview&fragment=1");
+    assert!(words(&page).contains("as GitHub and GitLab bill them"), "{}", words(&page));
+    // Runs: GitHub's run and GitLab's pipeline, each linked to its own host, one passed and one failed.
+    let (_, page) = part(&link, "/?p=runs&fragment=1");
+    let said = words(&page);
+    assert!(said.contains("Pipeline") && said.contains("Passed") && said.contains("Failed"), "{said}");
+    assert!(page.contains("/-/pipelines/") || page.contains("p=run&"), "{page}");
+    // Another job of the pipeline, running: its page says it runs, and has no Cancel (a GitLab pipeline is not
+    // cancelled from here yet).
+    let (more, pending) = served.gitlab.pending("test 2", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(pending) < 300);
+    assert!(served.gitlab_webhook(served.gitlab.running(more, served.now_ms())) < 300);
+    let pipeline = served.store.under(&format!("job:gl{gl}"))[0].1["run_id"].as_u64().unwrap();
+    assert_eq!(served.store.under(&format!("job:gl{more}"))[0].1["run_id"].as_u64(), Some(pipeline), "the same pipeline");
+    // (The dashboard reads the control plane again every few seconds.)
+    // (Asked as the page asks, every few seconds.)
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        if words(&part(&link, "/?p=jobs&fragment=1").1).contains("test 2") { break }
+        assert!(std::time::Instant::now() < end, "the running job not shown");
+    }
+    let (_, page) = part(&link, &format!("/?p=run&repo=acme/app&id={pipeline}&attempt=0&fragment=1"));
+    assert!(words(&page).contains("Running") && words(&page).contains("Jobs here 2") && !page.contains("Cancel run"), "{}", words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
