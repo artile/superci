@@ -1,8 +1,9 @@
 //! `superci runs create` as it runs, against a control plane served on this computer (`superci_testkit`), the test
 //! playing the machine's runner: the working tree sent, every line of the job printed once and in order (what the
 //! runner dropped as it went, from the step's whole log), and how the run ended.
+mod common;
 use std::process::{Command, Stdio};
-use superci_testkit::{serve, Runner};
+use superci_testkit::{serve, Browser, Runner};
 
 fn checkout() -> std::path::PathBuf {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -319,4 +320,33 @@ fn a_job_that_may_fail_lets_the_run_go_on_and_one_past_its_timeout_is_ended() {
     assert_eq!((ended["state"].as_str(), ended["error"].as_str()), (Some("failed"), Some("it ran past its timeout-minutes (1), and its machine was ended")), "{ended}");
     let record = served.store.under(&format!("run:{run}"))[0].1.clone();
     assert_eq!(record["jobs"].as_array().unwrap().iter().find(|j| j["name"] == "after").unwrap()["result"], "failure");
+}
+
+#[test]
+fn a_run_from_a_computer_is_followed_in_the_dashboard_from_runs_to_its_jobs_log() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let dir = checkout();
+    let started = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    let run = run_of(&served);
+    play(&served, &run, &["compiling".to_string(), "test 1 passed".to_string()], "succeeded");
+    let home = common::signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    // Runs: the run, by its workflow; its page: its job; the job's page: its steps, and their lines.
+    b.click("nav a", "Runs");
+    b.wait(r#"document.querySelector('main a[href*="p=run&"]') !== null"#);
+    b.eval(r#"document.querySelector('main a[href*="p=run&"]').click()"#);
+    b.wait(&shows("tests"));
+    b.wait(r#"document.querySelector('main a[href*="p=job&"]') !== null"#);
+    b.eval(r#"document.querySelector('main a[href*="p=job&"]').click()"#);
+    b.wait("document.querySelector('details.lstep') !== null");
+    b.click("details.lstep summary", "Run make test");
+    b.wait("[...document.querySelectorAll('.ll .lx')].some(l => l.textContent === 'test 1 passed')");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&dir);
 }
