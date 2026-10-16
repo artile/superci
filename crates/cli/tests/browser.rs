@@ -203,6 +203,78 @@ fn a_runner_provider_is_taken_out_of_the_order_and_put_back_and_awss_on_demand_m
 }
 
 #[test]
+fn money_limits_the_longest_job_the_cache_and_public_repositories_are_set_in_the_browser() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A control plane whose own AWS account runs jobs, with GitHub connected (its App installed on acme/app).
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.github.set_public(true);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    let routing = || setting("ROUTING").and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok()).unwrap_or_default();
+    let settled = |words: &str| format!("{} && !document.body.classList.contains('busy')", shows(words));
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runners");
+    b.wait(&shows("Limits"));
+
+    // Everything: $50 a month, $5 a day.
+    b.click(r#"button[aria-label="Everything limits"]"#, "");
+    b.wait("document.getElementById('limit-all').open");
+    b.fill("#limit-all input[name=usd]", "50");
+    b.fill("#limit-all input[name=daily]", "5");
+    b.click("#limit-all button.primary", "Save");
+    until("the CI's limits", || routing()["monthly_usd"] == 50.0 && routing()["daily_usd"] == 5.0);
+    b.wait(&settled("$50.00"));
+    // AWS's account: $40 a month (its spot and on-demand machines together), no budget in AWS itself.
+    b.click(r#"button[aria-label="AWS account 111111111111 limits"]"#, "");
+    b.wait("document.getElementById('limit-aws').open");
+    b.fill("#limit-aws input[name=usd]", "40");
+    b.click("#limit-aws button.primary", "Save");
+    until("the account's limit", || routing()["account_usd"]["aws"] == 40.0 && routing().get("aws_budget").is_none());
+    b.wait(&settled("$40.00"));
+    // Lifted again: empty is no limit.
+    b.click(r#"button[aria-label="AWS account 111111111111 limits"]"#, "");
+    b.wait("document.getElementById('limit-aws').open");
+    b.fill("#limit-aws input[name=usd]", "");
+    b.click("#limit-aws button.primary", "Save");
+    until("the account's limit lifted", || routing().get("account_usd").is_none());
+    b.wait(&format!("!document.body.classList.contains('busy') && !({})", shows("$40.00")));
+
+    // Settings: the longest job, in hours.
+    b.click(".side a", "Settings");
+    b.wait(&shows("Longest job"));
+    b.fill("input[name=max_hours]", "12");
+    b.eval("document.querySelector('input[name=max_hours]').form.querySelector('button').click()");
+    until("the longest job", || routing()["max_minutes"] == 720);
+    b.wait("document.querySelector('input[name=max_hours]') && document.querySelector('input[name=max_hours]').value === '12' && !document.body.classList.contains('busy')");
+    // The cache: what a repository keeps, and how long an entry may go unused.
+    b.fill("input[name=size_gb]", "50");
+    b.eval("document.querySelector('input[name=size_gb]').form.querySelector('button').click()");
+    until("the cache's size", || routing()["cache"]["size_gb"] == 50);
+    b.wait("document.querySelector('input[name=size_gb]').value === '50' && !document.body.classList.contains('busy')");
+    b.fill("input[name=days]", "3");
+    b.eval("document.querySelector('input[name=days]').form.querySelector('button').click()");
+    until("the cache's days", || routing()["cache"]["days"] == 3);
+    b.wait("document.querySelector('input[name=days]').value === '3' && !document.body.classList.contains('busy')");
+    // A public repository allowed to run jobs here (anyone can open a pull request on one).
+    b.wait(&shows("Public repositories"));
+    b.click("button.secondary", "Choose…");
+    b.wait("document.getElementById('public-repos').open");
+    b.eval("document.querySelector('#public-repos input[value=\"acme/app\"]').checked = true");
+    b.click("#public-repos button.primary", "");
+    until("the public repository allowed", || routing()["public_repos"] == serde_json::json!(["acme/app"]));
+    b.wait(&settled("app"));
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_default_machine_is_picked_on_workflows_and_the_workspace_renamed_in_settings() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
