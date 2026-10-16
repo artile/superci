@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.12
+## 0.19.12 — 2026-10-17
 - A run from a computer no longer prints a line twice, or says a line will follow when nothing was missing: GitHub's runner leaves empty lines out of what it sends as a job goes, but counts them. Lines really missing are printed once the step's log is in, as "which came late".
 
 ## 0.19.11 — 2026-10-16
