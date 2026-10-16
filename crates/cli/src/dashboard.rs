@@ -3400,7 +3400,7 @@ mark();load()})();</script>"#;
         let html = format!("{said_once}{}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.others_ended_notice(), d.render(section, &views, last));
         let html = if look_again && !html.contains("data-refresh=") { format!(r#"<div data-refresh="2"></div>{html}"#) } else { html };
         // A change's note is said once.
-        if ["planes", "runners"].contains(&section_name(section)) { d.flash = None }
+        if ["planes", "runners", "repos"].contains(&section_name(section)) { d.flash = None }
         d.keep();
         html
     }
@@ -3902,7 +3902,9 @@ mark();load()})();</script>"#;
             format!("{rows}{add}{}", if old { String::new() } else { gitlab_dialog(true) })
         };
         let sources = format!(r#"<section class="card"><div class="card-head"><h2>Where jobs come from</h2></div><p class="note">Your code hosts send their jobs to your control plane; the ones that ask for your label run on your runners (<a href="/?p=workflows">in your workflows</a>).</p><div class="picks">{github}{gitlab}{}</div></section>"#, more_rows("More code hosts", &HOSTS_SOON));
-        format!(r#"{bar}<div class="cards">{sources}</div>"#)
+        // (A change's note: an organization removed, with what is left to do on GitHub.)
+        let note = match &self.flash { Some(f) => format!(r#"<div class="notice">{}<span>{}</span></div>"#, icon("check"), esc(f)), None => String::new() };
+        format!(r#"{bar}{note}<div class="cards">{sources}</div>"#)
     }
 
     /// How workflows use your runners, for the code hosts connected (a switch when both are): the label, the steps

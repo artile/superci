@@ -574,3 +574,32 @@ fn a_job_past_a_spend_limit_fails_saying_which_limit_and_one_under_them_starts()
     let j = served.store.under(&format!("job:{id}")).into_iter().next().map(|(_, j)| j).unwrap_or_default();
     assert!(j["state"] == "launched" && j["failed_fast"].is_null(), "{j}");
 }
+
+#[test]
+fn a_further_organization_is_removed_from_the_dashboard_its_app_uninstalled_and_forgotten() {
+    let served = serve(|_| {});
+    served.connect_github();
+    // A second organization's App beside acme's (as the dashboard keeps a further one).
+    let mut globex = superci_testkit::GitHub::app();
+    for (k, v) in [("id", serde_json::json!(2002)), ("slug", serde_json::json!("superci-globex")), ("owner", serde_json::json!("globex"))] { globex[k] = v }
+    served.aws.put(&format!("/superci/{}/GITHUB_APP_2002", superci_testkit::PLANE), &globex.to_string());
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    // (The control plane has both.)
+    let connections = json(&home, &["connections", "list"]).1;
+    assert!(connections["github"].as_array().unwrap().iter().any(|a| a["id"] == 2002 && a["owner"] == "globex"), "{connections}");
+    // The first organization is not one to remove here (that is stopping SuperCI); one not here neither.
+    for app in ["1001", "3003"] {
+        let (status, _, said) = common::post(&link, "/github/remove", &[("app", app)]);
+        assert!(status >= 400 && words(&said).contains("That organization is not one added here"), "{app}: {status} {}", words(&said));
+    }
+    // Removed: its App uninstalled at GitHub, its secret gone, and what to do on GitHub said.
+    let (status, to, _) = common::post(&link, "/github/remove", &[("app", "2002")]);
+    assert!(status == 303 && to.contains("p=repos"), "{status} {to}");
+    assert!(served.github.uninstalled());
+    assert!(served.aws.settings(superci_testkit::PLANE).iter().all(|(k, _)| k != "GITHUB_APP_2002"));
+    let (_, page) = part(&link, "/?p=repos&fragment=1");
+    assert!(words(&page).contains("Removed globex. Its App") && words(&page).contains("is uninstalled; delete the App itself on GitHub"), "{}", words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
