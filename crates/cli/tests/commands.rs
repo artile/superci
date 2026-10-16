@@ -619,3 +619,26 @@ fn everything_moves_to_another_control_plane_from_the_dashboard_and_the_old_one_
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn the_first_control_plane_deployed_in_a_named_workspace_is_called_what_the_workspace_is() {
+    // An account with no control plane yet (AWS answering as it did a real deploy), and a workspace named AcmeCI
+    // signed in to it.
+    let account = superci_testkit::Aws::serve();
+    let new = superci_testkit::serve_as("deployplane1", |_| {});
+    account.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", "deployplane1"), ("http://new-plane.test", &new.url)]);
+    let home = common::temp("named-home");
+    let ws = home.join("workspaces/default");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("sign-ins.json"), serde_json::json!({ "aws": { "region": "us-east-1", "account_id": "111111111111", "who": "arn:aws:sts::111111111111:assumed-role/Admin/someone",
+        "creds": { "access_key_id": "ASIAEXAMPLE", "secret_access_key": "example", "session_token": "example", "expires_at_ms": 4102444800000u64 }, "refresh_token": "", "dpop": { "private_b64": "", "kid": "" } } }).to_string()).unwrap();
+    std::fs::write(ws.join("workspace.json"), serde_json::json!({ "name": "AcmeCI" }).to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    let (_child, link) = common::dashboard(&home);
+    let (status, to, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "deployplane1")]);
+    assert!(status == 303 && to.contains("p=plane"), "{status} {to}");
+    // (Taken in when a page is shown next.)
+    let named = (0..120).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::part(&link, "/?p=plane&fragment=1"); account.settings("deployplane1").iter().any(|(k, v)| k == "NAME" && v == "AcmeCI") });
+    assert!(named, "{:?}", account.settings("deployplane1").iter().map(|(k, _)| k).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&home);
+}
