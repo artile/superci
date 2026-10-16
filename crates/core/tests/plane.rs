@@ -3806,7 +3806,7 @@ fn the_layer_store_switches_ubuntu_26_machines_to_superci_layers_with_a_disk_of_
     run(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26"));
     let launch = launches(&http.clouds).pop().expect("a machine");
     let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
-    assert!(script.contains("curl -fsSm60 --retry 2 $c/layers|bash>>/var/log/superci-layers.log 2>&1") && script.find("$c/layers|bash").unwrap() < script.find("cd /home/runner && ").unwrap(), "{script}");
+    assert!(script.contains("/layers|bash||(systemctl restart docker &>/dev/null &)") && !script.contains("\n(systemctl restart docker &>/dev/null &)") && script.find("/layers|bash").unwrap() < script.find("cd /home/runner && ").unwrap(), "{script}");
     assert_eq!((field(&launch, "BlockDeviceMapping.2.DeviceName"), field(&launch, "BlockDeviceMapping.2.Ebs.VolumeSize"), field(&launch, "BlockDeviceMapping.2.Ebs.Throughput")), ("/dev/sdf".to_string(), "20".to_string(), "500".to_string()));
     let j = job(&store, 1);
     assert_eq!(j["layers"], true);
@@ -3817,7 +3817,7 @@ fn the_layer_store_switches_ubuntu_26_machines_to_superci_layers_with_a_disk_of_
     let get = |p: &str| run(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/{p}")));
     let s = get("layers");
     let body = String::from_utf8(s.body.clone()).unwrap();
-    assert!(s.status == 200 && body.contains(&format!("'{PLANE_URL}/cache/{link}/layers-program'")) && body.contains(&format!("$f setup --index-url='{PLANE_URL}/cache/{link}/layers.json'")), "{body}");
+    assert!(s.status == 200 && body.contains(&format!("'{PLANE_URL}/cache/{link}/layers-program'")) && body.contains(&format!("$f setup --index-url='{PLANE_URL}/cache/{link}/layers.json' || (systemctl restart docker")) && body.starts_with("exec >>/var/log/superci-layers.log"), "{body}");
     let p = get("layers-program");
     assert!(p.status == 302 && p.header("location").unwrap().contains(&format!("/superci/layers-{}-x86_64?X-Amz-", superci_core::plane::VERSION)));
     let index = json(&get("layers.json"));
@@ -3831,7 +3831,7 @@ fn the_layer_store_switches_ubuntu_26_machines_to_superci_layers_with_a_disk_of_
     // Ubuntu 24.04 (Docker 28): as before, no store, no second disk.
     run(labelled("queued", 2, "acme/app", None, "superci/image=ubuntu24"));
     let launch = launches(&http.clouds).pop().unwrap();
-    assert!(!String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap().contains("$c/layers") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
+    assert!(!String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap().contains("/layers|bash") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
     assert_eq!(job(&store, 2)["layers"], serde_json::Value::Null);
 }
 
@@ -3846,7 +3846,7 @@ fn the_layer_store_is_off_unless_turned_on() {
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26")));
     let launch = launches(&http.clouds).pop().expect("a machine");
     let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
-    assert!(script.contains("superci-cache") && !script.contains("$c/layers") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
+    assert!(script.contains("superci-cache") && !script.contains("/layers|bash") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
     let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
     assert_eq!(block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/layers.json")))).status, 404);
 }

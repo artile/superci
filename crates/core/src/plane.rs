@@ -4639,8 +4639,9 @@ impl<'a> ControlPlane<'a> {
         if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string() }).await.is_err() { return (user_data, false) }
         let link = format!("{plane_url}/cache/{token}");
         let with = if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data);
-        let layers = layers && os == "linux" && self.config.routing.cache.layers && self.layers_ready(region, arch, creds, now).await;
-        match layers.then(|| aws::with_layers(with.clone())) { Some(Ok(w)) => (w, true), _ => (with, false) }
+        // (GitHub's jobs only: GitLab's machines start Docker otherwise.)
+        let layers = layers && os == "linux" && !runner.starts_with("gl:") && self.config.routing.cache.layers && self.layers_ready(region, arch, creds, now).await;
+        match layers.then(|| aws::with_layers(with.clone(), &link)) { Some(Ok(w)) => (w, true), _ => (with, false) }
     }
 
     /// Whether a region's bucket has this version's `superci-layers` for an architecture (looked at as `cache_ready`).

@@ -87,6 +87,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     match argv.get(1).map(String::as_str) {
         Some("off") => std::process::exit(setup::off()),
+        Some("setup-finish") => std::process::exit(setup::finish()),
         Some("setup") => {
             let mut o = setup::Options { index_url: String::new(), disk: "auto".into(), root: "/var/lib/superci-layers".into() };
             for arg in &argv[2..] {

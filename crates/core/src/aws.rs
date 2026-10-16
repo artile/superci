@@ -1315,27 +1315,24 @@ pub fn with_cache(script: String, plane: &str) -> Result<String> {
     Ok(format!("{before}{}{RUNNER}{after}", CACHE.replace("PLANE_LINK", plane)))
 }
 
-/// What `with_layers` adds after the cache's part (its `$c`) and before the runner: `superci-layers` fetched and
-/// Docker switched to it (see its `setup`: checked first, and Docker as it comes on anything that fails). Before
-/// the runner, as it starts Docker again; a second or two.
-/// (The control plane's own script for it: a line here, where AWS takes 16 KB of start-up script.)
-const LAYERS: &str = r#"# Docker's image layers from this control plane's layer store, through superci-layers (Docker as it comes on anything that fails).
-curl -fsSm60 --retry 2 $c/layers|bash>>/var/log/superci-layers.log 2>&1
-"#;
+/// What `with_layers` puts in place of the start script's restart of Docker (beside the runner): the control
+/// plane's script for `superci-layers` (`layers_script`), which switches Docker to it and starts containerd and Docker
+/// again itself, beside the runner as before; the restart as it was when that script cannot be had.
+const LAYERS: &str = "curl -fsSm60 --retry 2 LINK/layers|bash||(systemctl restart docker &>/dev/null &)\n";
+const DOCKER_RESTART: &str = "(systemctl restart docker &>/dev/null &)\n";
 
-/// What a machine's link answers at `layers` (see `LAYERS`): `superci-layers` fetched from its `layers-program`,
-/// then its `setup` with the index at `layers.json`.
-pub fn layers_script(link: &str) -> String {
-    format!("f=/usr/local/bin/superci-layers\ncurl -fsSL --retry 2 -m 60 -o $f '{link}/layers-program' && chmod 755 $f && $f setup --index-url='{link}/layers.json'\n")
+/// A Linux machine's start-up script with `superci-layers` (`link`, the machine's own link to the control plane).
+pub fn with_layers(script: String, link: &str) -> Result<String> {
+    if !link.starts_with("https://") || !link.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid layers link".into()) }
+    if !script.contains(DOCKER_RESTART) { return Err("no restart of Docker in the start-up script".into()) }
+    Ok(script.replacen(DOCKER_RESTART, &LAYERS.replace("LINK", link), 1))
 }
 
-/// A Linux machine's start-up script, with the cache's part already (`with_cache`, `with_cache_gitlab`), with
-/// `superci-layers` too.
-pub fn with_layers(script: String) -> Result<String> {
-    let runner = if script.contains("export GL_URL=") { "export GL_URL=" } else { "cd /home/runner && " };
-    if !script.contains("c='https://") { return Err("no cache link in the start-up script".into()) }
-    let (before, after) = script.split_once(runner).ok_or("no runner in the start-up script")?;
-    Ok(format!("{before}{LAYERS}{runner}{after}"))
+/// What a machine's link answers at `layers` (see `LAYERS`): `superci-layers` fetched from its `layers-program` and
+/// its `setup` run (it starts containerd and Docker again, beside the runner, with the index at `layers.json`); what
+/// it says in its own log. Without the program, Docker restarted as the start script restarts it.
+pub fn layers_script(link: &str) -> String {
+    format!("exec >>/var/log/superci-layers.log 2>&1\nf=/usr/local/bin/superci-layers\ncurl -fsSL --retry 2 -m 60 -o $f '{link}/layers-program' && chmod 755 $f && $f setup --index-url='{link}/layers.json' || (systemctl restart docker &>/dev/null &)\n")
 }
 
 /// The same for a GitLab job's machine: GitLab's runner keeps its cache in "S3" at `superci-cache` here (path-style,
@@ -1480,9 +1477,9 @@ mod tests {
         let script = runner_user_data_for(&crate::io::Work::GitHub { jit }, 360, "linux", Some("https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/interrupted?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken")).unwrap();
         let script = with_hello(with_scratch(script, false), "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/hello?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken").unwrap();
         let script = with_cache(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
-        let script = with_layers(script).unwrap();
+        let script = with_layers(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
         let script = compact(&script);
-        assert!(script.contains("wait $g") && script.contains("curl -fsSm60 --retry 2 $c/layers|bash") && script.len() < 16_384, "{} bytes", script.len());
+        assert!(script.contains("wait $g") && script.contains("/cache/tokentokentokentokentoken/layers|bash||(systemctl restart docker") && script.len() < 16_384, "{} bytes", script.len());
         assert_eq!((script.matches("&live=").count(), script.matches("&log=runner").count()), (1, 1), "each part of what the machine says, once");
         println!("{} bytes with a 10,000-character configuration", script.len());
     }

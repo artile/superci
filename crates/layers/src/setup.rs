@@ -1,14 +1,19 @@
-//! A machine's switch to SuperCI's layers, at its start and before its runner: checked first, and on anything
-//! that fails, put back as it was (Docker as it comes) before the job runs. It never fails the start.
+//! A machine's switch to SuperCI's layers, at its start, in the start script's place for starting Docker again: what
+//! comes before the runner takes a fraction of a second, and Docker starts once, beside the runner, as it would have
+//! anyway (a job's first use of it waits on its socket, as it does without this). On anything that fails, Docker as
+//! it comes; it never fails the start.
 //!
-//! 1. Docker keeps its images in containerd already (Docker 29 does by default; turning that on for an older Docker
-//!    would change what Docker is like, so this does not).
+//! Before the runner (`setup`), at once where they can be:
+//! 1. Docker keeps its images in containerd already (Docker 29 does by default: its installed package says, not the
+//!    daemon, which is starting; turning that on for an older Docker would change what Docker is like).
 //! 2. The kernel mounts an EROFS file (a small one carried here).
 //! 3. The store's disk, when the machine has one, made and mounted for the layer files; the index fetched.
-//! 4. This service started under systemd, and answering.
+//! 4. This service started under systemd (a unit of its own while the machine runs), and answering.
 //! 5. containerd's and Docker's settings kept, then changed: containerd's own content store off, this service as
-//!    its snapshotter and content store, Docker on it; both started again.
-//! 6. Docker says it uses this service, and containerd reaches both of its parts.
+//!    its snapshotter and content store, Docker on it.
+//!
+//! Beside the runner (`finish`, on its own): containerd and Docker started again, then Docker says it uses this
+//! service and containerd reaches both of its parts; if not, their settings put back and both started again.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +22,6 @@ const CHECK_EROFS: &[u8] = include_bytes!("../assets/check.erofs");
 const CONTAINERD_CONFIG: &str = "/etc/containerd/config.toml";
 const DOCKER_CONFIG: &str = "/etc/docker/daemon.json";
 const KEPT: &str = ".superci-stock";
-const UNIT: &str = "/etc/systemd/system/superci-layers.service";
 const BIN: &str = "/usr/local/bin/superci-layers";
 const SOCKET: &str = "/run/superci-layers.sock";
 const INDEX: &str = "/etc/superci/layers.json";
@@ -34,13 +38,58 @@ pub struct Options {
 pub fn setup(o: &Options) -> i32 {
     let began = std::time::Instant::now();
     match switch(o) {
-        Ok(said) => println!("superci-layers: on in {:.1} s: {said}", began.elapsed().as_secs_f64()),
+        Ok(said) => {
+            println!("superci-layers: switched in {:.2} s: {said}; containerd and Docker start again beside the runner", began.elapsed().as_secs_f64());
+            if let Err(e) = detached(&[std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| BIN.into()).as_str(), "setup-finish"]) {
+                println!("superci-layers: off: {e}");
+                let _ = put_back_before_restart();
+            }
+        }
+        Err(e) => {
+            println!("superci-layers: off: {e}");
+            if let Err(e) = put_back_before_restart() { println!("superci-layers: putting Docker back as it was: {e}") }
+        }
+    }
+    0
+}
+
+/// After the switch, beside the runner: containerd and Docker started again on this service (once, as the start
+/// script would have started Docker), then checked; Docker as it comes again if it did not take.
+pub fn finish() -> i32 {
+    let began = std::time::Instant::now();
+    let done = (|| -> Result<(), String> {
+        run("systemctl", &["restart", "containerd", "docker"])?;
+        wait_for_docker()?;
+        let driver = docker_info()?["Driver"].as_str().unwrap_or_default().to_string();
+        if driver != "superci" { return Err(format!("Docker's driver is {driver:?} after the switch")) }
+        check_containerd()
+    })();
+    match done {
+        Ok(()) => println!("superci-layers: on: Docker answered on it {:.1} s after the switch", began.elapsed().as_secs_f64()),
         Err(e) => {
             println!("superci-layers: off: {e}");
             if let Err(e) = put_back() { println!("superci-layers: putting Docker back as it was: {e}") }
         }
     }
     0
+}
+
+/// A program started on its own (its own session, its output in the log), not waited for.
+fn detached(argv: &[&str]) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open("/var/log/superci-layers.log").map_err(|e| e.to_string())?;
+    let mut c = Command::new(argv[0]);
+    c.args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e| e.to_string())?).stderr(log);
+    unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
+    c.spawn().map(|_| ()).map_err(|e| format!("{}: {e}", argv[0]))
+}
+
+/// Before containerd and Docker were started again: the settings as they were, this service stopped, and Docker
+/// started again beside the runner as the start script starts it.
+fn put_back_before_restart() -> Result<(), String> {
+    restore_settings()?;
+    let _ = run("systemctl", &["stop", "superci-layers"]);
+    detached(&["systemctl", "restart", "docker"])
 }
 
 /// Docker as it comes again (by hand, or after a failed switch).
@@ -56,35 +105,47 @@ fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
 }
 
 fn switch(o: &Options) -> Result<String, String> {
-    // 1. Docker's images in containerd already.
-    let status = run("docker", &["info", "--format", "{{json .DriverStatus}}"])?;
-    if !status.contains("io.containerd.snapshotter.v1") { return Err("Docker keeps its images in its own driver, not containerd (Docker before 29)".into()) }
-    // 2. EROFS from a file.
-    check_erofs(&o.root)?;
-    // 3. The files' disk, and the index.
+    // (Each step's time, said with the outcome: the switch is before the runner, so its time is the job's.)
+    let mut took: Vec<(&str, f64)> = vec![];
+    let mut clock = std::time::Instant::now();
+    let mut step = |name: &'static str, took: &mut Vec<(&str, f64)>| { took.push((name, clock.elapsed().as_secs_f64())); clock = std::time::Instant::now(); };
+    // 1-3 at once, each timed: Docker keeps its images in containerd already; an EROFS file mounts (its module
+    // loaded, the first time); the files' disk made; the index fetched.
     let files = o.root.join("files");
     std::fs::create_dir_all(&files).map_err(|e| format!("{}: {e}", files.display()))?;
-    let disk = store_disk(&o.disk, &files)?;
-    let index = fetch_index(&o.index_url)?;
-    // 4. The service.
-    std::fs::write(UNIT, unit(&o.root, &files)).map_err(|e| format!("{UNIT}: {e}"))?;
-    run("systemctl", &["daemon-reload"])?;
-    run("systemctl", &["start", "superci-layers"])?;
-    // 5. containerd and Docker on it, their own settings kept for putting back.
+    let timed = |f: &dyn Fn() -> Result<String, String>| { let t = std::time::Instant::now(); (f(), t.elapsed().as_secs_f64()) };
+    let (docker, erofs, disk, index) = std::thread::scope(|s| {
+        let docker = s.spawn(|| timed(&|| docker_keeps_images_in_containerd().map(|_| String::new())));
+        let erofs = s.spawn(|| timed(&|| check_erofs(&o.root).map(|_| String::new())));
+        let index = s.spawn(|| timed(&|| fetch_index(&o.index_url).map(|n| n.to_string())));
+        let disk = timed(&|| store_disk(&o.disk, &files));
+        let stopped = |what: &str| (Err(format!("{what} stopped")), 0.0);
+        (docker.join().unwrap_or_else(|_| stopped("Docker's check")), erofs.join().unwrap_or_else(|_| stopped("the EROFS check")), disk, index.join().unwrap_or_else(|_| stopped("fetching the index")))
+    });
+    docker.0?;
+    erofs.0?;
+    let (disk_t, index_t) = (disk.1, index.1);
+    let (disk, index) = (disk.0?, index.0?);
+    step("checks, disk and index at once", &mut took);
+    // (Each of the four, said after the time they took together.)
+    took.extend([("of which Docker's check", docker.1), ("EROFS", erofs.1), ("disk", disk_t), ("index", index_t)]);
+    // 4. The service: a unit of its own while the machine runs (no unit file, so no reload of systemd's).
+    let (root, files_arg) = (format!("--root={}", o.root.display()), format!("--files={}", files.display()));
+    run("systemd-run", &["--unit=superci-layers", "--service-type=notify", "--property=Restart=always", "--property=RestartSec=1", "--property=TimeoutStartSec=30",
+        "--description=SuperCI's image layers (containerd's snapshotter and content store)", BIN, &root, &files_arg, &format!("--index={INDEX}"), &format!("--socket={SOCKET}")])?;
+    step("service", &mut took);
+    // 5. containerd and Docker on it, their own settings kept for putting back; both started again at once
+    // (systemd starts Docker after containerd).
     keep(CONTAINERD_CONFIG)?;
     keep(DOCKER_CONFIG)?;
     let config = std::fs::read_to_string(CONTAINERD_CONFIG).unwrap_or_default();
     std::fs::write(CONTAINERD_CONFIG, containerd_config(&config)?).map_err(|e| format!("{CONTAINERD_CONFIG}: {e}"))?;
     let daemon = std::fs::read_to_string(DOCKER_CONFIG).unwrap_or_else(|_| "{}".into());
     std::fs::write(DOCKER_CONFIG, docker_config(&daemon)?).map_err(|e| format!("{DOCKER_CONFIG}: {e}"))?;
-    run("systemctl", &["restart", "containerd"])?;
-    run("systemctl", &["restart", "docker"])?;
-    wait_for_docker()?;
-    // 6. Checks.
-    let driver = run("docker", &["info", "--format", "{{.Driver}}"])?;
-    if driver != "superci" { return Err(format!("Docker's driver is {driver:?} after the switch")) }
-    check_containerd()?;
-    Ok(format!("{index} layers in the index; files on {disk}"))
+    step("settings", &mut took);
+    // 6. (Started again and checked beside the runner: `finish`.)
+    let times = took.iter().map(|(n, t)| format!("{n} {t:.2} s")).collect::<Vec<_>>().join(", ");
+    Ok(format!("{index} layers in the index; files on {disk} ({times})"))
 }
 
 /// The small EROFS file mounted and read.
@@ -143,10 +204,6 @@ fn fetch_index(url: &str) -> Result<usize, String> {
     Ok(index.layers.len())
 }
 
-fn unit(root: &Path, files: &Path) -> String {
-    format!("[Unit]\nDescription=SuperCI's image layers (containerd's snapshotter and content store)\nBefore=containerd.service\n\n[Service]\nType=notify\nExecStart={BIN} --root={} --files={} --index={INDEX} --socket={SOCKET}\nRestart=always\nRestartSec=1\n\n[Install]\nWantedBy=multi-user.target\n", root.display(), files.display())
-}
-
 /// A setting file kept beside it as it was (once: a second switch keeps the first one's), or that there was none.
 fn keep(path: &str) -> Result<(), String> {
     let kept = format!("{path}{KEPT}");
@@ -203,9 +260,53 @@ pub fn docker_config(daemon: &str) -> Result<String, String> {
     serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
 }
 
+/// Whether Docker keeps its images in containerd: Docker 29 or later (its installed package says) with no setting
+/// that turns that off. Not asked of the daemon: at a machine's start it is starting (the script starts it again,
+/// beside the runner), and waiting for it would be the job's time. A Docker installed some other way is asked.
+fn docker_keeps_images_in_containerd() -> Result<(), String> {
+    let refused = || Err("Docker keeps its images in its own driver, not containerd (Docker before 29)".to_string());
+    let daemon: serde_json::Value = std::fs::read_to_string(DOCKER_CONFIG).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    if daemon["features"]["containerd-snapshotter"] == false || daemon["storage-driver"].as_str().is_some_and(|d| d != "overlayfs") { return refused() }
+    match docker_version(&std::fs::read_to_string("/var/lib/dpkg/status").unwrap_or_default()) {
+        Some(major) if major >= 29 => Ok(()),
+        Some(_) => refused(),
+        None => if docker_info()?["DriverStatus"].to_string().contains("io.containerd.snapshotter.v1") { Ok(()) } else { refused() },
+    }
+}
+
+/// Docker's major version from dpkg's record of installed packages (`docker-ce`, else `docker.io`).
+fn docker_version(status: &str) -> Option<u32> {
+    for package in ["docker-ce", "docker.io"] {
+        for block in status.split("\n\n") {
+            if !block.lines().any(|l| l == format!("Package: {package}")) || !block.lines().any(|l| l.starts_with("Status:") && l.ends_with(" installed")) { continue }
+            let v = block.lines().find_map(|l| l.strip_prefix("Version: "))?;
+            // ("5:29.4.2-1~ubuntu.26.04~resolute": the epoch, then the version.)
+            let v = v.split_once(':').map(|(_, v)| v).unwrap_or(v);
+            return v.split('.').next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// What Docker's daemon says of itself (`GET /info` on its socket): asked of the daemon, not of the `docker`
+/// command, which a machine just started reads from a disk still coming from its snapshot (seconds, the first time).
+fn docker_info() -> Result<serde_json::Value, String> {
+    use std::io::{Read, Write};
+    let mut s = std::os::unix::net::UnixStream::connect("/var/run/docker.sock").map_err(|e| format!("Docker's socket: {e}"))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    // (HTTP/1.0: the answer whole, then the connection closed; no chunks.)
+    s.write_all(b"GET /info HTTP/1.0\r\nHost: docker\r\n\r\n").map_err(|e| format!("Docker's socket: {e}"))?;
+    let mut answer = Vec::new();
+    s.read_to_end(&mut answer).map_err(|e| format!("Docker's socket: {e}"))?;
+    let text = String::from_utf8_lossy(&answer);
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("Docker's daemon answered no HTTP")?;
+    if !head.starts_with("HTTP/1.0 200") && !head.starts_with("HTTP/1.1 200") { return Err(format!("Docker's daemon answered {}", head.lines().next().unwrap_or_default())) }
+    serde_json::from_str(body).map_err(|e| format!("Docker's daemon answered: {e}"))
+}
+
 fn wait_for_docker() -> Result<(), String> {
     for _ in 0..120 {
-        if run("docker", &["info", "--format", "{{.Driver}}"]).is_ok() { return Ok(()) }
+        if docker_info().is_ok() { return Ok(()) }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     Err("Docker did not answer after the switch".into())
@@ -230,16 +331,21 @@ fn check_containerd() -> Result<(), String> {
     })
 }
 
-/// containerd's and Docker's settings as they were, this service stopped, both started again, Docker answering.
-fn put_back() -> Result<(), String> {
+/// containerd's and Docker's settings as they were (kept by `keep`).
+fn restore_settings() -> Result<(), String> {
     for path in [CONTAINERD_CONFIG, DOCKER_CONFIG] {
         let kept = format!("{path}{KEPT}");
         if Path::new(&kept).exists() { std::fs::rename(&kept, path).map_err(|e| format!("{path}: {e}"))? }
         else if Path::new(&format!("{kept}-none")).exists() { let _ = std::fs::remove_file(path); let _ = std::fs::remove_file(format!("{kept}-none")); }
     }
+    Ok(())
+}
+
+/// containerd's and Docker's settings as they were, this service stopped, both started again, Docker answering.
+fn put_back() -> Result<(), String> {
+    restore_settings()?;
+    // (Its unit is the machine's while it runs: stopped, it is gone.)
     let _ = run("systemctl", &["stop", "superci-layers"]);
-    let _ = std::fs::remove_file(UNIT);
-    let _ = run("systemctl", &["daemon-reload"]);
     run("systemctl", &["restart", "containerd"])?;
     run("systemctl", &["restart", "docker"])?;
     wait_for_docker()
@@ -272,6 +378,23 @@ mod tests {
         assert_eq!(got, serde_json::json!({"max-concurrent-downloads": 16, "storage-driver": "superci", "features": {"x": true, "containerd-snapshotter": true}}));
         assert_eq!(serde_json::from_str::<serde_json::Value>(&docker_config("").unwrap()).unwrap()["storage-driver"], "superci");
         assert!(docker_config("[]").is_err());
+    }
+
+    #[test]
+    fn dockers_version_is_read_from_dpkgs_record() {
+        let status = "Package: containerd.io\nStatus: install ok installed\nVersion: 2.3.6-1\n\nPackage: docker-ce\nStatus: install ok installed\nVersion: 5:29.4.2-1~ubuntu.26.04~resolute\n\nPackage: x\nVersion: 1\n";
+        assert_eq!(docker_version(status), Some(29));
+        assert_eq!(docker_version("Package: docker.io\nStatus: install ok installed\nVersion: 28.2.2-0ubuntu1\n"), Some(28));
+        assert_eq!(docker_version("Package: docker-ce\nStatus: deinstall ok config-files\nVersion: 5:29.0.0-1\n"), None, "removed is not installed");
+        assert_eq!(docker_version(""), None);
+    }
+
+    #[test]
+    fn dockers_daemon_says_its_driver_on_its_socket() {
+        // (Where Docker runs: a developer's machine, CI.)
+        if !Path::new("/var/run/docker.sock").exists() { return }
+        let info = docker_info().unwrap();
+        assert!(info["Driver"].as_str().is_some_and(|d| !d.is_empty()) && info["DriverStatus"].is_array(), "{info}");
     }
 
     #[test]
