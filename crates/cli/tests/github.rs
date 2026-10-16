@@ -705,3 +705,26 @@ fn usage_says_what_jobs_cost_beside_githubs_runners_how_many_did_not_run_and_the
     let said = String::from_utf8_lossy(&o.stdout);
     assert!(said.contains("2 jobs, 1 ran, 1 did not") && said.contains("saved") && said.contains("Median wait for a machine: 30 s"), "{said}");
 }
+
+#[test]
+fn a_personal_accounts_app_registers_its_runners_in_the_repository_and_its_manifest_goes_to_the_persons_settings() {
+    // The App of a person's own account (not an organization's).
+    let served = serve(|_| {});
+    let mut app = superci_testkit::GitHub::app();
+    app["owner_is_org"] = serde_json::json!(false);
+    served.aws.put(&format!("/superci/{}/GITHUB_APP", superci_testkit::PLANE), &app.to_string());
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    let asked = || served.github.asked.lock().unwrap().clone();
+    assert!(asked().iter().any(|a| a == "POST https://api.github.com/repos/acme/app/actions/runners/generate-jitconfig"), "{:?}", asked());
+    // Cancelled before its runner took it: its runner taken back from the repository.
+    assert_eq!(served.webhook(served.github.cancel(id, served.now_ms())), 202);
+    assert!(asked().iter().any(|a| a.starts_with("DELETE https://api.github.com/repos/acme/app/actions/runners/")), "{:?}", asked());
+    // Made from Repositories for a person: GitHub's page for an App of their own.
+    let home = signed_in(&served);
+    let (_child, link) = dashboard(&home);
+    let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "octocat")]);
+    assert!(status == 200 && form.contains("https://github.com/settings/apps/new?state="), "{status} {}", words(&form));
+    let (status, _, said) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "nobody-here")]);
+    assert!(status == 400 && words(&said).contains("There is no GitHub organization or user named nobody-here"), "{status} {}", words(&said));
+}

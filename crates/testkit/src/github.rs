@@ -276,6 +276,8 @@ impl GitHub {
             }
             // Who a name is, and the App made from the dashboard's manifest (docs.github.com/rest/apps/apps#create-a-github-app-from-a-manifest).
             ("GET", ["users", OWNER]) => ok(200, fixture("org")),
+            // A person's own account (docs.github.com/rest/users/users#get-a-user).
+            ("GET", ["users", "octocat"]) => ok(200, json!({ "login": "octocat", "id": 1, "type": "User", "site_admin": false, "name": "The Octocat", "html_url": "https://github.com/octocat" })),
             ("GET", ["users", _]) => ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/users/users#get-a-user", "status": "404" })),
             ("POST", ["app-manifests", _, "conversions"]) => {
                 let app = Self::app();
@@ -289,7 +291,8 @@ impl GitHub {
             ("GET", ["repositories", id]) => { drop(h); let r = self.repo(); if r["id"].to_string() == *id { ok(200, r) } else { ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/repos/repos#get-a-repository", "status": "404" })) } }
             ("GET", ["installation", "repositories"]) => { drop(h); ok(200, json!({ "total_count": 1, "repository_selection": "all", "repositories": [self.repo()] })) }
             // A runner for one job (docs.github.com/rest/actions/self-hosted-runners).
-            ("POST", ["orgs", OWNER, "actions", "runners", "generate-jitconfig"]) => {
+            // (A personal account's App registers its runners in each repository: the same, there.)
+            ("POST", ["orgs", OWNER, "actions", "runners", "generate-jitconfig"] | ["repos", OWNER, "app", "actions", "runners", "generate-jitconfig"]) => {
                 let body: Value = serde_json::from_slice(&r.body).ok()?;
                 h.next += 1;
                 let id = 20 + h.next;
@@ -299,13 +302,13 @@ impl GitHub {
                 ok(201, json!({ "runner": { "id": id, "name": name, "os": "unknown", "status": "offline", "busy": false, "labels": labels },
                     "encoded_jit_config": superci_core::crypto::b64(format!("{{\"runner\":{id}}}").as_bytes()) }))
             }
-            ("GET", ["orgs", OWNER, "actions", "runners", id]) => {
+            ("GET", ["orgs", OWNER, "actions", "runners", id] | ["repos", OWNER, "app", "actions", "runners", id]) => {
                 let id: u64 = id.parse().ok()?;
                 let name = h.runners.get(&id)?.clone();
                 let busy = h.jobs.values().any(|j| j["runner_id"] == id && j["status"] == "in_progress");
                 ok(200, json!({ "id": id, "name": name, "os": "linux", "status": "online", "busy": busy, "labels": [] }))
             }
-            ("DELETE", ["orgs", OWNER, "actions", "runners", id]) => { h.runners.remove(&id.parse().ok()?); Some(Response::new(204, "text/plain", "")) }
+            ("DELETE", ["orgs", OWNER, "actions", "runners", id] | ["repos", OWNER, "app", "actions", "runners", id]) => { h.runners.remove(&id.parse().ok()?); Some(Response::new(204, "text/plain", "")) }
             // Its repository, runs and jobs (in the shape recorded).
             ("GET", ["repos", o, n]) if format!("{o}/{n}") == REPO => { drop(h); ok(200, self.repo()) }
             ("GET", ["repos", o, n, "actions", "jobs", id]) if format!("{o}/{n}") == REPO => h.jobs.get(&id.parse().ok()?).cloned().map(|j| Response::new(200, "application/json", j.to_string())),
