@@ -552,6 +552,9 @@ fn machine_name(size: Size) -> String { format!("{}cpu-{}gb{}", size.cpu, size.r
 /// How a try ends when starting the machine failed at more than one place (followed by what each said).
 const SEVERAL: &str = "no provider could start its machine: ";
 
+/// How long a cancelled run's job has to stop before its machine is ended: its runner's grace time, and a minute more.
+const CANCEL_MS: u64 = 6 * 60_000;
+
 /// A place refusing what a job asks, as it would any job asking the same (no hiccup): no GPU machines allowed in the
 /// AWS account, or a runner agent refusing the request (Modal: no GPUs without a payment method).
 fn refuses_alike(e: &str) -> bool { e.starts_with(NO_GPU_QUOTA) || e.contains(" runner agent: 400 ") || e.starts_with("Modal refused: ") }
@@ -1222,6 +1225,7 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/runs/tree") if self.dashboard(&req) || self.run_key(&req).is_some() => self.tree_part(&url, &req, &plane_url).await,
             ("POST", "/runs") if self.dashboard(&req) => self.create_run(&req, &plane_url, None).await,
             ("POST", "/runs") if self.run_key(&req).is_some() => { let k = self.run_key(&req); self.create_run(&req, &plane_url, k).await }
+            ("POST", p) if p.starts_with("/runs/") && p.ends_with("/cancel") && (self.dashboard(&req) || self.run_key(&req).is_some()) => self.cancel_run(p, &plane_url).await,
             ("GET", p) if p.starts_with("/runs/") && p.ends_with("/artifacts") && self.reader(&req) => self.run_artifacts(p, &url, &plane_url).await,
             ("GET", p) if p.starts_with("/runs/") && p.ends_with("/log") && self.reader(&req) => self.run_log(p, &url).await,
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
@@ -3597,10 +3601,21 @@ impl<'a> ControlPlane<'a> {
                         over = true;
                     }
                 }
+                // Cancelled, and its runner did not stop it within the grace time: its machine ended, and it is cancelled.
+                let mut said = said;
+                if let (None, false, Some(by), Some(mut rec)) = (&said, over, j["cancel_by"].as_u64(), record.clone()) {
+                    if self.clock.now_ms() > by {
+                        self.stop_machine(plane_url, &rec).await;
+                        (rec.state, rec.error) = ("cancelled".into(), Some("its run was cancelled, and its machine was ended".into()));
+                        rec.ended_ms.get_or_insert(self.clock.now_ms());
+                        self.keep(&format!("job:{id}"), &rec).await?;
+                        said = Some("cancelled".into());
+                    }
+                }
                 if said.is_none() && !over { continue }
                 // AWS took its spot machine back, and it did not pass anyway: started again, off spot machines, once
                 // (as a GitHub job is run again; here this control plane is the one that runs it).
-                if record.as_ref().is_some_and(|r| r.interrupted) && said.as_deref() != Some("succeeded") && j["off_spot"] != true {
+                if record.as_ref().is_some_and(|r| r.interrupted) && said.as_deref() != Some("succeeded") && j["off_spot"] != true && run["cancelled"] != true {
                     j["state"] = "pending".into();
                     j["off_spot"] = true.into();
                     if let Some(o) = j.as_object_mut() { o.remove("job_id"); o.remove("token"); }
@@ -3827,6 +3842,72 @@ impl<'a> ControlPlane<'a> {
         if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(()) }
         self.indexes(&job_key(&job), &job, true, None).await?;
         self.start_soon(plane_url, &mut job).await
+    }
+
+    /// `POST /runs/<id>/cancel`: a run from a computer stopped, as GitHub cancels a run: its jobs not started yet end
+    /// cancelled; a job whose runner has it is told to stop, as GitHub tells it (its steps stop, and it ends cancelled);
+    /// one whose machine has not begun it yet has its machine ended at once.
+    async fn cancel_run(&self, path: &str, plane_url: &str) -> Result<Response> {
+        let Some(id) = path.trim_start_matches("/runs/").trim_end_matches("/cancel").parse::<u64>().ok() else { return Ok(nothing_here()) };
+        let key = format!("run:{id}");
+        // A GitHub run (none of this control plane's own): GitHub cancels it, asked with the App's token for its
+        // repository; its jobs here end as GitHub tells (a machine whose job ended is ended).
+        if self.store.get(&key).await?.is_none() {
+            let mut known = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect::<Vec<_>>();
+            known.extend(self.newest_jobs(200).await?);
+            let Some(j) = known.into_iter().find(|j| j.run_id == id && j.provider.is_empty()) else { return Ok(nothing_here()) };
+            let said = match (self.app_of(&j), self.installation_token_for(&j).await) {
+                (Some(app), Some(token)) => github::cancel_run(self.http, &app.api(), &token, &j.repo, id).await,
+                _ => Err("GitHub gave no token for its repository".into()),
+            };
+            return Ok(Response::json(&match said { Ok(()) => serde_json::json!({ "run_id": id.to_string(), "cancelled": true, "github": true }), Err(e) => serde_json::json!({ "error": e }) }))
+        }
+        for _ in 0..16 {
+            let Some(was) = self.store.get(&key).await? else { return Ok(nothing_here()) };
+            let mut run: serde_json::Value = serde_json::from_str(&was).map_err(|e| e.to_string())?;
+            if run["jobs"].as_array().is_some_and(|jobs| jobs.iter().all(|j| j["state"] == "done")) { return Ok(Response::json(&serde_json::json!({ "run_id": id.to_string(), "cancelled": false, "over": true }))) }
+            let now = self.clock.now_ms();
+            let (mut told, mut ended) = (vec![], vec![]);
+            for j in run["jobs"].as_array_mut().into_iter().flatten() {
+                match j["state"].as_str() {
+                    Some("pending") => { j["state"] = "done".into(); j["result"] = "cancelled".into(); }
+                    Some("started") => {
+                        let (Some(token), Some(job_id)) = (j["token"].as_str().map(str::to_string), j["job_id"].as_str().and_then(|i| i.parse::<u64>().ok())) else { continue };
+                        // (Its runner has until the grace time and a little more: then its machine is ended.)
+                        j["cancel_by"] = (now + CANCEL_MS).into();
+                        told.push((token, job_id));
+                    }
+                    _ => {}
+                }
+            }
+            run["cancelled"] = true.into();
+            if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
+            for (token, job_id) in told {
+                let handed_key = format!("rjob:{token}");
+                let Some(mut handed) = get_json::<crate::runner_service::HandedJob>(self.store, &handed_key).await? else { continue };
+                if handed.result.is_some() { continue }
+                if handed.taken { handed.cancel = true } else {
+                    // Not taken yet: nothing ran; its machine goes now.
+                    handed.result = Some("cancelled".into());
+                    ended.push(job_id);
+                }
+                put_json(self.store, &handed_key, &handed).await?;
+            }
+            for job_id in &ended {
+                if let Some(mut rec) = get_json::<Job>(self.store, &format!("job:{job_id}")).await? {
+                    self.stop_machine(plane_url, &rec).await;
+                    self.withdraw_runner(&mut rec).await;
+                    (rec.state, rec.began) = ("cancelled".into(), true);
+                    rec.ended_ms.get_or_insert(now);
+                    self.settle(plane_url, &mut rec).await;
+                    self.keep(&format!("job:{job_id}"), &rec).await?;
+                }
+            }
+            if let Err(e) = self.advance_run(plane_url, id).await { let _ = self.store.put_until(&format!("run-error:{id}"), e, now + 2 * 86_400_000).await; }
+            self.timer.wake_in(CANCEL_MS).await?;
+            return Ok(Response::json(&serde_json::json!({ "run_id": id.to_string(), "cancelled": true, "over": false })))
+        }
+        Err("the run kept changing while it was cancelled".into())
     }
 
     /// `GET /runs/<id>/artifacts`: a run from a computer's artifacts (each one's name and size), or with `name`, links

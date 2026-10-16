@@ -412,3 +412,90 @@ fn a_job_whose_spot_machine_aws_took_back_is_started_again_off_spot_and_the_run_
     assert!(out.status.success() && said.contains("The run ended: success"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_run_from_a_computer_is_cancelled_its_running_job_told_to_stop_and_the_job_waiting_for_it_never_started() {
+    let served = serve(|_| {});
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: sleep 600\n  after:\n    needs: build\n    runs-on: superci\n    steps:\n      - run: echo after\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let build = runner_of(&served, &run, "build");
+    let message = build.handed(&served);
+    build.take();
+    build.steps(&[("ffffffff-0000-0000-0000-000000000006", "Run sleep 600", 1, "inProgress", None, None)]);
+    // Cancelled, with the key that started it.
+    let o = superci(&served, &dir, &["runs", "cancel", &run]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains(&format!("Cancelled run {run}")), "{said}");
+    // The job that waited for it ends cancelled, never started; the running one's runner is told, as GitHub tells it,
+    // once.
+    let jobs = || served.store.under(&format!("run:{run}"))[0].1["jobs"].clone();
+    let after = jobs().as_array().unwrap().iter().find(|j| j["key"] == "after").cloned().unwrap();
+    assert_eq!((after["state"].as_str(), after["result"].as_str(), after.get("token")), (Some("done"), Some("cancelled"), None), "{after}");
+    let (status, told) = build.message();
+    assert_eq!((status, told["messageType"].as_str()), (200, Some("JobCancellation")), "{told}");
+    let body: serde_json::Value = serde_json::from_str(told["body"].as_str().unwrap()).unwrap();
+    assert_eq!((body["jobId"].clone(), body["timeout"].as_str()), (message["jobId"].clone(), Some("00:05:00")));
+    assert_eq!(build.message().0, 204, "told once");
+    // It stops its steps and ends cancelled: the run is over, cancelled.
+    build.finish("canceled");
+    let o = superci(&served, &dir, &["runs", "wait", &run, "--quiet"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("The run ended: cancelled"), "{said}");
+    assert_eq!(superci(&served, &dir, &["runs", "cancel", &run]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains("was over already")).ok(), Some(true));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_run_cancelled_before_its_machine_began_its_job_ends_that_machine_at_once() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let _ = runner_of(&served, &run, "tests");
+    let o = superci(&served, &dir, &["runs", "cancel", &run]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let job = served.store.under("job:").into_iter().map(|(_, j)| j).find(|j| j["provider"] == "local").unwrap();
+    assert_eq!((job["state"].as_str(), job["ended_ms"].is_u64()), (Some("cancelled"), true), "{job}");
+    let jobs = served.store.under(&format!("run:{run}"))[0].1["jobs"].clone();
+    assert_eq!((jobs[0]["state"].as_str(), jobs[0]["result"].as_str()), (Some("done"), Some("cancelled")), "{jobs}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_running_run_is_cancelled_from_its_page_in_the_browser() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let dir = checkout();
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let runner = runner_of(&served, &run, "tests");
+    runner.take();
+    runner.steps(&[("abababab-0000-0000-0000-000000000007", "Run make", 1, "inProgress", None, None)]);
+    let home = common::signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runs");
+    b.wait(r#"document.querySelector('main a[href*="p=run&"]') !== null"#);
+    b.eval(r#"document.querySelector('main a[href*="p=run&"]').click()"#);
+    // Running: its Cancel; clicked, its runner is told to stop, as GitHub tells one.
+    b.wait(r#"[...document.querySelectorAll('main button')].some(x => x.textContent === 'Cancel run')"#);
+    b.eval(r#"[...document.querySelectorAll('main button')].find(x => x.textContent === 'Cancel run').click()"#);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let told = loop {
+        let (status, m) = runner.message();
+        if status == 200 { break m }
+        assert!(std::time::Instant::now() < end, "its runner was not told");
+    };
+    assert_eq!(told["messageType"], "JobCancellation", "{told}");
+    runner.finish("canceled");
+    b.wait(&shows("Cancelled"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&dir);
+}

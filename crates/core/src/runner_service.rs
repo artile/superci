@@ -40,7 +40,13 @@ pub struct HandedJob {
     /// The control plane's record of the job (`job:<id>`) and its runner's name.
     #[serde(default)] pub job_id: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")] pub runner: String,
+    /// Asked to stop (its run was cancelled), and whether its runner has been told: GitHub's message for it, once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub cancel: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub cancel_told: bool,
 }
+
+/// How long a cancelled job's steps have to stop (as GitHub gives them), before its runner ends them.
+pub const CANCEL_GRACE: &str = "00:05:00";
 
 /// How long what a run's job left (its lines, its logs) is kept.
 pub const KEPT_MS: u64 = 2 * 86_400_000;
@@ -306,6 +312,12 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> R
             job.taken = true;
             put_json(store, &key, &job).await?;
             return Ok(ok(json!({ "messageId": 1, "messageType": "PipelineAgentJobRequest", "body": job.message.to_string() })))
+        }
+        // Its run cancelled: the runner is told as GitHub tells it, and it stops the job's steps (the job ends cancelled).
+        if job.cancel && !job.cancel_told {
+            job.cancel_told = true;
+            put_json(store, &key, &job).await?;
+            return Ok(ok(json!({ "messageId": 2, "messageType": "JobCancellation", "body": json!({ "jobId": job.message["jobId"], "timeout": CANCEL_GRACE }).to_string() })))
         }
         Response::new(204, "application/json", "").with_header("x-superci-hold", &HOLD_MS.to_string())
     } else if p.contains("/AgentRequest/") {

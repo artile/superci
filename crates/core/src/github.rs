@@ -305,6 +305,11 @@ pub async fn rerun_job(http: &dyn Http, api: &str, token: &str, repo: &str, job_
     gh(http, api, "POST", &format!("/repos/{repo}/actions/jobs/{job_id}/rerun"), Some(token), Some(serde_json::json!({}))).await.map(|_| ())
 }
 
+/// A workflow run cancelled, as its Cancel button does (its jobs' runners are told to stop; those not started end).
+pub async fn cancel_run(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64) -> Result<()> {
+    gh(http, api, "POST", &format!("/repos/{repo}/actions/runs/{run_id}/cancel"), Some(token), Some(serde_json::json!({}))).await.map(|_| ())
+}
+
 /// Runs a finished run's failed jobs again (and the jobs that depend on them), as one new attempt: for a run with
 /// several jobs to run again (GitHub takes one request per attempt).
 pub async fn rerun_failed_jobs(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64) -> Result<()> {

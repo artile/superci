@@ -3196,6 +3196,17 @@ impl Dashboard {
                 self.shown(&plane, |s| s["routing"] == want)?;
                 Ok(Response::redirect(if field("action").starts_with("public") || field("action").starts_with("cache") || ["max_cpu", "max_hours"].contains(&field("action").as_str()) { "/?p=settings" } else { "/?p=runners" }))
             }
+            // A run cancelled (see `superci runs cancel`), then its page again.
+            ("POST", "/run/cancel") => {
+                let plane = self.plane()?;
+                let id = field("id");
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return Ok(message(400, "Which run?", "")) }
+                let got = cloudflare::plane_post(plane.url(), self.key(), &format!("/runs/{id}/cancel"), &serde_json::json!({}))?;
+                if let Some(e) = got["error"].as_str() { return Ok(message(400, "The run was not cancelled", &esc(e))) }
+                let repo: String = url::form_urlencoded::byte_serialize(field("repo").as_bytes()).collect();
+                let attempt: u64 = field("attempt").parse().unwrap_or(0);
+                Ok(Response::redirect(&format!("/?p=run&repo={repo}&id={id}&attempt={attempt}")))
+            }
             // A repository's cache entries taken out (all of them, or one key's).
             ("POST", "/caches/delete") => {
                 let plane = self.plane()?;
@@ -4023,6 +4034,11 @@ mark();load()})();</script>"#;
             row("Last to end", esc(run_last(&r).trim_start_matches("Last to end: "))),
         ].concat();
         let going = kind == "accent";
+        // While it runs: Cancel, as GitHub's does (a run of GitHub's, cancelled by GitHub; one from a computer, here).
+        let at = if going && r["provider"] != "gitlab" {
+            format!(r#"{at}<form method="post" action="/run/cancel"><input type="hidden" name="id" value="{}"><input type="hidden" name="repo" value="{}"><input type="hidden" name="attempt" value="{}"><button class="button secondary sm">Cancel run</button></form>"#,
+                r["id"], esc(r["repo"].as_str().unwrap_or_default()), r["attempt"].as_u64().unwrap_or(0))
+        } else { at };
         // A run from a computer's artifacts (a run of GitHub's keeps its own at GitHub), each a download.
         let artifacts = if !link.is_empty() { String::new() } else {
             let listed = cloudflare::plane_get(v.plane.url(), &self.status_key, &format!("/runs/{}/artifacts", r["id"])).ok();

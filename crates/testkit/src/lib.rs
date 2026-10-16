@@ -373,7 +373,9 @@ impl Runner {
         let token = r["jobs"].as_array()?.iter().find_map(|j| j["token"].as_str())?.to_string();
         Some(Runner { at: format!("{}/runner/{token}/_apis/v1", served.url) })
     }
-    fn post(&self, path: &str, body: Vec<u8>) -> u16 {
+    fn post(&self, path: &str, body: Vec<u8>) -> u16 { self.exchange(path, body).0 }
+    /// A call and what it answered: its status and its body.
+    fn exchange(&self, path: &str, body: Vec<u8>) -> (u16, String) {
         let u = self.at.trim_start_matches("http://");
         let (host, rest) = u.split_once('/').unwrap();
         let mut s = TcpStream::connect(host).unwrap();
@@ -381,10 +383,16 @@ impl Runner {
         s.write_all(&body).unwrap();
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
-        out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0)
+        (out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0), out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
     }
     /// It takes the job (asks for its message, as a runner does once it listens).
     pub fn take(&self) -> u16 { self.post("/Message/1", Vec::new()) }
+    /// It asks for its next message, as a runner keeps doing while it runs its job: none (204), or one, as it came
+    /// (`messageType`, and its `body`).
+    pub fn message(&self) -> (u16, Value) {
+        let (status, body) = self.exchange("/Message/1", Vec::new());
+        (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
     /// Each step's record: (id, name, order, state, result, its log's number).
     pub fn steps(&self, steps: &[(&str, &str, u64, &str, Option<&str>, Option<u64>)]) -> u16 {
         let value: Vec<Value> = steps.iter().map(|(id, name, order, state, result, log)| json!({ "id": id, "type": "Task", "name": name, "order": order, "state": state, "result": result,

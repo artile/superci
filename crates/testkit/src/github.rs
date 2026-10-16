@@ -212,6 +212,12 @@ impl GitHub {
             // Its repository, runs and jobs (in the shape recorded).
             ("GET", ["repos", o, n]) if format!("{o}/{n}") == REPO => { drop(h); ok(200, self.repo()) }
             ("GET", ["repos", o, n, "actions", "jobs", id]) if format!("{o}/{n}") == REPO => h.jobs.get(&id.parse().ok()?).cloned().map(|j| Response::new(200, "application/json", j.to_string())),
+            // A run cancelled, as its Cancel button does: GitHub accepts it (its jobs end as `cancel` then says).
+            ("POST", ["repos", o, n, "actions", "runs", run, "cancel"]) if format!("{o}/{n}") == REPO => {
+                let run: u64 = run.parse().ok()?;
+                if !h.jobs.values().any(|j| j["run_id"] == run) { return ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/actions/workflow-runs#cancel-a-workflow-run", "status": "404" })) }
+                ok(202, json!({}))
+            }
             ("GET", ["repos", o, n, "actions", "runs", run, "logs"] | ["repos", o, n, "actions", "runs", run, "attempts", _, "logs"]) if format!("{o}/{n}") == REPO => {
                 let run: u64 = run.parse().ok()?;
                 if !h.run_logs.contains_key(&run) { return ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/actions/workflow-runs#download-workflow-run-attempt-logs", "status": "404" })) }

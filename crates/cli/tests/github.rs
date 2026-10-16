@@ -271,3 +271,27 @@ fn a_jobs_steps_run_side_by_side_show_their_own_lines_once_its_run_has_ended() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_github_run_is_cancelled_from_the_cli_by_github_and_its_running_jobs_machine_ends() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
+    let run = served.github.job(id)["run_id"].as_u64().unwrap().to_string();
+    // Cancelled from the CLI: GitHub is asked, with the App's token for its repository.
+    let o = superci(&home, &["runs", "cancel", &run]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains(&format!("GitHub cancels run {run}")), "{said}");
+    assert!(served.github.asked.lock().unwrap().iter().any(|a| a == &format!("POST https://api.github.com/repos/acme/app/actions/runs/{run}/cancel")), "{:?}", served.github.asked.lock().unwrap());
+    // GitHub stops its runner's job and says so: its machine is ended.
+    assert_eq!(served.webhook(served.github.cancel(id, served.now_ms())), 202);
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(job["ended_ms"].is_u64() && job["conclusion"] == "cancelled", "{job}");
+    // A run nobody here knows: said so.
+    let o = superci(&home, &["runs", "cancel", "12345"]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("No run 12345 here"), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&home);
+}
