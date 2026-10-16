@@ -689,3 +689,45 @@ fn with_two_live_control_planes_a_command_or_a_change_says_which_one_it_is_for()
     assert!(status == 404 && common::words(&said).contains("That control plane is not known here"), "{status}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn workspaces_are_listed_made_renamed_and_forgotten_from_the_cli() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let text = |args: &[&str]| { let o = superci(&home, args); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (ok, said) = text(&["workspaces", "list"]);
+    assert!(ok && said.contains("default") && said.contains("AWS · 111111111111 · us-east-1"), "{said}");
+    // Made (as a dry run first): empty, its id from its name; a second of that id refused.
+    let (code, v) = json(&home, &["workspaces", "create", "Acme", "CI", "--dry-run"]);
+    assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains("make an empty workspace called Acme CI, with the id acme-ci"), "{v}");
+    assert!(!home.join("workspaces/acme-ci").exists());
+    let (ok, said) = text(&["workspaces", "create", "Acme", "CI"]);
+    assert!(ok && said.contains("The workspace Acme CI is made, with nothing in it yet. Its id is acme-ci."), "{said}");
+    let (ok, said) = text(&["workspaces", "create", "Acme", "CI"]);
+    assert!(!ok && said.contains("There is a workspace with the id acme-ci already"), "{said}");
+    let (_, said) = text(&["workspaces", "list"]);
+    assert!(said.contains("acme-ci") && said.contains("nothing set up yet"), "{said}");
+    // Given another id (a dry run first); one not here refused.
+    let (code, v) = json(&home, &["workspaces", "update", "acme-ci", "--id=acme", "--dry-run"]);
+    assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains("give the workspace acme-ci the id acme"), "{v}");
+    let (ok, said) = text(&["workspaces", "update", "acme-ci", "--id=acme"]);
+    assert!(ok && said.contains("The workspace acme-ci has the id acme now.") && home.join("workspaces/acme").exists(), "{said}");
+    let (ok, _) = text(&["workspaces", "update", "nowhere", "--id=x2"]);
+    assert!(!ok);
+    // Forgotten (a dry run first, and only with --confirm): signed out, nothing in its clouds deleted.
+    let (code, v) = json(&home, &["workspaces", "delete", "acme", "--confirm", "--dry-run"]);
+    assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains("sign the workspace acme out and forget it on this machine"), "{v}");
+    let (ok, said) = text(&["workspaces", "delete", "acme"]);
+    assert!(!ok && said.contains("--confirm"), "{said}");
+    let (ok, said) = text(&["workspaces", "delete", "acme", "--confirm"]);
+    assert!(ok && said.contains("The workspace acme is forgotten on this machine.") && !home.join("workspaces/acme").exists(), "{said}");
+    // The one with a control plane: its key leaves the control plane as it is signed out.
+    let keys = || served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| k.starts_with("DASHBOARD_KEY_")).count();
+    let before = keys();
+    let (ok, said) = text(&["workspaces", "delete", "default", "--confirm"]);
+    assert!(ok && said.contains("The workspace default is forgotten"), "{said}");
+    assert!(keys() < before, "its key gone from the control plane");
+    let (ok, said) = text(&["workspaces", "list"]);
+    assert!(ok && said.contains("None yet"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
