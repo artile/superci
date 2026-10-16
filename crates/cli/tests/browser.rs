@@ -350,3 +350,67 @@ fn a_workspace_is_made_from_the_switcher_switched_to_and_removed_from_its_settin
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Its own AWS account runs jobs (signed in to it here), with Cloudflare's containers.
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    let routing = || setting("ROUTING").and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok()).unwrap_or_default();
+    let runners = |b: &mut Browser| { b.goto(&format!("{link}&p=runners")); b.wait(&format!("{} && !document.body.classList.contains('busy')", shows("Clouds"))); };
+    runners(&mut b);
+
+    // The AWS account's budget in AWS: it needs the monthly limit, and an email address that is one.
+    b.click(r#"button[aria-label="AWS account 111111111111 limits"]"#, "");
+    b.wait("document.getElementById('limit-aws').open");
+    b.eval("document.querySelector('#limit-aws select[name=budget]').value = 'emails'");
+    b.click("#limit-aws button.primary", "Save");
+    b.wait("document.body.innerText.includes('A budget in AWS needs the monthly limit')");
+    // (The page's own field refuses an address that is none before it is sent; the dashboard checks it again.)
+    runners(&mut b);
+    assert_eq!(b.eval("document.querySelector('#limit-aws input[name=email]').type"), serde_json::json!("email"));
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails"), ("email", "not an address")]);
+    assert!(status == 400 && common::words(&said).contains("That is no email address"), "{status} {}", common::words(&said));
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "lift")]);
+    assert!(status == 400 && common::words(&said).contains("There is no budget in AWS to lift"), "{status} {}", common::words(&said));
+    assert!(routing().get("account_usd").is_none() && routing().get("aws_budget").is_none(), "{}", routing());
+
+    // Cloudflare's image, under Clouds: an address that is https and plain, else said.
+    runners(&mut b);
+    b.click(r#"button[aria-label="Cloudflare account settings"]"#, "");
+    b.wait("[...document.querySelectorAll('dialog')].some(d => d.open && d.querySelector('input[name=image]'))");
+    b.eval("(() => { const d = [...document.querySelectorAll('dialog')].find(d => d.open); d.querySelector('input[name=image]').type = 'text'; d.querySelector('input[name=image]').value = 'ftp://images.example.com/full'; d.querySelector('button.primary').click(); })()");
+    b.wait("document.body.innerText.includes('https://')");
+    assert_eq!(setting("CF_IMAGE"), None);
+    runners(&mut b);
+    b.click(r#"button[aria-label="Cloudflare account settings"]"#, "");
+    b.wait("[...document.querySelectorAll('dialog')].some(d => d.open && d.querySelector('input[name=image]'))");
+    b.eval("(() => { const d = [...document.querySelectorAll('dialog')].find(d => d.open); d.querySelector('input[name=image]').value = 'https://images.example.com/full'; d.querySelector('button.primary').click(); })()");
+    until("Cloudflare's image", || setting("CF_IMAGE").as_deref() == Some("https://images.example.com/full"));
+
+    // Your own network, under the AWS account: what it says is checked as it is written.
+    runners(&mut b);
+    b.click(r#"button[aria-label="AWS account 111111111111 settings"]"#, "");
+    b.wait("[...document.querySelectorAll('dialog')].some(d => d.open && d.querySelector('textarea[name=networks]'))");
+    b.eval("(() => { const d = [...document.querySelectorAll('dialog')].find(d => d.open); d.querySelector('textarea[name=networks]').value = 'us-east-1 not-a-subnet'; d.querySelector('button.primary').click(); })()");
+    b.wait("document.body.innerText.includes('Check your networks')");
+    assert_eq!(setting("AWS_NETWORKS"), None);
+
+    // A new order: each provider once, and only ones it has (as a page made up would say).
+    for fields in [&[("action", "order"), ("cloud_0", "aws"), ("cloud_1", "aws")][..], &[("action", "order"), ("cloud_0", "nowhere")]] {
+        let (status, _, said) = common::post(&link, "/routing", fields);
+        assert!(status == 400 && common::words(&said).contains("Unknown provider"), "{fields:?}: {status}");
+    }
+    // The default machine: Windows only on x64.
+    let (status, _, said) = common::post(&link, "/machine", &[("os", "windows"), ("arch", "arm64")]);
+    assert!(status == 400 && common::words(&said).contains("Windows machines are x64"), "{status} {}", common::words(&said));
+    assert_eq!(setting("MACHINE"), None);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
