@@ -209,7 +209,8 @@ inputs:
         SUPERCI_PATH: ${{{{ inputs.path }}}}
         SUPERCI_REPOSITORY: ${{{{ inputs.repository }}}}
       run: |
-        set -euo pipefail
+        set -Eeuo pipefail
+        trap 'echo "::error::The checkout stopped at its line $LINENO ($BASH_COMMAND), with status $?."' ERR
         if [ -n "$SUPERCI_REPOSITORY" ] && [ "$SUPERCI_REPOSITORY" != "$GITHUB_REPOSITORY" ]; then echo "::error::A run from a computer has its own working tree only; $SUPERCI_REPOSITORY is not checked out here."; exit 1; fi
         dir="$GITHUB_WORKSPACE/$SUPERCI_PATH"; mkdir -p "$dir"; cd "$dir"
         {fetch}
@@ -483,7 +484,8 @@ mod tests {
         let whole = (0..40).all(|n| std::fs::read_to_string(work.join(format!("file-{n}.txt"))).is_ok_and(|t| t == format!("{n} ").repeat(2000)));
         let left = std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.status.success() && whole, "{said}");
+        assert!(out.status.success() && whole, "{:?}, whole: {whole}\n{said}", out.status);
+        assert!(!said.contains("The checkout stopped"), "{said}");
         assert!(said.contains("Part 1: asked again (1; curl error 18)") && said.contains("Part 2: waiting for the computer to finish sending it") && !said.contains("Part 2: asked again") && said.contains("Part 0: ") && said.contains("The working tree: fetched in ") && said.contains("The working tree as it was on the computer: 40 files"), "{said}");
         assert_eq!(left, 0, "the parts are gone once unpacked");
     }
