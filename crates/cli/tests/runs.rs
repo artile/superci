@@ -602,6 +602,42 @@ fn a_job_whose_spot_machine_aws_took_back_is_started_again_off_spot_and_the_run_
 }
 
 #[test]
+fn a_job_taken_back_that_succeeded_anyway_is_not_started_again_nor_one_started_again_already() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let interrupted = |served: &superci_testkit::Served, job: &str| { let mut m = served.store.0.lock().unwrap(); let mut j: serde_json::Value = serde_json::from_str(&m[job]).unwrap(); j["interrupted"] = true.into(); m.insert(job.to_string(), j.to_string()); };
+    let jobs_of = |served: &superci_testkit::Served, run: &str| served.store.under("job:").into_iter().filter(|(_, j)| j["run_id"].as_u64().is_some_and(|r| r.to_string() == run)).map(|(k, _)| k).collect::<Vec<_>>();
+    // Its machine taken back, but the job had succeeded: the run is over, a success, with that one job.
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+    let run = run_of(&served);
+    let first = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    first.take();
+    interrupted(&served, &jobs_of(&served, &run)[0]);
+    first.finish("succeeded");
+    let said = String::from_utf8_lossy(&cli.wait_with_output().unwrap().stdout).into_owned();
+    assert!(said.contains("The run ended: success") && jobs_of(&served, &run).len() == 1, "{said}");
+    // Started again off spot once, and taken back again (an on-demand machine is not, but its record may say so): it
+    // fails, not a third time.
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+    let second = loop { if let Some((k, _)) = served.store.under("run:").into_iter().find(|(k, _)| *k != format!("run:{run}")) { break k.trim_start_matches("run:").to_string() } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &second) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    runner.take();
+    interrupted(&served, &jobs_of(&served, &second)[0]);
+    runner.finish("failed");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while jobs_of(&served, &second).len() < 2 { assert!(std::time::Instant::now() < end, "not started again"); std::thread::sleep(std::time::Duration::from_millis(50)) }
+    let again = loop { if let Some(r) = Runner::of_run(&served, &second) { if r.at != runner.at { break r } } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    again.take();
+    let off_spot = jobs_of(&served, &second).into_iter().find(|k| served.store.under(k)[0].1["no_spot"] == true).unwrap();
+    interrupted(&served, &off_spot);
+    again.finish("failed");
+    let out = cli.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("The run ended: failure") && jobs_of(&served, &second).len() == 2, "{} jobs; {}\n{said}", jobs_of(&served, &second).len(), served.store.under(&format!("run:{second}"))[0].1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_run_from_a_computer_is_cancelled_its_running_job_told_to_stop_the_job_waiting_for_it_never_started_and_an_always_job_runs() {
     let served = serve(|_| {});
     let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: sleep 600\n  after:\n    needs: build\n    runs-on: superci\n    steps:\n      - run: echo after\n  report:\n    needs: build\n    if: always()\n    runs-on: superci\n    steps:\n      - run: echo report\n")]);

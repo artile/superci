@@ -26,12 +26,13 @@ impl Store for Mem {
 }
 
 #[derive(Default)]
-struct FakeClouds { calls: RefCell<Vec<(String, String, String)>> }
+struct FakeClouds { calls: RefCell<Vec<(String, String, String)>>, headers: RefCell<Vec<(String, Vec<(String, String)>)>> }
 #[async_trait(?Send)]
 impl Http for FakeClouds {
     async fn send(&self, r: Request) -> io::Result<Response> {
         let body = String::from_utf8_lossy(&r.body).to_string();
         self.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body.clone()));
+        self.headers.borrow_mut().push((r.url.clone(), r.headers.clone()));
         let json = |v: serde_json::Value| Ok(Response::new(201, "application/json", v.to_string()));
         let xml = |s: &str| Ok(Response::new(200, "text/xml", s.to_string()));
         let u = r.url.as_str();
@@ -174,6 +175,9 @@ fn aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines() {
     // The stack's report: the token, this control plane's own role, the chosen region; accepted once.
     assert_eq!(run(report("forged", &role)).status, 403);
     assert_eq!(run(report("connect-token-0001", "arn:aws:iam::123456789012:role/someone-elses")).status, 400);
+    // An account that is not twelve digits, or another region than the connection's: refused alike.
+    let said = |account: &str, region: &str| { let mut b = serde_json::json!({ "token": "connect-token-0001", "accountId": account, "region": region, "roleArn": role_arn(account, PLANE_ID) }); if account.is_empty() { b["roleArn"] = role.clone().into() } run(Request::new("POST", &format!("{PLANE_URL}/aws/callback")).with_header("content-type", "application/json").with_body(b.to_string())).status };
+    assert_eq!((said("12345678901", "us-east-1"), said("12345678901x", "us-east-1"), said("123456789012", "eu-west-1")), (400, 400, 400));
     let ok = run(report("connect-token-0001", &role));
     assert_eq!((ok.status, json(&ok)["connected"].as_bool()), (200, Some(true)));
     assert_eq!(run(report("connect-token-0001", &role)).status, 409, "the token works once");
@@ -409,14 +413,63 @@ fn moving_hands_everything_to_the_new_control_plane_once_and_the_old_one_says_wh
     let sig = late.header("x-hub-signature-256").map(str::to_string);
     let mut forwarded = late.clone();
     forwarded.url = format!("{PLANE_URL}/webhook");
-    block_on(old.handle(forwarded));
+    // (With what a proxy on the way adds, and GitHub's own headers.)
+    for (k, v) in [("content-type", "application/json"), ("user-agent", "GitHub-Hookshot/1a2b3c"), ("x-github-delivery", "d-1"), ("x-gitlab-instance", "https://gitlab.example"), ("x-forwarded-for", "203.0.113.9"), ("authorization", "Bearer someone-else")] {
+        forwarded = forwarded.with_header(k, v);
+    }
+    block_on(old.handle(forwarded.clone()));
     let passed = clouds.calls.borrow().iter().rev().find(|c| c.1 == format!("{NEW_URL}/webhook")).cloned().expect("passed on");
     assert_eq!(passed.2, String::from_utf8(late.body.clone()).unwrap());
     assert!(sig.is_some());
+    // GitHub's and GitLab's headers go on with it, its type and who sent it; nothing else.
+    let sent: Vec<String> = clouds.headers.borrow().iter().rev().find(|(u, _)| *u == format!("{NEW_URL}/webhook")).map(|(_, h)| h.iter().map(|(k, _)| k.clone()).collect()).unwrap();
+    for k in ["x-hub-signature-256", "x-github-event", "x-github-delivery", "x-gitlab-instance", "content-type", "user-agent"] { assert!(sent.iter().any(|s| s == k), "{k} in {sent:?}") }
+    assert!(!sent.iter().any(|s| s == "x-forwarded-for" || s == "authorization"), "{sent:?}");
+    // One not signed by GitHub is not passed on.
+    let before = clouds.calls.borrow().len();
+    let mut forged = forwarded.clone();
+    forged.headers.retain(|(k, _)| k != "x-hub-signature-256");
+    forged = forged.with_header("x-hub-signature-256", "sha256=00");
+    assert_eq!(block_on(old.handle(forged)).status, 401);
+    assert_eq!(clouds.calls.borrow().len(), before);
     assert!(new_store.0.borrow().contains_key("job:41"), "the history came along");
     // And back: the old one, claimed again, is in use again.
     call(&old, PLANE_URL, "/move/claim", None, serde_json::json!({ "from": NEW_URL }));
     assert!(json(&block_on(old.handle(get("/health")))).get("moved_to").is_none());
+}
+
+/// The fake clouds, with every machine refused for `code` (as EC2 says it, in its XML).
+struct Refusing { clouds: FakeClouds, code: &'static str }
+#[async_trait(?Send)]
+impl Http for Refusing {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        let body = String::from_utf8_lossy(&r.body).to_string();
+        if body.contains("Action=RunInstances") || body.contains("Action=CreateFleet") {
+            self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body));
+            return Ok(Response::new(400, "text/xml", format!("<Response><Errors><Error><Code>{}</Code><Message>gone</Message></Error></Errors></Response>", self.code)));
+        }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn a_network_or_an_image_aws_says_is_gone_is_looked_up_anew_for_the_next_job() {
+    for (code, action, anew) in [("InvalidSubnetID.NotFound", "Action=DescribeVpcs", true), ("InvalidGroup.NotFound", "Action=DescribeVpcs", true), ("InvalidSecurityGroupID.NotFound", "Action=DescribeVpcs", true),
+        ("InvalidAMIID.NotFound", "Action=DescribeImages", true), ("InvalidAMIID.NotFound", "Action=DescribeVpcs", false), ("Unsupported", "Action=DescribeVpcs", false), ("Unsupported", "Action=DescribeImages", false)] {
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let http = Refusing { clouds: FakeClouds::default(), code };
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        let asked = || http.clouds.calls.borrow().iter().filter(|c| c.2.contains(action)).count();
+        block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+        let first = asked();
+        assert!(first > 0, "{code}: {action} asked for the first job: {:?}", http.clouds.calls.borrow().iter().map(|c| c.2.split('&').next().unwrap_or_default().to_string()).collect::<Vec<_>>());
+        block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
+        // (Anything else AWS refuses for: what was looked up stays, for a while.)
+        assert_eq!(asked() > first, anew, "{code}: {action} asked anew for the next job: {anew}");
+    }
 }
 
 #[derive(Default)]
@@ -2638,6 +2691,25 @@ fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself()
     let text = kept["log"].as_str().unwrap();
     assert!(text.starts_with("[2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()\n... 30 s ...\n[2026-10-13 22:56:41Z WARN") && !text.contains('\u{7}') && text.len() < 16_100 && text.lines().all(|l| l.len() <= 300), "{text}");
     assert_eq!(kept["listening_ms"], 1_790_000_011_000u64, "what it said before stays");
+}
+
+#[test]
+fn a_job_waits_for_a_spot_machine_only_when_on_demand_was_refused_for_the_limit_alone_and_spot_was_asked() {
+    // Spot has no machine; on-demand is refused for `on_demand` (the account's limit, or AWS's capacity).
+    for (label, on_demand, waits) in [("superci", "VcpuLimitExceeded", true), ("superci", "InsufficientInstanceCapacity", false), ("superci/spot=false", "VcpuLimitExceeded", false)] {
+        let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+            if !body.contains("Action=RunInstances") { return None }
+            Some(aws_refuses(if body.contains("MarketType=spot") { "InsufficientInstanceCapacity" } else { on_demand }))
+        });
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(labelled("queued", 9, "acme/app", None, label)));
+        let e = job(&store, 9)["error"].as_str().unwrap_or_default().to_string();
+        assert_eq!(e.starts_with("waiting: AWS has no spot machine for it now, and your AWS account's on-demand limit"), waits, "{label}, on-demand {on_demand}: {e}");
+    }
 }
 
 #[test]
