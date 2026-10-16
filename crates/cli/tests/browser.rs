@@ -129,7 +129,8 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     b.click("#pool-0 button.primary", "Save");
     until("the provider's limits", || pool()["max_jobs"] == 5 && pool()["monthly_usd"] == 30.0);
     until("its location", || setting("CF_LOCATION").as_deref() == Some("weur"));
-    b.wait(&shows("Runner providers"));
+    // (Once the page shows what was saved: a dialog opened before it is drawn anew would go with the old page.)
+    b.wait(&format!("{} && !document.body.classList.contains('busy')", shows("5 at once")));
     b.click(r#"button[aria-label="Cloudflare settings"]"#, "");
     b.wait("document.getElementById('pool-0').open");
     assert_eq!(b.eval("[document.querySelector('#pool-0 input[name=max]').value, document.querySelector('#pool-0 input[name=usd]').value, document.querySelector('#pool-0 select[name=location]').value]"), serde_json::json!(["5", "30", "weur"]));
@@ -185,7 +186,7 @@ fn a_runner_provider_is_taken_out_of_the_order_and_put_back_and_awss_on_demand_m
     b.fill("#pool-2 input[name=max]", "3");
     b.click("#pool-2 button.primary", "Save");
     until("on-demand's limit and regions", || order().as_array().is_some_and(|o| o.iter().any(|p| p["cloud"] == "aws-on-demand" && p["max_jobs"] == 3 && p["regions"] == serde_json::json!(["us-east-1"]))));
-    b.wait(&shows("Runner providers"));
+    b.wait(&format!("{} && !document.body.classList.contains('busy')", shows("3 at once")));
     // Taken out from its dialog: out of the order, said below it; nothing deleted.
     b.click(r#"button[aria-label="AWS on-demand settings"]"#, "");
     b.wait("document.getElementById('pool-2').open");
