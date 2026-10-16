@@ -1581,6 +1581,8 @@ version = "0.19.7"
 dependencies = [
  "getrandom",
  "serde_json",
+ "superci-core",
+ "superci-testkit",
  "ureq",
 ]
 

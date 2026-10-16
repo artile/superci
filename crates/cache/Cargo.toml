@@ -18,3 +18,5 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+superci-core = { path = "../core" }
+superci-testkit = { path = "../testkit" }

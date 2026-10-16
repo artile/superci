@@ -209,7 +209,16 @@ impl GitHub {
             return Some(match r.method.as_str() {
                 "PUT" => { h.objects.insert(key, r.body.clone()); Response::new(200, "application/xml", "") }
                 "HEAD" => if h.objects.contains_key(&key) { Response::new(200, "application/octet-stream", "") } else { Response::new(404, "application/xml", "") },
-                "GET" => h.objects.get(&key).map(|b| Response::new(200, "application/octet-stream", b.clone())).unwrap_or_else(missing),
+                // (A range of it, as S3 answers one: 206 with those bytes.)
+                "GET" => match (h.objects.get(&key), r.header("range").and_then(|v| v.strip_prefix("bytes=")).and_then(|v| v.split_once('-'))) {
+                    (Some(b), Some((from, to))) => {
+                        let from = from.parse::<usize>().unwrap_or(0).min(b.len());
+                        let to = to.parse::<usize>().map(|t| t + 1).unwrap_or(b.len()).clamp(from, b.len());
+                        Response::new(206, "application/octet-stream", b[from..to].to_vec()).with_header("content-range", &format!("bytes {from}-{}/{}", to.saturating_sub(1), b.len()))
+                    }
+                    (Some(b), None) => Response::new(200, "application/octet-stream", b.clone()),
+                    (None, _) => missing(),
+                },
                 "DELETE" => { h.objects.remove(&key); Response::new(204, "application/xml", "") }
                 _ => return None,
             })

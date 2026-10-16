@@ -637,7 +637,7 @@ impl State {
         for attempt in 0..4 {
             if attempt > 0 { std::thread::sleep(Duration::from_millis(500 * attempt)) }
             debug(&format!("put {} bytes to {}", body.len(), link.split('?').next().unwrap_or_default()));
-            match self.agent.put(link).send(body) {
+            match self.agent.put(&stand_in(link)).send(body) {
                 Ok(r) if r.status().is_success() => return Ok(()),
                 Ok(r) => last = format!("the bucket said {}: {}", r.status(), r.into_body().read_to_string().unwrap_or_default().chars().take(200).collect::<String>()),
                 Err(e) => last = e.to_string(),
@@ -790,12 +790,21 @@ impl Read for Parallel {
     }
 }
 
+/// A link to the bucket, or (in a debug build with `SUPERCI_STAND_IN`, as the CLI's) the test kit's stand-in for it.
+fn stand_in(link: &str) -> String {
+    #[cfg(debug_assertions)]
+    if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
+        if let Some(rest) = link.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com"))) { return format!("{}/{rest}", at.trim_end_matches('/')) }
+    }
+    link.to_string()
+}
+
 /// One part of a piece, by its range; tried four times.
 fn fetch(agent: &ureq::Agent, (link, at, len): &(String, u64, u64)) -> Result<Vec<u8>, String> {
     let mut last = String::new();
     for attempt in 0..4 {
         if attempt > 0 { std::thread::sleep(Duration::from_millis(300 * attempt)) }
-        match agent.get(link).header("range", &format!("bytes={at}-{}", at + len - 1)).call() {
+        match agent.get(&stand_in(link)).header("range", &format!("bytes={at}-{}", at + len - 1)).call() {
             Ok(r) if r.status().as_u16() == 206 || (r.status().as_u16() == 200 && *at == 0) => {
                 let mut body = Vec::with_capacity(*len as usize);
                 match r.into_body().into_reader().take(*len).read_to_end(&mut body) {
