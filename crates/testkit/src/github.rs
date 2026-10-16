@@ -42,7 +42,8 @@ struct Hub {
 }
 
 #[derive(Clone, Default)]
-pub struct GitHub { hub: Arc<Mutex<Hub>>, pub asked: Arc<Mutex<Vec<String>>>, pub unanswered: Arc<Mutex<Vec<String>>>, /** gitlab.com, beside it. */ pub gitlab: crate::GitLab }
+pub struct GitHub { hub: Arc<Mutex<Hub>>, pub asked: Arc<Mutex<Vec<String>>>, pub unanswered: Arc<Mutex<Vec<String>>>, /** gitlab.com, beside it. */ pub gitlab: crate::GitLab,
+    /** AWS's stand-in, for what a control plane asks of AWS (but S3, kept here). */ pub aws: Arc<Mutex<Option<crate::Aws>>> }
 
 fn fixture(name: &str) -> Value {
     serde_json::from_str(match name {
@@ -246,6 +247,20 @@ impl GitHub {
         if url.host_str() == Some("token.actions.githubusercontent.com") && path == "/.well-known/jwks" {
             self.hub.lock().unwrap().jwks_asked += 1;
             return ok(200, Self::job_keys())
+        }
+        // STS, a control plane assuming the role it was given (as AWS's documentation answers it; no recording has
+        // a control plane's own call): credentials for an hour.
+        if url.host_str().is_some_and(|h| h.starts_with("sts.") && h.ends_with(".amazonaws.com")) && (r.url.contains("Action=AssumeRoleWithWebIdentity") || String::from_utf8_lossy(&r.body).contains("Action=AssumeRoleWithWebIdentity")) {
+            return Some(Response::new(200, "text/xml", "<AssumeRoleWithWebIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>ASIAEXAMPLEPLANE0001</AccessKeyId><SecretAccessKey>example-secret</SecretAccessKey><SessionToken>example-session-token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials><AssumedRoleUser><Arn>arn:aws:sts::111111111111:assumed-role/superci-plane/plane</Arn><AssumedRoleId>AROAEXAMPLE:plane</AssumedRoleId></AssumedRoleUser></AssumeRoleWithWebIdentityResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000000</RequestId></ResponseMetadata></AssumeRoleWithWebIdentityResponse>"))
+        }
+        // The rest of AWS: as AWS's stand-in answers the CLI (its recordings, SSM kept).
+        if let (Some(h), Some(aws)) = (url.host_str().filter(|h| h.ends_with(".amazonaws.com")), self.aws.lock().unwrap().clone()) {
+            let _ = h;
+            let target = r.header("x-amz-target").unwrap_or_default().to_string();
+            let (status, headers, answer) = aws.handle_full(&r.method, &r.url, &target, &String::from_utf8_lossy(&r.body));
+            let mut res = Response::new(status, if answer.starts_with('<') { "text/xml" } else { "application/x-amz-json-1.1" }, answer);
+            for (k, v) in headers { res = res.with_header(&k, &v) }
+            return Some(res)
         }
         if url.host_str() != Some("api.github.com") { return None }
         let permissions = json!({ "actions": "write", "metadata": "read", "organization_self_hosted_runners": "write" });

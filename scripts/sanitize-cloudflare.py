@@ -6,11 +6,11 @@
 As `sanitize-recording.py`, and for Cloudflare: the account's id and name, its workers.dev subdomain (each given with
 -r), every other 32-hex id (namespaces, tags, etags) by a stand-in, the secrets written to a Worker and the container
 registry's credentials blanked, and Workers that are not a control plane's or a runner agent's left out of a listing.
-Modal's calls in the same recording (protobuf, in base64) get only the replacements of the same length (as in
+AWS's calls in the same recording are sanitized as `sanitize-recording.py` does, SSM's left out. Modal's calls (protobuf, in base64) get only the replacements of the same length (as in
 `sanitize-modal.py`; one of another length found there stops it), and Modal's session token is blanked.
 Look through the result before keeping it.
 """
-import json, re, sys, base64, importlib.util
+import json, re, sys, base64, urllib.parse, importlib.util
 
 spec = importlib.util.spec_from_file_location("aws_sanitize", __file__.replace("sanitize-cloudflare.py", "sanitize-recording.py"))
 aws_sanitize = importlib.util.module_from_spec(spec)
@@ -64,6 +64,15 @@ def main():
         with open(f"{out}/{name}.jsonl", "w") as to:
             for line in open(path):
                 x = json.loads(line)
+                # (AWS in the same recording: SSM is the test kit's own, and an answer read with decryption is never
+                # kept; an upload, a function's code say, by its size only.)
+                if x.get("target", "").startswith("AmazonSSM."):
+                    continue
+                # (A listing of the account's roles: only SuperCI's and AWS's own service roles stay.)
+                if "Action=ListRoles" in x.get("asked", "") + x["url"]:
+                    x["answer"] = re.sub(r"<member>(?:(?!</member>).)*</member>", lambda m: m.group(0) if re.search(r"<RoleName>(superci-plane-|AWSServiceRoleFor)", m.group(0)) else "", x["answer"], flags=re.S)
+                if len(x.get("asked", "")) > 100_000:
+                    x["asked"] = f"({len(x['asked'])} bytes)"
                 if "api.modal.com" in x["url"]:
                     answer = json.loads(x["answer"])
                     if x["url"].endswith("/AuthTokenGet") and "answers" in answer:
@@ -87,10 +96,13 @@ def main():
                 x = tidy(x)
                 for k in ("url", "target", "asked", "answer"):
                     for real, stand_in in more:
-                        x[k] = x[k].replace(real, stand_in)
+                        # (As it is, and URL-encoded, as a form or a query carries it.)
+                        x[k] = x[k].replace(real, stand_in).replace(urllib.parse.quote(real, safe=""), urllib.parse.quote(stand_in, safe="")).replace(urllib.parse.quote_plus(real), urllib.parse.quote_plus(stand_in))
                     x[k] = aws_sanitize.sanitize(x[k], of)
                     x[k] = re.sub(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])", lambda m: m.group(0) if set(m.group(0)) <= set("1a") else of("hex32", m.group(0), lambda n: f"{n:032x}"), x[k])
                 for h in x.get("headers", []):
+                    for real, stand_in in more:
+                        h[1] = h[1].replace(real, stand_in)
                     h[1] = aws_sanitize.sanitize(h[1], of)
                 to.write(json.dumps(x, separators=(",", ":"), sort_keys=True) + "\n")
 
