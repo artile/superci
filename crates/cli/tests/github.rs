@@ -452,6 +452,9 @@ fn github_jobs_reach_the_cache_with_githubs_own_token_each_branch_in_its_own_sco
     let o = superci(&home, &["caches", "delete", "--repo=acme/app", "deps-fix", "--scope=refs/heads/fix", "--confirm"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(found(&branch, "deps-x")["key"], "deps-main");
+    // By the repository's id too.
+    let o = superci(&home, &["caches", "delete", "--repo=gh197814629", "deps-none", "--confirm"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let o = superci(&home, &["caches", "delete", "--repo=acme/app", "--confirm"]);
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("acme/app's cache entries are out."), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(found(&main, "deps-main")["hit"], false);
@@ -637,7 +640,8 @@ fn a_running_github_jobs_lines_as_its_machine_sends_them_are_read_before_github_
             let r = agent.post(&format!("{}/hello?runner={runner}&t={hello}&live=timeline_{step}_1.log&at={at}", served.url)).send(page).unwrap();
             assert_eq!(r.status().as_u16(), 200);
         }
-        // A link not its own is not taken.
+        // An empty page is nothing to keep; a link not its own is not taken.
+        assert_eq!(agent.post(&format!("{}/hello?runner={runner}&t={hello}&live=timeline_{step}_2.log&at=0", served.url)).send("").unwrap().status().as_u16(), 200);
         assert_eq!(agent.post(&format!("{}/hello?runner={runner}&t=not-its-link-at-all&live=x_1.log", served.url)).send("x").unwrap().status().as_u16(), 404);
         assert_eq!(served.github.objects().iter().filter(|(k, _)| k.contains("/live/")).count(), if bucket { 2 } else { 0 }, "{:?}", served.github.objects());
         let o = superci(&home, &["jobs", "retrieve", &id.to_string()]);

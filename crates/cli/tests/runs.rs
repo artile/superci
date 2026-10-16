@@ -740,6 +740,8 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
     let (_, more) = cache("tool-sign", serde_json::json!({ "tool": "turbo", "hash": hash, "names": ["p00001"] }));
     assert_eq!(s3("PUT", more["urls"][0].as_str().unwrap(), b"files").0, 200);
     assert_eq!(cache("tool-sign", serde_json::json!({ "tool": "turbo", "hash": hash, "names": ["../x"] })).0, 400);
+    assert_eq!(cache("tool-sign", serde_json::json!({ "tool": "turbo", "hash": hash, "names": [] })).0, 400);
+    assert_eq!(cache("tool-sign", serde_json::json!({ "tool": "turbo", "hash": hash, "names": (0..65).map(|n| format!("p{n:05}")).collect::<Vec<_>>() })).0, 400);
     assert_eq!(cache("tool-finish", serde_json::json!({ "tool": "turbo", "hash": hash, "pieces": [["p00000", 5], ["p00001", 5]], "meta": "{\"duration\":12}" })).1["size"], 10);
     assert_eq!(cache("tool-begin", serde_json::json!({ "tool": "turbo", "hash": hash })).0, 409);
     assert_eq!(cache("tool-finish", serde_json::json!({ "tool": "nx", "hash": hash, "size": 3 })).0, 404);
@@ -776,6 +778,10 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
     assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "report", "names": ["p00001"] })).0, 404, "(kept already)");
     assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "late" })).1["ok"], true);
     assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "late", "names": [] })).0, 400);
+    assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "late", "names": ["a/b"] })).0, 400);
+    assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "late", "names": (0..65).map(|n| format!("p{n:05}")).collect::<Vec<_>>() })).0, 400);
+    // A runner's link too short, or with what a link has not: nothing there.
+    for at in ["/runner/short/superci/tree", "/runner/aaaaaaaaaaaaaaaa%21%21/superci/tree"] { assert_eq!(fetch(&format!("{}{at}", served.url)).0, 404, "{at}") }
     assert_eq!(cache("artifact-finish", serde_json::json!({ "token": token, "name": "none", "pieces": [] })).0, 404);
     assert_eq!(cache("artifacts", serde_json::json!({ "token": token })).1["artifacts"].as_array().map(Vec::len), Some(11), "(the three, and the eight as other tools make them)");
     assert_eq!(cache("artifact-get", serde_json::json!({ "token": token, "name": "report" })).1["size"], report.len());
