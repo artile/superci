@@ -3560,6 +3560,8 @@ impl<'a> ControlPlane<'a> {
         let run_id = local_id();
         // Its jobs' cache: the repository's entries, as GitHub's jobs keep them when GitHub knows it here.
         let (ns, default_branch) = match self.repository_of(&r.repository).await { Some((id, default)) => (format!("gh{id}"), default), None => (cache::local_ns(&r.repository), "main".to_string()) };
+        // (Its name, for the cache's list: a repository GitHub does not know here has no other.)
+        if ns.starts_with("local-") && !r.repository.is_empty() { let _ = self.store.put_if_absent(&format!("cachename:{ns}"), r.repository.clone()).await; }
         let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
             "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances, "called": r.called,
             "cache": { "ns": ns, "default_branch": default_branch } });

@@ -515,12 +515,16 @@ fn a_called_workflows_required_input_not_given_is_said_and_nothing_runs() {
 }
 
 /// A plain GET on this computer (the control plane, or the stand-in for S3): its status, its `location`, its body.
-fn fetch(url: &str) -> (u16, String, Vec<u8>) {
+fn fetch(url: &str) -> (u16, String, Vec<u8>) { http("GET", url, &[]) }
+
+/// A request on this computer: its status, its `location`, its body.
+fn http(method: &str, url: &str, body: &[u8]) -> (u16, String, Vec<u8>) {
     use std::io::{Read, Write};
     let u = url.trim_start_matches("http://");
     let (host, rest) = u.split_once('/').unwrap_or((u, ""));
     let mut s = std::net::TcpStream::connect(host).unwrap();
-    s.write_all(format!("GET /{rest} HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n").as_bytes()).unwrap();
+    s.write_all(format!("{method} /{rest} HTTP/1.1\r\nhost: {host}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+    s.write_all(body).unwrap();
     let mut out = vec![];
     let _ = s.read_to_end(&mut out);
     let at = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(out.len());
@@ -650,3 +654,150 @@ fn a_steps_lines_that_came_late_are_printed_from_its_log_without_the_runners_tim
     assert_eq!(said.lines().filter(|s| s.trim_end().ends_with("first")).count(), 1, "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A zip as `upload-artifact` makes one (stored), of these files.
+fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let (mut out, mut dir) = (vec![], vec![]);
+    for (name, data) in files {
+        let at = out.len() as u32;
+        let (n, size) = (name.len() as u16, data.len() as u32);
+        out.extend([0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend(size.to_le_bytes()); out.extend(size.to_le_bytes()); out.extend(n.to_le_bytes()); out.extend(0u16.to_le_bytes());
+        out.extend(name.as_bytes()); out.extend(*data);
+        dir.extend([0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        dir.extend(size.to_le_bytes()); dir.extend(size.to_le_bytes()); dir.extend(n.to_le_bytes());
+        dir.extend([0u8; 12]); dir.extend(at.to_le_bytes()); dir.extend(name.as_bytes());
+    }
+    let (cd_at, cd_len, count) = (out.len() as u32, dir.len() as u32, files.len() as u16);
+    out.extend(dir);
+    out.extend([0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]);
+    out.extend(count.to_le_bytes()); out.extend(count.to_le_bytes()); out.extend(cd_len.to_le_bytes()); out.extend(cd_at.to_le_bytes()); out.extend([0, 0]);
+    out
+}
+
+#[test]
+fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_they_are_fetched_from_the_computer() {
+    // A control plane with its own AWS account and its bucket ready; the job's machine given its link to the cache.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+    });
+    let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    let dir = checkout();
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let token = runner.handed(&served)["resources"]["endpoints"][0]["authorization"]["parameters"]["AccessToken"].as_str().unwrap().to_string();
+    let machine = served.machines.0.lock().unwrap()[0].clone();
+    let link = "machine-cache-link-000000000001";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": machine }).to_string());
+    let cache = |what: &str, body: serde_json::Value| { let (s, _, b) = http("POST", &format!("{}/cache/{link}/{what}", served.url), body.to_string().as_bytes()); (s, serde_json::from_slice::<serde_json::Value>(&b).unwrap_or_default()) };
+    let s3 = |method: &str, url: &str, body: &[u8]| http(method, &format!("{}/{}", served.aws.url, url.trim_start_matches("https://")), body);
+    let version = "a".repeat(64);
+    // Its program, from the bucket.
+    let (status, to, _) = fetch(&format!("{}/cache/{link}/program", served.url));
+    assert!(status == 302 && to.contains(&bucket) && to.contains("cache-"), "{status} {to}");
+    assert_eq!(fetch(&format!("{}/cache/not-a-machine-link-0000/program", served.url)).0, 404);
+    // Nothing kept yet; then a save: begun, its piece's link, put there, finished.
+    assert_eq!(cache("lookup", serde_json::json!({ "token": token, "key": "deps-1", "restore_keys": ["deps-"], "version": version })).1["hit"], false);
+    assert_eq!(cache("begin", serde_json::json!({ "token": token, "key": "deps-1", "version": version })).1["ok"], true);
+    let (status, said) = cache("begin", serde_json::json!({ "token": token, "key": "deps-1", "version": version }));
+    assert_eq!((status, said["why"].as_str()), (409, Some("exists")), "{said}");
+    assert_eq!(cache("begin", serde_json::json!({ "token": token, "key": "a,b", "version": version })).0, 400);
+    for names in [serde_json::json!([]), serde_json::json!(["bad/name"]), serde_json::json!((0..65).map(|n| format!("p{n}")).collect::<Vec<_>>())] {
+        assert_eq!(cache("sign", serde_json::json!({ "token": token, "key": "deps-1", "version": version, "names": names })).0, 400, "{names}");
+    }
+    assert_eq!(cache("sign", serde_json::json!({ "token": token, "key": "never-begun", "version": version, "names": ["p00000"] })).0, 404);
+    let (_, signed) = cache("sign", serde_json::json!({ "token": token, "key": "deps-1", "version": version, "names": ["p00000"] }));
+    assert_eq!(s3("PUT", signed["urls"][0].as_str().unwrap(), b"node_modules, packed").0, 200);
+    assert_eq!(cache("finish", serde_json::json!({ "token": token, "key": "deps-1", "version": version, "pieces": [["p00000", 20]] })).1["size"], 20);
+    // Restored by its key's beginning, and read back.
+    let (_, hit) = cache("lookup", serde_json::json!({ "token": token, "key": "deps-2", "restore_keys": ["deps-"], "version": version }));
+    assert_eq!((hit["hit"].as_bool(), hit["key"].as_str()), (Some(true), Some("deps-1")), "{hit}");
+    assert_eq!(s3("GET", hit["pieces"][0]["url"].as_str().unwrap(), b"").2, b"node_modules, packed");
+    // Without a job's token: refused; a token of no one's: refused.
+    let (status, said) = cache("lookup", serde_json::json!({ "key": "deps-1", "version": version }));
+    assert_eq!((status, said["ok"].as_bool()), (403, Some(false)), "{said}");
+    assert_eq!(cache("lookup", serde_json::json!({ "token": "eyJhbGciOiJFUzI1NiJ9.e30.c2ln", "key": "deps-1", "version": version })).0, 403);
+    assert_eq!(http("POST", &format!("{}/cache/not-a-machine-link-0000/lookup", served.url), b"{}").0, 404);
+    // A tool's outputs (Turbo's), by the machine's job, with no token: one piece, then two more, and read back.
+    assert_eq!(cache("tool-begin", serde_json::json!({ "tool": "make", "hash": "abc" })).0, 400);
+    let hash = "b".repeat(64);
+    assert_eq!(cache("tool-get", serde_json::json!({ "tool": "turbo", "hash": hash })).1["hit"], false);
+    let (_, begun) = cache("tool-begin", serde_json::json!({ "tool": "turbo", "hash": hash }));
+    assert_eq!(s3("PUT", begun["url"].as_str().unwrap(), b"dist ").0, 200);
+    let (_, more) = cache("tool-sign", serde_json::json!({ "tool": "turbo", "hash": hash, "names": ["p00001"] }));
+    assert_eq!(s3("PUT", more["urls"][0].as_str().unwrap(), b"files").0, 200);
+    assert_eq!(cache("tool-sign", serde_json::json!({ "tool": "turbo", "hash": hash, "names": ["../x"] })).0, 400);
+    assert_eq!(cache("tool-finish", serde_json::json!({ "tool": "turbo", "hash": hash, "pieces": [["p00000", 5], ["p00001", 5]], "meta": "{\"duration\":12}" })).1["size"], 10);
+    assert_eq!(cache("tool-begin", serde_json::json!({ "tool": "turbo", "hash": hash })).0, 409);
+    assert_eq!(cache("tool-finish", serde_json::json!({ "tool": "nx", "hash": hash, "size": 3 })).0, 404);
+    let (_, got) = cache("tool-get", serde_json::json!({ "tool": "turbo", "hash": hash }));
+    assert_eq!((got["size"].as_u64(), got["meta"].as_str()), (Some(10), Some("{\"duration\":12}")), "{got}");
+    let back: Vec<u8> = got["pieces"].as_array().unwrap().iter().flat_map(|p| s3("GET", p["url"].as_str().unwrap(), b"").2).collect();
+    assert_eq!(back, b"dist files");
+    // Its artifacts: kept in the run (a zip, a file that is not one, a zip naming a place outside its folder).
+    let keep = |name: &str, bytes: &[u8]| {
+        assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": name })).1["ok"], true, "{name}");
+        let (_, signed) = cache("artifact-sign", serde_json::json!({ "token": token, "name": name, "names": ["p00000"] }));
+        assert_eq!(s3("PUT", signed["urls"][0].as_str().unwrap(), bytes).0, 200);
+        cache("artifact-finish", serde_json::json!({ "token": token, "name": name, "pieces": [["p00000", bytes.len()]] })).1
+    };
+    let report = zip_of(&[("index.html", b"<h1>all passed</h1>"), ("data/results.json", b"{\"passed\":3}")]);
+    assert!(keep("report", &report)["id"].as_u64().is_some());
+    keep("notes", b"plain words, not a zip");
+    keep("evil", &zip_of(&[("../outside.txt", b"x")]));
+    assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "report" })).0, 409);
+    assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "a/b:c" })).0, 400);
+    assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "none", "names": ["p00000"] })).0, 404);
+    assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "report", "names": ["p00001"] })).0, 404, "(kept already)");
+    assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "late" })).1["ok"], true);
+    assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "late", "names": [] })).0, 400);
+    assert_eq!(cache("artifact-finish", serde_json::json!({ "token": token, "name": "none", "pieces": [] })).0, 404);
+    assert_eq!(cache("artifacts", serde_json::json!({ "token": token })).1["artifacts"].as_array().map(Vec::len), Some(3));
+    assert_eq!(cache("artifact-get", serde_json::json!({ "token": token, "name": "report" })).1["size"], report.len());
+    assert_eq!(cache("artifact-get", serde_json::json!({ "token": token, "name": "none" })).0, 404);
+    // From the computer: listed, and each fetched: the zip unpacked, the file kept as it is, the bad zip refused.
+    let cli = |args: &[&str]| { let o = superci(&served, &dir, args).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap(); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (ok, said) = cli(&["artifacts", "list", &format!("--run={run}")]);
+    assert!(ok && said.contains("report") && said.contains("notes") && said.contains("evil"), "{said}");
+    let out = common::temp("artifact");
+    let (ok, said) = cli(&["artifacts", "retrieve", "report", &format!("--run={run}"), &format!("--out={}", out.display())]);
+    assert!(ok && said.contains("2 files"), "{said}");
+    assert_eq!(std::fs::read_to_string(out.join("data/results.json")).unwrap(), "{\"passed\":3}");
+    let (ok, said) = cli(&["artifacts", "retrieve", "notes", &format!("--run={run}"), &format!("--out={}", out.join("n").display())]);
+    assert!(ok && said.contains("1 file") && std::fs::read_to_string(out.join("n/notes")).unwrap() == "plain words, not a zip", "{said}");
+    let (ok, said) = cli(&["artifacts", "retrieve", "evil", &format!("--run={run}"), &format!("--out={}", out.join("e").display())]);
+    assert!(!ok && said.contains("evil could not be unpacked: a name outside its folder: ../outside.txt"), "{said}");
+    // In the dashboard: the run's page lists them, each a download (the zip as it was kept).
+    let home = common::signed_in(&served);
+    let repository = served.store.under(&format!("run:{run}"))[0].1["repository"].as_str().unwrap().to_string();
+    let (mut child, link) = common::dashboard(&home);
+    let page_at = format!("/?p=run&repo={}&id={run}&attempt=0&fragment=1", url_encoded(&repository));
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::part(&link, &page_at).1 }).find(|p| p.contains("Its artifacts")).unwrap_or_default();
+    assert!(page.contains(&format!("/run/artifact?run={run}&amp;name=report")) && page.contains("name=notes"), "{}", common::words(&page));
+    let (status, zip) = common::part(&link, &format!("/run/artifact?run={run}&name=report"));
+    assert!(status == 200 && zip.contains("data/results.json") && zip.len() == report.len(), "{status} {}", zip.len());
+    for bad in ["/run/artifact?run=x&name=report", "/run/artifact?run=1&name="] { assert_eq!(common::part(&link, bad).0, 400, "{bad}") }
+    let _ = child.kill();
+    // Deleted by the job; gone from the bucket.
+    assert_eq!(cache("artifact-delete", serde_json::json!({ "token": token, "name": "notes" })).1["ok"], true);
+    assert_eq!(cache("artifact-delete", serde_json::json!({ "token": token, "name": "notes" })).0, 404);
+    assert_eq!(cache("nothing", serde_json::json!({ "token": token })).0, 404);
+    // The run's repository's cache entries, and removed.
+    let (_, listed) = common::json(&home, &["caches", "list"]);
+    assert_eq!((listed["repos"][0]["name"].as_str(), listed["repos"][0]["entries"].as_u64()), (Some(repository.as_str()), Some(2)), "{listed}");
+    let (_, entries) = common::json(&home, &["caches", "list", &format!("--repo={repository}")]);
+    assert!(entries["entries"].as_array().unwrap().iter().any(|e| e["key"] == "deps-1"), "{entries}");
+    let o = common::superci(&home, &["caches", "delete", &format!("--repo={repository}"), "deps-1", "--confirm"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("deps-1 is out of"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let (_, entries) = common::json(&home, &["caches", "list", &format!("--repo={repository}")]);
+    assert!(!entries.to_string().contains("deps-1"), "{entries}");
+    assert_eq!(cache("lookup", serde_json::json!({ "token": token, "key": "deps-1", "version": version })).1["hit"], false);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+fn url_encoded(s: &str) -> String { url::form_urlencoded::byte_serialize(s.as_bytes()).collect() }
