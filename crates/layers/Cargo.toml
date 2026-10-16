@@ -25,10 +25,10 @@ redb = "4"
 regex = "1"
 libc = "0.2"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
-hyper-util = { version = "0.1", features = ["tokio"] }
-tower = "0.5"
 
 [build-dependencies]
 protox = "0.10"

@@ -211,6 +211,32 @@ impl Store {
         Ok(())
     }
 
+    /// A folder for files on their way into the store (`superci-fetch`, beside containerd's own folders, on the
+    /// same disk so a file is moved in, not copied).
+    pub fn fetch_dir(&self) -> Result<PathBuf> {
+        let d = self.root.join("superci-fetch");
+        std::fs::create_dir_all(&d)?;
+        Ok(d)
+    }
+
+    /// A file fetched whole made the blob `d`, if it is: hashed, moved into place, made read-only (as a commit
+    /// does). One there already is kept, and the file thrown away.
+    pub fn put_file(&self, d: &Digest, file: &Path) -> Result<()> {
+        let got = crate::fetch::hash_file(file, d.algorithm)?;
+        if got != *d {
+            let _ = std::fs::remove_file(file);
+            return Err(Error::FailedPrecondition(format!("unexpected commit digest {got}, expected {d}")));
+        }
+        let target = self.blob_path(d);
+        std::fs::create_dir_all(target.parent().unwrap())?;
+        if target.exists() { let _ = std::fs::remove_file(file); return Ok(()) }
+        std::fs::rename(file, &target)?;
+        std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all())?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444));
+        Ok(())
+    }
+
     pub fn status(&self, r: &str) -> Result<Status> { status_at(&self.ingest_root(r)) }
 
     /// Each write in progress the filters match (by `ref`).

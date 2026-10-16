@@ -15,6 +15,9 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+/// Every content call said (`SUPERCI_LAYERS_DEBUG=1`), for working on the service.
+fn debug(what: impl FnOnce() -> String) { if std::env::var_os("SUPERCI_LAYERS_DEBUG").is_some() { eprintln!("superci-layers: {}", what()) } }
+
 fn ts(n: Nanos) -> Option<prost_types::Timestamp> { Some(prost_types::Timestamp { seconds: n.div_euclid(1_000_000_000), nanos: n.rem_euclid(1_000_000_000) as i32 }) }
 /// A time a caller sent (Go's zero time is year 1, past what nanoseconds since 1970 hold: kept at the nearest).
 fn from_ts(t: Option<prost_types::Timestamp>) -> Nanos { t.map(|t| t.seconds.saturating_mul(1_000_000_000).saturating_add(t.nanos as i64)).unwrap_or(0) }
@@ -71,7 +74,7 @@ impl sapi::snapshots_server::Snapshots for Snapshots {
     async fn remove(&self, r: Request<sapi::RemoveSnapshotRequest>) -> std::result::Result<Response<()>, Status> {
         let key = r.into_inner().key;
         let l = self.layers.clone();
-        blocking(move || l.overlay.remove(&key)).await?;
+        blocking(move || l.remove(&key)).await?;
         Ok(Response::new(()))
     }
 
@@ -122,7 +125,7 @@ impl sapi::snapshots_server::Snapshots for Snapshots {
 
     async fn cleanup(&self, _r: Request<sapi::CleanupRequest>) -> std::result::Result<Response<()>, Status> {
         let l = self.layers.clone();
-        blocking(move || l.overlay.cleanup()).await?;
+        blocking(move || l.cleanup()).await?;
         Ok(Response::new(()))
     }
 }
@@ -144,7 +147,10 @@ impl capi::content_server::Content for Content {
     async fn info(&self, r: Request<capi::InfoRequest>) -> std::result::Result<Response<capi::InfoResponse>, Status> {
         let d = digest_arg(&r.into_inner().digest)?;
         let l = self.layers.clone();
-        let i = blocking(move || l.content_info(&d)).await?;
+        let dd = d.clone();
+        let i = blocking(move || l.content_info(&d)).await;
+        debug(|| format!("info {dd}: {}", match &i { Ok(i) => format!("{} bytes", i.size), Err(e) => e.message().to_string() }));
+        let i = i?;
         Ok(Response::new(capi::InfoResponse { info: Some(content_info(i)) }))
     }
 
@@ -275,6 +281,7 @@ fn write_session(l: &Layers, mut stream: tonic::Streaming<capi::WriteContentRequ
     let store: &Store = &l.content;
     let mut req = match handle.block_on(stream.message())? { Some(m) => m, None => return Err(Status::cancelled("no message")) };
     let reference = req.r#ref.clone();
+    debug(|| format!("write {reference}: action {}, total {}, expected {:?}, {} bytes", req.action, req.total, req.expected, req.data.len()));
     if reference.is_empty() { return Err(Status::invalid_argument("first message must have a reference")) }
     let mut total = req.total;
     let mut expected = req.expected.clone();
