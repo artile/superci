@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.11
+## 0.19.11 — 2026-10-16
 - Machines on AWS can run Ubuntu 26.04, with Docker 29: `runs-on: superci/image=ubuntu26` for a job, or `superci machine update --image=ubuntu26` (and the dashboard's default machine) for every job. Unset, the Ubuntu follows GitHub's `ubuntu-latest`: 24.04 until 19 November 2026, 26.04 from then on. `image=ubuntu24` keeps 24.04 after that. Cloudflare's and Modal's containers stay on 24.04 for now, and a label asking for 26.04 is not sent there.
 
 ## 0.19.10 — 2026-10-16
