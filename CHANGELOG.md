@@ -2,6 +2,11 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.8
+- A run from a computer starts its machine while its working tree is still being sent (its checkout waits for the rest), and the machine fetches the tree's parts at once, each into a file: a connection that stalls is dropped after 10 seconds and the part asked for again from its start (one fetch took 69 seconds where the one before took 1). The checkout says how long each part took, and how much of it was the control plane's answer.
+- `superci runs create` says how a job's start went once it runs (AWS's answer, the machine switched on, its boot, its runner), and `--dry-run` checks the workflow, its job and the working tree and starts nothing: it started a real run.
+- `--tests` reads test runners whose lines are marked by the process they came from (`[slot 2] …`, several at once) apart from one another and adds them up: a failed Playwright test in such lines was missed. A failed job none of whose tests is read as failed says so, with how to get its whole log, and `runs create --quiet` lists a failed step's failed tests before its last lines.
+
 ## 0.19.7 — 2026-10-16
 - A dashboard page asked for often (several tabs open, say) shows what changed within seconds: it showed the reading it had when the page was first opened, for as long as it was asked for every second or two.
 - `superci runs cancel ID`, and Cancel run on a run's page: a run from a computer stops as GitHub's Cancel stops one (its jobs not started end; a running one's runner is told to stop, with five minutes for its steps, then its machine ends); a GitHub run is cancelled by GitHub, asked with your App's token.

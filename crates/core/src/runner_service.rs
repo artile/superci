@@ -182,11 +182,21 @@ pub fn checkout_action(tree: &str, parts: u32, layered: bool) -> String {
     const INPUTS: [&str; 20] = ["repository", "ref", "token", "ssh-key", "ssh-known-hosts", "ssh-strict", "ssh-user", "persist-credentials", "path", "clean", "filter", "sparse-checkout",
         "sparse-checkout-cone-mode", "fetch-depth", "fetch-tags", "show-progress", "lfs", "submodules", "set-safe-directory", "github-server-url"];
     let inputs: String = INPUTS.iter().map(|i| format!("  {i}:\n    required: false\n    default: ''\n")).collect();
-    let fetch = match (parts, layered) {
-        (0, _) => "true".to_string(),
+    // Each part into a file of its own, all at once; a connection that stalls (nothing for 10 s) is dropped and the
+    // part asked for again from its start (the control plane gives a fresh link each time), five times at most. A part
+    // still on its way from the computer (425: the run was started while it was sent) is waited for, ten minutes at
+    // most. How long each took is said: the control plane's answer, then the bucket's.
+    let get = format!(r#"t=$(mktemp -d "${{RUNNER_TEMP:-/tmp}}/superci-tree.XXXXXX"); began=$SECONDS
+        fetch() {{ local tries=0 waited=0 rc said code size total asked; while :; do rc=0; said=$(curl -q -sSL --connect-timeout 10 --speed-limit 20000 --speed-time 10 -o "$t/$1" -w "%{{http_code}} %{{size_download}} %{{time_total}} %{{time_redirect}}" "{tree}?part=$1") || rc=$?; read -r code size total asked <<< "$said"; [ $rc = 0 ] || code="curl error $rc"; case "$code" in 200) echo "Part $1: $size bytes in $total s ($asked s of it the control plane's answer)"; return 0;; 425) [ $waited = 0 ] && echo "Part $1: waiting for the computer to finish sending it"; waited=$((waited + 1)); [ $waited -ge 600 ] && {{ echo "::error::The computer did not finish sending the working tree in ten minutes."; return 1; }}; sleep 1; continue;; esac; tries=$((tries + 1)); [ $tries -ge 5 ] && {{ echo "::error::Part $1 of the working tree could not be fetched (last: $code)."; return 1; }}; echo "Part $1: asked again ($tries; $code)"; sleep 1; done; }}
+        pids=(); for part in $(seq 0 {last}); do fetch "$part" & pids+=($!); done; for p in "${{pids[@]}}"; do wait "$p"; done; fetched=$SECONDS"#, last = parts.saturating_sub(1));
+    let unpack = if layered {
         // Each archive on the one before; then what was removed since the base.
-        (_, true) => format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\" | tar -xzi; done; if [ -f .superci-removed ]; then tr '\\n' '\\0' < .superci-removed | xargs -0 -r rm -f --; rm -f .superci-removed; fi", parts - 1),
-        _ => format!("for part in $(seq 0 {}); do curl -fsSL --retry 3 \"{tree}?part=$part\"; done | tar -xz", parts - 1),
+        format!("for part in $(seq 0 {}); do tar -xzi -f \"$t/$part\"; done; if [ -f .superci-removed ]; then tr '\\n' '\\0' < .superci-removed | xargs -0 -r rm -f --; rm -f .superci-removed; fi", parts.saturating_sub(1))
+    } else {
+        format!("for part in $(seq 0 {}); do cat \"$t/$part\"; done | tar -xz", parts.saturating_sub(1))
+    };
+    let fetch = if parts == 0 { "true".to_string() } else {
+        format!("{get}\n        {unpack}; rm -rf \"$t\"\n        echo \"The working tree: fetched in $((fetched - began)) s, unpacked in $((SECONDS - fetched)) s\"")
     };
     format!(r#"name: Check out (SuperCI)
 description: The working tree a run from a computer was started with, in place of a checkout from GitHub.
@@ -404,7 +414,7 @@ mod tests {
     fn the_checkout_is_an_action_the_runner_can_unpack() {
         let gz = checkout_tarball("https://plane.example/runner/abc/superci/tree", 3, false);
         let layered = checkout_action("https://plane.example/runner/abc/superci/tree", 2, true);
-        assert!(layered.contains(r#"for part in $(seq 0 1); do curl -fsSL --retry 3 "https://plane.example/runner/abc/superci/tree?part=$part" | tar -xzi; done"#) && layered.contains("xargs -0 -r rm -f --") && layered.contains(r"tr '\n' '\0' < .superci-removed"), "{layered}");
+        assert!(layered.contains(r#"for part in $(seq 0 1); do tar -xzi -f "$t/$part"; done"#) && layered.contains("xargs -0 -r rm -f --") && layered.contains(r"tr '\n' '\0' < .superci-removed"), "{layered}");
         assert_eq!(&gz[..3], &[0x1f, 0x8b, 8]);
         // (Unpacked by the system's own tar, as the runner does.)
         let dir = std::env::temp_dir().join(format!("superci-checkout-{}", guid()));
@@ -413,7 +423,57 @@ mod tests {
         let ok = std::process::Command::new("tar").args(["xzf", "a.tar.gz", "--strip-components", "1"]).current_dir(&dir).status().unwrap().success();
         let action = std::fs::read_to_string(dir.join("action.yml")).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(ok && action.contains("using: composite") && action.contains("for part in $(seq 0 2); do curl -fsSL --retry 3 \"https://plane.example/runner/abc/superci/tree?part=$part\"") && action.contains("  fetch-depth:\n    required: false"), "{action}");
+        assert!(ok && action.contains("using: composite") && action.contains("for part in $(seq 0 2); do fetch \"$part\" &") && action.contains("  fetch-depth:\n    required: false"), "{action}");
         assert!(action.contains("SUPERCI_PATH: ${{ inputs.path }}"));
+    }
+
+    /// The checkout's script run by bash, as the runner runs it, against a control plane that sends each part on to
+    /// the bucket and a bucket that drops the first answer halfway: that part is asked for again from its start, one the
+    /// computer is still sending is waited for, and the tree is unpacked whole.
+    #[test]
+    fn the_checkout_asks_again_for_a_part_cut_off_and_unpacks_the_tree_whole() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("superci-fetch-{}", guid()));
+        let (src, work, tmp) = (dir.join("src"), dir.join("work"), dir.join("tmp"));
+        for d in [&src, &work, &tmp] { std::fs::create_dir_all(d).unwrap() }
+        for n in 0..40 { std::fs::write(src.join(format!("file-{n}.txt")), format!("{n} ").repeat(2000)).unwrap() }
+        let packed = std::process::Command::new("tar").args(["-czf", "-", "."]).current_dir(&src).output().unwrap().stdout;
+        let pieces: Vec<Vec<u8>> = packed.chunks(packed.len().div_ceil(3)).map(<[u8]>::to_vec).collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let early = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let served = pieces.clone();
+        std::thread::spawn(move || for stream in listener.incoming() {
+            let (mut stream, pieces, cut, early) = (stream.unwrap(), served.clone(), cut.clone(), early.clone());
+            std::thread::spawn(move || {
+                let mut asked = vec![0u8; 4096];
+                let n = stream.read(&mut asked).unwrap_or(0);
+                let line = String::from_utf8_lossy(&asked[..n]).lines().next().unwrap_or_default().to_string();
+                let path = line.split(' ').nth(1).unwrap_or_default().to_string();
+                // (The last part is still on its way from the computer, the first two times it is asked for.)
+                if path == "/tree?part=2" && early.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    let _ = write!(stream, "HTTP/1.1 425 Too Early\r\ncontent-length: 5\r\nconnection: close\r\n\r\nlater");
+                } else if let Some(part) = path.strip_prefix("/tree?part=") {
+                    let _ = write!(stream, "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{port}/bucket/{part}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                } else if let Some(part) = path.strip_prefix("/bucket/").and_then(|p| p.parse::<usize>().ok()) {
+                    let body = &pieces[part];
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    // (The first answer for the second part ends halfway.)
+                    let whole = !(part == 1 && !cut.swap(true, std::sync::atomic::Ordering::SeqCst));
+                    let _ = stream.write_all(if whole { body } else { &body[..body.len() / 2] });
+                }
+            });
+        });
+        let action = checkout_action(&format!("http://127.0.0.1:{port}/tree"), pieces.len() as u32, false);
+        let script: String = action.split("run: |\n").nth(1).unwrap().lines().map(|l| l.strip_prefix("        ").unwrap_or(l)).collect::<Vec<_>>().join("\n");
+        let out = std::process::Command::new("bash").args(["-c", &script]).env("GITHUB_WORKSPACE", &work).env("RUNNER_TEMP", &tmp).env("SUPERCI_PATH", "").env("SUPERCI_REPOSITORY", "").env("GITHUB_REPOSITORY", "acme/app").output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        let whole = (0..40).all(|n| std::fs::read_to_string(work.join(format!("file-{n}.txt"))).is_ok_and(|t| t == format!("{n} ").repeat(2000)));
+        let left = std::fs::read_dir(&tmp).map(|d| d.count()).unwrap_or(0);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success() && whole, "{said}");
+        assert!(said.contains("Part 1: asked again (1; curl error 18)") && said.contains("Part 2: waiting for the computer to finish sending it") && !said.contains("Part 2: asked again") && said.contains("Part 0: ") && said.contains("The working tree: fetched in ") && said.contains("The working tree as it was on the computer: 40 files"), "{said}");
+        assert_eq!(left, 0, "the parts are gone once unpacked");
     }
 }

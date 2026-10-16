@@ -311,6 +311,10 @@ fn job_tests(v: &PlaneView, key: &str, j: &Value) -> Value {
         Ok(log) => serde_json::to_value(crate::test_results::read(&String::from_utf8_lossy(&log))).unwrap_or_default(),
         Err(e) => return json!({ "error": e }),
     };
+    // (A failed job none of whose tests is read as failed: what failed is elsewhere in its log.)
+    if failed_job(j) && tests["failed"].as_u64().unwrap_or(0) == 0 {
+        tests["note"] = format!("The job failed, but no test in its log is read as failed (a step besides the tests, or a test runner whose lines are not read). Its whole log: `superci jobs retrieve {} --out=job.log`", j["job_id"]).into();
+    }
     if j["provider"] == "local" {
         let run = j["run_id"].as_u64().unwrap_or_default();
         if let Ok(got) = crate::cloudflare::plane_get(v.plane.url(), key, &format!("/runs/{run}/artifacts")) {
@@ -335,6 +339,7 @@ fn tests_lines(t: &Value, indent: &str) -> Vec<String> {
         out.push(format!("{indent}✗ {}{}", f["name"].as_str().unwrap_or_default(), f["file"].as_str().map(|p| format!("  ({p})")).unwrap_or_default()));
         for l in f["error"].as_str().unwrap_or_default().lines().filter(|l| !l.trim().is_empty()).take(3) { out.push(format!("{indent}    {l}")) }
     }
+    if let Some(note) = t["note"].as_str() { out.push(format!("{indent}{note}")) }
     for a in t["artifacts"].as_array().into_iter().flatten() { out.push(format!("{indent}Artifact {}: `{}`", a["name"].as_str().unwrap_or_default(), a["fetch"].as_str().unwrap_or_default())) }
     if let Some(at) = t["artifacts_at"].as_str() { out.push(format!("{indent}Its artifacts: {at}")) }
     out
@@ -452,7 +457,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 Some((url, key)) => (url, key),
                 None => { let mut d = signed_in(); let (v, key) = look(&mut d)?; (v.plane.url().to_string(), crate::cloudflare::plane_key(&key, v.plane.url())) }
             };
-            let how = crate::local_run::Follow { quiet: args.has("quiet"), detach: args.has("detach") };
+            let how = crate::local_run::Follow { quiet: args.has("quiet"), detach: args.has("detach"), dry_run: args.has("dry-run") };
             Ok(crate::local_run::create(&url, &key, workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, how, steps)?)
         }
         ("runs", "cancel") => {
@@ -475,7 +480,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 Some((url, key)) => (url, key),
                 None => { let mut d = signed_in(); let (v, key) = look(&mut d)?; (v.plane.url().to_string(), crate::cloudflare::plane_key(&key, v.plane.url())) }
             };
-            Ok(crate::local_run::wait(&url, &key, &w(2), crate::local_run::Follow { quiet: args.has("quiet"), detach: false }, steps)?)
+            Ok(crate::local_run::wait(&url, &key, &w(2), crate::local_run::Follow { quiet: args.has("quiet"), ..Default::default() }, steps)?)
         }
         ("usage", "retrieve") => {
             let period = args.get("period").unwrap_or("day");

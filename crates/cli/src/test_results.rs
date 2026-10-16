@@ -74,9 +74,40 @@ fn error_after(lines: &[String], from: usize, stop: impl Fn(&str) -> bool) -> St
     text.chars().take(ERROR_CHARS).collect()
 }
 
-/// What a job's log says of its tests (nothing found: no runners, no counts).
+/// A line's mark of the process it came from, when several run at once and each line says which (`[slot 2] …`,
+/// `[web] …`), and the line without it. (Not Playwright's own `[chromium] › file`.)
+fn marked(line: &str) -> (&str, &str) {
+    let s = line.trim_start();
+    if let Some(end) = s.strip_prefix('[').and_then(|r| r.find("] ")).map(|at| at + 1) {
+        let (mark, rest) = (&s[..=end], &s[end + 2..]);
+        if !rest.starts_with('›') && mark.len() <= 40 && !mark[1..end].contains(['[', ']']) { return (mark, rest) }
+    }
+    ("", line)
+}
+
+/// What a job's log says of its tests (nothing found: no runners, no counts). Lines marked by the process they came
+/// from (`[slot 2] …`) are read as that process's own, apart from the others' they are mixed with, and added up.
 pub fn read(log: &str) -> Tests {
-    let lines: Vec<String> = log.lines().map(plain).collect();
+    let mut streams: Vec<(String, Vec<String>)> = vec![];
+    for l in log.lines() {
+        let line = plain(l);
+        let (mark, rest) = marked(&line);
+        match streams.iter_mut().find(|(m, _)| m == mark) {
+            Some((_, lines)) => lines.push(rest.to_string()),
+            None => streams.push((mark.to_string(), vec![rest.to_string()])),
+        }
+    }
+    let mut t = Tests::default();
+    for (_, lines) in streams {
+        let one = read_lines(&lines);
+        for r in one.runners { if !t.runners.contains(&r) { t.runners.push(r) } }
+        (t.passed, t.failed, t.skipped) = (t.passed + one.passed, t.failed + one.failed, t.skipped + one.skipped);
+        for f in one.failures { if t.failures.len() < MOST { t.failures.push(f) } }
+    }
+    t
+}
+
+fn read_lines(lines: &[String]) -> Tests {
     let mut t = Tests::default();
     let runner = |t: &mut Tests, name: &'static str| if !t.runners.contains(&name) { t.runners.push(name) };
     let push = |t: &mut Tests, f: Failure| if t.failures.len() < MOST && !t.failures.iter().any(|g| g.runner == f.runner && g.name == f.name) { t.failures.push(f) };
@@ -88,7 +119,7 @@ pub fn read(log: &str) -> Tests {
             let (file, name) = rest.split_once(" > ").unwrap();
             if file.contains(".test.") || file.contains(".spec.") || file.contains('/') {
                 runner(&mut t, "vitest");
-                let error = error_after(&lines, i + 1, |n| { let n = n.trim_start(); (n.starts_with("FAIL ") && n.contains(" > ")) || n.starts_with("⎯⎯") || n.starts_with("Test Files") });
+                let error = error_after(lines, i + 1, |n| { let n = n.trim_start(); (n.starts_with("FAIL ") && n.contains(" > ")) || n.starts_with("⎯⎯") || n.starts_with("Test Files") });
                 push(&mut t, Failure { runner: "vitest", name: name.trim().to_string(), file: Some(file.trim().to_string()), error });
                 continue;
             }
@@ -101,7 +132,7 @@ pub fn read(log: &str) -> Tests {
         // Jest: `● suite › name` and its error, then `Tests:  2 failed, 9 passed, 11 total`.
         if let Some(name) = s.strip_prefix("● ").filter(|n| !n.starts_with("Console") && !n.starts_with("Test suite failed to run")) {
             runner(&mut t, "jest");
-            let error = error_after(&lines, i + 1, |n| n.trim_start().starts_with("● ") || n.trim_start().starts_with("Test Suites:"));
+            let error = error_after(lines, i + 1, |n| n.trim_start().starts_with("● ") || n.trim_start().starts_with("Test Suites:"));
             push(&mut t, Failure { runner: "jest", name: name.trim().to_string(), file: None, error });
             continue;
         }
@@ -121,7 +152,7 @@ pub fn read(log: &str) -> Tests {
                     let file = parts[1].trim();
                     let name = parts[2..].join(" › ").trim_end_matches(|c: char| c == '─' || c.is_whitespace()).to_string();
                     let summary = |n: &str| { let w: Vec<&str> = n.split_whitespace().collect(); w.len() >= 2 && w[0].parse::<u64>().is_ok() && ["passed", "failed", "flaky", "skipped", "interrupted", "did"].contains(&w[1]) };
-                    let error = error_after(&lines, i + 1, |n| { let n = n.trim_start(); summary(n) || n.split_once(") [").is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit())) });
+                    let error = error_after(lines, i + 1, |n| { let n = n.trim_start(); summary(n) || n.split_once(") [").is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit())) });
                     push(&mut t, Failure { runner: "playwright", name: format!("[{project}] {name}"), file: Some(file.to_string()), error });
                     continue;
                 }
@@ -151,7 +182,7 @@ pub fn read(log: &str) -> Tests {
         if let Some(name) = s.strip_prefix("test ").and_then(|r| r.strip_suffix(" ... FAILED")) {
             runner(&mut t, "cargo");
             let block = lines.iter().position(|b| b.trim() == format!("---- {name} stdout ----"));
-            let error = block.map(|b| error_after(&lines, b + 1, |n| n.trim_start().starts_with("---- ") || n.trim() == "failures:")).unwrap_or_default();
+            let error = block.map(|b| error_after(lines, b + 1, |n| n.trim_start().starts_with("---- ") || n.trim() == "failures:")).unwrap_or_default();
             push(&mut t, Failure { runner: "cargo", name: name.to_string(), file: None, error });
             continue;
         }
@@ -166,7 +197,7 @@ pub fn read(log: &str) -> Tests {
             t.failed += 1;
             let name = rest.split(" (").next().unwrap_or(rest).trim().to_string();
             let depth = l.len() - s.len();
-            let error = error_after(&lines, i + 1, |n| { let d = n.len() - n.trim_start().len(); !n.trim().is_empty() && d <= depth });
+            let error = error_after(lines, i + 1, |n| { let d = n.len() - n.trim_start().len(); !n.trim().is_empty() && d <= depth });
             push(&mut t, Failure { runner: "go", name, file: None, error });
             continue;
         }
@@ -241,5 +272,29 @@ mod tests {
     fn a_log_without_tests_says_none() {
         let t = read("Run make build\ncompiling…\nDone in 3s");
         assert_eq!(t, Tests::default());
+    }
+
+    #[test]
+    fn lines_marked_by_the_process_they_came_from_are_read_apart_and_added_up() {
+        // Two Playwright processes at once, and Vitest before them, their lines mixed.
+        let log = "2026-10-16T09:00:00.0000000Z  Test Files  40 passed (40)\n\
+                   2026-10-16T09:00:00.0000000Z       Tests  1915 passed (1915)\n\
+                   2026-10-16T09:00:01.0000000Z [slot 1] Running 30 tests using 2 workers\n\
+                   2026-10-16T09:00:01.0000000Z [slot 2] Running 28 tests using 2 workers\n\
+                   2026-10-16T09:00:09.0000000Z [slot 2]   1) [chromium] › e2e/billing.spec.ts:21:3 › billing › shows the invoice ───\n\
+                   2026-10-16T09:00:09.0000000Z [slot 1]   ✓ [chromium] › e2e/login.spec.ts:4:3 › logs in (2.1s)\n\
+                   2026-10-16T09:00:09.0000000Z [slot 2] \n\
+                   2026-10-16T09:00:09.0000000Z [slot 2]     Error: expect(locator).toHaveText(expected) failed\n\
+                   2026-10-16T09:00:10.0000000Z [slot 1]   30 passed (12.0s)\n\
+                   2026-10-16T09:00:10.0000000Z [slot 2]     Expected: \"Invoice\"\n\
+                   2026-10-16T09:00:11.0000000Z [slot 2]   1 failed\n\
+                   2026-10-16T09:00:11.0000000Z [slot 2]     [chromium] › e2e/billing.spec.ts:21:3 › billing › shows the invoice\n\
+                   2026-10-16T09:00:11.0000000Z [slot 2]   27 passed (13.4s)";
+        let t = read(log);
+        assert_eq!((t.runners.clone(), t.passed, t.failed), (vec!["vitest", "playwright"], 1915 + 30 + 27, 1));
+        assert_eq!((t.failures[0].name.as_str(), t.failures[0].file.as_deref()), ("[chromium] billing › shows the invoice", Some("e2e/billing.spec.ts:21:3")));
+        assert_eq!(t.failures[0].error, "Error: expect(locator).toHaveText(expected) failed\nExpected: \"Invoice\"");
+        // (Playwright's own project in front of a line is no process's mark.)
+        assert_eq!(marked("[chromium] › a.spec.ts:1:1 › x"), ("", "[chromium] › a.spec.ts:1:1 › x"));
     }
 }

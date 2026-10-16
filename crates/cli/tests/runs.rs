@@ -59,6 +59,8 @@ fn a_run_from_a_computer_prints_every_line_once_in_order_and_ends_with_how_each_
     // How it ended: each step, then the run.
     let has = |s: &str| printed.iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("no {s:?} in:\n{said}"));
     assert!(has("✓ Run make 7 s") < has("✓ Run make test 7 s") && said.contains("The run ended: success"), "{said}");
+    // Once it ran, how its start went (where the time from sending it to its first step went).
+    assert!(has("Running (started in ") < has(&line(1)) && said.contains("its machine was asked for "), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -101,6 +103,19 @@ fn quiet_a_failed_run_says_how_each_step_went_and_the_end_of_the_one_that_failed
     assert!(!out.status.success(), "{said}");
     assert!(said.contains("✗ Run make test") && said.contains("test 61 FAILED") && said.contains("The run ended: failure"), "{said}");
     assert!(!said.contains("test 1 ok") && said.contains("test 60 ok"), "only the last lines of the failed step:\n{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_dry_run_checks_the_workflow_its_job_and_the_tree_and_starts_nothing() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--dry-run"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(o.status.success() && said.starts_with("Would send the working tree (") && said.contains("and run .github/workflows/ci.yml: its job ") && said.contains("Nothing was sent and no machine was started."), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--job=nope", "--dry-run"]).output().unwrap();
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("has no job nope (its jobs: "), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(served.store.under("run:").is_empty() && served.store.under("rtree").is_empty() && served.machines.0.lock().unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -199,19 +214,25 @@ fn a_failed_runs_tests_are_read_from_its_log_names_files_errors_and_counts() {
     let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
     let run = run_of(&served);
     let vitest: Vec<String> = [" ❯ src/sum.test.ts (3 tests | 1 failed) 12ms", "⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯", "", " FAIL  src/sum.test.ts > sums > adds two numbers",
-        "AssertionError: expected 3 to be 4 // Object.is equality", "", "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯", " Test Files  1 failed | 4 passed (5)", "      Tests  1 failed | 41 passed (42)"].iter().map(|s| s.to_string()).collect();
+        "AssertionError: expected 3 to be 4 // Object.is equality", "", "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯", " Test Files  1 failed | 4 passed (5)", "      Tests  1 failed | 41 passed (42)",
+        // Then Playwright in two processes at once, each line marked by its own, then a long teardown.
+        "[slot 1] Running 3 tests using 1 worker", "[slot 2] Running 2 tests using 1 worker", "[slot 2]   1) [chromium] › e2e/billing.spec.ts:21:3 › shows the invoice ───", "[slot 1]   3 passed (4.0s)",
+        "[slot 2]     Error: expect(locator).toHaveText(expected) failed", "[slot 2]   1 failed", "[slot 2]   1 passed (5.1s)"].iter().map(|s| s.to_string()).chain((1..=50).map(|n| format!("stopping container {n}"))).collect();
     play(&served, &run, &vitest, "failed");
-    let _ = cli.wait_with_output();
+    // Quiet, the failed step's tests are said, though its last lines are the teardown's.
+    let out = cli.wait_with_output().unwrap();
+    let quiet = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(quiet.contains("✗ [chromium] shows the invoice (e2e/billing.spec.ts:21:3): Error: expect(locator).toHaveText(expected) failed") && quiet.contains("✗ sums > adds two numbers (src/sum.test.ts)"), "{quiet}");
     // As a coding agent asks: the failed test, its file and error, and the counts.
     let o = superci(&served, &dir, &["runs", "retrieve", &run, "--tests", "--json"]).output().unwrap();
     let got: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
     let tests = &got["runs"][0]["job_list"][0]["tests"];
-    assert_eq!((tests["runners"][0].as_str(), tests["failed"].as_u64(), tests["passed"].as_u64()), (Some("vitest"), Some(1), Some(41)), "{got}");
+    assert_eq!((tests["runners"][0].as_str(), tests["runners"][1].as_str(), tests["failed"].as_u64(), tests["passed"].as_u64()), (Some("vitest"), Some("playwright"), Some(2), Some(45)), "{got}");
     assert_eq!((tests["failures"][0]["name"].as_str(), tests["failures"][0]["file"].as_str()), (Some("sums > adds two numbers"), Some("src/sum.test.ts")));
     assert!(tests["failures"][0]["error"].as_str().unwrap().starts_with("AssertionError: expected 3 to be 4"));
     // As a person reads it.
     let said = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "retrieve", &run, "--tests"]).output().unwrap().stdout).into_owned();
-    assert!(said.contains("Tests: 1 failed, 41 passed (vitest)") && said.contains("✗ sums > adds two numbers  (src/sum.test.ts)") && said.contains("AssertionError: expected 3 to be 4"), "{said}");
+    assert!(said.contains("Tests: 2 failed, 45 passed (vitest, playwright)") && said.contains("✗ [chromium] shows the invoice  (e2e/billing.spec.ts:21:3)") && said.contains("✗ sums > adds two numbers  (src/sum.test.ts)") && said.contains("AssertionError: expected 3 to be 4"), "{said}");
 }
 
 /// A checkout with these files, committed.
@@ -585,6 +606,16 @@ fn a_second_run_from_the_same_checkout_sends_only_what_changed_on_top_of_the_tre
         gunzipped(&bytes)
     };
     let (base, changed) = (part(0), part(1));
+    // (Sent while its machine started: the run was made first, and its machine told to wait until the computer said
+    // all of it was there.)
+    assert!(served.store.under("rtree-later:").is_empty(), "the computer said it was all sent");
+    let token = runner.at.trim_end_matches("/_apis/v1").rsplit('/').next().unwrap().to_string();
+    let handed = served.store.under(&format!("rjob:{token}"))[0].1.clone();
+    let tree_id = handed["tree"].as_str().unwrap().to_string();
+    let at = served.store.under(&format!("rtree-at:{tree_id}"))[0].1.to_string().trim_matches('"').to_string();
+    served.store.0.lock().unwrap().insert(format!("rtree-later:{tree_id}"), at);
+    assert_eq!(fetch(&format!("{tree}?part=0")).0, 425, "still on its way");
+    served.store.0.lock().unwrap().remove(&format!("rtree-later:{tree_id}"));
     assert!(base.contains("big.txt") && base.contains("soon gone") && base.contains("one\n"), "the base as it was");
     assert!(changed.contains("small.txt") && changed.contains("two\n") && !changed.contains("big.txt") && changed.contains(".superci-removed") && changed.contains("gone.txt\n"), "{changed}");
     // Most of the tree changed: all of it again, kept as the next base.

@@ -3224,9 +3224,18 @@ impl<'a> ControlPlane<'a> {
         let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
         let id = q.get("id").filter(|i| (16..=64).contains(&i.len()) && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
         let (Some(id), Some(part)) = (id, q.get("part").and_then(|p| p.parse::<u32>().ok()).filter(|p| *p < 1000)) else { return Ok(Response::text(400, "say which tree (id) and which part")) };
+        // The computer has sent all of a tree it said would come after its run was started (`later`).
+        if q.contains_key("sent") {
+            self.store.delete(&format!("rtree-later:{id}")).await?;
+            return Ok(Response::json(&serde_json::json!({ "sent": true })))
+        }
         if q.contains_key("link") {
             let now = self.clock.now_ms();
             let Some((region, creds)) = self.tree_bucket(plane_url, now).await? else { return Ok(Response::json(&serde_json::json!({ "url": null }))) };
+            // A tree sent while its run's machine starts (`later`): its machine waits for it until the computer says it
+            // is all there (a quarter of an hour at most).
+            let later = q.contains_key("later");
+            if later { self.store.put_until(&format!("rtree-later:{id}"), now.to_string(), now + 900_000).await? }
             let bucket = cache::bucket(&self.config.plane_id, &region);
             let named = |n: &String| (8..=80).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_alphanumeric());
             let _ = self.store.put_if_absent(&format!("rtree-at:{id}"), now.to_string()).await;
@@ -3241,13 +3250,13 @@ impl<'a> ControlPlane<'a> {
                     self.store.put(&format!("rtree-s3:{id}:00000"), format!("{region}|{base}")).await?;
                     let changed = tree_object(id, 1);
                     self.store.put(&format!("rtree-s3:{id}:00001"), format!("{region}|{changed}")).await?;
-                    return Ok(Response::json(&serde_json::json!({ "url": aws::presign("PUT", &aws::s3_url(&bucket, &region, &changed), &creds, &region, cache::LINK_SECONDS, now)?, "base": true, "parts": 2 })))
+                    return Ok(Response::json(&serde_json::json!({ "url": aws::presign("PUT", &aws::s3_url(&bucket, &region, &changed), &creds, &region, cache::LINK_SECONDS, now)?, "base": true, "parts": 2, "later": later })))
                 }
                 _ => tree_object(id, part),
             };
             let link = aws::presign("PUT", &aws::s3_url(&bucket, &region, &object), &creds, &region, cache::LINK_SECONDS, now)?;
             self.store.put(&format!("rtree-s3:{id}:{part:05}"), format!("{region}|{object}")).await?;
-            return Ok(Response::json(&serde_json::json!({ "url": link })))
+            return Ok(Response::json(&serde_json::json!({ "url": link, "later": later })))
         }
         if req.body.len() > 5_000_000 { return Ok(Response::text(413, "a part is 5 MB at most")) }
         for (i, piece) in req.body.chunks(300_000).enumerate() { self.store.put(&format!("rtree:{id}:{part:05}:{i:03}"), crate::crypto::b64(piece)).await? }
@@ -3280,6 +3289,7 @@ impl<'a> ControlPlane<'a> {
             }
         }
         self.store.delete(&format!("rtree-at:{tree}")).await?;
+        self.store.delete(&format!("rtree-later:{tree}")).await?;
         Ok(())
     }
 
@@ -3974,7 +3984,14 @@ impl<'a> ControlPlane<'a> {
                 let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
                 steps = handed.steps.iter().filter(|s| s["type"] != "Job").map(|s| serde_json::json!({ "id": s["id"], "name": s["name"], "state": s["state"], "result": s["result"], "order": s["order"], "log": s["log"], "start": s["start"], "finish": s["finish"] })).collect();
             }
-            out.push(serde_json::json!({ "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
+            // How its start went, once it is running: its record and what its machine said (see `MachineStart`).
+            let mut start = serde_json::Value::Null;
+            if let Some(r) = record.as_ref().filter(|r| r.started_ms.is_some()) {
+                start = serde_json::to_value(r).unwrap_or_default();
+                if let Some(m) = get_json::<serde_json::Value>(self.store, &format!("hello:{}", r.job_id)).await? { start["machine"] = m }
+                if let Some(o) = start.as_object_mut() { o.remove("hello"); o.remove("local"); }
+            }
+            out.push(serde_json::json!({ "start": start, "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
                 "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next, "posts": posts, "steps": steps,
                 // What its machine cost, and how long the job ran.
                 "usd": record.as_ref().map(|r| job_usd(r, self.clock.now_ms())), "took_ms": record.as_ref().and_then(|r| Some(r.ended_ms.unwrap_or(self.clock.now_ms()).saturating_sub(r.started_ms?))) }));
@@ -4003,6 +4020,9 @@ impl<'a> ControlPlane<'a> {
         if sub == "superci/tree" {
             let part = url.query_pairs().find(|(k, _)| k == "part").and_then(|(_, v)| v.parse::<u32>().ok()).unwrap_or(0);
             let Some(tree) = &before.tree else { return Ok(nothing_here()) };
+            // (Still on its way from the computer: asked for again in a moment.)
+            let since = self.store.get(&format!("rtree-later:{tree}")).await?.and_then(|at| at.trim_matches('"').parse::<u64>().ok());
+            if since.is_some_and(|at| self.clock.now_ms() < at + 900_000) { return Ok(Response::text(425, "the computer is still sending the working tree")) }
             // (In the bucket: a link there, for a while.)
             if let Some(kept) = self.store.get(&format!("rtree-s3:{tree}:{part:05}")).await? {
                 let now = self.clock.now_ms();
