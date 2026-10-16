@@ -289,6 +289,51 @@ fn a_run_whose_test_runner_found_no_test_says_so() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_green_run_whose_slot_ran_no_tests_says_so_lists_what_ran_and_its_job_is_found_by_its_run() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+    let run = run_of(&served);
+    // Three slots: one's `file:line` no longer points at a test, and no tests found is allowed there.
+    let lines: Vec<String> = ["[slot 1] Running 2 tests using 1 worker", "[slot 1]   ✓  1 [chromium] › e2e/cart.spec.ts:12:3 › adds to cart (2.0s)", "[slot 1]   ✘  2 [chromium] › e2e/cart.spec.ts:30:3 › known bug (1.0s)", "[slot 1]   2 passed (3.0s)",
+        "[slot 2] Running 0 tests using 0 workers", "[slot 3] Running 1 test using 1 worker", "[slot 3]   ✓  1 [chromium] › e2e/login.spec.ts:5:3 › logs in (1.0s)", "[slot 3]   1 passed (1.0s)"].iter().map(|s| s.to_string()).collect();
+    play(&served, &run, &lines, "succeeded");
+    let out = cli.wait_with_output().unwrap();
+    let quiet = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{quiet}");
+    assert!(quiet.contains("Tests: 0 failed, 3 passed (playwright)") && quiet.contains("[slot 2] Playwright ran no tests."), "{quiet}");
+    assert!(quiet.contains("What ran:") && quiet.contains("✓ [chromium] adds to cart  (e2e/cart.spec.ts:12:3)") && quiet.contains("✓ (failed as expected) [chromium] known bug"), "{quiet}");
+    // A passed job's tests too, with what was said of them.
+    let said = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "retrieve", &run, "--tests"]).output().unwrap().stdout).into_owned();
+    assert!(said.contains("[slot 2] Playwright ran no tests."), "{said}");
+    // Its job by its run, for a script: no id read out of text.
+    let file = dir.join("job.log");
+    let o = superci(&served, &dir, &["jobs", "retrieve", &format!("--run={run}"), &format!("--out={}", file.display())]).output().unwrap();
+    assert!(o.status.success() && std::fs::read_to_string(&file).unwrap().contains("[slot 2] Running 0 tests"), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = superci(&served, &dir, &["jobs", "retrieve", &format!("--run={run}"), "--job=nope"]).output().unwrap();
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("has no job nope (its jobs: tests)"), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_run_followed_with_json_gives_its_jobs_ids() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--json"]).spawn().unwrap();
+    let run = run_of(&served);
+    play(&served, &run, &["broken".to_string()], "failed");
+    let out = cli.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    let got: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stdout)));
+    assert_eq!((got["ok"].as_bool(), got["result"].as_str(), got["run_id"].as_str()), (Some(false), Some("failure"), Some(run.as_str())), "{got}");
+    let job = got["jobs"][0]["job_id"].as_str().unwrap_or_else(|| panic!("{got}")).to_string();
+    assert!(got["error"].as_str().unwrap().contains("The run ended: failure"));
+    let o = superci(&served, &dir, &["jobs", "retrieve", &job]).output().unwrap();
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("broken"), "{}", String::from_utf8_lossy(&o.stdout));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A checkout with these files, committed.
 fn checkout_with(files: &[(&str, &str)]) -> std::path::PathBuf {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

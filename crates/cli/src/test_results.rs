@@ -16,9 +16,23 @@ pub struct Tests {
     pub failed: u64,
     pub skipped: u64,
     pub failures: Vec<Failure>,
-    /// What a runner said of the tests as a whole that a count does not: that none matched what was asked, say.
+    /// What a runner said of the tests as a whole that a count does not: that none matched what was asked, or that
+    /// it ran none (a `file:line` that no longer points at a test, with no tests found allowed).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Each test that ran and how it came out, where the runner lists them (Playwright's list): the first `MOST`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ran: Vec<Ran>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Ran {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// "passed", "failed", "skipped", "flaky" (failed, then passed when run again), or "failed as expected" (a test
+    /// marked to fail, as `test.fail()`, that failed: a pass, though its runner marks it ✘).
+    pub outcome: &'static str,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -101,14 +115,43 @@ pub fn read(log: &str) -> Tests {
         }
     }
     let mut t = Tests::default();
-    for (_, lines) in streams {
-        let one = read_lines(&lines);
+    for (mark, lines) in streams {
+        let mut one = read_lines(&lines);
+        // A runner that ran nothing, and did not say why: said (the run may have passed without its tests).
+        if !one.runners.is_empty() && one.notes.is_empty() && one.passed + one.failed + one.skipped == 0 && one.failures.is_empty() {
+            one.notes.push(format!("{} ran no tests.", one.runners.iter().map(|r| runner_name(r)).collect::<Vec<_>>().join(", ")));
+        }
         for r in one.runners { if !t.runners.contains(&r) { t.runners.push(r) } }
         (t.passed, t.failed, t.skipped) = (t.passed + one.passed, t.failed + one.failed, t.skipped + one.skipped);
         for f in one.failures { if t.failures.len() < MOST { t.failures.push(f) } }
-        for n in one.notes { if !t.notes.contains(&n) { t.notes.push(n) } }
+        for r in one.ran { if t.ran.len() < MOST { t.ran.push(r) } }
+        // (Which process said it, where lines are marked so.)
+        for n in one.notes { let n = if mark.is_empty() { n } else { format!("{mark} {n}") }; if !t.notes.contains(&n) { t.notes.push(n) } }
     }
     t
+}
+
+fn runner_name(r: &str) -> &'static str {
+    match r { "vitest" => "Vitest", "jest" => "Jest", "playwright" => "Playwright", "pytest" => "pytest", "cargo" => "cargo test", "go" => "go test", _ => "A test runner" }
+}
+
+/// A line of Playwright's list of tests as they end (`  ✓  3 [chromium] › e2e/a.spec.ts:4:3 › logs in (2.1s)`): its
+/// mark, the test's name (with its project) and its file.
+fn listed(s: &str) -> Option<(char, String, String)> {
+    let mark = s.chars().next().filter(|c| ['✓', '✘', '-'].contains(c))?;
+    let rest = s[mark.len_utf8()..].trim_start();
+    let rest = rest.split_once(' ').filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()).map(|(_, r)| r.trim_start()).unwrap_or(rest);
+    let parts: Vec<&str> = rest.split(" › ").collect();
+    let (project, file, title) = match parts.as_slice() {
+        [p, f, t @ ..] if p.starts_with('[') && p.ends_with(']') && !t.is_empty() => (Some(&p[1..p.len() - 1]), *f, t.join(" › ")),
+        [f, t @ ..] if !t.is_empty() && f.contains(':') => (None, *f, t.join(" › ")),
+        _ => return None,
+    };
+    if !file.chars().last().is_some_and(|c| c.is_ascii_digit()) { return None }
+    // (Without its time, and a retry's mark.)
+    let mut title = title.trim().to_string();
+    for _ in 0..2 { if title.ends_with(')') { if let Some(at) = title.rfind(" (") { title.truncate(at) } } }
+    Some((mark, match project { Some(p) => format!("[{p}] {title}"), None => title }, file.trim().to_string()))
 }
 
 /// A runner's word that it ran no test because none matched (its runner, and the note), from one of its lines.
@@ -123,6 +166,7 @@ fn none_matched(s: &str) -> Option<(&'static str, &'static str)> {
 
 fn read_lines(lines: &[String]) -> Tests {
     let mut t = Tests::default();
+    let mut listed_order: Vec<(String, String, &'static str)> = vec![];
     let runner = |t: &mut Tests, name: &'static str| if !t.runners.contains(&name) { t.runners.push(name) };
     let push = |t: &mut Tests, f: Failure| if t.failures.len() < MOST && !t.failures.iter().any(|g| g.runner == f.runner && g.name == f.name) { t.failures.push(f) };
     let playwright = lines.iter().any(|l| l.trim_start().starts_with("Running ") && l.contains(" using ") && l.contains("worker"));
@@ -160,8 +204,21 @@ fn read_lines(lines: &[String]) -> Tests {
             (t.passed, t.failed, t.skipped) = (t.passed + count(rest, "passed"), t.failed + count(rest, "failed"), t.skipped + count(rest, "skipped") + count(rest, "todo"));
             continue;
         }
-        // Playwright: `1) [chromium] › tests/a.spec.ts:12:5 › name ───`, then its summary lines.
+        // Playwright: each test as it ends (its list), `1) [chromium] › tests/a.spec.ts:12:5 › name ───` for each
+        // failure, then its summary lines.
         if playwright {
+            // (Its first line: Playwright ran here, though it may say nothing more.)
+            if s.starts_with("Running ") && s.contains(" using ") && s.contains("worker") { runner(&mut t, "playwright"); continue }
+            if let Some((mark, name, file)) = listed(s) {
+                runner(&mut t, "playwright");
+                let outcome = match mark { '✓' => "passed", '✘' => "failed", _ => "skipped" };
+                match listed_order.iter().position(|(n, f, _)| *n == name && *f == file) {
+                    // (Run again: failed before and passed now is flaky.)
+                    Some(at) => { let was = listed_order[at].2; listed_order[at].2 = if was == "failed" && outcome == "passed" { "flaky" } else { outcome } }
+                    None => listed_order.push((name, file, outcome)),
+                }
+                continue;
+            }
             if let Some((n, rest)) = s.split_once(") [").filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
                 let _ = n;
                 let parts: Vec<&str> = rest.split(" › ").collect();
@@ -225,6 +282,12 @@ fn read_lines(lines: &[String]) -> Tests {
     }
     // (Failures listed but no summary seen: counted from the list.)
     if t.failed < t.failures.len() as u64 { t.failed = t.failures.len() as u64 }
+    // A test listed as failed that is not among the failures failed as it was marked to (`test.fail()`).
+    for (name, file, outcome) in listed_order {
+        let failure = t.failures.iter().any(|f| f.name == name && f.file.as_deref() == Some(file.as_str()));
+        let outcome = if outcome == "failed" && !failure { "failed as expected" } else { outcome };
+        if t.ran.len() < MOST { t.ran.push(Ran { name, file: Some(file), outcome }) }
+    }
     t
 }
 
@@ -291,10 +354,33 @@ mod tests {
     fn a_runner_that_found_no_test_matching_says_so() {
         let t = read("[slot 1] Running 0 tests using 0 workers\n[slot 1] Error: No tests found.\n[slot 1] Make sure that arguments are regular expressions matching test files.");
         assert_eq!((t.runners.clone(), t.failed, t.notes.len()), (vec!["playwright"], 0, 1));
-        assert!(t.notes[0].starts_with("Playwright found no test to run: a `file:line` must be the first line of a test"));
+        assert!(t.notes[0].starts_with("[slot 1] Playwright found no test to run: a `file:line` must be the first line of a test"), "{:?}", t.notes);
         assert_eq!(read("No test files found, exiting with code 1").notes, ["Vitest found no test file matching what was asked."]);
         assert_eq!(read("No tests found, exiting with code 1\nRun with `--passWithNoTests` to exit with code 0").runners, ["jest"]);
         assert_eq!(read("============================ no tests ran in 0.01s =============================").runners, ["pytest"]);
+    }
+
+    #[test]
+    fn the_tests_that_ran_are_listed_a_test_marked_to_fail_passes_and_a_process_that_ran_none_is_said() {
+        let log = "[slot 1] Running 4 tests using 2 workers\n\
+                   [slot 1]   ✓  1 [chromium] › e2e/a.spec.ts:4:3 › logs in (2.1s)\n\
+                   [slot 1]   ✘  2 [chromium] › e2e/a.spec.ts:9:3 › known bug (1.0s)\n\
+                   [slot 1]   ✘  3 [chromium] › e2e/b.spec.ts:2:1 › sometimes (3.0s)\n\
+                   [slot 1]   ✓  4 [chromium] › e2e/b.spec.ts:2:1 › sometimes (retry #1) (2.0s)\n\
+                   [slot 1]   -  5 [chromium] › e2e/c.spec.ts:1:1 › later\n\
+                   [slot 1]   1 skipped\n\
+                   [slot 1]   1 flaky\n\
+                   [slot 1]   2 passed (6.0s)\n\
+                   [slot 2] Running 0 tests using 0 workers\n\
+                   [slot 3] Running 1 test using 1 worker\n\
+                   [slot 3]   ✓  1 e2e/d.spec.ts:3:1 › alone (1s)\n\
+                   [slot 3]   1 passed (1.0s)";
+        let t = read(log);
+        assert_eq!((t.failed, t.passed, t.skipped), (0, 4, 1));
+        let ran: Vec<(&str, &str)> = t.ran.iter().map(|r| (r.name.as_str(), r.outcome)).collect();
+        assert_eq!(ran, [("[chromium] logs in", "passed"), ("[chromium] known bug", "failed as expected"), ("[chromium] sometimes", "flaky"), ("[chromium] later", "skipped"), ("alone", "passed")]);
+        assert_eq!(t.ran[0].file.as_deref(), Some("e2e/a.spec.ts:4:3"));
+        assert_eq!(t.notes, ["[slot 2] Playwright ran no tests."]);
     }
 
     #[test]

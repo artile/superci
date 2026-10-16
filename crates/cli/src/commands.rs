@@ -25,7 +25,7 @@ const HELP: &[(&str, &str, &str)] = &[
         "It also asks Cloudflare to end its sign-in, and the control plane to forget this machine's key. Your control plane\nand runners keep working."),
     ("status", "  superci status                    The control plane in use: where, its version, whether jobs can run.",
         "With --json: the control plane, and under \"status\" everything it says of itself (repositories, runner providers,\nlimits, the latest jobs)."),
-    ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N] [--out=FILE] [--tests]",
+    ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N] [--out=FILE] [--tests]\n  superci jobs retrieve --run=ID [--job=NAME] [--out=FILE] [--tests]",
         "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job: how its start went step by step (what AWS was asked and answered, when its machine booted, when\n          its runner listened), and the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, four million at most). --out=FILE: its whole log into FILE, whatever its size. GitHub keeps a job's log once the job has ended.\n          --tests: its tests instead, from its whole log: the ones that failed, each with its file and error, and how many\n          passed, failed and were skipped (what Vitest, Jest, Playwright, pytest, cargo and Go say in their output)."),
     ("runs", "  superci runs list\n  superci runs retrieve ID [--tests]\n  superci runs create --workflow=FILE [--job=NAME] [--quiet] [--detach]\n  superci runs wait ID [--quiet]\n  superci runs cancel ID",
         "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again). --tests: each failed job's tests too,\n          from its whole log: the ones that failed, with their files and errors, and where its artifacts are.\ncreate    Runs a workflow's job from this computer, as GitHub would run it, on a machine as any job here: the working\n          tree as it is (what git tracks, and new files it does not ignore), with nothing pushed. --workflow=FILE runs its\n          jobs (each combination of a matrix a job of its own, each job once those it needs have ended); --job=NAME\n          runs that job and those it needs. --event=push|pull_request (push unless given), and what GitHub would give\n          it and cannot here: --secret=NAME=VALUE and --var=NAME=VALUE, as often as needed. It waits for the run and\n          prints its jobs' lines, then each step's result and time and what its machines cost; it fails when the run does.\n          --quiet: each step's result, and the last lines of one that failed, not every line (for a coding agent).\n          --detach: says the run's id and ends; `superci runs wait ID` follows it.\nwait      Follows a run from a computer to its end, as create does.\ncancel    Stops a run, as GitHub's Cancel does: its jobs not started end, and a running one is told to stop (its steps\n          have five minutes), then its machine ends. A GitHub run is cancelled by GitHub, asked with your App's token.\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
@@ -121,18 +121,23 @@ SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"])
 /// How a command did not do its thing: it was not a whole command (its resource's help follows), it would delete
 /// something and was not told to, or it failed.
 #[derive(Debug, PartialEq)]
-pub enum Fail { Usage(String), Unconfirmed(String), Failed(String) }
+/// A command that failed: not a whole command (its help follows), a change not confirmed, or one that failed, with what
+/// it read on the way when there is that (a run that ended in failure, with its jobs), for `--json`.
+pub enum Fail { Usage(String), Unconfirmed(String), Failed(String), Ended(String, Value) }
 
 impl From<String> for Fail { fn from(e: String) -> Self { Fail::Failed(e) } }
 impl From<&str> for Fail { fn from(e: &str) -> Self { Fail::Failed(e.to_string()) } }
 
 impl Fail {
-    pub fn said(&self) -> &str { match self { Fail::Usage(e) | Fail::Unconfirmed(e) | Fail::Failed(e) => e } }
+    pub fn said(&self) -> &str { match self { Fail::Usage(e) | Fail::Unconfirmed(e) | Fail::Failed(e) | Fail::Ended(e, _) => e } }
 }
 
 type Result<T> = std::result::Result<T, Fail>;
 
 fn usage<T>(say: impl Into<String>) -> Result<T> { Err(Fail::Usage(say.into())) }
+
+/// A run followed to its end: done when it succeeded, else a failure with what was read of it.
+fn ended(done: Done) -> Result<Done> { if done.data["ok"] == false { Err(Fail::Ended(done.said.join("\n"), done.data)) } else { Ok(done) } }
 
 /// What was typed: words, and flags with their values (`--region us-east-1`, `--region=us-east-1`; a flag given
 /// twice keeps both).
@@ -339,10 +344,23 @@ fn tests_lines(t: &Value, indent: &str) -> Vec<String> {
         out.push(format!("{indent}✗ {}{}", f["name"].as_str().unwrap_or_default(), f["file"].as_str().map(|p| format!("  ({p})")).unwrap_or_default()));
         for l in f["error"].as_str().unwrap_or_default().lines() { out.push(format!("{indent}    {l}")) }
     }
+    out.extend(ran_lines(t, indent));
     for n in t["notes"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) { out.push(format!("{indent}{n}")) }
     if let Some(note) = t["note"].as_str() { out.push(format!("{indent}{note}")) }
     for a in t["artifacts"].as_array().into_iter().flatten() { out.push(format!("{indent}Artifact {}: `{}`", a["name"].as_str().unwrap_or_default(), a["fetch"].as_str().unwrap_or_default())) }
     if let Some(at) = t["artifacts_at"].as_str() { out.push(format!("{indent}Its artifacts: {at}")) }
+    out
+}
+
+/// The tests that ran, each with how it came out, when there are few enough to read (30 at most; else the counts say it).
+pub fn ran_lines(t: &Value, indent: &str) -> Vec<String> {
+    let ran = t["ran"].as_array().cloned().unwrap_or_default();
+    if ran.is_empty() || ran.len() > 30 { return vec![] }
+    let mut out = vec![format!("{indent}What ran:")];
+    for r in &ran {
+        let mark = match r["outcome"].as_str().unwrap_or_default() { "passed" => "✓", "failed" => "✗", "skipped" => "–", "flaky" => "✓ (flaky)", "failed as expected" => "✓ (failed as expected)", _ => "·" };
+        out.push(format!("{indent}  {mark} {}{}", r["name"].as_str().unwrap_or_default(), r["file"].as_str().map(|f| format!("  ({f})")).unwrap_or_default()));
+    }
     out
 }
 
@@ -414,10 +432,25 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("jobs", "list") => jobs(),
         ("jobs", "retrieve") => {
             let id = w(2);
-            if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return usage("Say which: `superci jobs retrieve ID` (ids are in `superci jobs list`).") }
+            // Or by its run and its name (`--run=ID --job=NAME`; the name may be left out when the run has one job), for
+            // a script that started the run.
+            let by_run = args.get("run").filter(|_| id.is_empty());
+            if by_run.is_none() && (id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit())) { return usage("Say which: `superci jobs retrieve ID`, or `--run=ID --job=NAME` (ids are in `superci jobs list`).") }
             let mut d = signed_in();
             let (v, key) = look(&mut d)?;
-            let j = v.jobs().into_iter().find(|j| j["job_id"].as_u64().is_some_and(|n| n.to_string() == id)).ok_or("That job is not among the latest this control plane keeps (ids are in `superci jobs list`).")?;
+            let j = match by_run {
+                Some(run) => {
+                    let of_run: Vec<Value> = v.jobs().into_iter().filter(|j| j["run_id"].as_u64().is_some_and(|n| n.to_string() == run)).collect();
+                    let names = || of_run.iter().filter_map(|j| j["name"].as_str()).collect::<Vec<_>>().join(", ");
+                    match args.get("job") {
+                        Some(name) => of_run.iter().find(|j| j["name"] == name).cloned().ok_or_else(|| if of_run.is_empty() { format!("No jobs of run {run} among the latest this control plane keeps (ids are in `superci runs list`).") } else { format!("Run {run} has no job {name} (its jobs: {}).", names()) })?,
+                        None if of_run.len() == 1 => of_run[0].clone(),
+                        None if of_run.is_empty() => return Err(format!("No jobs of run {run} among the latest this control plane keeps (ids are in `superci runs list`).").into()),
+                        None => return usage(format!("Run {run} has several jobs: say which with --job=NAME ({}).", names())),
+                    }
+                }
+                None => v.jobs().into_iter().find(|j| j["job_id"].as_u64().is_some_and(|n| n.to_string() == id)).ok_or("That job is not among the latest this control plane keeps (ids are in `superci jobs list`).")?,
+            };
             let words = job_words(&j);
             // Its whole log into a file, whatever its size.
             if let Some(out) = args.get("out") {
@@ -459,7 +492,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 None => { let mut d = signed_in(); let (v, key) = look(&mut d)?; (v.plane.url().to_string(), crate::cloudflare::plane_key(&key, v.plane.url())) }
             };
             let how = crate::local_run::Follow { quiet: args.has("quiet"), detach: args.has("detach"), dry_run: args.has("dry-run") };
-            Ok(crate::local_run::create(&url, &key, workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, how, steps)?)
+            ended(crate::local_run::create(&url, &key, workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, how, steps)?)
         }
         ("runs", "cancel") => {
             let id = w(2);
@@ -481,7 +514,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 Some((url, key)) => (url, key),
                 None => { let mut d = signed_in(); let (v, key) = look(&mut d)?; (v.plane.url().to_string(), crate::cloudflare::plane_key(&key, v.plane.url())) }
             };
-            Ok(crate::local_run::wait(&url, &key, &w(2), crate::local_run::Follow { quiet: args.has("quiet"), ..Default::default() }, steps)?)
+            ended(crate::local_run::wait(&url, &key, &w(2), crate::local_run::Follow { quiet: args.has("quiet"), ..Default::default() }, steps)?)
         }
         ("usage", "retrieve") => {
             let period = args.get("period").unwrap_or("day");
@@ -530,8 +563,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 said.push(r["link"].as_str().unwrap_or_default().to_string());
                 for (j, words) in raw.iter().zip(its.iter_mut()) {
                     said.push(format!("  {}", job_line(words)));
-                    // Its tests, from its whole log: the failed jobs' (a passed job's would only say that).
-                    if args.has("tests") && failed_job(j) {
+                    // Its tests, from its whole log: a passed job's too (it may have run fewer than asked, or none).
+                    if args.has("tests") && (failed_job(j) || j["machine_id"].is_string()) {
                         let tests = job_tests(&v, &key, j);
                         said.extend(tests_lines(&tests, "    "));
                         words["tests"] = tests;

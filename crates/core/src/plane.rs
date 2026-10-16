@@ -4003,7 +4003,7 @@ impl<'a> ControlPlane<'a> {
                 if let Some(m) = get_json::<serde_json::Value>(self.store, &format!("hello:{}", r.job_id)).await? { start["machine"] = m }
                 if let Some(o) = start.as_object_mut() { o.remove("hello"); o.remove("local"); }
             }
-            out.push(serde_json::json!({ "start": start, "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
+            out.push(serde_json::json!({ "start": start, "job_id": record.as_ref().map(|r| r.job_id.to_string()), "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
                 "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next, "posts": posts, "steps": steps,
                 // What its machine cost, and how long the job ran.
                 "usd": record.as_ref().map(|r| job_usd(r, self.clock.now_ms())), "took_ms": record.as_ref().and_then(|r| Some(r.ended_ms.unwrap_or(self.clock.now_ms()).saturating_sub(r.started_ms?))) }));

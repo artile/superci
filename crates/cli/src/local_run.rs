@@ -331,7 +331,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             // printed as they came.
             let usd: f64 = jobs.iter().filter_map(|j| j["usd"].as_f64()).sum::<f64>() + 0.0;
             for (i, j) in jobs.iter().enumerate() {
-                say(&format!("{}{} ({}{}{}): {}", crate::commands::JOB_LINE, j["name"].as_str().unwrap_or("job"), j["machine"].as_str().unwrap_or("no machine"),
+                say(&format!("{}{}{} ({}{}{}): {}", crate::commands::JOB_LINE, j["name"].as_str().unwrap_or("job"), j["job_id"].as_str().map(|id| format!(" · job {id}")).unwrap_or_default(), j["machine"].as_str().unwrap_or("no machine"),
                     j["took_ms"].as_u64().map(|ms| format!(", {}", span(ms / 1000))).unwrap_or_default(), j["usd"].as_f64().map(|u| format!(", ${u:.3}")).unwrap_or_default(),
                     match (j["result"].as_str().unwrap_or("?"), j["error"].as_str().filter(|e| !e.is_empty())) { (r, Some(e)) => format!("{r} ({e})"), (r, None) => r.to_string() }));
                 let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
@@ -362,16 +362,19 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     all.push_str(&text);
                     all.push('\n');
                 }
+                if let (Some(id), true) = (j["job_id"].as_str(), j["result"] == "failure") { say(&format!("{}  Its whole log: superci jobs retrieve {id} --out=job.log", crate::commands::JOB_LINE)) }
                 // What its tests came to, passed or not, and what a runner said of them as a whole.
                 let tests = crate::test_results::read(&all);
                 if !tests.runners.is_empty() {
                     say(&format!("{}  Tests: {} failed, {} passed{} ({})", crate::commands::JOB_LINE, tests.failed, tests.passed, if tests.skipped > 0 { format!(", {} skipped", tests.skipped) } else { String::new() }, tests.runners.join(", ")));
+                    for l in crate::commands::ran_lines(&serde_json::to_value(&tests).unwrap_or_default(), "  ") { say(&format!("{}{l}", crate::commands::JOB_LINE)) }
                     for n in &tests.notes { say(&format!("{}  {n}", crate::commands::JOB_LINE)) }
                 }
             }
             let said = format!("The run ended: {result}, {} after it was {}, ${usd:.3} of machines.", span(took), if sent_here { "sent" } else { "followed from here" });
-            if result != "success" { return Err(said) }
-            return Ok(Done { said: vec![said], data: json!({ "run_id": run, "result": result, "seconds": took, "usd": usd, "jobs": jobs.iter().map(|j| json!({ "name": j["name"], "result": j["result"], "machine": j["machine"], "usd": j["usd"], "took_ms": j["took_ms"],
+            // (Not a success: the same data, as a failure's, with its job ids for a script.)
+            let ok = result == "success";
+            return Ok(Done { said: vec![said.clone()], data: json!({ "ok": ok, "error": if ok { Value::Null } else { said.into() }, "run_id": run, "result": result, "seconds": took, "usd": usd, "jobs": jobs.iter().map(|j| json!({ "name": j["name"], "job_id": j["job_id"], "result": j["result"], "machine": j["machine"], "usd": j["usd"], "took_ms": j["took_ms"],
                 "steps": j["steps"].as_array().into_iter().flatten().map(|s| json!({ "name": s["name"], "result": s["result"], "start": s["start"], "finish": s["finish"] })).collect::<Vec<_>>() })).collect::<Vec<_>>() }) })
         }
         if began.elapsed().as_secs() > 6 * 3600 { return Err(format!("Still not over after six hours: `superci runs retrieve {run}`.")) }
