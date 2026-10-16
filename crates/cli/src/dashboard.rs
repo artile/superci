@@ -5056,7 +5056,8 @@ var before=list.dataset.order.split(','),note=document.getElementById('order-not
 function say(c,h){if(note){note.className='order-note '+c;note.innerHTML=h}}
 function keep(o){list.dataset.order=o;document.querySelectorAll('input[name=current]').forEach(function(i){i.value=o})}
 keep(order.join());li.classList.add('moved');say('saving','<span class="mini-spin"></span>Saving the order…');
-fetch('/routing',{method:'POST',body:body,credentials:'same-origin'}).then(function(r){if(!r.ok)throw 0;li.classList.remove('moved');say('saved','<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>Order saved');setTimeout(function(){if(note&&note.classList.contains('saved'))say('','')},2500)})
+var qs=['w','c'].filter(function(n){return new URLSearchParams(location.search).get(n)}).map(function(n){return n+'='+encodeURIComponent(new URLSearchParams(location.search).get(n))}).join('&');
+fetch('/routing'+(qs?'?'+qs:''),{method:'POST',body:body,credentials:'same-origin'}).then(function(r){if(!r.ok)throw 0;li.classList.remove('moved');say('saved','<svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>Order saved');setTimeout(function(){if(note&&note.classList.contains('saved'))say('','')},2500)})
 .catch(function(){before.forEach(function(c){var x=list.querySelector('.pool[data-cloud="'+c+'"]');if(x)list.appendChild(x)});keep(before.join());li.classList.remove('moved');say('bad','The order was not saved; it is back as it was.')})});})();
 </script>"#;
 

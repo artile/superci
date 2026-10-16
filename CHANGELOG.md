@@ -8,6 +8,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - Runs from a computer run steps side by side as GitHub does: `background: true`, `wait`, `wait-all`, `cancel` and `parallel` groups, refused where GitHub refuses them.
 - A GitHub job whose steps ran side by side shows each step's own lines on its page, from its run's logs once the run has ended (until then its lines are in the order they came, and the page says so).
 - On AWS and Modal control planes, a job's Raw log opens GitHub's own link again, whatever its size.
+- With several workspaces on the computer, dragging Runners into a new order saves it, instead of putting it back as it was.
 - `superci login aws --workspace=ID` with several workspaces on the computer: Continue to AWS goes on to AWS, instead of a page asking which workspace.
 - A matrix made by an expression (`${{ fromJSON(needs.setup.outputs.matrix) }}`) is read once the jobs it needs have ended, as on GitHub.
 - A job's `timeout-minutes` ends it once it has run that long, and its `continue-on-error` lets the run go on when it fails (the jobs that need it see a success, as on GitHub).

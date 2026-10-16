@@ -159,6 +159,9 @@ fn a_runner_provider_is_taken_out_of_the_order_and_put_back_and_awss_on_demand_m
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     let home = signed_in(&served);
+    // (Another workspace on this computer: what is changed says which workspace it is for.)
+    std::fs::create_dir_all(home.join("workspaces/globex")).unwrap();
+    std::fs::write(home.join("workspaces/globex/sign-ins.json"), "{}").unwrap();
     let (mut child, link) = dashboard(&home);
     let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
     let order = || setting("ROUTING").and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok()).map(|r| r["order"].clone()).unwrap_or_default();
@@ -166,18 +169,27 @@ fn a_runner_provider_is_taken_out_of_the_order_and_put_back_and_awss_on_demand_m
     b.wait(&shows("Usage"));
     b.click("nav a", "Runners");
     b.wait(&shows("Runner providers"));
+    // Dragged: Cloudflare to the top, and saved.
+    b.eval(r#"(() => { const list = document.querySelector('ol.pools'), moved = list.querySelector('[data-cloud="cloudflare"]'), first = list.querySelector('.pool'), dt = new DataTransfer();
+        moved.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+        first.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt, clientY: first.getBoundingClientRect().top + 1 }));
+        moved.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dt })); })()"#);
+    b.wait("document.getElementById('order-note').textContent.includes('Order saved')");
+    assert_eq!(order().as_array().map(|o| o.iter().map(|p| p["cloud"].clone()).collect::<Vec<_>>()), Some(vec![serde_json::json!("cloudflare"), serde_json::json!("aws"), serde_json::json!("aws-on-demand")]));
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&shows("Runner providers"));
     // AWS on-demand's settings, like AWS spot's: its regions (here N. Virginia, where the control plane is set up).
     b.click(r#"button[aria-label="AWS on-demand settings"]"#, "");
-    b.wait("document.getElementById('pool-1').open");
-    assert_eq!(b.eval("[...document.querySelectorAll('#pool-1 .rg')].map(r => r.dataset.region)"), serde_json::json!(["us-east-1"]));
-    b.fill("#pool-1 input[name=max]", "3");
-    b.click("#pool-1 button.primary", "Save");
+    b.wait("document.getElementById('pool-2').open");
+    assert_eq!(b.eval("[...document.querySelectorAll('#pool-2 .rg')].map(r => r.dataset.region)"), serde_json::json!(["us-east-1"]));
+    b.fill("#pool-2 input[name=max]", "3");
+    b.click("#pool-2 button.primary", "Save");
     until("on-demand's limit and regions", || order().as_array().is_some_and(|o| o.iter().any(|p| p["cloud"] == "aws-on-demand" && p["max_jobs"] == 3 && p["regions"] == serde_json::json!(["us-east-1"]))));
     b.wait(&shows("Runner providers"));
     // Taken out from its dialog: out of the order, said below it; nothing deleted.
     b.click(r#"button[aria-label="AWS on-demand settings"]"#, "");
-    b.wait("document.getElementById('pool-1').open");
-    b.click("#pool-1 button.secondary", "Take out of the order");
+    b.wait("document.getElementById('pool-2').open");
+    b.click("#pool-2 button.secondary", "Take out of the order");
     until("on-demand taken out", || order().as_array().is_some_and(|o| o.iter().any(|p| p["cloud"] == "aws-on-demand" && p["off"] == true && p["max_jobs"] == 3)));
     b.wait(&shows("Taken out of the order"));
     assert_eq!(b.eval(r#"document.querySelector('li.pool[data-cloud="aws-on-demand"]') === null"#), serde_json::json!(true));
