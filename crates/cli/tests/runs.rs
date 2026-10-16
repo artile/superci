@@ -499,3 +499,17 @@ fn a_running_run_is_cancelled_from_its_page_in_the_browser() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_called_workflows_required_input_not_given_is_said_and_nothing_runs() {
+    let served = serve(|_| {});
+    let dir = checkout_with(&[
+        (".github/workflows/ci.yml", "jobs:\n  build:\n    uses: ./.github/workflows/build.yml\n    with:\n      fast: false\n"),
+        (".github/workflows/build.yml", "on:\n  workflow_call:\n    inputs:\n      target:\n        type: string\n        required: true\n      fast:\n        type: boolean\n        default: true\njobs:\n  compile:\n    runs-on: superci\n    steps:\n      - run: make ${{ inputs.target }}\n"),
+    ]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("the called workflow's input target is required, and not given"), "{said}");
+    assert!(served.machines.0.lock().unwrap().is_empty(), "no machine started");
+    let _ = std::fs::remove_dir_all(&dir);
+}

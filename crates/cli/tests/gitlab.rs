@@ -125,3 +125,18 @@ fn gitlab_is_connected_and_a_project_switched_on_and_off_in_the_browser() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_gitlab_job_asking_for_windows_or_only_modal_is_said_to_have_nowhere_to_run() {
+    // Modal's sandboxes beside Cloudflare's containers: neither runs Docker for GitLab on Windows, and Modal runs none.
+    let served = serve(|c| { c.containers = true; c.agents = vec![superci_core::plane::Agent { cloud: "modal".into(), url: "https://acme--superci-runners.modal.run".into() }]; });
+    served.connect_gitlab();
+    for (tags, why) in [(&["superci/os=windows"][..], "runs no GitLab jobs on Windows"), (&["superci/provider=modal"], "Modal runs no Docker")] {
+        let (id, pending) = served.gitlab.pending("test", tags, served.now_ms());
+        assert!(served.gitlab_webhook(pending) < 300);
+        let job = served.store.under(&format!("job:gl{id}")).into_iter().next().map(|(_, j)| j).unwrap_or_default();
+        let error = job["error"].as_str().unwrap_or_default().to_string();
+        assert!(error.contains(why), "{tags:?}: {job}");
+    }
+    assert!(served.machines.0.lock().unwrap().is_empty(), "no machine started");
+}
