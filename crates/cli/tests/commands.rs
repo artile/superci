@@ -329,9 +329,17 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
         (&["artifacts", "list", "--run=x1"], "Say which run: --run=ID"),
         (&["artifacts", "retrieve", "--run=12"], "Say which artifact"),
         (&["usage", "retrieve", "--period=year"], "--period is day, week or month"),
+        (&["jobs", "list", "-x"], "-x is not a flag of superci"),
+        (&["jobs", "retrieve", "x1"], "Say which: `superci jobs retrieve ID`"),
+        (&["login", "gcp"], "Say which: `superci login aws`"),
     ] {
         let (code, v) = json(&home, args);
         assert!(code == 2 && v["error"].as_str().unwrap_or_default().contains(said), "{args:?}: {code} {v}");
+    }
+    // Signed in already: said, and no sign-in begun (a further AWS account is `--add`).
+    for args in [&["login", "aws"][..], &["login"]] {
+        let o = superci(&home, args);
+        assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("SuperCI is signed in on this computer"), "{args:?}: {}", String::from_utf8_lossy(&o.stdout));
     }
     // What deletes needs --confirm; with --dry-run, what it would do, and nothing done.
     let (code, v) = json(&home, &["caches", "delete", "--repo=acme/app"]);
