@@ -308,3 +308,23 @@ fn a_github_run_is_cancelled_from_the_cli_by_github_and_its_running_jobs_machine
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_job_asking_for_more_than_allowed_fails_at_once_saying_why_and_the_dashboard_shows_why() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    // More than any machine (a label that says no machine), and more than this CI allows (32 CPUs unless set).
+    for (label, why) in [("superci/cpu=999", "cpu is a number of CPUs from 1 to 192"), ("superci/cpu=64", "the most allowed is 32")] {
+        let (id, queued) = served.github.queue("test", label, served.now_ms());
+        assert_eq!(served.webhook(queued), 202);
+        let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+        assert!(job["state"] == "failed" && job["failed_fast"] == true && job["error"].as_str().unwrap_or_default().contains(why), "{label}: {job}");
+    }
+    assert!(served.machines.0.lock().unwrap().iter().all(|m| m.ends_with("-x")), "no machine for it, only one that fails it on GitHub: {:?}", served.machines.0.lock().unwrap());
+    let (mut child, link) = dashboard(&home);
+    let (_, page) = part(&link, "/?p=jobs&fragment=1");
+    assert!(words(&page).contains("the most allowed is 32"), "{}", words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
