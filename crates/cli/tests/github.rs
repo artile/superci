@@ -368,3 +368,80 @@ fn each_jobs_row_says_where_it_ran_and_why_in_plain_words() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn github_jobs_reach_the_cache_with_githubs_own_token_each_branch_in_its_own_scope_reading_the_default_branchs() {
+    // A control plane with its own AWS account; a machine's link to its cache; GitHub's App connected.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    let link = "machine-cache-link-000000000002";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner" }).to_string());
+    let post = |what: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut r = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body.to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    let put = |url: &str, bytes: &[u8]| {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        agent.put(&format!("{}/{}", served.aws.url, url.trim_start_matches("https://"))).send(bytes).unwrap().status().as_u16()
+    };
+    // GitHub's tokens: a push to main (writes main's), a pull request's branch (writes its own, reads main's), a job
+    // that only reads, another repository's.
+    let exp = 4_102_444_800u64;
+    let token = |repo: u64, ac: serde_json::Value| superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": repo.to_string(), "ac": ac.to_string(), "exp": exp }));
+    let main = token(197814629, serde_json::json!([{ "Scope": "refs/heads/main", "Permission": 3 }]));
+    let branch = token(197814629, serde_json::json!([{ "Scope": "refs/heads/fix", "Permission": 3 }, { "Scope": "refs/heads/main", "Permission": 1 }]));
+    let reads = token(197814629, serde_json::json!([{ "Scope": "refs/heads/main", "Permission": 1 }]));
+    let other = token(5, serde_json::json!([{ "Scope": "refs/heads/main", "Permission": 3 }]));
+    let version = "c".repeat(64);
+    let save = |t: &str, key: &str, bytes: &[u8]| {
+        assert_eq!(post("begin", serde_json::json!({ "token": t, "key": key, "version": version })).1["ok"], true, "{key}");
+        let (_, signed) = post("sign", serde_json::json!({ "token": t, "key": key, "version": version, "names": ["p00000"] }));
+        assert_eq!(put(signed["urls"][0].as_str().unwrap(), bytes), 200);
+        assert_eq!(post("finish", serde_json::json!({ "token": t, "key": key, "version": version, "pieces": [["p00000", bytes.len()]] })).1["ok"], true);
+    };
+    let found = |t: &str, key: &str| post("lookup", serde_json::json!({ "token": t, "key": key, "restore_keys": ["deps-"], "version": version })).1;
+    save(&main, "deps-main", b"main's");
+    // The branch reads main's; saves its own, which it then finds first; main does not see the branch's.
+    assert_eq!(found(&branch, "deps-x")["key"], "deps-main");
+    save(&branch, "deps-fix", b"fix's");
+    assert_eq!(found(&branch, "deps-x")["key"], "deps-fix");
+    assert_eq!(found(&main, "deps-fix")["key"], "deps-main", "(main reads only its own)");
+    // One that only reads: finds, may not save. Another repository: finds nothing.
+    assert_eq!(found(&reads, "deps-main")["hit"], true);
+    let (status, said) = post("begin", serde_json::json!({ "token": reads, "key": "deps-new", "version": version }));
+    assert_eq!((status, said["why"].as_str()), (403, Some("this job may only read the cache")), "{said}");
+    assert_eq!(found(&other, "deps-main")["hit"], false);
+    // Its artifacts are GitHub's to keep.
+    let (status, said) = post("artifact-begin", serde_json::json!({ "token": main, "name": "report" }));
+    assert_eq!((status, said["why"].as_str()), (403, Some("a job of GitHub's keeps its artifacts at GitHub")), "{said}");
+    // Refused: a token past its time, one with no repository, one not GitHub's (signed by a key GitHub has not).
+    let late = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "197814629", "ac": "[]", "exp": 1 }));
+    let nameless = superci_testkit::GitHub::job_token(&serde_json::json!({ "ac": "[]", "exp": exp }));
+    let mut forged = main.clone();
+    forged.truncate(forged.len() - 4);
+    forged.push_str("AAAA");
+    for (t, why) in [(late.as_str(), "expired"), (nameless.as_str(), "a token without its repository"), (forged.as_str(), "bad signature"), ("not.a.token", "not a job's token")] {
+        let (status, said) = post("lookup", serde_json::json!({ "token": t, "key": "deps-main", "version": version }));
+        assert_eq!((status, said["why"].as_str()), (403, Some(why)), "{said}");
+    }
+    // GitHub's keys were asked for once, and kept.
+    assert_eq!(served.github.jwks_asked(), 1);
+    // The cache's list: the repository by its name, as GitHub has it; its entries by scope; a branch's taken out.
+    let home = signed_in(&served);
+    let (_, listed) = json(&home, &["caches", "list"]);
+    assert_eq!((listed["repos"][0]["name"].as_str(), listed["repos"][0]["entries"].as_u64()), (Some("acme/app"), Some(2)), "{listed}");
+    let (_, entries) = json(&home, &["caches", "list", "--repo=acme/app"]);
+    let scopes: Vec<&str> = entries["entries"].as_array().unwrap().iter().filter_map(|e| e["scope"].as_str()).collect();
+    assert!(scopes.contains(&"refs/heads/main") && scopes.contains(&"refs/heads/fix"), "{entries}");
+    let o = superci(&home, &["caches", "delete", "--repo=acme/app", "deps-fix", "--scope=refs/heads/fix", "--confirm"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(found(&branch, "deps-x")["key"], "deps-main");
+    let o = superci(&home, &["caches", "delete", "--repo=acme/app", "--confirm"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("acme/app's cache entries are out."), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(found(&main, "deps-main")["hit"], false);
+    let (_, listed) = json(&home, &["caches", "list"]);
+    assert_eq!(listed["repos"], serde_json::json!([]), "{listed}");
+}

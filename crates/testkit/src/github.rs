@@ -29,6 +29,8 @@ struct Hub {
     next: u64,
     /// `acme/app` is public (anyone can open a pull request that runs code there).
     public: bool,
+    /// How many times GitHub's key set for its jobs' tokens was asked for.
+    jwks_asked: u64,
     /// S3's objects, by bucket and key (`bucket/key`), as the control plane's buckets keep them.
     objects: BTreeMap<String, Vec<u8>>,
 }
@@ -66,6 +68,9 @@ impl GitHub {
     /// An object put in a bucket (`bucket/key`), as the control plane's deploy leaves its program there.
     pub fn put_object(&self, key: &str, bytes: &[u8]) { self.hub.lock().unwrap().objects.insert(key.to_string(), bytes.to_vec()); }
 
+    /// How many times GitHub's key set for its jobs' tokens was asked for.
+    pub fn jwks_asked(&self) -> u64 { self.hub.lock().unwrap().jwks_asked }
+
     /// The buckets' objects' keys (`bucket/key`) and sizes.
     pub fn objects(&self) -> Vec<(String, usize)> { self.hub.lock().unwrap().objects.iter().map(|(k, v)| (k.clone(), v.len())).collect() }
 
@@ -95,6 +100,24 @@ impl GitHub {
             String::from_utf8(out.stdout).unwrap()
         });
         json!({ "id": APP_ID, "slug": "superci-acme", "pem": pem, "webhook_secret": WEBHOOK_SECRET, "owner": OWNER, "owner_is_org": true })
+    }
+
+    /// A token GitHub gives a job (`ACTIONS_RUNTIME_TOKEN`), with these claims, signed with the key GitHub's key set
+    /// (`token.actions.githubusercontent.com/.well-known/jwks`, here) has.
+    pub fn job_token(claims: &Value) -> String {
+        let mut c = claims.clone();
+        c["iss"] = json!("https://token.actions.githubusercontent.com");
+        superci_core::crypto::rs256_jwt(&c, Self::app()["pem"].as_str().unwrap()).unwrap()
+    }
+
+    /// GitHub's key set for its jobs' tokens: the public half of the key above.
+    fn job_keys() -> Value {
+        let mut openssl = std::process::Command::new("openssl").args(["rsa", "-noout", "-modulus"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().expect("openssl");
+        { use std::io::Write; openssl.stdin.take().unwrap().write_all(Self::app()["pem"].as_str().unwrap().as_bytes()).unwrap(); }
+        let out = String::from_utf8(openssl.wait_with_output().unwrap().stdout).unwrap();
+        let hex = out.trim().trim_start_matches("Modulus=");
+        let n: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        json!({ "keys": [{ "kty": "RSA", "alg": "RS256", "use": "sig", "n": superci_core::crypto::b64url(&n), "e": "AQAB" }] })
     }
 
     /// GitHub's record of job `id` as it stands.
@@ -183,6 +206,10 @@ impl GitHub {
                 _ => return None,
             })
         }
+        if url.host_str() == Some("token.actions.githubusercontent.com") && path == "/.well-known/jwks" {
+            self.hub.lock().unwrap().jwks_asked += 1;
+            return ok(200, Self::job_keys())
+        }
         if url.host_str() != Some("api.github.com") { return None }
         let permissions = json!({ "actions": "write", "metadata": "read", "organization_self_hosted_runners": "write" });
         let account = json!({ "login": OWNER, "id": 9_919, "type": "Organization", "avatar_url": "https://avatars.githubusercontent.com/u/9919?v=4", "html_url": format!("https://github.com/{OWNER}") });
@@ -211,6 +238,8 @@ impl GitHub {
                     "webhook_secret": WEBHOOK_SECRET, "pem": app["pem"] }))
             }
             ("PATCH", ["app", "hook", "config"]) => ok(200, json!({ "content_type": "json", "insecure_ssl": "0", "url": serde_json::from_slice::<Value>(&r.body).ok()?["url"] })),
+            // A repository by its id (docs.github.com/rest/repos/repos#get-a-repository, as `/repositories/{id}`).
+            ("GET", ["repositories", id]) => { drop(h); let r = self.repo(); if r["id"].to_string() == *id { ok(200, r) } else { ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/repos/repos#get-a-repository", "status": "404" })) } }
             ("GET", ["installation", "repositories"]) => { drop(h); ok(200, json!({ "total_count": 1, "repository_selection": "all", "repositories": [self.repo()] })) }
             // A runner for one job (docs.github.com/rest/actions/self-hosted-runners).
             ("POST", ["orgs", OWNER, "actions", "runners", "generate-jitconfig"]) => {
