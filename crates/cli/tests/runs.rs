@@ -350,3 +350,35 @@ fn a_run_from_a_computer_is_followed_in_the_dashboard_from_runs_to_its_jobs_log(
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn overviews_period_and_the_runs_and_jobs_tabs_switch_in_the_browser() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let dir = checkout();
+    let started = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    play(&served, &run_of(&served), &["ok".to_string()], "succeeded");
+    let home = common::signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
+    let on = |period: &str| format!(r#"document.querySelector('nav.seg-links a[aria-current="true"]') && document.querySelector('nav.seg-links a[aria-current="true"]').textContent === {}"#, serde_json::json!(period));
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    // The period: 24 hours unless chosen; 7 days, then 30, each marked and kept in the address.
+    b.wait(&on("24 hours"));
+    b.click("nav.seg-links a", "7 days");
+    b.wait(&format!("{} && new URLSearchParams(location.search).get('usage') === 'week'", on("7 days")));
+    b.click("nav.seg-links a", "30 days");
+    b.wait(&format!("{} && new URLSearchParams(location.search).get('usage') === 'month'", on("30 days")));
+    // Runs and Jobs: one tab each, the run there and its job here.
+    b.click("nav a", "Runs");
+    b.wait(r#"document.querySelector('a.tab[aria-selected="true"]') && document.querySelector('a.tab[aria-selected="true"]').textContent === 'Runs'"#);
+    b.wait(&shows("ci.yml"));
+    b.click("a.tab", "Jobs");
+    b.wait(r#"document.querySelector('a.tab[aria-selected="true"]') && document.querySelector('a.tab[aria-selected="true"]').textContent === 'Jobs'"#);
+    b.wait(&shows("tests"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&dir);
+}
