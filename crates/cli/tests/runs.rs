@@ -822,3 +822,35 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
 }
 
 fn url_encoded(s: &str) -> String { url::form_urlencoded::byte_serialize(s.as_bytes()).collect() }
+
+#[test]
+fn jobs_if_conditions_are_read_as_github_reads_its_expressions() {
+    let served = serve(|_| {});
+    // Each job runs when its condition holds as GitHub would have it: numbers in hex and with exponents, negatives,
+    // text and booleans as numbers, `&&` and `||` giving a side's value, `join` and `format`, an id with a dash,
+    // a filter over an object.
+    let holds = [
+        "0x10 == 16 && 1.5e2 == 150 && -2 < 0 && 2.5 > 2",
+        "'' == 0 && true == 1 && ' ' == 0 && null == 0 && '0x1F' == 31",
+        "(false || 'x') == 'x' && (0 && 'y') == 0 && !(null)",
+        "join(fromJSON('[1,2]')) == '1,2' && join(fromJSON('[\"a\",\"b\"]'), '-') == 'a-b' && join('one') == 'one'",
+        "format('{0}{1}', 3.0, 0.5) == '30.5' && format('{{x}}') == '{x}'",
+        "contains(github.*, 'push') && github.event_name >= 'PUSH' && 'b' > 'A'",
+        "fromJSON('{\"my-key\": 1e3}').my-key == 1000",
+    ];
+    let fails = ["0x10 == 15", "'a' && ''", "-1 > 0 || 'NaN' == 0", "1e400 < 0"];
+    let mut wf = String::from("jobs:\n");
+    // (One job for all that hold: each is read, as each holds. A job each for what does not.)
+    wf += &format!("  yes:\n    if: >-\n      ${{{{ {} }}}}\n    runs-on: superci\n    steps:\n      - run: echo\n", holds.map(|c| format!("({c})")).join(" && "));
+    for (i, c) in fails.iter().enumerate() { wf += &format!("  no-{i}:\n    if: >-\n      ${{{{ {c} }}}}\n    runs-on: superci\n    steps:\n      - run: echo\n") }
+    let dir = checkout_with(&[(".github/workflows/ci.yml", &wf)]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let jobs = served.store.under(&format!("run:{run}"))[0].1["jobs"].clone();
+    let result = |name: &str| jobs.as_array().unwrap().iter().find(|j| j["key"] == name).map(|j| (j["state"].as_str().unwrap_or_default().to_string(), j["result"].as_str().unwrap_or_default().to_string())).unwrap_or_default();
+    let (state, ended) = result("yes");
+    assert!(state == "started" && ended.is_empty(), "started: {jobs}");
+    for (i, c) in fails.iter().enumerate() { assert_eq!(result(&format!("no-{i}")).1, "skipped", "{c}: {jobs}") }
+    let _ = std::fs::remove_dir_all(&dir);
+}
