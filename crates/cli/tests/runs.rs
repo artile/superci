@@ -796,6 +796,27 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
     let (_, entries) = common::json(&home, &["caches", "list", &format!("--repo={repository}")]);
     assert!(!entries.to_string().contains("deps-1"), "{entries}");
     assert_eq!(cache("lookup", serde_json::json!({ "token": token, "key": "deps-1", "version": version })).1["hit"], false);
+    // The job played to its end, its tests in its log: what they say, with the run's artifacts to fetch.
+    let step = "eeeeeeee-0000-0000-0000-000000000005";
+    runner.take();
+    runner.steps(&[(step, "Run cargo test", 1, "inProgress", None, None)]);
+    let lines: Vec<String> = (1..=40).map(|n| format!("test tests::case_{n} ... ok")).chain(["test result: ok. 40 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out".to_string()]).collect();
+    runner.lines(step, 1, &lines);
+    runner.log(1, &lines.iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n"));
+    runner.steps(&[(step, "Run cargo test", 1, "completed", Some("succeeded"), Some(1))]);
+    runner.finish("succeeded");
+    let job = loop {
+        let done = served.store.under("job:").into_iter().find(|(_, j)| j["run_id"].to_string() == run && j["state"] == "done");
+        if let Some((_, j)) = done { break j["job_id"].to_string() }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let said = String::from_utf8_lossy(&common::superci(&home, &["jobs", "retrieve", &job, "--tests"]).stdout).into_owned();
+    assert!(said.contains("Tests: 0 failed, 40 passed, 2 skipped (cargo)") && said.contains(&format!("Artifact report: `superci artifacts retrieve report --run={run}`")), "{said}");
+    // Its log's end only, when asked for a few bytes; then the run, over, is not cancelled again.
+    let said = String::from_utf8_lossy(&common::superci(&home, &["jobs", "retrieve", &job, "--bytes=100"]).stdout).into_owned();
+    assert!(said.contains("The end of its log (") && said.contains("40 passed"), "{said}");
+    let said = String::from_utf8_lossy(&common::superci(&home, &["runs", "cancel", &run]).stdout).into_owned();
+    assert!(said.contains(&format!("Run {run} was over already.")), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&out);
 }
