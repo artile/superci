@@ -847,6 +847,24 @@ fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_t
     assert!(said.contains("The end of its log (") && said.contains("40 passed"), "{said}");
     let said = String::from_utf8_lossy(&common::superci(&home, &["runs", "cancel", &run]).stdout).into_owned();
     assert!(said.contains(&format!("Run {run} was over already.")), "{said}");
+    // A day later the upkeep forgets the run: its jobs' messages, lines and logs, its artifacts (and their pieces
+    // in the bucket), its working tree. The cache keeps its entries for their days.
+    let artifacts_in_bucket = || served.github.objects().into_iter().filter(|(k, _)| k.contains(&format!("run-{run}"))).count();
+    assert!(artifacts_in_bucket() > 0);
+    served.later(2 * 86_400_000);
+    served.upkeep();
+    for prefix in [format!("run:{run}"), "rjob:".into(), "rline:".into(), "rlog:".into(), format!("artifact:{run}"), "rtree".into()] {
+        assert!(served.store.under(&prefix).is_empty(), "{prefix} kept: {:?}", served.store.under(&prefix).iter().map(|(k, _)| k).collect::<Vec<_>>());
+    }
+    assert_eq!(artifacts_in_bucket(), 0, "{:?}", served.github.objects());
+    let (ok, said) = cli(&["artifacts", "list", &format!("--run={run}")]);
+    assert!(!ok && said.contains("No such run"), "{said}");
+    // Unused past its days (7): gone, its pieces from the bucket too.
+    let pieces = || served.github.objects().into_iter().filter(|(k, _)| !k.contains("/bases/") && !k.contains("superci/cache-") && !k.contains("run-")).count();
+    assert!(pieces() > 0, "{:?}", served.github.objects());
+    served.later(8 * 86_400_000);
+    served.upkeep();
+    assert_eq!(pieces(), 0, "{:?}", served.github.objects());
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&out);
 }
