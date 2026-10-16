@@ -707,6 +707,9 @@ fn workspaces_are_listed_made_renamed_and_forgotten_from_the_cli() {
     assert!(!ok && said.contains("There is a workspace with the id acme-ci already"), "{said}");
     let (_, said) = text(&["workspaces", "list"]);
     assert!(said.contains("acme-ci") && said.contains("nothing set up yet"), "{said}");
+    // With several, status says which one it is of.
+    let (code, status) = json(&home, &["status", "--workspace=default"]);
+    assert!(code == 0 && status["workspace"] == "default" && status["workspaces"] == 2, "{status}");
     // Given another id (a dry run first); one not here refused.
     let (code, v) = json(&home, &["workspaces", "update", "acme-ci", "--id=acme", "--dry-run"]);
     assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains("give the workspace acme-ci the id acme"), "{v}");
