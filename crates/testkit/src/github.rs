@@ -31,6 +31,8 @@ struct Hub {
     public: bool,
     /// How many times GitHub's key set for its jobs' tokens was asked for.
     jwks_asked: u64,
+    /// The App was uninstalled.
+    uninstalled: bool,
     /// S3's objects, by bucket and key (`bucket/key`), as the control plane's buckets keep them.
     objects: BTreeMap<String, Vec<u8>>,
 }
@@ -70,6 +72,9 @@ impl GitHub {
 
     /// How many times GitHub's key set for its jobs' tokens was asked for.
     pub fn jwks_asked(&self) -> u64 { self.hub.lock().unwrap().jwks_asked }
+
+    /// Whether the App was uninstalled.
+    pub fn uninstalled(&self) -> bool { self.hub.lock().unwrap().uninstalled }
 
     /// The buckets' objects' keys (`bucket/key`) and sizes.
     pub fn objects(&self) -> Vec<(String, usize)> { self.hub.lock().unwrap().objects.iter().map(|(k, v)| (k.clone(), v.len())).collect() }
@@ -226,6 +231,8 @@ impl GitHub {
                 "created_at": "2026-10-01T10:00:00Z", "updated_at": "2026-10-01T10:00:00Z", "single_file_name": null, "suspended_at": null }])),
             ("POST", ["app", "installations", id, "access_tokens"]) if *id == INSTALLATION.to_string() => ok(201, json!({ "token": "ghs_16C7e42F292c6912E7710c838347Ae178B4a", "expires_at": "2099-01-01T00:00:00Z",
                 "permissions": permissions, "repository_selection": "all" })),
+            // The App uninstalled (docs.github.com/rest/apps/apps#delete-an-installation-for-the-authenticated-app).
+            ("DELETE", ["app", "installations", id]) if *id == INSTALLATION.to_string() => { h.uninstalled = true; Some(Response::new(204, "text/plain", "")) }
             ("GET", ["app", "hook", "deliveries"]) => ok(200, json!([])),
             // Who a name is, and the App made from the dashboard's manifest (docs.github.com/rest/apps/apps#create-a-github-app-from-a-manifest).
             ("GET", ["users", OWNER]) => ok(200, fixture("org")),

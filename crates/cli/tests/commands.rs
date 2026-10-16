@@ -411,3 +411,34 @@ fn the_aws_accounts_own_budget_is_made_raised_made_to_stop_lifted_and_removed_as
     assert!(asked.iter().any(|t| t.ends_with("CreateBudget")) && asked.iter().any(|t| t.ends_with("DeleteBudget")), "{asked:?}");
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
 }
+
+#[test]
+fn superci_is_stopped_from_the_dashboard_github_and_gitlab_let_go_of_and_its_control_plane_deleted_as_aws_answered() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let home = common::signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    // A GitLab project sending its jobs here.
+    let project = superci_testkit::gitlab::PROJECT.to_string();
+    let (status, _, _) = common::post(&link, "/gitlab/project", &[("gitlab", ""), ("id", &project), ("enabled", "true")]);
+    assert!(status < 400);
+    // Not typed as asked: nothing is done.
+    let (status, _, said) = common::post(&link, "/plane/leave", &[("confirm", "yes")]);
+    assert!(status == 400 && common::words(&said).contains("Type superci to confirm"), "{status} {}", common::words(&said));
+    assert!(!served.github.uninstalled());
+    // Stopped: GitLab's webhook and GitHub's App let go of, then the control plane deleted (AWS answering as a real
+    // account answered a control plane's deletion, this one's id in it).
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    let (status, _, said) = common::post(&link, "/plane/leave", &[("confirm", "superci")]);
+    let said = common::words(&said);
+    assert!(status == 200 && said.contains("SuperCI is stopped") && said.contains("Delete the GitHub App superci-acme on GitHub") && said.contains("Change runs-on: superci back"), "{status} {said}");
+    assert!(served.github.uninstalled(), "its App uninstalled");
+    assert!(served.gitlab.asked.lock().unwrap().iter().any(|a| a.starts_with(&format!("DELETE https://gitlab.com/api/v4/projects/{project}/hooks/"))), "{:?}", served.gitlab.asked.lock().unwrap());
+    assert!(served.aws.settings(superci_testkit::PLANE).is_empty(), "{:?}", served.aws.settings(superci_testkit::PLANE));
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
+    assert!(asked.iter().any(|a| a == &format!("DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-{}", superci_testkit::PLANE)), "{asked:?}");
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
