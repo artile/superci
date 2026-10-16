@@ -336,7 +336,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     match (j["result"].as_str().unwrap_or("?"), j["error"].as_str().filter(|e| !e.is_empty())) { (r, Some(e)) => format!("{r} ({e})"), (r, None) => r.to_string() }));
                 let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
                 steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
-                // Quiet, each step's whole log is read for its tests (its own log, else what its machine sent of it).
+                // Each step's whole log is read for its tests (its own log, else what its machine sent of it).
                 let step_text = |s: &Value| -> String {
                     let at = match s["log"].as_u64() { Some(n) => format!("log={n}"), None => format!("step={}&lines=1", s["id"].as_str().unwrap_or_default()) };
                     let r = Request::new("GET", &format!("{plane}/runs/{run}/log?job={i}&{at}")).with_header("authorization", &format!("Bearer {key}"));
@@ -347,9 +347,9 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     let mark = match s["result"].as_str() { Some("succeeded") => "✓", Some("failed") => "✗", Some("skipped") | Some("cancelled") => "–", _ => "·" };
                     let time = match (s["start"].as_str().and_then(crate::log_view::seconds), s["finish"].as_str().and_then(crate::log_view::seconds)) { (Some(a), Some(b)) => format!(" {}", span(b.saturating_sub(a))), _ => String::new() };
                     say(&format!("{}  {mark} {}{time}", crate::commands::JOB_LINE, s["name"].as_str().unwrap_or("step")));
-                    if !how.quiet || ["skipped", "cancelled"].contains(&s["result"].as_str().unwrap_or_default()) { continue }
+                    if ["skipped", "cancelled"].contains(&s["result"].as_str().unwrap_or_default()) { continue }
                     let text = step_text(s);
-                    if s["result"] == "failed" {
+                    if how.quiet && s["result"] == "failed" {
                         // The tests it failed, each with its whole error (its last lines may be another's, or a
                         // teardown's), then those lines.
                         for f in &crate::test_results::read(&text).failures {

@@ -3,6 +3,9 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.9
+- Docker on AWS machines pulls sixteen of an image's layers at once (it pulled three): a stack of many images, as a local Supabase's, is pulled sooner. Its own settings stay.
+- `superci runs create` and `runs wait` say what each job's tests came to at the end with or without `--quiet`, and when a test runner ran no tests (a run that passed having run nothing said so only with `--quiet` or `--tests`).
+- A run from a computer's checkout says the line it stopped at, when it stops.
 - The dashboard keeps sign-ins made in another terminal while it runs, however many: after it took one in, a second made before its next write was put back as it had been (a second AWS account, signed in from a terminal, was lost).
 
 ## 0.19.8 — 2026-10-16

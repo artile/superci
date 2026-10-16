@@ -1408,16 +1408,19 @@ pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<Stri
 exec > >(tee /var/log/superci.log > /dev/console) 2>&1
 "#, bound!(), r#"
 {grow}# As GitHub's Ubuntu runners: unprivileged user namespaces (Chromium's sandbox).
-sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-# The ports a job's own servers listen on in 50000-59999 (Supabase's 54321-54329, say) are never handed out to the
+# And the ports a job's own servers listen on in 50000-59999 (Supabase's 54321-54329, say) never handed out to the
 # connections the machine opens (Linux hands those out from 32768-60999): one found its port taken now and then.
-sysctl -w net.ipv4.ip_local_reserved_ports=50000-59999 > /dev/null || true
+sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 net.ipv4.ip_local_reserved_ports=50000-59999||:
 # Docker as on GitHub's runners: the runner's user may use it (the image leaves it to root), and it starts now,
 # beside the runner, not at a job's first use of it (services, container jobs, docker steps).
-usermod -aG docker runner 2>/dev/null || true
-(systemctl start docker > /dev/null 2>&1 &)
+usermod -aG docker runner 2>/dev/null||:
+# Docker pulls sixteen of an image's layers at once (three unless told): a stack of many images (a local Supabase's
+# eight, 99 layers) is pulled sooner, its own settings kept. (Restarted for it when the image started it already;
+# nothing runs in it yet.)
+f=/etc/docker/daemon.json;[ -e $f ]||echo {{}}>$f;jq '.["max-concurrent-downloads"]=16' $f>$f.n&&mv $f.n $f
+(systemctl restart docker &>/dev/null &)
 {reach}# First reads from a new volume are slow one at a time: the runner's own files are read 64 at a time first.
-find /home/runner/bin -type f -print0 2>/dev/null | xargs -0 -r -P 64 -n 16 cat > /dev/null 2>&1
+find /home/runner/bin -type f -print0 2>/dev/null|xargs -0 -r -P 64 -n 16 cat &>/dev/null
 {wait}{hook}cd /home/runner && sudo -u runner -H {run} --jitconfig {jit_config}
 poweroff
 "#), jit_config = jit_config, hook = hook, run = run, secs = max_minutes * 60, minutes = max_minutes + 1,
@@ -1650,7 +1653,7 @@ mod tests {
         // Docker and the runner start, with Docker's files, the work folder and /tmp bound from it.
         let ram = with_scratch(script.clone(), true);
         assert!(ram.contains(r#"mount -t tmpfs -o size=75% tmpfs "$scratch""#) && !ram.contains("Instance Storage") && ram.contains("for d in /var/lib/docker /var/lib/containerd /home/runner/work /tmp;"), "{ram}");
-        assert!(ram.find("growpart").unwrap() < ram.find("tmpfs").unwrap() && ram.find("mount --bind").unwrap() < ram.find("systemctl start docker").unwrap() && ram.find("mount --bind").unwrap() < ram.find("./run.sh").unwrap());
+        assert!(ram.find("growpart").unwrap() < ram.find("tmpfs").unwrap() && ram.find("mount --bind").unwrap() < ram.find("systemctl restart docker").unwrap() && ram.find("mount --bind").unwrap() < ram.find("./run.sh").unwrap());
         // Without it, the machine's own NVMe disk when it has one: found, formatted and mounted; nothing on a machine without.
         let local = with_scratch(script.clone(), false);
         assert!(local.contains("/Instance Storage/") && local.contains("mkfs.ext4 -q -F") && !local.contains("tmpfs") && !local.contains("MOUNT_SCRATCH") && local.contains(r#"if mountpoint -q "$scratch"; then"#), "{local}");
@@ -1684,9 +1687,11 @@ mod tests {
         assert!(!runner_user_data_for(&gh, 70, "windows", None).unwrap().contains("Start-Job"), "on-demand: nothing to watch");
         // Docker is the job's to use on a Linux machine, as on GitHub's runners: its user is let in before the runner starts.
         let linux = runner_user_data_for(&gh, 70, "linux", None).unwrap();
-        assert!(linux.find("usermod -aG docker runner").unwrap() < linux.find("sudo -u runner").unwrap() && linux.contains("systemctl start docker"));
+        assert!(linux.find("usermod -aG docker runner").unwrap() < linux.find("sudo -u runner").unwrap() && linux.contains("systemctl restart docker"));
+        // (Many layers at once, set before Docker starts.)
+        assert!(linux.find(r#"jq '.["max-concurrent-downloads"]=16'"#).unwrap() < linux.find("systemctl restart docker").unwrap());
         // (Its job's servers' ports kept from the machine's own connections, before Docker or the runner opens any.)
-        assert!(linux.find("sysctl -w net.ipv4.ip_local_reserved_ports=50000-59999").unwrap() < linux.find("systemctl start docker").unwrap());
+        assert!(linux.find("net.ipv4.ip_local_reserved_ports=50000-59999").unwrap() < linux.find("systemctl restart docker").unwrap());
         // Linux: GitHub's runner is interrupted, GitLab's ended; a failing runner watches nothing.
         let linux = runner_user_data_for(&gh, 70, "linux", Some(link)).unwrap();
         assert!(linux.contains(&format!("-X POST '{link}'")) && linux.contains("--retry 4") && linux.contains("pkill -INT -f Runner.Listener"));

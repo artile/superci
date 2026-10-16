@@ -59,6 +59,8 @@ fn a_run_from_a_computer_prints_every_line_once_in_order_and_ends_with_how_each_
     // How it ended: each step, then the run.
     let has = |s: &str| printed.iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("no {s:?} in:\n{said}"));
     assert!(has("✓ Run make 7 s") < has("✓ Run make test 7 s") && said.contains("The run ended: success"), "{said}");
+    // (Its log has no tests: no line of them.)
+    assert!(!said.contains("Tests:"), "{said}");
     // Once it ran, how its start went (where the time from sending it to its first step went).
     assert!(has("Running (started in ") < has(&line(1)) && said.contains("its machine was asked for "), "{said}");
     // Its end said after its lines, the late ones too.
@@ -304,6 +306,9 @@ fn a_green_run_whose_slot_ran_no_tests_says_so_lists_what_ran_and_its_job_is_fou
     assert!(out.status.success(), "{quiet}");
     assert!(quiet.contains("Tests: 0 failed, 3 passed (playwright)") && quiet.contains("[slot 2] Playwright ran no tests."), "{quiet}");
     assert!(quiet.contains("What ran:") && quiet.contains("✓ [chromium] adds to cart  (e2e/cart.spec.ts:12:3)") && quiet.contains("✓ (failed as expected) [chromium] known bug"), "{quiet}");
+    // Followed without --quiet, the same at its end.
+    let all = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "wait", &run]).output().unwrap().stdout).into_owned();
+    assert!(all.contains("Tests: 0 failed, 3 passed (playwright)") && all.contains("[slot 2] Playwright ran no tests."), "{all}");
     // A passed job's tests too, with what was said of them.
     let said = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "retrieve", &run, "--tests"]).output().unwrap().stdout).into_owned();
     assert!(said.contains("[slot 2] Playwright ran no tests."), "{said}");
