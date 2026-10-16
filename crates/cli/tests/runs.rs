@@ -353,6 +353,55 @@ fn a_job_on_a_machine_without_superci_s_cache_is_told_of_a_miss_as_github_says_i
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_job_starts_on_an_aws_spot_machine_as_aws_answered_its_first_pool_full_then_a_fleet_and_a_cancel_ends_it() {
+    // A control plane with its own AWS account: a job's machine is asked of AWS, which answers as it did on Test (the
+    // first pool, c8a.large in us-east-1f, had no machine; the rest were asked in one request, and AWS gave one).
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    // (Two CPUs: the machines asked for on Test.)
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2\n    steps:\n      - run: make test\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let job = loop {
+        if let Some((_, j)) = served.store.under("job:").into_iter().next().filter(|(_, j)| j["machine_id"].is_string() || j["state"] == "failed") { break j }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let calls: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| { let asked = a["asked"].as_str().unwrap_or_default(); format!("{} {}", a["status"], asked.split('&').find(|p| p.starts_with("Action=")).unwrap_or(a["target"].as_str().unwrap_or_default())) }).collect();
+    assert_eq!((job["cloud"].as_str(), job["machine_id"].as_str(), job["machine_type"].as_str(), job["zone"].as_str()), (Some("aws"), Some("i-00000000000000001"), Some("c8a.large"), Some("us-east-1d")), "{job}\n{calls:?}\n{:?}", served.aws.unanswered.lock().unwrap());
+    // How its start went: the full pool, then the request for the rest.
+    let asks = job["asks"].as_array().cloned().unwrap_or_default();
+    assert!(asks.iter().any(|a| a["said"] == "InsufficientInstanceCapacity" && a["zone"] == "us-east-1f"), "{job}");
+    // Cancelled before its runner began: its machine is ended in AWS.
+    let o = superci(&served, &dir, &["runs", "cancel", &run]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let ended = served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("Action=TerminateInstances") && a["asked"].as_str().unwrap_or_default().contains("i-00000000000000001"));
+    assert!(ended, "{:?}", served.aws.asked.lock().unwrap().iter().map(|a| a["asked"].as_str().unwrap_or_default().chars().take(60).collect::<String>()).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_job_whose_label_says_spot_false_starts_on_an_aws_on_demand_machine_as_aws_answered() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.replaying(include_str!("../fixtures/aws/launch/on-demand.jsonl"), &[]);
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2/spot=false\n    steps:\n      - run: make test\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let job = loop {
+        if let Some((_, j)) = served.store.under("job:").into_iter().next().filter(|(_, j)| j["machine_id"].is_string() || j["state"] == "failed") { break j }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!((job["cloud"].as_str(), job["on_demand"].as_bool(), job["machine_id"].as_str(), job["machine_type"].as_str(), job["zone"].as_str()), (Some("aws"), Some(true), Some("i-00000000000000002"), Some("m7a.large"), Some("us-east-1a")), "{job}\n{:?}", served.aws.unanswered.lock().unwrap());
+    // (No spot price asked: an on-demand machine is asked by its types' order.)
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("DescribeSpotPriceHistory")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A checkout with these files, committed.
 fn checkout_with(files: &[(&str, &str)]) -> std::path::PathBuf {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

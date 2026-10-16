@@ -29,7 +29,11 @@ def sanitize(text, of):
     text = re.sub(r"\bo-[a-z0-9]{10,32}\b", lambda m: of("org", m.group(0), lambda n: f"o-example{n:03d}"), text)
     text = re.sub(r"\bp-[a-z0-9]{8}\b", lambda m: of("policy", m.group(0), lambda n: f"p-example{n}"), text)
     text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", lambda m: of("uuid", m.group(0), lambda n: f"00000000-0000-4000-8000-{n:012d}"), text)
-    text = re.sub(r"\b((?:vpc-cidr-assoc|vpc|subnet|sg|rtb|igw|acl|dopt|eni|eipalloc|i|vol|snap|lt)-)([0-9a-f]{8,17})\b", lambda m: m.group(1) + of(m.group(1), m.group(2), lambda n: f"{n:017x}"), text)
+    text = re.sub(r"\b((?:vpc-cidr-assoc|vpc|subnet|sg|rtb|igw|acl|dopt|eni-attach|eni|eipalloc|i|r|vol|snap|lt)-)([0-9a-f]{8,17})\b", lambda m: m.group(1) + of(m.group(1), m.group(2), lambda n: f"{n:017x}"), text)
+    # A machine's own network addresses: its private address (and the name made of it), its MAC.
+    text = re.sub(r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", lambda m: of("ip", m.group(0), lambda n: f"10.0.0.{n}"), text)
+    text = re.sub(r"\bip-10-\d{1,3}-\d{1,3}-\d{1,3}\b", lambda m: of("ipname", m.group(0), lambda n: f"ip-10-0-0-{n}"), text)
+    text = re.sub(r"\b02(?::[0-9a-f]{2}){5}\b", lambda m: of("mac", m.group(0), lambda n: f"02:00:00:00:00:{n:02x}"), text)
     # (IAM's own ids of a role, a policy, a user or a key.)
     text = re.sub(r"\b(AROA|ANPA|AIDA|AGPA|AKIA|ASIA)[A-Z0-9]{12,}\b", lambda m: m.group(1) + of("iam-" + m.group(1), m.group(0), lambda n: f"EXAMPLE{n:09d}"), text)
     text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "someone@example.com", text)

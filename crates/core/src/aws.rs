@@ -447,7 +447,10 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
     }
     let own: Vec<(String, String)> = l.tags.iter().filter(|(k, _)| k == "superci-plane").cloned().collect();
     let began = l.clock.map(|c| c.now_ms());
-    ec2(http, l.region, creds, "CreateLaunchTemplate", serde_json::json!({ "LaunchTemplateName": name, "LaunchTemplateData": data, "TagSpecification": [{ "ResourceType": "launch-template", "Tag": tags(&own) }] }), now_ms).await?;
+    // (Its own tag says whose it is, for a sweep to find; AWS refuses a tag list with nothing in it.)
+    let mut asked = serde_json::json!({ "LaunchTemplateName": name, "LaunchTemplateData": data });
+    if !own.is_empty() { asked["TagSpecification"] = serde_json::json!([{ "ResourceType": "launch-template", "Tag": tags(&own) }]) }
+    ec2(http, l.region, creds, "CreateLaunchTemplate", asked, now_ms).await?;
     // Each group in turn, until one has a machine. (The time of making the template is counted with the first.)
     let mut answer: Result<Result<Started>> = Err("no pools to ask".into());
     let mut began = began;
@@ -1139,7 +1142,9 @@ const SPOT_WATCH_WINDOWS: &str = r#"Start-Job -ScriptBlock {
 /// A machine's start-up script for an operating system ("linux" or "windows"; see `runner_user_data`). `notice`: for
 /// a spot machine running a GitHub job, where it says that AWS is taking it back.
 pub fn runner_user_data_for(work: &crate::io::Work, max_minutes: u32, os: &str, notice: Option<&str>) -> Result<String> {
-    if notice.is_some_and(|url| !url.starts_with("https://") || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b))) { return Err("invalid notice link".into()) }
+    // (A control plane on this computer, as tests serve one, in debug builds.)
+    let loopback = cfg!(debug_assertions) && notice.is_some_and(|url| url.starts_with("http://127.0.0.1:"));
+    if notice.is_some_and(|url| !(url.starts_with("https://") || loopback) || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b))) { return Err("invalid notice link".into()) }
     if os != "windows" {
         let script = runner_user_data(work, max_minutes)?;
         // Before the runner starts. GitHub's runner stops its job on an interrupt; GitLab's on being ended (the job

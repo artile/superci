@@ -700,6 +700,37 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let said = match said { Ok(s) => s, Err(e) => format!("refused or failed: {e}") };
             Ok(Done { data: json!({ "answer": said }), said: vec![said] })
         }
+        // (One machine started as the control plane starts a job's, with this workspace's AWS sign-in, and ended at
+        // once: what AWS answers each step, for the test kit (`SUPERCI_RECORD=FILE superci debug launch REGION [spot|
+        // on-demand] [TYPE,TYPE]`).)
+        #[cfg(debug_assertions)]
+        ("debug", "launch") => {
+            let mut d = signed_in();
+            let plane_id = view(&mut d)?.plane.plane_id().to_string();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            let http = crate::aws::Blocking::new();
+            let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_millis() as u64).unwrap_or(0);
+            let region = if w(2).is_empty() { "us-east-1" } else { w(2) };
+            let spot = w(3) != "on-demand";
+            let types: Vec<String> = if w(4).is_empty() { vec!["c8a.large".into(), "c7a.large".into(), "m7a.large".into()] } else { w(4).split(',').map(str::to_string).collect() };
+            let config = superci_core::plane::Config::new(plane_id.clone());
+            use superci_core::aws;
+            use futures::executor::block_on;
+            let (image, image_gb) = block_on(aws::latest_image_sized(&http, region, &creds, &config.image_owner, &config.image_name, now()))?;
+            let network = block_on(aws::find_network(&http, region, &creds, &plane_id, now()))?;
+            let types = block_on(aws::offered_types(&http, region, &creds, &types, now())).unwrap_or(types);
+            let tags = vec![("Name".to_string(), "superci-probe".to_string()), ("superci-plane".to_string(), plane_id.clone()), ("superci-job".to_string(), "1".to_string()), ("superci-repo".to_string(), "acme/app".to_string())];
+            let launch = aws::Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: "#!/bin/bash\npoweroff\n", disk_gb: image_gb.max(20), disk_mibs: 125, disk_iops: 3000, tags: &tags, spot, os: "linux",
+                clock: None, skip: &[], avoid: &[], timer: None, jitter_ms: 0, fleet: spot };
+            let mut told = aws::Told::default();
+            let started = block_on(aws::run_instance(&http, &creds, &launch, now(), &mut told));
+            if let Some(name) = told.template_left.take() { let _ = block_on(aws::delete_template(&http, region, &creds, &name, now())); }
+            let said = match &started {
+                Ok(m) => { let ended = block_on(aws::terminate_instance(&http, region, &creds, &m.id, now())); format!("started {} ({} in {}), ended: {ended:?}; asked {:?}", m.id, m.kind, m.zone, told.asked) }
+                Err(e) => format!("not started: {e}; refused {:?}", told.refused),
+            };
+            Ok(Done { data: json!({ "answer": said }), said: vec![said] })
+        }
         // (A signed call to an AWS service that speaks REST, S3 among them: `superci debug rest REGION SERVICE METHOD URL
         // [FILE]`, FILE being the body.)
         #[cfg(debug_assertions)]
