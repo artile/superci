@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.9
+- The dashboard keeps sign-ins made in another terminal while it runs, however many: after it took one in, a second made before its next write was put back as it had been (a second AWS account, signed in from a terminal, was lost).
+
 ## 0.19.8 — 2026-10-16
 - A run from a computer starts its machine while its working tree is still being sent (its checkout waits for the rest), and the machine fetches the tree's parts at once, each into a file: a connection that stalls is dropped after 10 seconds and the part asked for again from its start (one fetch took 69 seconds where the one before took 1). The checkout says how long each part took, and how much of it was the control plane's answer.
 - `superci runs create` says how a job's start went once it runs (AWS's answer, the machine switched on, its boot, its runner), and `--dry-run` checks the workflow, its job and the working tree and starts nothing: it started a real run.

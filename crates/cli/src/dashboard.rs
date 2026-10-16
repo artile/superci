@@ -1680,7 +1680,19 @@ impl Dashboard {
         if theirs("cloudflare") && !self.cf_given { (self.cf, self.cf_ended, self.looked_cf, took) = (on_disk.cloudflare, on_disk.cloudflare_ended, false, true); self.cf_accounts.clear(); }
         if theirs("modal") && !self.modal_given { (self.modal, self.modal_ended, self.looked_modal, took) = (on_disk.modal, on_disk.modal_ended, false, true) }
         if theirs("key") { if let Some(k) = on_disk.key { (self.status_key, self.status_secret, self.keyed, took) = (k.value, k.name, k.planes.into_iter().collect(), true) } }
-        if took { self.views = None }
+        if took {
+            self.views = None;
+            // What was taken in is as the file has it now: a further change there before this one writes is taken in
+            // too (it was taken for this one's own, and the write put it back as it was).
+            let mut known = last.clone();
+            for field in ["aws", "aws_more", "aws_ended", "cloudflare", "cloudflare_ended", "modal", "modal_ended", "key"] {
+                if value(&self.kept())[field] == disk[field] {
+                    // (One the file leaves out, as it leaves out what is not there: left out too.)
+                    match (&disk[field], known.as_object_mut()) { (serde_json::Value::Null, Some(o)) => { o.remove(field); } (v, _) => known[field] = v.clone() }
+                }
+            }
+            if let Ok(k) = serde_json::from_value::<crate::store::Kept>(known) { self.kept_as = serde_json::to_string(&k).unwrap_or_default() }
+        }
     }
 
     /// Keeps the sign-ins as they are now (a new one, a renewed one, one that ended), when they changed. Signed in
@@ -7706,11 +7718,38 @@ mod tests {
         store.write(&other).unwrap();
         d.keep();
         assert_eq!(store.read().modal.map(|m| m.workspace), Some("mine".to_string()));
+        // `superci login aws` elsewhere: its account is taken in; a second account added there comes after the one in use.
+        let mut other = store.read();
+        other.aws = Some(aws::Session::for_test("111111111111"));
+        store.write(&other).unwrap();
+        d.take_in();
+        assert_eq!(d.aws.as_ref().map(|a| a.account_id.as_str()), Some("111111111111"));
+        let mut other = store.read();
+        (other.aws, other.aws_more) = (Some(aws::Session::for_test("222222222222")), vec![aws::Session::for_test("111111111111")]);
+        store.write(&other).unwrap();
+        d.take_in();
+        assert_eq!((d.aws.as_ref().map(|a| a.account_id.as_str()), d.aws_others.iter().map(|a| a.account_id.as_str()).collect::<Vec<_>>()), (Some("111111111111"), vec!["222222222222"]), "the one in use stays in use");
+        d.keep();
+        // AWS ended the sign-ins, said so by another process (which kept the control plane and the key).
+        let mut other = store.read();
+        (other.aws, other.aws_more, other.aws_ended) = (None, vec![], true);
+        store.write(&other).unwrap();
+        d.take_in();
+        assert!(d.aws.is_none() && d.aws_others.is_empty() && d.aws_ended);
+        d.keep();
+        // Cloudflare signed in again elsewhere, and a new key: both taken in.
+        let mut other = store.read();
+        other.cloudflare = with_cloudflare(&[("a2", "Initech")]).cf.clone();
+        other.key = Some(crate::store::Key { name: "DASHBOARD_KEY_9999999999_ABCDEF".into(), value: "a-new-folder-key-0001".into(), planes: vec!["https://a.example".into()] });
+        store.write(&other).unwrap();
+        d.take_in();
+        assert!(d.cf.is_some() && d.status_key == "a-new-folder-key-0001" && d.keyed.contains("https://a.example"));
+        d.keep();
         // `superci logout` elsewhere removes the file: this dashboard is signed out too, and does not write it back.
         store.remove().unwrap();
         d.take_in();
         d.keep();
-        assert!(d.modal.is_none() && d.cf.is_none() && !store.path().exists());
+        assert!(d.modal.is_none() && d.cf.is_none() && d.aws.is_none() && !store.path().exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
