@@ -22,8 +22,14 @@ NAME = "__NAME__"
 
 app = modal.App(NAME)
 web_image = modal.Image.debian_slim(python_version="3.12").pip_install("fastapi[standard]==0.118.0", "cryptography==46.0.1")
-# GitHub's runner image; the runner refuses root unless told it may (sandboxes start as root).
-runner_image = modal.Image.from_registry("ghcr.io/actions/actions-runner:latest").env({"RUNNER_ALLOW_RUNASROOT": "1"})
+# GitHub's runner image; the runner refuses root unless told it may (sandboxes start as root). With what GitHub's own
+# runners have that it lacks and common actions use: xz and zstd (setup-zig's and others' archives, the cache's), zip,
+# jq, git, and a C compiler (a Rust or Node build links with it).
+runner_image = (
+    modal.Image.from_registry("ghcr.io/actions/actions-runner:latest")
+    .dockerfile_commands(["USER root", "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xz-utils zstd zip unzip jq git wget build-essential pkg-config && rm -rf /var/lib/apt/lists/*"])
+    .env({"RUNNER_ALLOW_RUNASROOT": "1"})
+)
 
 
 def b64url(s: str) -> bytes:

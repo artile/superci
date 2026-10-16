@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.8
+## 0.19.8 — 2026-10-16
 - A run from a computer starts its machine while its working tree is still being sent (its checkout waits for the rest), and the machine fetches the tree's parts at once, each into a file: a connection that stalls is dropped after 10 seconds and the part asked for again from its start (one fetch took 69 seconds where the one before took 1). The checkout says how long each part took, and how much of it was the control plane's answer.
 - `superci runs create` says how a job's start went once it runs (AWS's answer, the machine switched on, its boot, its runner), and `--dry-run` checks the workflow, its job and the working tree and starts nothing: it started a real run.
 - `--tests` reads test runners whose lines are marked by the process they came from (`[slot 2] …`, several at once) apart from one another and adds them up: a failed Playwright test in such lines was missed. A failed job none of whose tests is read as failed says so, with how to get its whole log.
@@ -10,6 +10,9 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - `superci runs create --quiet` says what each job's tests came to (passed too), each failed test with its whole error, and a job's end after its last lines (some came after it).
 - A test runner that ran no tests is said, in a run that passed too (a `file:line` that no longer points at a test, where no tests found is allowed: `[slot 2] Playwright ran no tests.`). `--tests` and `--quiet` list the tests that ran when there are 30 or fewer, a test marked to fail (`test.fail()`) that failed as a pass ("failed as expected", where Playwright marks it ✘) and one that passed when run again as flaky; `runs retrieve --tests` reads passed jobs too.
 - A script finds a run's job without reading text: `superci jobs retrieve --run=ID [--job=NAME] --out=job.log`. `runs create` says each job's id, with the command for a failed one's whole log, and with `--json` a failed run gives its jobs and their ids beside `"ok": false` (it gave only the error).
+- Cancelling a run from a computer runs a waiting job whose `if` holds after a cancel (`always()`, `cancelled()`) once what it needs has ended, as GitHub does; the rest end cancelled (all waiting jobs ended at once).
+- Modal's machines have what GitHub's own runners have and common actions use: xz and zstd, zip, jq, git and a C compiler (setup-zig could not unpack Zig).
+- A run from a computer's job on Modal or Cloudflare is told its cache has no entry as GitHub's cache says it, at once (the cache's client asked again five times each way, about a minute for each cache step), and upload-artifact is refused there saying why.
 - AWS machines keep ports 50000-59999 for a job's own servers: the machine's own connections took one now and then (Supabase's local stack failed to start on a port in use).
 
 ## 0.19.7 — 2026-10-16

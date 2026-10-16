@@ -308,6 +308,17 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> R
     let body: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
     let p = path.split('?').next().unwrap_or_default();
     let m = req.method.as_str();
+    // GitHub's results service, reached here only from a machine without SuperCI's cache beside its runner (Modal's,
+    // Cloudflare's; on AWS `superci-cache` answers it): its cache has no entry and takes none, said as GitHub's own
+    // service says it (a miss, at once: an answer that is not JSON is asked again five times, each way); artifacts are
+    // refused, saying why.
+    if let Some(call) = p.split_once("/twirp/github.actions.results.api.v1.").map(|(_, c)| c) {
+        return Ok(match call.split_once('/') {
+            Some(("CacheService", "GetCacheEntryDownloadURL" | "CreateCacheEntry" | "FinalizeCacheEntryUpload")) => ok(json!({ "ok": false })),
+            Some(("CacheService", _)) => Response::json(&json!({ "code": "not_found", "msg": "no cache entries for this job's machine" })).with_status(404),
+            _ => Response::json(&json!({ "code": "unimplemented", "msg": "artifacts of a run from a computer are kept from SuperCI's AWS machines only: this job ran on another provider's" })).with_status(501),
+        })
+    }
     Ok(if p.ends_with("/connectionData") {
         Response::new(200, "application/json", LOCATIONS)
     } else if p.contains("/auth/") {

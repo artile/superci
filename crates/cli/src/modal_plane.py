@@ -32,8 +32,14 @@ image = (
     .add_local_file("/tmp/superci-plane", "/opt/superci/plane", copy=True)
     .run_commands("chmod +x /opt/superci/plane")
 )
-# GitHub's runner image; the runner refuses root unless told it may (sandboxes start as root).
-runner_image = modal.Image.from_registry("ghcr.io/actions/actions-runner:latest").env({"RUNNER_ALLOW_RUNASROOT": "1"})
+# GitHub's runner image; the runner refuses root unless told it may (sandboxes start as root). With what GitHub's own
+# runners have that it lacks and common actions use: xz and zstd (setup-zig's and others' archives, the cache's), zip,
+# jq, git, and a C compiler (a Rust or Node build links with it).
+runner_image = (
+    modal.Image.from_registry("ghcr.io/actions/actions-runner:latest")
+    .dockerfile_commands(["USER root", "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xz-utils zstd zip unzip jq git wget build-essential pkg-config && rm -rf /var/lib/apt/lists/*"])
+    .env({"RUNNER_ALLOW_RUNASROOT": "1"})
+)
 state = modal.Dict.from_name(f"{NAME}-state", create_if_missing=True)
 # Each kind of record (the key up to its first colon: job, live, rline, …) in a Dict of its own, so listing one kind
 # never reads every record. Before, all were in `state`: until they are moved (`migrate`, at each sweep), what is not

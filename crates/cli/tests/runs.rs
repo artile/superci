@@ -334,6 +334,25 @@ fn a_failed_run_followed_with_json_gives_its_jobs_ids() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_job_on_a_machine_without_superci_s_cache_is_told_of_a_miss_as_github_says_it_and_artifacts_are_refused_saying_why() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success());
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let results = runner.at.trim_end_matches("/_apis/v1").to_string() + "/twirp/github.actions.results.api.v1.";
+    let call = |what: &str| { let (status, _, body) = http("POST", &format!("{results}{what}"), br#"{"key":"setup-zig","version":"1"}"#); (status, serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default()) };
+    // (JSON each time: the cache's client asks again five times for an answer that is not.)
+    for what in ["CacheService/GetCacheEntryDownloadURL", "CacheService/CreateCacheEntry", "CacheService/FinalizeCacheEntryUpload"] {
+        assert_eq!(call(what), (200, serde_json::json!({ "ok": false })), "{what}");
+    }
+    let (status, said) = call("ArtifactService/CreateArtifact");
+    assert!(status == 501 && said["code"] == "unimplemented" && said["msg"].as_str().unwrap().contains("AWS machines only"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A checkout with these files, committed.
 fn checkout_with(files: &[(&str, &str)]) -> std::path::PathBuf {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -534,9 +553,9 @@ fn a_job_whose_spot_machine_aws_took_back_is_started_again_off_spot_and_the_run_
 }
 
 #[test]
-fn a_run_from_a_computer_is_cancelled_its_running_job_told_to_stop_and_the_job_waiting_for_it_never_started() {
+fn a_run_from_a_computer_is_cancelled_its_running_job_told_to_stop_the_job_waiting_for_it_never_started_and_an_always_job_runs() {
     let served = serve(|_| {});
-    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: sleep 600\n  after:\n    needs: build\n    runs-on: superci\n    steps:\n      - run: echo after\n")]);
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: sleep 600\n  after:\n    needs: build\n    runs-on: superci\n    steps:\n      - run: echo after\n  report:\n    needs: build\n    if: always()\n    runs-on: superci\n    steps:\n      - run: echo report\n")]);
     let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let run = run_of(&served);
@@ -548,18 +567,23 @@ fn a_run_from_a_computer_is_cancelled_its_running_job_told_to_stop_and_the_job_w
     let o = superci(&served, &dir, &["runs", "cancel", &run]).output().unwrap();
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(o.status.success() && said.contains(&format!("Cancelled run {run}")), "{said}");
-    // The job that waited for it ends cancelled, never started; the running one's runner is told, as GitHub tells it,
-    // once.
+    // The running one's runner is told, as GitHub tells it, once; the jobs waiting for it wait on.
     let jobs = || served.store.under(&format!("run:{run}"))[0].1["jobs"].clone();
-    let after = jobs().as_array().unwrap().iter().find(|j| j["key"] == "after").cloned().unwrap();
-    assert_eq!((after["state"].as_str(), after["result"].as_str(), after.get("token")), (Some("done"), Some("cancelled"), None), "{after}");
+    let of = |key: &str| jobs().as_array().unwrap().iter().find(|j| j["key"] == key).cloned().unwrap();
+    assert_eq!(of("after")["state"], "pending");
     let (status, told) = build.message();
     assert_eq!((status, told["messageType"].as_str()), (200, Some("JobCancellation")), "{told}");
     let body: serde_json::Value = serde_json::from_str(told["body"].as_str().unwrap()).unwrap();
     assert_eq!((body["jobId"].clone(), body["timeout"].as_str()), (message["jobId"].clone(), Some("00:05:00")));
     assert_eq!(build.message().0, 204, "told once");
-    // It stops its steps and ends cancelled: the run is over, cancelled.
+    // It stops its steps and ends cancelled. As on GitHub, the job that waited for it ends cancelled, never started,
+    // and the one whose `if` holds after a cancel (`always()`) runs; then the run is over, cancelled.
     build.finish("canceled");
+    let after = of("after");
+    assert_eq!((after["state"].as_str(), after["result"].as_str(), after.get("token")), (Some("done"), Some("cancelled"), None), "{after}");
+    let report = runner_of(&served, &run, "report");
+    report.take();
+    report.finish("succeeded");
     let o = superci(&served, &dir, &["runs", "wait", &run, "--quiet"]).output().unwrap();
     let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
     assert!(said.contains("The run ended: cancelled"), "{said}");

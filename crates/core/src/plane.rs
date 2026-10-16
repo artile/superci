@@ -3663,16 +3663,21 @@ impl<'a> ControlPlane<'a> {
                     let own = match &source { Some(p) => called.get(p).ok_or_else(|| format!("{p} is not in the run"))?, None => &wf };
                     let key_name = jobs[i]["job_key"].as_str().or(jobs[i]["key"].as_str()).unwrap_or_default().to_string();
                     let job = own.get("jobs").and_then(|j| j.get(&key_name));
-                    let (needs, status, all_good) = needs_said(&jobs, &needed, call.as_deref(), &called, &wf)?;
+                    let (needs, mut status, mut all_good) = needs_said(&jobs, &needed, call.as_deref(), &called, &wf)?;
+                    // Its run cancelled: as on GitHub, a job waiting runs only if its `if` says so then (`always()`,
+                    // `cancelled()`); the rest end cancelled.
+                    let cancelled = run["cancelled"] == true;
+                    if cancelled { (status, all_good) = (crate::expression::Status::Cancelled, false) }
                     // A called workflow's job: its caller's `if` first (by default, if what the caller needs went well),
                     // then its inputs, from what the caller gives.
                     if let Some(caller) = &call {
-                        let (caller_needs, caller_status, caller_good) = needs_said(&jobs, &wait, None, &called, &wf)?;
+                        let (caller_needs, mut caller_status, mut caller_good) = needs_said(&jobs, &wait, None, &called, &wf)?;
+                        if cancelled { (caller_status, caller_good) = (crate::expression::Status::Cancelled, false) }
                         let caller_job = wf.get("jobs").and_then(|j| j.get(caller));
                         let caller_values = self.run_contexts(&run, &serde_json::json!({}), &caller_needs);
                         let cc = crate::expression::Contexts { values: &caller_values, status: caller_status };
                         let caller_runs = match caller_job.and_then(|j| j.get("if")).and_then(|n| n.text()) { Some(cond) => crate::expression::holds(cond, &cc).map_err(|e| format!("the job {caller}'s if: {e}"))?, None => caller_good };
-                        if !caller_runs { jobs[i]["state"] = "done".into(); jobs[i]["result"] = "skipped".into(); jobs[i]["name"] = format!("{caller} / {key_name}").into(); moved = true; continue }
+                        if !caller_runs { jobs[i]["state"] = "done".into(); jobs[i]["result"] = if cancelled { "cancelled" } else { "skipped" }.into(); jobs[i]["name"] = format!("{caller} / {key_name}").into(); moved = true; continue }
                         let part = source.as_ref().and_then(|p| called.get(p)).and_then(crate::workflow::call_part);
                         jobs[i]["inputs"] = call_inputs(part, caller_job.and_then(|j| j.get("with")), &cc)?;
                     }
@@ -3727,7 +3732,7 @@ impl<'a> ControlPlane<'a> {
                         jobs[i]["token"] = token.clone().into();
                         start.push(token);
                     } else {
-                        jobs[i]["state"] = "done".into(); jobs[i]["result"] = "skipped".into();
+                        jobs[i]["state"] = "done".into(); jobs[i]["result"] = if cancelled { "cancelled" } else { "skipped" }.into();
                     }
                     moved = true;
                 }
@@ -3886,7 +3891,9 @@ impl<'a> ControlPlane<'a> {
             let (mut told, mut ended) = (vec![], vec![]);
             for j in run["jobs"].as_array_mut().into_iter().flatten() {
                 match j["state"].as_str() {
-                    Some("pending") => { j["state"] = "done".into(); j["result"] = "cancelled".into(); }
+                    // (Waiting: left to `advance_run`, which ends it cancelled once what it needs has ended, unless
+                    // its `if` says to run then.)
+                    Some("pending") => {}
                     Some("started") => {
                         let (Some(token), Some(job_id)) = (j["token"].as_str().map(str::to_string), j["job_id"].as_str().and_then(|i| i.parse::<u64>().ok())) else { continue };
                         // (Its runner has until the grace time and a little more: then its machine is ended.)
