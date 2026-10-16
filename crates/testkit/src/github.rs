@@ -20,6 +20,8 @@ const LOGS_AT: &str = "https://productionresultssa0.blob.core.windows.net/action
 
 #[derive(Default)]
 struct Hub {
+    /// S3 refuses what is put (as it refuses a link that ended).
+    refuse_puts: bool,
     jobs: BTreeMap<u64, Value>,
     logs: BTreeMap<u64, String>,
     /// Each run's logs, once it has ended (GitHub's zip: a folder for each job, a file for each step).
@@ -74,6 +76,9 @@ impl GitHub {
 
     /// An object put in a bucket (`bucket/key`), as the control plane's deploy leaves its program there.
     pub fn put_object(&self, key: &str, bytes: &[u8]) { self.hub.lock().unwrap().objects.insert(key.to_string(), bytes.to_vec()); }
+
+    /// From now on S3 refuses what is put in a bucket (`false`: takes it again).
+    pub fn refuse_puts(&self, refuse: bool) { self.hub.lock().unwrap().refuse_puts = refuse }
 
     /// How many times GitHub's key set for its jobs' tokens was asked for.
     pub fn jwks_asked(&self) -> u64 { self.hub.lock().unwrap().jwks_asked }
@@ -228,6 +233,7 @@ impl GitHub {
             let mut h = self.hub.lock().unwrap();
             let missing = || Response::new(404, "application/xml", format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>{}</Key></Error>", path.trim_start_matches('/')));
             return Some(match r.method.as_str() {
+                "PUT" if h.refuse_puts => Response::new(403, "application/xml", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>"),
                 "PUT" => { h.objects.insert(key, r.body.clone()); Response::new(200, "application/xml", "") }
                 "HEAD" => if h.objects.contains_key(&key) { Response::new(200, "application/octet-stream", "") } else { Response::new(404, "application/xml", "") },
                 // (A range of it, as S3 answers one: 206 with those bytes.)

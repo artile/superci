@@ -845,6 +845,24 @@ fn a_second_run_from_the_same_checkout_sends_only_what_changed_on_top_of_the_tre
 }
 
 #[test]
+fn a_working_tree_the_bucket_refused_cancels_its_run_and_says_why() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+    });
+    let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    served.github.refuse_puts(true);
+    let dir = checkout();
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    let run = run_of(&served);
+    assert!(!o.status.success() && said.contains("The working tree was not sent (the bucket said 403") && said.contains(&format!("run {run} was cancelled")), "{said}");
+    assert_eq!(served.store.under(&format!("run:{run}"))[0].1["cancelled"], true);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn what_a_run_from_a_computer_cannot_start_or_follow_is_said() {
     let served = serve(|_| {});
     let said = |dir: &std::path::Path, args: &[&str]| { let o = superci(&served, dir, args).output().unwrap(); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };

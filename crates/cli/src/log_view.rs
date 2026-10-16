@@ -262,6 +262,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_lines_time_and_gitlabs_stream_mark_are_read_only_where_they_are() {
+        assert_eq!(split_time("2026-10-16T10:00:01.0000000Z hello"), (Some("10:00:01"), "hello"));
+        // Not a time: too short, no dash or T where they go, not digits, or no Z soon after.
+        for raw in ["2026-10-16T10:00Z x", "2026x10-16T10:00:01.0000000Z x", "2026-10-16x10:00:01.0000000Z x", "abcd-10-16T10:00:01.0000000Z x", "2026-10-16T10:00:01.0000000000000000000000000000000Z x"] {
+            assert_eq!(split_time(raw), (None, raw), "{raw}");
+        }
+        assert_eq!(gitlab_text("2026-10-16T10:00:01.0000000Z 00O+ text"), "text");
+        assert_eq!(gitlab_text("2026-10-16T10:00:01.0000000Z 01E text"), "text");
+        for raw in ["00X text", "0aO text", "00"] { assert_eq!(gitlab_text(raw), raw) }
+    }
+
+    #[test]
     fn githubs_lines_go_to_the_step_they_were_written_in() {
         let got = json!({ "steps": [
             { "name": "Set up job", "status": "completed", "conclusion": "success", "started_at": "2026-10-14T21:09:50Z", "completed_at": "2026-10-14T21:09:52Z" },

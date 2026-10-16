@@ -384,6 +384,53 @@ mod tests {
     }
 
     #[test]
+    fn lines_are_read_whatever_wraps_them_and_odd_ones_are_not_taken_for_tests() {
+        // A line's time (GitHub's), GitLab's stream mark, colour codes and carriage returns go; what only looks like
+        // them stays.
+        assert_eq!(plain("2026-10-16T10:00:00.1234567Z \u{1b}[31mok\u{1b}[0m\r"), "ok");
+        assert_eq!(plain("00O+passed line"), "passed line");
+        assert_eq!(plain("12E text"), "text");
+        for kept in ["00X text", "0aO text", "00Otext", "abc", "2026x10-16T10:00:00Z short one", "2026-10-16x10:00:00.0000000Z not a time", "abcd-10-16T10:00:00.0000000Z not a year", "\u{1b}x"] {
+            assert_eq!(plain(kept), kept.trim_end(), "{kept:?}");
+        }
+        // pytest's summary with errors only; a line of = that is no summary.
+        let t = read("========================= 2 errors in 0.31s =========================\n===== not a summary =====");
+        assert_eq!((t.runners.clone(), t.failed), (vec!["pytest"], 2));
+        assert_eq!(read("=== RESULTS: 3 passed ===").runners, Vec::<&str>::new(), "no time, no summary");
+        // Vitest's FAIL with no test file named: not a failure of its.
+        assert!(read(" FAIL  build > step").failures.is_empty());
+        assert_eq!(read(" FAIL  pkg/x.ts > a > b\nboom").failures.len(), 1);
+        assert_eq!(read(" FAIL  a.spec.ts > b\nboom").failures[0].file.as_deref(), Some("a.spec.ts"));
+        // An error is cut at a second blank line, and at `ERROR_LINES` lines.
+        let long: String = (1..=60).map(|n| format!("  line {n}\n")).collect();
+        let t = read(&format!(" FAIL  a.test.ts > b\n{long}"));
+        assert_eq!(t.failures[0].error.lines().count(), ERROR_LINES);
+        let t = read(" FAIL  a.test.ts > b\nfirst\n\nsecond\n\n\nthird");
+        assert_eq!(t.failures[0].error, "first\n\nsecond");
+        // The same failure said twice is one; at most `MOST` are kept.
+        assert_eq!(read(" FAIL  a.test.ts > b\nx\n FAIL  a.test.ts > b\nx").failures.len(), 1);
+        let many: String = (0..MOST + 5).map(|n| format!(" FAIL  a.test.ts > t{n}\nx\n")).collect();
+        assert_eq!(read(&many).failures.len(), MOST);
+        // Marks: one too long, one with brackets inside, Playwright's own list line: no process's.
+        let long_mark = format!("[{}] Running 1 test using 1 worker", "x".repeat(50));
+        assert_eq!(marked(&long_mark).0, "");
+        assert_eq!(marked("[a[b] text").0, "");
+        assert_eq!(marked("[slot 1] › text").0, "");
+        // Playwright's list: without a project, with a file but no line, a retry passed (flaky), passed then failed.
+        let t = read("Running 4 tests using 1 worker\n  ✓  1 e2e/a.spec.ts:3:1 › one (1s)\n  ✓  2 e2e/a.spec.ts › no line (1s)\n  ✘  3 [p] › e2e/b.spec.ts:1:1 › two (1s)\n  ✓  4 [p] › e2e/b.spec.ts:1:1 › two (retry #1) (1s)\n  ✓  5 [p] › e2e/c.spec.ts:1:1 › three (1s)\n  ✘  6 [p] › e2e/c.spec.ts:1:1 › three (1s)\n  ✓  [p] › e2e/d.spec.ts:2:2 › four\n  - [p] e2e/x.spec.ts:1:1 no separator\n  3 passed (4s)");
+        let ran: Vec<(&str, &str)> = t.ran.iter().map(|r| (r.name.as_str(), r.outcome)).collect();
+        assert_eq!(ran, [("one", "passed"), ("[p] two", "flaky"), ("[p] three", "failed as expected"), ("[p] four", "passed")]);
+        // Playwright's summary that is not one: too many words, or a word it does not say.
+        let t = read("Running 1 test using 1 worker\n  2 passed but slowly today\n  2 tests\n  1 passed (1s)");
+        assert_eq!(t.passed, 1);
+        // "Running" alone is not Playwright's.
+        assert!(read("Running 3 checks\n  1 passed").runners.is_empty());
+        // A note said once, however many processes say it.
+        let t = read("Error: No tests found\n[a] Error: No tests found\n[a] Error: No tests found");
+        assert_eq!(t.notes.len(), 2);
+    }
+
+    #[test]
     fn a_log_without_tests_says_none() {
         let t = read("Run make build\ncompiling…\nDone in 3s");
         assert_eq!(t, Tests::default());

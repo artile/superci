@@ -609,6 +609,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_run_is_said_by_its_number() {
+        assert!(run_ok("123").is_ok());
+        for bad in ["", "12a", "-1"] { assert!(run_ok(bad).unwrap_err().starts_with("Say which run")) }
+    }
+
+    #[test]
     fn a_zip_as_upload_artifact_makes_it_is_unpacked_inside_its_folder() {
         let dir = std::env::temp_dir().join(format!("superci-unzip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
