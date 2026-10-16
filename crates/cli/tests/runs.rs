@@ -304,7 +304,7 @@ fn a_green_run_whose_slot_ran_no_tests_says_so_lists_what_ran_and_its_job_is_fou
     let out = cli.wait_with_output().unwrap();
     let quiet = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{quiet}");
-    assert!(quiet.contains("Tests: 0 failed, 3 passed (playwright)") && quiet.contains("[slot 2] Playwright ran no tests."), "{quiet}");
+    assert!(quiet.contains("Tests: 0 failed, 3 passed (playwright), of the passed 1 failed as expected") && quiet.contains("[slot 2] Playwright ran no tests."), "{quiet}");
     assert!(quiet.contains("What ran:") && quiet.contains("✓ [chromium] adds to cart  (e2e/cart.spec.ts:12:3)") && quiet.contains("✓ (failed as expected) [chromium] known bug"), "{quiet}");
     // Followed without --quiet, the same at its end.
     let all = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "wait", &run]).output().unwrap().stdout).into_owned();
@@ -318,6 +318,30 @@ fn a_green_run_whose_slot_ran_no_tests_says_so_lists_what_ran_and_its_job_is_fou
     assert!(o.status.success() && std::fs::read_to_string(&file).unwrap().contains("[slot 2] Running 0 tests"), "{}", String::from_utf8_lossy(&o.stderr));
     let o = superci(&served, &dir, &["jobs", "retrieve", &format!("--run={run}"), "--job=nope"]).output().unwrap();
     assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("has no job nope (its jobs: tests)"), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_run_whose_tests_passed_and_a_type_check_failed_names_that_step_and_a_value_shells_read_is_noted() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet", "--var=CURRENCY=gbp|eur"]).spawn().unwrap();
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let (a, b) = ("aaaaaaaa-0000-0000-0000-000000000001", "bbbbbbbb-0000-0000-0000-000000000002");
+    runner.take();
+    runner.steps(&[(a, "Run npm test", 1, "inProgress", None, None), (b, "Run npm run typecheck", 2, "pending", None, None)]);
+    runner.log(1, "2026-10-16T10:00:01.0000000Z  Test Files  5 passed (5)\n2026-10-16T10:00:01.0000000Z       Tests  41 passed (41)");
+    runner.steps(&[(a, "Run npm test", 1, "completed", Some("succeeded"), Some(1)), (b, "Run npm run typecheck", 2, "inProgress", None, None)]);
+    runner.log(2, "2026-10-16T10:00:02.0000000Z src/a.ts(3,1): error TS2322: Type 'string' is not assignable to type 'number'.");
+    runner.steps(&[(a, "Run npm test", 1, "completed", Some("succeeded"), Some(1)), (b, "Run npm run typecheck", 2, "completed", Some("failed"), Some(2))]);
+    runner.finish("failed");
+    let out = cli.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("Note: --var CURRENCY's value has characters a shell runs (|)"), "{said}");
+    assert!(said.contains("Tests: 0 failed, 41 passed (vitest)") && said.contains("Failed: Run npm run typecheck") && said.contains("The run ended: failure"), "{said}");
+    let tests = String::from_utf8_lossy(&superci(&served, &dir, &["runs", "retrieve", &run, "--tests"]).output().unwrap().stdout).into_owned();
+    assert!(tests.contains("no test in its log is read as failed (failed: Run npm run typecheck)"), "{tests}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -15,6 +15,11 @@ pub struct Tests {
     pub passed: u64,
     pub failed: u64,
     pub skipped: u64,
+    /// Of those passed: tests marked to fail that failed (`test.fail()`), and tests that passed when run again.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub failed_as_expected: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub flaky: u64,
     pub failures: Vec<Failure>,
     /// What a runner said of the tests as a whole that a count does not: that none matched what was asked, or that
     /// it ran none (a `file:line` that no longer points at a test, with no tests found allowed).
@@ -46,6 +51,8 @@ pub struct Failure {
     /// What it failed with: the first lines its runner printed of it.
     pub error: String,
 }
+
+fn is_zero(n: &u64) -> bool { *n == 0 }
 
 /// At most this many failures are kept (their error at most `ERROR_LINES` lines, `ERROR_CHARS` characters).
 const MOST: usize = 200;
@@ -128,6 +135,8 @@ pub fn read(log: &str) -> Tests {
         // (Which process said it, where lines are marked so.)
         for n in one.notes { let n = if mark.is_empty() { n } else { format!("{mark} {n}") }; if !t.notes.contains(&n) { t.notes.push(n) } }
     }
+    t.failed_as_expected = t.ran.iter().filter(|r| r.outcome == "failed as expected").count() as u64;
+    t.flaky = t.ran.iter().filter(|r| r.outcome == "flaky").count() as u64;
     t
 }
 
@@ -149,7 +158,7 @@ fn listed(s: &str) -> Option<(char, String, String)> {
     };
     if !file.chars().last().is_some_and(|c| c.is_ascii_digit()) { return None }
     // (Without its time and a retry's mark, as Playwright adds them: "(2.1s)", "(345ms)", "(1.2m)", "(retry #1)".
-    // Nothing else in brackets: "(legacy feed)" is the test's own title.)
+    // Nothing else in brackets: "(old layout)" is the test's own title.)
     let mut title = title.trim().to_string();
     let added = |inner: &str| {
         let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.') && s.bytes().next().is_some_and(|b| b.is_ascii_digit());
@@ -390,6 +399,7 @@ mod tests {
         let ran: Vec<(&str, &str)> = t.ran.iter().map(|r| (r.name.as_str(), r.outcome)).collect();
         assert_eq!(ran, [("[chromium] logs in", "passed"), ("[chromium] known bug", "failed as expected"), ("[chromium] sometimes", "flaky"), ("[chromium] later", "skipped"), ("alone", "passed")]);
         assert_eq!(t.ran[0].file.as_deref(), Some("e2e/a.spec.ts:4:3"));
+        assert_eq!((t.failed_as_expected, t.flaky), (1, 1));
         assert_eq!(t.notes, ["[slot 2] Playwright ran no tests."]);
     }
 
@@ -444,11 +454,12 @@ mod tests {
     fn a_titles_own_brackets_are_kept_and_only_a_real_failure_is_one() {
         // Two tests alike but for their bracketed end, one of which really failed: each its own line, and the failed
         // one a failure (not "failed as expected", which only a test marked to fail is).
-        let log = "Running 3 tests using 1 worker\n  ✓  1 [chromium] › e2e/feed.spec.ts:4:3 › shows the feed (legacy feed) (1.2s)\n  ✓  2 [chromium] › e2e/feed.spec.ts:9:3 › shows the feed (business feed) (845ms)\n  ✘  3 [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (FINDING #25) (2.0m)\n  ✘  4 [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (FINDING #25) (retry #1) (1.9m)\n\n  1) [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (FINDING #25) ───\n\n    Error: expected 1, got 2\n\n  1 failed\n  2 passed (4.1m)";
+        let log = "Running 3 tests using 1 worker\n  ✓  1 [chromium] › e2e/feed.spec.ts:4:3 › shows the page (old layout) (1.2s)\n  ✓  2 [chromium] › e2e/feed.spec.ts:9:3 › shows the page (new layout) (845ms)\n  ✘  3 [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (issue #25) (2.0m)\n  ✘  4 [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (issue #25) (retry #1) (1.9m)\n\n  1) [chromium] › e2e/audit.spec.ts:2:1 › keeps the order (issue #25) ───\n\n    Error: expected 1, got 2\n\n  1 failed\n  2 passed (4.1m)";
         let t = read(log);
         let ran: Vec<(&str, &str)> = t.ran.iter().map(|r| (r.name.as_str(), r.outcome)).collect();
-        assert_eq!(ran, [("[chromium] shows the feed (legacy feed)", "passed"), ("[chromium] shows the feed (business feed)", "passed"), ("[chromium] keeps the order (FINDING #25)", "failed")]);
-        assert_eq!((t.failed, t.failures[0].name.as_str()), (1, "[chromium] keeps the order (FINDING #25)"));
+        assert_eq!(ran, [("[chromium] shows the page (old layout)", "passed"), ("[chromium] shows the page (new layout)", "passed"), ("[chromium] keeps the order (issue #25)", "failed")]);
+        assert_eq!((t.failed_as_expected, t.flaky), (0, 0));
+        assert_eq!((t.failed, t.failures[0].name.as_str()), (1, "[chromium] keeps the order (issue #25)"));
     }
 
     #[test]

@@ -3,7 +3,10 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.10 — 2026-10-16
-- `--tests` and `--quiet` keep a test's own bracketed title ("shows the feed (legacy feed)"): only Playwright's time and retry marks are taken off. Two tests alike but for that showed as one line, and a test that really failed, titled "… (FINDING #25)", was listed as failed as expected.
+- A failed job's summary names the steps that failed ("Failed: Run npm run typecheck"), with `runs create`, `runs wait` and `runs retrieve --tests`: when every test passed and a type-check failed, only "The run ended: failure" said so.
+- The tests' totals count those that failed as expected (`test.fail()`) and the flaky ones ("Tests: 0 failed, 65 passed (playwright), of the passed 3 failed as expected, 1 flaky"), also when the list of tests is left out.
+- `superci runs create` notes a `--var` or `--secret` value with characters a shell runs (`|`, `;`, `&`, a backquote, `$(`): a step that puts it in a `run:` line runs them.
+- `--tests` and `--quiet` keep a test's own bracketed title ("shows the page (old layout)"): only Playwright's time and retry marks are taken off. Two tests alike but for that showed as one line, and a test that really failed, titled "… (issue #25)", was listed as failed as expected.
 - An AWS sign-in is renewed by one SuperCI at a time, as Cloudflare's already was: several commands at once (agents in parallel) each renewed it, AWS took the first renewal and refused the rest, and those took it for the sign-in's end and signed everything out.
 - A run from a computer sends what changed since that folder's last run, and says so ("Sending what changed since this folder's last run, 3 minutes ago: 2 files, 0 removed"): each run's changes are kept as a layer on the last run's, eight at most, then all of it again. It sent what changed since the folder's first run, which grew with every edit and read as wrong both ways.
 - A run from a computer's checkout on a macOS machine unpacks what changed since a run before: macOS's tar refused how it was asked.

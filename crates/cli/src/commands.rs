@@ -318,7 +318,14 @@ fn job_tests(v: &PlaneView, key: &str, j: &Value) -> Value {
     };
     // (A failed job none of whose tests is read as failed: what failed is elsewhere in its log.)
     if failed_job(j) && tests["failed"].as_u64().unwrap_or(0) == 0 {
-        tests["note"] = format!("The job failed, but no test in its log is read as failed (a step besides the tests, or a test runner whose lines are not read). Its whole log: `superci jobs retrieve {} --out=job.log`", j["job_id"]).into();
+        // (The steps that failed, by name, where the control plane says: a type-check, say.)
+        let gl = if j["provider"] == "gitlab" { format!("&gl={}", j["gitlab"].as_str().unwrap_or_default()) } else { String::new() };
+        let failed: Vec<String> = crate::cloudflare::plane_get(v.plane.url(), key, &format!("/job/log?id={}&steps=1&bytes=1{gl}", j["job_id"])).ok()
+            .and_then(|g| g["steps"].as_array().cloned()).unwrap_or_default().iter()
+            .filter(|s| s["result"] == "failed" || s["conclusion"] == "failure").filter_map(|s| s["name"].as_str().map(str::to_string)).collect();
+        let at = if failed.is_empty() { "a step besides the tests, or a test runner whose lines are not read".to_string() } else { format!("failed: {}", failed.join(", ")) };
+        tests["note"] = format!("The job failed, but no test in its log is read as failed ({at}). Its whole log: `superci jobs retrieve {} --out=job.log`", j["job_id"]).into();
+        tests["failed_steps"] = failed.into();
     }
     if j["provider"] == "local" {
         let run = j["run_id"].as_u64().unwrap_or_default();
@@ -336,10 +343,9 @@ fn job_tests(v: &PlaneView, key: &str, j: &Value) -> Value {
 fn tests_lines(t: &Value, indent: &str) -> Vec<String> {
     if let Some(e) = t["error"].as_str() { return vec![format!("{indent}Its log could not be read: {e}")] }
     let runners: Vec<&str> = t["runners"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
-    let n = |k: &str| t[k].as_u64().unwrap_or(0);
     // (Its artifacts are said either way.)
     let mut out = vec![if runners.is_empty() { format!("{indent}No test results in its log (none of Vitest, Jest, Playwright, pytest, cargo or Go said any).") }
-        else { format!("{indent}Tests: {} failed, {} passed{} ({})", n("failed"), n("passed"), if n("skipped") > 0 { format!(", {} skipped", n("skipped")) } else { String::new() }, runners.join(", ")) }];
+        else { format!("{indent}{}", totals_line(t)) }];
     for f in t["failures"].as_array().into_iter().flatten() {
         out.push(format!("{indent}✗ {}{}", f["name"].as_str().unwrap_or_default(), f["file"].as_str().map(|p| format!("  ({p})")).unwrap_or_default()));
         for l in f["error"].as_str().unwrap_or_default().lines() { out.push(format!("{indent}    {l}")) }
@@ -350,6 +356,18 @@ fn tests_lines(t: &Value, indent: &str) -> Vec<String> {
     for a in t["artifacts"].as_array().into_iter().flatten() { out.push(format!("{indent}Artifact {}: `{}`", a["name"].as_str().unwrap_or_default(), a["fetch"].as_str().unwrap_or_default())) }
     if let Some(at) = t["artifacts_at"].as_str() { out.push(format!("{indent}Its artifacts: {at}")) }
     out
+}
+
+/// What a job's tests came to, in a line: "Tests: 0 failed, 65 passed, 2 skipped (playwright), of the passed 3 failed
+/// as expected, 1 flaky" (those marked to fail, `test.fail()`, are counted among the passed, as their runner counts them).
+pub fn totals_line(t: &Value) -> String {
+    let n = |k: &str| t[k].as_u64().unwrap_or(0);
+    let runners: Vec<&str> = t["runners"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).collect();
+    let mut extra: Vec<String> = vec![];
+    if n("failed_as_expected") > 0 { extra.push(format!("{} failed as expected", n("failed_as_expected"))) }
+    if n("flaky") > 0 { extra.push(format!("{} flaky", n("flaky"))) }
+    format!("Tests: {} failed, {} passed{} ({}){}", n("failed"), n("passed"), if n("skipped") > 0 { format!(", {} skipped", n("skipped")) } else { String::new() }, runners.join(", "),
+        if extra.is_empty() { String::new() } else { format!(", of the passed {}", extra.join(", ")) })
 }
 
 /// The tests that ran, each with how it came out, when there are few enough to read (30 at most; else the counts say it).
@@ -491,6 +509,11 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 Some((url, key)) => (url, key),
                 None => { let mut d = signed_in(); let (v, key) = look(&mut d)?; (v.plane.url().to_string(), crate::cloudflare::plane_key(&key, v.plane.url())) }
             };
+            // A value with what a shell reads as commands (`|`, `;`, `&`, a backquote, `$(`): said, as a workflow that puts
+            // it in a `run:` line (or inside its own quotes) runs them. (A secret by its name only.)
+            let shelly = |v: &str| ["|", ";", "&", "`", "$(", "\n"].iter().any(|c| v.contains(c));
+            for (k, v) in vars.iter().filter(|(_, v)| shelly(v)) { steps(&format!("{}Note: --var {k}'s value has characters a shell runs ({}): a step that puts it in a `run:` line runs them; pass it through `env:` and quote it there.", JOB_LINE, ["|", ";", "&", "`", "$("].iter().filter(|c| v.contains(*c)).copied().collect::<Vec<_>>().join(" "))) }
+            for (k, _) in secrets.iter().filter(|(_, v)| shelly(v)) { steps(&format!("{}Note: --secret {k}'s value has characters a shell runs: a step that puts it in a `run:` line runs them; pass it through `env:` and quote it there.", JOB_LINE)) }
             let how = crate::local_run::Follow { quiet: args.has("quiet"), detach: args.has("detach"), dry_run: args.has("dry-run") };
             ended(crate::local_run::create(&url, &key, workflow, args.get("job"), args.get("event").unwrap_or("push"), &secrets, &vars, how, steps)?)
         }

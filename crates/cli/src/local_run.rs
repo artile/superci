@@ -394,11 +394,16 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     all.push_str(&text);
                     all.push('\n');
                 }
+                // A failed job: which steps failed, said in words (all its tests may have passed: a type-check failed, say).
+                if j["result"] == "failure" {
+                    let failed: Vec<&str> = j["steps"].as_array().into_iter().flatten().filter(|s| s["result"] == "failed").filter_map(|s| s["name"].as_str()).collect();
+                    if !failed.is_empty() { say(&format!("{}  Failed: {}", crate::commands::JOB_LINE, failed.join(", "))) }
+                }
                 if let (Some(id), true) = (j["job_id"].as_str(), j["result"] == "failure") { say(&format!("{}  Its whole log: superci jobs retrieve {id} --out=job.log", crate::commands::JOB_LINE)) }
                 // What its tests came to, passed or not, and what a runner said of them as a whole.
                 let tests = crate::test_results::read(&all);
                 if !tests.runners.is_empty() {
-                    say(&format!("{}  Tests: {} failed, {} passed{} ({})", crate::commands::JOB_LINE, tests.failed, tests.passed, if tests.skipped > 0 { format!(", {} skipped", tests.skipped) } else { String::new() }, tests.runners.join(", ")));
+                    say(&format!("{}  {}", crate::commands::JOB_LINE, crate::commands::totals_line(&serde_json::to_value(&tests).unwrap_or_default())));
                     for l in crate::commands::ran_lines(&serde_json::to_value(&tests).unwrap_or_default(), "  ") { say(&format!("{}{l}", crate::commands::JOB_LINE)) }
                     for n in &tests.notes { say(&format!("{}  {n}", crate::commands::JOB_LINE)) }
                 }
