@@ -714,7 +714,8 @@ fn usage_says_what_jobs_cost_beside_githubs_runners_how_many_did_not_run_and_the
     assert_eq!(code, 0, "{v}");
     let o = superci(&home, &["usage", "retrieve"]);
     let said = String::from_utf8_lossy(&o.stdout);
-    assert!(said.contains("2 jobs, 1 ran, 1 did not") && said.contains("saved") && said.contains("Median wait for a machine: 30 s"), "{said}");
+    // (Half a minute, and the moment the test itself took.)
+    assert!(said.contains("2 jobs, 1 ran, 1 did not") && said.contains("saved") && (said.contains("Median wait for a machine: 30 s") || said.contains("Median wait for a machine: 31 s")), "{said}");
 }
 
 #[test]
