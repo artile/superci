@@ -328,3 +328,43 @@ fn a_job_asking_for_more_than_allowed_fails_at_once_saying_why_and_the_dashboard
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn each_jobs_row_says_where_it_ran_and_why_in_plain_words() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    // Jobs as the control plane keeps them after what AWS and Cloudflare said (each a real job of acme/app, its
+    // record then given what that situation writes).
+    let cases: Vec<(serde_json::Value, &str)> = vec![
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "on_demand": true, "spot_refused": "us-east-1: MaxSpotInstanceCountExceeded: Max spot instance count exceeded", "spot_ending": true }), "On-demand: your AWS spot limit in N. Virginia was reached (machines AWS was still ending count too)"),
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "on_demand": true, "spot_refused": "us-east-1: InsufficientInstanceCapacity" }), "On-demand: AWS had no spot machine for it"),
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "on_demand": true, "spot_refused": format!("us-east-1: {}", superci_core::plane::SPOT_NOT_ALLOWED) }), "On-demand: your AWS organization does not allow spot machines"),
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "on_demand": true, "spot_refused": "us-east-1: RequestLimitExceeded" }), "On-demand: AWS refused the spot request for its rate"),
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "on_demand": true, "after_reclaim": true }), "On-demand: run again after AWS took back its spot machine"),
+        (serde_json::json!({ "state": "running", "cloud": "aws", "machine_type": "c8a.2xlarge", "cpu": 8, "spot_again": true }), "On a spot machine again: an on-demand one does not fit"),
+        (serde_json::json!({ "state": "done", "cloud": "aws", "machine_type": "m8a.xlarge", "cpu": 4, "local_disk": true, "disk_gb": 120, "disk_mibs": 500 }), "4 CPU · m8a.xlarge · 120 GB disk at 500 MiB/s · local disk"),
+        (serde_json::json!({ "state": "failed", "cloud": "cloudflare", "error": "runner container: 502 the container did not start in time" }), "Cloudflare did not start its container"),
+        (serde_json::json!({ "state": "failed", "cloud": "cloudflare", "error": "the container cannot be kept running" }), "Cloudflare could not keep its container running"),
+        (serde_json::json!({ "state": "failed", "cloud": "", "error": format!("waiting: {}", "x".repeat(130)) }), &"…"),
+        (serde_json::json!({ "state": "swept", "cloud": "aws", "error": null }), "Its machine never started the job"),
+        (serde_json::json!({ "state": "orphan", "cloud": "aws", "error": null }), "Its machine was lost"),
+    ];
+    for (fields, _) in &cases {
+        let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+        assert_eq!(served.webhook(queued), 202);
+        let key = format!("job:{id}");
+        let mut m = served.store.0.lock().unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap();
+        for (k, v) in fields.as_object().unwrap() { j[k] = v.clone() }
+        m.insert(key, j.to_string());
+    }
+    let (mut child, link) = dashboard(&home);
+    let (_, page) = part(&link, "/?p=jobs&fragment=1");
+    let said = words(&page);
+    for (_, want) in &cases { assert!(said.contains(want), "no {want:?} in: {said}") }
+    // The spot limit reached in the last day: said once above the jobs, with where to ask AWS for more.
+    assert!(said.contains("in the last day ran on on-demand machines, at about twice the price: your AWS account's spot limit in N. Virginia was reached") && page.contains("servicequotas"), "{said}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
