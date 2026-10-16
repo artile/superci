@@ -205,6 +205,35 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream) -> std::io::Resul
     write(stream, res.status, &res.headers, &res.body)
 }
 
+/// A DictUpdateRequest's entries (`updates`, field 2: each a key, field 1, and a value, field 2), each pickled as
+/// Modal's client pickles a string (protocol 4), as text.
+fn modal_entries(b: &[u8]) -> Vec<(String, String)> {
+    fn varint(b: &[u8], i: &mut usize) -> Option<u64> { let (mut n, mut shift) = (0u64, 0); loop { let c = *b.get(*i)?; *i += 1; n |= ((c & 0x7f) as u64) << shift; shift += 7; if c < 0x80 { return Some(n) } } }
+    fn fields(b: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let (mut i, mut out) = (0, vec![]);
+        while i < b.len() {
+            let Some(key) = varint(b, &mut i) else { break };
+            match key & 7 {
+                0 => { if varint(b, &mut i).is_none() { break } }
+                2 => { let Some(n) = varint(b, &mut i) else { break }; let end = (i + n as usize).min(b.len()); out.push((key >> 3, b[i..end].to_vec())); i = end }
+                _ => break,
+            }
+        }
+        out
+    }
+    let unpickle = |p: &[u8]| -> String {
+        // 0x80 0x04 0x95, 8 bytes of length; then 0x8c and one byte, or `X` and four, of the text's length; the text.
+        let body = p.get(11..).unwrap_or_default();
+        let (at, len) = match body.first() { Some(0x8c) => (2, *body.get(1).unwrap_or(&0) as usize), Some(b'X') => (5, u32::from_le_bytes(body.get(1..5).and_then(|s| s.try_into().ok()).unwrap_or([0; 4])) as usize), _ => (0, 0) };
+        String::from_utf8_lossy(body.get(at..at + len).unwrap_or_default()).into_owned()
+    };
+    fields(b).into_iter().filter(|(f, _)| *f == 2).map(|(_, entry)| {
+        let e = fields(&entry);
+        let get = |n: u64| e.iter().find(|(f, _)| *f == n).map(|(_, v)| unpickle(v)).unwrap_or_default();
+        (get(1), get(2))
+    }).collect()
+}
+
 /// AWS as SuperCI's calls find it (the CLI and the dashboard reach it with `SUPERCI_STAND_IN` set to `url`; what they ask of other hosts there, GitHub's stand-in answers): SSM's
 /// parameters, kept and answered for exactly as SSM does (its answers recorded from a real account are
 /// `crates/cli/fixtures/aws/settings/ssm.jsonl`, and a test holds this to them). Each exchange is kept, in the shape
@@ -227,6 +256,8 @@ pub struct Aws {
     pub github: Arc<Mutex<Option<GitHub>>>,
     /// The secrets written to each Worker (by its script's name), as Cloudflare keeps them for it: its settings.
     pub worker_secrets: Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>,
+    /// What Modal's settings Dicts were given (`DictUpdate`), by key: a Modal control plane's settings.
+    pub modal_settings: Arc<Mutex<BTreeMap<String, String>>>,
     /// Workers on workers.dev, by host (`superci.acme.workers.dev`), and the control plane on this computer each stands
     /// for (its address).
     pub workers: Arc<Mutex<BTreeMap<String, String>>>,
@@ -248,9 +279,9 @@ impl Aws {
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
-            // Cloudflare's API and its container registry, and GitHub's (where its runner image is), as a recording has
-            // them (what is not there is said as unanswered).
-            if ["api.cloudflare.com", "dash.cloudflare.com", "registry.cloudflare.com", "ghcr.io"].contains(&host.as_str()) {
+            // Cloudflare's API and its container registry, GitHub's (where its runner image is), and Modal's API (its
+            // calls as the CLI sends them to a stand-in), as a recording has them (what is not there is unanswered).
+            if ["api.cloudflare.com", "dash.cloudflare.com", "registry.cloudflare.com", "ghcr.io", "api.modal.com"].contains(&host.as_str()) {
                 let url = format!("https:/{target}");
                 let asked = String::from_utf8_lossy(&body).to_string();
                 // (A Worker's secrets kept as written: what a control plane served here reads as its settings.)
@@ -263,6 +294,10 @@ impl Aws {
                         ("DELETE", "") => { kept.remove(script); }
                         _ => {}
                     }
+                }
+                // (What a Modal settings Dict is given, kept: a Modal control plane served here reads it.)
+                if url.ends_with("/DictUpdate") {
+                    for (k, v) in modal_entries(&{ use base64::Engine; base64::engine::general_purpose::STANDARD.decode(asked.trim()).unwrap_or_default() }) { a.modal_settings.lock().unwrap().insert(k, v); }
                 }
                 let (status, said, answer) = a.replay(&method, &url, "", &asked).unwrap_or_else(|| {
                     a.unanswered.lock().unwrap().push(format!("{method} {url}"));
@@ -327,6 +362,10 @@ impl Aws {
         *all = r;
         self.replayed.lock().unwrap().clear();
     }
+
+    /// What Modal's settings Dicts were given, as a Modal control plane reads them (its settings; an empty value is
+    /// one taken out).
+    pub fn modal_plane_settings(&self) -> Vec<(String, String)> { self.modal_settings.lock().unwrap().iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect() }
 
     /// A Worker's secrets, as a control plane there reads them (its settings).
     pub fn worker_settings(&self, script: &str) -> Vec<(String, String)> { self.worker_secrets.lock().unwrap().get(script).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default() }

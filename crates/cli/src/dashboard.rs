@@ -2187,7 +2187,7 @@ impl Dashboard {
                 // Every control plane answers to the same label (one is in use at a time; workflows do not change on a move).
                 let label = "superci".to_string();
                 let again = field("plane");
-                let plane_id = if again.len() == 12 && again.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { again } else { superci_core::crypto::random_id(12) };
+                let plane_id = if again.len() == 12 && again.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { again } else { cloudflare::new_plane_id() };
                 self.start_deploy("modal", format!("workspace {}", session.workspace), &modal::DEPLOY_STEPS, vec![("plane", plane_id.clone())], move |step| {
                     let url = modal::deploy_plane(&session, &plane_id, &label, step)?;
                     step(2);
@@ -2463,7 +2463,7 @@ impl Dashboard {
                 let label = "superci".to_string();
                 // Trying again after a stop reuses what the first try created (same id, same names).
                 let again = field("plane");
-                let plane_id = if again.len() == 12 && again.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { again } else { superci_core::crypto::random_id(12) };
+                let plane_id = if again.len() == 12 && again.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) { again } else { cloudflare::new_plane_id() };
                 let creds = self.aws_creds()?;
                 self.start_deploy("aws", format!("account {account_id} · {region}"), &aws_plane::DEPLOY_STEPS, vec![("region", region.clone()), ("plane", plane_id.clone())], move |step| {
                     // Before anything is made: the region is the account's to use, and has the image jobs run on.

@@ -103,16 +103,45 @@ impl Session {
     }
 }
 
-struct Client { rt: tokio::runtime::Runtime, channel: Channel, session: Option<Session>, auth_token: Option<String> }
+/// `stand_in`: in a debug build with `SUPERCI_STAND_IN`, where each call goes instead (the test kit's, which answers
+/// as a recording has it); no connection to Modal is made then.
+struct Client { rt: tokio::runtime::Runtime, channel: Option<Channel>, session: Option<Session>, auth_token: Option<String>, stand_in: Option<String> }
 
 impl Client {
     fn new(session: Option<Session>) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+        #[cfg(debug_assertions)]
+        let stand_in = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty());
+        #[cfg(not(debug_assertions))]
+        let stand_in: Option<String> = None;
+        if stand_in.is_some() { return Ok(Client { rt, channel: None, session, auth_token: None, stand_in }) }
         let channel = rt.block_on(async {
             Endpoint::from_static(API).tls_config(ClientTlsConfig::new().with_webpki_roots()).map_err(|e| e.to_string())?
                 .timeout(Duration::from_secs(90)).connect().await.map_err(|e| format!("Modal: {e}"))
         })?;
-        Ok(Client { rt, channel, session, auth_token: None })
+        Ok(Client { rt, channel: Some(channel), session, auth_token: None, stand_in })
+    }
+
+    /// A call as the test kit answers it (`stand_in`, given the whole request): each answer's bytes, or Modal's refusal.
+    fn stand_in_call(&self, method: &str, asked: &[u8]) -> Result<Vec<Vec<u8>>> {
+        use base64::Engine;
+        let at = self.stand_in.as_deref().unwrap_or_default();
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let mut r = agent.post(&format!("{}/api.modal.com/modal.client.ModalClient/{method}", at.trim_end_matches('/'))).send(b64.encode(asked)).map_err(|e| format!("Modal: {e}"))?;
+        let v: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| format!("Modal: {e}"))?;
+        if let Some(e) = v["error"].as_str() { return Err(e.to_string()) }
+        v["answers"].as_array().into_iter().flatten().map(|a| b64.decode(a.as_str().unwrap_or_default()).map_err(|e| e.to_string())).collect()
+    }
+
+    /// In a debug build with `SUPERCI_RECORD`: the call, kept as the test kit answers it (what was asked by its size
+    /// only: it can hold a token); the answers as protobuf in base64.
+    #[cfg(debug_assertions)]
+    fn record(method: &str, asked: usize, answered: std::result::Result<Vec<Vec<u8>>, &str>) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let (status, answer) = match answered { Ok(a) => (200, serde_json::json!({ "answers": a.iter().map(|m| b64.encode(m)).collect::<Vec<_>>() })), Err(e) => (500, serde_json::json!({ "error": e })) };
+        crate::aws::record(&superci_core::io::Request::new("POST", &format!("{API}/modal.client.ModalClient/{method}")).with_body(format!("({asked} bytes)").into_bytes()), status, &[], answer.to_string().as_bytes());
     }
 
     fn request<T>(&self, message: T, with_auth: bool) -> tonic::Request<T> {
@@ -137,27 +166,37 @@ impl Client {
             let t: pb::AuthTokenGetResponse = self.unary("AuthTokenGet", pb::Empty {})?;
             self.auth_token = Some(t.token);
         }
+        let asked = message.encoded_len();
+        if self.stand_in.is_some() { return R::decode(self.stand_in_call(method, &message.encode_to_vec())?.first().map(Vec::as_slice).unwrap_or_default()).map_err(|e| format!("Modal: {e}")) }
         let req = self.request(message, authed);
         let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
-        let mut grpc = tonic::client::Grpc::new(self.channel.clone());
-        self.rt.block_on(async {
+        let mut grpc = tonic::client::Grpc::new(self.channel.clone().ok_or("Modal: no connection")?);
+        let got: Result<R> = self.rt.block_on(async {
             grpc.ready().await.map_err(|e| format!("Modal: {e}"))?;
             grpc.unary(req, path, tonic_prost::ProstCodec::default()).await.map(|r| r.into_inner()).map_err(|s| refused(method, &s))
-        })
+        });
+        #[cfg(debug_assertions)]
+        Self::record(method, asked, got.as_ref().map(|r| vec![r.encode_to_vec()]).map_err(String::as_str));
+        got
     }
 
     /// A server stream, read to its end (or `limit` messages).
     fn stream<Q: prost::Message + Send + Sync + 'static, R: prost::Message + Default + Send + Sync + 'static>(&mut self, method: &'static str, message: Q, limit: usize) -> Result<Vec<R>> {
+        let asked = message.encoded_len();
+        if self.stand_in.is_some() { return self.stand_in_call(method, &message.encode_to_vec())?.iter().take(limit).map(|b| R::decode(b.as_slice()).map_err(|e| format!("Modal: {e}"))).collect() }
         let req = self.request(message, true);
         let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
-        let mut grpc = tonic::client::Grpc::new(self.channel.clone());
-        self.rt.block_on(async {
+        let mut grpc = tonic::client::Grpc::new(self.channel.clone().ok_or("Modal: no connection")?);
+        let got: Result<Vec<R>> = self.rt.block_on(async {
             grpc.ready().await.map_err(|e| format!("Modal: {e}"))?;
             let mut s = grpc.server_streaming(req, path, tonic_prost::ProstCodec::default()).await.map_err(|s| refused(method, &s))?.into_inner();
             let mut out = vec![];
             while let Some(m) = s.message().await.map_err(|s| refused(method, &s))? { out.push(m); if out.len() >= limit { break } }
             Ok(out)
-        })
+        });
+        #[cfg(debug_assertions)]
+        Self::record(method, asked, got.as_ref().map(|r| r.iter().map(|m| m.encode_to_vec()).collect()).map_err(String::as_str));
+        got
     }
 }
 
