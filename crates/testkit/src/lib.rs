@@ -240,8 +240,18 @@ impl Aws {
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
-            // (S3's objects are kept by GitHub's stand-in, which the control plane reaches AWS through.)
-            if (!host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com")) || host.contains(".s3.") {
+            // (S3's objects are kept by GitHub's stand-in, which the control plane reaches AWS through; a call to S3 a
+            // recording has, at that very address, is answered as recorded.)
+            let s3 = host.contains(".s3.");
+            if s3 {
+                let url = format!("https:/{target}");
+                if let Some((status, said, answer)) = a.replay(&method, &url, "", &String::from_utf8_lossy(&body)).filter(|_| a.recorded.lock().unwrap().iter().any(|r| r["url"] == url.as_str() && r["method"] == method.as_str())) {
+                    a.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": "", "asked": String::from_utf8_lossy(&body), "status": status, "answer": answer }));
+                    let _ = write(stream, status, &said, answer.as_bytes());
+                    continue;
+                }
+            }
+            if (!host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com")) || s3 {
                 let gh = a.github.lock().unwrap().clone().unwrap_or_default();
                 let mut req = Request::new(&method, &format!("https:/{target}")).with_body(body);
                 for (k, v) in &headers { if !k.eq_ignore_ascii_case("host") { req = req.with_header(k, v) } }

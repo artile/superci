@@ -250,7 +250,8 @@ fn another_control_plane_is_deleted_as_aws_answered_a_real_account_and_the_one_i
     assert!(served.aws.settings("testplane0002").is_empty(), "{:?}", served.aws.settings("testplane0002"));
     assert!(!served.aws.settings(superci_testkit::PLANE).is_empty());
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap(), a["asked"].as_str().unwrap().chars().take(80).collect::<String>())).collect();
-    for gone in ["DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0002", "superci-plane-testplane0002\"}", "Action=DeleteRole&Version=2010-05-08&RoleName=superci-plane-testplane0002"] {
+    for gone in ["DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0002", "superci-plane-testplane0002\"}", "Action=DeleteRole&Version=2010-05-08&RoleName=superci-plane-testplane0002",
+        "DELETE https://superci-plane-testplane0002-us-east-1.s3.us-east-1.amazonaws.com/ "] {
         assert!(asked.iter().any(|a| a.contains(gone)), "{gone}: {asked:?}");
     }
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
