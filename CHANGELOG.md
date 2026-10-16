@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.10 — 2026-10-16
+- A run from a computer's checkout on a macOS machine no longer fails now and then after unpacking the whole tree: macOS's tar stops reading at the archive's end, and what still fed it was taken for a failure.
 - A failed job's summary names the steps that failed ("Failed: Run npm run typecheck"), with `runs create`, `runs wait` and `runs retrieve --tests`: when every test passed and a type-check failed, only "The run ended: failure" said so.
 - The tests' totals count those that failed as expected (`test.fail()`) and the flaky ones ("Tests: 0 failed, 65 passed (playwright), of the passed 3 failed as expected, 1 flaky"), also when the list of tests is left out.
 - `superci runs create` notes a `--var` or `--secret` value with characters a shell runs (`|`, `;`, `&`, a backquote, `$(`): a step that puts it in a `run:` line runs them.

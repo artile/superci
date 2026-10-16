@@ -193,7 +193,9 @@ pub fn checkout_action(tree: &str, parts: u32, layered: bool) -> String {
         // Each archive on the one before, and what was removed by it, in turn.
         format!("for part in $(seq 0 {}); do tar -xz --ignore-zeros -f \"$t/$part\"; if [ -f .superci-removed ]; then tr '\\n' '\\0' < .superci-removed | xargs -0 -r rm -f --; rm -f .superci-removed; fi; done", parts.saturating_sub(1))
     } else {
-        format!("for part in $(seq 0 {}); do cat \"$t/$part\"; done | tar -xz", parts.saturating_sub(1))
+        // (tar may stop reading at the archive's end marker, before the last padding: the feeder stopped by that is
+        // no failure; tar's own is.)
+        format!("{{ for part in $(seq 0 {}); do cat \"$t/$part\"; done || true; }} | tar -xz", parts.saturating_sub(1))
     };
     let fetch = if parts == 0 { "true".to_string() } else {
         format!("{get}\n        {unpack}; rm -rf \"$t\"\n        echo \"The working tree: fetched in $((fetched - began)) s, unpacked in $((SECONDS - fetched)) s\"")
