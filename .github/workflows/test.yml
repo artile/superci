@@ -61,3 +61,28 @@ jobs:
         run: |
           go test -c -o conformance.test .
           sudo SUPERCI_LAYERS="$GITHUB_WORKSPACE/target/debug/superci-layers" ./conformance.test -test.count=1 -test.v
+
+  # Docker with superci-layers against Docker as it comes, on the machines' versions and the newest: the same work
+  # both ways, the same results (crates/layers/e2e/docker.sh).
+  layers-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - docker: 5:29.4.2-1~ubuntu.26.04~resolute
+            containerd: 2.3.6-1~ubuntu.26.04~resolute
+          - docker: 5:29.9.1-1~ubuntu.26.04~resolute
+            containerd: 2.4.2-2~ubuntu.26.04~resolute
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: superci-layers
+        run: cargo build -p superci-layers
+      - name: Docker ${{ matrix.docker }} with containerd ${{ matrix.containerd }}
+        run: |
+          docker build -q --build-arg DOCKER='${{ matrix.docker }}' --build-arg CONTAINERD='${{ matrix.containerd }}' -t e2e crates/layers/e2e
+          docker volume create e2e-lib
+          docker run --rm --privileged -v "$PWD/target/debug/superci-layers:/superci-layers:ro" -v e2e-lib:/var/lib e2e
