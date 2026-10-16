@@ -350,12 +350,24 @@ fn tests_lines(t: &Value, indent: &str) -> Vec<String> {
         out.push(format!("{indent}✗ {}{}", f["name"].as_str().unwrap_or_default(), f["file"].as_str().map(|p| format!("  ({p})")).unwrap_or_default()));
         for l in f["error"].as_str().unwrap_or_default().lines() { out.push(format!("{indent}    {l}")) }
     }
+    out.splice(1..1, process_lines(t, indent));
     out.extend(ran_lines(t, indent));
+    out.extend(expected_lines(t, indent));
     for n in t["notes"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) { out.push(format!("{indent}{n}")) }
     if let Some(note) = t["note"].as_str() { out.push(format!("{indent}{note}")) }
     for a in t["artifacts"].as_array().into_iter().flatten() { out.push(format!("{indent}Artifact {}: `{}`", a["name"].as_str().unwrap_or_default(), a["fetch"].as_str().unwrap_or_default())) }
     if let Some(at) = t["artifacts_at"].as_str() { out.push(format!("{indent}Its artifacts: {at}")) }
     out
+}
+
+/// Where a job's log came from and how old its last line is, after it: a running job's log comes in blocks, minutes
+/// behind at times ("…its last line 21:18:46 UTC, 12 minutes ago; the job is still running").
+pub fn log_said(got: &Value, now: u64) -> Vec<String> {
+    let Some(source) = got["source"].as_str() else { return vec![] };
+    let last = got["last_line_at"].as_str().and_then(|t| superci_core::aws::parse_iso_ms(&format!("{t}Z")).map(|ms| (t, ms)));
+    let age = last.map(|(t, ms)| { let ago = now.saturating_sub(ms) / 1000; format!("; its last line {} UTC, {}", t.get(11..).unwrap_or(t), if ago < 90 { format!("{ago} s ago") } else { format!("{} minutes ago", ago / 60) }) }).unwrap_or_default();
+    let running = if got["running"] == true { "; the job is still running (a running job's log comes in blocks, minutes behind at times: `superci jobs retrieve` again for more)" } else { "" };
+    vec![format!("(The log is {source}{age}{running}.)")]
 }
 
 /// What a job's tests came to, in a line: "Tests: 0 failed, 65 passed, 2 skipped (playwright), of the passed 3 failed
@@ -368,6 +380,33 @@ pub fn totals_line(t: &Value) -> String {
     if n("flaky") > 0 { extra.push(format!("{} flaky", n("flaky"))) }
     format!("Tests: {} failed, {} passed{} ({}){}", n("failed"), n("passed"), if n("skipped") > 0 { format!(", {} skipped", n("skipped")) } else { String::new() }, runners.join(", "),
         if extra.is_empty() { String::new() } else { format!(", of the passed {}", extra.join(", ")) })
+}
+
+/// Each process's own counts, where several ran tests at once (`[slot 2] …`).
+pub fn process_lines(t: &Value, indent: &str) -> Vec<String> {
+    t["by_process"].as_array().into_iter().flatten().map(|p| {
+        let n = |k: &str| p[k].as_u64().unwrap_or(0);
+        let mut words = vec![format!("{} failed", n("failed")), format!("{} passed", n("passed"))];
+        if n("skipped") > 0 { words.push(format!("{} skipped", n("skipped"))) }
+        if n("failed_as_expected") > 0 { words.push(format!("{} failed as expected", n("failed_as_expected"))) }
+        if n("flaky") > 0 { words.push(format!("{} flaky", n("flaky"))) }
+        format!("{indent}  {} {}", p["mark"].as_str().unwrap_or_default(), words.join(", "))
+    }).collect()
+}
+
+/// The tests that failed as they were marked to (`test.fail()`), each named where the list of what ran does not show
+/// them, and what that means: their runner prints no error for them, and passes one that failed for another reason.
+pub fn expected_lines(t: &Value, indent: &str) -> Vec<String> {
+    let tests = t["failed_as_expected_tests"].as_array().cloned().unwrap_or_default();
+    if tests.is_empty() { return vec![] }
+    let mut out = vec![];
+    let ran = t["ran"].as_array().map(|r| r.len()).unwrap_or(0);
+    if ran == 0 || ran > 30 {
+        out.push(format!("{indent}Failed as expected:"));
+        for r in &tests { out.push(format!("{indent}  ✓ {}{}", r["name"].as_str().unwrap_or_default(), r["file"].as_str().map(|f| format!("  ({f})")).unwrap_or_default())) }
+    }
+    out.push(format!("{indent}(Marked to fail, as test.fail(): Playwright prints no error for these, and passes one that failed for another reason too.)"));
+    out
 }
 
 /// The tests that ran, each with how it came out, when there are few enough to read (30 at most; else the counts say it).
@@ -474,7 +513,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if let Some(out) = args.get("out") {
                 let log = crate::dashboard::whole_log(v.plane.url(), &key, &j)?;
                 std::fs::write(out, &log).map_err(|e| format!("{out}: {e}"))?;
-                return Ok(Done { said: vec![format!("Its whole log ({}, {} lines) is in {out}.", crate::dashboard::size_words(log.len() as u64), log.iter().filter(|b| **b == b'\n').count())], data: json!({ "job": words, "out": out, "bytes": log.len() }) })
+                let so_far = ["launching", "launched", "running", "waiting"].contains(&j["state"].as_str().unwrap_or_default());
+                return Ok(Done { said: vec![format!("{} ({}, {} lines) is in {out}.", if so_far { "Its log so far (the job is still running)" } else { "Its whole log" }, crate::dashboard::size_words(log.len() as u64), log.iter().filter(|b| **b == b'\n').count())], data: json!({ "job": words, "out": out, "bytes": log.len() }) })
             }
             // Its tests, from its whole log (see `test_results`), instead of the end of its log.
             if args.has("tests") {
@@ -483,7 +523,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 said.extend(tests_lines(&tests, "  "));
                 return Ok(Done { said, data: json!({ "job": words, "tests": tests }) })
             }
-            let mut path = format!("/job/log?id={id}&bytes={}", args.get("bytes").unwrap_or("200000"));
+            // (By its run: the job found's own id.)
+            let job_id = j["job_id"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| id.to_string());
+            let mut path = format!("/job/log?id={job_id}&bytes={}", args.get("bytes").unwrap_or("200000"));
             if j["provider"] == "gitlab" { path += &format!("&gl={}", j["gitlab"].as_str().unwrap_or_default()) }
             let got = crate::cloudflare::plane_get(v.plane.url(), &key, &path)
                 .map_err(|e| if e.contains("404") { "Reading a job's log needs control plane 0.11.0 or newer: `superci planes update`.".to_string() } else { e })?;
@@ -492,7 +534,11 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if let Some(choice) = words["choice"].as_str() { said.push(format!("{choice}.")) }
             said.extend(job_start_lines(&j));
             match got["log"].as_str() {
-                Some(log) => { said.push(if got["truncated"] == true { format!("The end of its log ({} bytes in all):", got["bytes"]) } else { "Its log:".to_string() }); said.push(log.trim_end().to_string()) }
+                Some(log) => {
+                    said.push(if got["truncated"] == true { format!("The end of its log ({} bytes in all):", got["bytes"]) } else { "Its log:".to_string() });
+                    said.push(log.trim_end().to_string());
+                    said.extend(log_said(&got, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)));
+                }
                 None => said.push(format!("No log: {}.", got["error"].as_str().unwrap_or("the control plane gave none").trim_end_matches('.'))),
             }
             Ok(Done { said, data: json!({ "job": words, "log": got["log"], "truncated": got["truncated"], "log_error": got["error"] }) })
@@ -1484,7 +1530,7 @@ fn run_line(r: &Value) -> String {
 
 fn job_line(j: &Value) -> String {
     let s = |k: &str| j[k].as_str().unwrap_or_default().to_string();
-    let tail: Vec<String> = [s("runner"), s("took"), j["usd"].as_f64().map(|c| format!("${c:.3}")).unwrap_or_default(), s("why")].into_iter().filter(|t| !t.is_empty()).collect();
+    let tail: Vec<String> = [s("runner"), s("took"), j["usd"].as_f64().map(|c| format!("${c:.3}")).unwrap_or_default(), s("why"), s("choice")].into_iter().filter(|t| !t.is_empty()).collect();
     // (A job a machine ran to its end is said by how the job itself ended, when that is known: passed, failed.)
     let stands = Some(s("ended")).filter(|e| !e.is_empty()).unwrap_or_else(|| s("state"));
     format!("{:<12} {:<9} {} · {}{}", j["id"].as_u64().unwrap_or_default(), stands, s("job"), s("in"), if tail.is_empty() { String::new() } else { format!("  ({})", tail.join(" · ")) })
@@ -1550,6 +1596,27 @@ fn planes() -> Result<Done> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_logs_source_and_the_age_of_its_last_line_are_said() {
+        let now = superci_core::aws::parse_iso_ms("2026-10-16T21:30:46Z").unwrap();
+        let got = json!({ "source": "GitHub's, then what its machine sent after it", "last_line_at": "2026-10-16T21:18:46", "running": true });
+        assert_eq!(log_said(&got, now), ["(The log is GitHub's, then what its machine sent after it; its last line 21:18:46 UTC, 12 minutes ago; the job is still running (a running job's log comes in blocks, minutes behind at times: `superci jobs retrieve` again for more).)"]);
+        assert_eq!(log_said(&json!({ "source": "GitHub's", "last_line_at": "2026-10-16T21:30:16" }), now), ["(The log is GitHub's; its last line 21:30:16 UTC, 30 s ago.)"]);
+        assert!(log_said(&json!({}), now).is_empty(), "an older control plane says no source");
+    }
+
+    #[test]
+    fn each_slots_counts_and_each_test_that_failed_as_expected_are_said() {
+        let mut log = String::new();
+        for slot in 1..=2 { log.push_str(&format!("[slot {slot}] Running 40 tests using 2 workers\n")); for i in 0..40 { log.push_str(&format!("[slot {slot}]   {}  {} [c] › e2e/s{slot}.spec.ts:{}:1 › t{i} (1s)\n", if slot == 2 && i == 39 { '✘' } else { '✓' }, i + 1, i + 1)) } log.push_str(&format!("[slot {slot}]   {} passed (9s)\n", if slot == 2 { 39 } else { 40 })); if slot == 2 { log.push_str("[slot 2]   1 failed\n") } }
+        let t = serde_json::to_value(crate::test_results::read(&log)).unwrap();
+        assert_eq!(process_lines(&t, ""), ["  [slot 1] 0 failed, 40 passed", "  [slot 2] 1 failed, 39 passed, 1 failed as expected"]);
+        let said = expected_lines(&t, "");
+        assert_eq!(said[..2], ["Failed as expected:".to_string(), "  ✓ [c] t39  (e2e/s2.spec.ts:40:1)".to_string()], "named: the list of what ran is too long to show");
+        assert!(said[2].contains("Playwright prints no error for these"));
+        assert!(tests_lines(&t, "")[1].starts_with("  [slot 1]"), "each slot's counts right after the totals");
+    }
 
     fn args(line: &str) -> Args { Args::parse(&line.split_whitespace().map(str::to_string).collect::<Vec<_>>()).unwrap() }
 

@@ -336,6 +336,11 @@ pub struct Job {
     /// Refused spot at the account's limit while machines SuperCI had just ended still counted there (AWS counts a
     /// machine until it has ended it, a minute or two after its job).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub spot_ending: bool,
+    /// Since when it waits for spot at the account's spot limit, while SuperCI's own machines that just ended still
+    /// count toward it (`SPOT_LIMIT_WAIT_MS` at most, then the next place in the order).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub spot_limit_wait: Option<u64>,
+    /// What machines it had before this one cost (each one that never took it, stopped for a new one: `again`).
+    #[serde(default, skip_serializing_if = "is_zero_f64")] pub earlier_usd: f64,
     /// Kept off spot machines, and the account's on-demand limit did not let its machine start: asked on a spot
     /// machine again, whatever kept it off them (and kept there: it waits for one rather than for that limit).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub spot_again: bool,
@@ -384,7 +389,11 @@ fn template_key(region: &str, name: &str) -> String { format!("aws:template:{reg
 pub struct Ask { pub at: u64, pub kind: String, #[serde(default, skip_serializing_if = "String::is_empty")] pub zone: String, pub spot: bool, pub said: String, pub ms: u64,
     /// How many pools the request asked at once, when more than the one it names (see `aws::fleet`: the type and
     /// zone are then the pool AWS chose, or none).
-    #[serde(default, skip_serializing_if = "is_zero")] pub pools: u32 }
+    #[serde(default, skip_serializing_if = "is_zero")] pub pools: u32,
+    /// The pool's spot price an hour when it was asked (none known: 0), to say why a pricier one was taken.
+    #[serde(default, skip_serializing_if = "is_zero_f64")] pub usd: f64 }
+
+fn is_zero_f64(v: &f64) -> bool { *v == 0.0 }
 
 /// What a machine said of its own start (see `aws::with_hello`), by its own clock: how long after its kernel started
 /// its start-up script began (seconds), when the script began, when it began reading the runner's files, when it was
@@ -576,6 +585,11 @@ const WAIT_FOR_SPOT: &str = "waiting: AWS has no spot machine for it now, and no
 /// what each said): the job waits while machines of this control plane's own are using them, as it would for a place
 /// that is full; with none of its own running it is tried again and then fails, saying which limits to raise.
 const AT_LIMIT: &str = "at the AWS account's limits: ";
+/// A job refused spot for the account's spot limit while SuperCI's own spot machines that just ended still count toward
+/// it (AWS counts a machine until it has shut down): asked again every 20 seconds, for this long, before the next
+/// place in the order (on-demand machines cost two to three times as much).
+const SPOT_LIMIT_WAIT_MS: u64 = 120_000;
+const SPOT_LIMIT_WAITING: &str = "waiting: your AWS spot limit is reached while machines of SuperCI's that just ended still count toward it; spot is asked again in 20 seconds, on-demand after two minutes";
 
 /// How a try ends for a job kept off spot machines whose on-demand machine the account's limit refused (followed by
 /// what each region said): it is asked on a spot machine again (see `Job::spot_again`).
@@ -794,15 +808,34 @@ pub fn month_start_ms(now_ms: u64) -> u64 {
 }
 
 /// A job's estimated machine cost so far (USD).
+/// The time of a log's last line that has one (`2026-10-17T21:18:46`, to the second).
+pub fn last_time(log: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(log).lines().rev().map(|l| l.trim_start_matches('\u{feff}')).find(|l| { let b = l.as_bytes(); b.len() > 19 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) }).map(|l| l[..19].to_string())
+}
+
+/// The lines of a log written after `after` (a time as `last_time` says it), with the untimed lines that go with them.
+pub fn newer_lines(log: &[u8], after: &str) -> Vec<u8> {
+    if after.is_empty() || log.is_empty() { return vec![] }
+    let mut out = String::new();
+    let mut keep = false;
+    for l in String::from_utf8_lossy(log).lines() {
+        let t = l.trim_start_matches('\u{feff}');
+        let b = t.as_bytes();
+        if b.len() > 19 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) { keep = &t[..19] > after }
+        if keep { out.push_str(l); out.push('\n') }
+    }
+    out.into_bytes()
+}
+
 pub fn job_usd(j: &Job, now_ms: u64) -> f64 {
     if let Some(settled) = j.cost_usd { return settled }
-    let Some(per_hour) = j.usd_per_hour else { return 0.0 };
+    let Some(per_hour) = j.usd_per_hour else { return j.earlier_usd };
     // Paid from when the machine started, whether or not a job came: an AWS machine boots billed, a sandbox is billed
     // for what it holds, a container for its memory and disk (and CPU as used) while its runner waits.
     let from = j.launched_ms.or(j.started_ms).unwrap_or(j.at_ms);
     let end = j.ended_ms.unwrap_or(if active(j) { now_ms } else { from });
     let began = j.started_ms.unwrap_or(end).clamp(from, end.max(from));
-    (began.saturating_sub(from) as f64 * j.waiting_usd_per_hour.unwrap_or(per_hour) + end.saturating_sub(began) as f64 * per_hour) / 3_600_000.0
+    j.earlier_usd + (began.saturating_sub(from) as f64 * j.waiting_usd_per_hour.unwrap_or(per_hour) + end.saturating_sub(began) as f64 * per_hour) / 3_600_000.0
 }
 
 /// GitHub's price per minute for its hosted Linux runner with this many CPUs (2 and fewer: the standard runner), x64 or
@@ -1078,7 +1111,10 @@ impl<'a> ControlPlane<'a> {
                     let now = self.clock.now_ms();
                     put_json(self.store, &format!("spot:interrupted:{now}:{}", j.job_id), &now).await?;
                 }
-                Ok(Response::text(200, "ok"))
+                // What the machine runs with this answer: the reason, in the job's own log on GitHub, where it is
+                // otherwise only "The runner has received a shutdown signal" (a GitHub job: GitLab's says its own).
+                let said = if !j.gitlab.is_empty() || q.contains_key("gl") { String::new() } else if j.provider == "local" { aws::reclaim_said("SuperCI starts the job again by itself at once, off spot machines.") } else { aws::reclaim_said("SuperCI runs the job again by itself, off spot machines, once its run has finished.") };
+                Ok(Response::new(200, "text/x-shellscript", said))
             }
             // A machine saying how its own start went (see `MachineStart`): with its link, and only what it may say.
             ("POST", "/hello") => {
@@ -1244,6 +1280,11 @@ impl<'a> ControlPlane<'a> {
             ("POST", p) if p.starts_with("/cache/") && p.ends_with("/layers-links") => self.layers_route(&plane_url, p, Some(&req)).await,
             ("POST", p) if p.starts_with("/cache/") => self.cache_route(&req, &plane_url, p).await,
             ("GET", p) if p.starts_with("/cache/") && p.ends_with("/program") => self.cache_program(&plane_url, p).await,
+            // The cache's part of a Linux machine's start (its start-up script fetches it: AWS takes 16 KB of that).
+            ("GET", p) if p.starts_with("/cache/") && p.ends_with("/cache") => {
+                let token = p.trim_start_matches("/cache/").trim_end_matches("/cache");
+                match cache::machine(self.store, token, self.clock.now_ms()).await? { Some(_) => Ok(Response::new(200, "text/x-shellscript", aws::cache_script(&format!("{plane_url}/cache/{token}")))), None => Ok(nothing_here()) }
+            }
             // Its `superci-layers`: the script that switches Docker to it, the program, the index (and its links again).
             ("GET", p) if p.starts_with("/cache/") && (p.ends_with("/layers") || p.ends_with("/layers-program") || p.ends_with("/layers.json")) => self.layers_route(&plane_url, p, None).await,
             // The cache's entries (by repository, or one repository's), and taking some out.
@@ -1441,6 +1482,7 @@ impl<'a> ControlPlane<'a> {
             match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_steps(self.http, &app.api(), &token, &j.repo, j.job_id).await.map(serde_json::Value::Array).unwrap_or_default(), _ => serde_json::Value::Null }
         } else { serde_json::Value::Null };
         // A run from a computer: each step's whole log as its runner sent it here, else the lines it sent as it went.
+        let mut source = if j.provider == "gitlab" { "GitLab's" } else { "its runner's" };
         let fetched = if j.provider == "local" {
             let token = j.local.clone().unwrap_or_default();
             self.local_log(&token).await
@@ -1448,10 +1490,16 @@ impl<'a> ControlPlane<'a> {
             match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(project)) => gitlab::job_trace(self.http, gl, project, j.job_id).await, _ => Err("its GitLab is no longer connected".into()) }
         } else {
             let from_github = match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) };
-            // Not yet from GitHub (it gives a job's log once it has ended): what its runner wrote as it went.
+            // A job still running: GitHub has its log only as far as its runner has sent it in blocks (minutes behind,
+            // at times), then what its machine sent after that. Not yet from GitHub: what its machine sent alone.
+            let live = if active(&j) || !matches!(&from_github, Ok(l) if !l.is_empty()) { self.live_log(key.trim_start_matches("job:"), 1_000_000).await.unwrap_or_default() } else { vec![] };
             match from_github {
-                Ok(l) if !l.is_empty() => Ok(l),
-                other => match self.live_log(key.trim_start_matches("job:"), 1_000_000).await { Ok(l) if !l.is_empty() => Ok(l), _ => other },
+                Ok(l) if !l.is_empty() => {
+                    let after = newer_lines(&live, last_time(&l).as_deref().unwrap_or_default());
+                    if after.is_empty() { source = "GitHub's" } else { source = "GitHub's, then what its machine sent after it" }
+                    Ok([l, after].concat())
+                }
+                other => if live.is_empty() { other } else { source = "what its machine sent"; Ok(live) },
             }
         };
         let log = match fetched { Ok(l) => l, Err(e) => return Ok(Response::json(&serde_json::json!({ "error": e, "steps": steps }))) };
@@ -1460,7 +1508,8 @@ impl<'a> ControlPlane<'a> {
         // From a line's start, when the cut falls inside one.
         let from = log.len().saturating_sub(want);
         let from = if from == 0 { 0 } else { log[from..].iter().position(|b| *b == b'\n').map(|n| from + n + 1).unwrap_or(from) };
-        Ok(Response::json(&serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0, "steps": steps })))
+        Ok(Response::json(&serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0, "steps": steps,
+            "source": source, "last_line_at": last_time(&log), "running": active(&j) })))
     }
 
     /// What the dashboard shows, for a key a dashboard session set and that has not expired (or one that only reads):
@@ -1610,6 +1659,14 @@ impl<'a> ControlPlane<'a> {
     /// A job whose machine never began it: its runner registration is withdrawn and it is placed again (elsewhere, or
     /// waiting for room).
     async fn again(&self, plane_url: &str, key: &str, j: &mut Job, why: &str) -> Result<()> {
+        // What its machine cost until now stays in the job's cost (the next machine's is counted from its own start).
+        if j.machine_id.is_some() {
+            let now = self.clock.now_ms();
+            let mut until_now = j.clone();
+            until_now.ended_ms = Some(now);
+            until_now.earlier_usd = 0.0;
+            j.earlier_usd += job_usd(&until_now, now);
+        }
         self.withdraw_runner(j).await;
         if let (Some(id), Some(runner)) = (&j.machine_id, &j.runner) { let _ = self.store.delete(&format!("assign:{id}:{runner}")).await; }
         j.runner = None;
@@ -1810,7 +1867,7 @@ impl<'a> ControlPlane<'a> {
                             put_json(self.store, &rerun_key(&project, ev.pipeline_id, &ev.name), &now).await?;
                             let asked = gitlab::retry_job(self.http, gl, ev.project_id, ev.job_id).await;
                             if asked.is_err() { self.store.delete(&rerun_key(&project, ev.pipeline_id, &ev.name)).await?; }
-                            j.error = Some(match &asked { Ok(()) => "AWS took back its spot machine; run again, off spot machines".to_string(), Err(e) => format!("AWS took back its spot machine; not run again: {e}").chars().take(300).collect() });
+                            j.error = Some(match &asked { Ok(()) => "AWS took back its spot machine; SuperCI ran the job again by itself, off spot machines".to_string(), Err(e) => format!("AWS took back its spot machine; not run again: {e}").chars().take(300).collect() });
                             j.rerun = Some(Rerun { job_id: ev.job_id, run_id: ev.pipeline_id, repo: ev.project.clone(), name: ev.name.clone(), state: if asked.is_ok() { "asked".into() } else { "not run again".into() }, at_ms: now });
                         }
                         self.settle(plane_url, &mut j).await;
@@ -2004,7 +2061,7 @@ impl<'a> ControlPlane<'a> {
             None
         }.await;
         let Some(state) = settled else { return false };
-        j.error = Some(if state == "asked" { "AWS took back its spot machine; run again, off spot machines".into() } else { format!("AWS took back its spot machine; {state}") });
+        j.error = Some(if state == "asked" { "AWS took back its spot machine; SuperCI ran the job again by itself, off spot machines (the run's next attempt)".into() } else { format!("AWS took back its spot machine; {state}") });
         r.state = state;
         j.rerun = Some(r);
         true
@@ -2175,7 +2232,7 @@ impl<'a> ControlPlane<'a> {
         self.note_permission("aws", "Prices", &disk).await;
         let gb_month = disk.unwrap_or_else(|_| aws::disk_gb_month(&region));
         if let Ok(machine) = machine {
-            j.cost_usd = Some(machine + (aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) + store_disk_usd_per_hour(gb_month, j.layers)) * hours);
+            j.cost_usd = Some(j.earlier_usd + machine + (aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) + store_disk_usd_per_hour(gb_month, j.layers)) * hours);
             j.cost_from = Some("prices".into());
         }
     }
@@ -2624,6 +2681,17 @@ impl<'a> ControlPlane<'a> {
                 // Its job ended at its code host meanwhile, before any runner took it (cancelled): nothing more is asked for.
                 if self.store.get(&gone_key(job)).await.ok().flatten().is_some() { gone = true; break }
                 if self.ended_meanwhile(&key, job).await { gone = true; break }
+                // Spot refused for the account's limit while machines that just ended still count: a while longer on
+                // spot before on-demand.
+                if place == AWS_ON_DEMAND && tried_spot && job.spot_ending {
+                    let since = *job.spot_limit_wait.get_or_insert(now);
+                    if now.saturating_sub(since) < SPOT_LIMIT_WAIT_MS {
+                        job.state = "waiting".into();
+                        job.error = Some(SPOT_LIMIT_WAITING.into());
+                        self.keep(&key, &*job).await?;
+                        return self.timer.wake_in(20_000).await;
+                    }
+                }
                 job.cloud = cloud_of(&runner);
                 job.on_demand = place == AWS_ON_DEMAND;
                 // What only the place before had (a spot machine's notice, Cloudflare's price while waiting).
@@ -2717,7 +2785,7 @@ impl<'a> ControlPlane<'a> {
                             }
                             // Each request and its answer is kept with the job (the last two dozen).
                             let mut at = self.clock.now_ms().saturating_sub(job.at_ms).saturating_sub(told.asked.iter().map(|a| a.3).sum());
-                            for (kind, zone, said, ms, pools) in told.asked.drain(..) { job.asks.push(Ask { at, kind, zone, spot: !on_demand, said, ms, pools }); at += ms }
+                            for (kind, zone, said, ms, pools, usd) in told.asked.drain(..) { job.asks.push(Ask { at, kind, zone, spot: !on_demand, said, ms, pools, usd }); at += ms }
                             if job.asks.len() > 24 { let over = job.asks.len() - 24; job.asks.drain(..over); }
                             // A zone AWS does not offer a type in is not asked for it again (for a day).
                             for (kind, zone, said) in &told.refused { if said == "Unsupported" && !zone.is_empty() { let _ = self.store.put(&unoffered_key(region, kind, zone), now.to_string()).await; } }
@@ -2900,6 +2968,7 @@ impl<'a> ControlPlane<'a> {
                 }
             };
             job.state = "launched".into();
+            job.spot_limit_wait = None;
             job.launched_ms = Some(self.clock.now_ms());
             job.machine_id = Some(machine_id);
             // Its CPUs are the machine's (AWS may give a larger size than asked when the family has no such size).
@@ -3146,6 +3215,8 @@ impl<'a> ControlPlane<'a> {
                         (other.zone, other.disk_gb, other.waiting_usd_per_hour, other.launched_ms) = (j.zone.take(), j.disk_gb.take(), j.waiting_usd_per_hour.take(), j.launched_ms);
                         (other.on_demand, other.notice, other.interrupted, other.private, other.for_job) = (j.on_demand, j.notice.take(), j.interrupted, j.private, None);
                         other.spot_refused = j.spot_refused.take();
+                        // (Its machine's own link goes with it: what it sends of its log as it goes is this job's now.)
+                        other.hello = j.hello.take();
                         (other.cost_usd, other.cost_from, other.sent_gb, other.fail_pending, other.failed_fast) = (None, None, None, None, false);
                         other.state = "running".into();
                         (other.seen_in_progress, other.began) = (true, true);
@@ -3422,13 +3493,19 @@ impl<'a> ControlPlane<'a> {
         use base64::Engine;
         let marks = self.store.list(&format!("glive:{id}:")).await?;
         let size = |v: &str| v.trim_matches('"').strip_prefix("s3:").and_then(|r| r.rsplit(':').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(v.len() * 3 / 4);
-        // From the end, as much as is wanted.
-        let (mut total, mut from) = (0usize, marks.len());
-        while from > 0 && total < want { from -= 1; total += size(&marks[from].1) }
+        // From the end of each page, as much as is wanted (the pages' keys go by their names, not their times: the
+        // last ones by key may be an old step's, the newest page's end before them).
+        let file_of = |k: &str| k.strip_prefix(&format!("glive:{id}:")).unwrap_or_default().split(':').next().unwrap_or_default().to_string();
+        let mut chosen = vec![false; marks.len()];
+        let mut totals: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, (k, v)) in marks.iter().enumerate().rev() {
+            let t = totals.entry(file_of(k)).or_insert(0);
+            if *t < want { *t += size(v); chosen[i] = true }
+        }
         let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
         let mut creds = None;
         let mut pages: Vec<(String, Vec<u8>)> = vec![];
-        for (k, v) in &marks[from..] {
+        for (k, v) in marks.iter().zip(&chosen).filter(|(_, c)| **c).map(|(m, _)| m) {
             let rest = k.strip_prefix(&format!("glive:{id}:")).unwrap_or_default();
             let file = rest.split(':').next().unwrap_or_default().to_string();
             let bytes = match v.trim_matches('"').strip_prefix("s3:") {
@@ -4151,9 +4228,9 @@ impl<'a> ControlPlane<'a> {
             if j.interrupted && j.rerun.is_none() && !matches!(ev.conclusion.as_deref(), Some("success" | "skipped" | "neutral")) {
                 j.state = "failed".into();
                 if j.provider == "local" {
-                    j.error = Some("AWS took back its spot machine; the job is started again, off spot machines".into());
+                    j.error = Some("AWS took back its spot machine; SuperCI starts the job again by itself, off spot machines".into());
                 } else {
-                    j.error = Some("AWS took back its spot machine; the job is run again, off spot machines once its run has finished".into());
+                    j.error = Some("AWS took back its spot machine; SuperCI runs the job again by itself, off spot machines, once its run has finished (GitHub runs a job again only then)".into());
                     j.rerun = Some(Rerun { job_id, run_id: ev.run_id, repo: ev.repo.clone(), name: ev.name.clone(), state: "pending".into(), at_ms: self.clock.now_ms() });
                     self.timer.wake_in(60_000).await?;
                 }
@@ -4641,7 +4718,7 @@ impl<'a> ControlPlane<'a> {
         let with = if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data);
         // (GitHub's jobs only: GitLab's machines start Docker otherwise.)
         let layers = layers && os == "linux" && !runner.starts_with("gl:") && self.config.routing.cache.layers && self.layers_ready(region, arch, creds, now).await;
-        match layers.then(|| aws::with_layers(with.clone(), &link)) { Some(Ok(w)) => (w, true), _ => (with, false) }
+        match layers.then(|| aws::with_layers(with.clone())) { Some(Ok(w)) => (w, true), _ => (with, false) }
     }
 
     /// Whether a region's bucket has this version's `superci-layers` for an architecture (looked at as `cache_ready`).

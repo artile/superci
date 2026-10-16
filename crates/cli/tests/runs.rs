@@ -620,7 +620,7 @@ fn a_job_whose_spot_machine_aws_took_back_is_started_again_off_spot_and_the_run_
     let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while token(&served) == was || token(&served).is_empty() { assert!(std::time::Instant::now() < end, "not started again: {}", served.store.under(&format!("run:{run}"))[0].1); std::thread::sleep(std::time::Duration::from_millis(50)) }
     let first_job = served.store.under(&key)[0].1.clone();
-    assert!(first_job["error"].as_str().unwrap_or_default().contains("started again, off spot machines") && first_job.get("rerun").is_none(), "{first_job}");
+    assert!(first_job["error"].as_str().unwrap_or_default().contains("SuperCI starts the job again by itself, off spot machines") && first_job.get("rerun").is_none(), "{first_job}");
     let again = served.store.under("job:").into_iter().find(|(k, _)| *k != key).map(|(_, j)| j).unwrap();
     assert_eq!(again["no_spot"], true, "{again}");
     play(&served, &run, &["ok".to_string()], "succeeded");

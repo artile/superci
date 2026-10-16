@@ -28,6 +28,26 @@ pub struct Tests {
     /// Each test that ran and how it came out, where the runner lists them (Playwright's list): the first `MOST`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ran: Vec<Ran>,
+    /// The tests that failed as they were marked to (the first `MOST`, however many ran): their runner passes them
+    /// and prints no error for them, so each is named.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failed_as_expected_tests: Vec<Ran>,
+    /// Each process's own counts, where lines are marked by the process they came from (`[slot 2] …`) and more than
+    /// one ran tests.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub by_process: Vec<Process>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct Process {
+    pub mark: String,
+    pub passed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub failed_as_expected: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub flaky: u64,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -100,7 +120,7 @@ fn error_after(lines: &[String], from: usize, stop: impl Fn(&str) -> bool) -> St
 
 /// A line's mark of the process it came from, when several run at once and each line says which (`[slot 2] …`,
 /// `[web] …`), and the line without it. (Not Playwright's own `[chromium] › file`.)
-fn marked(line: &str) -> (&str, &str) {
+pub fn marked(line: &str) -> (&str, &str) {
     let s = line.trim_start();
     if let Some(end) = s.strip_prefix('[').and_then(|r| r.find("] ")).map(|at| at + 1) {
         let (mark, rest) = (&s[..=end], &s[end + 2..]);
@@ -128,15 +148,20 @@ pub fn read(log: &str) -> Tests {
         if !one.runners.is_empty() && one.notes.is_empty() && one.passed + one.failed + one.skipped == 0 && one.failures.is_empty() {
             one.notes.push(format!("{} ran no tests.", one.runners.iter().map(|r| runner_name(r)).collect::<Vec<_>>().join(", ")));
         }
-        for r in one.runners { if !t.runners.contains(&r) { t.runners.push(r) } }
+        for r in one.runners.clone() { if !t.runners.contains(&r) { t.runners.push(r) } }
         (t.passed, t.failed, t.skipped) = (t.passed + one.passed, t.failed + one.failed, t.skipped + one.skipped);
         for f in one.failures { if t.failures.len() < MOST { t.failures.push(f) } }
         for r in one.ran { if t.ran.len() < MOST { t.ran.push(r) } }
+        for r in one.failed_as_expected_tests { if t.failed_as_expected_tests.len() < MOST { t.failed_as_expected_tests.push(r) } }
+        (t.failed_as_expected, t.flaky) = (t.failed_as_expected + one.failed_as_expected, t.flaky + one.flaky);
+        if !mark.is_empty() && !one.runners.is_empty() {
+            t.by_process.push(Process { mark: mark.clone(), passed: one.passed, failed: one.failed, skipped: one.skipped, failed_as_expected: one.failed_as_expected, flaky: one.flaky });
+        }
         // (Which process said it, where lines are marked so.)
         for n in one.notes { let n = if mark.is_empty() { n } else { format!("{mark} {n}") }; if !t.notes.contains(&n) { t.notes.push(n) } }
     }
-    t.failed_as_expected = t.ran.iter().filter(|r| r.outcome == "failed as expected").count() as u64;
-    t.flaky = t.ran.iter().filter(|r| r.outcome == "flaky").count() as u64;
+    // (One process alone: its counts are the whole's.)
+    if t.by_process.len() < 2 { t.by_process.clear() }
     t
 }
 
@@ -301,10 +326,13 @@ fn read_lines(lines: &[String]) -> Tests {
     }
     // (Failures listed but no summary seen: counted from the list.)
     if t.failed < t.failures.len() as u64 { t.failed = t.failures.len() as u64 }
-    // A test listed as failed that is not among the failures failed as it was marked to (`test.fail()`).
+    // A test listed as failed that is not among the failures failed as it was marked to (`test.fail()`). Counted
+    // over every test listed (only the first `MOST` are kept to show).
     for (name, file, outcome) in listed_order {
         let failure = t.failures.iter().any(|f| f.name == name && f.file.as_deref() == Some(file.as_str()));
         let outcome = if outcome == "failed" && !failure { "failed as expected" } else { outcome };
+        match outcome { "failed as expected" => t.failed_as_expected += 1, "flaky" => t.flaky += 1, _ => {} }
+        if outcome == "failed as expected" && t.failed_as_expected_tests.len() < MOST { t.failed_as_expected_tests.push(Ran { name: name.clone(), file: Some(file.clone()), outcome }) }
         if t.ran.len() < MOST { t.ran.push(Ran { name, file: Some(file), outcome }) }
     }
     t
@@ -332,6 +360,17 @@ mod tests {
         assert_eq!((t.runners.clone(), t.passed, t.failed, t.skipped), (vec!["vitest"], 41, 1, 2));
         assert_eq!((t.failures[0].name.as_str(), t.failures[0].file.as_deref()), ("sums > adds two numbers", Some("src/sum.test.ts")));
         assert!(t.failures[0].error.starts_with("AssertionError: expected 3 to be 4") && t.failures[0].error.contains("+ Received"), "{}", t.failures[0].error);
+    }
+
+    #[test]
+    fn tests_that_failed_as_expected_are_counted_however_many_tests_ran() {
+        // 250 tests, the last 18 marked to fail (✘, not among the failures): all 18 counted and named, past the 200 kept.
+        let mut log = String::from("Running 250 tests using 4 workers\n");
+        for i in 0..250 { log.push_str(&format!("  {}  {} [chromium] › e2e/t.spec.ts:{}:1 › test {i} (1.0s)\n", if i >= 232 { '✘' } else { '✓' }, i + 1, i + 1)) }
+        log.push_str("  18 failed\n  232 passed (1.0m)\n");
+        let t = read(&log);
+        assert_eq!((t.ran.len(), t.failed_as_expected, t.failed_as_expected_tests.len()), (200, 18, 18));
+        assert_eq!(t.failed_as_expected_tests[0].name, "[chromium] test 232");
     }
 
     #[test]
@@ -401,6 +440,9 @@ mod tests {
         assert_eq!(t.ran[0].file.as_deref(), Some("e2e/a.spec.ts:4:3"));
         assert_eq!((t.failed_as_expected, t.flaky), (1, 1));
         assert_eq!(t.notes, ["[slot 2] Playwright ran no tests."]);
+        // Each process's own counts (the one that ran nothing, none); each test that failed as expected, named.
+        assert_eq!(t.by_process.iter().map(|p| (p.mark.as_str(), p.passed, p.failed_as_expected, p.flaky)).collect::<Vec<_>>(), [("[slot 1]", 3, 1, 1), ("[slot 2]", 0, 0, 0), ("[slot 3]", 1, 0, 0)]);
+        assert_eq!(t.failed_as_expected_tests.iter().map(|r| (r.name.as_str(), r.file.as_deref())).collect::<Vec<_>>(), [("[chromium] known bug", Some("e2e/a.spec.ts:9:3"))]);
     }
 
     #[test]

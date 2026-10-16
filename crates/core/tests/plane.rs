@@ -534,6 +534,9 @@ fn a_machine_that_never_begins_its_job_is_tried_again_then_the_job_fails() {
         clock.0.set(clock.0.get() + 4 * 60_000);
         block_on(plane.alarm()).unwrap();
         assert_eq!((starts(), job(&store, 7)["state"].as_str(), job(&store, 7)["retries"].as_u64()), (n, Some("launched"), Some(n as u64 - 1)));
+        // What each machine before cost stays in the job's (one that never took it is paid all the same).
+        let earlier = job(&store, 7)["earlier_usd"].as_f64().unwrap_or(0.0);
+        assert!(earlier > 0.0, "machine {n}: {}", job(&store, 7));
     }
     assert!(own.0.borrow().iter().any(|c| c.starts_with("stop")) && clouds.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1.contains("/actions/runners/")));
     // The third time it fails, saying why.
@@ -1402,6 +1405,9 @@ fn a_spot_machine_taken_back_fails_its_job_at_once_and_the_job_is_run_again_on_d
     run(webhook("in_progress", Some(&runner)));
     assert_eq!(notice(7, &token), 200);
     assert_eq!(job(&store, 7)["interrupted"], true);
+    // What the machine runs with the answer: the reason, as a GitHub error in the output of the step running now.
+    let said = String::from_utf8(run(Request::new("POST", &format!("{PLANE_URL}/interrupted?runner={runner}&t={token}"))).body).unwrap();
+    assert!(said.contains("pgrep -f Runner.Worker") && said.contains("> /proc/$p/fd/1") && said.contains("::error title=SuperCI::AWS is taking this spot machine back (two minutes’ notice). SuperCI runs the job again by itself, off spot machines, once its run has finished."), "{said}");
     // Its job fails (the runner was stopped): to be run again once its run has finished.
     run(webhook("completed", Some(&runner)));
     let j = job(&store, 7);
@@ -1671,7 +1677,7 @@ fn a_gitlab_job_whose_spot_machine_is_taken_back_is_run_again_on_demand() {
     run(gitlab_event_on(1977, "failed", secret, Some(55)));
     assert!(clouds.0.calls.borrow().iter().any(|c| c.0 == "POST" && c.1.ends_with("/projects/380/jobs/1977/retry")));
     assert_eq!((job(1977)["state"].as_str(), job(1977)["rerun"]["state"].as_str()), (Some("failed"), Some("asked")));
-    assert!(job(1977)["error"].as_str().unwrap().starts_with("AWS took back its spot machine; run again"));
+    assert!(job(1977)["error"].as_str().unwrap().starts_with("AWS took back its spot machine; SuperCI ran the job again by itself, off spot machines"));
     run(gitlab_event(1981, "pending", secret));
     assert_eq!((job(1981)["on_demand"].as_bool(), job(1981).get("notice")), (Some(true), None));
     assert_eq!(field(&launches(&clouds.0)[1], "InstanceMarketOptions.MarketType"), "");
@@ -2774,7 +2780,7 @@ fn a_job_run_again_after_a_reclaim_goes_back_on_spot_when_the_on_demand_limit_ca
     run(job_event("queued", 10, "acme/app", None));
     let j = job(&store, 10);
     assert_eq!((j["state"].as_str(), j.get("retries").and_then(|r| r.as_u64()).unwrap_or(0)), (Some("waiting"), 0), "{j}");
-    assert!(j["error"].as_str().unwrap().starts_with("waiting: AWS still counts a machine of yours that ended a moment ago against your account's limit of running CPUs; trying again (us-east-1: MaxSpotInstanceCountExceeded"), "{}", j["error"]);
+    assert!(j["error"].as_str().unwrap().starts_with("waiting: your AWS spot limit is reached while machines of SuperCI's that just ended still count toward it"), "{}", j["error"]);
     // Two minutes on, nothing of its own counts any more: the limits themselves are what refuses it.
     sweep_after(130_000);
     assert!(job(&store, 10)["error"].as_str().unwrap().starts_with("waiting: starting its machine failed, trying again (Your AWS account's limits do not let this machine start"), "{}", job(&store, 10)["error"]);
@@ -2828,7 +2834,8 @@ fn a_job_sent_on_demand_by_the_spot_limit_notes_when_machines_just_ended_still_c
     let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     let runner = |job: u64| format!("superci-{PLANE_ID}-{job}");
-    // A spot machine's job ends; a moment later the spot limit refuses the next one, which goes on-demand at once.
+    // A spot machine's job ends; a moment later the spot limit refuses the next one: it waits on spot a while (the
+    // machine that ended still counts until it has shut down), not on-demand at once.
     run(job_event("queued", 21, "acme/app", None));
     assert_eq!(job(&store, 21).get("on_demand"), None);
     run(job_event("in_progress", 21, "acme/app", Some(&runner(21))));
@@ -2837,7 +2844,24 @@ fn a_job_sent_on_demand_by_the_spot_limit_notes_when_machines_just_ended_still_c
     clock.0.set(clock.0.get() + 10_000);
     run(job_event("queued", 22, "acme/app", None));
     let j = job(&store, 22);
-    assert_eq!((j["state"].as_str(), j["on_demand"].as_bool(), j["spot_ending"].as_bool()), (Some("launched"), Some(true), Some(true)), "{j}");
+    assert_eq!((j["state"].as_str(), j.get("on_demand"), j["spot_ending"].as_bool()), (Some("waiting"), None, Some(true)), "{j}");
+    assert!(j["error"].as_str().unwrap().starts_with("waiting: your AWS spot limit is reached while machines of SuperCI's that just ended still count toward it"), "{j}");
+    // Twenty seconds on, still at the limit: still waiting. The machine gone, the limit has room: a spot machine.
+    clock.0.set(clock.0.get() + 20_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(job(&store, 22)["state"], "waiting");
+    full.set(false);
+    clock.0.set(clock.0.get() + 20_000);
+    block_on(plane.alarm()).unwrap();
+    let j = job(&store, 22);
+    assert_eq!((j["state"].as_str(), j.get("on_demand"), j.get("spot_limit_wait")), (Some("launched"), None, None), "{j}");
+    // At the limit for two minutes: on-demand then (as soon as nothing of its own ended within them).
+    full.set(true);
+    run(job_event("queued", 24, "acme/app", None));
+    assert_eq!(job(&store, 24)["state"], "waiting");
+    for _ in 0..7 { clock.0.set(clock.0.get() + 20_000); block_on(plane.alarm()).unwrap(); }
+    let j = job(&store, 24);
+    assert_eq!((j["state"].as_str(), j["on_demand"].as_bool()), (Some("launched"), Some(true)), "{j}");
     // Two minutes on, nothing of its own is still being ended: the limit alone refused it.
     clock.0.set(clock.0.get() + 130_000);
     run(job_event("queued", 23, "acme/app", None));
@@ -2962,7 +2986,7 @@ fn the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request() {
     let fleet = &calls_of(&clouds, "CreateFleet")[0];
     let f = |n: &str| field(fleet, n);
     assert_eq!((f("Type"), f("TargetCapacitySpecification.TotalTargetCapacity"), f("TargetCapacitySpecification.DefaultTargetCapacityType"), f("SpotOptions.AllocationStrategy"), f("SpotOptions.InstanceInterruptionBehavior")),
-        ("instant".to_string(), "1".to_string(), "spot".to_string(), "capacity-optimized-prioritized".to_string(), "terminate".to_string()));
+        ("instant".to_string(), "1".to_string(), "spot".to_string(), "price-capacity-optimized".to_string(), "terminate".to_string()));
     assert_eq!((f("LaunchTemplateConfigs.1.LaunchTemplateSpecification.LaunchTemplateName"), f("LaunchTemplateConfigs.1.LaunchTemplateSpecification.Version")), (name.clone(), "$Latest".to_string()));
     let pool = |n: usize| (f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.InstanceType")), f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.SubnetId")), f(&format!("LaunchTemplateConfigs.1.Overrides.{n}.Priority")));
     assert_eq!((pool(1), pool(6), pool(17), pool(18)), (("c8a.16xlarge".to_string(), "subnet-b".to_string(), "1".to_string()), ("m8a.16xlarge".to_string(), "subnet-a".to_string(), "6".to_string()),
@@ -3690,9 +3714,12 @@ fn a_machine_keeps_githubs_cache_in_its_regions_bucket_as_its_jobs_token_allows(
     // The machine fetches superci-cache with a link that does only that, and has a link of its own to the cache.
     let launch = launches(&http.clouds).pop().expect("a machine");
     let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
-    assert!(script.contains(r#"curl -fsSL --retry 2 -m 30 -o $f "$c/program""#) && script.contains("TURBO_API=%s") && script.contains("/etc/bazel.bazelrc"), "{script}");
-    assert!(script.find("$f wrap /home/runner/externals").unwrap() < script.find("cd /home/runner && ").unwrap());
+    // (The cache's part of its start is fetched from the machine's link: AWS takes 16 KB of start-up script.)
     let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    assert!(script.find("$c/cache|bash").unwrap() < script.find("cd /home/runner && ").unwrap(), "{script}");
+    let cache = String::from_utf8(run(get(&format!("/cache/{link}/cache"))).body).unwrap();
+    assert!(cache.starts_with(&format!("c='{PLANE_URL}/cache/{link}'")) && cache.contains(r#"curl -fsSL --retry 2 -m 30 -o $f "$c/program""#) && cache.contains("$f wrap /home/runner/externals") && cache.contains("TURBO_API=%s") && cache.contains("/etc/bazel.bazelrc") && !cache.contains("# "), "{cache}");
+    assert_eq!(run(get("/cache/someone-elses-link-here/cache")).status, 404);
     let program = run(get(&format!("/cache/{link}/program")));
     let to = program.header("location").unwrap();
     assert_eq!(program.status, 302);
@@ -3846,7 +3873,7 @@ fn the_layer_store_is_off_unless_turned_on() {
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26")));
     let launch = launches(&http.clouds).pop().expect("a machine");
     let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
-    assert!(script.contains("superci-cache") && !script.contains("/layers|bash") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
+    assert!(script.contains("$c/cache|bash") && !script.contains("/layers|bash") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
     let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
     assert_eq!(block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/layers.json")))).status, 404);
 }
@@ -3878,8 +3905,10 @@ fn turbo_nx_and_bazel_keep_their_artifacts_by_the_branch_github_said_the_job_is_
     let link_of = |r: Request| {
         run(r);
         let script = String::from_utf8(STANDARD.decode(field(&launches(&http.clouds).pop().unwrap(), "UserData")).unwrap()).unwrap();
-        assert!(script.contains("TURBO_API=%s") && script.contains("NX_SELF_HOSTED_REMOTE_CACHE_SERVER=%s") && script.contains("build --remote_cache=$u/bazel"));
-        script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string()
+        let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+        let cache = String::from_utf8(run(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/cache"))).body).unwrap();
+        assert!(cache.contains("TURBO_API=%s") && cache.contains("NX_SELF_HOSTED_REMOTE_CACHE_SERVER=%s") && cache.contains("build --remote_cache=$u/bazel"));
+        link
     };
     let (main, feature) = (link_of(on_branch(7, "main")), link_of(on_branch(8, "feature")));
     let call = |link: &str, what: &str, body: serde_json::Value| { let r = run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/{what}")).with_body(body.to_string())); (r.status, json(&r)) };
@@ -4202,4 +4231,14 @@ fn jobs_kept_before_their_indexes_are_indexed_once_and_each_job_is_counted_in_it
     clock.0.set(t + 31 * 60_000);
     block_on(plane.alarm()).unwrap();
     assert!(keys("live:").is_empty(), "{:?}", keys("live:"));
+}
+
+#[test]
+fn a_running_jobs_log_is_githubs_then_the_lines_its_machine_sent_after() {
+    use superci_core::plane::{last_time, newer_lines};
+    let github = b"2026-10-16T21:18:40.1000000Z step one\n2026-10-16T21:18:46.2000000Z heartbeat\n";
+    let live = b"2026-10-16T21:18:40.1000000Z step one\n2026-10-16T21:18:46.2000000Z heartbeat\n2026-10-16T21:23:01.0000000Z heartbeat\n  its second line\n2026-10-16T21:28:01.0000000Z heartbeat\n";
+    assert_eq!(last_time(github).as_deref(), Some("2026-10-16T21:18:46"));
+    assert_eq!(String::from_utf8(newer_lines(live, "2026-10-16T21:18:46")).unwrap(), "2026-10-16T21:23:01.0000000Z heartbeat\n  its second line\n2026-10-16T21:28:01.0000000Z heartbeat\n", "a message's untimed lines go with it");
+    assert!(newer_lines(live, "").is_empty() && last_time(b"no times\n").is_none());
 }

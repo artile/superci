@@ -333,6 +333,8 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 // Running: how its start went, in a line (where the time from sending it to its first step went).
                 let start = if state == "running" { start_line(&j["start"]) } else { String::new() };
                 say(&format!("{mark}{}{}{start}", &state[..1].to_uppercase(), &state[1..]));
+                // (A machine other than the first choice, and why: AWS had none of that one, at that price.)
+                if state == "running" { if let Some(choice) = crate::dashboard::choice_said(&j["start"]) { say(&format!("{mark}{choice}; it got {}{}.", j["start"]["machine_type"].as_str().unwrap_or("another"), j["start"]["usd_per_hour"].as_f64().map(|u| format!(" (${u:.3} an hour)")).unwrap_or_default())) } }
                 *last = state
             };
             if !ended { said_state(say, state.clone(), &mut last[i]) }
@@ -388,11 +390,14 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                             say(&format!("{}    ✗ {}{}", crate::commands::JOB_LINE, f.name, f.file.as_deref().map(|p| format!(" ({p})")).unwrap_or_default()));
                             for l in f.error.lines() { say(&format!("{}        {l}", crate::commands::JOB_LINE)) }
                         }
-                        let lines: Vec<&str> = text.lines().collect();
-                        for l in &lines[lines.len().saturating_sub(40)..] { say(&format!("{}    {}", crate::commands::JOB_LINE, without_time(l))) }
+                        for l in last_lines(&text) { say(&format!("{}    {l}", crate::commands::JOB_LINE)) }
                     }
                     all.push_str(&text);
                     all.push('\n');
+                }
+                // A runner slow to reach the control plane: what it logged meanwhile (its machine sends it once it listens).
+                if let Some(log) = j["start"]["machine"]["log"].as_str().filter(|l| !l.trim().is_empty()) {
+                    for l in crate::dashboard::runner_log_lines(log, true) { say(&format!("{}  {l}", crate::commands::JOB_LINE)) }
                 }
                 // A failed job: which steps failed, said in words (all its tests may have passed: a type-check failed, say).
                 if j["result"] == "failure" {
@@ -403,8 +408,9 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 // What its tests came to, passed or not, and what a runner said of them as a whole.
                 let tests = crate::test_results::read(&all);
                 if !tests.runners.is_empty() {
-                    say(&format!("{}  {}", crate::commands::JOB_LINE, crate::commands::totals_line(&serde_json::to_value(&tests).unwrap_or_default())));
-                    for l in crate::commands::ran_lines(&serde_json::to_value(&tests).unwrap_or_default(), "  ") { say(&format!("{}{l}", crate::commands::JOB_LINE)) }
+                    let t = serde_json::to_value(&tests).unwrap_or_default();
+                    say(&format!("{}  {}", crate::commands::JOB_LINE, crate::commands::totals_line(&t)));
+                    for l in crate::commands::process_lines(&t, "  ").into_iter().chain(crate::commands::ran_lines(&t, "  ")).chain(crate::commands::expected_lines(&t, "  ")) { say(&format!("{}{l}", crate::commands::JOB_LINE)) }
                     for n in &tests.notes { say(&format!("{}  {n}", crate::commands::JOB_LINE)) }
                 }
             }
@@ -635,6 +641,22 @@ impl Lines {
     fn complete(&self) -> bool { self.steps == 0 || self.done.len() >= self.steps }
 }
 
+/// A failed step's last lines: its last 40, or where several processes wrote at once (`[slot 2] …`), each one's own
+/// last lines (the last 40 would be the last one to end's), in the order each began.
+fn last_lines(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().map(without_time).collect();
+    let mut marks: Vec<&str> = vec![];
+    for l in &lines { let m = crate::test_results::marked(l).0; if !m.is_empty() && !marks.contains(&m) { marks.push(m) } }
+    if marks.len() < 2 { return lines[lines.len().saturating_sub(40)..].iter().map(|l| l.to_string()).collect() }
+    let each = (40 / marks.len()).max(8);
+    let mut out = vec![];
+    for m in marks {
+        let own: Vec<&&str> = lines.iter().filter(|l| crate::test_results::marked(l).0 == m).collect();
+        out.extend(own[own.len().saturating_sub(each)..].iter().map(|l| l.to_string()));
+    }
+    out
+}
+
 /// A time in seconds as a person reads it: "42 s", "3m 5s".
 /// A job's start in a line, from its record (see `dashboard::job_start`): " (its machine in 19.4 s: AWS gave a
 /// machine 6.1 s, …)"; nothing when the control plane did not say.
@@ -678,6 +700,17 @@ fn without_time(line: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_steps_last_lines_are_each_slots_own() {
+        let mut text = String::new();
+        for i in 0..60 { text.push_str(&format!("2026-10-17T10:00:00.0000000Z [slot {}] line {i}\n", if i < 10 { 1 } else { 2 })) }
+        let got = last_lines(&text);
+        assert!(got.contains(&"[slot 1] line 9".to_string()) && got.contains(&"[slot 2] line 59".to_string()), "{got:?}");
+        assert_eq!(got.iter().filter(|l| l.starts_with("[slot 1]")).count(), 10, "slot 1's all ten, though slot 2 wrote after it");
+        let plain: String = (0..50).map(|i| format!("line {i}\n")).collect();
+        assert_eq!(last_lines(&plain).len(), 40);
+    }
 
     #[test]
     fn a_run_is_said_by_its_number() {

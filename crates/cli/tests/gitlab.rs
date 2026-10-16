@@ -236,7 +236,7 @@ fn gitlab_jobs_cancelled_at_each_point_end_here_too_and_one_on_a_spot_machine_aw
     }
     assert!(served.gitlab_webhook(served.gitlab.finish(e, "failed", "", now())) < 300);
     let j = state(e);
-    assert_eq!((j["state"].as_str(), j["error"].as_str()), (Some("failed"), Some("AWS took back its spot machine; run again, off spot machines")), "{j}");
+    assert_eq!((j["state"].as_str(), j["error"].as_str()), (Some("failed"), Some("AWS took back its spot machine; SuperCI ran the job again by itself, off spot machines")), "{j}");
     assert!(served.gitlab.asked.lock().unwrap().iter().any(|x| x.ends_with(&format!("/jobs/{e}/retry"))), "{:?}", served.gitlab.asked.lock().unwrap());
 }
 

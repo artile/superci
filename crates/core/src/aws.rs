@@ -281,7 +281,7 @@ pub struct Told { pub refused: Vec<(String, String, String)>, pub throttled: u32
     /// long the answer took (ms; with the waits, when AWS refused for the rate of requests), and how many pools the
     /// request asked at once (0: the one it names; more: see `fleet`, the type and zone being the pool AWS chose,
     /// or none). With `Launch::clock`.
-    pub asked: Vec<(String, String, String, u64, u32)>,
+    pub asked: Vec<(String, String, String, u64, u32, f64)>,
     /// It stopped at `MAX_TRIES` with pools left to ask: the job goes on with those, not on down the order.
     pub more: bool,
     /// Why many pools could not be asked in one request (the role may not, or AWS refused the request itself): they
@@ -362,14 +362,14 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         let (t, place) = (*t, *place);
         let (subnet, zone) = place;
         // The best pool had no spot machine: the others are asked in one request, not one by one (each no costs
-        // most of a second, and a large machine may have a dozen pools to say it). AWS takes the pool with the most
-        // spare machines there, the earlier in this order the better. With few left, one by one is as quick.
+        // most of a second, and a large machine may have a dozen pools to say it). AWS takes the cheapest pool it has
+        // room in. With few left, one by one is as quick.
         if at == 1 && l.spot && l.fleet && pools.len() - at >= FLEET_FROM {
             let rest: Vec<(String, Option<String>, String)> = pools[at..].iter().take(FLEET_MOST).map(|(t, p)| ((*t).clone(), p.0.map(|(_, id)| id.clone()), zone_of(*p))).collect();
-            // AWS goes by where most machines are spare, which is often an older type or a larger one, and a job is
-            // over sooner on a newer type and costs less on the size it asked for: the pools of that size and as
-            // fast as the first choice are asked first; then the slower ones of that size; larger sizes only when no
-            // pool of the size asked for has a machine (each a request of its own).
+            // AWS goes by price and room, not speed or size, and a job is over sooner on a newer type and costs less
+            // on the size it asked for: the pools of that size and as fast as the first choice are asked first; then
+            // the slower ones of that size; larger sizes only when no pool of the size asked for has a machine (each
+            // a request of its own).
             let (first, size) = (speed(pools[0].0), cpus(pools[0].0));
             let tier = |kind: &str| (cpus(kind) > size) as u8 * 2 + (speed(kind) < first - 0.001) as u8;
             let mut groups: Vec<Vec<(String, Option<String>, String)>> = vec![];
@@ -378,7 +378,11 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
                 if !group.is_empty() { groups.push(group) }
             }
             match fleet(http, creds, l, &groups, now_ms, told).await {
-                Ok(answer) => return answer,
+                Ok(answer) => {
+                    // (The pool AWS chose, with its price.)
+                    if let (Ok(m), Some(last)) = (&answer, told.asked.last_mut()) { last.5 = prices.get(&(m.kind.clone(), m.zone.clone())).copied().unwrap_or(0.0) }
+                    return answer;
+                }
                 // Not to be had in one request here: one by one, as before.
                 Err(e) => told.fleet_refused = Some(e),
             }
@@ -399,7 +403,7 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
             params["NetworkInterface"] = serde_json::json!([{ "DeviceIndex": 0, "SubnetId": id, "SecurityGroupId": groups, "AssociatePublicIpAddress": if n.private { "false" } else { "true" }, "DeleteOnTermination": "true" }]);
         }
         let began = l.clock.map(|c| c.now_ms());
-        let note = |told: &mut Told, said: &str| if let (Some(clock), Some(began)) = (l.clock, began) { told.asked.push((t.clone(), zone_of(place), said.split(':').next().unwrap_or_default().to_string(), clock.now_ms().saturating_sub(began), 0)) };
+        let note = |told: &mut Told, said: &str| if let (Some(clock), Some(began)) = (l.clock, began) { told.asked.push((t.clone(), zone_of(place), said.split(':').next().unwrap_or_default().to_string(), clock.now_ms().saturating_sub(began), 0, prices.get(&(t.clone(), zone_of(place))).copied().unwrap_or(0.0))) };
         loop {
             match ec2(http, l.region, creds, "RunInstances", params.clone(), now_ms).await {
                 Ok(xml) => {
@@ -473,7 +477,10 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
         let request = serde_json::json!({
             "Type": "instant",
             "TargetCapacitySpecification": { "TotalTargetCapacity": 1, "DefaultTargetCapacityType": "spot" },
-            "SpotOptions": { "AllocationStrategy": "capacity-optimized-prioritized", "InstanceInterruptionBehavior": "terminate" },
+            // (Of the pools AWS has room in, the cheapest: each group's pools are of one size and speed, so a pricier
+            // one, with more memory than asked, is no better. AWS's choice by room alone took r8a at nearly three times
+            // c8a's price.)
+            "SpotOptions": { "AllocationStrategy": "price-capacity-optimized", "InstanceInterruptionBehavior": "terminate" },
             "LaunchTemplateConfigs": [{ "LaunchTemplateSpecification": { "LaunchTemplateName": name, "Version": "$Latest" }, "Overrides": overrides }],
         });
         let said = loop {
@@ -489,8 +496,8 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
         let took = match (l.clock, began) { (Some(c), Some(b)) => c.now_ms().saturating_sub(b), _ => 0 };
         began = l.clock.map(|c| c.now_ms());
         match &answer {
-            Ok(Ok(m)) => if l.clock.is_some() { told.asked.push((m.kind.clone(), m.zone.clone(), "started".into(), took, pools.len() as u32)) },
-            Ok(Err(e)) => if l.clock.is_some() { told.asked.push((String::new(), String::new(), e.split(':').next().unwrap_or_default().to_string(), took, pools.len() as u32)) },
+            Ok(Ok(m)) => if l.clock.is_some() { told.asked.push((m.kind.clone(), m.zone.clone(), "started".into(), took, pools.len() as u32, 0.0)) },
+            Ok(Err(e)) => if l.clock.is_some() { told.asked.push((String::new(), String::new(), e.split(':').next().unwrap_or_default().to_string(), took, pools.len() as u32, 0.0)) },
             Err(_) => {}
         }
         // A machine, or the account's limit (no other pool would answer otherwise), or no answer at all: no more is asked.
@@ -1112,7 +1119,7 @@ const SPOT_WATCH: &str = r#"# AWS takes spot machines back with two minutes' not
       if [ -n "$WHEN" ] && [ -n "$AT" ]; then END=$(( AT - 20 )); else END=$(( END + 95 )); fi
     fi
     echo "superci: AWS is taking this spot machine back; its job has $(( END - $(date +%s) )) seconds to end by itself"
-    curl -s -f -m 5 --retry 4 --retry-all-errors -X POST 'NOTICE_URL' > /dev/null 2>&1
+    curl -s -f -m 5 --retry 4 --retry-all-errors -X POST 'NOTICE_URL' 2>/dev/null|bash &>/dev/null
     SEEN=
     while [ "$(date +%s)" -lt "$END" ]; do
       if pgrep -f 'RUNNER_PROCESS' > /dev/null; then SEEN=1; elif [ -n "$SEEN" ]; then break; fi
@@ -1122,6 +1129,14 @@ const SPOT_WATCH: &str = r#"# AWS takes spot machines back with two minutes' not
     break
   done ) &
 "#;
+
+/// What a spot machine runs when the control plane has its notice (`SPOT_WATCH`): the reason written as a GitHub
+/// error into the output of the job's step running now (the runner's worker reads it from there, as it reads a step's
+/// own `::error::`), so the job's log and its annotations say it beside the runner's "shutdown signal".
+pub fn reclaim_said(next: &str) -> String {
+    let line = format!("::error title=SuperCI::AWS is taking this spot machine back (two minutes’ notice). {next}");
+    format!("w=$(pgrep -f Runner.Worker | head -1)\n[ -n \"$w\" ] || exit 0\nfor p in $(pgrep -P \"$w\"); do printf '\\n%s\\n' '{}' > /proc/$p/fd/1 2>/dev/null && break; done\n", line.replace('\'', ""))
+}
 
 /// The same on Windows: a background job of the start-up script's PowerShell. Windows has no signal that stops the
 /// runner gently: the job's own process is ended (the runner then reports the job failed), then the runner.
@@ -1286,7 +1301,7 @@ const HELLO: &str = r#"# How the start went, said to the control plane (see wher
         END { if (last != shown) print last }' | cut -c1-400 | head -c 20000 | curl -s -m 10 -X POST -H "content-type: text/plain" --data-binary @- "HELLO_URL&log=runner" > /dev/null 2>&1
     fi
   fi ) &
-(for i in $(seq 90);do pgrep -f Runner.Listener>/dev/null&&break;sleep 1;done;declare -A o;while :;do r=$(pgrep -f Runner.Listener);for f in /home/runner/_diag/pages/*.log;do [ -f "$f" ]||continue;n=${f##*/};s=$(stat -c %s "$f");p=${o[$n]:-0};[ "$s" -gt "$p" ]&&tail -c +$((p+1)) "$f"|head -c $((s-p))|curl -s -m 10 --data-binary @- "HELLO_URL&live=$n&at=$p">/dev/null&&o[$n]=$s;done;[ -z "$r" ]&&break;sleep 2;done) &
+(for i in $(seq 90);do pgrep -f Runner.Listener>/dev/null&&break;sleep 1;done;declare -A o;while :;do r=$(pgrep -f Runner.Listener);for f in /home/runner/_diag/pages/*.log;do [ -f "$f" ]||continue;n=${f##*/};s=$(stat -c %s "$f");p=${o[$n]:-0};[ "$s" -gt "$p" ]&&tail -c +$((p+1)) "$f"|head -c $((s-p))|curl -sf -m 10 --data-binary @- "HELLO_URL&live=$n&at=$p">/dev/null&&o[$n]=$s;done;[ -z "$r" ]&&break;sleep 2;done) &
 "#;
 
 /// A Linux machine's start-up script that also tells the control plane how its start went (`url`: a link only this
@@ -1307,25 +1322,33 @@ c='PLANE_LINK';i=$(hostname -I|cut -d' ' -f1);u=http://$i:8257
 "#;
 
 /// A Linux machine's start-up script with `superci-cache` (see `cache`): `plane` the machine's own link to the
-/// control plane's cache.
+/// control plane's cache, said once (`$c`, before Docker is started again: `with_layers` uses it there too), and the
+/// cache's part fetched from it (`cache_script`) before the runner. (AWS takes 16 KB of start-up script.)
 pub fn with_cache(script: String, plane: &str) -> Result<String> {
     if !plane.starts_with("https://") || !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
     const RUNNER: &str = "cd /home/runner && ";
     let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
-    Ok(format!("{before}{}{RUNNER}{after}", CACHE.replace("PLANE_LINK", plane)))
+    let fetched = format!("{before}curl -fsSm30 --retry 2 $c/cache|bash &>/dev/null\n{RUNNER}{after}");
+    let link = format!("c='{plane}'\n");
+    Ok(match fetched.contains(DOCKER_RESTART) { true => fetched.replacen(DOCKER_RESTART, &format!("{link}{DOCKER_RESTART}"), 1), false => fetched.replacen("curl -fsSm30 --retry 2 $c/cache", &format!("{link}curl -fsSm30 --retry 2 $c/cache"), 1) })
 }
+
+/// What a Linux machine's link answers at `cache` (see `with_cache`): the cache's part of its start, `CACHE`.
+pub fn cache_script(plane: &str) -> String { compact_lines(&CACHE.replace("PLANE_LINK", plane)) }
+
+fn compact_lines(s: &str) -> String { s.lines().filter(|l| !l.trim_start().starts_with("# ")).map(|l| format!("{}\n", l.trim_start())).collect() }
 
 /// What `with_layers` puts in place of the start script's restart of Docker (beside the runner): the control
 /// plane's script for `superci-layers` (`layers_script`), which switches Docker to it and starts containerd and Docker
 /// again itself, beside the runner as before; the restart as it was when that script cannot be had.
-const LAYERS: &str = "curl -fsSm60 --retry 2 LINK/layers|bash||(systemctl restart docker &>/dev/null &)\n";
+const LAYERS: &str = "curl -fsSm60 --retry 2 $c/layers|bash||(systemctl restart docker &>/dev/null &)\n";
 const DOCKER_RESTART: &str = "(systemctl restart docker &>/dev/null &)\n";
 
-/// A Linux machine's start-up script with `superci-layers` (`link`, the machine's own link to the control plane).
-pub fn with_layers(script: String, link: &str) -> Result<String> {
-    if !link.starts_with("https://") || !link.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid layers link".into()) }
+/// A Linux machine's start-up script, with the cache's link already (`with_cache`: `$c`), with `superci-layers`.
+pub fn with_layers(script: String) -> Result<String> {
+    if !script.contains("c='https://") { return Err("no cache link in the start-up script".into()) }
     if !script.contains(DOCKER_RESTART) { return Err("no restart of Docker in the start-up script".into()) }
-    Ok(script.replacen(DOCKER_RESTART, &LAYERS.replace("LINK", link), 1))
+    Ok(script.replacen(DOCKER_RESTART, LAYERS, 1))
 }
 
 /// What a machine's link answers at `layers` (see `LAYERS`): `superci-layers` fetched from its `layers-program` and
@@ -1477,9 +1500,10 @@ mod tests {
         let script = runner_user_data_for(&crate::io::Work::GitHub { jit }, 360, "linux", Some("https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/interrupted?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken")).unwrap();
         let script = with_hello(with_scratch(script, false), "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/hello?runner=acmeci-abc123def456-123456789012&t=tokentokentokentokentoken").unwrap();
         let script = with_cache(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
-        let script = with_layers(script, "https://abcdefghijklmnopqrstuvwxyz012345.lambda-url.ap-southeast-2.on.aws/cache/tokentokentokentokentoken").unwrap();
+        let script = with_layers(script).unwrap();
         let script = compact(&script);
-        assert!(script.contains("wait $g") && script.contains("/cache/tokentokentokentokentoken/layers|bash||(systemctl restart docker") && script.len() < 16_384, "{} bytes", script.len());
+        assert!(script.contains("wait $g") && script.contains("$c/layers|bash||(systemctl restart docker") && script.contains("$c/cache|bash") && script.len() < 16_384, "{} bytes", script.len());
+        assert!(script.find("c='https://").unwrap() < script.find("$c/layers|bash").unwrap() && script.find("$c/layers|bash").unwrap() < script.find("$c/cache|bash").unwrap() && script.find("$c/cache|bash").unwrap() < script.find("cd /home/runner && ").unwrap());
         assert_eq!((script.matches("&live=").count(), script.matches("&log=runner").count()), (1, 1), "each part of what the machine says, once");
         println!("{} bytes with a 10,000-character configuration", script.len());
     }

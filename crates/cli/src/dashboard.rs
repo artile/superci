@@ -804,15 +804,22 @@ fn asks_said(j: &serde_json::Value) -> String {
 fn passed_over(j: &serde_json::Value) -> Vec<String> {
     let got = j["machine_type"].as_str().unwrap_or_default();
     let mut kinds: Vec<String> = vec![];
+    let mut said: Vec<String> = vec![];
     for a in j["asks"].as_array().into_iter().flatten() {
         let kind = a["kind"].as_str().unwrap_or_default();
-        if a["spot"] == true && a["said"] == "InsufficientInstanceCapacity" && kind != got && !kinds.iter().any(|k| k == kind) { kinds.push(kind.to_string()) }
+        if a["spot"] == true && a["said"] == "InsufficientInstanceCapacity" && kind != got && !kinds.iter().any(|k| k == kind) {
+            kinds.push(kind.to_string());
+            // (Where, and at what price, when the control plane kept them: why a pricier one was taken.)
+            let zone = a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default();
+            let usd = a["usd"].as_f64().filter(|u| *u > 0.0).map(|u| format!(" (${u:.3} an hour)")).unwrap_or_default();
+            said.push(format!("{kind}{zone}{usd}"));
+        }
     }
-    if got.is_empty() || j["on_demand"] == true { vec![] } else { kinds }
+    if got.is_empty() || j["on_demand"] == true { vec![] } else { said }
 }
 
-/// The same as a job's note: "Not the first choice: AWS had no spot m8a.8xlarge".
-fn choice_said(j: &serde_json::Value) -> Option<String> {
+/// The same as a job's note: "Not the first choice: AWS had no spot m8a.8xlarge in us-east-1a ($0.135 an hour)".
+pub fn choice_said(j: &serde_json::Value) -> Option<String> {
     let kinds = passed_over(j);
     let list = match kinds.as_slice() { [] => return None, [one] => one.clone(), [most @ .., last] => format!("{} or {last}", most.join(", ")) };
     Some(format!("Not the first choice: AWS had no spot {list}"))
@@ -875,11 +882,19 @@ pub fn job_start_lines(j: &serde_json::Value) -> Vec<String> {
         let more = s["more"].as_str().filter(|m| !m.is_empty()).map(|m| format!(" ({m})")).unwrap_or_default();
         out.push(format!("  {:>7}  {}{more}", secs(s["ms"].as_u64().unwrap_or_default()), s["what"].as_str().unwrap_or_default()));
     }
-    // A runner that was slow to reach GitHub: what it logged meanwhile, as its machine sent it.
+    // A runner that was slow to reach GitHub (a run from a computer's: this control plane): what it logged meanwhile,
+    // as its machine sent it.
     if let Some(log) = start["runner_log"].as_str() {
-        out.push("What its runner logged while it was slow to reach GitHub (its waits, warnings and errors):".to_string());
-        out.extend(log.lines().map(|l| format!("  {l}")));
+        out.extend(runner_log_lines(log, j["provider"] == "local"));
     }
+    out
+}
+
+/// What a slow runner logged while it reached GitHub (`local`: this control plane), as its machine sent it: its waits,
+/// warnings and errors (a fixed wait of 30 seconds is its retry after a request that failed).
+pub fn runner_log_lines(log: &str, local: bool) -> Vec<String> {
+    let mut out = vec![format!("What its runner logged while it was slow to reach {} (its waits, warnings and errors):", if local { "the control plane" } else { "GitHub" })];
+    out.extend(log.lines().map(|l| format!("  {l}")));
     out
 }
 
@@ -5628,7 +5643,10 @@ fn fetch_all(urls: &[String]) -> Result<Vec<u8>> {
 pub fn whole_log(plane_url: &str, key: &str, j: &serde_json::Value) -> Result<Vec<u8>> {
     let id = j["job_id"].as_u64().unwrap_or_default();
     let provider = j["provider"].as_str().unwrap_or_default();
-    if provider == "local" || provider.is_empty() {
+    // (A GitHub job still running: GitHub's file is as far as its runner sent it in blocks; the control plane adds
+    // what its machine sent after.)
+    let running = provider.is_empty() && ["launching", "launched", "running", "waiting"].contains(&j["state"].as_str().unwrap_or_default());
+    if (provider == "local" || provider.is_empty()) && !running {
         if let Ok(got) = cloudflare::plane_get(plane_url, key, &format!("/job/log?id={id}&link=1")) {
             if let Some(urls) = got["urls"].as_array() { return fetch_all(&urls.iter().filter_map(|u| u.as_str().map(str::to_string)).collect::<Vec<_>>()) }
             if let Some(url) = got["url"].as_str() { return fetch_all(&[url.to_string()]) }
@@ -8088,8 +8106,12 @@ mod tests {
         let words = job_words(&j);
         assert_eq!((words["start"]["ms"].as_u64(), words["start"]["steps"].as_array().map(|s| s.len()), words["start"]["steps"][5]["ms"].as_u64()), (Some(60_100), Some(8), Some(37_000)));
         // Its row says, quietly, that its machine was not the first choice (no fault of anyone's; it changes the job's time and price).
-        assert_eq!(words["choice"], "Not the first choice: AWS had no spot m8a.8xlarge or r8a.8xlarge");
-        assert!(job_table(&[j.clone()]).contains(r#"<small class="jt-why held">Not the first choice: AWS had no spot m8a.8xlarge or r8a.8xlarge</small>"#));
+        assert_eq!(words["choice"], "Not the first choice: AWS had no spot m8a.8xlarge in us-east-1a or r8a.8xlarge in us-east-1a");
+        assert!(job_table(&[j.clone()]).contains(r#"<small class="jt-why held">Not the first choice: AWS had no spot m8a.8xlarge in us-east-1a or r8a.8xlarge in us-east-1a</small>"#));
+        // With the price AWS's spot pool had when it was asked: why a pricier machine was taken.
+        let mut priced = j.clone();
+        priced["asks"][0]["usd"] = serde_json::json!(0.135);
+        assert!(job_words(&priced)["choice"].as_str().unwrap().starts_with("Not the first choice: AWS had no spot m8a.8xlarge in us-east-1a ($0.135 an hour)"), "{}", job_words(&priced)["choice"]);
         // A job that got its first choice, and one from before any of this was kept, say what there is.
         let mut first = j.clone();
         first["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "started")]);
@@ -8102,7 +8124,7 @@ mod tests {
         many["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), { "at": 800, "kind": "r8a.8xlarge", "zone": "us-east-1d", "spot": true, "said": "started", "ms": 2_900, "pools": 14 }]);
         many["machine_type"] = "r8a.8xlarge".into();
         assert_eq!(job_start_lines(&many)[2], "    4.0 s  AWS gave a machine (no spot m8a.8xlarge; r8a.8xlarge in us-east-1d, AWS's choice of 14 pools)");
-        assert_eq!(job_words(&many)["choice"], "Not the first choice: AWS had no spot m8a.8xlarge");
+        assert_eq!(job_words(&many)["choice"], "Not the first choice: AWS had no spot m8a.8xlarge in us-east-1a");
         // None of them had one either: said once, and the job went on to an on-demand machine.
         many["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), { "at": 800, "kind": "", "spot": true, "said": "InsufficientInstanceCapacity", "ms": 2_900, "pools": 14 },
             { "at": 3_700, "kind": "m8a.8xlarge", "zone": "us-east-1a", "spot": false, "said": "started", "ms": 900 }]);

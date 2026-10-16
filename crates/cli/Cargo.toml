@@ -19,10 +19,10 @@ name = "superci"
 path = "src/main.rs"
 
 [dependencies]
-superci-core = { path = "../core", version = "=0.19.12" }
-superci-programs-planes = { path = "../programs-planes", version = "=0.19.12" }
-superci-programs-cache = { path = "../programs-cache", version = "=0.19.12" }
-superci-programs-layers = { path = "../programs-layers", version = "=0.19.12" }
+superci-core = { path = "../core", version = "=0.19.13" }
+superci-programs-planes = { path = "../programs-planes", version = "=0.19.13" }
+superci-programs-cache = { path = "../programs-cache", version = "=0.19.13" }
+superci-programs-layers = { path = "../programs-layers", version = "=0.19.13" }
 url.workspace = true
 miniz_oxide = "0.9"
 ureq = { version = "3", features = ["json"] }
