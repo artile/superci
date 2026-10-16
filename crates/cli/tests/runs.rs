@@ -895,6 +895,18 @@ fn what_a_run_from_a_computer_cannot_start_or_follow_is_said() {
     assert!(ok && out.contains("No artifacts"), "{out}");
     let (ok, out) = said(&real, &["artifacts", "retrieve", "report", &format!("--run={run}")]);
     assert!(!ok && out.contains("The run has no artifact report."), "{out}");
+    // A run with no jobs here, asked for its job; a run cancelled that is not here.
+    let (ok, out) = said(&real, &["jobs", "retrieve", "--run=999"]);
+    assert!(!ok && out.contains("No jobs of run 999 among the latest"), "{out}");
+    let (ok, out) = said(&real, &["jobs", "retrieve", "--run=999", "--job=tests"]);
+    assert!(!ok && out.contains("No jobs of run 999 among the latest"), "{out}");
+    let (ok, out) = said(&real, &["runs", "cancel", "999"]);
+    assert!(!ok && out.contains("No run 999 here"), "{out}");
+    // A control plane's address that is not one, and a key it does not take.
+    let o = superci(&served, &real, &["jobs", "list"]).env("SUPERCI_PLANE", "ftp://plane.example").output().unwrap();
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("SUPERCI_PLANE is the control plane's address"), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = superci(&served, &real, &["jobs", "list"]).env("SUPERCI_KEY", "superci_read_not-a-key-of-its-own").output().unwrap();
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("did not take SUPERCI_KEY"), "{}", String::from_utf8_lossy(&o.stderr));
     for d in [bare, dir, real] { let _ = std::fs::remove_dir_all(d); }
 }
 
