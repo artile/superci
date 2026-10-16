@@ -41,6 +41,14 @@ fn migration(existing: bool, tag: Option<&str>, extra: &[&str]) -> Option<Value>
     }
 }
 
+/// A new control plane's id: random (in a debug build, `SUPERCI_NEW_PLANE_ID` when it is one: the tests', so that
+/// what a recording answered of it fits).
+pub fn new_plane_id() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(id) = std::env::var("SUPERCI_NEW_PLANE_ID").ok().filter(|i| i.len() == 12 && i.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())) { return id }
+    superci_core::crypto::random_id(12)
+}
+
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(120))).build().into()
 }
@@ -97,8 +105,11 @@ impl Cloudflare {
 
     /// One API call; Cloudflare's envelope `{ success, errors, result }` becomes the result or an error.
     fn call(&self, method: &str, path: &str, body: Option<(&str, Vec<u8>)>) -> Result<Value> {
-        let url = format!("{API}{path}");
+        let url = crate::aws::stand_in(&format!("{API}{path}"));
         let auth = format!("Bearer {}", self.token);
+        // (What was asked, for a recording: JSON as it is; anything else, a Worker's upload say, by its size only.)
+        #[cfg(debug_assertions)]
+        let asked: Vec<u8> = match &body { Some((t, b)) if t.starts_with("application/json") => b.clone(), Some((t, b)) => format!("({t}, {} bytes)", b.len()).into_bytes(), None => vec![] };
         let response = match (method, body) {
             ("GET", _) => self.agent.get(&url).header("authorization", &auth).call(),
             ("DELETE", _) => self.agent.delete(&url).header("authorization", &auth).call(),
@@ -112,7 +123,11 @@ impl Cloudflare {
             }
         };
         let mut response = response.map_err(|e| format!("{method} {path}: {e}"))?;
+        #[cfg(debug_assertions)]
+        let (status, headers): (u16, Vec<(String, String)>) = (response.status().as_u16(), response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect());
         let text = response.body_mut().read_to_string().map_err(|e| e.to_string())?;
+        #[cfg(debug_assertions)]
+        crate::aws::record(&superci_core::io::Request::new(method, &format!("{API}{path}")).with_body(asked), status, &headers, text.as_bytes());
         let v: Value = serde_json::from_str(&text).map_err(|_| format!("{method} {path}: {}", text.chars().take(200).collect::<String>()))?;
         if v["success"] == true { return Ok(v["result"].clone()) }
         let errors = v["errors"].as_array().map(|es| es.iter().map(|e| format!("{} ({})", e["message"].as_str().unwrap_or("?"), e["code"])).collect::<Vec<_>>().join("; ")).unwrap_or_default();
@@ -125,9 +140,13 @@ impl Cloudflare {
 
     /// One query to Cloudflare's GraphQL Analytics API.
     pub fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        let mut r = self.agent.post(&format!("{API}/graphql")).header("authorization", &format!("Bearer {}", self.token)).header("content-type", "application/json")
-            .send(json!({ "query": query, "variables": variables }).to_string()).map_err(|e| format!("analytics: {e}"))?;
-        let v: Value = serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let asked = json!({ "query": query, "variables": variables }).to_string();
+        let mut r = self.agent.post(&crate::aws::stand_in(&format!("{API}/graphql"))).header("authorization", &format!("Bearer {}", self.token)).header("content-type", "application/json")
+            .send(asked.as_str()).map_err(|e| format!("analytics: {e}"))?;
+        let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+        #[cfg(debug_assertions)]
+        crate::aws::record(&superci_core::io::Request::new("POST", &format!("{API}/graphql")).with_body(asked.into_bytes()), r.status().as_u16(), &[], text.as_bytes());
+        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         if let Some(e) = v["errors"].as_array().filter(|e| !e.is_empty()) { return Err(format!("analytics: {}", e[0]["message"].as_str().unwrap_or("error"))) }
         Ok(v["data"].clone())
     }
@@ -174,7 +193,7 @@ impl Cloudflare {
         step(0);
         let existing = self.call("GET", &format!("/accounts/{a}/workers/scripts/{name}/settings"), None).ok();
         let old_id = existing.as_ref().and_then(|s| s["bindings"].as_array().and_then(|bs| bs.iter().find(|b| b["name"] == "PLANE_ID").and_then(|b| b["text"].as_str().map(str::to_string))));
-        let plane_id = old_id.clone().unwrap_or_else(|| superci_core::crypto::random_id(12));
+        let plane_id = old_id.clone().unwrap_or_else(new_plane_id);
         let image = if runners { Some(self.runner_image(a)?) } else { None };
         let mut metadata = json!({
             "main_module": "index.js",
@@ -256,7 +275,7 @@ impl Cloudflare {
     pub fn deploy_runners(&self, a: &str, plane_url: &str, plane_id: &str) -> Result<String> {
         let name = format!("superci-runners-{plane_id}");
         // The control plane's public keys, pinned in the agent (a Worker cannot fetch another on the same workers.dev).
-        let mut r = agent().get(&format!("{plane_url}/.well-known/jwks.json")).call().map_err(|e| e.to_string())?;
+        let mut r = agent().get(&crate::aws::stand_in(&format!("{plane_url}/.well-known/jwks.json"))).call().map_err(|e| e.to_string())?;
         let keys = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
         if !serde_json::from_str::<Value>(&keys).is_ok_and(|k| k["keys"].is_array()) { return Err("the control plane did not publish its keys".into()) }
         let existing = self.call("GET", &format!("/accounts/{a}/workers/scripts/{name}/settings"), None).is_ok();
@@ -393,7 +412,7 @@ pub fn authorize() -> (String, Pending) {
 
 fn token_call(fields: &[(&str, &str)]) -> Result<Session> {
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields).finish();
-    let mut r = agent().post("https://dash.cloudflare.com/oauth2/token").header("content-type", "application/x-www-form-urlencoded").send(body).map_err(|e| e.to_string())?;
+    let mut r = agent().post(&crate::aws::stand_in("https://dash.cloudflare.com/oauth2/token")).header("content-type", "application/x-www-form-urlencoded").send(body).map_err(|e| e.to_string())?;
     let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&text).unwrap_or_default();
     let Some(access) = v["access_token"].as_str() else { return Err(format!("Cloudflare sign-in: {}", text.chars().take(200).collect::<String>())) };
@@ -460,7 +479,7 @@ pub fn health(plane_url: &str) -> Option<Value> {
 }
 
 fn health_once(plane_url: &str) -> Option<Value> {
-    let mut r = quick().get(&format!("{plane_url}/health")).call().ok()?;
+    let mut r = quick().get(&crate::aws::stand_in(&format!("{plane_url}/health"))).call().ok()?;
     if r.status().as_u16() != 200 { return None }
     serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()
 }
@@ -480,7 +499,7 @@ pub fn plane_key(key: &str, plane_url: &str) -> String {
 pub fn plane_get(plane_url: &str, key: &str, path: &str) -> Result<Value> {
     let key = &plane_key(key, plane_url);
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(40))).build().into();
-    let mut r = agent.get(&format!("{plane_url}{path}")).header("authorization", &format!("Bearer {key}")).call().map_err(|e| e.to_string())?;
+    let mut r = agent.get(&crate::aws::stand_in(&format!("{plane_url}{path}"))).header("authorization", &format!("Bearer {key}")).call().map_err(|e| e.to_string())?;
     let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
     // (409: what it cannot do as things stand, said as it is.)
     if r.status().as_u16() == 409 { return Err(format!("{}.", text.trim_end_matches('.'))) }
@@ -491,7 +510,7 @@ pub fn plane_get(plane_url: &str, key: &str, path: &str) -> Result<Value> {
 /// A change the control plane makes itself (no restart), asked with this session's key.
 pub fn plane_post(plane_url: &str, key: &str, path: &str, body: &Value) -> Result<Value> {
     let key = &plane_key(key, plane_url);
-    let mut r = quick().post(&format!("{plane_url}{path}")).header("authorization", &format!("Bearer {key}")).header("content-type", "application/json")
+    let mut r = quick().post(&crate::aws::stand_in(&format!("{plane_url}{path}"))).header("authorization", &format!("Bearer {key}")).header("content-type", "application/json")
         .send(body.to_string()).map_err(|e| e.to_string())?;
     if r.status().as_u16() != 200 { return Err(format!("the control plane answered {}", r.status())) }
     serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string())
@@ -502,7 +521,7 @@ pub fn plane_post(plane_url: &str, key: &str, path: &str, body: &Value) -> Resul
 pub fn plane_move_call(plane_url: &str, key: &str, token: &str, path: &str, body: &Value) -> Result<(u16, Value)> {
     let key = &plane_key(key, plane_url);
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(60))).build().into();
-    let mut r = agent.post(&format!("{plane_url}{path}")).header("authorization", &format!("Bearer {key}")).header("x-move-token", token)
+    let mut r = agent.post(&crate::aws::stand_in(&format!("{plane_url}{path}"))).header("authorization", &format!("Bearer {key}")).header("x-move-token", token)
         .header("content-type", "application/json").send(body.to_string()).map_err(|e| e.to_string())?;
     let status = r.status().as_u16();
     let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
@@ -517,7 +536,7 @@ pub fn status_light(plane_url: &str, key: &str) -> Option<Value> { status_of(pla
 
 fn status_of(plane_url: &str, key: &str, query: &str) -> Option<Value> {
     let key = &plane_key(key, plane_url);
-    let mut r = quick().get(&format!("{plane_url}/status{query}")).header("authorization", &format!("Bearer {key}")).call().ok()?;
+    let mut r = quick().get(&crate::aws::stand_in(&format!("{plane_url}/status{query}"))).header("authorization", &format!("Bearer {key}")).call().ok()?;
     if r.status().as_u16() != 200 { return None }
     serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()
 }

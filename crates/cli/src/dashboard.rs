@@ -2831,11 +2831,11 @@ impl Dashboard {
                 let Some(mut agents) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Vec<superci_core::plane::Agent>>(s["agents"].clone()).ok()) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
-                let keys: serde_json::Value = ureq::get(&format!("{}/.well-known/jwks.json", plane.url())).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
+                let keys: serde_json::Value = ureq::get(&crate::aws::stand_in(&format!("{}/.well-known/jwks.json", plane.url()))).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
                 eprintln!("Deploying the Modal runner agent (the first time builds a small image in your workspace)…");
                 let url = modal::deploy_runners(&session, plane.url(), plane.plane_id(), &keys)?;
                 // Its first answer can take a few seconds (a cold start).
-                for _ in 0..20 { if ureq::get(&format!("{url}/health")).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(std::time::Duration::from_secs(3)) }
+                for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(std::time::Duration::from_secs(3)) }
                 agents.retain(|a| a.cloud != "modal");
                 agents.push(superci_core::plane::Agent { cloud: "modal".into(), url });
                 self.put_secret(&plane, "AGENTS", &serde_json::to_string(&agents).map_err(|e| e.to_string())?)?;
@@ -6412,9 +6412,9 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
             Carry::Comes("modal") => match to {
                 Plane::Modal { .. } => w.put(to, "CONTAINERS", "on")?,
                 _ => {
-                    let keys: serde_json::Value = ureq::get(&format!("{}/.well-known/jwks.json", to.url())).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
+                    let keys: serde_json::Value = ureq::get(&crate::aws::stand_in(&format!("{}/.well-known/jwks.json", to.url()))).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
                     let url = modal::deploy_runners(w.modal.as_ref().ok_or("Sign in with Modal first.")?, to.url(), to.plane_id(), &keys)?;
-                    for _ in 0..20 { if ureq::get(&format!("{url}/health")).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(Duration::from_secs(3)) }
+                    for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(Duration::from_secs(3)) }
                     agents.retain(|a| a.cloud != "modal");
                     agents.push(superci_core::plane::Agent { cloud: "modal".into(), url });
                 }
@@ -6487,7 +6487,7 @@ fn report_to_plane(plane_url: &str, report: &serde_json::Value) -> Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
     let mut last = String::new();
     for _ in 0..12 {
-        let mut r = agent.post(&format!("{plane_url}/aws/callback")).header("content-type", "application/json").send(report.to_string()).map_err(|e| e.to_string())?;
+        let mut r = agent.post(&crate::aws::stand_in(&format!("{plane_url}/aws/callback"))).header("content-type", "application/json").send(report.to_string()).map_err(|e| e.to_string())?;
         let text = r.body_mut().read_to_string().unwrap_or_default();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
         if r.status().as_u16() == 200 && v["connected"] == true { return Ok(()) }

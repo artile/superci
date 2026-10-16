@@ -225,6 +225,11 @@ pub struct Aws {
     pub plane_url: Arc<Mutex<String>>,
     /// Where what is not AWS's goes (GitHub's logs).
     pub github: Arc<Mutex<Option<GitHub>>>,
+    /// The secrets written to each Worker (by its script's name), as Cloudflare keeps them for it: its settings.
+    pub worker_secrets: Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>,
+    /// Workers on workers.dev, by host (`superci.acme.workers.dev`), and the control plane on this computer each stands
+    /// for (its address).
+    pub workers: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 /// What a request asks AWS to do: its target (JSON APIs) or its Action (query APIs).
@@ -243,6 +248,47 @@ impl Aws {
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
+            // Cloudflare's API and its container registry, and GitHub's (where its runner image is), as a recording has
+            // them (what is not there is said as unanswered).
+            if ["api.cloudflare.com", "dash.cloudflare.com", "registry.cloudflare.com", "ghcr.io"].contains(&host.as_str()) {
+                let url = format!("https:/{target}");
+                let asked = String::from_utf8_lossy(&body).to_string();
+                // (A Worker's secrets kept as written: what a control plane served here reads as its settings.)
+                let path = url.split('?').next().unwrap_or_default().to_string();
+                if let Some((script, rest)) = path.split_once("/workers/scripts/").map(|(_, r)| r.split_once('/').unwrap_or((r, ""))) {
+                    let mut kept = a.worker_secrets.lock().unwrap();
+                    match (method.as_str(), rest) {
+                        ("PUT", "secrets") => if let Ok(v) = serde_json::from_str::<Value>(&asked) { if let (Some(n), Some(t)) = (v["name"].as_str(), v["text"].as_str()) { kept.entry(script.to_string()).or_default().insert(n.to_string(), t.to_string()); } },
+                        ("DELETE", r) if r.starts_with("secrets/") => { if let Some(m) = kept.get_mut(script) { m.remove(&r["secrets/".len()..]); } }
+                        ("DELETE", "") => { kept.remove(script); }
+                        _ => {}
+                    }
+                }
+                let (status, said, answer) = a.replay(&method, &url, "", &asked).unwrap_or_else(|| {
+                    a.unanswered.lock().unwrap().push(format!("{method} {url}"));
+                    (404, vec![], json!({ "success": false, "errors": [{ "code": 0, "message": format!("the test kit's Cloudflare has no answer for {method} {url}") }] }).to_string())
+                });
+                a.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": "", "asked": asked, "status": status, "answer": answer }));
+                let said = if said.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) { said } else { vec![("content-type".into(), "application/json".into())] };
+                let _ = write(stream, status, &said, answer.as_bytes());
+                continue;
+            }
+            // A Worker on workers.dev: the control plane on this computer it stands for.
+            if let Some(to) = a.workers.lock().unwrap().get(&host).cloned() {
+                let rest = target.splitn(3, '/').nth(2).unwrap_or_default();
+                let u = to.trim_start_matches("http://");
+                let (h, _) = u.split_once('/').unwrap_or((u, ""));
+                let mut out = vec![];
+                if let Ok(mut s) = TcpStream::connect(h) {
+                    let extra: String = headers.iter().filter(|(k, _)| !["host", "content-length", "connection"].contains(&k.to_ascii_lowercase().as_str())).map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+                    let _ = s.write_all(format!("{method} /{rest} HTTP/1.1\r\nhost: {h}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes());
+                    let _ = s.write_all(&body);
+                    let _ = s.read_to_end(&mut out);
+                }
+                let mut stream = stream;
+                let _ = stream.write_all(&out);
+                continue;
+            }
             // (S3's objects are kept by GitHub's stand-in, which the control plane reaches AWS through; a call to S3 a
             // recording has, at that very address, is answered as recorded.)
             let s3 = host.contains(".s3.");
@@ -281,6 +327,9 @@ impl Aws {
         *all = r;
         self.replayed.lock().unwrap().clear();
     }
+
+    /// A Worker's secrets, as a control plane there reads them (its settings).
+    pub fn worker_settings(&self, script: &str) -> Vec<(String, String)> { self.worker_secrets.lock().unwrap().get(script).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default() }
 
     /// A parameter written as the dashboard writes one.
     pub fn put(&self, name: &str, value: &str) {

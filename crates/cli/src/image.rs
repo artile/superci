@@ -30,7 +30,7 @@ impl Registry {
     fn send(&mut self, method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<Answer> {
         for attempt in 0..2 {
             let url = if url.starts_with("http") { url.to_string() } else { format!("{}{url}", self.base) };
-            let mut b = ureq::http::Request::builder().method(method).uri(url.as_str());
+            let mut b = ureq::http::Request::builder().method(method).uri(crate::aws::stand_in(&url).as_str());
             for (k, v) in headers { b = b.header(*k, *v) }
             if let Some(t) = &self.bearer { b = b.header("authorization", format!("Bearer {t}")) } else if let Some(basic) = &self.basic { b = b.header("authorization", format!("Basic {basic}")) }
             let req = b.body(body.map(|b| b.to_vec()).unwrap_or_default()).map_err(|e| e.to_string())?;
@@ -42,6 +42,12 @@ impl Registry {
                 continue;
             }
             let body = if method == "HEAD" { vec![] } else { r.body_mut().with_config().limit(64 * 1024 * 1024).read_to_vec().map_err(|e| e.to_string())? };
+            // (A recording keeps no layer: a layer is many MB.)
+            #[cfg(debug_assertions)]
+            {
+                let said: Vec<(String, String)> = [("location", &answer.location), ("content-type", &answer.content_type), ("www-authenticate", &answer.challenge)].into_iter().filter_map(|(k, v)| Some((k.to_string(), v.clone()?))).collect();
+                crate::aws::record(&superci_core::io::Request::new(method, &url), answer.status, &said, if body.len() > 1_000_000 { b"(a layer)" } else { &body });
+            }
             return Ok(Answer { body, ..answer });
         }
         Err(format!("{method} {url}: not allowed"))
@@ -55,10 +61,13 @@ impl Registry {
         let mut url = url::Url::parse(&realm).map_err(|e| e.to_string())?;
         if let Some(s) = field("service") { url.query_pairs_mut().append_pair("service", &s); }
         if let Some(s) = field("scope") { url.query_pairs_mut().append_pair("scope", &s); }
-        let mut req = self.agent.get(url.as_str());
+        let mut req = self.agent.get(crate::aws::stand_in(url.as_str()).as_str());
         if let Some(basic) = &self.basic { req = req.header("authorization", &format!("Basic {basic}")) }
         let mut r = req.call().map_err(|e| e.to_string())?;
-        let v: Value = serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+        #[cfg(debug_assertions)]
+        crate::aws::record(&superci_core::io::Request::new("GET", url.as_str()), r.status().as_u16(), &[], text.as_bytes());
+        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         self.bearer = Some(v["token"].as_str().or(v["access_token"].as_str()).ok_or("registry gave no token")?.to_string());
         Ok(())
     }

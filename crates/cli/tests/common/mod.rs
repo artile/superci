@@ -42,7 +42,7 @@ pub fn signed_in(served: &Served) -> std::path::PathBuf {
 }
 
 /// The CLI or the dashboard, in `home`'s workspace (with its stand-in for AWS, if it has one).
-fn command(home: &std::path::Path) -> Command {
+pub fn command(home: &std::path::Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_superci"));
     c.env("SUPERCI_HOME", home).env_remove("SUPERCI_PLANE").env_remove("SUPERCI_KEY").env("SUPERCI_STAND_IN", std::fs::read_to_string(home.join("aws-at")).unwrap_or_default());
     c

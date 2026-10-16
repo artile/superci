@@ -42,12 +42,12 @@ impl Http for Blocking {
     }
 }
 
-/// In a debug build with `SUPERCI_RECORD=FILE`: every exchange with AWS is appended to that file, a line each (the
+/// In a debug build with `SUPERCI_RECORD=FILE`: every exchange with AWS (and Cloudflare's API) is appended to that file, a line each (the
 /// address, what was asked, the status, the answer's telling headers and the whole answer), to make test fixtures of what a real account answers.
 /// No header is kept (the credentials are in them), nor a sign-in's exchange. The answers name the account: they are
 /// sanitized before they are kept anywhere (`scripts/sanitize-recording.py`).
 #[cfg(debug_assertions)]
-fn record(r: &Request, status: u16, headers: &[(String, String)], body: &[u8]) {
+pub(crate) fn record(r: &Request, status: u16, headers: &[(String, String)], body: &[u8]) {
     let Some(file) = std::env::var_os("SUPERCI_RECORD").filter(|f| !f.is_empty()) else { return };
     if r.url.contains("signin.") || r.url.contains("/oauth") { return }
     let target = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-amz-target")).map(|(_, v)| v.clone()).unwrap_or_default();
@@ -61,7 +61,7 @@ fn record(r: &Request, status: u16, headers: &[(String, String)], body: &[u8]) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) { let _ = f.write_all(format!("{line}\n").as_bytes()); }
 }
 
-/// In a debug build with `SUPERCI_STAND_IN=URL`: what is asked of AWS, GitHub's API, where GitHub keeps logs, and gitlab.com, goes to a
+/// In a debug build with `SUPERCI_STAND_IN=URL`: what is asked of AWS, GitHub's API, where GitHub keeps logs, gitlab.com and Cloudflare's API, goes to a
 /// stand-in for them there instead (`superci_testkit`'s), as `URL/<the host>/<path>`.
 #[cfg(debug_assertions)]
 fn to_stand_in(mut r: Request) -> Request {
@@ -74,7 +74,7 @@ fn to_stand_in(mut r: Request) -> Request {
 pub fn stand_in(url: &str) -> String {
     #[cfg(debug_assertions)]
     if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
-        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".signin.aws.amazon.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h == "gitlab.com")) {
+        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".signin.aws.amazon.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h == "gitlab.com" || h == "api.cloudflare.com" || h == "dash.cloudflare.com" || h == "registry.cloudflare.com" || h == "ghcr.io" || h.ends_with(".workers.dev"))) {
             return format!("{}/{rest}", at.trim_end_matches('/'));
         }
     }
