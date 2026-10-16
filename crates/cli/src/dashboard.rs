@@ -1057,7 +1057,9 @@ impl Dashboard {
     fn aws_login_page(&self) -> Response {
         let stuck = !self.aws_stuck().is_empty();
         let (heading, text) = if stuck { ("Your AWS sign-in is not finished", "If AWS said “400 Bad Request”, an old AWS sign-in in this browser is in the way.") } else { ("Sign in with AWS", "Where AWS lists sessions, choose the account your CI runs in, not an organization's management account. The sign-in lasts as long as that session: twelve hours from when it began.") };
-        let go = |fresh: bool, class: &str, label: &str| format!(r#"<form method="post" action="/aws/signin"><input type="hidden" name="next">{}<button class="{class}">{label}</button></form>"#, if fresh { r#"<input type="hidden" name="fresh" value="on">"# } else { "" });
+        // (Which workspace it is for: with several on this computer, nothing that changes one goes without saying.)
+        let w = esc(&self.workspace());
+        let go = |fresh: bool, class: &str, label: &str| format!(r#"<form method="post" action="/aws/signin"><input type="hidden" name="w" value="{w}"><input type="hidden" name="next">{}<button class="{class}">{label}</button></form>"#, if fresh { r#"<input type="hidden" name="fresh" value="on">"# } else { "" });
         let buttons = if stuck { format!("{}{}", go(true, "button", "Sign out of AWS and try again"), go(false, "button secondary", "Try again")) } else { go(false, "button", "Continue to AWS") };
         document(200, "SuperCI", &format!(r#"<div class="done"><div><span class="done-mark">{}</span><h1>{}</h1><p>{}</p><div class="done-go">{buttons}</div></div></div><script>addEventListener('pageshow',function(e){{if(e.persisted)location.reload()}})</script>"#, logo("aws", 44), esc(heading), esc(text)), None)
     }
@@ -6445,6 +6447,13 @@ mod tests {
         // A page that names none is sent on to the one the program was started in, by name.
         assert_eq!(ask("GET", "/", &[], "").1, "/?w=acme");
         assert_eq!(ask("GET", "/", &[("p", "settings")], "").1, "/?p=settings&w=acme");
+        // `superci login aws --workspace=acme`: its one button says which workspace it is for, and goes on to AWS.
+        lock(&hub.board("acme")).task = Some(Task::Login(Some("aws")));
+        let (_, _, page) = ask("GET", "/", &[("w", "acme")], "");
+        assert!(page.contains(r#"<form method="post" action="/aws/signin"><input type="hidden" name="w" value="acme">"#), "{page}");
+        let (status, to, said) = ask("POST", "/aws/signin", &[], "w=acme&next=");
+        assert!(status == 303 && to.contains("signin.aws.amazon.com"), "{status} {to} {said}");
+        lock(&hub.board("acme")).task = None;
         // Each has its own dashboard, from its own folder: nothing of acme is in globex.
         assert_eq!(lock(&hub.board("acme")).signed_in_as().as_deref(), Some("Modal workspace acme-team"));
         assert!(lock(&hub.board("globex")).signed_in_as().is_none() && lock(&hub.board("globex")).w == "globex" && lock(&hub.board("acme")).w.is_empty());
