@@ -308,7 +308,9 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
     let served = serve(|_| {});
     served.connect_github();
     let home = common::signed_in(&served);
-    let settings = || served.aws.settings(superci_testkit::PLANE);
+    // (Its settings, without this computer's own keys: a command with a cloud sign-in hands the control plane one
+    // of its own the first time it reaches it, as signing in does.)
+    let settings = || served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| !k.starts_with("DASHBOARD_KEY_")).collect::<Vec<_>>();
     let before = settings();
     // What a command needs and is not given: said, as a usage error (exit 2).
     for (args, said) in [
@@ -331,6 +333,15 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
         (&["artifacts", "retrieve", "--run=12"], "Say which artifact"),
         (&["usage", "retrieve", "--period=year"], "--period is day, week or month"),
         (&["jobs", "list", "-x"], "-x is not a flag of superci"),
+        (&["images", "create", "mars-1"], "Say where: `superci images create REGION`"),
+        (&["images", "create", "ca-central-1", "--from=nope"], "--from is"),
+        (&["images", "update", "mars-1"], "Say where: `superci images update REGION`"),
+        (&["images", "delete", "mars-1"], "Say where: `superci images delete REGION --confirm`"),
+        (&["planes", "delete"], "Say which: `superci planes delete ID --confirm`"),
+        (&["planes", "create", "gcp"], "Say where: `superci planes create aws --region=us-east-1`"),
+        (&["planes", "create", "aws"], "Say where: --region=us-east-1"),
+        (&["runners", "create", "gcp"], "Say which: `superci runners create aws`"),
+        (&["runners", "delete", "gcp"], "Say which: `superci runners delete aws --confirm`"),
         (&["jobs", "retrieve", "x1"], "Say which: `superci jobs retrieve ID`"),
         (&["login", "gcp"], "Say which: `superci login aws`"),
     ] {
@@ -353,6 +364,13 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
         (&["keys", "delete", "agent", "--dry-run"], "end the key named agent"),
         (&["accounts", "update", "aws", "--monthly-usd=50", "--aws-budget=none", "--dry-run"], "no budget in AWS itself"),
         (&["runs", "cancel", "12", "--dry-run"], "cancel run 12"),
+        (&["images", "delete", "ca-central-1", "--confirm", "--dry-run"], "remove your copy of the image jobs run on from ca-central-1"),
+        (&["runners", "delete", "aws", "--only-here", "--confirm", "--dry-run"], "leaving what SuperCI made for it there"),
+        (&["runners", "create", "aws", "--dry-run"], "let aws run jobs for the control plane in use"),
+        (&["planes", "delete", "testplane0002", "--confirm", "--dry-run"], "delete the control plane testplane0002"),
+        (&["planes", "allow", "--dry-run"], "give the AWS role of the control plane testplane0001"),
+        (&["leave", "--confirm", "--dry-run"], "stop SuperCI"),
+        (&["leave", "--plane=testplane0001", "--confirm", "--dry-run"], "stop the control plane testplane0001"),
     ] {
         let (code, v) = json(&home, args);
         assert!(code == 0 && v["dry_run"] == true && v["would"].as_str().unwrap_or_default().contains(would), "{args:?}: {code} {v}");
@@ -517,6 +535,9 @@ fn an_aws_accounts_look_is_said_by_the_cli_and_on_add_runners_as_aws_answered_ea
         let o = superci(&home, &["accounts", "retrieve", "aws"]);
         let text = String::from_utf8_lossy(&o.stdout);
         assert!(o.status.success() && text.contains(said), "{name}: {text}{}", String::from_utf8_lossy(&o.stderr));
+        // The image jobs run on, by region: published there, or to copy in.
+        let (code, images) = json(&home, &["images", "list"]);
+        assert!(code == 0 && images["images"].as_array().is_some_and(|i| !i.is_empty()), "{name}: {images}");
         let (mut child, link) = common::dashboard(&home);
         // (Looked at in the background once signed in: shown when it is in.)
         let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=add-runners&fragment=1").1) }).find(|p| p.contains("AWS account aws 111111111111") && !p.contains("Looking")).unwrap_or_default();
