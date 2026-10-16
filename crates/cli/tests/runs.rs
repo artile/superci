@@ -596,6 +596,11 @@ fn a_second_run_from_the_same_checkout_sends_only_what_changed_on_top_of_the_tre
     std::fs::write(dir.join("small.txt"), "three\n").unwrap();
     let (said, _) = run();
     assert!(said.contains("Sending the working tree (") && !said.contains("what changed"), "{said}");
+    // Two changed since that base, nothing removed.
+    std::fs::write(dir.join("small.txt"), "four\n").unwrap();
+    std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+    let (said, _) = run();
+    assert!(said.contains("Sending what changed in the working tree (2 files, 0 removed,"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -914,5 +919,32 @@ fn jobs_if_conditions_are_read_as_github_reads_its_expressions() {
     let (state, ended) = result("yes");
     assert!(state == "started" && ended.is_empty(), "started: {jobs}");
     for (i, c) in fails.iter().enumerate() { assert_eq!(result(&format!("no-{i}")).1, "skipped", "{c}: {jobs}") }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_tree_too_large_for_one_request_goes_in_parts_two_jobs_may_call_one_workflow_and_a_file_not_yaml_is_said() {
+    let served = serve(|_| {});
+    // 4 MB that does not pack smaller (random), through the control plane in parts of 3 MB.
+    let mut noise = vec![0u8; 4_000_000];
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    for b in noise.iter_mut() { x ^= x << 13; x ^= x >> 7; x ^= x << 17; *b = x as u8 }
+    let dir = checkout_with(&[
+        (".github/workflows/ci.yml", "jobs:\n  web:\n    uses: ./.github/workflows/build.yml\n  api:\n    uses: ./.github/workflows/build.yml\n"),
+        (".github/workflows/build.yml", "on:\n  workflow_call:\njobs:\n  compile:\n    runs-on: superci\n    steps:\n      - run: make\n"),
+    ]);
+    std::fs::write(dir.join("noise.bin"), &noise).unwrap();
+    assert!(Command::new("git").current_dir(&dir).args(["add", "-A"]).status().unwrap().success());
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("2 parts)"), "{said}");
+    let run = run_of(&served);
+    let names: Vec<String> = served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().filter_map(|j| j["name"].as_str().map(str::to_string)).collect();
+    assert!(names.contains(&"web / compile".to_string()) && names.contains(&"api / compile".to_string()), "{names:?}");
+    // A workflow file that is not YAML: said by the control plane, nothing started.
+    std::fs::write(dir.join(".github/workflows/bad.yml"), "jobs: [unclosed\n").unwrap();
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/bad.yml"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("the control plane said 400") && said.contains("not YAML"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
