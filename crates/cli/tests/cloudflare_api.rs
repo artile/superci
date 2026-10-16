@@ -154,3 +154,56 @@ fn a_cloudflare_control_plane_gets_modals_runners_then_everything_moves_to_a_mod
     assert!(ok && said.contains("Deleted Modal · acmeorg."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_cloudflare_control_planes_containers_are_set_and_cloudflare_and_modal_control_planes_updated_as_both_answered() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = serve_as("cfplane00003", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00003/CONTAINERS");
+    let aws = served.aws.clone();
+    let md = serve_as("mdplane00003", move |c| { c.read_settings(&aws.modal_plane_settings()); c.own_cloud = "modal".into(); c.containers = false; });
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00003.modal.run".into(), md.url.clone());
+    let home = common::signed_in(&served);
+    with_cloudflare(&home);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let step = |name: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/update/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    let run = |id: &str, args: &[&str]| {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", id).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    step("01-deploy-cf");
+    assert!(run("cfplane00003", &["planes", "create", "cloudflare"]).0);
+    step("02-deploy-modal");
+    assert!(run("mdplane00003", &["planes", "create", "modal"]).0);
+    step("03-cf-containers");
+    assert!(run("", &["runners", "create", "cloudflare", "--plane=cfplane00003"]).0);
+    // Its containers: where they start, GitHub's full image, how many at once (each a secret of its Worker).
+    step("04-cf-settings");
+    let (ok, said) = run("", &["runners", "update", "cloudflare", "--location=weur", "--max-jobs=3", "--image=https://images.example.com/full", "--plane=cfplane00003"]);
+    assert!(ok && said.contains("up to 3 jobs at once"), "{said}");
+    let secret = |n: &str| served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == n).map(|(_, v)| v).unwrap_or_default();
+    assert_eq!((secret("CF_LOCATION").as_str(), secret("CF_IMAGE").as_str()), ("weur", "https://images.example.com/full"));
+    // Each updated to this version: the Worker uploaded again; Modal's app deployed again.
+    step("05-update-cf");
+    let (ok, said) = run("", &["planes", "update", "cfplane00003", "--plane=cfplane00003"]);
+    assert!(ok && said.contains(&format!("Updated to {}", env!("CARGO_PKG_VERSION"))), "{said}");
+    step("06-update-md");
+    let (ok, said) = run("", &["planes", "update", "mdplane00003", "--plane=mdplane00003"]);
+    assert!(ok && said.contains(&format!("Updated to {}", env!("CARGO_PKG_VERSION"))), "{said}");
+    step("07-delete-cf");
+    assert!(run("", &["planes", "delete", "cfplane00003", "--confirm"]).0);
+    step("08-delete-md");
+    assert!(run("", &["planes", "delete", "mdplane00003", "--confirm"]).0);
+    assert!(served.aws.unanswered.lock().unwrap().iter().all(|u| !(u.contains("cloudflare.com") || u.contains("modal.com")) || u.ends_with("/workers/scripts/superci/secrets")), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = std::fs::remove_dir_all(&home);
+}
