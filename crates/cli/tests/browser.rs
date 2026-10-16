@@ -402,6 +402,20 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
     b.eval("(() => { const d = [...document.querySelectorAll('dialog')].find(d => d.open); d.querySelector('textarea[name=networks]').value = 'us-east-1 not-a-subnet'; d.querySelector('button.primary').click(); })()");
     b.wait("document.body.innerText.includes('Check your networks')");
     assert_eq!(setting("AWS_NETWORKS"), None);
+    // One that AWS has (as a real account answered for its subnets and security group): kept, private as said.
+    runners(&mut b);
+    b.click(r#"button[aria-label="AWS account 111111111111 settings"]"#, "");
+    b.wait("[...document.querySelectorAll('dialog')].some(d => d.open && d.querySelector('textarea[name=networks]'))");
+    b.eval("(() => { const d = [...document.querySelectorAll('dialog')].find(d => d.open); d.querySelector('textarea[name=networks]').value = 'us-east-1: subnet-00000000000000001, subnet-00000000000000002, sg-00000000000000001, private'; d.querySelector('button.primary').click(); })()");
+    until("your own network", || setting("AWS_NETWORKS").is_some_and(|n| n.contains("subnet-00000000000000002") && n.contains("sg-00000000000000001")));
+    let networks: serde_json::Value = serde_json::from_str(&setting("AWS_NETWORKS").unwrap()).unwrap();
+    assert_eq!(networks["us-east-1"]["private"], true, "{networks}");
+    // A subnet AWS does not have there, and a group it does not have: said, and what was kept stays.
+    for (text, why) in [("us-east-1 subnet-00000000000000099 sg-00000000000000001", "no subnet subnet-00000000000000099 there"), ("us-east-1 subnet-00000000000000001 sg-00000000000000099", "no security group sg-00000000000000099")] {
+        let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", text)]);
+        assert!(status == 400 && common::words(&said).contains(why), "{text}: {status} {}", common::words(&said));
+    }
+    assert!(setting("AWS_NETWORKS").unwrap().contains("subnet-00000000000000002"));
 
     // A new order: each provider once, and only ones it has (as a page made up would say).
     for fields in [&[("action", "order"), ("cloud_0", "aws"), ("cloud_1", "aws")][..], &[("action", "order"), ("cloud_0", "nowhere")]] {
