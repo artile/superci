@@ -78,6 +78,12 @@ fn gitlab_is_connected_from_the_dashboard_and_a_project_switched_on_and_off() {
     assert_eq!(projects["projects"][0]["enabled"], true, "{projects}");
     common::post(&link, "/gitlab/project", &[("gitlab", ""), ("id", &gitlab::PROJECT.to_string()), ("enabled", "false")]);
     assert_eq!(json(&home, &["projects", "list"]).1["projects"][0]["enabled"], false);
+    // Disconnected: its projects all off, and the connection kept as off.
+    common::post(&link, "/gitlab/project", &[("gitlab", ""), ("id", &gitlab::PROJECT.to_string()), ("enabled", "true")]);
+    let (status, to, _) = common::post(&link, "/gitlab/disconnect", &[("gitlab", "")]);
+    assert!(status == 303 && to.contains("p=repos"), "{status} {to}");
+    assert_eq!(served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "GITLAB").map(|(_, v)| v).as_deref(), Some("off"));
+    assert!(served.gitlab.asked.lock().unwrap().iter().any(|a| a.starts_with(&format!("DELETE https://gitlab.com/api/v4/projects/{}/hooks/", gitlab::PROJECT))), "its webhook removed");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
