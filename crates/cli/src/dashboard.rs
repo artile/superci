@@ -24,7 +24,7 @@ use superci_core::page::{document, esc, manifest_form, nearby_regions, region_na
 
 use crate::aws;
 use crate::aws_plane;
-use crate::cloudflare::{self, Cloudflare, OAUTH_PORT};
+use crate::cloudflare::{self, Cloudflare, oauth_port};
 use crate::logos::{icon, logo};
 use crate::modal;
 use crate::plane::Plane;
@@ -393,7 +393,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Req> {
 /// The name of the cookie that holds a dashboard's key: `superci_local` on the usual port, with the port after it
 /// on another.
 fn key_cookie(host: &str) -> String {
-    match host.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) { Some(p) if p != OAUTH_PORT => format!("superci_local_{p}"), _ => "superci_local".into() }
+    match host.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) { Some(p) if p != oauth_port() => format!("superci_local_{p}"), _ => "superci_local".into() }
 }
 
 fn write_response(stream: &mut TcpStream, r: &Response) {
@@ -1081,7 +1081,7 @@ impl Dashboard {
         // (Cloudflare's and Modal's own variables are not read).
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
-        Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
+        Dashboard { key: random_token(24), base: format!("http://localhost:{}", oauth_port()), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
             status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
@@ -1123,7 +1123,7 @@ impl Dashboard {
     pub fn for_task(mut self, task: Task) -> Self { self.task = Some(task); self }
 
     /// The port this dashboard is served on.
-    fn port(&self) -> u16 { self.base.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(OAUTH_PORT) }
+    fn port(&self) -> u16 { self.base.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(oauth_port()) }
 
     fn signed_in_with(&self, cloud: &str) -> bool { match cloud { "aws" => self.aws.is_some(), "cloudflare" => self.cf.is_some(), _ => self.modal.is_some() } }
 
@@ -1934,8 +1934,8 @@ impl Dashboard {
         let asked: Option<u16> = std::env::var("SUPERCI_PORT").ok().and_then(|p| p.parse().ok());
         let ports: Vec<u16> = match asked {
             Some(p) => vec![p],
-            None if matches!(self.task, Some(Task::Login(Some("cloudflare")))) => vec![OAUTH_PORT],
-            None => (OAUTH_PORT..OAUTH_PORT + 10).collect(),
+            None if matches!(self.task, Some(Task::Login(Some("cloudflare")))) => vec![oauth_port()],
+            None => (oauth_port()..oauth_port() + 10).collect(),
         };
         let mut port = ports[0];
         for p in ports {
@@ -1949,13 +1949,13 @@ impl Dashboard {
             if listening > 0 { break }
         }
         if listening == 0 {
-            return Err(if port == OAUTH_PORT && asked.is_none() { format!("Cloudflare's sign-in comes back to port {OAUTH_PORT} only, and another program has it (another SuperCI, or `wrangler login`). Stop that one, or sign in to Cloudflare there.") }
+            return Err(if port == oauth_port() && asked.is_none() { format!("Cloudflare's sign-in comes back to port {} only, and another program has it (another SuperCI, or `wrangler login`). Stop that one, or sign in to Cloudflare there.", oauth_port()) }
                 else { format!("port {port} is in use (is another SuperCI running?)") })
         }
-        if port != OAUTH_PORT {
+        if port != oauth_port() {
             self.base = format!("http://localhost:{port}");
             let shared = if std::env::var_os("SUPERCI_HOME").is_some_and(|v| !v.is_empty()) { "" } else { " Both use the same sign-ins (SUPERCI_HOME gives this one a folder of its own)." };
-            if asked.is_none() { println!("Port {OAUTH_PORT} is taken (another SuperCI?): this one is on {port}.{shared}") }
+            if asked.is_none() { println!("Port {} is taken (another SuperCI?): this one is on {port}.{shared}", oauth_port()) }
         }
         let link = format!("{}/?k={}", self.base, self.key);
         println!("{}: {link}", match &self.task { Some(Task::Login(_)) => "Sign in with your cloud here (on this machine only)", Some(Task::GitHub { .. }) => "Create the GitHub App and choose its repositories here (on this machine only)", None => "SuperCI dashboard (on this machine only)" });
@@ -2028,7 +2028,7 @@ impl Dashboard {
         self.cf.as_mut().ok_or_else(|| "Sign in with Cloudflare first.".to_string())?.client()
     }
 
-    fn cloudflare(&mut self) -> Result<Cloudflare> {
+    pub(crate) fn cloudflare(&mut self) -> Result<Cloudflare> {
         let ended = self.cf_ended;
         if self.cf.is_none() { return Err(if ended { CF_ENDED } else { "Sign in with Cloudflare first." }.into()) }
         let client = self.cf_client();
@@ -2517,8 +2517,8 @@ impl Dashboard {
             }
 
             // The connect screen's links: each remembers itself as the cloud picked last ("Last used"), in this browser only.
-            ("GET", "/connect/cloudflare") | ("POST", "/cloudflare/signin") if self.port() != OAUTH_PORT => Ok(message(409, "Cloudflare's sign-in needs port 8976",
-                &format!("Cloudflare's sign-in comes back to http://localhost:{OAUTH_PORT} only, and this dashboard is on port {}. Stop the SuperCI that has {OAUTH_PORT} and start this one again, or sign in to Cloudflare there.", self.port()))),
+            ("GET", "/connect/cloudflare") | ("POST", "/cloudflare/signin") if self.port() != oauth_port() => Ok(message(409, "Cloudflare's sign-in needs port 8976",
+                &format!("Cloudflare's sign-in comes back to http://localhost:{} only, and this dashboard is on port {}. Stop the SuperCI that has {} and start this one again, or sign in to Cloudflare there.", oauth_port(), self.port(), oauth_port()))),
             ("GET", "/connect/cloudflare") => {
                 let (link, pending) = cloudflare::authorize();
                 self.cf_pending = Some(pending);

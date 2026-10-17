@@ -49,6 +49,110 @@ fn each_page_shows_what_the_control_plane_has() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// An AWS sign-in that AWS finishes (as a real one answered, its tokens replaced): the account is kept, with who
+/// signed in; once its credentials are due, they are renewed with its renewal token, and the renewal kept.
+#[test]
+fn an_aws_sign_in_is_kept_and_renewed_as_aws_answered_a_real_one() {
+    let served = serve(|_| {});
+    served.aws.replaying(&[include_str!("../fixtures/aws/sign-in/sign-in.jsonl"), include_str!("../fixtures/aws/sign-in/renew.jsonl")].concat(), &[]);
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let (mut child, link) = dashboard(&home);
+    let (_, to, page) = common::post(&link, "/aws/signin", &[("next", "?p=overview")]);
+    let at = if to.is_empty() { page } else { to };
+    let state = at.split("state=").nth(1).and_then(|r| r.split(['&', '"']).next()).expect("a state").to_string();
+    let (status, _, done) = common::get(&link, &format!("/oauth/callback?code=a-code-from-aws&state={state}"));
+    assert!(status < 400 && words(&done).contains("Signed in with AWS"), "{status} {}", words(&done));
+    let _ = child.kill();
+    let file = home.join("workspaces/default/sign-ins.json");
+    let kept = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap() };
+    let aws = &kept()["aws"];
+    assert_eq!((aws["account_id"].as_str(), aws["who"].as_str(), aws["creds"]["access_key_id"].as_str(), aws["refresh_token"].as_str()),
+        (Some("111111111111"), Some("arn:aws:iam::111111111111:root"), Some("example-accessKeyId-1"), Some("example-refreshToken-1")), "{aws}");
+    // Due: the next command renews them first, and keeps what AWS gave.
+    let mut k = kept();
+    k["aws"]["creds"]["expires_at_ms"] = 0.into();
+    std::fs::write(&file, k.to_string()).unwrap();
+    let o = common::superci(&home, &["debug", "iam", "ListRoles", "MaxItems=1000", "--json"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let aws = &kept()["aws"];
+    assert_eq!((aws["creds"]["access_key_id"].as_str(), aws["refresh_token"].as_str()), (Some("example-accessKeyId-2"), Some("example-refreshToken-2")), "{aws}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Cloudflare sign-in as a real one answered (its tokens replaced), on the port Cloudflare's sign-in comes back to
+/// (this test's own, standing for 8976): kept; renewed once due, the renewal kept; ended at Cloudflare at sign-out.
+#[test]
+fn a_cloudflare_sign_in_is_kept_renewed_and_ended_as_cloudflare_answered_a_real_one() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    served.aws.replaying(&[include_str!("../fixtures/cloudflare/sign-in/sign-in.jsonl"), include_str!("../fixtures/cloudflare/sign-in/renew.jsonl"), include_str!("../fixtures/cloudflare/sign-in/sign-out.jsonl")].concat(), &[]);
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let mut child = common::command(&home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string()).env("SUPERCI_OAUTH_PORT", port.to_string())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
+    let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
+    std::thread::spawn(move || lines.for_each(drop));
+    let key = link.split_once("/?k=").unwrap().1.to_string();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
+    let get = |path: &str| { let mut r = agent.get(&format!("http://127.0.0.1:{port}{path}")).header("cookie", &format!("superci_local={key}")).header("sec-fetch-site", "same-origin").call().unwrap();
+        let to = r.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string(); (r.status().as_u16(), to, r.body_mut().read_to_string().unwrap_or_default()) };
+    // To Cloudflare's page, with the state it comes back with; back, with its code.
+    let (_, to, page) = get("/connect/cloudflare");
+    let to = if to.is_empty() { page.split("https://dash.cloudflare.com/oauth2/auth?").nth(1).map(|r| format!("https://dash.cloudflare.com/oauth2/auth?{}", r.split(['"', '\'']).next().unwrap().replace("&amp;", "&"))).unwrap_or_default() } else { to };
+    assert!(to.contains(&format!("redirect_uri=http%3A%2F%2Flocalhost%3A{port}%2Foauth%2Fcallback")), "{to}");
+    let state = to.split("state=").nth(1).and_then(|r| r.split('&').next()).unwrap().to_string();
+    let (status, _, done) = get(&format!("/oauth/callback?code=a-code-from-cloudflare&state={state}"));
+    assert!(status < 400 && words(&done).contains("Signed in with Cloudflare"), "{status} {}", words(&done));
+    let _ = child.kill();
+    let file = home.join("workspaces/default/sign-ins.json");
+    let kept = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap() };
+    assert_eq!((kept()["cloudflare"]["access"].as_str(), kept()["cloudflare"]["refresh"].as_str()), (Some("example-access_token-1"), Some("example-refresh_token-1")), "{}", kept());
+    // Due: renewed by the next command, and what Cloudflare gave kept (it takes a renewal token once).
+    let mut k = kept();
+    k["cloudflare"]["expires_at_ms"] = 0.into();
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (code, accounts) = json(&home, &["debug", "cloudflare", "GET", "/accounts"]);
+    assert!(code == 0 && accounts.to_string().contains("00000000000000000000000000000001"), "{accounts}");
+    assert_eq!(kept()["cloudflare"]["refresh"].as_str(), Some("example-refresh_token-2"));
+    // Signed out: Cloudflare asked to end it.
+    let o = common::superci(&home, &["logout"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("Cloudflare ended SuperCI's sign-in"), "{}", String::from_utf8_lossy(&o.stdout));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `superci login modal`: Modal's page (its token flow made), then waited on until approved there (as a real one went:
+/// a while of "not yet", then the token): kept, with the workspace's name, and the command ends by itself.
+#[test]
+fn a_modal_sign_in_waits_for_its_approval_and_keeps_the_token_as_modal_answered_a_real_one() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let mut child = common::command(&home).args(["login", "modal", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { let _ = tx.send(l); });
+    let link = loop { let l = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("its link"); if let Some(w) = l.split_whitespace().find(|w| w.starts_with("http://localhost")) { break w.to_string() } };
+    // The browser opens the sign-in: to Modal's page, its flow made.
+    let (_, _, page) = common::get(&link, "/connect/modal");
+    assert!(page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{}", words(&page));
+    // Approved there: the command says so and ends.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut said = vec![];
+    while let Ok(l) = rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) { said.push(l) }
+    let status = child.wait().unwrap();
+    assert!(status.success() && said.iter().any(|l| l.contains("Modal workspace acmeci1")), "{status} {said:?}");
+    let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+    assert_eq!((kept["modal"]["token_id"].as_str(), kept["modal"]["workspace"].as_str()), (Some("ak-EXAMPLE000000000000001"), Some("acmeci1")), "{kept}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn an_aws_sign_in_that_aws_does_not_finish_says_so_and_its_button_signs_in_again() {
     let served = serve(|_| {});

@@ -382,7 +382,15 @@ fn upload_parts(metadata: &Value, js: &[u8], wasm: &[u8]) -> (String, Vec<u8>) {
 const OAUTH_CLIENT: &str = "54d11594-84e4-41aa-b438-e81b8fa78ee7";
 pub const OAUTH_PORT: u16 = 8976;
 
-pub fn oauth_redirect() -> String { format!("http://localhost:{OAUTH_PORT}/oauth/callback") }
+/// The port Cloudflare's sign-in comes back to: `OAUTH_PORT`; in a debug build, `SUPERCI_OAUTH_PORT` (a test's dashboard
+/// on a port of its own, its Cloudflare the test kit's).
+pub fn oauth_port() -> u16 {
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var("SUPERCI_OAUTH_PORT").ok().and_then(|p| p.parse().ok()) { return p }
+    OAUTH_PORT
+}
+
+pub fn oauth_redirect() -> String { format!("http://localhost:{}/oauth/callback", oauth_port()) }
 
 pub struct Pending { verifier: String, pub state: String }
 

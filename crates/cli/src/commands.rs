@@ -927,9 +927,15 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         #[cfg(debug_assertions)]
         ("debug", "cloudflare") => {
             let mut d = signed_in();
-            let cf = d.cf.as_mut().ok_or("Sign in with Cloudflare first.")?.client()?;
+            // (Renewed as every command renews it, and kept: Cloudflare takes a renewal token once.)
+            if d.cf.is_none() { return Err("Sign in with Cloudflare first.".into()) }
+            let cf = d.cloudflare()?;
             let body = if w(4).is_empty() { None } else { Some(std::fs::read(w(4)).map_err(|e| format!("{}: {e}", w(4)))?) };
-            let got = cf.debug_call(w(2), w(3), body)?;
+            // (Its analytics, `POST /graphql FILE` with {"query", "variables"}: answered in GraphQL's own shape.)
+            let got = if w(3) == "/graphql" {
+                let asked: Value = serde_json::from_slice(&body.unwrap_or_default()).map_err(|e| format!("{}: {e}", w(4)))?;
+                cf.graphql(asked["query"].as_str().unwrap_or_default(), asked["variables"].clone())?
+            } else { cf.debug_call(w(2), w(3), body)? };
             Ok(Done { said: vec![got.to_string()], data: got })
         }
         // (GitHub's runner taking one job from SuperCI's own service, run here: `superci debug runner-service FILE JOB

@@ -518,7 +518,8 @@ impl Aws {
         let name = a["Name"].as_str().unwrap_or_default().to_string();
         // AWS's sign-in refusing its last step, as it answered a real one whose account was changed on its page
         // midway (15 October 2026).
-        if url.contains(".signin.aws.amazon.com/v1/token") {
+        // (A recording of a sign-in that finished, and of its renewals, answers instead when one is played.)
+        if url.contains(".signin.aws.amazon.com/v1/token") && !self.recorded.lock().unwrap().iter().any(|r| r["url"] == url) {
             return (400, json!({ "error": "INVALID_REQUEST", "message": "The request is missing a required parameter, includes an invalid parameter value, or is otherwise malformed." }))
         }
         // Lambda, a function called without waiting for it (the control plane's own sweep, its converter).
