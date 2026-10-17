@@ -284,3 +284,22 @@ fn the_routing_keys_and_cache_forms_change_the_control_plane() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A control plane that does not answer (starting with a new setting, or gone a moment): what changes it says to try
+/// again in a few seconds, and nothing is changed (labels too: one that does not answer is not taken for an old one).
+#[test]
+fn changes_to_a_control_plane_that_does_not_answer_say_to_try_again() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let silent = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); format!("http://127.0.0.1:{}", l.local_addr().unwrap().port()) };
+    let file = home.join("workspaces/default/sign-ins.json");
+    std::fs::write(&file, std::fs::read_to_string(&file).unwrap().replace(&served.url, &silent)).unwrap();
+    let (mut child, link) = dashboard(&home);
+    for (path, fields) in [("/routing", &[("action", "default"), ("cloud", "aws")][..]), ("/plane/update", &[("plane", "")]), ("/labels", &[("label", "superci-gpu")]),
+        ("/runners/remove", &[("cloud", "cloudflare")])] {
+        let (status, _, said) = common::post(&link, path, fields);
+        assert!(status == 503 && words(&said).contains("The control plane did not answer yet"), "{path}: {status} {}", words(&said));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
