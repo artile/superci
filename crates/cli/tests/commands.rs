@@ -697,6 +697,13 @@ fn another_ci_in_the_same_account_is_listed_apart_and_a_workspace_of_its_own_pic
     // The dashboard: the other CI is offered as the workspace that looks after it.
     let (_child, link) = common::dashboard(&home);
     assert!((0..40).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); let w = common::words(&common::part(&link, "/?p=planes&fragment=1").1); w.contains("Other CIs in your signed-in accounts") && w.contains("GlobexCI") && w.contains("Open Globex") }));
+    // Each CI in the account has a name of its own: this one is not renamed to the other's (whatever the case).
+    let (status, _, said) = common::post(&link, "/name?w=default", &[("name", "globexci")]);
+    assert!(status == 409 && common::words(&said).contains("testplane0002 in the same AWS account is called globexci"), "{status} {}", common::words(&said));
+    assert!(!served.aws.settings(superci_testkit::PLANE).iter().any(|(k, v)| k == "NAME" && v == "globexci"));
+    // The duplicate is said in the list of workspaces.
+    let o = superci(&home, &["workspaces", "list"]);
+    assert!(String::from_utf8_lossy(&o.stdout).lines().all(|l| !l.contains("same CI as")), "none yet: {}", String::from_utf8_lossy(&o.stdout));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -742,5 +749,32 @@ fn workspaces_are_listed_made_renamed_and_forgotten_from_the_cli() {
     assert!(keys() < before, "its key gone from the control plane");
     let (ok, said) = text(&["workspaces", "list"]);
     assert!(ok && said.contains("None yet"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_computers_that_look_after_a_ci_are_listed_with_their_names_and_one_is_taken_out() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    // Another computer's dashboard, which said what it is called.
+    let other = "dashboard-key-of-another-computer-0002";
+    served.aws.put(&format!("/superci/{}/DASHBOARD_KEY_4102444800_OTHER2", superci_testkit::PLANE), other);
+    let hello = ureq::post(&format!("{}/keys/hello", served.url)).header("authorization", &format!("Bearer {other}")).send_json(serde_json::json!({ "computer": "Ada's laptop" })).unwrap();
+    assert_eq!(hello.status(), 200);
+    // Listed: this one (its own key) and the other, by name.
+    let (code, v) = json(&home, &["keys", "list"]);
+    let computers = v["computers"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert!(code == 0 && computers.iter().any(|c| c["name"] == "DASHBOARD_KEY_4102444800_TEST" && c["this_computer"] == true), "{v}");
+    assert!(computers.iter().any(|c| c["name"] == "DASHBOARD_KEY_4102444800_OTHER2" && c["computer"] == "Ada's laptop" && c["last_used_ms"].is_u64()), "{v}");
+    let o = superci(&home, &["keys", "list"]);
+    assert!(String::from_utf8_lossy(&o.stdout).contains("Ada's laptop"), "{}", String::from_utf8_lossy(&o.stdout));
+    // This computer's own is not taken out here (logout does that); the other one is.
+    let (code, v) = json(&home, &["keys", "delete", "DASHBOARD_KEY_4102444800_TEST"]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("this computer's own key"), "{v}");
+    let (code, v) = json(&home, &["keys", "delete", "DASHBOARD_KEY_4102444800_OTHER2"]);
+    assert!(code == 0, "{v}");
+    assert!(!served.aws.settings(superci_testkit::PLANE).iter().any(|(k, _)| k == "DASHBOARD_KEY_4102444800_OTHER2"), "gone from the CI");
+    let gone = ureq::get(&format!("{}/keys", served.url)).header("authorization", &format!("Bearer {other}")).config().http_status_as_error(false).build().call().unwrap();
+    assert_ne!(gone.status(), 200, "its key no longer reaches the CI");
     let _ = std::fs::remove_dir_all(&home);
 }

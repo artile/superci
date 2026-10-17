@@ -69,6 +69,8 @@ pub struct Dashboard {
     found_about: HashMap<String, FoundAbout>,
     /// Whose jobs each control plane runs as last written into it (`OWNERS`), by its id: written again when that changes.
     owners_written: HashMap<String, String>,
+    /// The control planes told this session which computer its key is on (`/keys/hello`), by their id.
+    hello_sent: HashSet<String>,
     keep_failed: bool,
     /// A kept AWS sign-in turned out to have ended (AWS ends one after twelve hours at most).
     aws_ended: bool,
@@ -211,6 +213,15 @@ const MOVE_STEPS: [&str; 4] = ["Copying your settings and history", "Bringing yo
 struct FoundAbout { name: Option<String>, owners: Option<String>, label: Option<String>, version: Option<String>,
     /// Whether GitHub or GitLab sends it jobs (it is a CI), as it answered; one that does not is a place set up and never used.
     serves: bool }
+
+/// What this computer is called, as its owner named it (macOS's computer name), else its host name.
+fn computer_name() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|n| !n.is_empty());
+        run("scutil", &["--get", "ComputerName"]).or_else(|| run("hostname", &[])).unwrap_or_default().chars().take(64).collect()
+    }).clone()
+}
 
 /// Whose jobs a control plane runs, as kept in `OWNERS` (`github:acme,gitlab:gitlab.com`), in words.
 fn owners_said(owners: &str) -> String {
@@ -1014,7 +1025,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -1345,6 +1356,18 @@ impl Dashboard {
         Ok(())
     }
 
+    /// This session's key: its name (as kept in the control plane) and its value.
+    pub fn status_key_name(&self) -> String { self.status_secret.clone() }
+    pub fn status_key_value(&self) -> String { self.status_key.clone() }
+
+    /// Another computer's key taken out of the CI in use (its dashboard stops reaching it); never this one's own.
+    pub fn drop_computer_key(&mut self, name: &str) -> Result<()> {
+        if !name.starts_with("DASHBOARD_KEY_") || !name[14..].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { return Err("That is not a computer's key (names are in `superci keys list`).".into()) }
+        if name == self.status_secret { return Err("That is this computer's own key: `superci logout` takes it out.".into()) }
+        let plane = self.plane()?;
+        self.drop_secret(&plane, name)
+    }
+
     /// `superci logout`: what is kept on this machine is removed, after the clouds that can end a sign-in were asked
     /// to (Cloudflare), and the control plane in use was asked to forget this machine's key. What was done, in words.
     pub fn logout(mut self) -> Result<Vec<String>> { self.sign_out() }
@@ -1428,6 +1451,10 @@ impl Dashboard {
         // Whose picture it shows: the first organization on github.com (see `picture_due`). Another one's goes.
         self.picture_owner = apps.iter().find(|a| a["host"].as_str().is_none_or(str::is_empty)).and_then(|a| a["owner"].as_str()).unwrap_or_default().to_string();
         if about.picture_of != self.picture_owner { (about.picture, about.picture_of) = (String::new(), String::new()) }
+        // Which computer this session's key is on, said once a session (for the CI's Keys).
+        if self.hello_sent.insert(v.plane.plane_id().to_string()) {
+            let _ = cloudflare::plane_post(v.plane.url(), &self.status_key, "/keys/hello", &serde_json::json!({ "computer": computer_name() }));
+        }
         // Whose jobs it runs, kept in it where its account's sign-in reads it (before anything of this computer's
         // is in it: what a workspace picking among an account's CIs shows), once it changes.
         let owners = about.hosts.iter().map(|(kind, name)| format!("{kind}:{name}")).collect::<Vec<_>>().join(",");
@@ -2088,6 +2115,15 @@ impl Dashboard {
         Ok(format!("This workspace looks after {} now.", p.place()))
     }
 
+    /// Another control plane in the same AWS account as `plane` called `name` (whatever the case): its id. None where
+    /// none is, or the account cannot be read (a name is not refused for what was not seen).
+    fn name_taken(&mut self, plane: &Plane, name: &str) -> Option<String> {
+        let Plane::Aws { account_id, .. } = plane else { return None };
+        let creds = self.aws.iter_mut().chain(self.aws_others.iter_mut()).find(|s| s.account_id == *account_id)?.credentials().ok()?;
+        let others = aws::connected_planes(&creds).ok()?;
+        others.into_iter().filter(|o| o.plane_id != plane.plane_id()).filter_map(|o| Some((o.plane_id, o.lambda?.0))).find(|(id, region)| aws_plane::about(&creds, region, id).ok().and_then(|(n, _)| n).is_some_and(|n| n.eq_ignore_ascii_case(name))).map(|(id, _)| id)
+    }
+
     /// The control planes found in the signed-in clouds that are not this workspace's, with what each says of itself.
     pub fn found(&self) -> Vec<(Plane, Option<String>, Option<String>)> {
         self.found.iter().map(|p| { let a = self.found_about.get(p.plane_id()).cloned().unwrap_or_default(); (p.clone(), a.name, a.owners) }).collect()
@@ -2619,6 +2655,11 @@ impl Dashboard {
                 // In the account named (one of those signed in to), else the one in hand.
                 if !field("account").is_empty() && !self.hold_account(&field("account")) { return Ok(message(403, "Sign in with AWS first", &format!("Sign in to account {}.", esc(&field("account"))))) }
                 let account_id = self.aws.as_ref().ok_or("Sign in with AWS first.")?.account_id.clone();
+                // (It is called what the workspace is: another CI in the account called that first gets a name of its own.)
+                let named = self.about.name.clone();
+                if !named.is_empty() { if let Some(other) = self.name_taken(&Plane::Aws { account_id: account_id.clone(), region: region.clone(), url: String::new(), plane_id: String::new(), label: String::new() }, &named) {
+                    return Ok(message(409, "Another CI is called that", &format!("{} in this AWS account is called {}, as this workspace is. Rename this workspace (Settings) first: each CI in an account has a name of its own. Nothing was set up.", esc(&other), esc(&named))))
+                } }
                 // A region the account is known not to have (refused to it, or without the image jobs run on):
                 // said before anything is made there.
                 if let Some(look) = self.aws_look() {
@@ -3090,11 +3131,20 @@ impl Dashboard {
             }
             // What it is called where people read it: the dashboard's header, the App's name for further
             // organizations, what it says on a job it could not run. SuperCI again by naming it that.
+            // A key taken out of the CI: another computer's (its dashboard stops reaching it), or one that only reads.
+            ("POST", "/keys/remove") => {
+                if !field("read").is_empty() { self.revoke_key(&field("read"))?; return Ok(Response::redirect("/?p=settings")) }
+                match self.drop_computer_key(&field("name")) {
+                    Ok(()) => Ok(Response::redirect("/?p=settings")),
+                    Err(e) => Ok(message(409, "That key was not taken out", &format!("{} Nothing has changed.", esc(&e)))),
+                }
+            }
             ("POST", "/name") => {
                 let plane = self.plane()?;
                 if view::older(view::plane_view(&plane, Some(&self.status_key)).version.as_deref(), "0.12.0") { return Ok(message(409, "Update the control plane first", "It can be named from control plane 0.12.0 on (Control plane → Update).")) }
                 let name = field("name").trim().to_string();
                 if let Err(e) = superci_core::spec::valid_name(&name) { return Ok(message(400, "That cannot be its name", &esc(&e))) }
+                if let Some(other) = self.name_taken(&plane, &name) { return Ok(message(409, "Another CI is called that", &format!("{} in the same AWS account is called {}: each CI there has a name of its own, so a workspace picking among them can tell them apart. Nothing was changed.", esc(&other), esc(&name)))) }
                 self.put_secret(&plane, "NAME", &name)?;
                 self.shown(&plane, |s| s["name"] == name.as_str())?;
                 let mut about = self.about.clone();
@@ -3621,8 +3671,12 @@ mark();load()})();</script>"#;
     fn workspaces_menu(&self, views: &[PlaneView]) -> String {
         let Some(root) = self.store.as_ref().and_then(|s| s.root()) else { return String::new() };
         let me = self.workspace();
-        let rows = crate::store::listed(&root, Some(&me)).into_iter().map(|mut l| {
+        let all = crate::store::listed(&root, Some(&me));
+        // Two looking after the same CI (a duplicate): each says which other one it is the same as.
+        let same: Vec<(String, String)> = all.iter().map(|l| (l.id.clone(), l.plane_id.clone())).collect();
+        let rows = all.into_iter().map(|mut l| {
             let current = l.id == me;
+            let twin = same.iter().find(|(id, p)| *id != l.id && !p.is_empty() && *p == l.plane_id).map(|(id, _)| id.clone());
             // This one as it is now.
             if current {
                 // (One whose CI has not been named goes by its id.)
@@ -3630,7 +3684,8 @@ mark();load()})();</script>"#;
                 (l.name, l.hosts, l.picture, l.signed_in) = (name, self.about.hosts.clone(), self.about.picture.clone(), self.signed_in_as().is_some());
                 l.place = views.get(view::in_use(views)).map(|v| v.plane.place()).unwrap_or_default();
             }
-            format!(r#"<a class="space" href="/?w={}&c=" aria-current="{current}">{}<span>{}</span><small>{}</small></a>"#, esc(&l.id), workspace_logo(&l, 28), esc(l.title()), esc(&workspace_sub(&l)))
+            let sub = match &twin { Some(t) => format!("same CI as {t}"), None => workspace_sub(&l) };
+            format!(r#"<a class="space" href="/?w={}&c=" aria-current="{current}">{}<span>{}</span><small>{}</small></a>"#, esc(&l.id), workspace_logo(&l, 28), esc(l.title()), esc(&sub))
         }).collect::<String>();
         format!(r##"<div data-switch hidden>{rows}<hr><a href="#" onclick="this.closest('details').open=false;document.getElementById('new-workspace').showModal();return false"><span>New workspace…</span></a></div>"##)
     }
@@ -4190,7 +4245,32 @@ mark();load()})();</script>"#;
         let public = if v.github { cloudflare::plane_get(v.plane.url(), &self.status_key, "/github/public-repos").ok().and_then(|r| r["repos"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())) } else { Some(vec![]) };
         // What the cache keeps (a control plane from before has none to say).
         let caches = if v.aws { cloudflare::plane_get(v.plane.url(), &self.status_key, "/caches").ok() } else { None };
-        format!(r#"{bar}<div class="cards">{}{}{}{here}</div>"#, called_card(v), limits_card(v, public), cache_card(v, caches.as_ref()))
+        let keys = cloudflare::plane_get(v.plane.url(), &self.status_key, "/keys").ok();
+        format!(r#"{bar}<div class="cards">{}{}{}{}{here}</div>"#, called_card(v), limits_card(v, public), cache_card(v, caches.as_ref()), self.keys_card(keys.as_ref()))
+    }
+
+    /// The keys this CI takes: each computer's that looks after it (which one, when it was made and last used) and
+    /// those that only read or start runs, each with Remove (this computer's own is taken out by signing out). Nothing
+    /// from a control plane from before that cannot say.
+    fn keys_card(&self, keys: Option<&serde_json::Value>) -> String {
+        let Some(k) = keys else { return String::new() };
+        let ago = |ms: Option<u64>| ms.map(|t| ago_words(now_ms().saturating_sub(t))).unwrap_or_else(|| "not yet".into());
+        let left = |until: Option<u64>| until.map(|u| match u.saturating_sub(now_ms()) / 86_400_000 { 0 => "ends today".to_string(), 1 => "1 more day".into(), d => format!("{d} more days") }).unwrap_or_default();
+        let mut rows = String::new();
+        for c in k["computers"].as_array().into_iter().flatten() {
+            let name = c["name"].as_str().unwrap_or_default();
+            let mine = name == self.status_secret;
+            let who = c["computer"].as_str().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| "A computer".into());
+            let made = c["until_ms"].as_u64().map(|u| ago_words(now_ms().saturating_sub(u.saturating_sub(30 * 86_400_000)))).unwrap_or_default();
+            let end = if mine { pill("good", "This computer") } else { format!(r#"<form method="post" action="/keys/remove" onsubmit="return confirm('Remove this computer\'s key? Its dashboard stops reaching this CI until it opens again with its sign-in.')"><input type="hidden" name="name" value="{}"><button class="button secondary sm">Remove</button></form>"#, esc(name)) };
+            rows.push_str(&format!(r#"<div class="pick act"><span><strong>{}</strong><small>Its dashboard · made {made} · last used {}</small></span><span class="pick-end">{end}</span></div>"#, esc(&who), ago(c["last_ms"].as_u64())));
+        }
+        for r in k["read"].as_array().into_iter().flatten() {
+            let name = r["name"].as_str().unwrap_or_default();
+            rows.push_str(&format!(r#"<div class="pick act"><span><strong>{}</strong><small>{} · {}</small></span><span class="pick-end"><form method="post" action="/keys/remove"><input type="hidden" name="read" value="{}"><button class="button secondary sm">Remove</button></form></span></div>"#,
+                esc(&name.to_lowercase()), if r["runs"] == true { "Reads and starts runs (an agent's)" } else { "Reads only" }, left(r["until_ms"].as_u64()), esc(name)));
+        }
+        format!(r#"<section class="card"><div class="card-head"><h2>Keys</h2><span class="card-sub">Who reaches this CI: each computer's dashboard, and keys made for agents and scripts. Anyone signed in to its cloud account can add their own.</span></div><div class="picks">{rows}</div></section>"#)
     }
 
     /// One run's page: how it stands, how long it took (its first job queued to its last over), what its machines cost,

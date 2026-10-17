@@ -74,6 +74,9 @@ pub struct Config {
     /// Set by each dashboard session on your machine (through the cloud's API): keys to read `/status`, each with
     /// the time it expires (ms).
     pub dashboard_keys: Vec<(u64, String)>,
+    /// The same keys by name (`DASHBOARD_KEY_<expires>_<random>`, as kept), for whoever looks after the CI to see
+    /// which computers have one.
+    pub dashboard_key_names: Vec<(String, String)>,
     /// Keys that only read (`superci keys create`, for a coding agent or a script that should look and not change):
     /// each with the time it expires (ms), its name, and the SHA-256 of the key (the key itself is not kept here).
     /// Set through the cloud's API like the dashboard's, as READ_KEY_<expires, unix seconds>_<NAME>.
@@ -137,6 +140,7 @@ impl Config {
         self.machine = get("MACHINE").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
         // One per dashboard session: DASHBOARD_KEY_<expires, unix seconds>_<random>.
         self.dashboard_keys = named("DASHBOARD_KEY_").filter_map(|(n, v)| Some((n.strip_prefix("DASHBOARD_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.clone()))).collect();
+        self.dashboard_key_names = named("DASHBOARD_KEY_").filter(|(_, v)| !v.is_empty()).map(|(n, v)| (n.to_string(), v.clone())).collect();
         // One per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
         self.read_keys = named("READ_KEY_").filter_map(|(n, v)| read_key(n, v)).collect();
         self.move_token = get("MOVE_TOKEN").map(str::to_string);
@@ -177,6 +181,7 @@ impl Config {
             cloudflare_location: "enam".into(),
             cloudflare_image: None,
             dashboard_keys: Vec::new(),
+            dashboard_key_names: Vec::new(),
             read_keys: Vec::new(),
             move_token: None,
             agents: Vec::new(),
@@ -213,6 +218,8 @@ pub struct Cache {
     /// millisecond (see `ControlPlane::lines_in`).
     runner_links: RefCell<HashMap<String, u64>>,
     lines_seq: std::cell::Cell<u64>,
+    /// When each dashboard key's use was last noted (by its name), so it is noted ten minutes apart at most.
+    key_seen: RefCell<HashMap<String, u64>>,
     installed: RefCell<Option<(bool, u64)>>,
     creds: RefCell<Option<Credentials>>,
     tokens: RefCell<HashMap<u64, (String, u64)>>,
@@ -1089,6 +1096,8 @@ impl<'a> ControlPlane<'a> {
         let url = url::Url::parse(&req.url).map_err(|e| e.to_string())?;
         let plane_url = origin(&req.url);
         if get_json::<String>(self.store, "plane_url").await?.as_deref() != Some(plane_url.as_str()) { put_json(self.store, "plane_url", &plane_url).await? }
+        // A computer's key in use: noted (ten minutes apart at most), for whoever looks after the CI to see.
+        if let Some(name) = self.dashboard_key_name(&req) { let _ = self.note_key(&name, None).await; }
         match (req.method.as_str(), url.path()) {
             ("GET", "/.well-known/openid-configuration") => Ok(Response::json(&serde_json::json!({
                 "issuer": plane_url, "jwks_uri": format!("{plane_url}/.well-known/jwks.json"), "response_types_supported": ["id_token"],
@@ -1106,6 +1115,15 @@ impl<'a> ControlPlane<'a> {
                 Ok(Response::json(&health))
             }
             ("GET", "/status") => self.status(&req).await,
+            // The computers that look after this CI, each with its key (which says what it is called once).
+            ("POST", "/keys/hello") if self.dashboard(&req) => {
+                let computer: String = serde_json::from_slice::<serde_json::Value>(&req.body).ok().and_then(|b| b["computer"].as_str().map(str::to_string)).unwrap_or_default()
+                    .chars().filter(|c| !c.is_control()).take(64).collect();
+                let Some(name) = self.dashboard_key_name(&req) else { return Ok(nothing_here()) };
+                self.note_key(&name, Some(computer.trim())).await?;
+                Ok(Response::text(200, "ok"))
+            }
+            ("GET", "/keys") if self.dashboard(&req) => self.keys().await,
             // Moved: events that still arrive here (sent just before the switch) go on to the new control plane.
             ("POST", "/webhook") | ("POST", "/gitlab/webhook") if self.store.get("moved_to").await?.is_some() => self.forward(&req, url.path()).await,
             ("POST", "/webhook") => self.webhook(&req, &plane_url).await,
@@ -1445,6 +1463,40 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Whether a request carries a dashboard session's key that has not expired.
+    /// The name of the dashboard key a request came with (`DASHBOARD_KEY_<expires>_<random>`), if it is one.
+    fn dashboard_key_name(&self, req: &Request) -> Option<String> {
+        let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).filter(|g| g.len() >= 16)?;
+        if !self.dashboard(req) { return None }
+        self.config.dashboard_key_names.iter().find(|(_, v)| safe_eq(given.as_bytes(), v.as_bytes())).map(|(n, _)| n.clone())
+    }
+
+    /// A dashboard key's use, noted as its record (`dkey:<name>`: the computer it is on, when it was first and last
+    /// used), kept until a day after the key ends; at most every ten minutes, unless it says what its computer is called.
+    async fn note_key(&self, name: &str, computer: Option<&str>) -> Result<()> {
+        let now = self.clock.now_ms();
+        if computer.is_none() && self.cache.key_seen.borrow().get(name).is_some_and(|at| now.saturating_sub(*at) < 600_000) { return Ok(()) }
+        self.cache.key_seen.borrow_mut().insert(name.to_string(), now);
+        let at = format!("dkey:{name}");
+        let mut v = get_json::<serde_json::Value>(self.store, &at).await?.unwrap_or_else(|| serde_json::json!({ "first_ms": now }));
+        v["last_ms"] = now.into();
+        if let Some(c) = computer.filter(|c| !c.is_empty()) { v["computer"] = c.into() }
+        let until = name.strip_prefix("DASHBOARD_KEY_").and_then(|r| r.split('_').next()).and_then(|t| t.parse::<u64>().ok()).map(|t| t * 1000 + 86_400_000).unwrap_or(now + 31 * 86_400_000);
+        self.store.put_until(&at, v.to_string(), until).await
+    }
+
+    /// Every key this CI takes: each computer's (its dashboard: the computer it is on, when it was made and last
+    /// used, until when it lasts) and those that only read or start runs (made for agents and scripts).
+    async fn keys(&self) -> Result<Response> {
+        let mut computers = vec![];
+        for (name, _) in &self.config.dashboard_key_names {
+            let until = name.strip_prefix("DASHBOARD_KEY_").and_then(|r| r.split('_').next()).and_then(|t| t.parse::<u64>().ok()).map(|t| t * 1000);
+            let seen = get_json::<serde_json::Value>(self.store, &format!("dkey:{name}")).await?.unwrap_or_default();
+            computers.push(serde_json::json!({ "name": name, "until_ms": until, "computer": seen["computer"], "first_ms": seen["first_ms"], "last_ms": seen["last_ms"] }));
+        }
+        let read: Vec<serde_json::Value> = self.config.read_keys.iter().map(|(until, name, kept)| serde_json::json!({ "name": name, "until_ms": until, "runs": kept.split_once(':').and_then(|(_, more)| RunKey::of(more)).is_some() })).collect();
+        Ok(Response::json(&serde_json::json!({ "computers": computers, "read": read })))
+    }
+
     fn dashboard(&self, req: &Request) -> bool {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         let now = self.clock.now_ms();

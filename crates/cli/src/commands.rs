@@ -714,7 +714,17 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                     Some(_) => format!("{:<24} reads and starts runs from a computer until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default()),
                     None => format!("{:<24} reads until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default()),
                 }).collect() };
-            Ok(Done { said, data: json!({ "keys": keys }) })
+            // Each computer's that looks after this CI (its dashboard), when the control plane can say.
+            let mine = d.status_key_name();
+            let computers: Vec<Value> = crate::cloudflare::plane_get(v.plane.url(), &d.status_key_value(), "/keys").ok().and_then(|k| k["computers"].as_array().cloned()).unwrap_or_default().into_iter()
+                .map(|c| json!({ "name": c["name"], "computer": c["computer"], "this_computer": c["name"].as_str() == Some(mine.as_str()), "last_used_ms": c["last_ms"], "until_ms": c["until_ms"] })).collect();
+            let mut said = said;
+            if !computers.is_empty() {
+                said.push(String::new());
+                said.push("Computers that look after it (each its dashboard's key; `superci keys delete NAME` takes one out):".into());
+                said.extend(computers.iter().map(|c| format!("{:<34} {}{}", c["name"].as_str().unwrap_or_default(), c["computer"].as_str().filter(|n| !n.is_empty()).unwrap_or("a computer"), if c["this_computer"] == true { " (this one)" } else { "" })));
+            }
+            Ok(Done { said, data: json!({ "keys": keys, "computers": computers }) })
         }
         ("keys", "create") => {
             if w(2).is_empty() { return usage("Give it a name: `superci keys create agent`.") }
@@ -741,6 +751,11 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut d = ready_to_set()?;
             in_use(&d)?;
             if let Some(done) = dry(args, &format!("end the key named {}", w(2)), "keys", &[]) { return Ok(done) }
+            // A computer's (its dashboard's), or one that only reads.
+            if w(2).starts_with("DASHBOARD_KEY_") {
+                d.drop_computer_key(w(2))?;
+                return Ok(Done::said(format!("The key {} is taken out: that computer's dashboard no longer reaches this CI until it opens again with its sign-in.", w(2))))
+            }
             d.revoke_key(w(2))?;
             Ok(Done::said(format!("The key {} no longer reads.", w(2).to_lowercase())))
         }
@@ -1456,16 +1471,19 @@ fn workspaces(args: &Args) -> Result<Done> {
     match w(1) {
         "list" => {
             let all = store::listed(&root, None);
+            // Another one that looks after the same CI (a duplicate).
+            let twin = |l: &store::Listed| all.iter().find(|o| o.id != l.id && !l.plane_id.is_empty() && o.plane_id == l.plane_id).map(|o| o.id.clone());
             let line = |l: &store::Listed| {
                 let mut parts: Vec<String> = vec![];
                 if !l.name.is_empty() { parts.push(l.name.clone()) }
                 parts.extend(l.hosts.iter().map(|(kind, name)| format!("{} {name}", if kind == "gitlab" { "GitLab" } else { "GitHub" })));
                 if !l.place.is_empty() { parts.push(l.place.clone()) }
                 if !l.signed_in { parts.push(if l.place.is_empty() { "nothing set up yet".into() } else { "signed out".into() }) }
+                if let Some(twin) = twin(l) { parts.push(format!("same CI as {twin}")) }
                 format!("{:<24} {}", l.id, parts.join(" · "))
             };
             let said = if all.is_empty() { vec!["None yet: the first one (default) is made when you sign in (`superci login`).".to_string()] } else { all.iter().map(line).collect() };
-            let data: Vec<Value> = all.iter().map(|l| json!({ "id": l.id, "name": l.name, "hosts": l.hosts.iter().map(|(kind, name)| json!({ "kind": kind, "name": name })).collect::<Vec<_>>(), "control_plane": l.place, "signed_in": l.signed_in })).collect();
+            let data: Vec<Value> = all.iter().map(|l| json!({ "id": l.id, "name": l.name, "hosts": l.hosts.iter().map(|(kind, name)| json!({ "kind": kind, "name": name })).collect::<Vec<_>>(), "control_plane": l.place, "plane_id": l.plane_id, "same_as": twin(l), "signed_in": l.signed_in })).collect();
             Ok(Done { said, data: json!({ "workspaces": data }) })
         }
         "create" => {
