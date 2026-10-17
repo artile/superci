@@ -168,3 +168,39 @@ fn turbo_nx_and_bazel_keep_their_outputs_and_a_save_in_blocks_comes_back_whole_o
     assert_eq!(twirp("GetCacheEntryDownloadURL", serde_json::json!({ "key": "none", "version": "v1" }))["ok"], false);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// What the control plane refuses (or cannot be reached for) is said to GitHub's artifact client as twirp says it:
+/// an artifact there already, none of that name, anything else; and none of it as kept.
+#[test]
+fn artifacts_the_control_plane_refuses_are_said_as_twirp_errors() {
+    let (status_of, why) = (|what: &str| match what { "artifact-begin" => 409, "artifact-get" | "artifact-delete" => 404, _ => 400 }, "the store refused");
+    let plane = server(move |_, path, _| { let what = path.rsplit('/').next().unwrap(); (status_of(what), serde_json::json!({ "why": why }).to_string().into_bytes()) });
+    let gone = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    for (plane_port, reached) in [(plane, true), (gone, false)] {
+        let dir = std::env::temp_dir().join(format!("superci-cache-refused-{}-{plane_port}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let _ends = Ends(std::process::Command::new(env!("CARGO_BIN_EXE_superci-cache")).args(["serve", dir.to_str().unwrap()])
+            .env("SUPERCI_CACHE_PLANE", format!("http://127.0.0.1:{plane_port}/cache/t")).env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", port.to_string()).spawn().unwrap());
+        for _ in 0..100 { if TcpStream::connect(("127.0.0.1", port)).is_ok() { break } std::thread::sleep(std::time::Duration::from_millis(20)) }
+        let twirp = |op: &str| { let (s, b) = call(port, "POST", &format!("/twirp/github.actions.results.api.v1.ArtifactService/{op}"), br#"{"name":"coverage"}"#); (s, serde_json::from_slice::<serde_json::Value>(&b).unwrap_or_default()) };
+        let expect = |op: &str, status: u16, code: &str| {
+            let (s, b) = twirp(op);
+            assert!(s == status && b["code"] == code, "{op} ({}): {s} {b}", if reached { "refused" } else { "not reached" });
+        };
+        if reached {
+            expect("CreateArtifact", 409, "already_exists");
+            expect("ListArtifacts", 400, "internal");
+            expect("GetSignedArtifactURL", 404, "not_found");
+            expect("DeleteArtifact", 404, "not_found");
+        } else {
+            expect("CreateArtifact", 503, "failed_precondition");
+            expect("ListArtifacts", 503, "internal");
+            expect("GetSignedArtifactURL", 503, "internal");
+            expect("DeleteArtifact", 503, "internal");
+        }
+        // (Finished before anything was uploaded: said as that.)
+        expect("FinalizeArtifact", 400, "failed_precondition");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
