@@ -152,7 +152,7 @@ fn runners_limits_the_cache_and_keys_are_set_and_read_back() {
     let (code, wiped) = json(&home, &["caches", "delete", "--repo=acme/app", "--confirm"]);
     assert_eq!(code, 0, "{wiped}");
 
-    // A key for coding agents: made (kept by the control plane as its hash), listed, ended.
+    // A run key: made (kept by the control plane as its hash), listed, ended.
     let key = ok(&["keys", "create", "builder", "--runs", "--days=7"]);
     assert_eq!((key["name"].as_str(), key["runs"].as_bool()), (Some("builder"), Some(true)), "{key}");
     let secret = key["env"]["SUPERCI_KEY"].as_str().unwrap().to_string();
@@ -362,8 +362,8 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
     for (args, would) in [
         (&["caches", "delete", "--repo=acme/app", "--confirm", "--dry-run"][..], "take every cache entry of acme/app out"),
         (&["caches", "delete", "node-modules-1", "--repo=acme/app", "--scope=refs/heads/main", "--confirm", "--dry-run"], "take the cache entry node-modules-1 of acme/app out"),
-        (&["keys", "create", "bot", "--dry-run"], "make a key named bot that only reads, good for 30 days"),
-        (&["keys", "create", "bot", "--runs", "--days=7", "--dry-run"], "make a key named bot that reads and starts runs from a computer, good for 7 days"),
+        (&["keys", "create", "bot", "--dry-run"], "make a key named bot (a read key: it only reads), good for 30 days"),
+        (&["keys", "create", "bot", "--runs", "--days=7", "--dry-run"], "make a key named bot (a run key: it reads and starts runs from a computer), good for 7 days"),
         (&["keys", "delete", "agent", "--dry-run"], "end the key named agent"),
         (&["accounts", "update", "aws", "--monthly-usd=50", "--aws-budget=none", "--dry-run"], "no budget in AWS itself"),
         (&["runs", "cancel", "12", "--dry-run"], "cancel run 12"),
@@ -385,7 +385,7 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
     assert_eq!(code, 0, "{v}");
     assert_eq!(settings(), before, "nothing changed");
 
-    // With a key that only reads (an agent's, elsewhere): what looks works, what changes is refused.
+    // With a read key (a coding agent's, elsewhere): what looks works, what changes is refused.
     let made = json(&home, &["keys", "create", "reader"]).1;
     // A key's name, how long it lasts, one there already, one not there: each said, nothing written.
     for (args, said) in [(&["keys", "create", "ci-2"][..], "A key's name is letters and digits"), (&["keys", "create", "abcdefghijklmnopqrstuvwxyz"], "A key's name is letters and digits"),
@@ -749,6 +749,61 @@ fn workspaces_are_listed_made_renamed_and_forgotten_from_the_cli() {
     assert!(keys() < before, "its key gone from the control plane");
     let (ok, said) = text(&["workspaces", "list"]);
     assert!(ok && said.contains("None yet"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn secrets_are_kept_for_runs_from_a_computer_from_stdin_or_a_variable_listed_without_values_and_taken_out() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let given = |args: &[&str], stdin: &str, env: &[(&str, &str)]| -> (i32, serde_json::Value) {
+        use std::io::Write;
+        let mut c = common::command(&home);
+        c.args([args, &["--json"]].concat()).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        for (k, v) in env { c.env(k, v); }
+        let mut child = c.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        let o = child.wait_with_output().unwrap();
+        let text = String::from_utf8_lossy(&o.stdout);
+        (o.status.code().unwrap_or(-1), serde_json::from_str(&text).unwrap_or_else(|_| panic!("{args:?}: {text}{}", String::from_utf8_lossy(&o.stderr))))
+    };
+    let kept = || served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| k.starts_with("SECRET_")).collect::<Vec<_>>();
+    // Nothing given: refused, with how.
+    let (code, v) = given(&["secrets", "create", "NPM_TOKEN"], "", &[]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("empty"), "{v}");
+    let (code, v) = given(&["secrets", "create", "GITHUB_THING"], "x", &[]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("GitHub's own"), "{v}");
+    // From stdin (its last line's end left out), and from a variable; each scope a setting of its own.
+    let (code, v) = given(&["secrets", "create", "npm_token"], "npm-value-0001\n", &[]);
+    assert!(code == 0 && v["name"] == "NPM_TOKEN", "{v}");
+    let (code, v) = given(&["secrets", "create", "NPM_TOKEN"], "again", &[]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("already"), "{v}");
+    let (code, v) = given(&["secrets", "create", "NPM_TOKEN", "--repo=acme/app", "--branch=release/*", "--value-env=MY_NPM"], "", &[("MY_NPM", "npm-value-0002")]);
+    assert!(code == 0, "{v}");
+    let settings = kept();
+    assert_eq!(settings.iter().map(|(k, _)| k.as_str()).filter(|k| *k == "SECRET_NPM_TOKEN_ALL").count(), 1, "{settings:?}");
+    assert!(settings.iter().any(|(_, v)| v.contains("\"value\":\"npm-value-0001\"")) && settings.iter().any(|(_, v)| v.contains("npm-value-0002") && v.contains("release/*")), "{settings:?}");
+    // Listed: names and scopes, never a value.
+    let (code, v) = given(&["secrets", "list"], "", &[]);
+    assert!(code == 0 && !v.to_string().contains("npm-value"), "{v}");
+    assert_eq!(v["secrets"].as_array().unwrap().iter().map(|s| (s["name"].as_str().unwrap(), s["scope"]["repo"].as_str())).collect::<Vec<_>>(), [("NPM_TOKEN", None), ("NPM_TOKEN", Some("acme/app"))]);
+    let o = superci(&home, &["secrets", "list"]);
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(text.contains("repo acme/app, branch release/*") && text.contains("every run") && !text.contains("npm-value"), "{text}");
+    // A new value for one kept; none for one that is not.
+    let (code, v) = given(&["secrets", "update", "NPM_TOKEN"], "npm-value-0003", &[]);
+    assert!(code == 0, "{v}");
+    assert!(kept().iter().any(|(_, v)| v.contains("npm-value-0003")) && !kept().iter().any(|(_, v)| v.contains("npm-value-0001")));
+    let (code, v) = given(&["secrets", "update", "OTHER"], "x", &[]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("not kept"), "{v}");
+    // Taken out by name and scope, when confirmed.
+    let (code, _) = given(&["secrets", "delete", "NPM_TOKEN"], "", &[]);
+    assert_ne!(code, 0);
+    let (code, v) = given(&["secrets", "delete", "NPM_TOKEN", "--repo=acme/web", "--confirm"], "", &[]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("repo acme/app, branch release/*"), "{v}");
+    let (code, v) = given(&["secrets", "delete", "NPM_TOKEN", "--confirm"], "", &[]);
+    assert!(code == 0, "{v}");
+    assert_eq!(kept().len(), 1);
     let _ = std::fs::remove_dir_all(&home);
 }
 

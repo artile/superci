@@ -38,8 +38,11 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     for name in headers.keys().filter(|k| k.starts_with(SETTINGS)).collect::<Vec<_>>() { headers.delete(&name)? }
     let mut settings = serde_json::Map::new();
     for n in SETTING_NAMES { if let Ok(v) = env.secret(n) { settings.insert(n.into(), v.to_string().into()); } }
-    // One secret for each further organization's GitHub App: GITHUB_APP_<its id>.
-    for n in js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>()).iter().filter_map(|n| n.as_string()).filter(|n| n.starts_with("GITHUB_APP_") || n.starts_with("GITLAB_")) {
+    // One secret for each further organization's GitHub App (GITHUB_APP_<its id>) and GitLab connection; and those
+    // kept for runs from a computer (SECRET_<name>_<scope>), only where they are read (a run made, their list, a move).
+    let path = req.path();
+    let kept = path == "/runs" || path == "/secrets" || path == "/move/export";
+    for n in js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>()).iter().filter_map(|n| n.as_string()).filter(|n| n.starts_with("GITHUB_APP_") || n.starts_with("GITLAB_") || (kept && n.starts_with("SECRET_"))) {
         if let Ok(v) = env.secret(&n) { settings.insert(n, v.to_string().into()); }
     }
     // In pieces: a header's value has a size limit, and each further organization's App adds its key.

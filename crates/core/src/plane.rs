@@ -85,7 +85,7 @@ pub struct Config {
     /// someone who controls this cloud account can ask): the old one hands over its settings with it, the new one
     /// takes its history and GitLab's project runners with it.
     pub move_token: Option<String>,
-    /// Runner agents in other clouds (Cloudflare containers, Modal sandboxes), set from the dashboard.
+    /// Runner bridges in other clouds (Cloudflare containers, Modal sandboxes), set from the dashboard.
     pub agents: Vec<Agent>,
     /// Where jobs run, set from the dashboard (workflows only say `runs-on: <label>`).
     pub routing: Routing,
@@ -104,6 +104,9 @@ pub struct Config {
     pub instance_types: Vec<String>,
     /// The default machine (`runs-on: superci`), set from the dashboard; a job's label may ask for another.
     pub machine: Spec,
+    /// Secrets kept for runs from a computer (`superci secrets create`), each a setting of its own
+    /// (SECRET_<NAME>_<its scope's id>), by setting.
+    pub secrets: Vec<(String, crate::secrets::Stored)>,
 }
 
 /// This control plane's version (SuperCI's): the dashboard offers an update when it is older than the dashboard.
@@ -149,6 +152,7 @@ impl Config {
         self.aws_regions = get("AWS_REGIONS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
         self.aws_networks = get("AWS_NETWORKS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
         self.aws_runners_off = get("AWS_RUNNERS") == Some("off");
+        self.secrets = named("SECRET_").filter_map(|(n, v)| Some((n.clone(), serde_json::from_str::<crate::secrets::Stored>(v).ok()?))).collect();
     }
 
     /// What it is called: SuperCI, unless given a name of its own.
@@ -195,6 +199,7 @@ impl Config {
             image_name: "runs-on-v2.2-ubuntu24-full-x64-*".into(),
             instance_types: vec!["c8a.xlarge".into(), "c7a.xlarge".into(), "m7a.xlarge".into()],
             machine: Spec::default(),
+            secrets: Vec::new(),
         }
     }
 
@@ -303,7 +308,7 @@ pub struct Job {
     /// A job of a run from a computer (provider "local"): the token in its runner's address, `/runner/<token>`,
     /// where the runner takes its job from this control plane in place of GitHub (see `runner_service`).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub local: Option<String>,
-    /// The key for coding agents that started it (its name), when one did (see `RunKey`).
+    /// The run key that started it (its name), when one did (see `RunKey`).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub by: Option<String>,
     /// What it writes most is in memory, or on its machine's own disk (its label asked: `-ramdisk`, `-localdisk`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub ramdisk: bool,
@@ -585,8 +590,8 @@ const SEVERAL: &str = "no provider could start its machine: ";
 const CANCEL_MS: u64 = 6 * 60_000;
 
 /// A place refusing what a job asks, as it would any job asking the same (no hiccup): no GPU machines allowed in the
-/// AWS account, or a runner agent refusing the request (Modal: no GPUs without a payment method).
-fn refuses_alike(e: &str) -> bool { e.starts_with(NO_GPU_QUOTA) || e.contains(" runner agent: 400 ") || e.starts_with("Modal refused: ") }
+/// AWS account, or a runner bridge refusing the request (Modal: no GPUs without a payment method).
+fn refuses_alike(e: &str) -> bool { e.starts_with(NO_GPU_QUOTA) || e.contains(" runner bridge: 400 ") || e.starts_with("Modal refused: ") }
 
 /// How a try ends when AWS has no spot machine for a job and nothing else in the order can run it (followed by what
 /// each region said): the job waits, and is tried again, rather than failing.
@@ -655,7 +660,7 @@ pub const AWS_ON_DEMAND: &str = "aws-on-demand";
 /// The place in the order a job's machine counts toward (its limits and its spend).
 fn place_of(j: &Job) -> &str { if j.cloud == "aws" && j.on_demand { AWS_ON_DEMAND } else { &j.cloud } }
 
-/// A runner agent in another cloud: it starts one runner per request from this control plane, which it trusts the way
+/// A runner bridge in another cloud: it starts one runner per request from this control plane, which it trusts the way
 /// AWS does, by this control plane's signed tokens (issuer = the control plane's URL, audience = the agent's URL).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Agent { pub cloud: String, pub url: String }
@@ -1033,7 +1038,7 @@ pub fn read_key(name: &str, value: &str) -> Option<(u64, String, String)> {
     Some((until.parse::<u64>().ok()? * 1000, key_name.to_string(), value.to_ascii_lowercase()))
 }
 
-/// A key for coding agents: it may also start runs from a computer. It has no limits of its own: its jobs are any
+/// A run key: a read key that may also start runs from a computer. It has no limits of its own: its jobs are any
 /// job of this control plane's, within its limits (the largest machine, what may be spent in a month and a day).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunKey { pub name: String }
@@ -1131,6 +1136,7 @@ impl<'a> ControlPlane<'a> {
                 Ok(Response::text(200, "ok"))
             }
             ("GET", "/keys") if self.dashboard(&req) => self.keys().await,
+            ("GET", "/secrets") if self.dashboard(&req) => self.secrets().await,
             // Moved: events that still arrive here (sent just before the switch) go on to the new control plane.
             ("POST", "/webhook") | ("POST", "/gitlab/webhook") if self.store.get("moved_to").await?.is_some() => self.forward(&req, url.path()).await,
             ("POST", "/webhook") => self.webhook(&req, &plane_url).await,
@@ -1408,6 +1414,8 @@ impl<'a> ControlPlane<'a> {
         let records = |prefix: &'static str| async move { self.store.list(prefix).await };
         Ok(Response::json(&serde_json::json!({
             "app": self.config.app, "more_apps": self.config.more_apps, "gitlab": self.config.gitlab, "more_gitlabs": self.config.more_gitlabs, "routing": self.config.routing, "machine": self.config.machine,
+            // The secrets it keeps, as kept (the new control plane keeps them in its own cloud).
+            "secrets": self.config.secrets.iter().map(|(n, s)| (n.clone(), serde_json::to_string(s).unwrap_or_default())).collect::<Vec<_>>(),
             // GitLab's project runners, and jobs that have finished (ones still running finish here).
             "state": records("glrunner:").await?.into_iter()
                 .chain(records("job:").await?.into_iter().filter(|(_, v)| serde_json::from_str::<Job>(v).is_ok_and(|j| ["done", "failed", "cancelled", "swept", "orphan"].contains(&j.state.as_str()))))
@@ -1492,7 +1500,7 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Every key this CI takes: each computer's (its dashboard: the computer it is on, when it was made and last
-    /// used, until when it lasts) and those that only read or start runs (made for agents and scripts).
+    /// used, until when it lasts) and those that only read or start runs (read and run keys, made for coding agents and scripts).
     async fn keys(&self) -> Result<Response> {
         let mut computers = vec![];
         for (name, _) in &self.config.dashboard_key_names {
@@ -1502,6 +1510,18 @@ impl<'a> ControlPlane<'a> {
         }
         let read: Vec<serde_json::Value> = self.config.read_keys.iter().map(|(until, name, kept)| serde_json::json!({ "name": name, "until_ms": until, "runs": kept.split_once(':').and_then(|(_, more)| RunKey::of(more)).is_some() })).collect();
         Ok(Response::json(&serde_json::json!({ "computers": computers, "read": read })))
+    }
+
+    /// The secrets this CI keeps (see `secrets`), for whoever looks after it: each one's name, scope, when it was set
+    /// and last given to a run (which, and who started it); never a value.
+    async fn secrets(&self) -> Result<Response> {
+        let mut out = vec![];
+        for (setting, s) in &self.config.secrets {
+            let used = get_json::<serde_json::Value>(self.store, &format!("sused:{setting}")).await?;
+            out.push(serde_json::json!({ "setting": setting, "name": s.name, "scope": s.scope, "said": s.scope.said(), "updated_ms": s.updated_ms, "used": used }));
+        }
+        out.sort_by(|a, b| (a["name"].as_str(), a["said"].as_str()).cmp(&(b["name"].as_str(), b["said"].as_str())));
+        Ok(Response::json(&serde_json::json!({ "secrets": out, "now_ms": self.clock.now_ms() })))
     }
 
     fn dashboard(&self, req: &Request) -> bool {
@@ -1524,7 +1544,7 @@ impl<'a> ControlPlane<'a> {
         self.config.read_keys.iter().any(|(until, _, kept)| *until > now && safe_eq(hash.as_bytes(), kept.split(':').next().unwrap_or_default().as_bytes()))
     }
 
-    /// A key for coding agents the request comes with, one that may start runs from a computer (see `RunKey`), and
+    /// A run key the request comes with, one that may start runs from a computer (see `RunKey`), and
     /// has not expired.
     fn run_key(&self, req: &Request) -> Option<RunKey> {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
@@ -2290,7 +2310,7 @@ impl<'a> ControlPlane<'a> {
             else { Placement::Fail(format!("nowhere to run {}: {}", spec.describe(), never.join("; "))) })
     }
 
-    /// One call to a runner agent, with a token this control plane signs for it alone.
+    /// One call to a runner bridge, with a token this control plane signs for it alone.
     async fn agent_call(&self, plane_url: &str, a: &Agent, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let secs = self.clock.now_ms() / 1000;
         let token = self.identity().await?.signing.jwt(&serde_json::json!({ "iss": plane_url, "sub": format!("plane:{}", self.config.plane_id), "aud": a.url, "iat": secs, "exp": secs + 120 }))?;
@@ -2300,9 +2320,9 @@ impl<'a> ControlPlane<'a> {
         if r.status >= 300 {
             // What it said (FastAPI's `detail`), else its answer as it came.
             let said = serde_json::from_slice::<serde_json::Value>(&r.body).ok().and_then(|v| v["detail"].as_str().map(str::to_string)).unwrap_or_else(|| r.body_text());
-            return Err(format!("{} runner agent: {} {}", a.cloud, r.status, said.chars().take(300).collect::<String>()));
+            return Err(format!("{} runner bridge: {} {}", a.cloud, r.status, said.chars().take(300).collect::<String>()));
         }
-        serde_json::from_slice(&r.body).map_err(|e| format!("{} runner agent: {e}", a.cloud))
+        serde_json::from_slice(&r.body).map_err(|e| format!("{} runner bridge: {e}", a.cloud))
     }
 
     /// Ends the machine that ran (or would have run) a job, wherever it is.
@@ -2978,7 +2998,7 @@ impl<'a> ControlPlane<'a> {
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
                         for (k, v) in work.json().as_object().into_iter().flatten() { body[k] = v.clone() }
                         let v = self.agent_call(plane_url, &a, "/launch", body).await?;
-                        Ok(Tried::Started(v["id"].as_str().ok_or("runner agent answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
+                        Ok(Tried::Started(v["id"].as_str().ok_or("runner bridge answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
                     }.await,
                 };
                 match tried {
@@ -3124,7 +3144,7 @@ impl<'a> ControlPlane<'a> {
                         job.cpu.unwrap_or(4), aws::SPOT_CPU_QUOTA)
                 }
             };
-            // No GPU machines allowed in the AWS account, or a runner agent refusing what was asked (Modal: no GPUs
+            // No GPU machines allowed in the AWS account, or a runner bridge refusing what was asked (Modal: no GPUs
             // without a payment method): every job asking for it fails alike, at once.
             if !e.starts_with(SEVERAL) && refuses_alike(&e) { intrinsic = true; job.cloud = String::new() }
             // No spot machine anywhere and no other place for it: it waits for one, however long (as for a place that is full).
@@ -3775,17 +3795,35 @@ impl<'a> ControlPlane<'a> {
         }
         if instances.len() > 64 { return Ok(Response::text(400, &format!("{} jobs: a run from a computer runs 64 at most", instances.len()))) }
         let run_id = local_id();
+        // The secrets this CI keeps that the run may have (see `secrets`): those its workflows name, whose scope holds
+        // for its repository, branch and workflow file; each job gets its own of them (`start_instance`). Named and
+        // neither kept nor given: said, and empty, as on GitHub.
+        let texts: Vec<&str> = std::iter::once(r.workflow.as_str()).chain(r.called.values().map(String::as_str)).collect();
+        let named = crate::secrets::named(&texts);
+        let kept: Vec<crate::secrets::Stored> = self.config.secrets.iter().map(|(_, s)| s.clone()).collect();
+        let stored = crate::secrets::for_run(&kept, &r.repository, crate::secrets::branch_of(&r.reference), &r.path, named.as_ref());
+        let missing: Vec<String> = named.iter().flatten().filter(|n| !r.secrets.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)) && !stored.iter().any(|s| &s.name == *n)).cloned().collect();
+        // Each one's use, noted for whoever looks after the CI: the run, its workflow and branch, and who started it.
+        let by = match &key { Some(k) => Some(k.name.clone()), None => match self.dashboard_key_name(req) {
+            Some(n) => get_json::<serde_json::Value>(self.store, &format!("dkey:{n}")).await?.and_then(|v| v["computer"].as_str().map(str::to_string)),
+            None => None,
+        } };
+        for (setting, s) in &self.config.secrets {
+            if !stored.contains(s) { continue }
+            let used = serde_json::json!({ "run_id": run_id.to_string(), "at_ms": now, "repository": r.repository, "path": r.path, "ref": r.reference, "by": by, "run_key": key.is_some() });
+            self.store.put_until(&format!("sused:{setting}"), used.to_string(), now + 400 * 86_400_000).await?;
+        }
         // Its jobs' cache: the repository's entries, as GitHub's jobs keep them when GitHub knows it here.
         let (ns, default_branch) = match self.repository_of(&r.repository).await { Some((id, default)) => (format!("gh{id}"), default), None => (cache::local_ns(&r.repository), "main".to_string()) };
         // (Its name, for the cache's list: a repository GitHub does not know here has no other.)
         if ns.starts_with("local-") && !r.repository.is_empty() { let _ = self.store.put_if_absent(&format!("cachename:{ns}"), r.repository.clone()).await; }
         let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
-            "event_name": r.event_name, "secrets": r.secrets, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances, "called": r.called,
+            "event_name": r.event_name, "secrets": r.secrets, "stored": stored, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances, "called": r.called,
             "cache": { "ns": ns, "default_branch": default_branch } });
         put_json(self.store, &format!("run:{run_id}"), &run).await?;
         if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
         let run = get_json::<serde_json::Value>(self.store, &format!("run:{run_id}")).await?.unwrap_or_default();
-        Ok(Response::json(&serde_json::json!({ "run_id": run_id.to_string(), "jobs": run["jobs"].as_array().map(|j| j.iter().map(|j| j["name"].clone()).collect::<Vec<_>>()).unwrap_or_default() })))
+        Ok(Response::json(&serde_json::json!({ "run_id": run_id.to_string(), "jobs": run["jobs"].as_array().map(|j| j.iter().map(|j| j["name"].clone()).collect::<Vec<_>>()).unwrap_or_default(), "missing_secrets": missing })))
     }
 
     /// Moves a run from a computer on: notes how its started jobs ended, then starts each job whose needs have all
@@ -3948,7 +3986,7 @@ impl<'a> ControlPlane<'a> {
             let start: Vec<usize> = jobs.iter().enumerate().filter(|(_, j)| j["token"].as_str().is_some_and(|t| start.iter().any(|s| s == t))).map(|(i, _)| i).collect();
             if !changed { return Ok(()) }
             // A run all over keeps no secret.
-            if jobs.iter().all(|j| j["state"] == "done") { run["secrets"] = serde_json::json!([]) }
+            if jobs.iter().all(|j| j["state"] == "done") { run["secrets"] = serde_json::json!([]); run["stored"] = serde_json::json!([]) }
             let secrets: Vec<(String, String)> = serde_json::from_value(run["secrets"].clone()).unwrap_or_default();
             run["jobs"] = serde_json::Value::Array(jobs.clone());
             if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
@@ -4018,7 +4056,15 @@ impl<'a> ControlPlane<'a> {
         let own_text = match source { Some(p) => run["called"][p].as_str().ok_or_else(|| format!("{p} is not in the run"))?.to_string(), None => run["workflow"].as_str().unwrap_or_default().to_string() };
         let own = match source { Some(_) => crate::workflow::parse(&own_text)?, None => wf.clone() };
         let wf = &own;
-        let secrets: Vec<(String, String)> = match inst["call"].as_str().and_then(|c| run_wf_job(run, c)).and_then(|j| j.get("secrets").cloned()) {
+        // The run's secrets: those this CI keeps that the run was given (see `create_run`), the narrowest under each
+        // name, and those given with the run, which win.
+        let stored: Vec<crate::secrets::Stored> = serde_json::from_value(run["stored"].clone()).unwrap_or_default();
+        let with_run: Vec<String> = secrets.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
+        let mut all = crate::secrets::resolve(&stored, None);
+        all.retain(|(n, _)| !with_run.contains(n));
+        all.extend(secrets.iter().cloned());
+        let secrets = &all[..];
+        let mut secrets: Vec<(String, String)> = match inst["call"].as_str().and_then(|c| run_wf_job(run, c)).and_then(|j| j.get("secrets").cloned()) {
             Some(crate::workflow::Node::Scalar { text, .. }) if text == "inherit" => secrets.to_vec(),
             Some(m @ crate::workflow::Node::Map { .. }) => {
                 let mut values = self.run_contexts(run, &serde_json::json!({}), &serde_json::Map::new());
@@ -4029,10 +4075,24 @@ impl<'a> ControlPlane<'a> {
             _ if inst["call"].is_string() => vec![],
             _ => secrets.to_vec(),
         };
-        let secrets = &secrets[..];
         let job = wf.get("jobs").and_then(|j| j.get(key_name));
         let needs = inst["needs_said"].as_object().cloned().unwrap_or_default();
         let values = self.run_contexts(run, inst, &needs);
+        // A job with an `environment:` has that environment's kept secrets over what its caller gives, as on GitHub
+        // (a value given with the run still wins).
+        let environment = job.and_then(|j| j.get("environment")).and_then(|e| e.get("name").or(Some(e)).and_then(|n| n.text()).map(str::to_string));
+        let environment = environment.map(|e| match e.contains("${{") {
+            true => read_text(&e, &crate::expression::Contexts { values: &values, status: crate::expression::Status::Success }).ok().map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default(),
+            false => e,
+        });
+        if let Some(e) = environment.as_deref().filter(|e| !e.is_empty()) {
+            let theirs: Vec<crate::secrets::Stored> = stored.iter().filter(|s| s.scope.environment.is_some()).cloned().collect();
+            for (n, v) in crate::secrets::resolve(&theirs, Some(e)).into_iter().filter(|(n, _)| !with_run.contains(n)) {
+                secrets.retain(|(k, _)| !k.eq_ignore_ascii_case(&n));
+                secrets.push((n, v));
+            }
+        }
+        let secrets = &secrets[..];
         let c = crate::expression::Contexts { values: &values, status: crate::expression::Status::Success };
         // Its machine: the one its label says when it is this control plane's, else the default machine.
         let runs_on = job.and_then(|j| j.get("runs-on")).and_then(|n| n.text()).map(|t| crate::expression::interpolate(t, &c)).transpose()?.unwrap_or_default();
@@ -4076,7 +4136,7 @@ impl<'a> ControlPlane<'a> {
         let key = format!("run:{id}");
         // A GitHub run (none of this control plane's own): GitHub cancels it, asked with the App's token for its
         // repository; its jobs here end as GitHub tells (a machine whose job ended is ended). Only with a dashboard's
-        // key: a key for coding agents cancels the runs it may start, from a computer, and no GitHub run.
+        // key: a run key cancels the runs it may start, from a computer, and no GitHub run.
         if self.store.get(&key).await?.is_none() {
             if !github_too { return Ok(nothing_here()) }
             let mut known = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect::<Vec<_>>();

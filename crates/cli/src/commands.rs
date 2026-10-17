@@ -57,8 +57,10 @@ const HELP: &[(&str, &str, &str)] = &[
         "What a run from a computer's jobs kept with upload-artifact, kept for a day. (A run of GitHub's keeps its artifacts at\nGitHub: `gh run download`.)\n\nlist      Each artifact's name and size.\nretrieve  Fetches one and unpacks it into DIR (./NAME unless given), as download-artifact would."),
     ("caches", "  superci caches retrieve\n  superci caches list [--repo=OWNER/NAME]\n  superci caches update [--enabled=true|false] [--size-gb=N] [--days=N]\n  superci caches delete --repo=OWNER/NAME [KEY] [--scope=REF] --confirm",
         "GitHub's cache for jobs on AWS, kept in a bucket of your control plane's in your account, in each region its machines\nrun in. Workflows do not change: actions/cache, the setup actions' caches and Docker's type=gha reach it as they reach\nGitHub's. A job reads and writes what GitHub would let it (a pull request writes only its own branch's).\n\nretrieve  Whether it is on, what it keeps, and each repository with what it keeps now.\nlist      Each repository with its entries and size; --repo: that repository's entries (key, branch, size, last use).\nupdate    --enabled=false: jobs use GitHub's own cache. --size-gb: what one repository keeps at most (25 unless set;\n          the least recently used go first). --days: how long an entry may go unused (7 unless set). An entry saved 30\n          days ago is saved anew whatever its use.\ndelete    Takes a repository's entries out, all of them or KEY's (--scope: on that branch only, as refs/heads/main)."),
+    ("secrets", "  superci secrets list\n  superci secrets create NAME [--repo=OWNER/NAME] [--branch=PATTERN] [--workflow=PATTERN] [--environment=NAME]\n  superci secrets update NAME [the same]\n  superci secrets delete NAME [the same] --confirm",
+        "Secrets kept for runs from a computer (`superci runs create`), as a repository's secrets are kept for its runs on\nGitHub. A run gets the ones its workflows name (${{ secrets.NAME }}) and nothing else; one it names that is not kept is\nempty, as on GitHub, and said before its jobs start. Jobs GitHub sends keep getting GitHub's own secrets.\n\nThey are written with this computer's sign-in into your control plane's own cloud (SSM on AWS, the Worker's secrets\non Cloudflare, a Dict on Modal) and are never read back out: `list` says names, where each may be used, when it was\nset and last given to a run, and who started that run. A run key (`superci keys create NAME --runs`) starts runs\nthat get them; nothing but a computer signed in changes them.\n\ncreate    Keeps NAME (letters, digits and _; not GITHUB_…), its value read from stdin or from the variable\n          --value-env names, never from the command: `printf %s \"$NPM_TOKEN\" | superci secrets create NPM_TOKEN`.\n          4 KB at most. --repo, --branch, --workflow (a file's name or path) and --environment (a job's\n          environment:) narrow where it may be used; patterns are GitHub's (release/*). The same name may be kept\n          for several scopes: a job gets the narrowest (an environment's, then a repository's, a workflow's, a\n          branch's). A value given with the run (--secret=NAME=VALUE) wins over all of them.\nupdate    A new value for NAME as kept for that scope.\ndelete    Takes it out."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30] [--runs]\n  superci keys delete NAME",
-        "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, the key also starts runs from a computer (`superci runs create`), and nothing else. Its jobs keep\n          to this control plane's limits, as every job does (`superci limits`). For a coding agent that should run the\n          tests without pushing and without your sign-in.\ndelete    Ends one at once."),
+        "Read keys and run keys, for a coding agent or a script. (Each computer that looks after the CI has a key of its own,\nits computer key, listed here too.)\n\ncreate    Makes a read key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, a run key: it also starts runs from a computer (`superci runs create`), and nothing else. Its jobs keep\n          to this control plane's limits, as every job does (`superci limits`). For a coding agent that should run the\n          tests without pushing and without your sign-in.\ndelete    Ends one at once: a read or run key by its name, a computer key by its DASHBOARD_KEY_… name."),
     ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images update REGION [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
         "The image AWS machines start from (GitHub's own runner image, published for AWS by RunsOn in most regions).\n\nlist      Each region the AWS account can use: whether the image is published there, or your own copy is.\ncreate    Copies the image into a region it is not published in, so that jobs can start there. Where to copy\n          from is read from its maker's public list; --from names a region and an image instead. AWS takes about\n          ten minutes. The copy is kept in your account's storage there (about $1.50 a month).\nupdate    Copies the newest build in, where your copy is of an older one (its maker builds the image anew every\n          week or two; `list` says when one is out). Jobs start from the older copy until the new one is\n          there; the older one is then removed.\ndelete    Removes your copy from a region, with its storage."),
     ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces update ID --plane=PLANE\n  superci workspaces delete ID --confirm",
@@ -112,7 +114,7 @@ Workspaces:
 {FLAGS}
 SuperCI keeps its own sign-ins in ~/.superci (SUPERCI_HOME to put it elsewhere), by workspace, and reads no other
 tool's. On a machine with no browser, a sign-in can be given by name: SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID and
-SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "artifacts", "usage"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits", "caches"]),
+SUPERCI_MODAL_TOKEN_SECRET.", group(&["dashboard", "login", "logout", "status"]), group(&["jobs", "runs", "secrets", "artifacts", "usage"]), group(&["planes"]), group(&["runners", "accounts", "images", "labels", "name", "machine", "limits", "caches"]),
                 group(&["connections", "deliveries", "projects", "public_repos"]), group(&["keys"]), group(&["workspaces"]), group(&["leave"]))
         }
     }
@@ -145,7 +147,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 14] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach", "tests"];
-const VALUES: [&str; 51] = ["layers", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 54] = ["branch", "environment", "value-env", "layers", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -431,7 +433,7 @@ fn look(d: &mut Dashboard) -> Result<(PlaneView, String)> {
     if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1:") { return usage("SUPERCI_PLANE is the control plane's address, starting with https:// (`superci status` says it).") }
     let health = crate::cloudflare::health(&url).ok_or("The control plane at SUPERCI_PLANE did not answer.")?;
     let v = crate::view::plane_view(&Plane::Seen { url, plane_id: health["plane"].as_str().unwrap_or_default().to_string() }, Some(&key));
-    if v.status.is_none() { return Err("The control plane did not take SUPERCI_KEY: it has ended, was revoked, or is another control plane's (keys that only read need control plane 0.11.0 or newer).".into()) }
+    if v.status.is_none() { return Err("The control plane did not take SUPERCI_KEY: it has ended, was revoked, or is another control plane's (read keys need control plane 0.11.0 or newer).".into()) }
     named_is(v.plane.plane_id(), v.plane.url(), "the one SUPERCI_PLANE and SUPERCI_KEY read")?;
     Ok((v, key))
 }
@@ -475,7 +477,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("status", "") => {
             let mut d = signed_in();
             let (signed_in, view) = match given_key() {
-                Some(_) => ("with a key that only reads (SUPERCI_KEY)".to_string(), Some(look(&mut d)?.0)),
+                Some(_) => ("with a read key (SUPERCI_KEY)".to_string(), Some(look(&mut d)?.0)),
                 None => { let v = d.current()?; if let Some(v) = &v { named_is(v.plane.plane_id(), v.plane.url(), &v.plane.place())? } (d.signed_in_as().unwrap_or_else(|| "nowhere now (AWS's sign-in has ended; this is read with this machine's key)".into()), v) }
             };
             let mut v = match view { Some(v) => json!({ "signed_in": signed_in, "control_plane": plane_json(&v), "status": v.status }), None => json!({ "signed_in": signed_in, "control_plane": null }) };
@@ -547,7 +549,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let Some(workflow) = args.get("workflow") else { return usage("Say which workflow: `superci runs create --workflow=.github/workflows/ci.yml` (and --job=NAME when it has several jobs).") };
             let pairs = |flag: &str| args.all(flag).iter().map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or(format!("--{flag} is NAME=VALUE"))).collect::<std::result::Result<Vec<_>, String>>();
             let (secrets, vars) = match (pairs("secret"), pairs("var")) { (Ok(s), Ok(v)) => (s, v), (Err(e), _) | (_, Err(e)) => return usage(e) };
-            // With a key for coding agents (SUPERCI_PLANE, SUPERCI_KEY), no sign-in is needed; else this computer's key
+            // With a run key (SUPERCI_PLANE, SUPERCI_KEY), no sign-in is needed; else this computer's key
             // with the control plane it is kept for (each control plane is handed a key of its own, made from it). A
             // cloud sign-in is needed only to find a control plane, or to hand it the key again: a run needs neither,
             // so it goes on when AWS has ended its sign-in or another account is signed in.
@@ -703,16 +705,62 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             }
             Ok(Done { said, data: got })
         }
+        ("secrets", "list") => {
+            let mut d = signed_in();
+            in_use(&d)?;
+            let got = d.kept_secrets_said()?;
+            let kept = got["secrets"].as_array().cloned().unwrap_or_default();
+            let now = got["now_ms"].as_u64().unwrap_or(0);
+            let ago = |ms: u64| { let m = now.saturating_sub(ms) / 60_000; match m { 0 => "just now".to_string(), 1..=59 => format!("{m} min ago"), 60..=2879 => format!("{} h ago", m / 60), _ => format!("{} days ago", m / 1440) } };
+            let mut said = vec![];
+            if kept.is_empty() { said.push("No secrets kept. A run from a computer gets the ones it names: `printf %s \"$NPM_TOKEN\" | superci secrets create NPM_TOKEN`.".to_string()) }
+            for s in &kept {
+                let used = match s["used"]["at_ms"].as_u64() {
+                    Some(at) => format!("used {} by {}", ago(at), s["used"]["by"].as_str().map(|b| if s["used"]["run_key"] == true { format!("the key {}", b.to_lowercase()) } else { b.to_string() }).unwrap_or_else(|| "a computer".into())),
+                    None => "not used yet".into(),
+                };
+                said.push(format!("{:<28} {:<44} set {}, {used}", s["name"].as_str().unwrap_or_default(), s["said"].as_str().unwrap_or_default(), ago(s["updated_ms"].as_u64().unwrap_or(0))));
+            }
+            let data: Vec<Value> = kept.iter().map(|s| json!({ "name": s["name"], "scope": s["scope"], "updated_ms": s["updated_ms"], "used": s["used"] })).collect();
+            Ok(Done { said, data: json!({ "secrets": data }) })
+        }
+        ("secrets", "create") | ("secrets", "update") | ("secrets", "delete") => {
+            let op = w(1);
+            if w(2).is_empty() { return usage(format!("Give its name: `superci secrets {op} NPM_TOKEN`.")) }
+            let name = superci_core::secrets::valid_name(w(2))?;
+            let scope = superci_core::secrets::valid_scope(args.get("repo"), args.get("branch"), args.get("workflow"), args.get("environment"))?;
+            if op == "delete" {
+                confirmed(args, &format!("take the secret {name} ({}) out", scope.said()))?;
+                let mut d = ready_to_set()?;
+                in_use(&d)?;
+                if let Some(done) = dry(args, &format!("take the secret {name} ({}) out", scope.said()), "secrets", &[]) { return Ok(done) }
+                d.forget_secret(&name, &scope)?;
+                return Ok(Done { said: vec![format!("{name} ({}) is taken out: runs from a computer no longer get it.", scope.said())], data: json!({ "ok": true, "name": name, "scope": scope }) })
+            }
+            // The value: never in the command itself (it would stay in the shell's history), but from a variable or stdin.
+            let value = match args.get("value-env") {
+                Some(var) => std::env::var(var).map_err(|_| format!("{var} is not set."))?,
+                None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => return usage(format!("Give the value on stdin (`printf %s \"$TOKEN\" | superci secrets {op} {name}`, or `< file`), or by a variable's name: --value-env=TOKEN.")),
+                None => { let mut v = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut v).map_err(|e| e.to_string())?; v.strip_suffix('\n').map(|x| x.strip_suffix('\r').unwrap_or(x).to_string()).unwrap_or(v) }
+            };
+            superci_core::secrets::valid_value(&value)?;
+            let mut d = ready_to_set()?;
+            in_use(&d)?;
+            let would = format!("{} the secret {name} for {}", if op == "create" { "keep" } else { "give a new value to" }, scope.said());
+            if let Some(done) = dry(args, &would, "secrets", &[]) { return Ok(done) }
+            d.keep_secret(&name, &scope, &value, op == "create")?;
+            Ok(Done { said: vec![format!("{name} is kept for {}: a run from a computer that names it (${{{{ secrets.{name} }}}}) gets it. It is in your control plane's cloud only, and is never shown again.", scope.said())], data: json!({ "ok": true, "name": name, "scope": scope }) })
+        }
         ("keys", "list") => {
             let mut d = signed_in();
             let v = d.current()?.ok_or(NO_PLANE)?;
             let status = v.status.clone().unwrap_or_default();
             let runs_of = |name: &str| status["read_keys"].as_array().into_iter().flatten().find(|k| k["name"] == name).map(|k| k["runs"].clone()).filter(|r| !r.is_null());
             let keys: Vec<Value> = read_keys(&status).into_iter().map(|(name, until)| { let mut k = json!({ "name": name.to_lowercase(), "until": day_of(until / 1000) }); if let Some(r) = runs_of(&name) { k["runs"] = r } k }).collect();
-            let said = if keys.is_empty() { vec!["No keys that only read. Make one for a coding agent or a script: `superci keys create agent`.".to_string()] }
+            let said = if keys.is_empty() { vec!["No read or run keys. Make one for a coding agent or a script: `superci keys create agent` (with --runs, a run key).".to_string()] }
                 else { keys.iter().map(|k| match k.get("runs") {
-                    Some(_) => format!("{:<24} reads and starts runs from a computer until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default()),
-                    None => format!("{:<24} reads until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default()),
+                    Some(_) => format!("{:<24} run key: reads and starts runs from a computer, until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default()),
+                    None => format!("{:<24} read key, until {}", k["name"].as_str().unwrap_or_default(), k["until"].as_str().unwrap_or_default()),
                 }).collect() };
             // Each computer's that looks after this CI (its dashboard), when the control plane can say.
             let mine = d.status_key_name();
@@ -721,7 +769,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut said = said;
             if !computers.is_empty() {
                 said.push(String::new());
-                said.push("Computers that look after it (each its dashboard's key; `superci keys delete NAME` takes one out):".into());
+                said.push("Computer keys: each computer that looks after it (`superci keys delete NAME` takes one out):".into());
                 said.extend(computers.iter().map(|c| format!("{:<34} {}{}", c["name"].as_str().unwrap_or_default(), c["computer"].as_str().filter(|n| !n.is_empty()).unwrap_or("a computer"), if c["this_computer"] == true { " (this one)" } else { "" })));
             }
             Ok(Done { said, data: json!({ "keys": keys, "computers": computers }) })
@@ -734,15 +782,15 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let runs = args.has("runs");
             let mut d = ready_to_set()?;
             let plane = in_use(&d)?;
-            let what = if runs { "that reads and starts runs from a computer" } else { "that only reads" };
+            let what = if runs { "(a run key: it reads and starts runs from a computer)" } else { "(a read key: it only reads)" };
             if let Some(done) = dry(args, &format!("make a key named {} {what}, good for {days} days", w(2)), "keys", &[]) { return Ok(done) }
             let (key, until) = d.create_key(w(2), days, runs)?;
             if runs {
-                return Ok(Done { said: vec![format!("A key for coding agents, until {}: it reads, and starts runs from a computer, within this control plane's limits (`superci limits retrieve`). It is shown this once:", day_of(until)), String::new(),
+                return Ok(Done { said: vec![format!("A run key, until {}: it reads, and starts runs from a computer, within this control plane's limits (`superci limits retrieve`). It is shown this once:", day_of(until)), String::new(),
                     format!("  SUPERCI_PLANE={} SUPERCI_KEY={key}", plane.url()), String::new(), "With these two set, `superci runs create --workflow=…` works with no sign-in, and nothing else can be changed.".to_string()],
                     data: json!({ "ok": true, "name": w(2).to_lowercase(), "until": day_of(until), "runs": true, "env": { "SUPERCI_PLANE": plane.url(), "SUPERCI_KEY": key } }) })
             }
-            Ok(Done { said: vec![format!("A key that only reads, until {}. It is shown this once:", day_of(until)), String::new(), format!("  SUPERCI_PLANE={} SUPERCI_KEY={key}", plane.url()), String::new(),
+            Ok(Done { said: vec![format!("A read key, until {}. It is shown this once:", day_of(until)), String::new(), format!("  SUPERCI_PLANE={} SUPERCI_KEY={key}", plane.url()), String::new(),
                 "With these two set, whatever looks works with no sign-in (`superci status`, `superci jobs list`, `superci runners list`…), and nothing can be changed.".to_string()],
                 data: json!({ "ok": true, "name": w(2).to_lowercase(), "until": day_of(until), "env": { "SUPERCI_PLANE": plane.url(), "SUPERCI_KEY": key } }) })
         }
@@ -754,7 +802,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             // A computer's (its dashboard's), or one that only reads.
             if w(2).starts_with("DASHBOARD_KEY_") {
                 d.drop_computer_key(w(2))?;
-                return Ok(Done::said(format!("The key {} is taken out: that computer's dashboard no longer reaches this CI until it opens again with its sign-in.", w(2))))
+                return Ok(Done::said(format!("The computer key {} is taken out: that computer's dashboard no longer reaches this CI until it opens again with its sign-in.", w(2))))
             }
             d.revoke_key(w(2))?;
             Ok(Done::said(format!("The key {} no longer reads.", w(2).to_lowercase())))
@@ -1112,7 +1160,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut d = ready()?;
             let plane = in_use(&d)?;
             // As the Add runners page does: a control plane starts machines in its own cloud itself; elsewhere it is
-            // connected (AWS: a role it may assume; Cloudflare, Modal: a small agent there).
+            // connected (AWS: a role it may assume; Cloudflare, Modal: a small runner bridge there).
             let (path, fields) = match (cloud, &plane) {
                 ("aws", Plane::Aws { .. }) => ("/runners/aws-own", vec![]),
                 ("aws", _) => match args.get("region") { Some(r) => ("/aws/connect", vec![field("region", r)]), None => return usage("Say where its machines start: `superci runners create aws --region=us-east-1`.") },

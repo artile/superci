@@ -246,6 +246,9 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts, "layered": layered, "called": called });
     let made = call("POST", "/runs", body.to_string().into_bytes())?;
     let run = made["run_id"].as_str().unwrap_or_default().to_string();
+    // Secrets its workflows name that this CI does not keep for it and that were not given: empty, as on GitHub.
+    let missing: Vec<&str> = made["missing_secrets"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
+    let missing_said = (!missing.is_empty()).then(|| format!("Not set in this CI, empty as on GitHub: {} (`superci secrets create NAME`, or --secret=NAME=VALUE).", missing.join(", ")));
     // The tree still to send goes while the machine starts; the control plane is told once it is all there. Not
     // sent: the run is cancelled (its machine would wait for it).
     let sending = pending.map(|(link, bytes, base)| {
@@ -268,8 +271,9 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     };
     if how.detach {
         sent(sending)?;
-        return Ok(Done { said: vec![format!("Run {run} of {path} started. Follow it: superci runs wait {run}")], data: json!({ "run_id": run, "jobs": made["jobs"] }) })
+        return Ok(Done { said: missing_said.into_iter().chain([format!("Run {run} of {path} started. Follow it: superci runs wait {run}")]).collect(), data: json!({ "run_id": run, "jobs": made["jobs"], "missing_secrets": missing }) })
     }
+    if let Some(m) = &missing_said { say(m) }
     say(&format!("Run {run} of {path}, on machines of this control plane's"));
     let followed = follow(plane, key, &run, how, std::time::Instant::now(), true, say);
     sent(sending)?;

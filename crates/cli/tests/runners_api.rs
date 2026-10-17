@@ -1,5 +1,5 @@
 //! Runner providers across clouds: a control plane in AWS given AWS's machines, Cloudflare's containers and Modal's
-//! sandboxes through runner agents, then everything moved to a Cloudflare control plane (AWS's machines through a role
+//! sandboxes through runner bridges, then everything moved to a Cloudflare control plane (AWS's machines through a role
 //! it is given), and both deleted, AWS, Cloudflare and Modal answering as they answered a real account (`fixtures/
 //! runners`, recorded 2026-10-16 with throwaway control planes, deleted after); each control plane served here.
 mod common;
@@ -35,7 +35,7 @@ fn an_aws_control_plane_gets_every_providers_runners_then_moves_to_cloudflare_as
     {
         let mut w = served.aws.workers.lock().unwrap();
         w.insert("superci.acme.workers.dev".into(), cf.url.clone());
-        // (The runner agents' health, which the dashboard waits for once each is deployed: a server here answers.)
+        // (The runner bridges' health, which the dashboard waits for once each is deployed: a server here answers.)
         for agent in ["acmeorg--superci-runners-awsplane0001.modal.run", "acmeorg--superci-runners-cfplane00004.modal.run", "superci-runners-awsplane0001.acme.workers.dev"] { w.insert(agent.into(), cf.url.clone()); }
     }
     let home = common::signed_in(&served);

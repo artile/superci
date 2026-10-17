@@ -1330,7 +1330,7 @@ impl Dashboard {
         if name.is_empty() || name.len() > 24 || !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) { return Err("A key's name is letters and digits, 24 at most (agent, ci2).".into()) }
         if !(1..=366).contains(&days) { return Err("A key lasts from 1 to 366 days.".into()) }
         let seen = view::plane_view(&plane, Some(&self.status_key));
-        if view::older(seen.version.as_deref(), "0.11.0") { return Err("Update the control plane first: keys that only read need control plane 0.11.0 or newer (`superci planes update`).".into()) }
+        if view::older(seen.version.as_deref(), "0.11.0") { return Err("Update the control plane first: read keys need control plane 0.11.0 or newer (`superci planes update`).".into()) }
         let status = seen.status.or_else(|| status_soon(plane.url(), &self.status_key)).ok_or("The control plane did not answer: try again in a few seconds")?;
         if read_keys(&status).iter().any(|(n, _)| *n == name) { return Err(format!("There is a key named {} already: `superci keys delete {}` first.", name.to_lowercase(), name.to_lowercase())) }
         // (A key that may also start runs from a computer says so after its hash.)
@@ -1366,6 +1366,69 @@ impl Dashboard {
         if name == self.status_secret { return Err("That is this computer's own key: `superci logout` takes it out.".into()) }
         let plane = self.plane()?;
         self.drop_secret(&plane, name)
+    }
+
+    /// The secrets the CI in use keeps for runs from a computer, as its control plane says them (names, scopes, last
+    /// use; never a value).
+    pub fn kept_secrets(&mut self) -> Result<Vec<serde_json::Value>> { Ok(self.kept_secrets_said()?["secrets"].as_array().cloned().unwrap_or_default()) }
+
+    /// The same with the control plane's time (`now_ms`).
+    pub fn kept_secrets_said(&mut self) -> Result<serde_json::Value> {
+        let plane = self.plane()?;
+        let seen = view::plane_view(&plane, Some(&self.status_key));
+        if view::older(seen.version.as_deref(), "0.19.13") { return Err("Update the control plane first: secrets for runs from a computer need control plane 0.19.13 or newer (`superci planes update`).".into()) }
+        cloudflare::plane_get(plane.url(), &self.status_key, "/secrets")
+    }
+
+    /// Keeps a secret for runs from a computer: a new one (`create`: refused when the name is kept with this scope
+    /// already), or a new value for one kept (not `create`: refused when it is not). It is written into the control
+    /// plane's own cloud with this computer's sign-in; nothing on this machine keeps it. Its name as kept.
+    pub fn keep_secret(&mut self, name: &str, scope: &superci_core::secrets::Scope, value: &str, create: bool) -> Result<String> {
+        use superci_core::secrets;
+        let name = secrets::valid_name(name)?;
+        secrets::valid_value(value)?;
+        let plane = self.plane()?;
+        let kept = self.kept_secrets()?;
+        let setting = secrets::setting(&name, scope);
+        let there = kept.iter().any(|s| s["setting"] == setting.as_str());
+        if create && there { return Err(format!("{name} is kept for {} already: `superci secrets update {name}` gives it a new value.", scope.said())) }
+        if !create && !there { return Err(format!("{name} is not kept for {}: `superci secrets create {name}` keeps it.", scope.said())) }
+        if create && kept.len() >= 100 { return Err("A CI keeps 100 secrets at most.".into()) }
+        let at = now_ms();
+        let text = serde_json::to_string(&secrets::Stored { name: name.clone(), value: value.to_string(), scope: scope.clone(), updated_ms: at }).map_err(|e| e.to_string())?;
+        // (Cloudflare keeps 5 KB in a secret, and hands its control plane what a run is given with the request.)
+        if matches!(plane, Plane::Cloudflare { .. }) {
+            if text.len() > 5000 { return Err("On Cloudflare a secret holds about 4.8 KB at most.".into()) }
+            let more: u64 = kept.iter().filter(|s| s["setting"] != setting.as_str()).count() as u64;
+            if more >= 12 && create { return Err("A control plane on Cloudflare keeps 12 secrets at most (it is handed them with each run).".into()) }
+        }
+        self.put_secret(&plane, &setting, &text)?;
+        for _ in 0..60 {
+            let seen = cloudflare::plane_get(plane.url(), &self.status_key, "/secrets").unwrap_or_default();
+            if seen["secrets"].as_array().into_iter().flatten().any(|s| s["setting"] == setting.as_str() && s["updated_ms"].as_u64() == Some(at)) { return Ok(name) }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Err(format!("{name} is written; the control plane has not taken it yet. Look with `superci secrets list` in a moment."))
+    }
+
+    /// A kept secret taken out (its name and scope as kept).
+    pub fn forget_secret(&mut self, name: &str, scope: &superci_core::secrets::Scope) -> Result<String> {
+        use superci_core::secrets;
+        let name = secrets::valid_name(name)?;
+        let plane = self.plane()?;
+        let kept = self.kept_secrets()?;
+        let setting = secrets::setting(&name, scope);
+        if !kept.iter().any(|s| s["setting"] == setting.as_str()) {
+            let others: Vec<&str> = kept.iter().filter(|s| s["name"] == name.as_str()).filter_map(|s| s["said"].as_str()).collect();
+            return Err(match others.is_empty() { true => format!("{name} is not kept."), false => format!("{name} is not kept for {}; it is for: {}. Say which with --repo, --branch, --workflow and --environment.", scope.said(), others.join("; ")) })
+        }
+        self.drop_secret(&plane, &setting)?;
+        for _ in 0..60 {
+            let seen = cloudflare::plane_get(plane.url(), &self.status_key, "/secrets").unwrap_or_default();
+            if !seen["secrets"].as_array().into_iter().flatten().any(|s| s["setting"] == setting.as_str()) { break }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Ok(name)
     }
 
     /// `superci logout`: what is kept on this machine is removed, after the clouds that can end a sign-in were asked
@@ -2490,8 +2553,8 @@ impl Dashboard {
                     (_, _) if own_containers => {}
                     ("modal", false) => if let Some(m) = &self.modal { if let Err(e) = modal::delete_runners(m, &id) { left.push(format!("its Modal app superci-runners-{id} ({e})")) } },
                     ("modal", true) => left.push(format!("the Modal app superci-runners-{id} in your workspace")),
-                    (_, false) => { let cf = cf.as_ref().ok_or("Sign in with Cloudflare first")?; for (a, _) in self.cf_accounts.clone() { if let Err(e) = cf.delete_runners(&a, &id) { left.push(format!("its Cloudflare runner agent ({e})")) } } }
-                    (_, true) => left.push(format!("the Cloudflare runner agent superci-runners-{id}")),
+                    (_, false) => { let cf = cf.as_ref().ok_or("Sign in with Cloudflare first")?; for (a, _) in self.cf_accounts.clone() { if let Err(e) = cf.delete_runners(&a, &id) { left.push(format!("its Cloudflare runner bridge ({e})")) } } }
+                    (_, true) => left.push(format!("the Cloudflare runner bridge superci-runners-{id}")),
                 }
                 self.views = None;
                 self.flash = Some(format!("Removed {name}.{}", if left.is_empty() { String::new() } else { format!(" Left: {}.", left.join("; ")) }));
@@ -2885,9 +2948,9 @@ impl Dashboard {
                 let state = self.updating.clone();
                 let containers = status["containers"] == true;
                 let cf_agent = status["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare"));
-                // Its runner agent in Cloudflare is updated with it, when Cloudflare is signed in to: a sign-in
+                // Its runner bridge in Cloudflare is updated with it, when Cloudflare is signed in to: a sign-in
                 // that is over stops nothing else, and is said with the result.
-                let note = if cf_agent && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare runner agent was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
+                let note = if cf_agent && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare runner bridge was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
                 *lock(&state) = Some(Update { plane: plane.plane_id().to_string(), steps, at: 0, result: None, ended_ms: 0, note });
                 // Signed in to the AWS account its machines run in: the update also gives its runner role what this
                 // version asks for (an AWS control plane's own update does that already).
@@ -2909,7 +2972,7 @@ impl Dashboard {
                             Plane::Modal { plane_id, label, .. } => modal::deploy_plane(session.as_ref().ok_or("Sign in with Modal first.")?, plane_id, label, &step)?,
                             Plane::Seen { .. } => return Err("Sign in where this control plane runs to update it".into()),
                         };
-                        // A separate Cloudflare runner agent (for a control plane elsewhere) is updated with it.
+                        // A separate Cloudflare runner bridge (for a control plane elsewhere) is updated with it.
                         if let (true, Some(cf), Some(account)) = (cf_agent && !matches!(plane, Plane::Cloudflare { .. }), &cf, &cf_account) { cf.deploy_runners(account, plane.url(), plane.plane_id())?; }
                         // An AWS control plane's machines get their own network in each of its regions too.
                         if let (Plane::Aws { .. }, Some(creds), true) = (&plane, &creds, aws_runners) { aws::make_networks(creds, plane.plane_id(), &regions)?; }
@@ -3050,7 +3113,7 @@ impl Dashboard {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
                 let keys: serde_json::Value = ureq::get(&crate::aws::stand_in(&format!("{}/.well-known/jwks.json", plane.url()))).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
-                eprintln!("Deploying the Modal runner agent (the first time builds a small image in your workspace)…");
+                eprintln!("Deploying the Modal runner bridge (the first time builds a small image in your workspace)…");
                 let url = modal::deploy_runners(&session, plane.url(), plane.plane_id(), &keys)?;
                 // Its first answer can take a few seconds (a cold start).
                 for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(std::time::Duration::from_secs(3)) }
@@ -3081,7 +3144,7 @@ impl Dashboard {
                         }
                         wait_for(plane.url(), &self.status_key, |s| s["containers"] == true && !s["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
                     }
-                    // A control plane elsewhere cannot start Cloudflare containers: a small agent in Cloudflare does.
+                    // A control plane elsewhere cannot start Cloudflare containers: a small runner bridge in Cloudflare does.
                     _ => {
                         let mut agents: Vec<superci_core::plane::Agent> = serde_json::from_value(status["agents"].clone()).unwrap_or_default();
                         // Which Cloudflare account its runners go into: the only one the sign-in reaches, or the one
@@ -3132,6 +3195,15 @@ impl Dashboard {
             // What it is called where people read it: the dashboard's header, the App's name for further
             // organizations, what it says on a job it could not run. SuperCI again by naming it that.
             // A key taken out of the CI: another computer's (its dashboard stops reaching it), or one that only reads.
+            ("POST", "/secrets/add") | ("POST", "/secrets/remove") => {
+                let scope = match superci_core::secrets::valid_scope(Some(&field("repo")), Some(&field("branch")), Some(&field("workflow")), Some(&field("environment"))) { Ok(s) => s, Err(e) => return Ok(message(400, "That cannot be its scope", &esc(&e))) };
+                let add = req.path == "/secrets/add";
+                let done = if add { self.keep_secret(&field("name"), &scope, &field("value"), true) } else { self.forget_secret(&field("name"), &scope) };
+                match done {
+                    Ok(_) => Ok(Response::redirect("/?p=settings")),
+                    Err(e) => Ok(message(409, if add { "That secret was not added" } else { "That secret was not taken out" }, &format!("{} Nothing has changed.", esc(&e)))),
+                }
+            }
             ("POST", "/keys/remove") => {
                 if !field("read").is_empty() { self.revoke_key(&field("read"))?; return Ok(Response::redirect("/?p=settings")) }
                 match self.drop_computer_key(&field("name")) {
@@ -4060,12 +4132,12 @@ mark();load()})();</script>"#;
             format!(r#"<form method="post" action="/aws/connect" class="aws-add"><details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Add</button></form>"#,
                 region_select_options("us-east-1", &self.quotas, &closest(Some(v)), self.aws_look()))
         } else { connect_action("aws") };
-        // A Modal control plane starts sandboxes itself; one elsewhere gets a small agent in your Modal workspace.
+        // A Modal control plane starts sandboxes itself; one elsewhere gets a small runner bridge in your Modal workspace.
         let own_modal = matches!(v.plane, Plane::Modal { .. });
         let modal = if agent("modal") || (own_modal && v.own_containers()) { added } else if own_modal { row_form("/runners/modal-own", "", "Add") } else if self.modal.is_some() { row_form("/runners/modal", "", "Add") }
             else if self.modal_pending.is_some() { format!(r#"{}<form method="post" action="/modal/signin"><input type="hidden" name="next"><button class="button secondary sm">Open again</button></form>"#, pill("open", "Waiting for Modal")) }
             else { connect_action("modal") };
-        let containers = if matches!(v.plane, Plane::Cloudflare { .. }) { "Containers, one per job, started by your control plane." } else { "Containers, one per job, through a small agent in your Cloudflare." };
+        let containers = if matches!(v.plane, Plane::Cloudflare { .. }) { "Containers, one per job, started by your control plane." } else { "Containers, one per job, through a small runner bridge in your Cloudflare." };
         let aws_what = match &self.aws {
             Some(a) if !v.aws => {
                 let quota = match self.quotas.get("us-east-1") { Some(Ok(n)) => format!("<br>{}", quota_text("us-east-1", *n)), _ => String::new() };
@@ -4251,7 +4323,9 @@ mark();load()})();</script>"#;
         // What the cache keeps (a control plane from before has none to say).
         let caches = if v.aws { cloudflare::plane_get(v.plane.url(), &self.status_key, "/caches").ok() } else { None };
         let keys = cloudflare::plane_get(v.plane.url(), &self.status_key, "/keys").ok();
-        format!(r#"{bar}<div class="cards">{}{}{}{}{here}</div>"#, called_card(v), limits_card(v, public), cache_card(v, caches.as_ref()), self.keys_card(keys.as_ref()))
+        // The secrets it keeps for runs from a computer (a control plane from before keeps none).
+        let secrets = if view::older(v.version.as_deref(), "0.19.13") { None } else { cloudflare::plane_get(v.plane.url(), &self.status_key, "/secrets").ok() };
+        format!(r#"{bar}<div class="cards">{}{}{}{}{}{here}</div>"#, called_card(v), limits_card(v, public), cache_card(v, caches.as_ref()), secrets_card(secrets.as_ref()), self.keys_card(keys.as_ref()))
     }
 
     /// The keys this CI takes: each computer's that looks after it (which one, when it was made and last used) and
@@ -4267,15 +4341,15 @@ mark();load()})();</script>"#;
             let mine = name == self.status_secret;
             let who = c["computer"].as_str().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| "A computer".into());
             let made = c["until_ms"].as_u64().map(|u| ago_words(now_ms().saturating_sub(u.saturating_sub(30 * 86_400_000)))).unwrap_or_default();
-            let end = if mine { pill("good", "This computer") } else { format!(r#"<form method="post" action="/keys/remove" onsubmit="return confirm('Remove this computer\'s key? Its dashboard stops reaching this CI until it opens again with its sign-in.')"><input type="hidden" name="name" value="{}"><button class="button secondary sm">Remove</button></form>"#, esc(name)) };
-            rows.push_str(&format!(r#"<div class="pick act"><span><strong>{}</strong><small>Its dashboard · made {made} · last used {}</small></span><span class="pick-end">{end}</span></div>"#, esc(&who), ago(c["last_ms"].as_u64())));
+            let end = if mine { pill("good", "This computer") } else { format!(r#"<form method="post" action="/keys/remove" onsubmit="return confirm('Remove this computer key? Its dashboard stops reaching this CI until it opens again with its sign-in.')"><input type="hidden" name="name" value="{}"><button class="button secondary sm">Remove</button></form>"#, esc(name)) };
+            rows.push_str(&format!(r#"<div class="limit"><div class="limit-text"><strong>{}</strong><small>Computer key · made {made} · last used {}</small></div><div class="limit-do">{end}</div></div>"#, esc(&who), ago(c["last_ms"].as_u64())));
         }
         for r in k["read"].as_array().into_iter().flatten() {
             let name = r["name"].as_str().unwrap_or_default();
-            rows.push_str(&format!(r#"<div class="pick act"><span><strong>{}</strong><small>{} · {}</small></span><span class="pick-end"><form method="post" action="/keys/remove"><input type="hidden" name="read" value="{}"><button class="button secondary sm">Remove</button></form></span></div>"#,
-                esc(&name.to_lowercase()), if r["runs"] == true { "Reads and starts runs (an agent's)" } else { "Reads only" }, left(r["until_ms"].as_u64()), esc(name)));
+            rows.push_str(&format!(r#"<div class="limit"><div class="limit-text"><strong>{}</strong><small>{} · {}</small></div><div class="limit-do"><form method="post" action="/keys/remove"><input type="hidden" name="read" value="{}"><button class="button secondary sm">Remove</button></form></div></div>"#,
+                esc(&name.to_lowercase()), if r["runs"] == true { "Run key: reads and starts runs from a computer" } else { "Read key: reads only" }, left(r["until_ms"].as_u64()), esc(name)));
         }
-        format!(r#"<section class="card"><div class="card-head"><h2>Keys</h2><span class="card-sub">Who reaches this CI: each computer's dashboard, and keys made for agents and scripts. Anyone signed in to its cloud account can add their own.</span></div><div class="picks">{rows}</div></section>"#)
+        format!(r#"<section class="card"><div class="card-head"><h2>Keys</h2><span class="card-sub">Who reaches this CI: each computer's key, and read and run keys made for coding agents and scripts. Anyone signed in to its cloud account can add their own.</span></div><div class="limits">{rows}</div></section>"#)
     }
 
     /// One run's page: how it stands, how long it took (its first job queued to its last over), what its machines cost,
@@ -4522,7 +4596,7 @@ mark();load()})();</script>"#;
         views
     }
 
-    /// Deletes a control plane from its cloud, and the runner agents and AWS role made for it in other clouds (those
+    /// Deletes a control plane from its cloud, and the runner bridges and AWS role made for it in other clouds (those
     /// this session is signed in to). Returns what could not be removed, in words.
     fn delete_plane(&mut self, plane: &Plane, status: &serde_json::Value) -> Result<Vec<String>> {
         self.own().check(plane)?;
@@ -4541,10 +4615,10 @@ mark();load()})();</script>"#;
         }
         let agent = |c: &str| status["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c));
         if agent("cloudflare") && !matches!(plane, Plane::Cloudflare { .. }) {
-            match self.cloudflare() { Ok(cf) => for (a, _) in self.cf_accounts.clone() { let _ = cf.delete_runners(&a, plane.plane_id()); }, Err(_) => left.push("Its Cloudflare runner agent (sign in with Cloudflare to remove it).".to_string()) }
+            match self.cloudflare() { Ok(cf) => for (a, _) in self.cf_accounts.clone() { let _ = cf.delete_runners(&a, plane.plane_id()); }, Err(_) => left.push("Its Cloudflare runner bridge (sign in with Cloudflare to remove it).".to_string()) }
         }
         if agent("modal") && !matches!(plane, Plane::Modal { .. }) {
-            match &self.modal { Some(m) => { let _ = modal::delete_runners(m, plane.plane_id()); } None => left.push("Its Modal runner agent (sign in with Modal to remove it).".into()) }
+            match &self.modal { Some(m) => { let _ = modal::delete_runners(m, plane.plane_id()); } None => left.push("Its Modal runner bridge (sign in with Modal to remove it).".into()) }
         }
         if let (Some(account), false) = (status["aws"]["account_id"].as_str(), matches!(plane, Plane::Aws { .. })) {
             match (&mut self.aws, account) {
@@ -4757,7 +4831,7 @@ mark();load()})();</script>"#;
         // In use.
         let updating_used = updating.as_ref().is_some_and(|u| u.plane == v.plane.plane_id() && !matches!(u.result, Some(Ok(_))));
         let state = if !v.online { pill("bad", "not answering") } else if v.outdated() || updating_used { update(used, v) } else { format!(r#"<span class="mono faint">{}</span>"#, esc(&v.version_name())) };
-        dialogs.push_str(&format!(r#"<dialog class="dlg" id="leave" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/leave" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Stopping…'"><div class="dlg-head"><span class="logo warn-mark">{ICON_ALERT}</span><span><strong>Stop using SuperCI?</strong><small>For good, from every cloud</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><ul class="checks stays"><li>–<span>GitHub's App is uninstalled and GitLab's projects stop sending jobs here (their webhooks and SuperCI's runners are removed).</span></li><li>–<span>Every control plane is deleted, with its history, and the runner agents and AWS roles made for them.</span></li><li>–<span>Jobs with <code>runs-on: superci</code> then wait for a runner: change them back first.</span></li></ul><label class="field"><span>Type <code>superci</code> to confirm</span><input type="text" name="confirm" autocomplete="off" required pattern="superci"></label><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Stop using SuperCI</button></div></form></dialog>"#));
+        dialogs.push_str(&format!(r#"<dialog class="dlg" id="leave" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/leave" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Stopping…'"><div class="dlg-head"><span class="logo warn-mark">{ICON_ALERT}</span><span><strong>Stop using SuperCI?</strong><small>For good, from every cloud</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><ul class="checks stays"><li>–<span>GitHub's App is uninstalled and GitLab's projects stop sending jobs here (their webhooks and SuperCI's runners are removed).</span></li><li>–<span>Every control plane is deleted, with its history, and the runner bridges and AWS roles made for them.</span></li><li>–<span>Jobs with <code>runs-on: superci</code> then wait for a runner: change them back first.</span></li></ul><label class="field"><span>Type <code>superci</code> to confirm</span><input type="text" name="confirm" autocomplete="off" required pattern="superci"></label><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Stop using SuperCI</button></div></form></dialog>"#));
         let state = if matches!(v.plane, Plane::Seen { .. }) { signin_button(v.plane.cloud(), &format!("Sign in with {}", provider_name(v.plane.cloud())), false) } else { state };
         let leave = if signed_in(v) { menu(&[("Stop using SuperCI…", "leave".to_string())]) } else { String::new() };
         let mut rows = row(" current", v, format!(r#"{state}{}{leave}"#, pill("accent", "In use")));
@@ -4791,7 +4865,7 @@ mark();load()})();</script>"#;
             let items = if signed_in(o) && !o.serves_its_own() { vec![("Delete…", format!("delete-{i}"))] } else { vec![] };
             let what = match o.plane { Plane::Cloudflare { .. } => "its Worker, its storage and its containers", Plane::Aws { .. } => "its function, table, schedule, parameters and role", _ => "its app and its Dicts" };
             if !o.serves_its_own() {
-                dialogs.push_str(&format!(r#"<dialog class="dlg" id="delete-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/delete" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Deleting…'"><input type="hidden" name="plane" value="{}"><div class="dlg-head">{}<span><strong>Delete {}?</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><p class="note">This deletes {what} from {}, and the runner agents made for it. The control plane in use, your jobs and your history are not touched.</p><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Delete</button></div></form></dialog>"#,
+                dialogs.push_str(&format!(r#"<dialog class="dlg" id="delete-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/delete" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Deleting…'"><input type="hidden" name="plane" value="{}"><div class="dlg-head">{}<span><strong>Delete {}?</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><p class="note">This deletes {what} from {}, and the runner bridges made for it. The control plane in use, your jobs and your history are not touched.</p><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Delete</button></div></form></dialog>"#,
                 esc(o.plane.plane_id()), logo(provider(o), 36), esc(&o.plane.place()), esc(o.plane.url().trim_start_matches("https://")), provider_name(provider(o))));
             }
             let end = if upd.is_empty() || end == upd { end } else { format!("{upd}{end}") };
@@ -5049,7 +5123,7 @@ fn remove_dialog(v: &PlaneView, cloud: &str, i: usize, signed_in: &[&str]) -> St
         "aws" => vec!["Its machines, and their network in each region".into(), if matches!(v.plane, Plane::Aws { .. }) { format!("The machines' policy on the role superci-plane-{id} (the control plane's own role stays)") } else { format!("The role superci-plane-{id} and its identity provider, in account {account}") }],
         _ if own => vec![],
         "modal" => vec![format!("The app superci-runners-{id} in your Modal workspace, and its sandboxes")],
-        _ => vec![format!("The runner agent superci-runners-{id} in your Cloudflare account, and its containers")],
+        _ => vec![format!("The runner bridge superci-runners-{id} in your Cloudflare account, and its containers")],
     };
     let what = if deleted.is_empty() { format!(r#"<p class="note">Nothing is deleted: your control plane stops starting {}.</p>"#, if cloud == "modal" { "sandboxes" } else { "containers" }) }
         else { format!(r#"<p class="note">Deleted in {name}:</p><ul class="needs">{}</ul>"#, deleted.iter().map(|d| format!("<li><span>{}</span></li>", esc(d))).collect::<String>()) };
@@ -5552,7 +5626,7 @@ fn clouds_card(v: &PlaneView, signed_in: &[&str]) -> String {
                 let field = if st.get("cloudflare_location").is_some() { format!(r#"<label class="field"><span>GitHub's full image (experimental)</span><input type="url" name="image" value="{}" placeholder="https://… (empty: the small image)"><small>Jobs then run inside GitHub's own runner image, with everything it has, loaded from this address as it is read and checked piece by piece (an address as <code>image-reader pack</code> names it). Empty: GitHub's small runner image, with few tools.</small></label>"#, esc(&image)) } else { String::new() };
                 (name.clone(), if image.is_empty() { "GitHub's small runner image".into() } else { "GitHub's full image (experimental)".to_string() }, field)
             }
-            _ => (name.clone(), "Its runner agent starts the sandboxes".to_string(), String::new()),
+            _ => (name.clone(), "Its runner bridge starts the sandboxes".to_string(), String::new()),
         };
         let n = 100 + i;
         rows.push_str(&format!(r#"<li class="pool still">{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now"></span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{n}').showModal()">{ICON_GEAR}</button></li>"#,
@@ -6397,6 +6471,7 @@ fn new_workspace_dialog() -> String {
     step_dialog("new-workspace", "New workspace", body).replacen(r#"onclick="if(event.target===this)this.close()""#, r#"onclick="if(event.target===this)this.close()" onclose="this.querySelector('form').reset()""#, 1)
 }
 
+const ICON_LOCK: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/></svg>"#;
 const ICON_REMOVE: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14M10 7V5h4v2M7 7l.8 12h8.4L17 7M10.5 11v5M13.5 11v5"/></svg>"#;
 const ICON_WORKSPACE: &str = r#"<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V6.5A1.5 1.5 0 0 1 5.5 5h8A1.5 1.5 0 0 1 15 6.5V20M15 10h3.5a1.5 1.5 0 0 1 1.5 1.5V20M2.5 20h19M8 9h3M8 12.5h3M8 16h3"/></svg>"#;
 
@@ -6601,6 +6676,31 @@ fn wait_for(plane_url: &str, key: &str, done: impl Fn(&serde_json::Value) -> boo
     false
 }
 
+/// The secrets the CI keeps for runs from a computer: each one's name, where it may be used, when it was set and last
+/// given to a run (and who started that run), with Remove; and Add, a dialog with its name, value and scope.
+fn secrets_card(said: Option<&serde_json::Value>) -> String {
+    let Some(said) = said else { return String::new() };
+    let now = said["now_ms"].as_u64().unwrap_or_else(now_ms);
+    let mut rows = String::new();
+    for s in said["secrets"].as_array().into_iter().flatten() {
+        let used = match s["used"]["at_ms"].as_u64() {
+            Some(at) => format!("last given to a run {}, started by {}", ago_words(now.saturating_sub(at)), esc(&s["used"]["by"].as_str().map(|b| if s["used"]["run_key"] == true { format!("the key {}", b.to_lowercase()) } else { b.to_string() }).unwrap_or_else(|| "a computer".into()))),
+            None => "not given to a run yet".into(),
+        };
+        let (name, scope) = (s["name"].as_str().unwrap_or_default(), &s["scope"]);
+        let hidden: String = ["repo", "branch", "workflow", "environment"].iter().filter_map(|k| scope[*k].as_str().map(|v| format!(r#"<input type="hidden" name="{k}" value="{}">"#, esc(v)))).collect();
+        rows.push_str(&format!(r#"<div class="limit"><div class="limit-text"><strong><code>{}</code></strong><small>{} · set {} · {used}</small></div><div class="limit-do"><form method="post" action="/secrets/remove" onsubmit="return confirm('Remove this secret? Runs from a computer stop getting it.')"><input type="hidden" name="name" value="{}">{hidden}<button class="button secondary sm">Remove</button></form></div></div>"#,
+            esc(name), esc(&capitalized(s["said"].as_str().unwrap_or_default())), ago_words(now.saturating_sub(s["updated_ms"].as_u64().unwrap_or(0))), esc(name)));
+    }
+    if rows.is_empty() { rows = r#"<div class="limit"><div class="limit-text"><strong>None kept</strong><small>A run from a computer gets the secrets its workflow names. One not kept is empty, as on GitHub.</small></div></div>"#.into() }
+    let close = r#"<button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button>"#;
+    let dialog = format!(r#"<dialog class="dlg" id="add-secret" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_LOCK}</span><span><strong>Add a secret</strong><small>Kept in your control plane's cloud, never shown again.</small></span>{close}</div><form method="post" action="/secrets/add" class="secret-form"><label>Name<input name="name" required pattern="[A-Za-z_][A-Za-z0-9_]*" title="Letters, digits and _" spellcheck="false" autocomplete="off" autocapitalize="characters" placeholder="NPM_TOKEN"></label><label>Value<textarea name="value" required rows="3" spellcheck="false" autocomplete="off" maxlength="4096"></textarea></label><details><summary>Where it may be used</summary><label>Repository<input name="repo" placeholder="acme/web" spellcheck="false" autocomplete="off"></label><label>Branch<input name="branch" placeholder="main, release/*" spellcheck="false" autocomplete="off"></label><label>Workflow<input name="workflow" placeholder="deploy.yml" spellcheck="false" autocomplete="off"></label><label>Environment<input name="environment" placeholder="production" spellcheck="false" autocomplete="off"></label></details><button class="button primary sm">Add</button></form></div></dialog>"#);
+    format!(r#"<section class="card"><div class="card-head"><h2>Secrets</h2><span class="card-sub">For runs from a computer. Jobs GitHub sends get GitHub's own.</span><button type="button" class="button secondary sm" onclick="document.getElementById('add-secret').showModal()">Add</button></div><div class="limits">{rows}</div></section>{dialog}"#)
+}
+
+/// A sentence's first letter in capitals.
+fn capitalized(s: &str) -> String { let mut c = s.chars(); c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default() }
+
 /// Every control plane's view, read in parallel (with this session's key where it was accepted).
 fn read_views(planes: &[(Plane, bool)], key: &str) -> Vec<PlaneView> {
     std::thread::scope(|s| {
@@ -6653,6 +6753,14 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     }
     for stale in cloudflare::status(to.url(), key).unwrap_or_default()["gitlabs"].as_array().into_iter().flatten().filter_map(|g| g["id"].as_str()).filter(|id| !id.is_empty() && !gitlabs.iter().any(|g| g == id)) {
         w.drop(to, &format!("GITLAB_{}", safe_id(stale)))?;
+    }
+    // The secrets it keeps for runs from a computer, each a setting of its own; one the new control plane has from
+    // before and the old one does not goes.
+    let secrets: Vec<(String, String)> = serde_json::from_value(out["secrets"].clone()).unwrap_or_default();
+    for (name, value) in &secrets { if name.starts_with("SECRET_") { w.put(to, name, value)? } }
+    let there = cloudflare::plane_get(to.url(), key, "/secrets").unwrap_or_default();
+    for stale in there["secrets"].as_array().into_iter().flatten().filter_map(|s| s["setting"].as_str()).filter(|n| !secrets.iter().any(|(k, _)| k == n)) {
+        w.drop(to, stale)?;
     }
     if old["aws_regions"].as_array().is_some_and(|r| !r.is_empty()) { w.put(to, "AWS_REGIONS", &old["aws_regions"].to_string())? }
     // Networks of the account's own for AWS's machines, and GitHub's full image for Cloudflare's containers.
@@ -8419,7 +8527,7 @@ mod tests {
         let from = PlaneView { plane: cf, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
             status: Some(serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "agents": [{ "cloud": "modal", "url": "https://m" }], "aws": { "account_id": "123456789012", "region": "us-east-1" }, "jobs": [] })) };
         let to = PlaneView { plane: aws_plane, online: true, github: false, installed: false, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(serde_json::json!({ "jobs": [] })) };
-        // Cloudflare's containers come (an agent there for the new one); Modal needs a sign-in first; AWS is the new one's own account.
+        // Cloudflare's containers come (a runner bridge there for the new one); Modal needs a sign-in first; AWS is the new one's own account.
         assert_eq!(d.carry_plan(&from, &to), vec![Carry::Comes("cloudflare"), Carry::NeedsSignIn("modal"), Carry::Comes("aws")]);
         assert!(d.move_dialog(0, &from, &to).contains(r#"<button class="button primary sm" disabled>Move</button>"#), "not before the sign-in");
         d.modal = Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() });
@@ -8617,14 +8725,14 @@ mod tests {
         let mut steps = vec![];
         assert_eq!(d.wait(Background::Update, &mut |s: &str| steps.push(s.to_string())).unwrap_err(), "AccessDenied: lambda:UpdateFunctionCode");
         assert_eq!(steps, UPDATE_AWS[..3], "a stop says the steps up to where it stopped");
-        // An update that left a part out (its runner agent in Cloudflare, whose sign-in is over) says so with its
+        // An update that left a part out (its runner bridge in Cloudflare, whose sign-in is over) says so with its
         // result, to a command and on the pages: the rest was updated.
-        let left = "Its Cloudflare runner agent was not updated: the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more.";
+        let left = "Its Cloudflare runner bridge was not updated: the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more.";
         *lock(&d.updating) = Some(Update { plane: "abcdef123456".into(), steps: &UPDATE_AWS, at: 3, result: Some(Ok(())), ended_ms: now_ms() - 11 * 60_000, note: left.into() });
         assert_eq!(d.wait(Background::Update, &mut |_| {}).unwrap(), format!("Updated to {DASHBOARD_VERSION}. {left}"));
         let updated = PlaneView { plane: d.plane_in_use().unwrap(), online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(DASHBOARD_VERSION.into()), status: None };
         let card = side_update(&updated, lock(&d.updating).as_ref(), &[], true);
-        assert!(card.contains(&format!("Updated to {DASHBOARD_VERSION}")) && card.contains("Its Cloudflare runner agent was not updated: the Cloudflare sign-in has expired."), "{card}");
+        assert!(card.contains(&format!("Updated to {DASHBOARD_VERSION}")) && card.contains("Its Cloudflare runner bridge was not updated: the Cloudflare sign-in has expired."), "{card}");
         assert_eq!(d.wait(Background::Move, &mut |_| {}).unwrap_err(), "no move was started");
     }
 

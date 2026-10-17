@@ -265,7 +265,11 @@ fn wait_ready(a: &Api, name: &str) -> Result<()> {
 
 /// A secret for the control plane: a SecureString parameter it reads (encrypted with the account's key for SSM).
 pub fn put_secret(creds: &Credentials, region: &str, plane_id: &str, secret: &str, value: &str) -> Result<()> {
-    api(creds, region).ssm("PutParameter", json!({ "Name": format!("/superci/{plane_id}/{secret}"), "Value": value, "Type": "SecureString", "Overwrite": true })).map(|_| ())
+    let mut body = json!({ "Name": format!("/superci/{plane_id}/{secret}"), "Value": value, "Type": "SecureString", "Overwrite": true });
+    // (A secret kept for runs from a computer may be larger than SSM's standard 4 KB: AWS keeps it as an advanced
+    // parameter then, at $0.05 a month.)
+    if secret.starts_with("SECRET_") { body["Tier"] = json!("Intelligent-Tiering") }
+    api(creds, region).ssm("PutParameter", body).map(|_| ())
 }
 
 pub fn delete_secret(creds: &Credentials, region: &str, plane_id: &str, secret: &str) -> Result<()> {

@@ -96,7 +96,7 @@ fn a_cloudflare_control_plane_gets_modals_runners_then_everything_moves_to_a_mod
     md.aws.params.lock().unwrap().remove("/superci/mdplane00002/CONTAINERS");
     served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
     served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00002.modal.run".into(), md.url.clone());
-    // (The Modal runner agent's health, which the dashboard waits for once it is deployed: answered by a server here.)
+    // (The Modal runner bridge's health, which the dashboard waits for once it is deployed: answered by a server here.)
     served.aws.workers.lock().unwrap().insert("acmeorg--superci-runners-cfplane00002.modal.run".into(), md.url.clone());
     let home = common::signed_in(&served);
     with_cloudflare(&home);
@@ -115,13 +115,13 @@ fn a_cloudflare_control_plane_gets_modals_runners_then_everything_moves_to_a_mod
     step("02-deploy-modal");
     let (ok, said) = run("mdplane00002", &["planes", "create", "modal"]);
     assert!(ok && said.contains("The control plane is running: https://acmeorg--superci-plane-mdplane00002.modal.run"), "{said}");
-    // The Cloudflare one: its own containers, and Modal's sandboxes through a runner agent deployed in Modal.
+    // The Cloudflare one: its own containers, and Modal's sandboxes through a runner bridge deployed in Modal.
     step("03-cf-containers");
     let (ok, said) = run("", &["runners", "create", "cloudflare", "--plane=cfplane00002"]);
     assert!(ok && said.contains("cloudflare runs jobs now."), "{said}");
     step("04-cf-modal-agent");
     let (ok, said) = run("", &["runners", "create", "modal", "--plane=cfplane00002"]);
-    assert!(ok && said.contains("Deploying the Modal runner agent") && said.contains("modal runs jobs now."), "{said}");
+    assert!(ok && said.contains("Deploying the Modal runner bridge") && said.contains("modal runs jobs now."), "{said}");
     let agents = served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == "AGENTS").map(|(_, v)| v).unwrap_or_default();
     assert!(agents.contains("\"cloud\":\"modal\"") && agents.contains("acmeorg--superci-runners-cfplane00002"), "{agents}");
     let (ok, said) = run("", &["runners", "list", "--plane=cfplane00002"]);

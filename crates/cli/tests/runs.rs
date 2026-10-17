@@ -1298,3 +1298,18 @@ fn a_tree_too_large_for_one_request_goes_in_parts_two_jobs_may_call_one_workflow
     assert!(!o.status.success() && said.contains("the control plane said 400") && said.contains("not YAML"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_run_with_a_run_key_gets_the_secrets_the_ci_keeps_and_says_which_it_names_that_are_not_set() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{}/SECRET_KEPT_ALL", superci_testkit::PLANE), &serde_json::json!({ "name": "KEPT", "value": "kept-value-0001", "updated_ms": 1 }).to_string());
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.KEPT }} ${{ secrets.NOT_KEPT }}\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && said.contains("Not set in this CI, empty as on GitHub: NOT_KEPT"), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    let run = run_of(&served);
+    let handed = loop { if let Some((_, v)) = served.store.under("rjob:").into_iter().next() { break v } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    assert_eq!(handed["message"]["variables"]["KEPT"]["value"], "kept-value-0001");
+    assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}

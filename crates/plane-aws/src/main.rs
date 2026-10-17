@@ -1,5 +1,5 @@
 //! A SuperCI control plane on AWS Lambda (provided.al2023, arm64): GitHub's webhooks arrive through the function's
-//! URL; state is one DynamoDB table; secrets (the GitHub App, runner agents, dashboard keys) are SecureString parameters
+//! URL; state is one DynamoDB table; secrets (the GitHub App, runner bridges, dashboard keys) are SecureString parameters
 //! under /superci/<id>/ in SSM Parameter Store, written by the dashboard; a schedule calls the sweep every minute,
 //! and the function calls itself for a sweep sooner than that (see `Scheduled`). Machines in this account are
 //! started with the function's own role, so AWS needs no OpenID Connect here.

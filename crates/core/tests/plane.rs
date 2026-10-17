@@ -2012,7 +2012,7 @@ fn with_on_demand_turned_off_and_nothing_else_in_the_order_the_job_waits_for_a_s
 
 #[test]
 fn a_provider_that_cannot_start_the_machine_sends_the_job_to_the_next_in_the_order() {
-    // Cloudflare's runner agent fails every launch (a hiccup of its own). The order: Cloudflare, then AWS.
+    // Cloudflare's runner bridge fails every launch (a hiccup of its own). The order: Cloudflare, then AWS.
     let down = std::cell::Cell::new(true);
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (down.get() && r.url == "https://runners.acme.workers.dev/launch").then(|| Response::new(503, "text/plain", "containers temporarily unavailable")));
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
@@ -2042,7 +2042,7 @@ fn a_provider_that_cannot_start_the_machine_sends_the_job_to_the_next_in_the_ord
     let j = job(&store, 7);
     let e = j["error"].as_str().unwrap().to_string();
     assert_eq!((j["state"].as_str(), j["retries"].as_u64()), (Some("waiting"), Some(1)), "{j}");
-    assert!(e.contains("no provider could start its machine: Cloudflare: cloudflare runner agent: 503 containers temporarily unavailable; AWS: UnauthorizedOperation") && !e.contains("AWS on-demand"), "said once for AWS: {e}");
+    assert!(e.contains("no provider could start its machine: Cloudflare: cloudflare runner bridge: 503 containers temporarily unavailable; AWS: UnauthorizedOperation") && !e.contains("AWS on-demand"), "said once for AWS: {e}");
     assert_eq!(j["failed_at"], serde_json::json!(["cloudflare", "aws", "aws-on-demand"]));
     block_on(plane.alarm()).unwrap();
     block_on(plane.alarm()).unwrap();
@@ -2075,7 +2075,7 @@ fn a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fa
     let j = job(&store, 7);
     let e = j["error"].as_str().unwrap().to_string();
     assert_eq!((j["state"].as_str(), j["retries"].as_u64().unwrap_or(0)), (Some("failed"), 0), "{j}");
-    assert!(e.starts_with("no provider could start its machine: Modal: modal runner agent: 400 GPUs need a payment method; AWS: AWS lets this account run no GPU machines yet"), "{e}");
+    assert!(e.starts_with("no provider could start its machine: Modal: modal runner bridge: 400 GPUs need a payment method; AWS: AWS lets this account run no GPU machines yet"), "{e}");
 }
 
 #[test]
@@ -3644,6 +3644,78 @@ fn a_key_for_coding_agents_starts_runs_within_the_control_planes_own_limits() {
     assert!(!store.0.borrow().values().any(|v| v.contains("a-secret-value-0001")), "nothing of it left once cancelled");
     // A key of the form 0.18.0 made (with limits of its own) is no key now.
     assert!(superci_core::plane::read_key("READ_KEY_4102444800_OLD", &format!("{}:runs:16:10", superci_core::crypto::sha256_hex(key.as_bytes()))).is_none());
+}
+
+#[test]
+fn the_secrets_a_ci_keeps_go_to_the_runs_from_a_computer_that_name_them_the_narrowest_under_each_name() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    // Kept as the dashboard writes them: one setting each, by name and scope.
+    let kept = |name: &str, value: &str, scope: serde_json::Value| {
+        let s: superci_core::secrets::Stored = serde_json::from_value(serde_json::json!({ "name": name, "value": value, "updated_ms": 1 }).as_object().unwrap().clone().into_iter().chain(scope.as_object().unwrap().clone()).collect::<serde_json::Map<_, _>>().into()).unwrap();
+        (superci_core::secrets::setting(name, &s.scope), serde_json::to_string(&s).unwrap())
+    };
+    config.read_settings(&[
+        ("DASHBOARD_KEY_4102444800_abc".into(), "dashboard-session-key-1".into()),
+        kept("TOKEN", "token-all-0001", serde_json::json!({})),
+        kept("TOKEN", "token-app-0002", serde_json::json!({ "repo": "Acme/App" })),
+        kept("TOKEN", "token-prod-0003", serde_json::json!({ "environment": "production" })),
+        kept("NPM_TOKEN", "npm-release-0004", serde_json::json!({ "branch": "release/*" })),
+        kept("NPM_TOKEN", "npm-ci-0005", serde_json::json!({ "workflow": "ci.yml" })),
+        kept("UNNAMED", "unnamed-0006", serde_json::json!({})),
+        kept("OTHER", "other-0007", serde_json::json!({ "repo": "acme/web" })),
+        ("SECRET_BROKEN_ALL".into(), "not json".into()),
+        ("MOVE_TOKEN".into(), "move-token-0123456789".into()),
+    ]);
+    assert_eq!(config.secrets.len(), 7);
+    block_on(store.put("dkey:DASHBOARD_KEY_4102444800_abc", serde_json::json!({ "computer": "Build Mac" }).to_string())).unwrap();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let workflow = "jobs:\n  test:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.token }} ${{ secrets.NPM_TOKEN }} ${{ secrets.MISSING }} ${{ secrets.OTHER }}\n  deploy:\n    runs-on: superci\n    environment:\n      name: ${{ 'production' }}\n    steps:\n      - run: echo ${{ secrets.TOKEN }}\n";
+    let made = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1")
+        .with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main", "secrets": [["npm_token", "npm-cli-0008"]] }).to_string())));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    // Named and neither kept for this run nor given: said (and empty, as on GitHub).
+    assert_eq!(json(&made)["missing_secrets"], serde_json::json!(["MISSING", "OTHER"]));
+    let run_id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let record: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{run_id}")]).unwrap();
+    let secrets_of = |i: usize| -> Vec<(String, String)> {
+        let h: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("rjob:{}", record["jobs"][i]["token"].as_str().unwrap())]).unwrap();
+        let mut v: Vec<(String, String)> = h["message"]["variables"].as_object().unwrap().iter().filter(|(_, v)| v["isSecret"] == true).map(|(k, v)| (k.clone(), v["value"].as_str().unwrap().to_string())).collect();
+        v.sort();
+        v
+    };
+    // The repository's over the CI's; the value given with the run over any kept; the environment's for the job that
+    // has it.
+    assert_eq!(secrets_of(0), [("TOKEN".to_string(), "token-app-0002".to_string()), ("npm_token".into(), "npm-cli-0008".into())]);
+    assert_eq!(secrets_of(1), [("TOKEN".to_string(), "token-prod-0003".to_string()), ("npm_token".into(), "npm-cli-0008".into())]);
+    // What the run does not name, or may not have, is nowhere in it.
+    assert!(!store.0.borrow().values().any(|v| v.contains("unnamed-0006") || v.contains("other-0007") || v.contains("npm-release-0004")));
+    // Whoever looks after the CI sees names, scopes and each one's last use (the run, who started it), never a value;
+    // nobody else sees them.
+    let listed = block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/secrets")).with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert_eq!(listed.status, 200);
+    assert!(!listed.body_text().contains("-000"), "{}", listed.body_text());
+    let l = json(&listed);
+    let rows: Vec<(String, String, Option<String>)> = l["secrets"].as_array().unwrap().iter().map(|s| (s["name"].as_str().unwrap().to_string(), s["said"].as_str().unwrap().to_string(), s["used"]["by"].as_str().map(str::to_string))).collect();
+    assert_eq!(rows, [
+        ("NPM_TOKEN".to_string(), "branch release/*".to_string(), None), ("NPM_TOKEN".into(), "workflow ci.yml".into(), Some("Build Mac".into())),
+        ("OTHER".into(), "repo acme/web".into(), None),
+        ("TOKEN".into(), "environment production".into(), Some("Build Mac".into())), ("TOKEN".into(), "every run".into(), Some("Build Mac".into())), ("TOKEN".into(), "repo Acme/App".into(), Some("Build Mac".into())),
+        ("UNNAMED".into(), "every run".into(), None),
+    ]);
+    assert_eq!(l["secrets"][1]["used"]["run_id"], run_id.as_str());
+    assert_eq!(block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/secrets")))).status, 404);
+    // A move carries them along, as kept.
+    let carried = json(&block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/move/export")).with_header("authorization", "Bearer dashboard-session-key-1").with_header("x-move-token", "move-token-0123456789"))));
+    let names: Vec<&str> = carried["secrets"].as_array().unwrap().iter().map(|p| p[0].as_str().unwrap()).collect();
+    assert!(names.len() == 7 && names.iter().all(|n| n.starts_with("SECRET_")), "{names:?}");
+    assert!(carried["secrets"][0][1].as_str().unwrap().contains("-000"));
+    // Cancelled, the run keeps nothing of them.
+    let cancelled = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs/{run_id}/cancel")).with_header("authorization", "Bearer dashboard-session-key-1")));
+    assert_eq!(cancelled.status, 200);
+    assert!(!store.0.borrow().values().any(|v| v.contains("token-") || v.contains("npm-")), "nothing of them left once cancelled");
 }
 
 #[test]

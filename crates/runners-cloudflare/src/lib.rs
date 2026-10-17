@@ -1,4 +1,4 @@
-//! A SuperCI runner agent on Cloudflare: one container per job (GitHub's runner, registered just in time for that
+//! A SuperCI runner bridge on Cloudflare: one container per job (GitHub's runner, registered just in time for that
 //! job), started when a control plane asks. It trusts one control plane the way AWS does: a token that control plane
 //! signed (ES256; its public keys pinned here when the dashboard set this agent up), for this agent's URL, from its
 //! subject, unexpired.
@@ -31,7 +31,7 @@ fn verify(req: &Request, env: &Env) -> std::result::Result<(), String> {
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let path = req.path();
     if req.method() == Method::Get && path == "/health" { return Response::from_json(&serde_json::json!({ "agent": "cloudflare" })) }
-    if req.method() != Method::Post || !["/launch", "/stop"].contains(&path.as_str()) { return Response::error("SuperCI runner agent: nothing here", 404) }
+    if req.method() != Method::Post || !["/launch", "/stop"].contains(&path.as_str()) { return Response::error("SuperCI runner bridge: nothing here", 404) }
     if let Err(e) = verify(&req, &env) { return Response::error(format!("not allowed: {e}"), 401) }
     let body: serde_json::Value = req.json().await?;
     let id = if path == "/launch" { body["name"].as_str() } else { body["id"].as_str() }.ok_or("no runner name")?.to_string();

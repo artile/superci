@@ -12,6 +12,9 @@ fn until(what: &str, holds: impl Fn() -> bool) {
     while !holds() { assert!(std::time::Instant::now() < end, "waited for {what}"); std::thread::sleep(std::time::Duration::from_millis(100)) }
 }
 
+/// What the page shows (anywhere in it) holds `words`.
+fn page_shows(words: &str) -> String { format!("document.body && document.body.innerText.includes({})", serde_json::json!(words)) }
+
 /// What the page's main part shows holds `words`.
 fn shows(words: &str) -> String { format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words)) }
 
@@ -492,6 +495,54 @@ fn a_new_workspace_signed_in_to_an_account_with_cis_in_it_picks_one_and_looks_af
     b.wait(&shows("This workspace looks after"));
     let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/globex/sign-ins.json")).unwrap()).unwrap();
     assert_eq!(kept["plane"]["Aws"]["plane_id"], "testplane0002", "{kept}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_secret_for_runs_from_a_computer_is_added_in_settings_listed_without_its_value_and_removed() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let kept = || served.aws.settings(PLANE).into_iter().filter(|(k, _)| k.starts_with("SECRET_")).collect::<Vec<_>>();
+    b.goto(&link);
+    b.wait(&page_shows("Usage"));
+    b.click("nav a", "Settings");
+    b.wait(&page_shows("None kept"));
+
+    // Added in its dialog, for one repository's release branches.
+    b.click(r#"button[onclick*="'add-secret'"]"#, "Add");
+    b.wait("document.getElementById('add-secret').open");
+    b.fill("#add-secret input[name=name]", "deploy_key");
+    b.fill("#add-secret textarea[name=value]", "deploy-value-0001");
+    b.eval("document.querySelector('#add-secret details').open = true");
+    b.fill("#add-secret input[name=repo]", "acme/app");
+    b.fill("#add-secret input[name=branch]", "release/*");
+    b.click("#add-secret button.primary", "Add");
+    b.wait(&page_shows("DEPLOY_KEY"));
+    let settings = kept();
+    assert!(settings.len() == 1 && settings[0].1.contains("deploy-value-0001") && settings[0].1.contains("release/*"), "{settings:?}");
+    let main = b.text("body");
+    assert!(main.contains("Repo acme/app, branch release/*") && main.contains("not given to a run yet") && !main.contains("deploy-value"), "{main}");
+    // A name GitHub would refuse is refused here, and nothing changes.
+    b.click(r#"button[onclick*="'add-secret'"]"#, "Add");
+    b.wait("document.getElementById('add-secret').open");
+    b.fill("#add-secret input[name=name]", "GITHUB_TOKEN");
+    b.fill("#add-secret textarea[name=value]", "x");
+    b.click("#add-secret button.primary", "Add");
+    b.wait(&page_shows("That secret was not added"));
+    assert_eq!(kept().len(), 1);
+    b.click("a", "Back");
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Settings");
+    b.wait(&page_shows("DEPLOY_KEY"));
+
+    // Removed.
+    b.eval("window.confirm = () => true");
+    b.click(r#"form[action="/secrets/remove"] button"#, "Remove");
+    b.wait(&page_shows("None kept"));
+    assert!(kept().is_empty());
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
