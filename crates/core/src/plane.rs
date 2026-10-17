@@ -2769,7 +2769,7 @@ impl<'a> ControlPlane<'a> {
             job.error = None;
             job.cloud = cloud_of(&places[0].1);
             job.on_demand = places[0].0 == AWS_ON_DEMAND;
-            let name = format!("{}-{}{}{}", runner_prefix(self.config.name(), &self.config.plane_id), if gitlab { "gl" } else { "" }, if gitlab { gitlab::local(&job.gitlab, job.job_id) } else { job.job_id.to_string() }, job.runner_suffix);
+            let mut name = format!("{}-{}{}{}", runner_prefix(self.config.name(), &self.config.plane_id), if gitlab { "gl" } else { "" }, if gitlab { gitlab::local(&job.gitlab, job.job_id) } else { job.job_id.to_string() }, job.runner_suffix);
             let work = if job.provider == "local" {
                 // A run from a computer: its runner takes the job from this control plane, at its own address.
                 let token = job.local.clone().ok_or("a run from a computer without its address")?;
@@ -2791,7 +2791,21 @@ impl<'a> ControlPlane<'a> {
                 let token = self.installation_token(app, job.installation_id).await?;
                 // Where GitHub's own runners check out code (Windows: the runner's own folder).
                 let folder = if spec.os() == "windows" { "_work" } else { "/home/runner/work" };
-                let (jit, runner_id) = github::jit_config(self.http, &app.api(), &token, &owner, &job.repo, &name, &[&label], folder).await?;
+                // Registered at GitHub on an earlier try that started no machine (it waited for spot): taken out
+                // first, as GitHub takes a runner's name once ("already exists").
+                if job.machine_id.is_none() && job.runner.as_deref() == Some(name.as_str()) && job.runner_id.is_some() {
+                    if let Some(rid) = job.runner_id { let _ = github::delete_runner(self.http, &app.api(), &token, &owner, &job.repo, rid).await; }
+                    job.runner_id = None;
+                }
+                // (Still taken, by a registration this control plane no longer knows of: a name of its own.)
+                let (jit, runner_id) = match github::jit_config(self.http, &app.api(), &token, &owner, &job.repo, &name, &[&label], folder).await {
+                    Err(e) if e.contains("already exists") => {
+                        job.runner_suffix = format!("-r{}", self.clock.now_ms() % 100_000);
+                        name = format!("{}-{}{}", runner_prefix(self.config.name(), &self.config.plane_id), job.job_id, job.runner_suffix);
+                        github::jit_config(self.http, &app.api(), &token, &owner, &job.repo, &name, &[&label], folder).await?
+                    }
+                    r => r?,
+                };
                 job.runner = Some(name.clone());
                 job.runner_id = Some(runner_id);
                 self.keep(&key, &*job).await?;

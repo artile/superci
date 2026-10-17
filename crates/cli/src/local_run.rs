@@ -313,6 +313,8 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
     let mut logs: Vec<Lines> = vec![];
     let mut ended_at: Vec<Option<std::time::Instant>> = vec![];
     let mut over_at: Option<std::time::Instant> = None;
+    // (Said once: the run is over, and its summary waits for what its runner still sends.)
+    let mut told_waiting = false;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let cursor = after.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
@@ -373,7 +375,10 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
         if st["over"] == true && over_at.is_none() { over_at = Some(std::time::Instant::now()) }
         // (And for each step's result, which its runner may send after the job has ended too.)
         let results_missing = jobs.iter().any(|j| j["result"].is_string() && !["skipped", "cancelled"].contains(&j["result"].as_str().unwrap_or_default()) && j["steps"].as_array().is_some_and(|ss| ss.iter().any(|s| s["result"].is_null() && s["start"].is_string())));
-        if st["over"] == true && (logs.iter().any(|l| !l.complete()) || results_missing) && over_at.is_some_and(|t| t.elapsed().as_secs() <= logs_wait_s()) { continue }
+        if st["over"] == true && (logs.iter().any(|l| !l.complete()) || results_missing) && over_at.is_some_and(|t| t.elapsed().as_secs() <= logs_wait_s()) {
+            if !told_waiting && over_at.is_some_and(|t| t.elapsed().as_secs() >= 2) { say("The run is over; its summary comes once its runner has sent the steps' logs (a minute at most)."); told_waiting = true }
+            continue
+        }
         if st["over"] == true {
             let (result, took) = (st["result"].as_str().unwrap_or_default().to_string(), began.elapsed().as_secs());
             // Each job's steps, how each went and how long it took; a failed step's last lines when they were not

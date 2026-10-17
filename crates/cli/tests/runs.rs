@@ -1336,5 +1336,7 @@ fn a_step_whose_result_never_came_is_judged_by_its_own_lines_and_its_failed_test
     assert!(!out.status.success(), "{quiet}");
     assert!(quiet.contains("✗ Run the tests") && quiet.contains("✗ [chromium] adds an item (e2e/cart.spec.ts:4:3)") && quiet.contains("Error: expected 2, got 1"), "{quiet}");
     assert!(quiet.contains("Failed: Run the tests") && quiet.contains("Tests: 1 failed, 1 passed (playwright)"), "{quiet}");
+    // (While it waited for that result, the run was said to be over, its summary still to come.)
+    assert!(quiet.contains("The run is over; its summary comes once its runner has sent the steps' logs"), "{quiet}");
     let _ = std::fs::remove_dir_all(&dir);
 }

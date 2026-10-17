@@ -49,7 +49,20 @@ impl Http for FakeClouds {
         // A public repository's runs: one from the repository itself, one from a fork's pull request.
         if u == "https://api.github.com/repos/acme/site-public/actions/runs/3" { return Ok(Response::new(200, "application/json", serde_json::json!({ "event": "push", "repository": { "id": 1 }, "head_repository": { "id": 1 } }).to_string())); }
         if u == "https://api.github.com/repos/acme/docs-public/actions/runs/3" { return Ok(Response::new(200, "application/json", serde_json::json!({ "event": "pull_request", "repository": { "id": 2 }, "head_repository": { "id": 99 } }).to_string())); }
-        if u.ends_with("/orgs/acme/actions/runners/generate-jitconfig") { return json(serde_json::json!({ "encoded_jit_config": "JITCONFIG+/=", "runner": { "id": 5 } })); }
+        if u.ends_with("/orgs/acme/actions/runners/generate-jitconfig") {
+            // Runners 5, 101, 102, … in the order they are registered. A name GitHub has registered already, and not
+            // deleted since (by that runner's id), is refused, as GitHub refuses it.
+            let name = |b: &str| serde_json::from_str::<serde_json::Value>(b).ok().and_then(|v| v["name"].as_str().map(str::to_string));
+            let calls = self.calls.borrow();
+            let earlier = &calls[..calls.len() - 1];
+            let registered: Vec<(usize, Option<String>)> = earlier.iter().enumerate().filter(|(_, c)| c.1.ends_with("/orgs/acme/actions/runners/generate-jitconfig")).map(|(i, c)| (i, name(&c.2))).collect();
+            let id_of = |n: usize| if n == 0 { 5 } else { 100 + n as u64 };
+            if let Some((k, (at, _))) = registered.iter().enumerate().rev().find(|(_, (_, n))| *n == name(&body)) {
+                let deleted = earlier[at + 1..].iter().any(|c| c.0 == "DELETE" && c.1.ends_with(&format!("/actions/runners/{}", id_of(k))));
+                if !deleted { return Ok(Response::new(409, "application/json", serde_json::json!({ "message": format!("Already exists - A runner with the name {} already exists.", name(&body).unwrap_or_default()), "status": "409" }).to_string())) }
+            }
+            return json(serde_json::json!({ "encoded_jit_config": "JITCONFIG+/=", "runner": { "id": id_of(registered.len()) } }));
+        }
         if u == "https://gitlab.example/api/v4/projects/380/jobs/1977" {
             assert_eq!(r.header("private-token"), Some("glpat-test"));
             return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 1977, "status": "pending", "tag_list": ["superci/cpu=2", "docker"] }).to_string()));
@@ -2401,7 +2414,7 @@ fn a_machine_nobody_waits_for_is_ended_at_the_first_sweep_after_it_had_time_to_c
     let said: RefCell<BTreeMap<u64, serde_json::Value>> = RefCell::default();
     let busy = std::cell::Cell::new(false);
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| {
-        if r.url == "https://api.github.com/orgs/acme/actions/runners/5" && r.method == "GET" { return Some(Response::new(200, "application/json", serde_json::json!({ "id": 5, "busy": busy.get() }).to_string())) }
+        if let (Some(id), "GET") = (r.url.strip_prefix("https://api.github.com/orgs/acme/actions/runners/").and_then(|i| i.parse::<u64>().ok()), r.method.as_str()) { return Some(Response::new(200, "application/json", serde_json::json!({ "id": id, "busy": busy.get() }).to_string())) }
         let id: u64 = r.url.strip_prefix("https://api.github.com/repos/acme/app/actions/jobs/")?.parse().ok()?;
         Some(Response::new(200, "application/json", said.borrow().get(&id).cloned().unwrap_or(serde_json::json!({ "status": "queued" })).to_string()))
     });
@@ -2430,7 +2443,7 @@ fn a_machine_nobody_waits_for_is_ended_at_the_first_sweep_after_it_had_time_to_c
     assert_eq!((job(&store, 7)["state"].as_str(), job(&store, 7).get("for_job"), stops(), starts()), (Some("done"), None, 1, 2));
     assert!(own.0.borrow().contains(&format!("stop {}", runner(7))));
 
-    // A machine whose job GitHub has on it, the event lost: found running, as if told. (Job 17's runner is runner 5.)
+    // A machine whose job GitHub has on it, the event lost: found running, as if told.
     run(job_event("queued", 17, "acme/app", None));
     says(17, serde_json::json!({ "status": "in_progress", "runner_name": runner(17) }));
     sweep_after(61_000);
