@@ -87,6 +87,10 @@ fn setup_switches_a_machines_docker_to_the_layers_service_and_off_puts_it_back()
     // (A kernel before 6.12, as GitHub's runners have, mounts no EROFS file: said, and Docker left as it comes, as on
     // such a machine. Ubuntu 26.04's mounts them.)
     if said.contains("the kernel does not mount an EROFS file") {
+        // (Only a kernel before 6.12 may say so: 6.12 mounts EROFS files.)
+        let kernel = m.sh("uname -r");
+        let (major, minor) = { let mut v = kernel.split(['.', '-']).map(|n| n.parse::<u32>().unwrap_or(0)); (v.next().unwrap_or(0), v.next().unwrap_or(0)) };
+        assert!((major, minor) < (6, 12), "kernel {kernel} mounts EROFS files, yet: {said}");
         assert!(o.status.success() && said.contains("superci-layers: off: "), "{said}");
         assert_eq!(m.sh("docker info -f '{{.Driver}}'"), stock);
         return
