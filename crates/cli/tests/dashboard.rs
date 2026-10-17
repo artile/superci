@@ -147,3 +147,36 @@ fn a_page_asked_for_often_still_shows_what_happened_a_few_seconds_ago() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// What the Runners and Settings pages' forms change, each as its page posts it: where jobs go (the default cloud, a
+/// rule for repositories, taken out again), a read key taken out, a repository's cache entries taken out; and what is
+/// refused, with nothing changed (a repository that is no repository, an unknown change, a budget choice AWS has not).
+#[test]
+fn the_routing_keys_and_cache_forms_change_the_control_plane() {
+    let served = superci_testkit::serve(|_| {});
+    let home = common::signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let routing = || served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").and_then(|(_, v)| serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_default();
+    let post = |path: &str, fields: &[(&str, &str)]| common::post(&link, path, fields);
+    assert!(post("/routing", &[("action", "default"), ("cloud", "aws")]).0 < 400);
+    assert_eq!(routing()["default"], "aws");
+    assert!(post("/routing", &[("action", "add"), ("repo", "acme/*"), ("cloud", "cloudflare")]).0 < 400);
+    assert_eq!(routing()["rules"], serde_json::json!([{ "repo": "acme/*", "cloud": "cloudflare" }]));
+    let (status, _, said) = post("/routing", &[("action", "add"), ("repo", "not a repository"), ("cloud", "aws")]);
+    assert!(status == 400 && common::words(&said).contains("A repository is owner/name, owner/* or *"), "{status} {}", common::words(&said));
+    assert!(post("/routing", &[("action", "remove"), ("repo", "acme/*")]).0 < 400);
+    assert_eq!(routing()["rules"], serde_json::json!([]));
+    assert_eq!(post("/routing", &[("action", "nothing-like-it")]).0, 400);
+    let (status, _, said) = post("/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "maybe")]);
+    assert!(status == 400 && common::words(&said).contains("What AWS does at the limit is none, emails or stops"), "{status} {}", common::words(&said));
+    // A read key taken out from Settings → Keys.
+    let read = |n: &str| served.aws.settings(superci_testkit::PLANE).iter().any(|(k, _)| k.starts_with("READ_KEY_") && k.ends_with(n));
+    assert!(read("_AGENT"));
+    assert!(post("/keys/remove", &[("read", "agent")]).0 < 400);
+    assert!(!read("_AGENT"));
+    // A repository's cache entries taken out (from the control plane's own store).
+    let (status, to, _) = post("/caches/delete", &[("repo", "acme/app")]);
+    assert!(status == 303 && to.contains("p=settings"), "{status} {to}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
