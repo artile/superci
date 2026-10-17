@@ -291,18 +291,84 @@ fn action(target: &str, asked: &str) -> String {
 }
 
 impl Aws {
+    /// Modal's answer to one call (`method`, its request's message), as a recording has it: each answer's message, or
+    /// Modal's refusal as a gRPC status (its code and message).
+    fn modal_answer(&self, method: &str, message: &[u8]) -> (Vec<Vec<u8>>, Option<(u32, String)>) {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let url = format!("https://api.modal.com/modal.client.ModalClient/{method}");
+        let asked = b64.encode(message);
+        // (What a Modal settings Dict is given, kept: a Modal control plane served here reads it.)
+        if method == "DictUpdate" { for (k, v) in modal_entries(message) { self.modal_settings.lock().unwrap().insert(k, v); } }
+        let (status, _, answer) = self.replay("POST", &url, "", &asked).unwrap_or_else(|| {
+            self.unanswered.lock().unwrap().push(format!("POST {url}"));
+            (404, vec![], json!({ "error": format!("Modal {method}: the test kit's Modal has no answer for it") }).to_string())
+        });
+        self.asked.lock().unwrap().push(json!({ "method": "POST", "url": url, "target": "", "asked": asked, "status": status, "answer": answer }));
+        let v: Value = serde_json::from_str(&answer).unwrap_or_default();
+        // (A refusal is recorded as the CLI said it: "Modal METHOD: …", or a sign-in Modal no longer takes, code 16.)
+        if let Some(e) = v["error"].as_str() {
+            let said = format!("Modal {method}: ");
+            return match e.find(&format!("(Modal {method}: ")) {
+                Some(at) if e.contains("no longer accepted") => (vec![], Some((16, e[at + 1 + said.len()..].trim_end_matches(')').to_string()))),
+                _ => (vec![], Some((2, e.strip_prefix(&said).unwrap_or(e).to_string()))),
+            }
+        }
+        (v["answers"].as_array().into_iter().flatten().filter_map(|a| b64.decode(a.as_str()?).ok()).collect(), None)
+    }
+
+    /// One HTTP/2 connection, each request a gRPC call to Modal (`modal_answer`): its message out of gRPC's frame, each
+    /// answer framed, then its status in the trailers.
+    fn serve_grpc(&self, stream: TcpStream) {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        let a = self.clone();
+        rt.block_on(async move {
+            if stream.set_nonblocking(true).is_err() { return }
+            let Ok(s) = tokio::net::TcpStream::from_std(stream) else { return };
+            let Ok(mut conn) = h2::server::handshake(s).await else { return };
+            while let Some(Ok((req, mut respond))) = conn.accept().await {
+                let a = a.clone();
+                tokio::spawn(async move {
+                    let method = req.uri().path().rsplit('/').next().unwrap_or_default().to_string();
+                    let mut body = req.into_body();
+                    let mut data = vec![];
+                    while let Some(Ok(chunk)) = body.data().await { let _ = body.flow_control().release_capacity(chunk.len()); data.extend_from_slice(&chunk); }
+                    // (gRPC's frame: a flag, four bytes of length, the message.)
+                    let (answers, refused) = a.modal_answer(&method, data.get(5..).unwrap_or_default());
+                    let Ok(mut send) = respond.send_response(http::Response::builder().status(200).header("content-type", "application/grpc").body(()).unwrap(), false) else { return };
+                    for m in &answers {
+                        let mut f = vec![0u8];
+                        f.extend((m.len() as u32).to_be_bytes());
+                        f.extend(m);
+                        let _ = send.send_data(bytes::Bytes::from(f), false);
+                    }
+                    let mut trailers = http::HeaderMap::new();
+                    let (code, message) = refused.unwrap_or((0, String::new()));
+                    trailers.insert("grpc-status", code.to_string().parse().unwrap());
+                    // (Its message percent-encoded where gRPC asks it to be.)
+                    let encoded: String = message.bytes().map(|b| if (0x20..0x7f).contains(&b) && b != b'%' { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+                    if code != 0 { if let Ok(v) = encoded.parse() { trailers.insert("grpc-message", v); } }
+                    let _ = send.send_trailers(trailers);
+                });
+            }
+        });
+    }
+
     pub fn serve() -> Aws {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let recorded = include_str!("../../cli/fixtures/aws/settings/dashboard.jsonl").lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
         let aws = Aws { url: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), recorded: Arc::new(Mutex::new(recorded)), ..Default::default() };
         let a = aws.clone();
         std::thread::spawn(move || for stream in listener.incoming().flatten() {
+            // HTTP/2 (its preface first): Modal's API over gRPC, as the CLI calls it.
+            let mut first = [0u8; 3];
+            if stream.peek(&mut first).is_ok_and(|n| n == 3) && &first == b"PRI" { let a = a.clone(); std::thread::spawn(move || a.serve_grpc(stream)); continue }
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
             // Cloudflare's API and its container registry, GitHub's (where its runner image is), and Modal's API (its
             // calls as the CLI sends them to a stand-in), as a recording has them (what is not there is unanswered).
-            if ["api.cloudflare.com", "dash.cloudflare.com", "registry.cloudflare.com", "ghcr.io", "api.modal.com"].contains(&host.as_str()) {
+            if ["api.cloudflare.com", "dash.cloudflare.com", "registry.cloudflare.com", "ghcr.io"].contains(&host.as_str()) {
                 let url = format!("https:/{target}");
                 let asked = String::from_utf8_lossy(&body).to_string();
                 // (A Worker's secrets kept as written: what a control plane served here reads as its settings.)
@@ -315,10 +381,6 @@ impl Aws {
                         ("DELETE", "") => { kept.remove(script); }
                         _ => {}
                     }
-                }
-                // (What a Modal settings Dict is given, kept: a Modal control plane served here reads it.)
-                if url.ends_with("/DictUpdate") {
-                    for (k, v) in modal_entries(&{ use base64::Engine; base64::engine::general_purpose::STANDARD.decode(asked.trim()).unwrap_or_default() }) { a.modal_settings.lock().unwrap().insert(k, v); }
                 }
                 let (status, said, answer) = a.replay(&method, &url, "", &asked).unwrap_or_else(|| {
                     a.unanswered.lock().unwrap().push(format!("{method} {url}"));

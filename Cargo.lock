@@ -2087,10 +2087,14 @@ version = "0.19.14"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "futures",
+ "h2",
+ "http",
  "libc",
  "serde_json",
  "superci-core",
+ "tokio",
  "url",
 ]
 

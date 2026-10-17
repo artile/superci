@@ -103,35 +103,23 @@ impl Session {
     }
 }
 
-/// `stand_in`: in a debug build with `SUPERCI_STAND_IN`, where each call goes instead (the test kit's, which answers
-/// as a recording has it); no connection to Modal is made then.
-struct Client { rt: tokio::runtime::Runtime, channel: Option<Channel>, session: Option<Session>, auth_token: Option<String>, stand_in: Option<String> }
+/// In a debug build with `SUPERCI_STAND_IN`, calls go there instead, over gRPC as to Modal (the test kit's, which
+/// answers as a recording has it): the same calls, without TLS.
+struct Client { rt: tokio::runtime::Runtime, channel: Option<Channel>, session: Option<Session>, auth_token: Option<String> }
 
 impl Client {
     fn new(session: Option<Session>) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
         #[cfg(debug_assertions)]
-        let stand_in = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty());
-        #[cfg(not(debug_assertions))]
-        let stand_in: Option<String> = None;
-        if stand_in.is_some() { return Ok(Client { rt, channel: None, session, auth_token: None, stand_in }) }
+        if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
+            let channel = rt.block_on(async { Endpoint::from_shared(at).map_err(|e| e.to_string())?.timeout(Duration::from_secs(30)).connect().await.map_err(|e| format!("Modal: {e}")) })?;
+            return Ok(Client { rt, channel: Some(channel), session, auth_token: None })
+        }
         let channel = rt.block_on(async {
             Endpoint::from_static(API).tls_config(ClientTlsConfig::new().with_webpki_roots()).map_err(|e| e.to_string())?
                 .timeout(Duration::from_secs(90)).connect().await.map_err(|e| format!("Modal: {e}"))
         })?;
-        Ok(Client { rt, channel: Some(channel), session, auth_token: None, stand_in })
-    }
-
-    /// A call as the test kit answers it (`stand_in`, given the whole request): each answer's bytes, or Modal's refusal.
-    fn stand_in_call(&self, method: &str, asked: &[u8]) -> Result<Vec<Vec<u8>>> {
-        use base64::Engine;
-        let at = self.stand_in.as_deref().unwrap_or_default();
-        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let mut r = agent.post(&format!("{}/api.modal.com/modal.client.ModalClient/{method}", at.trim_end_matches('/'))).send(b64.encode(asked)).map_err(|e| format!("Modal: {e}"))?;
-        let v: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().map_err(|e| e.to_string())?).map_err(|e| format!("Modal: {e}"))?;
-        if let Some(e) = v["error"].as_str() { return Err(e.to_string()) }
-        v["answers"].as_array().into_iter().flatten().map(|a| b64.decode(a.as_str().unwrap_or_default()).map_err(|e| e.to_string())).collect()
+        Ok(Client { rt, channel: Some(channel), session, auth_token: None })
     }
 
     /// In a debug build with `SUPERCI_RECORD`: the call, kept as the test kit answers it (what was asked by its size
@@ -167,7 +155,6 @@ impl Client {
             self.auth_token = Some(t.token);
         }
         let asked = message.encoded_len();
-        if self.stand_in.is_some() { return R::decode(self.stand_in_call(method, &message.encode_to_vec())?.first().map(Vec::as_slice).unwrap_or_default()).map_err(|e| format!("Modal: {e}")) }
         let req = self.request(message, authed);
         let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
         let mut grpc = tonic::client::Grpc::new(self.channel.clone().ok_or("Modal: no connection")?);
@@ -183,7 +170,6 @@ impl Client {
     /// A server stream, read to its end (or `limit` messages).
     fn stream<Q: prost::Message + Send + Sync + 'static, R: prost::Message + Default + Send + Sync + 'static>(&mut self, method: &'static str, message: Q, limit: usize) -> Result<Vec<R>> {
         let asked = message.encoded_len();
-        if self.stand_in.is_some() { return self.stand_in_call(method, &message.encode_to_vec())?.iter().take(limit).map(|b| R::decode(b.as_slice()).map_err(|e| format!("Modal: {e}"))).collect() }
         let req = self.request(message, true);
         let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
         let mut grpc = tonic::client::Grpc::new(self.channel.clone().ok_or("Modal: no connection")?);
