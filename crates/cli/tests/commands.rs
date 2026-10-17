@@ -920,3 +920,20 @@ fn a_control_plane_deleted_in_its_cloud_is_dropped_from_the_workspace() {
     assert!(!kept.contains(&format!("\"plane_id\":\"{}\"", superci_testkit::PLANE)), "{kept}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The control plane in use no longer takes this computer's key (removed there, by another device's tidy or by
+/// hand): it is found again with the sign-in, handed a new key, and read as before.
+#[test]
+fn a_control_plane_that_lost_this_computers_key_is_found_again_and_handed_a_new_one() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let plane = superci_testkit::PLANE;
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{plane}/DEVICE_KEY_4102444800_TEST"));
+    let (code, v) = json(&home, &["status"]);
+    assert_eq!(code, 0, "{v}");
+    let keys: Vec<String> = served.aws.settings(plane).into_iter().map(|(k, _)| k).filter(|k| k.starts_with("DEVICE_KEY_")).collect();
+    assert!(keys.len() == 1 && keys[0] != "DEVICE_KEY_4102444800_TEST", "{keys:?}");
+    let kept = std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap();
+    assert!(kept.contains(&keys[0]), "{kept}");
+    let _ = std::fs::remove_dir_all(&home);
+}
