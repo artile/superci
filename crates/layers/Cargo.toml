@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "superci-layers"
 path = "src/main.rs"
@@ -29,6 +32,7 @@ tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
+base64.workspace = true
 
 [build-dependencies]
 protox = "0.10"

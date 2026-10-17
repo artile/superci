@@ -24,14 +24,22 @@ const SOURCE: &str = "containerd.io/distribution.source.";
 pub const AGAIN: Duration = Duration::from_secs(30);
 pub const AGAIN_MOST: u32 = 20;
 
+/// How long pulls stop before a proposal: `QUIET`, or in a test what `SUPERCI_LAYERS_QUIET_MS` says (a debug build).
+fn quiet() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("SUPERCI_LAYERS_QUIET_MS").ok().and_then(|v| v.parse().ok()) { return Duration::from_millis(ms) }
+    QUIET
+}
+
 /// The proposer's loop: every few seconds, what was pulled once pulls are quiet, and what is due again.
 pub async fn run(layers: Arc<Layers>) {
     let mut again: Vec<(Instant, u32, (String, String))> = vec![];
+    let quiet = quiet();
     loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(5).min(quiet)).await;
         let Some(st) = &layers.store else { return };
         let Some(url) = st.index.read().unwrap().propose.clone() else { continue };
-        let mut pulled: Vec<(u32, (String, String))> = st.take_pulled(QUIET).into_iter().map(|p| (0, p)).collect();
+        let mut pulled: Vec<(u32, (String, String))> = st.take_pulled(quiet).into_iter().map(|p| (0, p)).collect();
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut again).into_iter().partition(|(at, _, _)| at.elapsed() >= AGAIN);
         again = later;
         pulled.extend(due.into_iter().map(|(_, n, p)| (n, p)));

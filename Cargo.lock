@@ -1970,6 +1970,7 @@ dependencies = [
 name = "superci-layers"
 version = "0.19.13"
 dependencies = [
+ "base64 0.22.1",
  "hyper-util",
  "libc",
  "prost",
