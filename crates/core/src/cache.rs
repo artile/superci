@@ -31,14 +31,14 @@ pub const BUCKET_DAYS: u32 = MAX_AGE_DAYS + 2;
 fn entry_end(e: &Entry) -> u64 { e.made + BUCKET_DAYS as u64 * 86_400_000 }
 
 /// The cache as set (Settings → Cache, `superci caches update`): on unless `off`; `size_gb` a repository keeps at
-/// most; `days` an entry may go unused (none: the defaults); `layers`, Docker's image layers served from the
-/// bucket's layer store on Ubuntu 26.04 machines (`superci-layers`; off unless turned on, while it is tried).
+/// most; `days` an entry may go unused (none: the defaults); `images_off`, Docker's images not kept (they are, on
+/// Ubuntu 26.04 machines, in the bucket's layer store: see `layers`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub off: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub size_gb: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub days: Option<u32>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub layers: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub images_off: bool,
 }
 
 impl Settings {

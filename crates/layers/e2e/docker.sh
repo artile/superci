@@ -3,7 +3,7 @@
 # work done each way (pull, run, build, commit, save, load, push, pull back, prune), and what can be compared
 # (image ids, what `docker save` writes) the same; once with no store, once with the images' layers served from a
 # store (their EROFS files made here as SuperCI's converter makes them, in a local bucket; their links asked for when
-# used; one link broken, that layer pulled as usual; one image's layers not in the store, proposed and uploaded once
+# used; one link broken, that layer pulled as usual; one image's layers not in the store, offered and uploaded after
 # pulled). Then superci-layers and containerd started again mid-way, and everything still there.
 # In a privileged container (see Dockerfile), with superci-layers at /superci-layers.
 set -Eeuo pipefail
@@ -128,7 +128,7 @@ def walk(d, image):
             seen.add(l["digest"]); print(l["digest"], l["size"], image)
 for m in json.load(open("/root/oci/index.json"))["manifests"]: walk(m["digest"], m.get("annotations", {}).get("io.containerd.image.name", ""))
 PY
-# (Busybox's layers are not in the store: pulled as usual, then proposed and uploaded.)
+# (Busybox's layers are not in the store: pulled as usual, then offered and uploaded after the job.)
 grep " $BUSYBOX\$" /root/layers.txt | cut -d' ' -f1 > /root/not-stored.txt
 [ -s /root/not-stored.txt ]
 grep -v " $BUSYBOX\$" /root/layers.txt > /root/stored.txt
@@ -150,7 +150,7 @@ jq -e '.layers | length' /root/index.json > /dev/null
 echo "  $n layers, $((total/1024)) KB of EROFS files; one link broken: $broken; not in the store: $(wc -l < /root/not-stored.txt)"
 # The machine's index has no links: they are asked for when a layer is used (the bucket's /links has them).
 mv /root/index.json /root/bucket/index.links.json
-jq '.layers |= map_values(.erofs.url = "" | .blob.url = "") | .refresh = {"url": "http://127.0.0.1:8000/links", "token": ""} | .propose = "http://127.0.0.1:8000/propose"' /root/bucket/index.links.json > /root/index.store.json
+jq '.layers |= map_values(.erofs.url = "" | .blob.url = "") | .refresh = {"url": "http://127.0.0.1:8000/links", "token": ""}' /root/bucket/index.links.json > /root/index.store.json
 python3 /bucket.py /root/bucket &
 
 sed 's|^disabled_plugins = \[\(.*\)\]|disabled_plugins = [\1, "io.containerd.content.v1.content"]|; s|\["", |[|' /root/config.stock.toml > "$CONF"
@@ -183,15 +183,18 @@ usual=$(grep -c "pulled as usual" /var/log/superci-layers.log || true)
 echo "  served from the store: $served; pulled as usual: $usual; blobs read from the store: $(grep -c 'read from the store' /var/log/superci-layers.log || true)"
 grep "pulled as usual" /var/log/superci-layers.log | grep -q "$broken" || { echo "the broken layer was not pulled as usual" >&2; exit 1; }
 [ "$served" -ge 3 ] && [ "$usual" -ge 1 ]
-# Busybox's layers, which the store lacks: proposed (with where they came from) once pulls stopped, and uploaded whole.
-for i in $(seq 60); do [ "$(sort -u /root/bucket/uploaded.txt 2>/dev/null | wc -l)" -ge "$(wc -l < /root/not-stored.txt)" ] && break; sleep 1; done
+# Nothing offered while the job runs. After it (as a machine does before it goes off): Busybox's layers, which the
+# store lacks, offered with where they came from and uploaded whole; what came from the store said.
+[ ! -e /root/bucket/proposed.txt ] || { echo "offered during the job" >&2; exit 1; }
+/superci-layers keep --link=http://127.0.0.1:8000 --index=/root/index.json --most=60 >> /var/log/superci-layers.log 2>&1
+jq -e '.served >= 3 and .pulled >= 1 and .uploaded >= 1' /root/bucket/kept.json > /dev/null || { echo "kept: $(cat /root/bucket/kept.json)" >&2; exit 1; }
 while read -r d; do
-  grep -q "^$d .*$L/busybox" /root/bucket/proposed.txt || { echo "$d was not proposed with its source" >&2; cat /root/bucket/proposed.txt >&2; exit 1; }
+  grep -q "^$d .*$L/busybox" /root/bucket/proposed.txt || { echo "$d was not offered with its source" >&2; cat /root/bucket/proposed.txt >&2; exit 1; }
   grep -q "^$d " /root/bucket/uploaded.txt || { echo "$d was not uploaded" >&2; exit 1; }
   [ "sha256:$(sha256sum "/root/bucket/staging/${d#sha256:}" | cut -c1-64)" = "$d" ]
 done < /root/not-stored.txt
-! cut -d' ' -f1 /root/stored.txt | grep -q -F -f - /root/bucket/proposed.txt || { echo "a layer the store has was proposed" >&2; exit 1; }
-echo "  proposed and uploaded: $(sort -u /root/bucket/uploaded.txt | wc -l) layer(s); links asked for: yes"
+! cut -d' ' -f1 /root/stored.txt | grep -q -F -f - /root/bucket/proposed.txt || { echo "a layer the store has was offered" >&2; exit 1; }
+echo "  offered and uploaded after the job: $(sort -u /root/bucket/uploaded.txt | wc -l) layer(s); kept: $(cat /root/bucket/kept.json); links asked for: yes"
 
 want stock && want superci || { T "passed (the store's run)"; exit 0; }
 T "the same each way"

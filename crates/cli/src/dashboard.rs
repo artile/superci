@@ -452,7 +452,7 @@ pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
     let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { off_spot(j).map(|(why, _)| why).unwrap_or_default() };
     // (How the job itself ended, where a machine ran it to its end: `passed`, `failed`, …; apart from `state`.)
     let ended = Some(job_ended(j).1.to_lowercase()).filter(|_| state == "done" && j["conclusion"].is_string());
-    serde_json::json!({ "id": j["job_id"], "state": state, "ended": ended, "job": title, "in": sub, "runner": runner_text(j).1, "disk": job_disk(j), "choice": choice_said(j), "start": job_start(j), "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
+    serde_json::json!({ "id": j["job_id"], "state": state, "ended": ended, "job": title, "in": sub, "runner": runner_text(j).1, "disk": job_disk(j), "choice": choice_said(j), "images": images_said(j), "start": job_start(j), "cloud": j["cloud"], "took": duration(j), "usd": job_cost(j).filter(|c| *c > 0.0), "why": why, "link": job_link(j), "at_ms": j["at_ms"] })
 }
 
 /// A run as commands say it: how it stands, what it is, how many of its jobs ran here, how long it took (ms, from its
@@ -876,6 +876,18 @@ fn passed_over(j: &serde_json::Value) -> Vec<String> {
         }
     }
     if got.is_empty() || j["on_demand"] == true { vec![] } else { said }
+}
+
+/// What a job had from the cache's Docker images and what it pulled, as its machine said after it: "103 layers from
+/// the cache (2.7 GB); 12 pulled (300 MB), kept for the next job". None: it said nothing (not a machine that keeps
+/// images, or one from before), or it used no images.
+pub fn images_said(j: &serde_json::Value) -> Option<String> {
+    let i = &j["images"];
+    let n = |k: &str| i[k].as_u64().unwrap_or(0);
+    let layers = |c: u64| if c == 1 { "1 layer".to_string() } else { format!("{c} layers") };
+    let from = (n("served") > 0).then(|| format!("{} from the cache ({})", layers(n("served")), size_words(n("served_bytes"))));
+    let pulled = (n("pulled") > 0).then(|| format!("{} pulled ({}), kept for the next job", layers(n("pulled")), size_words(n("pulled_bytes"))));
+    match (from, pulled) { (None, None) => None, (Some(a), None) | (None, Some(a)) => Some(a), (Some(a), Some(b)) => Some(format!("{a}; {b}")) }
 }
 
 /// The same as a job's note: "Not the first choice: AWS had no spot m8a.8xlarge in us-east-1a ($0.135 an hour)".
@@ -3393,7 +3405,7 @@ impl Dashboard {
                     "public_remove" => { let repo = field("repo"); routing.public_repos.retain(|r| *r != repo) }
                     // The cache: on or off, what a repository keeps, how long an entry may go unused.
                     "cache_on" => routing.cache.off = field("on") != "on",
-                    "cache_layers" => routing.cache.layers = field("on") == "on",
+                    "cache_images" => routing.cache.images_off = field("on") != "on",
                     "cache_size" => {
                         let Some(gb) = field("size_gb").parse::<u32>().ok().filter(|g| (1..=10_000).contains(g)) else { return Ok(message(400, "From 1 to 10,000 GB", "What one repository keeps in the cache at most.")) };
                         routing.cache.size_gb = Some(gb).filter(|g| *g != superci_core::cache::SIZE_GB);
@@ -4483,6 +4495,7 @@ mark();load()})();</script>"#;
             row("Time", duration(&j)),
             row("Cost", job_cost(&j).filter(|c| *c > 0.0).map(|c| cost_text(&j, c)).unwrap_or_default()),
             row("Queued", ago(j["at_ms"].as_u64().unwrap_or_default())),
+            row("Docker images", images_said(&j).map(|s| esc(&s)).unwrap_or_default()),
         ].concat();
         let lines = job_start_lines(&j);
         let start = lines.iter().enumerate().map(|(i, l)| { let l = l.trim(); let l = if i == 0 { l.strip_prefix("Its start: ").or_else(|| l.strip_prefix("Its start, so far:")).unwrap_or(l) } else { l }; l.to_string() })
@@ -5836,6 +5849,12 @@ fn cache_card(v: &PlaneView, caches: Option<&serde_json::Value>) -> String {
         format!(r#"<form method="post" action="/caches/delete" class="limit"><input type="hidden" name="repo" value="{}"><span class="limit-text"><strong>{}</strong><small>{entries} {} · {} · used {}</small></span><span class="limit-do"><button class="button secondary sm">Clear</button></span></form>"#,
             esc(id), esc(&name), if entries == 1 { "entry" } else { "entries" }, size_words(bytes), ago_words(now.saturating_sub(used)))
     }).collect::<String>();
+    // Docker's images: kept for the next jobs on Ubuntu 26.04 machines unless turned off.
+    let images_on = !c.images_off;
+    let images_switch = if images_on { r#"<input type="hidden" name="on" value="off"><button class="button secondary sm">Turn off</button>"# } else { r#"<input type="hidden" name="on" value="on"><button class="button primary sm">Turn on</button>"# };
+    let images_kept = caches.map(|c| &c["images"]).filter(|i| i["layers"].as_u64().unwrap_or(0) > 0).map(|i| format!(" {} layers kept now ({}).", i["layers"], size_words(i["bytes"].as_u64().unwrap_or(0)))).unwrap_or_default();
+    let images_what = if images_on { format!("On. A job's next run reads the images it pulled from your bucket instead of the internet (Ubuntu 26.04 machines).{images_kept}") } else { "Off. Docker pulls every image as it always has.".to_string() };
+    let images = if on { format!(r#"<form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="cache_images"><span class="limit-text"><strong>Docker images</strong><small>{}</small></span><span class="limit-do">{images_switch}</span></form>"#, esc(&images_what)) } else { String::new() };
     let kept = match caches {
         None => String::new(),
         Some(_) => format!(r#"<div class="limit"><span class="limit-text"><strong>Kept now</strong><small>{}</small></span></div>{list}"#, if repos.is_empty() { "Nothing kept yet." } else { "Clearing a repository's makes its jobs save anew." }),
@@ -5844,6 +5863,7 @@ fn cache_card(v: &PlaneView, caches: Option<&serde_json::Value>) -> String {
 <form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="cache_on"><span class="limit-text"><strong>In your AWS account</strong><small>{what}</small></span><span class="limit-do">{switch}</span></form>
 <form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="cache_size"><span class="limit-text"><strong>Each repository</strong><small>The least recently used go first. About $0.023 a GB a month in S3.</small></span><span class="limit-do"><input type="number" name="size_gb" min="1" max="10000" value="{gb}" aria-label="Most GB"><span class="note">GB</span><button class="button secondary sm">Save</button></span></form>
 <form method="post" action="/routing" class="limit"><input type="hidden" name="action" value="cache_days"><span class="limit-text"><strong>Unused for</strong><small>An entry goes after this. One saved {} days ago is saved anew.</small></span><span class="limit-do"><input type="number" name="days" min="1" max="{}" value="{days}" aria-label="Days"><span class="note">days</span><button class="button secondary sm">Save</button></span></form>
+{images}
 {kept}
 </div></section>"#, superci_core::cache::MAX_AGE_DAYS, superci_core::cache::MAX_AGE_DAYS)
 }

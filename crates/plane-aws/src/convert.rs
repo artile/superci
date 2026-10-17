@@ -1,8 +1,8 @@
 //! The layer store's converter: the same program as a second function (`SUPERCI_CONVERTER`), with a role that may
-//! only read and write the layer store's part of the buckets. Given a layer (a registry's link to its blob, or the
-//! blob a machine put in the bucket's staging), it streams the blob in once: hashed (it must be the digest it was
-//! asked for), kept as it is when it came from a registry, unpacked (gzip, zstd or a plain tar, as its first bytes
-//! say) and hashed again (the layer's diff ID), and the tar handed to `mkfs.erofs` as it comes. The EROFS file and
+//! only read and write the layer store's part of the buckets. Given a layer (the blob a machine put in the bucket's
+//! staging after its job), it streams the blob in once: hashed (it must be the digest it was asked for), unpacked
+//! (gzip, zstd or a plain tar, as its first bytes say) and hashed again (the layer's diff ID), and the tar handed to
+//! `mkfs.erofs` as it comes. The EROFS file and
 //! the blob go to the bucket, and what was made (or why nothing was) is written beside them for the control plane,
 //! which the sweep reads (`layers/done/`).
 use std::io::{BufRead, BufReader, Read, Write};
@@ -34,7 +34,7 @@ pub struct Job {
     pub size: u64,
     pub region: String,
     pub bucket: String,
-    /// Where the blob is: `{"url", "headers"}` (a registry, with its token) or `{"key"}` (the bucket's staging).
+    /// Where the blob is: `{"key"}`, in the bucket's staging (put there by the machine that pulled it).
     pub source: Value,
     pub erofs_key: String,
     pub blob_key: String,
@@ -199,41 +199,26 @@ pub fn convert(http: &(dyn Http + Sync), creds: &Credentials, job: &Job, mkfs: &
     let result = (|| -> Result<Value, String> {
         if job.size > MOST_BYTES { return Err(format!("a blob of {} bytes (converted up to {MOST_BYTES})", job.size)) }
         if !job.digest.starts_with("sha256:") || job.digest.len() != 71 || !job.digest[7..].bytes().all(|b| b.is_ascii_hexdigit()) { return Err("not a sha256 digest".into()) }
-        let (url, headers, staged) = match job.source["key"].as_str() {
-            Some(key) => (aws::presign("GET", &bucket_url(key), creds, &job.region, 3600, super::now_ms())?, vec![], Some(key.to_string())),
-            None => {
-                let url = job.source["url"].as_str().ok_or("no source")?.to_string();
-                let headers: Vec<(String, String)> = job.source["headers"].as_object().into_iter().flatten().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect();
-                (url, headers, None)
-            }
-        };
-        let mut request = agent().get(&superci_core::io::stand_in(&url));
-        for (k, v) in &headers { request = request.header(k.as_str(), v.as_str()) }
-        let response = request.call().map_err(|e| format!("fetching the blob: {e}"))?;
+        let key = job.source["key"].as_str().filter(|k| k.starts_with(superci_core::layers::STAGING)).ok_or("no blob in staging")?;
+        let url = aws::presign("GET", &bucket_url(key), creds, &job.region, 3600, super::now_ms())?;
+        let response = agent().get(&superci_core::io::stand_in(&url)).call().map_err(|e| format!("fetching the blob: {e}"))?;
         if response.status() != 200 { return Err(format!("fetching the blob: HTTP {}", response.status())) }
-        let (out, kept) = (tmp.join("layer.erofs"), tmp.join("layer.blob"));
-        let _ = std::fs::remove_file(&kept);
+        let out = tmp.join("layer.erofs");
         let reader = response.into_body().into_reader().take(job.size + 1);
-        let made = make(reader, mkfs, &out, staged.is_none().then_some(kept.as_path()))?;
+        let made = make(reader, mkfs, &out, None)?;
         if made.digest != job.digest || made.size != job.size { let _ = std::fs::remove_file(&out); return Err(format!("the blob is {} ({} bytes), not {} ({} bytes)", made.digest, made.size, job.digest, job.size)) }
         let erofs_size = std::fs::metadata(&out).map_err(|e| e.to_string())?.len();
         let erofs_digest = file_sha256(&out)?;
         upload(http, creds, &job.region, &bucket_url(&job.erofs_key), &out)?;
         let _ = std::fs::remove_file(&out);
-        match &staged {
-            // (Within the bucket: S3 copies it, up to 5 GB, larger than any blob converted.)
-            Some(key) => {
-                let source = format!("/{}/{key}", job.bucket);
-                let copied = said(block_on(aws::s3(http, "PUT", &bucket_url(&job.blob_key), &job.region, creds, vec![], &[("x-amz-copy-source", &source)], super::now_ms()))?, "copying the blob")?;
-                if copied.body_text().contains("<Error>") { return Err("copying the blob: S3 failed".into()) }
-                let _ = block_on(aws::s3(http, "DELETE", &bucket_url(key), &job.region, creds, vec![], &[], super::now_ms()));
-            }
-            None => { upload(http, creds, &job.region, &bucket_url(&job.blob_key), &kept)?; let _ = std::fs::remove_file(&kept); }
-        }
+        // The blob kept beside it (within the bucket: S3 copies it, up to 5 GB, larger than any blob converted).
+        let source = format!("/{}/{key}", job.bucket);
+        let copied = said(block_on(aws::s3(http, "PUT", &bucket_url(&job.blob_key), &job.region, creds, vec![], &[("x-amz-copy-source", &source)], super::now_ms()))?, "copying the blob")?;
+        if copied.body_text().contains("<Error>") { return Err("copying the blob: S3 failed".into()) }
+        let _ = block_on(aws::s3(http, "DELETE", &bucket_url(key), &job.region, creds, vec![], &[], super::now_ms()));
         Ok(json!({ "digest": job.digest, "size": job.size, "diff_id": made.diff_id, "erofs": { "key": job.erofs_key, "size": erofs_size, "digest": erofs_digest }, "blob": { "key": job.blob_key, "size": job.size } }))
     })();
     let _ = std::fs::remove_file(tmp.join("layer.erofs"));
-    let _ = std::fs::remove_file(tmp.join("layer.blob"));
     let mut done = result.unwrap_or_else(|e| json!({ "digest": job.digest, "error": e }));
     done["seconds"] = json!((began.elapsed().as_secs_f64() * 10.0).round() / 10.0);
     if let Err(e) = block_on(aws::s3(http, "PUT", &bucket_url(&job.done_key), &job.region, creds, done.to_string().into_bytes(), &[("content-type", "application/json")], super::now_ms())).map_err(|e| e.to_string()).and_then(|r| said(r, "writing what was made").map(|_| ())) {

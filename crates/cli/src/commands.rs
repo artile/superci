@@ -55,8 +55,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "What jobs used in the last 24 hours (day, unless given), 7 days or 30 days: how many ran, their machines' minutes and\nthe minutes GitHub or GitLab would bill (each job rounded up to a minute), what they cost, and what the code host's\nown runners of the same sizes would have charged."),
     ("artifacts", "  superci artifacts list --run=ID\n  superci artifacts retrieve NAME --run=ID [--out=DIR]",
         "What a run from a computer's jobs kept with upload-artifact, kept for a day. (A run of GitHub's keeps its artifacts at\nGitHub: `gh run download`.)\n\nlist      Each artifact's name and size.\nretrieve  Fetches one and unpacks it into DIR (./NAME unless given), as download-artifact would."),
-    ("caches", "  superci caches retrieve\n  superci caches list [--repo=OWNER/NAME]\n  superci caches update [--enabled=true|false] [--size-gb=N] [--days=N]\n  superci caches delete --repo=OWNER/NAME [KEY] [--scope=REF] --confirm",
-        "GitHub's cache for jobs on AWS, kept in a bucket of your control plane's in your account, in each region its machines\nrun in. Workflows do not change: actions/cache, the setup actions' caches and Docker's type=gha reach it as they reach\nGitHub's. A job reads and writes what GitHub would let it (a pull request writes only its own branch's).\n\nretrieve  Whether it is on, what it keeps, and each repository with what it keeps now.\nlist      Each repository with its entries and size; --repo: that repository's entries (key, branch, size, last use).\nupdate    --enabled=false: jobs use GitHub's own cache. --size-gb: what one repository keeps at most (25 unless set;\n          the least recently used go first). --days: how long an entry may go unused (7 unless set). An entry saved 30\n          days ago is saved anew whatever its use.\ndelete    Takes a repository's entries out, all of them or KEY's (--scope: on that branch only, as refs/heads/main)."),
+    ("caches", "  superci caches retrieve\n  superci caches list [--repo=OWNER/NAME]\n  superci caches update [--enabled=true|false] [--size-gb=N] [--days=N] [--images=true|false]\n  superci caches delete --repo=OWNER/NAME [KEY] [--scope=REF] --confirm",
+        "GitHub's cache for jobs on AWS, kept in a bucket of your control plane's in your account, in each region its machines\nrun in. Workflows do not change: actions/cache, the setup actions' caches and Docker's type=gha reach it as they reach\nGitHub's. A job reads and writes what GitHub would let it (a pull request writes only its own branch's).\n\nretrieve  Whether it is on, what it keeps, and each repository with what it keeps now.\nlist      Each repository with its entries and size; --repo: that repository's entries (key, branch, size, last use).\nupdate    --enabled=false: jobs use GitHub's own cache. --size-gb: what one repository keeps at most (25 unless set;\n          the least recently used go first). --days: how long an entry may go unused (7 unless set). An entry saved 30\n          days ago is saved anew whatever its use. --images=false: Docker pulls every image as it always has (they are\n          kept for each job's next run on Ubuntu 26.04 machines unless turned off).\ndelete    Takes a repository's entries out, all of them or KEY's (--scope: on that branch only, as refs/heads/main)."),
     ("secrets", "  superci secrets list\n  superci secrets create NAME [--repo=OWNER/NAME] [--branch=PATTERN] [--workflow=PATTERN] [--environment=NAME]\n  superci secrets update NAME [the same]\n  superci secrets delete NAME [the same] --confirm",
         "Secrets kept for runs from a computer (`superci runs create`), as a repository's secrets are kept for its runs on\nGitHub. A run gets the ones its workflows name (${{ secrets.NAME }}) and nothing else; one it names that is not kept is\nempty, as on GitHub, and said before its jobs start. Jobs GitHub sends keep getting GitHub's own secrets.\n\nThey are written with this computer's sign-in into your control plane's own cloud (SSM on AWS, the Worker's secrets\non Cloudflare, a Dict on Modal) and are never read back out: `list` says names, where each may be used, when it was\nset and last given to a run, and who started that run. A run key (`superci keys create NAME --runs`) starts runs\nthat get them; nothing but a computer signed in changes them.\n\ncreate    Keeps NAME (letters, digits and _; not GITHUB_…), its value read from stdin or from the variable\n          --value-env names, never from the command: `printf %s \"$NPM_TOKEN\" | superci secrets create NPM_TOKEN`.\n          4 KB at most. --repo, --branch, --workflow (a file's name or path) and --environment (a job's\n          environment:) narrow where it may be used; patterns are GitHub's (release/*). The same name may be kept\n          for several scopes: a job gets the narrowest (an environment's, then a repository's, a workflow's, a\n          branch's). A value given with the run (--secret=NAME=VALUE) wins over all of them.\nupdate    A new value for NAME as kept for that scope.\ndelete    Takes it out."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30] [--runs]\n  superci keys delete NAME",
@@ -147,7 +147,7 @@ pub struct Args { pub words: Vec<String>, flags: HashMap<String, Vec<String>> }
 
 /// Flags that stand alone; every other flag takes the word after it.
 const SWITCHES: [&str; 14] = ["json", "confirm", "dry-run", "no-browser", "all", "only-here", "stop-jobs", "help", "version", "add", "runs", "quiet", "detach", "tests"];
-const VALUES: [&str; 54] = ["branch", "environment", "value-env", "layers", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
+const VALUES: [&str; 54] = ["branch", "environment", "value-env", "images", "header", "extra-disk", "user-data", "period", "run", "out", "repo", "scope", "size-gb", "secret", "var", "workflow", "job", "event", "disk-speed", "workspace", "id", "from", "daily-usd", "aws-budget", "email", "enabled", "spot", "disk-iops", "gpu", "family", "scratch", "provider", "max-hours", "days", "bytes", "region", "account", "plane", "host", "url", "gitlab", "max-jobs", "monthly-usd", "regions", "networks", "location", "image", "cpu", "ram", "disk", "arch", "os", "max-cpu", "token-env"];
 
 impl Args {
     pub fn parse(raw: &[String]) -> Result<Args> {
@@ -534,6 +534,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut said = vec![job_line(&words), words["link"].as_str().unwrap_or_default().to_string()];
             // How its start went: what AWS was asked, and what its machine said of its own part.
             if let Some(choice) = words["choice"].as_str() { said.push(format!("{choice}.")) }
+            if let Some(images) = words["images"].as_str() { said.push(format!("Docker images: {images}.")) }
             said.extend(job_start_lines(&j));
             match got["log"].as_str() {
                 Some(log) => {
@@ -650,7 +651,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("caches", operation @ ("retrieve" | "list" | "update" | "delete")) => {
             let pick = |d: &Dashboard| -> Result<(String, String)> { Ok(match given_key() { Some(k) => k, None => { let p = in_use(d)?; (p.url().to_string(), d.key().to_string()) } }) };
             if operation == "update" {
-                if !args.has("enabled") && !args.has("size-gb") && !args.has("days") && !args.has("layers") { return usage("Say what to change: `superci caches update --size-gb=50` (see `superci help caches`).") }
+                if !args.has("enabled") && !args.has("size-gb") && !args.has("days") && !args.has("images") { return usage("Say what to change: `superci caches update --size-gb=50` (see `superci help caches`).") }
                 let mut d = signed_in();
                 to_set(&mut d)?;
                 in_use(&d)?;
@@ -660,10 +661,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 }
                 if let Some(gb) = args.get("size-gb") { apply!(d, args, format!("let each repository keep {gb} GB in the cache"), "/routing", &[field("action", "cache_size"), field("size_gb", gb)]); }
                 if let Some(days) = args.get("days") { apply!(d, args, format!("let a cache entry go unused for {days} days"), "/routing", &[field("action", "cache_days"), field("days", days)]); }
-                // (Docker's layers from the layer store on Ubuntu 26.04 machines: not in the help while it is tried.)
-                if let Some(l) = args.get("layers") {
-                    let on = match l { "true" => true, "false" => false, _ => return usage("--layers is true or false.") };
-                    apply!(d, args, if on { "serve Docker's layers from the layer store on Ubuntu 26.04 machines".to_string() } else { "let Docker pull its layers as it always has".to_string() }, "/routing", &[field("action", "cache_layers"), field("on", if on { "on" } else { "off" })]);
+                if let Some(l) = args.get("images") {
+                    let on = match l { "true" => true, "false" => false, _ => return usage("--images is true or false.") };
+                    apply!(d, args, if on { "keep the Docker images jobs pull, for their next jobs (Ubuntu 26.04 machines)".to_string() } else { "let Docker pull every image as it always has".to_string() }, "/routing", &[field("action", "cache_images"), field("on", if on { "on" } else { "off" })]);
                 }
             }
             if operation == "delete" {
@@ -695,6 +695,16 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut said = vec![];
             if repo.is_none() {
                 said.push(if got["on"] == true { format!("The cache is on: each repository keeps {} GB at most, and an entry goes after {} days unused ({} at most since it was saved).", got["size_gb"], got["days"], got["max_age_days"]) } else { "The cache is off: jobs use GitHub's own cache (`superci caches update --enabled=true`).".into() });
+                if got["on"] == true {
+                    let i = &got["images"];
+                    said.push(match (i["on"].as_bool(), i["layers"].as_u64().unwrap_or(0)) {
+                        (Some(true), 0) => "Docker images: kept for each job's next run (Ubuntu 26.04 machines); none yet.".to_string(),
+                        (Some(true), n) => format!("Docker images: kept for each job's next run (Ubuntu 26.04 machines): {n} layers now, {}.", size(i["bytes"].as_u64().unwrap_or(0))),
+                        (Some(false), _) => "Docker images: not kept (`superci caches update --images=true`).".to_string(),
+                        (None, _) => String::new(),
+                    });
+                    said.retain(|l| !l.is_empty());
+                }
                 let repos = got["repos"].as_array().cloned().unwrap_or_default();
                 if repos.is_empty() { said.push("Nothing kept yet.".into()) }
                 for r in &repos { said.push(format!("{:<40} {:>5} entries {:>9}   used {}", r["name"].as_str().or(r["id"].as_str()).unwrap_or_default(), r["entries"], size(r["bytes"].as_u64().unwrap_or(0)), ago(r["used_ms"].as_u64().unwrap_or(0)))) }

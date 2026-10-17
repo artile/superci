@@ -2,12 +2,12 @@
 //! registry serves) and as an EROFS file a machine mounts instead of unpacking it (see the `layers` crate, the
 //! program on machines). The control plane fills it and decides who reads what.
 //!
-//! A machine that pulled layers the store lacks proposes them, after its pull. A layer a public registry serves to
-//! anyone (asked as Docker asks, with no sign-in) is fetched by the converter from the registry itself, and every
-//! repository may read it. Any other the machine uploads to the bucket's staging, at a link that takes only a body
-//! of the layer's SHA-256 (so the upload proves the repository has it), and only that repository may read it: it is
-//! granted, and every other repository has to upload it too. A layer the store has is never shown to a repository
-//! that may not read it, and asking for one answers as for a layer the store lacks.
+//! After its job, a machine offers the layers it pulled that the store lacks, and uploads each it is asked for to the
+//! bucket's staging, at a link that takes only a body of the layer's SHA-256 (so the upload proves the repository has
+//! it); the job's own time is never touched. A layer a public registry serves to anyone (asked as Docker asks, with
+//! no sign-in) may be read by every repository; any other only by the repositories that uploaded it (granted). A
+//! layer the store has is never shown to a repository that may not read it, and asking for one answers as for a layer
+//! the store lacks.
 //!
 //! The converter (the AWS control plane's second function) writes what it made beside the files (`layers/done/`),
 //! which the sweep reads. Records, in the store's kinds:
@@ -15,7 +15,9 @@
 //!   `lgrant:<ns>:<digest>`     a repository that showed it has a layer (until `cache::MAX_AGE_DAYS` later)
 //!   `lconv:<region>:<digest>`  a conversion asked for and not heard of yet (`Converting`)
 //!   `lmiss:<region>:<digest>`  a layer not converted (refused, too large), not asked for again for a while
+//!   `lwant:<region>:<digest>`  a conversion waiting for room (`Wanted`)
 //!   `lup:<id>`                 an upload link given (`Upload`)
+//!   `limg:<repo>`              what a repository's last job had from the store and pulled (`Images`)
 //! A layer goes when unused for the cache's days, or made `cache::MAX_AGE_DAYS` ago (the bucket's own rule removes
 //! its files soon after: the next pull proposes it again), and the least recently used go first past a region's
 //! `REGION_BYTES`.
@@ -70,7 +72,7 @@ pub struct Layer {
 impl Layer {
     fn current(&self, now: u64) -> bool { now.saturating_sub(self.made) < cache::MAX_AGE_DAYS as u64 * 86_400_000 }
     fn is_public(&self, now: u64) -> bool { self.public.as_ref().is_some_and(|p| now.saturating_sub(p.checked) < PUBLIC_MS) }
-    fn bytes(&self) -> u64 { self.blob.size.unwrap_or(self.size) + self.erofs.size.unwrap_or(0) }
+    pub fn bytes(&self) -> u64 { self.blob.size.unwrap_or(self.size) + self.erofs.size.unwrap_or(0) }
 }
 
 /// A conversion asked for: when, its blob's size, and the registry it came from (a layer from staging has none).
@@ -82,9 +84,30 @@ pub struct Converting { pub at: u64, pub size: u64, #[serde(default)] pub public
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Wanted { pub at: u64, pub size: u64, pub source: Value, #[serde(default)] pub public: Option<Public> }
 
+/// What a job had from the store and what it pulled, as its machine said after the job (layers and their blobs'
+/// bytes): on the job's record, and the last of a repository's (`limg:<repo>`, for its next machine, see `plan`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Images { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub pulled_bytes: u64, pub uploaded: u64, pub uploaded_bytes: u64, #[serde(default)] pub at: u64 }
+
+/// How long a repository's last word counts for its next machine (the cache's days, at most).
+pub const PLAN_MS: u64 = 7 * 86_400_000;
+
+/// What a machine of a repository gets, from what its last job had and pulled (`Images`): the store set up at its
+/// start only when that job used images (else Docker exactly as it comes: nothing to be had, nothing to wait for), and
+/// the store's own disk only when its layers' files would not fit in a quarter of the machine's memory (EROFS files
+/// run about 1.5 times their blobs).
+pub fn plan(last: Option<&Images>, ram_gb: u32, now: u64) -> (bool, bool) {
+    let Some(l) = last.filter(|l| now.saturating_sub(l.at) < PLAN_MS) else { return (false, false) };
+    let bytes = l.served_bytes + l.pulled_bytes;
+    if bytes == 0 { return (false, false) }
+    (true, bytes * 3 / 2 > (ram_gb as u64) << 28)
+}
+
+pub fn images_key(repo: &str) -> String { format!("limg:{}", repo.to_ascii_lowercase()) }
+
 /// An upload link given to a machine: for which layer, of which repository, to where.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Upload { pub region: String, pub digest: String, pub size: u64, pub ns: String, pub key: String }
+pub struct Upload { pub region: String, pub digest: String, pub size: u64, pub ns: String, pub key: String, #[serde(default)] pub public: Option<Public> }
 
 pub fn layer_key(region: &str, digest: &str) -> String { format!("layer:{region}:{digest}") }
 fn grant_key(ns: &str, digest: &str) -> String { format!("lgrant:{ns}:{digest}") }
@@ -129,8 +152,8 @@ fn bearer_challenge(header: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// Whether a registry serves a layer to anyone: asked as Docker asks with no sign-in (a token for pulling, then the
-/// blob's first byte). The blob's address and the headers to fetch it with when it does; a refusal, a limit or a fault
-/// all mean "not public".
+/// blob's first byte). The blob's address and the headers it was asked with when it does; a refusal, a limit or a
+/// fault all mean "not public".
 pub async fn public_source(http: &dyn crate::io::Http, registry: &str, repository: &str, digest: &str) -> Option<Value> {
     let host = registry_host(registry)?;
     if !is_digest(digest) || repository.is_empty() || repository.len() > 255 || repository.starts_with('/') || repository.contains("..")
@@ -182,7 +205,7 @@ impl ControlPlane<'_> {
     }
 
     /// A machine's index: the layers in its region's bucket its repository may read, without links (asked for when a
-    /// layer is used, `layers-links`), and where to propose what it pulls.
+    /// layer is used, `layers-links`).
     pub(crate) async fn layers_index(&self, machine: &cache::Machine, link: &str, now: u64) -> Result<Response> {
         let (_, granted) = self.layer_reader(machine).await?;
         let mut layers = serde_json::Map::new();
@@ -194,7 +217,7 @@ impl ControlPlane<'_> {
             if let Some(d) = &l.erofs.digest { erofs["digest"] = d.clone().into() }
             layers.insert(digest, json!({ "size": l.size, "erofs": erofs, "blob": { "url": "" } }));
         }
-        Ok(Response::json(&json!({ "layers": layers, "refresh": { "url": format!("{link}/layers-links"), "token": "" }, "propose": format!("{link}/layers-propose") })))
+        Ok(Response::json(&json!({ "layers": layers, "refresh": { "url": format!("{link}/layers-links"), "token": "" } })))
     }
 
     /// Links to layers' files (`{"digests": [...]}`), only for those the machine's repository may read; each layer's
@@ -245,24 +268,24 @@ impl ControlPlane<'_> {
     }
 
     /// An upload link for a layer (to staging, taking only a body of its SHA-256), noted for `layers-uploaded`.
-    async fn upload_link(&self, machine: &cache::Machine, ns: &str, digest: &str, size: u64, creds: &aws::Credentials, now: u64) -> Result<Value> {
+    async fn upload_link(&self, machine: &cache::Machine, ns: &str, digest: &str, size: u64, public: Option<Public>, creds: &aws::Credentials, now: u64) -> Result<Value> {
         let id = crate::crypto::random_token(18);
         let key = format!("{STAGING}{}-{id}", &digest[7..]);
         let sum = crate::crypto::b64(&(0..32).map(|i| u8::from_str_radix(&digest[7 + 2 * i..9 + 2 * i], 16).unwrap_or(0)).collect::<Vec<u8>>());
         let url = aws::presign_with("PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &machine.region), &machine.region, &key), creds, &machine.region, UPLOAD_MS / 1000, now, &[("x-amz-checksum-sha256", &sum)])?;
-        let up = Upload { region: machine.region.clone(), digest: digest.to_string(), size, ns: ns.to_string(), key };
+        let up = Upload { region: machine.region.clone(), digest: digest.to_string(), size, ns: ns.to_string(), key, public };
         self.store.put_until(&format!("lup:{id}"), serde_json::to_string(&up).map_err(|e| e.to_string())?, now + UPLOAD_MS).await?;
         Ok(json!({ "do": "upload", "url": url, "headers": { "x-amz-checksum-sha256": sum }, "id": id }))
     }
 
-    /// Layers a machine pulled that the store lacks (`{"layers": [{"digest", "size", "sources": [{"registry",
-    /// "repository"}]}]}`), each answered: `have` (its repository may read it already), `named` (public: the
-    /// converter fetches it from the registry), `upload` (a link to put its blob at, then `layers-uploaded`), `later`
-    /// (being converted, or too many at once) or `no`.
+    /// Layers a machine pulled that the store lacks, offered after its job (`{"layers": [{"digest", "size", "sources":
+    /// [{"registry", "repository"}]}]}`), each answered: `have` (its repository may read it already, or it is public and
+    /// on its way), `upload` (a link to put its blob at, then `layers-uploaded`) or `no`. Every layer comes from the
+    /// machine that pulled it; whether its registry gives it to anyone decides only who may read it (every repository,
+    /// or those that uploaded it).
     pub(crate) async fn layers_propose(&self, machine: &cache::Machine, link: &str, creds: &aws::Credentials, body: &[u8], now: u64) -> Result<Response> {
         let proposed: Vec<Proposed> = serde_json::from_slice::<Value>(body).ok().and_then(|b| serde_json::from_value(b["layers"].clone()).ok()).unwrap_or_default();
         let (ns, granted) = self.layer_reader(machine).await?;
-        let mut converting = self.store.list(&format!("lconv:{}:", machine.region)).await?.len();
         // (Only a control plane on AWS has a converter: elsewhere the store keeps what it has, and takes nothing new.)
         let converts = self.config.aws_own.is_some() && self.config.aws_own_creds.is_some();
         let proposed: Vec<Proposed> = proposed.into_iter().filter(|p| is_digest(&p.digest)).take(PROPOSED_MOST).collect();
@@ -271,40 +294,26 @@ impl ControlPlane<'_> {
         let mut answers = serde_json::Map::new();
         for (p, record) in proposed.iter().zip(records) {
             let layer = record.and_then(|v| serde_json::from_str::<Layer>(&v).ok()).filter(|l| l.current(now));
-            let answer = if p.size == 0 || p.size > MOST_BYTES {
+            let answer = if p.size == 0 || p.size > MOST_BYTES || !converts || ns.is_none() {
                 json!({ "do": "no" })
             } else if let Some(l) = layer {
                 if l.is_public(now) || granted.contains(&p.digest) { json!({ "do": "have" }) }
-                else if let Some(ns) = &ns { self.upload_link(machine, ns, &p.digest, p.size, creds, now).await? }
-                else { json!({ "do": "no" }) }
-            } else if !converts || self.store.get(&refused_key(&machine.region, &p.digest)).await?.is_some() {
+                else { self.upload_link(machine, ns.as_deref().unwrap_or_default(), &p.digest, p.size, None, creds, now).await? }
+            } else if self.store.get(&refused_key(&machine.region, &p.digest)).await?.is_some() {
                 json!({ "do": "no" })
             } else {
-                // Converting or queued already: public, nothing more to do; else this repository's own upload grants it.
+                // On its way already (converting or queued): public, nothing more to do; else this repository's own
+                // upload grants it.
                 let under_way = match self.store.get(&converting_key(&machine.region, &p.digest)).await? {
                     Some(v) => serde_json::from_str::<Converting>(&v).ok().map(|c| c.public.is_some()),
                     None => self.store.get(&wanted_key(&machine.region, &p.digest)).await?.and_then(|v| serde_json::from_str::<Wanted>(&v).ok()).map(|w| w.public.is_some()),
                 };
-                match under_way {
-                    Some(true) => json!({ "do": "named" }),
-                    Some(false) => match &ns { Some(ns) => self.upload_link(machine, ns, &p.digest, p.size, creds, now).await?, None => json!({ "do": "no" }) },
-                    None => {
-                        let mut named = None;
-                        for s in p.sources.iter().take(4) {
-                            if let Some(source) = public_source(self.http, &s.registry, &s.repository, &p.digest).await { named = Some((s, source)); break }
-                        }
-                        match (named, &ns) {
-                            // Public: the converter reads it from its registry, now or once there is room.
-                            (Some((s, source)), _) => {
-                                let w = Wanted { at: now, size: p.size, source, public: Some(Public { registry: s.registry.clone(), repository: s.repository.clone(), checked: now }) };
-                                self.convert_or_queue(&machine.region, &p.digest, w, &mut converting, now).await?;
-                                json!({ "do": "named" })
-                            }
-                            // Else uploaded at once, while its machine is there (converted once there is room).
-                            (None, Some(ns)) => self.upload_link(machine, ns, &p.digest, p.size, creds, now).await?,
-                            (None, None) => json!({ "do": "no" }),
-                        }
+                if under_way == Some(true) { json!({ "do": "have" }) } else {
+                    let mut public = None;
+                    for s in p.sources.iter().take(4) {
+                        if public_source(self.http, &s.registry, &s.repository, &p.digest).await.is_some() { public = Some(Public { registry: s.registry.clone(), repository: s.repository.clone(), checked: now }); break }
                     }
+                    self.upload_link(machine, ns.as_deref().unwrap_or_default(), &p.digest, p.size, public, creds, now).await?
                 }
             };
             answers.insert(p.digest.clone(), answer);
@@ -340,8 +349,20 @@ impl ControlPlane<'_> {
         }
         // Converted now, or once there is room (the staged blob stays a day).
         let mut converting = self.store.list(&format!("lconv:{}:", up.region)).await?.len();
-        self.convert_or_queue(&up.region, &up.digest, Wanted { at: now, size: up.size, source: json!({ "key": up.key }), public: None }, &mut converting, now).await?;
+        self.convert_or_queue(&up.region, &up.digest, Wanted { at: now, size: up.size, source: json!({ "key": up.key }), public: up.public }, &mut converting, now).await?;
         Ok(Response::json(&json!({ "do": "converting" })))
+    }
+
+    /// What a machine's job had from the store and pulled, said after the job (`Images`): on the job's record, and
+    /// the repository's for its next machine.
+    pub(crate) async fn layers_kept(&self, machine: &cache::Machine, body: &[u8], now: u64) -> Result<Response> {
+        let Ok(mut said) = serde_json::from_slice::<Images>(body) else { return Ok(Response::text(400, "not what was kept")) };
+        said.at = now;
+        let Some(mut job) = self.job_of_runner(&machine.runner).await? else { return Ok(Response::text(404, "no job of this machine")) };
+        if !job.repo.is_empty() { self.store.put_until(&images_key(&job.repo), serde_json::to_string(&said).map_err(|e| e.to_string())?, now + PLAN_MS).await?; }
+        job.images = Some(said);
+        self.keep_job(&job).await?;
+        Ok(Response::json(&json!({})))
     }
 
     /// At each sweep while conversions are under way: what the converter made, recorded (or what it refused, not asked

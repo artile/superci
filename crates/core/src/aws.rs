@@ -1416,6 +1416,18 @@ pub fn with_layers(script: String) -> Result<String> {
     Ok(script.replacen(DOCKER_RESTART, LAYERS, 1))
 }
 
+/// What `with_keep` puts before a machine's end (after its runner): `superci-layers keep`, the program fetched when the
+/// start did not set it up (see `layers::plan`), three minutes at most; nothing it does stops the machine going off.
+const KEEP: &str = "f=/usr/local/bin/superci-layers;([ -x $f ]||(curl -fsSL --retry 2 -m 60 -o $f \"$c/layers-program\"&&chmod 755 $f))&&timeout 200 $f keep --link=\"$c\" --most=180 >>/var/log/superci-layers.log 2>&1\n";
+
+/// A Linux machine's start-up script, with the cache's link already (`with_cache`: `$c`), that keeps the Docker images
+/// its job pulled after the job (`KEEP`, before its last `poweroff`).
+pub fn with_keep(script: String) -> Result<String> {
+    if !script.contains("c='https://") { return Err("no cache link in the start-up script".into()) }
+    let at = script.trim_end().rfind("\npoweroff").ok_or("no end in the start-up script")?;
+    Ok(format!("{}\n{}{}", &script[..at], KEEP, &script[at + 1..]))
+}
+
 /// What a machine's link answers at `layers` (see `LAYERS`): `superci-layers` fetched from its `layers-program` and
 /// its `setup` run (it starts containerd and Docker again, beside the runner, with the index at `layers.json`); what
 /// it says in its own log. Without the program, Docker restarted as the start script restarts it.

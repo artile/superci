@@ -292,9 +292,10 @@ pub struct Job {
     /// Its disk's speed, when above what AWS includes (MiB a second, IOPS): counted in its price.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
-    /// Its machine has Docker's layers from the layer store, on a disk of the store's own (`cache::STORE_DISK`: in
-    /// its price).
+    /// Its machine has the layer store's own disk (`cache::STORE_DISK`: in its price; see `layers::plan`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub layers: bool,
+    /// What it had from the cache's Docker images and what it pulled, as its machine said after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub images: Option<crate::layers::Images>,
     /// How its start went, to see where a slow one lost its time. When GitHub made the job (ms; `at_ms` is when this
     /// control plane heard of it). Every request to AWS for its machine, in order (see `Ask`; the last two dozen). The
     /// link its machine says its own part with (`hello`); what it said is kept apart from this record (see
@@ -1336,7 +1337,7 @@ impl<'a> ControlPlane<'a> {
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
             (_, p) if p.starts_with("/runner/") => self.for_runner(&req, &plane_url, &url).await,
             // A machine's `superci-cache` (with the link only it has), for a job's cache.
-            ("POST", p) if p.starts_with("/cache/") && (p.ends_with("/layers-links") || p.ends_with("/layers-propose") || p.ends_with("/layers-uploaded")) => self.layers_route(&plane_url, p, Some(&req)).await,
+            ("POST", p) if p.starts_with("/cache/") && (p.ends_with("/layers-links") || p.ends_with("/layers-propose") || p.ends_with("/layers-uploaded") || p.ends_with("/layers-kept")) => self.layers_route(&plane_url, p, Some(&req)).await,
             ("POST", p) if p.starts_with("/cache/") => self.cache_route(&req, &plane_url, p).await,
             ("GET", p) if p.starts_with("/cache/") && p.ends_with("/program") => self.cache_program(&plane_url, p).await,
             // The cache's part of a Linux machine's start (its start-up script fetches it: AWS takes 16 KB of that).
@@ -2875,12 +2876,16 @@ impl<'a> ControlPlane<'a> {
                             // GitHub's cache, kept in this region's bucket, for a Linux machine of a GitHub job.
                             // (A GitLab job's machine is known by its runner's id: the job that runner takes is its own.)
                             let cache_runner = if gitlab { format!("gl:{}", gitlab::local(&job.gitlab, job.runner_id.unwrap_or_default())) } else { name.clone() };
-                            // Docker's layers from the layer store: on the Ubuntu whose Docker keeps its images in containerd.
-                            let layers = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26";
-                            let (user_data, layers) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), layers, &creds, plane_url, &cache_runner, now).await;
-                            job.layers = layers;
+                            // Docker's images from the cache: on the Ubuntu whose Docker keeps them in containerd. Set up at
+                            // the start only for a repository whose last job used images, with a disk of its own only
+                            // when they would not fit in memory (see `layers::plan`); kept after every job.
+                            let images = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26";
+                            let used = if images { get_json::<crate::layers::Images>(self.store, &crate::layers::images_key(&job.repo)).await.ok().flatten() } else { None };
+                            let (setup, disk) = crate::layers::plan(used.as_ref(), spec.ram_gb.unwrap_or(job.cpu.unwrap_or(4) * 2), now);
+                            let (user_data, set_up) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, now).await;
+                            job.layers = set_up && disk;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
-                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: layers.then_some(cache::STORE_DISK) };
+                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: job.layers.then_some(cache::STORE_DISK) };
                             let mut told = aws::Told::default();
                             let machine = aws::run_instance(self.http, &creds, &launch, now, &mut told).await;
                             if let Some(e) = told.fleet_refused.take() {
@@ -3292,6 +3297,12 @@ impl<'a> ControlPlane<'a> {
         self.keep(&format!("job:{job_id}"), &taken).await?;
         self.timer.wake_in(60_000).await
     }
+
+    /// The job a runner of this control plane's took (by its name).
+    pub(crate) async fn job_of_runner(&self, runner: &str) -> Result<Option<Job>> { self.by_runner(Some(runner).filter(|r| !r.is_empty())).await }
+
+    /// A job's record written again, under its key.
+    pub(crate) async fn keep_job(&self, job: &Job) -> Result<()> { self.keep(&job_key(job), job).await }
 
     async fn by_runner(&self, runner: Option<&str>) -> Result<Option<Job>> {
         let Some(name) = runner else { return Ok(None) };
@@ -4863,10 +4874,11 @@ impl<'a> ControlPlane<'a> {
 
     /// A machine's start-up script with `superci-cache` in it, when its region's bucket is ready, with the machine's
     /// own link to this control plane (until its longest job ends; its `program` sends it on to the bucket).
-    /// With `layers` (its Ubuntu's Docker keeps images in containerd), `superci-layers` too when the layer store is
-    /// on and its program is in the bucket: the second value says so (the machine then gets the store's disk).
+    /// With `images` (its Ubuntu's Docker keeps images in containerd), `superci-layers` too when the cache keeps
+    /// Docker's images and its program is in the bucket: kept after the job, and with `setup` served from the store
+    /// from the start (the second value says so).
     #[allow(clippy::too_many_arguments)]
-    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, layers: bool, creds: &Credentials, plane_url: &str, runner: &str, now: u64) -> (String, bool) {
+    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, images: bool, setup: bool, creds: &Credentials, plane_url: &str, runner: &str, now: u64) -> (String, bool) {
         // Which build of the program: by architecture, and Windows' of its own.
         let arch = match (os, arch) { ("windows", _) => "x86_64-windows", (_, "arm64") => "aarch64", _ => "x86_64" };
         if !["linux", "windows"].contains(&os) { return (user_data, false) }
@@ -4878,8 +4890,9 @@ impl<'a> ControlPlane<'a> {
         let link = format!("{plane_url}/cache/{token}");
         let with = if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data);
         // (GitHub's jobs only: GitLab's machines start Docker otherwise.)
-        let layers = layers && os == "linux" && !runner.starts_with("gl:") && self.config.routing.cache.layers && self.layers_ready(region, arch, creds, now).await;
-        match layers.then(|| aws::with_layers(with.clone())) { Some(Ok(w)) => (w, true), _ => (with, false) }
+        let images = images && os == "linux" && !runner.starts_with("gl:") && !self.config.routing.cache.images_off && self.layers_ready(region, arch, creds, now).await;
+        let Some(Ok(kept)) = images.then(|| aws::with_keep(with.clone())) else { return (with, false) };
+        match setup.then(|| aws::with_layers(kept.clone())) { Some(Ok(w)) => (w, true), _ => (kept, false) }
     }
 
     /// Whether a region's bucket has this version's `superci-layers` for an architecture (looked at as `cache_ready`).
@@ -4899,7 +4912,7 @@ impl<'a> ControlPlane<'a> {
         let now = self.clock.now_ms();
         let (token, what) = path.trim_start_matches("/cache/").split_once('/').unwrap_or_default();
         let Some(machine) = cache::machine(self.store, token, now).await? else { return Ok(nothing_here()) };
-        if !self.config.routing.cache.layers { return Ok(nothing_here()) }
+        if self.config.routing.cache.images_off { return Ok(nothing_here()) }
         let link = format!("{plane_url}/cache/{token}");
         match what {
             "layers" => return Ok(Response::new(200, "text/x-shellscript", aws::layers_script(&link))),
@@ -4917,6 +4930,7 @@ impl<'a> ControlPlane<'a> {
             "layers-links" => self.layers_links(&machine, &link, &creds, body, now).await,
             "layers-propose" => self.layers_propose(&machine, &link, &creds, body, now).await,
             "layers-uploaded" => self.layers_uploaded(&machine, &creds, body, now).await,
+            "layers-kept" => self.layers_kept(&machine, body, now).await,
             _ => Ok(nothing_here()),
         }
     }
@@ -5144,7 +5158,11 @@ impl<'a> ControlPlane<'a> {
         for (ns, (entries, bytes, used)) in &repos { named.push(serde_json::json!({ "id": ns, "name": self.cache_repo_name(ns).await, "entries": entries, "bytes": bytes, "used_ms": used })) }
         named.sort_by_key(|r| std::cmp::Reverse(r["bytes"].as_u64().unwrap_or(0)));
         let settings = &self.config.routing.cache;
-        let mut out = serde_json::json!({ "on": !settings.off, "size_gb": settings.size_gb(), "days": settings.days(), "max_age_days": cache::MAX_AGE_DAYS, "repos": named, "now_ms": now });
+        // Docker's images: the layers kept, in every region, and their files' bytes.
+        let (mut layers, mut layer_bytes) = (0u64, 0u64);
+        for (_, v) in self.store.list("layer:").await? { if let Ok(l) = serde_json::from_str::<crate::layers::Layer>(&v) { layers += 1; layer_bytes += l.bytes() } }
+        let mut out = serde_json::json!({ "on": !settings.off, "size_gb": settings.size_gb(), "days": settings.days(), "max_age_days": cache::MAX_AGE_DAYS, "repos": named, "now_ms": now,
+            "images": { "on": !settings.images_off, "layers": layers, "bytes": layer_bytes } });
         if let Some(want) = url.query_pairs().find(|(k, _)| k == "repo").map(|(_, v)| v.to_string()) {
             let ns = named.iter().find(|r| r["id"] == want.as_str() || r["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&want))).and_then(|r| r["id"].as_str().map(str::to_string));
             let entries: Vec<serde_json::Value> = all.iter().filter(|l| Some(&l.ns) == ns.as_ref()).map(|l| serde_json::json!({ "key": l.key, "scope": l.scope, "version": l.version,

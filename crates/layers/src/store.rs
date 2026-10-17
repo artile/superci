@@ -58,11 +58,6 @@ pub struct StoreSide {
     containerd: Option<Containerd>,
     started: Nanos,
     pub stats: Stats,
-    /// Layers pulled as Docker pulls them (the index lacks them), by namespace, not yet proposed; and when the last
-    /// was (proposed once pulls have stopped for a while).
-    pulled: Mutex<Vec<(String, String)>>,
-    last_pull: Mutex<Option<std::time::Instant>>,
-    proposed: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -87,7 +82,7 @@ impl Layers {
             erofs: Mutex::new(HashMap::new()), blobs: Mutex::new(HashMap::new()), targets: Mutex::new(HashMap::new()),
             at_once: tokio::sync::Semaphore::new(o.layers_at_once.max(1)), parallel: o.parallel.max(1), agent: crate::fetch::agent(),
             containerd: o.containerd.map(Containerd::new), started: crate::meta::now(), stats: Stats::default(),
-            pulled: Mutex::new(vec![]), last_pull: Mutex::new(None), proposed: Mutex::new(Default::default()),
+
         };
         let l = Layers { overlay, content, store: Some(side) };
         l.recover()?;
@@ -140,8 +135,6 @@ impl Layers {
         let (target, digest) = (labels.get(REF)?, labels.get(LAYER_DIGEST)?);
         let Some(layer) = st.index.read().unwrap().get(digest).cloned() else {
             st.stats.pulled.fetch_add(1, Ordering::Relaxed);
-            if let Some(ns) = key.split('/').next().filter(|n| !n.is_empty()) { st.pulled.lock().unwrap().push((ns.to_string(), digest.clone())) }
-            *st.last_pull.lock().unwrap() = Some(std::time::Instant::now());
             return None
         };
         // (Two pulls of one layer at once: one serves it, the other finds it served.)
@@ -376,14 +369,6 @@ impl StoreSide {
         let mut index = self.index.write().unwrap();
         for (d, layer) in fresh.layers { if digests.contains(&d) { index.layers.insert(d, layer); } }
         digests.first().is_some_and(|d| index.layers.get(d).is_some_and(|l| !l.erofs.url.is_empty()))
-    }
-
-    /// Layers pulled as Docker pulls them, once pulls have stopped for `quiet` (each proposed once).
-    pub fn take_pulled(&self, quiet: std::time::Duration) -> Vec<(String, String)> {
-        if !self.last_pull.lock().unwrap().is_some_and(|t| t.elapsed() >= quiet) { return vec![] }
-        let mut proposed = self.proposed.lock().unwrap();
-        let taken: Vec<(String, String)> = std::mem::take(&mut *self.pulled.lock().unwrap()).into_iter().filter(|(_, d)| proposed.insert(d.clone())).collect();
-        taken
     }
 
     pub fn containerd(&self) -> Option<&Containerd> { self.containerd.as_ref() }

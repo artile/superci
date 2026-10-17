@@ -2,8 +2,8 @@
 # The bucket: files from a folder by ranges, as S3 serves a signed link (a path with "broken" is refused); uploads to
 # staging/ taken only with a body of the SHA-256 the x-amz-checksum-sha256 header says, as a signed upload link does.
 # The control plane: links to layers' files (POST /links, from the index with links at ROOT/index.links.json),
-# proposals (POST /propose: every layer asked to be uploaded) and uploads said done (POST /uploaded), noted in
-# ROOT/uploaded.txt as "digest size".
+# offers after the job (POST /layers-propose: every layer asked to be uploaded), uploads said done (POST /uploaded),
+# noted in ROOT/uploaded.txt as "digest size", and what the job had and pulled (POST /layers-kept, ROOT/kept.json).
 import base64, hashlib, http.server, json, os, re, sys
 
 root = sys.argv[1]
@@ -21,7 +21,10 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path == "/links":
             full = json.load(open(os.path.join(root, "index.links.json")))["layers"]
             self.answer(200, json.dumps({"layers": {d: full[d] for d in b["digests"] if d in full}}).encode()); return
-        if self.path == "/propose":
+        if self.path == "/layers-kept":
+            with open(os.path.join(root, "kept.json"), "w") as f: json.dump(b, f)
+            self.answer(200, b"{}"); return
+        if self.path == "/layers-propose":
             out = {}
             for l in b["layers"]:
                 h = l["digest"].split(":")[1]

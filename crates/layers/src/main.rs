@@ -1,4 +1,4 @@
-use superci_layers::{containerd, content, error, index, overlay, propose, server, setup, store};
+use superci_layers::{containerd, content, error, index, keep, overlay, server, setup, store};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +10,9 @@ const HELP: &str = "superci-layers: containerd's snapshotter and content store f
                   comes (it never fails the start)
   superci-layers off
                   Docker as it comes again
+  superci-layers keep --link=URL [--most=SECONDS]
+                  after the job: the layers Docker pulled that the store lacks offered to the control plane at URL
+                  and uploaded where it asks (for SECONDS at most, 180 unless said), and what came from the store said
   superci-layers [--root=…] …  the service itself:
 
   --root=DIR          its own files: snapshots, labels (/var/lib/superci-layers)
@@ -68,6 +71,22 @@ fn main() {
     match argv.get(1).map(String::as_str) {
         Some("off") => std::process::exit(setup::off()),
         Some("setup-finish") => std::process::exit(setup::finish()),
+        Some("keep") => {
+            let mut o = keep::Options { link: String::new(), socket: "/run/containerd/containerd.sock".into(), content: "/var/lib/containerd/io.containerd.content.v1.content".into(),
+                index: "/etc/superci/layers.json".into(), most: std::time::Duration::from_secs(180) };
+            for arg in &argv[2..] {
+                match arg.split_once('=') {
+                    Some(("--link", v)) => o.link = v.trim_end_matches('/').into(),
+                    Some(("--most", v)) => match v.parse::<u64>() { Ok(n) => o.most = std::time::Duration::from_secs(n), Err(_) => { eprintln!("--most takes seconds"); std::process::exit(2) } },
+                    Some(("--socket", v)) => o.socket = v.into(),
+                    Some(("--content", v)) => o.content = v.into(),
+                    Some(("--index", v)) => o.index = v.into(),
+                    _ => { eprintln!("{arg:?} is not understood\n\n{HELP}"); std::process::exit(2) }
+                }
+            }
+            if o.link.is_empty() { eprintln!("keep takes --link\n\n{HELP}"); std::process::exit(2) }
+            std::process::exit(keep::keep(&o));
+        }
         Some("setup") => {
             let mut o = setup::Options { index_url: String::new(), disk: "auto".into(), root: "/var/lib/superci-layers".into() };
             for arg in &argv[2..] {
@@ -119,8 +138,6 @@ fn main() {
                 }
             }
         });
-        // (What it pulls that the store lacks, proposed once pulls stop.)
-        tokio::spawn(propose::run(layers.clone()));
         eprintln!("superci-layers: answering on {}", a.socket.display());
         notify_ready();
         if let Err(e) = server.await { eprintln!("superci-layers: {e}"); std::process::exit(1) }

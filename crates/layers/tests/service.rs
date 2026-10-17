@@ -2,7 +2,8 @@
 //! content APIs (the clients its .proto files make). Its content store (writes, reads, labels, writes under way, what
 //! it refuses), its snapshots (made, committed, viewed, listed, counted, removed), then layers from SuperCI's store: an
 //! index without links (asked for when a layer is used), a layer's file fetched (and, where it cannot be mounted, the
-//! layer pulled as usual), a layer pulled that the store lacks proposed and its blob uploaded, the index read again.
+//! layer pulled as usual), the index read again; and after the job (`keep`), a layer pulled that the store lacks
+//! offered and its blob uploaded, with what came from the store said.
 //! Mounting needs root: run as root (as on a machine) a served layer is mounted; otherwise it falls back, as it would.
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -40,7 +41,7 @@ fn start(name: &str, index: Option<&serde_json::Value>) -> Service {
     let child = Command::new(env!("CARGO_BIN_EXE_superci-layers"))
         .args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", socket.display()),
             format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("no-containerd.sock").display()), "--parallel=4".into(), "--sync-remove".into()])
-        .env("SUPERCI_LAYERS_QUIET_MS", "300").stderr(std::fs::File::create(dir.join("log")).unwrap()).spawn().unwrap();
+        .stderr(std::fs::File::create(dir.join("log")).unwrap()).spawn().unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     while !socket.exists() { assert!(Instant::now() < until, "it did not answer: {}", std::fs::read_to_string(dir.join("log")).unwrap_or_default()); std::thread::sleep(Duration::from_millis(20)) }
     Service { child, dir, socket }
@@ -160,10 +161,11 @@ async fn its_snapshots_are_containerds_overlay() {
 }
 
 /// SuperCI's store and control plane for the test, on one port: files by ranges (`/files/…`), links to a layer's
-/// files (`POST /links`), proposals (every layer asked to be uploaded, `POST /propose`), uploads (`PUT /up/…`,
-/// taken only with the SHA-256 they say) and their word (`POST /uploaded`). What it was asked, kept.
+/// files (`POST /links`), offers (every layer asked to be uploaded, `POST /layers-propose`), uploads (`PUT /up/…`,
+/// taken only with the SHA-256 they say), their word (`POST /uploaded`) and what was kept (`POST /layers-kept`).
+/// What it was asked, kept.
 #[derive(Default)]
-struct Plane { files: HashMap<String, Vec<u8>>, asked: Vec<String>, uploaded: HashMap<String, Vec<u8>> }
+struct Plane { files: HashMap<String, Vec<u8>>, asked: Vec<String>, uploaded: HashMap<String, Vec<u8>>, kept: Option<serde_json::Value> }
 
 fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -206,7 +208,7 @@ fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
                     }).collect();
                     send(&mut out, 200, "", serde_json::json!({ "layers": layers }).to_string().as_bytes())
                 }
-                ("POST", "/propose") => {
+                ("POST", "/layers-propose") => {
                     let answers: serde_json::Map<String, serde_json::Value> = json["layers"].as_array().unwrap().iter().map(|l| {
                         let d = l["digest"].as_str().unwrap();
                         let sum = { use base64::Engine; base64::engine::general_purpose::STANDARD.encode(hex(&d[7..])) };
@@ -219,6 +221,7 @@ fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
                     if ok { p.lock().unwrap().uploaded.insert(u[4..].to_string(), body); send(&mut out, 200, "", b"") } else { send(&mut out, 400, "", b"BadDigest") }
                 }
                 ("POST", "/uploaded") => send(&mut out, 200, "", br#"{"do": "converting"}"#),
+                ("POST", "/layers-kept") => { p.lock().unwrap().kept = Some(json); send(&mut out, 200, "", b"{}") }
                 _ => send(&mut out, 404, "", b""),
             }
         });
@@ -229,12 +232,12 @@ fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
 fn hex(s: &str) -> Vec<u8> { (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect() }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_proposed() {
+async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_the_job() {
     // A layer the store has (its EROFS file a stand-in: mounting it is not what is tested here), and its index
     // without links.
     let (stored, erofs) = (digest(b"a stored layer's blob"), vec![7u8; 300_000]);
     let (p, at) = plane([(format!("{stored}.erofs"), erofs.clone())].into_iter().collect());
-    let index = serde_json::json!({ "layers": { &stored: { "size": 21, "erofs": { "size": erofs.len() }, "blob": {} } }, "refresh": { "url": format!("{at}/links"), "token": "" }, "propose": format!("{at}/propose") });
+    let index = serde_json::json!({ "layers": { &stored: { "size": 21, "erofs": { "size": erofs.len() }, "blob": {} } }, "refresh": { "url": format!("{at}/links"), "token": "" } });
     let s = start("store", Some(&index));
     let mut snap = s.snapshots().await;
     let layer = |key: &str, d: &str, image: &str| sapi::PrepareSnapshotRequest { key: key.into(), parent: String::new(), labels: [("containerd.io/snapshot.ref".to_string(), format!("chain-{key}")),
@@ -247,19 +250,30 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_proposed() 
         Ok(m) => { assert_eq!(m.into_inner().mounts[0].r#type, "bind"); assert!(s.log().contains(&format!("{stored} pulled as usual")), "{}", s.log()) }
     }
     assert!(s.log().contains(&format!("{stored}'s file (0.3 MB) fetched in")), "{}", s.log());
-    // A layer the store lacks: pulled as usual (its blob written to the content store as a pull does), then proposed
-    // once pulls stop, and uploaded at the link the control plane gives, with the SHA-256 it said.
+    // A layer the store lacks: pulled as usual (its blob written to the content store as a pull does), with its
+    // image's manifest naming both layers, as containerd's records do.
     let blob = b"a layer the store lacks".repeat(200);
     let lacked = digest(&blob);
     let mut content = s.content().await;
-    write(&mut content, vec![msg(capi::WriteAction::Commit, "pull-1", blob.len() as i64, &lacked, 0, &blob)]).await.unwrap();
-    let m = snap.prepare(layer("moby/2/extract-2", &lacked, &lacked)).await.unwrap().into_inner().mounts;
-    assert_eq!(m[0].r#type, "bind");
-    let until = Instant::now() + Duration::from_secs(20);
-    while !p.lock().unwrap().uploaded.contains_key(&lacked) { assert!(Instant::now() < until, "not uploaded: {}", s.log()); tokio::time::sleep(Duration::from_millis(50)).await }
-    assert_eq!(p.lock().unwrap().uploaded[&lacked], blob);
+    let mut pull = msg(capi::WriteAction::Commit, "pull-1", blob.len() as i64, &lacked, 0, &blob);
+    pull.labels.insert("containerd.io/distribution.source.ghcr.io".into(), "acme/app".into());
+    write(&mut content, vec![pull]).await.unwrap();
+    let manifest = b"{\"layers\": []}".to_vec();
+    let mut m = msg(capi::WriteAction::Commit, "manifest-1", manifest.len() as i64, &digest(&manifest), 0, &manifest);
+    m.labels.extend([("containerd.io/gc.ref.content.l.0".to_string(), stored.clone()), ("containerd.io/gc.ref.content.l.1".to_string(), lacked.clone())]);
+    write(&mut content, vec![m]).await.unwrap();
+    let mounts = snap.prepare(layer("moby/2/extract-2", &lacked, &lacked)).await.unwrap().into_inner().mounts;
+    assert_eq!(mounts[0].r#type, "bind");
+    assert!(!p.lock().unwrap().asked.iter().any(|a| a.contains("layers-propose")), "nothing offered while the job runs");
+    // After the job: offered and uploaded at the link the control plane gives, with the SHA-256 it said; what came
+    // from the store and what was pulled, said.
+    let kept = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", s.socket.display()),
+        format!("--content={}", s.dir.join("content").display()), format!("--index={}", s.dir.join("index.json").display()), "--most=20".into()]).output().unwrap();
+    assert!(kept.status.success(), "{}", String::from_utf8_lossy(&kept.stderr));
+    assert_eq!(p.lock().unwrap().uploaded.get(&lacked), Some(&blob), "{}", String::from_utf8_lossy(&kept.stderr));
     assert!(p.lock().unwrap().asked.iter().any(|a| a == "POST /uploaded"));
-    assert!(s.log().contains(&format!("{lacked} uploaded to the store")), "{}", s.log());
+    let said = p.lock().unwrap().kept.clone().unwrap();
+    assert_eq!((said["served"].as_u64(), said["pulled"].as_u64(), said["pulled_bytes"].as_u64(), said["uploaded"].as_u64()), (Some(1), Some(1), Some(blob.len() as u64), Some(1)), "{said}");
     // The index written again and SIGHUP: read again.
     std::fs::write(s.dir.join("index.json"), serde_json::json!({ "layers": {} }).to_string()).unwrap();
     unsafe { libc::kill(s.child.id() as i32, libc::SIGHUP); }

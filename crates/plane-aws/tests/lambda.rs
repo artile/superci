@@ -165,20 +165,6 @@ fn mkfs_dir() -> std::path::PathBuf {
     d
 }
 
-/// A registry's blob at an address here: its bytes, whatever is asked.
-fn registry(blob: Vec<u8>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let at = format!("http://{}/v2/acme/app/blobs/x", listener.local_addr().unwrap());
-    std::thread::spawn(move || for mut s in listener.incoming().flatten() {
-        let mut buf = [0u8; 4096];
-        let _ = s.read(&mut buf);
-        assert!(String::from_utf8_lossy(&buf).to_ascii_lowercase().contains("authorization: bearer registry-token"), "fetched with the token it was given");
-        let _ = s.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", blob.len()).as_bytes());
-        let _ = s.write_all(&blob);
-    });
-    at
-}
-
 fn gzip(b: &[u8]) -> Vec<u8> {
     let mut out = Command::new("gzip").arg("-c").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
     out.stdin.take().unwrap().write_all(b).unwrap();
@@ -193,7 +179,7 @@ fn sha(b: &[u8]) -> String {
 }
 
 #[test]
-fn the_converter_makes_a_layers_file_from_a_registry_or_from_staging_as_lambda_runs_it() {
+fn the_converter_makes_a_layers_file_from_a_machines_upload_as_lambda_runs_it() {
     let aws = aws();
     let gh = aws.github.lock().unwrap().clone().unwrap();
     let (runtime, at) = Runtime::serve();
@@ -206,36 +192,33 @@ fn the_converter_makes_a_layers_file_from_a_registry_or_from_staging_as_lambda_r
             "erofs_key": format!("layers/{hex}.erofs"), "blob_key": format!("layers/{hex}.blob"), "done_key": format!("layers/done/{hex}.json") })
     };
     let object = |key: &str| gh.objects().into_iter().find(|(k, _)| k == &format!("{bucket}/{key}")).map(|(_, n)| n);
-    // From a registry, with its token: the blob kept as it came, its tar made a file, what was made said beside them.
+    let staged = |blob: &[u8], tail: &str| { let key = format!("layers/staging/{}-{tail}", &sha(blob)[7..]); gh.put_object(&format!("{bucket}/{key}"), blob); key };
+    // From staging (a machine's upload, after its job): its tar made a file, the blob copied in S3 and taken from
+    // staging, what was made said beside them.
     let tar = b"a layer's tar".repeat(500);
     let blob = gzip(&tar);
     let d = sha(&blob);
-    let (kind, done) = runtime.invoke(job(&d, blob.len(), json!({ "url": registry(blob.clone()), "headers": { "authorization": "Bearer registry-token" } })));
+    let key = staged(&blob, "abc");
+    let (kind, done) = runtime.invoke(job(&d, blob.len(), json!({ "key": key })));
     assert_eq!(kind, "response");
-    assert_eq!((done["digest"].as_str(), done["diff_id"].as_str(), done["erofs"]["size"].as_u64(), done["error"].as_str()), (Some(d.as_str()), Some(sha(&tar).as_str()), Some(tar.len() as u64), None), "{done}");
-    assert_eq!((object(&format!("layers/{}.erofs", &d[7..])), object(&format!("layers/{}.blob", &d[7..]))), (Some(tar.len()), Some(blob.len())));
+    assert_eq!((done["digest"].as_str(), done["diff_id"].as_str(), done["erofs"]["size"].as_u64(), done["error"].as_str(), done["blob"]["key"].as_str()), (Some(d.as_str()), Some(sha(&tar).as_str()), Some(tar.len() as u64), None, Some(format!("layers/{}.blob", &d[7..]).as_str())), "{done}");
+    assert_eq!((object(&format!("layers/{}.erofs", &d[7..])), object(&format!("layers/{}.blob", &d[7..])), object(&key)), (Some(tar.len()), Some(blob.len()), None));
     assert!(object(&format!("layers/done/{}.json", &d[7..])).is_some());
-    // From staging (a machine's upload): the blob copied in S3 and taken from staging.
-    let tar2 = b"another layer".repeat(300);
-    let blob2 = gzip(&tar2);
-    let d2 = sha(&blob2);
-    let staged = format!("layers/staging/{}-abc", &d2[7..]);
-    gh.put_object(&format!("{bucket}/{staged}"), &blob2);
-    let (_, done) = runtime.invoke(job(&d2, blob2.len(), json!({ "key": staged })));
-    assert_eq!((done["error"].as_str(), done["blob"]["key"].as_str()), (None, Some(format!("layers/{}.blob", &d2[7..]).as_str())), "{done}");
-    assert_eq!((object(&format!("layers/{}.blob", &d2[7..])), object(&staged)), (Some(blob2.len()), None));
-    // What it refuses, said as such: a tar mkfs.erofs takes not, a blob not of its digest, a digest of nothing.
+    // What it refuses, said as such: a tar mkfs.erofs takes not, a blob not of its digest, a digest of nothing, a blob
+    // from anywhere but staging.
     let odd = gzip(b"refuse this");
-    let (_, done) = runtime.invoke(job(&sha(&odd), odd.len(), json!({ "url": registry(odd.clone()), "headers": { "authorization": "Bearer registry-token" } })));
+    let (_, done) = runtime.invoke(job(&sha(&odd), odd.len(), json!({ "key": staged(&odd, "def") })));
     assert!(done["error"].as_str().is_some_and(|e| e.starts_with("mkfs.erofs refused the layer") && e.ends_with("unusual entry")), "{done}");
     let wrong = format!("sha256:{}", "c".repeat(64));
-    let (_, done) = runtime.invoke(job(&wrong, blob.len(), json!({ "url": registry(blob.clone()), "headers": { "authorization": "Bearer registry-token" } })));
+    let (_, done) = runtime.invoke(job(&wrong, blob.len(), json!({ "key": staged(&blob, "ghi") })));
     assert!(done["error"].as_str().unwrap().contains("not sha256:cccc"), "{done}");
     assert!(object(&format!("layers/{}.erofs", "c".repeat(64))).is_none(), "nothing made of it");
     let (_, done) = runtime.invoke(job("sha256:nope", 1, json!({ "key": "x" })));
     assert_eq!(done["error"], "not a sha256 digest");
     let (_, done) = runtime.invoke(job(&wrong, 5 << 30, json!({ "key": "x" })));
     assert!(done["error"].as_str().unwrap().contains("converted up to"), "{done}");
+    let (_, done) = runtime.invoke(job(&d, blob.len(), json!({ "url": "https://registry-1.docker.io/v2/library/alpine/blobs/x" })));
+    assert_eq!(done["error"], "no blob in staging");
     let (kind, done) = runtime.invoke(json!({ "something": "else" }));
     assert!(kind == "response" && done["error"].as_str().unwrap().starts_with("not a layer to convert"), "{done}");
 }

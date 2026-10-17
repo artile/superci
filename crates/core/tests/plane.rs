@@ -3952,6 +3952,12 @@ impl WithLayers {
         let key = link["url"].as_str().unwrap().strip_prefix(BUCKET).unwrap().split('?').next().unwrap().to_string();
         self.objects.borrow_mut().insert(key, (body.to_vec(), vec![("x-amz-checksum-sha256".into(), STANDARD.encode(Sha256::digest(body)))]));
     }
+    /// The same for a layer whose bytes the test does not have: what S3 keeps once it took a body of that SHA-256.
+    fn uploaded_as(&self, link: &serde_json::Value, digest: &str, size: usize) {
+        let key = link["url"].as_str().unwrap().strip_prefix(BUCKET).unwrap().split('?').next().unwrap().to_string();
+        let sum: Vec<u8> = (0..32).map(|i| u8::from_str_radix(&digest[7 + 2 * i..9 + 2 * i], 16).unwrap()).collect();
+        self.objects.borrow_mut().insert(key, (vec![0; size], vec![("x-amz-checksum-sha256".into(), STANDARD.encode(sum))]));
+    }
     /// What the converter would write when done with a layer it was given (a blob from staging taken from there).
     fn converter_done(&self, job: &serde_json::Value, error: Option<&str>) {
         let done = match error {
@@ -3972,41 +3978,78 @@ fn layered(job: u64, repo_id: u64, repo: &str) -> Request {
 }
 
 #[test]
-fn the_layer_store_switches_ubuntu_26_machines_to_superci_layers_with_a_disk_of_its_own() {
+fn ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has_them_from_the_start() {
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let http = WithLayers::default();
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.cache.layers = true;
     let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
-    // Ubuntu 26.04 (its Docker keeps images in containerd): superci-layers before the runner, the store's disk, in its price.
-    run(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26"));
-    let launch = launches(&http.clouds).pop().expect("a machine");
-    let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
-    assert!(script.contains("/layers|bash||(systemctl restart docker &>/dev/null &)") && !script.contains("\n(systemctl restart docker &>/dev/null &)") && script.find("/layers|bash").unwrap() < script.find("cd /home/runner && ").unwrap(), "{script}");
+    let machine = |job_id: u64, label: &str| -> (String, Vec<(String, String)>) {
+        run(labelled("queued", job_id, "acme/app", None, label));
+        let launch = launches(&http.clouds).pop().expect("a machine");
+        (String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap(), launch)
+    };
+    let link_of = |script: &str| script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    // A repository with nothing known yet: Docker exactly as it comes, no disk of the store's; its images kept after
+    // the job (the program fetched then), before the machine goes off.
+    let (script, launch) = machine(1, "superci/image=ubuntu26");
+    assert!(!script.contains("/layers|bash") && script.contains("\n(systemctl restart docker &>/dev/null &)") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty(), "{script}");
+    let keep = script.find("$f keep --link=\"$c\" --most=180").expect("kept after the job");
+    assert!(script.find("cd /home/runner && ").unwrap() < keep && keep < script.rfind("\npoweroff").unwrap() && script.contains("curl -fsSL --retry 2 -m 60 -o $f \"$c/layers-program\""), "{script}");
+    assert_eq!(job(&store, 1)["layers"], serde_json::Value::Null);
+    // After it, its machine says what it pulled: on the job's record, and for the repository's next machine.
+    let first = link_of(&script);
+    let kept = |link: &str, served: u64, pulled_bytes: u64| run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/layers-kept"))
+        .with_body(serde_json::json!({ "served": served, "served_bytes": served * 1000, "pulled": 5, "pulled_bytes": pulled_bytes, "uploaded": 5, "uploaded_bytes": pulled_bytes, "seconds": 3.1 }).to_string()));
+    let r = job(&store, 1)["runner"].as_str().unwrap().to_string();
+    run(labelled("in_progress", 1, "acme/app", Some(&r), "superci/image=ubuntu26"));
+    assert_eq!(kept(&first, 0, 300 << 20).status, 200);
+    assert_eq!(job(&store, 1)["images"]["pulled_bytes"], 300u64 << 20);
+    assert_eq!(kept("someone-elses-link-here", 0, 1).status, 404);
+    // The next: the store from its start, its files in memory (they fit in a quarter of it).
+    let (script, launch) = machine(2, "superci/image=ubuntu26");
+    assert!(script.contains("/layers|bash||(systemctl restart docker &>/dev/null &)") && !script.contains("\n(systemctl restart docker &>/dev/null &)") && script.find("/layers|bash").unwrap() < script.find("cd /home/runner && ").unwrap() && script.contains("$f keep"), "{script}");
+    assert!(field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
+    assert_eq!(job(&store, 2)["layers"], serde_json::Value::Null);
+    // One whose images would not fit: a disk of the store's own, in its price.
+    let r = job(&store, 2)["runner"].as_str().unwrap().to_string();
+    run(labelled("in_progress", 2, "acme/app", Some(&r), "superci/image=ubuntu26"));
+    kept(&link_of(&script), 40, 4 << 30);
+    let (script, launch) = machine(3, "superci/image=ubuntu26");
+    assert!(script.contains("/layers|bash"));
     assert_eq!((field(&launch, "BlockDeviceMapping.2.DeviceName"), field(&launch, "BlockDeviceMapping.2.Ebs.VolumeSize"), field(&launch, "BlockDeviceMapping.2.Ebs.Throughput")), ("/dev/sdf".to_string(), "20".to_string(), "500".to_string()));
-    let j = job(&store, 1);
-    assert_eq!(j["layers"], true);
+    assert_eq!(job(&store, 3)["layers"], true);
     let store_disk = superci_core::plane::store_disk_usd_per_hour(superci_core::aws::disk_gb_month("us-east-1"), true);
     assert!(store_disk > 0.01 && store_disk < 0.03, "{store_disk}");
     // Its link: the script, the program, the index with links to its files (and again for some).
-    let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let link = link_of(&script);
     let get = |p: &str| run(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/{p}")));
     let s = get("layers");
     let body = String::from_utf8(s.body.clone()).unwrap();
     assert!(s.status == 200 && body.contains(&format!("'{PLANE_URL}/cache/{link}/layers-program'")) && body.contains(&format!("$f setup --index-url='{PLANE_URL}/cache/{link}/layers.json' || (systemctl restart docker")) && body.starts_with("exec >>/var/log/superci-layers.log"), "{body}");
     let p = get("layers-program");
     assert!(p.status == 302 && p.header("location").unwrap().contains(&format!("/superci/layers-{}-x86_64?X-Amz-", superci_core::plane::VERSION)));
-    let index = json(&get("layers.json"));
-    assert_eq!(index, serde_json::json!({ "layers": {}, "refresh": { "url": format!("{PLANE_URL}/cache/{link}/layers-links"), "token": "" }, "propose": format!("{PLANE_URL}/cache/{link}/layers-propose") }));
+    assert_eq!(json(&get("layers.json")), serde_json::json!({ "layers": {}, "refresh": { "url": format!("{PLANE_URL}/cache/{link}/layers-links"), "token": "" } }));
     assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/cache/someone-elses-link-here/layers.json"))).status, 404);
-    // Ubuntu 24.04 (Docker 28): as before, no store, no second disk.
-    run(labelled("queued", 2, "acme/app", None, "superci/image=ubuntu24"));
-    let launch = launches(&http.clouds).pop().unwrap();
-    assert!(!String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap().contains("/layers|bash") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
-    assert_eq!(job(&store, 2)["layers"], serde_json::Value::Null);
+    // Ubuntu 24.04 (Docker 28): as before, nothing of the store's.
+    let (script, launch) = machine(4, "superci/image=ubuntu24");
+    assert!(!script.contains("/layers|bash") && !script.contains("$f keep") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
+    assert_eq!(job(&store, 4)["layers"], serde_json::Value::Null);
+}
+
+#[test]
+fn the_plan_for_a_repositorys_machine_follows_what_its_last_job_used() {
+    use superci_core::layers::{plan, Images};
+    let now = 1_790_000_000_000;
+    let used = |served_bytes: u64, pulled_bytes: u64, at: u64| Images { served_bytes, pulled_bytes, at, ..Default::default() };
+    assert_eq!(plan(None, 8, now), (false, false), "nothing known: Docker as it comes");
+    assert_eq!(plan(Some(&used(0, 0, now)), 8, now), (false, false), "no images used");
+    assert_eq!(plan(Some(&used(1 << 30, 0, now)), 8, now), (true, false), "1 GB of blobs (1.5 GB of files) in 8 GB of memory");
+    assert_eq!(plan(Some(&used(1 << 30, 1 << 30, now)), 8, now), (true, true), "3 GB of files: more than a quarter of 8 GB");
+    assert_eq!(plan(Some(&used(1 << 30, 1 << 30, now)), 32, now), (true, false));
+    assert_eq!(plan(Some(&used(1 << 30, 0, now - 8 * 86_400_000)), 8, now), (false, false), "a week old: not counted");
 }
 
 #[test]
@@ -4017,7 +4060,6 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.routing.cache.layers = true;
     let plane = ControlPlane { store: &store, http: &http, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     let link = || {
@@ -4042,12 +4084,16 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
         { "digest": private, "size": blob.len(), "sources": [{ "registry": "docker.io", "repository": "acme-private-xyz/app" }, { "registry": "ghcr.io", "repository": "acme-private-xyz/app" }, { "registry": "registry.acme.internal", "repository": "app" }] },
         { "digest": REDIS, "size": 3626020, "sources": [{ "registry": "public.ecr.aws", "repository": "docker/library/redis" }] },
         { "digest": big, "size": 5u64 << 30 }, { "digest": "sha256:nope", "size": 1 }] })));
-    assert_eq!((answers["layers"][ALPINE]["do"].as_str(), answers["layers"][REDIS]["do"].as_str(), answers["layers"][&big]["do"].as_str(), answers["layers"].get("sha256:nope")), (Some("named"), Some("named"), Some("no"), None), "{answers}");
-    assert_eq!(http.converted.borrow()[1]["source"], serde_json::json!({ "url": format!("https://public.ecr.aws/v2/docker/library/redis/blobs/{REDIS}"), "headers": { "authorization": "Bearer TOKEN-ecr" } }), "ECR Public's, which answers no HEAD for a blob");
+    // Every layer from the machine that pulled it, after its job; too large or not a digest, none.
+    assert_eq!((answers["layers"][ALPINE]["do"].as_str(), answers["layers"][REDIS]["do"].as_str(), answers["layers"][&big]["do"].as_str(), answers["layers"].get("sha256:nope")), (Some("upload"), Some("upload"), Some("no"), None), "{answers}");
+    assert!(http.converted.borrow().is_empty(), "nothing fetched from a registry");
     assert_eq!(answers["uploaded"], format!("{PLANE_URL}/cache/{app}/layers-uploaded"));
-    // Public: the converter fetches it from Docker Hub itself, with a token for pulling it.
+    // Alpine's, which Docker Hub serves to anyone: uploaded, converted from staging, and readable by every repository.
+    let alpine_up = answers["layers"][ALPINE].clone();
+    http.uploaded_as(&alpine_up, ALPINE, 3792075);
+    assert_eq!(json(&post(&app, "layers-uploaded", serde_json::json!({ "id": alpine_up["id"] })))["do"], "converting");
     let given = http.converted.borrow()[0].clone();
-    assert_eq!(given["source"], serde_json::json!({ "url": format!("https://registry-1.docker.io/v2/library/alpine/blobs/{ALPINE}"), "headers": { "authorization": "Bearer TOKEN-alpine" } }));
+    assert!(given["source"]["key"].as_str().unwrap().starts_with(&format!("layers/staging/{}-", &ALPINE[7..])), "{given}");
     assert_eq!((given["region"].as_str(), given["bucket"].as_str(), given["size"].as_u64()), (Some("us-east-1"), Some(format!("superci-plane-{PLANE_ID}-us-east-1").as_str()), Some(3792075)));
     assert_eq!((given["erofs_key"].as_str().unwrap(), given["blob_key"].as_str().unwrap(), given["done_key"].as_str().unwrap()), (&format!("layers/{}.erofs", &ALPINE[7..])[..], &format!("layers/{}.blob", &ALPINE[7..])[..], &format!("layers/done/{}.json", &ALPINE[7..])[..]));
     // Private: a link that takes only a body of its SHA-256.
@@ -4055,14 +4101,15 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
     let sum = STANDARD.encode(Sha256::digest(&blob));
     assert_eq!((up["do"].as_str(), up["headers"]["x-amz-checksum-sha256"].as_str()), (Some("upload"), Some(sum.as_str())), "{up}");
     assert!(up["url"].as_str().unwrap().starts_with(&format!("{BUCKET}layers/staging/{}-", &private[7..])) && up["url"].as_str().unwrap().contains("X-Amz-SignedHeaders=host%3Bx-amz-checksum-sha256"), "{up}");
-    // Proposed again while it is converted: nothing more to do (public). Something else at the link: refused.
-    assert_eq!(json(&post(&other, "layers-propose", serde_json::json!({ "layers": [{ "digest": ALPINE, "size": 3792075 }] })))["layers"][ALPINE]["do"], "named");
+    // Offered by another repository while it is converted: public, nothing more to do. Something else at the link:
+    // refused.
+    assert_eq!(json(&post(&other, "layers-propose", serde_json::json!({ "layers": [{ "digest": ALPINE, "size": 3792075 }] })))["layers"][ALPINE]["do"], "have");
     http.uploaded(&up, &blob[1..]);
     assert_eq!(post(&app, "layers-uploaded", serde_json::json!({ "id": up["id"] })).status, 409);
     assert_eq!(post(&other, "layers-uploaded", serde_json::json!({ "id": up["id"] })).status, 404, "another repository's machine was not given it");
     http.uploaded(&up, &blob);
     assert_eq!(json(&post(&app, "layers-uploaded", serde_json::json!({ "id": up["id"] })))["do"], "converting");
-    let staged = http.converted.borrow()[2].clone();
+    let staged = http.converted.borrow()[1].clone();
     assert!(staged["source"]["key"].as_str().unwrap().starts_with(&format!("layers/staging/{}-", &private[7..])) && staged["digest"] == private.as_str(), "{staged}");
     // The converter is done with both: the sweep records them. Each repository reads what it may.
     http.converter_done(&given, None);
@@ -4085,7 +4132,7 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
     assert_eq!(theirs["do"], "upload");
     http.uploaded(&theirs, &blob);
     assert_eq!(json(&post(&other, "layers-uploaded", serde_json::json!({ "id": theirs["id"] })))["do"], "granted");
-    assert_eq!(http.converted.borrow().len(), 3);
+    assert_eq!(http.converted.borrow().len(), 2);
     assert!(http.objects.borrow().keys().all(|k| !k.starts_with("layers/staging/")), "its blob is not kept twice");
     assert_eq!(digests(&get(&other, "layers.json")), both);
     assert_eq!(json(&post(&app, "layers-propose", serde_json::json!({ "layers": [{ "digest": private, "size": blob.len() }] })))["layers"][&private]["do"], "have");
@@ -4096,19 +4143,20 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
     let up = propose_odd();
     http.uploaded(&up, &odd_blob);
     post(&app, "layers-uploaded", serde_json::json!({ "id": up["id"] }));
-    http.converter_done(&http.converted.borrow()[3].clone(), Some("mkfs.erofs refused the layer"));
+    http.converter_done(&http.converted.borrow()[2].clone(), Some("mkfs.erofs refused the layer"));
     block_on(plane.alarm()).unwrap();
     assert_eq!(propose_odd()["do"], "no");
-    // With as many conversions under way as a region takes, a public layer waits in the control plane's queue: its
-    // machine has nothing more to do (and may be gone before there is room); a sweep starts it once there is.
-    store.0.borrow_mut().remove(&format!("lconv:us-east-1:{REDIS}"));
+    // With as many conversions under way as a region takes, an uploaded layer waits in the control plane's queue (its
+    // machine is gone soon after); a sweep starts it once there is room.
     let busy: Vec<String> = (0..superci_core::layers::AT_ONCE).map(|i| format!("lconv:us-east-1:sha256:{i:064x}")).collect();
     for k in &busy { store.0.borrow_mut().insert(k.clone(), serde_json::json!({ "at": clock.0.get(), "size": 1 }).to_string()); }
     let asked = http.converted.borrow().len();
-    let redis = json(&post(&app, "layers-propose", serde_json::json!({ "layers": [{ "digest": REDIS, "size": 3626020, "sources": [{ "registry": "public.ecr.aws", "repository": "docker/library/redis" }] }] })));
-    assert_eq!(redis["layers"][REDIS]["do"], "named");
+    let redis = json(&post(&app, "layers-propose", serde_json::json!({ "layers": [{ "digest": REDIS, "size": 3626020, "sources": [{ "registry": "public.ecr.aws", "repository": "docker/library/redis" }] }] })))["layers"][REDIS].clone();
+    http.uploaded_as(&redis, REDIS, 3626020);
+    assert_eq!(json(&post(&app, "layers-uploaded", serde_json::json!({ "id": redis["id"] })))["do"], "converting");
     assert_eq!(http.converted.borrow().len(), asked, "not converted yet");
-    assert!(store.0.borrow().contains_key(&format!("lwant:us-east-1:{REDIS}")));
+    let wanted: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("lwant:us-east-1:{REDIS}")]).unwrap();
+    assert_eq!(wanted["public"]["registry"], "public.ecr.aws", "ECR Public's, which answers no HEAD for a blob: asked for its first byte");
     block_on(plane.alarm()).unwrap();
     assert_eq!(http.converted.borrow().len(), asked, "still no room");
     for k in &busy { store.0.borrow_mut().remove(k); }
@@ -4131,17 +4179,18 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
 }
 
 #[test]
-fn the_layer_store_is_off_unless_turned_on() {
+fn docker_images_are_left_to_docker_when_the_cache_keeps_none() {
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let http = WithLayers::default();
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.cache.images_off = true;
     let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/image=ubuntu26")));
     let launch = launches(&http.clouds).pop().expect("a machine");
     let script = String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap();
-    assert!(script.contains("$c/cache|bash") && !script.contains("/layers|bash") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
+    assert!(script.contains("$c/cache|bash") && !script.contains("/layers|bash") && !script.contains("$f keep") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
     let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
     assert_eq!(block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/layers.json")))).status, 404);
 }
