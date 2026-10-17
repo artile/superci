@@ -3746,6 +3746,9 @@ fn a_run_from_a_computer_of_several_jobs_starts_each_once_what_it_needs_has_ende
     let workflow = "jobs:\n  build:\n    runs-on: superci\n    outputs:\n      version: ${{ steps.v.outputs.version }}\n    steps:\n      - id: v\n        run: echo version=1.2 >> $GITHUB_OUTPUT\n  test:\n    needs: build\n    if: needs.build.outputs.version == '1.2'\n    runs-on: superci/cpu=${{ matrix.cpu }}\n    strategy:\n      matrix:\n        cpu: [2, 4]\n    steps:\n      - run: echo ${{ matrix.cpu }}\n  report:\n    needs: test\n    if: failure()\n    runs-on: superci\n    steps:\n      - run: echo something failed\n";
     let made = run(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string())));
     assert_eq!(made.status, 200, "{}", made.body_text());
+    // (A job that calls another repository's workflow is refused, with what does run.)
+    let other = run(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": "jobs:\n  call:\n    uses: acme/shared/.github/workflows/ci.yml@v1\n", "path": ".github/workflows/call.yml", "repository": "acme/app" }).to_string())));
+    assert!(other.status == 400 && other.body_text().contains("a workflow of another repository is not run from a computer yet"), "{}", other.body_text());
     let run_id = json(&made)["run_id"].as_str().unwrap().to_string();
     let record = || -> serde_json::Value { serde_json::from_str(&store.0.borrow()[&format!("run:{run_id}")]).unwrap() };
     let states = || record()["jobs"].as_array().unwrap().iter().map(|j| format!("{}={}{}", j["name"].as_str().or(j["key"].as_str()).unwrap(), j["state"].as_str().unwrap(), j["result"].as_str().map(|r| format!(":{r}")).unwrap_or_default())).collect::<Vec<_>>();
@@ -4698,4 +4701,22 @@ fn what_a_machine_sent_to_the_internet_is_added_to_its_jobs_cost_once_cloudwatch
         let added = if said == Some(2.0) { 2.0 * superci_core::aws::DATA_OUT_USD_PER_GB } else { 0.0 };
         assert!((j["cost_usd"].as_f64().unwrap() - (before + added)).abs() < 1e-9, "{j}");
     }
+}
+
+/// A runner name GitHub has from a registration this control plane does not know of (an earlier deploy's, a lost
+/// record): the job's runner registers under a name of its own instead of the job failing.
+#[test]
+fn a_runner_name_github_has_already_gets_a_name_of_its_own() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let taken = format!("superci-{PLANE_ID}-31");
+    clouds.calls.borrow_mut().push(("POST".into(), "https://api.github.com/orgs/acme/actions/runners/generate-jitconfig".into(), serde_json::json!({ "name": taken }).to_string()));
+    block_on(plane.handle(job_event("queued", 31, "acme/app", None)));
+    let j = job(&store, 31);
+    let runner = j["runner"].as_str().unwrap_or_default();
+    assert!(j["state"] == "launched" && runner.starts_with(&format!("{taken}-r")), "{j}");
+    assert_eq!(clouds.calls.borrow().iter().filter(|c| c.1.ends_with("/generate-jitconfig")).count(), 3, "the earlier one, the refused one, its own");
 }
