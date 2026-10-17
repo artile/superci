@@ -131,8 +131,15 @@ fn switch(o: &Options) -> Result<String, String> {
     took.extend([("of which Docker's check", docker.1), ("EROFS", erofs.1), ("disk", disk_t), ("index", index_t)]);
     // 4. The service: a unit of its own while the machine runs (no unit file, so no reload of systemd's).
     let (root, files_arg) = (format!("--root={}", o.root.display()), format!("--files={}", files.display()));
-    run("systemd-run", &["--unit=superci-layers", "--service-type=notify", "--property=Restart=always", "--property=RestartSec=1", "--property=TimeoutStartSec=30",
-        "--description=SuperCI's image layers (containerd's snapshotter and content store)", BIN, &root, &files_arg, &format!("--index={INDEX}"), &format!("--socket={SOCKET}")])?;
+    // (What measures this program's tests, where something does, reaches the service as it reaches this: nothing on
+    // a machine.)
+    let measured: Vec<String> = std::env::vars().filter(|(k, _)| k.starts_with("SUPERCOV_")).map(|(k, v)| format!("--setenv={k}={v}")).collect();
+    let mut argv: Vec<&str> = vec!["--unit=superci-layers", "--service-type=notify", "--property=Restart=always", "--property=RestartSec=1", "--property=TimeoutStartSec=30",
+        "--description=SuperCI's image layers (containerd's snapshotter and content store)"];
+    argv.extend(measured.iter().map(String::as_str));
+    let (index_arg, socket_arg) = (format!("--index={INDEX}"), format!("--socket={SOCKET}"));
+    argv.extend([BIN, root.as_str(), files_arg.as_str(), index_arg.as_str(), socket_arg.as_str()]);
+    run("systemd-run", &argv)?;
     step("service", &mut took);
     // 5. containerd and Docker on it, their own settings kept for putting back; both started again at once
     // (systemd starts Docker after containerd).

@@ -28,6 +28,9 @@ jobs:
         # (In supercov's own copy of the repository: what ./build.sh built is found in this one.)
         env:
           SUPERCI_BUILT: ${{ github.workspace }}
+          # (superci-layers' end-to-end suite in a privileged container, measured with the rest.)
+          SUPERCI_LAYERS_E2E: "1"
+          IMAGES: mirror.gcr.io/library
         run: npx -y supercov@4.12.1 -- cargo test --workspace
       - name: What the tests reach
         if: always()
