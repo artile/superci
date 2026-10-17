@@ -4584,3 +4584,53 @@ fn a_machine_that_keeps_its_jobs_images_is_not_ended_with_its_job_but_goes_off_b
     assert_eq!(ended(), 2);
     assert!(!store.0.borrow().contains_key(&k));
 }
+
+/// The fake clouds with a GitLab that has project 380 (acme/app), whose webhooks are kept as GitLab keeps them.
+struct WithGitLabProjects { clouds: FakeClouds, hooks: RefCell<Vec<(u64, String)>> }
+#[async_trait(?Send)]
+impl Http for WithGitLabProjects {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        let json = |v: serde_json::Value| Ok(Response::new(200, "application/json", v.to_string()));
+        if let Some(path) = r.url.strip_prefix("https://gitlab.example/api/v4") {
+            self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), String::from_utf8_lossy(&r.body).to_string()));
+            let field = |name: &str| url::form_urlencoded::parse(&r.body).find(|(k, _)| k == name).map(|(_, v)| v.to_string()).unwrap_or_default();
+            match (r.method.as_str(), path.split('?').next().unwrap_or_default()) {
+                ("GET", "/projects") => return json(serde_json::json!([{ "id": 380, "path_with_namespace": "acme/app" }])),
+                ("GET", "/projects/380/hooks") => return json(serde_json::Value::Array(self.hooks.borrow().iter().map(|(id, url)| serde_json::json!({ "id": id, "url": url })).collect())),
+                ("POST", "/projects/380/hooks") => { let id = 9 + self.hooks.borrow().len() as u64; self.hooks.borrow_mut().push((id, field("url"))); return json(serde_json::json!({ "id": id })) }
+                ("DELETE", p) if p.starts_with("/projects/380/hooks/") => { let id: u64 = p.rsplit('/').next().unwrap().parse().unwrap(); self.hooks.borrow_mut().retain(|(i, _)| *i != id); return Ok(Response::new(204, "text/plain", "")) }
+                ("DELETE", p) if p.starts_with("/runners/") => return Ok(Response::new(204, "text/plain", "")),
+                _ => {}
+            }
+        }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn gitlabs_projects_follow_a_move_and_leaving_takes_their_webhooks_and_its_runners_away() {
+    const NEW_URL: &str = "https://superci.other-account.workers.dev";
+    let key = "dashboard-session-key-0123";
+    let gl = superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() };
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    // acme/app sends its jobs to the control plane before.
+    let http = WithGitLabProjects { clouds: FakeClouds::default(), hooks: RefCell::new(vec![(8, format!("{PLANE_URL}/gitlab/webhook"))]) };
+    let mut config = Config::new("newplane0001".into());
+    config.device_keys = vec![(u64::MAX, key.into())];
+    config.gitlab = Some(gl.clone());
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let call = |path: &str, body: serde_json::Value| block_on(plane.handle(Request::new("POST", &format!("{NEW_URL}{path}")).with_header("authorization", &format!("Bearer {key}")).with_body(body.to_string())));
+    // The switch: its webhook here, the one before gone.
+    let claimed = call("/move/claim", serde_json::json!({ "from": PLANE_URL }));
+    assert_eq!(claimed.status, 200, "{}", claimed.body_text());
+    assert_eq!(http.hooks.borrow().iter().map(|(_, u)| u.clone()).collect::<Vec<_>>(), [format!("{NEW_URL}/gitlab/webhook")]);
+    // Leaving: the webhook goes, and the project runners made here (only this GitLab's).
+    store.0.borrow_mut().insert("glrunner:56".into(), serde_json::json!({ "id": 56, "job": 1977, "gitlab": "" }).to_string());
+    store.0.borrow_mut().insert("glrunner:other:57".into(), serde_json::json!({ "id": 57, "job": 1978, "gitlab": "other" }).to_string());
+    let left = call("/leave", serde_json::json!({}));
+    assert_eq!(left.status, 200, "{}", left.body_text());
+    assert!(http.hooks.borrow().is_empty());
+    assert!(http.clouds.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1 == "https://gitlab.example/api/v4/runners/56"));
+    assert!(!http.clouds.calls.borrow().iter().any(|c| c.1 == "https://gitlab.example/api/v4/runners/57"), "another GitLab's runner is not this one's to take");
+    assert!(!store.0.borrow().contains_key("glrunner:56") && store.0.borrow().contains_key("glrunner:other:57"));
+}
