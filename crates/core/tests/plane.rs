@@ -4556,3 +4556,33 @@ fn a_running_jobs_log_is_githubs_then_the_lines_its_machine_sent_after() {
     assert_eq!(String::from_utf8(newer_lines(live, "2026-10-16T21:18:46")).unwrap(), "2026-10-16T21:23:01.0000000Z heartbeat\n  its second line\n2026-10-16T21:28:01.0000000Z heartbeat\n", "a message's untimed lines go with it");
     assert!(newer_lines(live, "").is_empty() && last_time(b"no times\n").is_none());
 }
+
+
+#[test]
+fn a_machine_that_keeps_its_jobs_images_is_not_ended_with_its_job_but_goes_off_by_itself() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithLayers::default();
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let ended = || http.clouds.calls.borrow().iter().filter(|c| c.2.contains("Action=TerminateInstances")).count();
+    for (id, label) in [(1, "superci/image=ubuntu26"), (2, "superci/image=ubuntu24")] {
+        run(labelled("queued", id, "acme/app", None, label));
+        let r = job(&store, id)["runner"].as_str().unwrap().to_string();
+        run(labelled("in_progress", id, "acme/app", Some(&r), label));
+        run(labelled("completed", id, "acme/app", Some(&r), label));
+    }
+    // Ubuntu 26.04's keeps its images after the job: not ended with it; Ubuntu 24.04's is, as before.
+    assert_eq!((job(&store, 1)["keeps"].as_bool(), job(&store, 2)["keeps"].as_bool()), (Some(true), None));
+    assert_eq!(ended(), 1);
+    // Still there once its time is up: ended by the sweep.
+    let k = store.0.borrow().keys().find(|k| k.starts_with("keeping:")).cloned().expect("noted");
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(ended(), 1, "not yet");
+    store.0.borrow_mut().insert(k.clone(), "0".into());
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(ended(), 2);
+    assert!(!store.0.borrow().contains_key(&k));
+}

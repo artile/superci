@@ -1418,14 +1418,21 @@ pub fn with_layers(script: String) -> Result<String> {
 
 /// What `with_keep` puts before a machine's end (after its runner): `superci-layers keep`, the program fetched when the
 /// start did not set it up (see `layers::plan`), three minutes at most; nothing it does stops the machine going off.
-const KEEP: &str = "f=/usr/local/bin/superci-layers;([ -x $f ]||(curl -fsSL --retry 2 -m 60 -o $f \"$c/layers-program\"&&chmod 755 $f))&&timeout 200 $f keep --link=\"$c\" --most=180 >>/var/log/superci-layers.log 2>&1\n";
+/// (What fails before it can say so itself is said to the control plane: the job's record says why nothing was kept.)
+const KEEP: &str = "f=/usr/local/bin/superci-layers;[ -x $f ]||curl -fsSL --retry 2 -m 60 -o $f \"$c/layers-program\"||curl -s -m 10 -d '{\"error\":\"its program could not be fetched\"}' \"$c/layers-kept\";chmod 755 $f;timeout 200 $f keep --link=\"$c\" --most=180 >>/var/log/superci-layers.log 2>&1||curl -s -m 10 -d \"{\\\"error\\\":\\\"it ended with status $?\\\"}\" \"$c/layers-kept\"\n";
+/// What the machine's image has in containerd at its start (images it comes with), noted before the runner: none of
+/// it is offered after the job.
+const BOOT_BLOBS: &str = "ls /var/lib/containerd/io.containerd.content.v1.content/blobs/sha256 >/run/superci-boot-blobs 2>/dev/null\n";
 
 /// A Linux machine's start-up script, with the cache's link already (`with_cache`: `$c`), that keeps the Docker images
 /// its job pulled after the job (`KEEP`, before its last `poweroff`).
 pub fn with_keep(script: String) -> Result<String> {
     if !script.contains("c='https://") { return Err("no cache link in the start-up script".into()) }
     let at = script.trim_end().rfind("\npoweroff").ok_or("no end in the start-up script")?;
-    Ok(format!("{}\n{}{}", &script[..at], KEEP, &script[at + 1..]))
+    let kept = format!("{}\n{}{}", &script[..at], KEEP, &script[at + 1..]);
+    const RUNNER: &str = "cd /home/runner && ";
+    if !kept.contains(RUNNER) { return Err("no runner in the start-up script".into()) }
+    Ok(kept.replacen(RUNNER, &format!("{BOOT_BLOBS}{RUNNER}"), 1))
 }
 
 /// What a machine's link answers at `layers` (see `LAYERS`): `superci-layers` fetched from its `layers-program` and

@@ -87,7 +87,10 @@ pub struct Wanted { pub at: u64, pub size: u64, pub source: Value, #[serde(defau
 /// What a job had from the store and what it pulled, as its machine said after the job (layers and their blobs'
 /// bytes): on the job's record, and the last of a job of a repository's (`images_key`, for its next machine, see `plan`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Images { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub pulled_bytes: u64, pub uploaded: u64, pub uploaded_bytes: u64, #[serde(default)] pub at: u64 }
+pub struct Images { #[serde(default)] pub served: u64, #[serde(default)] pub served_bytes: u64, #[serde(default)] pub pulled: u64, #[serde(default)] pub pulled_bytes: u64,
+    #[serde(default)] pub uploaded: u64, #[serde(default)] pub uploaded_bytes: u64, #[serde(default)] pub at: u64,
+    /// Why nothing could be said (containerd out of reach).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub error: Option<String> }
 
 /// How long a repository's last word counts for its next machine (the cache's days, at most).
 pub const PLAN_MS: u64 = 7 * 86_400_000;

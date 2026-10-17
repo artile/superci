@@ -73,7 +73,7 @@ fn main() {
         Some("setup-finish") => std::process::exit(setup::finish()),
         Some("keep") => {
             let mut o = keep::Options { link: String::new(), socket: "/run/containerd/containerd.sock".into(), content: "/var/lib/containerd/io.containerd.content.v1.content".into(),
-                index: "/etc/superci/layers.json".into(), most: std::time::Duration::from_secs(180) };
+                index: "/etc/superci/layers.json".into(), most: std::time::Duration::from_secs(180), boot: "/run/superci-boot-blobs".into() };
             for arg in &argv[2..] {
                 match arg.split_once('=') {
                     Some(("--link", v)) => o.link = v.trim_end_matches('/').into(),
@@ -81,6 +81,7 @@ fn main() {
                     Some(("--socket", v)) => o.socket = v.into(),
                     Some(("--content", v)) => o.content = v.into(),
                     Some(("--index", v)) => o.index = v.into(),
+                    Some(("--boot", v)) => o.boot = v.into(),
                     _ => { eprintln!("{arg:?} is not understood\n\n{HELP}"); std::process::exit(2) }
                 }
             }

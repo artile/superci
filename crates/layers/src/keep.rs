@@ -25,7 +25,9 @@ const SOURCE: &str = "containerd.io/distribution.source.";
 /// Uploads at once (the job is over: the machine's disk and network are its).
 const AT_ONCE: usize = 4;
 
-pub struct Options { pub link: String, pub socket: PathBuf, pub content: PathBuf, pub index: PathBuf, pub most: Duration }
+pub struct Options { pub link: String, pub socket: PathBuf, pub content: PathBuf, pub index: PathBuf, pub most: Duration,
+    /// The blobs containerd had at the machine's start (one hex digest a line): its image's own, none of it offered.
+    pub boot: PathBuf }
 
 /// A layer the job's images name: its digest, size, where it was pulled from.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,19 +79,27 @@ pub struct Done { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub p
 pub fn keep(o: &Options) -> i32 {
     let began = Instant::now();
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() { Ok(r) => r, Err(e) => { eprintln!("superci-layers keep: {e}"); return 0 } };
-    let infos = match rt.block_on(infos(&o.socket)) { Ok(i) => i, Err(e) => { eprintln!("superci-layers keep: containerd: {e}"); return 0 } };
+    let agent = crate::fetch::agent();
+    let infos = match rt.block_on(infos(&o.socket)) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("superci-layers keep: containerd: {e}");
+            let _ = post(&agent, &format!("{}/layers-kept", o.link), &json!({ "error": format!("containerd: {e}") }));
+            return 0
+        }
+    };
     let index = Index::load(&o.index).unwrap_or_default();
+    let boot: std::collections::HashSet<String> = std::fs::read_to_string(&o.boot).unwrap_or_default().lines().map(|h| format!("sha256:{}", h.trim())).collect();
     let mut done = Done::default();
     // (A layer from the store: counted as the index has it, whether or not containerd keeps its blob.)
     for d in named(&infos) { if let Some(l) = index.get(&d) { done.served += 1; done.served_bytes += l.size } }
     let mut offered = vec![];
-    for l in layers_of(&infos).into_iter().filter(|l| index.get(&l.digest).is_none()) {
+    for l in layers_of(&infos).into_iter().filter(|l| index.get(&l.digest).is_none() && !boot.contains(&l.digest)) {
         done.pulled += 1;
         done.pulled_bytes += l.size;
         // (Only a blob kept here whole.)
         if blob_path(&o.content, &l.digest).and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.len() == l.size) { offered.push(l) }
     }
-    let agent = crate::fetch::agent();
     let (uploaded, bytes) = offer(&agent, &o.link, &o.content, offered, began + o.most);
     (done.uploaded, done.uploaded_bytes) = (uploaded, bytes);
     let report = json!({ "served": done.served, "served_bytes": done.served_bytes, "pulled": done.pulled, "pulled_bytes": done.pulled_bytes,

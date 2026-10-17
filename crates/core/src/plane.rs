@@ -29,6 +29,10 @@ pub fn store_disk_usd_per_hour(gb_month: f64, layers: bool) -> f64 {
     aws::extras_usd_per_hour(gb_month, cache::STORE_DISK.0, cache::STORE_DISK.1, DISK_IOPS_INCLUDED, false)
 }
 
+/// How long a machine that keeps its job's images after the job may take before it is ended all the same (it gives
+/// itself three minutes, see `aws::with_keep`).
+pub const KEEPING_MS: u64 = 5 * 60_000;
+
 pub fn job_minutes(set: Option<u32>, cloud: &str) -> u32 { set.unwrap_or(MAX_JOB_MINUTES).clamp(1, max_minutes(cloud)) }
 
 /// The longest a cloud lets a machine live, in minutes. AWS sets no limit, so there it is the longest GitHub lets a
@@ -296,6 +300,9 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub layers: bool,
     /// What it had from the cache's Docker images and what it pulled, as its machine said after it.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub images: Option<crate::layers::Images>,
+    /// Its machine keeps the Docker images its job pulled after the job, and goes off by itself once it has (see
+    /// `aws::with_keep`): not ended when the job ends, only if it is still there `KEEPING_MS` later.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub keeps: bool,
     /// How its start went, to see where a slow one lost its time. When GitHub made the job (ms; `at_ms` is when this
     /// control plane heard of it). Every request to AWS for its machine, in order (see `Ask`; the last two dozen). The
     /// link its machine says its own part with (`hello`); what it said is kept apart from this record (see
@@ -2882,8 +2889,9 @@ impl<'a> ControlPlane<'a> {
                             let images = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26";
                             let used = if images { get_json::<crate::layers::Images>(self.store, &crate::layers::images_key(&job.repo, &job.workflow, &job.name)).await.ok().flatten() } else { None };
                             let (setup, disk) = crate::layers::plan(used.as_ref(), spec.ram_gb.unwrap_or(job.cpu.unwrap_or(4) * 2), now);
-                            let (user_data, set_up) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, &key, now).await;
+                            let (user_data, set_up, keeps) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, &key, now).await;
                             job.layers = set_up && disk;
+                            job.keeps = keeps;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
                                 clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: job.layers.then_some(cache::STORE_DISK) };
                             let mut told = aws::Told::default();
@@ -4389,7 +4397,11 @@ impl<'a> ControlPlane<'a> {
         let mut on_anothers = None;
         if let Some(mut j) = self.by_runner(runner).await? {
             if j.job_id != job_id { on_anothers = Some(j.for_job.unwrap_or(j.job_id)) }
-            self.stop_machine(plane_url, &j).await;
+            // (One that keeps its job's images goes off by itself once it has: ended later only if it has not.)
+            if j.keeps && j.cloud == "aws" {
+                self.store.put_until(&format!("keeping:{}", j.job_id), (self.clock.now_ms() + KEEPING_MS).to_string(), self.clock.now_ms() + 2 * KEEPING_MS).await?;
+                self.timer.wake_in(KEEPING_MS).await?;
+            } else { self.stop_machine(plane_url, &j).await; }
             if let Some(name) = runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
             j.state = "done".into();
             if j.job_id == job_id { j.began = true; j.conclusion = ev.conclusion.clone() }
@@ -4724,6 +4736,12 @@ impl<'a> ControlPlane<'a> {
         if let Err(e) = self.sweep_cache(&plane_url, now).await { let _ = self.store.put("cache-sweep-error", e).await; }
         // The layer store: what the converter made, and once an hour what goes.
         if let Err(e) = self.sweep_layers(&plane_url, now).await { let _ = self.store.put("layers-sweep-error", e).await; }
+        // Machines that kept their jobs' images and are still there a while after: ended now.
+        for (k, v) in self.store.list("keeping:").await.unwrap_or_default() {
+            if v.parse::<u64>().is_ok_and(|due| due > now) { continue }
+            if let Some(j) = get_json::<Job>(self.store, &format!("job:{}", k.trim_start_matches("keeping:"))).await.ok().flatten() { self.stop_machine(&plane_url, &j).await; }
+            let _ = self.store.delete(&k).await;
+        }
         self.redeliver_failed().await;
         self.untold_gitlab(&plane_url, now).await;
         let moved_lately = self.untold(&plane_url, now).await;
@@ -4879,23 +4897,23 @@ impl<'a> ControlPlane<'a> {
     /// own link to this control plane (until its longest job ends; its `program` sends it on to the bucket).
     /// With `images` (its Ubuntu's Docker keeps images in containerd), `superci-layers` too when the cache keeps
     /// Docker's images and its program is in the bucket: kept after the job, and with `setup` served from the store
-    /// from the start (the second value says so).
+    /// from the start (the second value says so; the third, that it keeps them).
     #[allow(clippy::too_many_arguments)]
-    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, images: bool, setup: bool, creds: &Credentials, plane_url: &str, runner: &str, job: &str, now: u64) -> (String, bool) {
+    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, images: bool, setup: bool, creds: &Credentials, plane_url: &str, runner: &str, job: &str, now: u64) -> (String, bool, bool) {
         // Which build of the program: by architecture, and Windows' of its own.
         let arch = match (os, arch) { ("windows", _) => "x86_64-windows", (_, "arm64") => "aarch64", _ => "x86_64" };
-        if !["linux", "windows"].contains(&os) { return (user_data, false) }
+        if !["linux", "windows"].contains(&os) { return (user_data, false, false) }
         // (Turned off in the dashboard: jobs use GitHub's cache.)
-        if self.config.routing.cache.off || !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return (user_data, false) }
+        if self.config.routing.cache.off || !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return (user_data, false, false) }
         let token = crate::crypto::random_token(18);
         let until = now + (self.machine_minutes("aws") as u64 + 30) * 60_000;
-        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string(), job: job.to_string() }).await.is_err() { return (user_data, false) }
+        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string(), job: job.to_string() }).await.is_err() { return (user_data, false, false) }
         let link = format!("{plane_url}/cache/{token}");
         let with = if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data);
         // (GitHub's jobs only: GitLab's machines start Docker otherwise.)
         let images = images && os == "linux" && !runner.starts_with("gl:") && !self.config.routing.cache.images_off && self.layers_ready(region, arch, creds, now).await;
-        let Some(Ok(kept)) = images.then(|| aws::with_keep(with.clone())) else { return (with, false) };
-        match setup.then(|| aws::with_layers(kept.clone())) { Some(Ok(w)) => (w, true), _ => (kept, false) }
+        let Some(Ok(kept)) = images.then(|| aws::with_keep(with.clone())) else { return (with, false, false) };
+        match setup.then(|| aws::with_layers(kept.clone())) { Some(Ok(w)) => (w, true, true), _ => (kept, false, true) }
     }
 
     /// Whether a region's bucket has this version's `superci-layers` for an architecture (looked at as `cache_ready`).

@@ -883,6 +883,7 @@ fn passed_over(j: &serde_json::Value) -> Vec<String> {
 /// images, or one from before), or it used no images.
 pub fn images_said(j: &serde_json::Value) -> Option<String> {
     let i = &j["images"];
+    if let Some(e) = i["error"].as_str() { return Some(format!("not kept ({e})")) }
     let n = |k: &str| i[k].as_u64().unwrap_or(0);
     let layers = |c: u64| if c == 1 { "1 layer".to_string() } else { format!("{c} layers") };
     let from = (n("served") > 0).then(|| format!("{} from the cache ({})", layers(n("served")), size_words(n("served_bytes"))));
