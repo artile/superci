@@ -70,8 +70,8 @@ fn setup_switches_a_machines_docker_to_the_layers_service_and_off_puts_it_back()
     let bin = &program();
     let name = format!("superci-layers-machine-{}", std::process::id());
     // (The store on a disk, as on a machine: the kernel mounts an EROFS file from a filesystem that reads pages itself,
-    // which a container's own overlay does not.)
-    let store = std::env::temp_dir().join(format!("superci-layers-store-{}", std::process::id()));
+    // which neither a container's own overlay nor tmpfs is: /tmp is tmpfs on Ubuntu 26.04. Cargo's folder is on disk.)
+    let store = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("superci-layers-store-{}", std::process::id()));
     std::fs::create_dir_all(&store).unwrap();
     let mut args: Vec<String> = ["run", "-d", "--privileged", "--cgroupns=host", "-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw", "--tmpfs", "/run", "--tmpfs", "/run/lock", "--name", &name,
         "-v", &format!("{bin}:/usr/local/bin/superci-layers:ro"), "-v", &format!("{}:/var/lib/superci-layers", store.display())].iter().map(|s| s.to_string()).collect();
