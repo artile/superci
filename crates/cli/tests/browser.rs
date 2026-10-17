@@ -3,7 +3,7 @@
 //! kit's stand-in for AWS (where the dashboard writes the control plane's settings, and the control plane reads them).
 //! Skipped where no Chrome is installed.
 mod common;
-use common::{dashboard, home, played, signed_in};
+use common::{dashboard, home, played, played_steps, signed_in};
 use superci_testkit::{serve, Browser, PLANE};
 
 /// Waits up to 15 seconds for `holds`, else fails saying `what`.
@@ -427,6 +427,35 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
     let (status, _, said) = common::post(&link, "/machine", &[("os", "windows"), ("arch", "arm64")]);
     assert!(status == 400 && common::words(&said).contains("Windows machines are x64"), "{status} {}", common::words(&said));
     assert_eq!(setting("MACHINE"), None);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn steps_run_side_by_side_are_shown_nested_with_what_they_are_as_github_shows_them() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = home(&served);
+    let workflow = "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - name: Boot the stack\n        id: stack\n        run: sleep 30\n        background: true\n      - run: npm ci\n      - parallel:\n          - name: Lint\n            run: npm run lint\n          - name: Unit tests\n            run: npm test\n      - name: Wait for the stack\n        wait: stack\n      - run: npm run e2e\n";
+    played_steps(&served, &home.join("checkout"), workflow, &[("Boot the stack", "succeeded"), ("Run npm ci", "succeeded"), ("Lint", "succeeded"), ("Unit tests", "succeeded"), ("Parallel group", "succeeded"), ("Wait for the stack", "succeeded"), ("Run npm run e2e", "succeeded")]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runs");
+    b.wait(&shows("Recent runs"));
+    b.click(".tabs a", "Jobs");
+    b.wait(&shows("Recent jobs"));
+    b.click("main a", "tests");
+    b.wait("document.querySelectorAll('details.lstep').length === 7");
+    // The group's row before its steps, which are under it; each says what it is.
+    let rows = b.eval("[...document.querySelectorAll('details.lstep')].map(d => (d.classList.contains('lchild') ? '  ' : '') + d.querySelector('.lsn').innerText + ' ' + d.querySelector('.lsb').innerText.replace(/\\s+/g, ' ').trim())");
+    assert_eq!(rows, serde_json::json!(["Boot the stack BACKGROUND", "Run npm ci ", "Parallel group BACKGROUND PARALLEL · 2 steps", "  Lint BACKGROUND", "  Unit tests BACKGROUND", "Wait for the stack WAIT Boot the stack", "Run npm run e2e "]));
+    if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { b.eval("window.scrollTo(0, document.querySelector('.log-card').offsetTop - 20)"); b.wait("new Promise(r => setTimeout(() => r(true), 400))"); b.screenshot(&std::path::Path::new(&dir).join("parallel-steps.png")) }
+    // The group folded: its steps hidden; unfolded: shown again.
+    b.click("details.lgroup summary", "");
+    b.wait("document.querySelectorAll('details.lchild.lhid').length === 2");
+    b.click("details.lgroup summary", "");
+    b.wait("document.querySelectorAll('details.lchild.lhid').length === 0");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

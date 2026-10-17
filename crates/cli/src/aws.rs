@@ -267,15 +267,19 @@ fn make_cache(http: &Blocking, region: &str, creds: &Credentials, plane_id: &str
 }
 
 
-/// Removes the control plane's machines, networks and cache buckets in these regions (all SuperCI offers, when it is deleted). A
+/// Removes the control plane's machines, networks and cache buckets in these regions (all SuperCI offers, when it is
+/// deleted); the network SuperCI's control planes share, only with the last of them. A
 /// region the account's organization keeps it out of has nothing of the control plane's (nothing could be made
 /// there), and is no network left behind.
 pub fn delete_networks(creds: &Credentials, plane_id: &str, regions: &[&str]) -> Result<()> {
     let sleep = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
+    // The network SuperCI's control planes share goes with the last of them in the account (one elsewhere whose
+    // machines run here has a role here too).
+    let last = !connected_planes(creds)?.iter().any(|p| p.plane_id != plane_id);
     let done: Vec<Result<()>> = std::thread::scope(|s| {
         let each: Vec<_> = regions.iter().map(|r| s.spawn(move || {
             let http = Blocking::new();
-            match futures::executor::block_on(aws::delete_network(&http, r, creds, plane_id, &now_ms, &sleep)) {
+            match futures::executor::block_on(aws::delete_network(&http, r, creds, plane_id, last, &now_ms, &sleep)) {
                 Err(e) if kept_out_by_organization(&e) => return Ok(()),
                 done => done.map_err(|e| format!("{r}: {e}"))?,
             }

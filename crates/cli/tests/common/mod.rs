@@ -59,6 +59,31 @@ pub fn json(home: &std::path::Path, args: &[&str]) -> (i32, serde_json::Value) {
 }
 
 /// A run of one job played to its end in a checkout under `dir`: its step, its 12 lines (in colour) and log, passed.
+/// A run from a computer of `workflow`'s job, its runner played: each step (its name, and how it ended) begun and
+/// ended in turn, a line each.
+pub fn played_steps(served: &Served, dir: &std::path::Path, workflow: &str, steps: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), workflow).unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(Command::new("git").current_dir(dir).args(args).status().unwrap().success()) }
+    let cli = Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"])
+        .env("SUPERCI_HOME", dir.join(".cli")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let run = loop { if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let runner = loop { if let Some(r) = Runner::of_run(served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    runner.take();
+    let ids: Vec<String> = (0..steps.len()).map(|i| format!("dddddddd-0000-0000-0000-{:012}", i + 1)).collect();
+    let record = |done: usize| -> Vec<(&str, &str, u64, &str, Option<&str>, Option<u64>)> {
+        steps.iter().enumerate().take(done + 1).map(|(i, (name, result))| if i < done { (ids[i].as_str(), *name, i as u64 + 1, "completed", Some(*result), Some(i as u64 + 1)) } else { (ids[i].as_str(), *name, i as u64 + 1, "inProgress", None, None) }).collect()
+    };
+    for (i, (name, _)) in steps.iter().enumerate() {
+        runner.steps(&record(i));
+        runner.lines(&ids[i], 1, &[format!("{name} going")]);
+        runner.log(i as u64 + 1, &format!("2026-10-15T10:00:0{}.0000000Z {name} going", i % 10));
+    }
+    runner.steps(&record(steps.len()));
+    runner.finish("succeeded");
+    let _ = cli.wait_with_output();
+}
+
 pub fn played(served: &Served, dir: &std::path::Path) {
     std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
     std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();

@@ -1032,6 +1032,23 @@ impl RunKey {
     fn of(more: &str) -> Option<RunKey> { (more == "runs").then(|| RunKey { name: String::new() }) }
 }
 
+/// The job message in a runner's own log (`_diag/Worker_*.log`: "Job message:", then the message as JSON).
+pub fn worker_message(log: &[u8]) -> Option<serde_json::Value> {
+    let at = log.windows(12).position(|w| w == b"Job message:")?;
+    let from = at + log[at..].iter().position(|b| *b == b'{')?;
+    serde_json::Deserializer::from_slice(&log[from..]).into_iter::<serde_json::Value>().next()?.ok()
+}
+
+/// Each step's shape in a job message, in its order: its id, whether it runs in the background, its parallel group,
+/// and for a step that waits for or cancels others, which (`wait`, `wait-all`, `cancel`; a parallel group's own step
+/// is a `wait` with the group's id).
+pub fn step_shape(message: &serde_json::Value) -> Vec<serde_json::Value> {
+    message["steps"].as_array().into_iter().flatten().map(|s| {
+        let control = (s["type"] == "backgroundStepControl").then(|| s["controlType"].clone());
+        serde_json::json!({ "id": s["contextName"].as_str().or(s["name"].as_str()), "bg": s["background"] == true, "group": s["parallelGroupId"], "control": control, "targets": s["stepIds"] })
+    }).collect()
+}
+
 fn nothing_here() -> Response {
     Response::text(404, "SuperCI plane: nothing here (set up and changed from the SuperCI dashboard on your machine)")
 }
@@ -1133,6 +1150,13 @@ impl<'a> ControlPlane<'a> {
                 if let Some(file) = q.get("live").filter(|f| f.len() <= 120 && f.ends_with(".log") && f.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))) {
                     let at = q.get("at").and_then(|a| a.parse::<u64>().ok()).unwrap_or(0);
                     if !req.body.is_empty() && req.body.len() <= 4_000_000 { self.keep_live(job_key(&j).trim_start_matches("job:"), file, at, &req.body, &plane_url, now).await? }
+                    return Ok(Response::text(200, "ok"))
+                }
+                // The job message its runner was handed (the start of the runner's own log has it): its steps' shape.
+                if q.get("worker").is_some() {
+                    if let Some(shape) = worker_message(&req.body).map(|m| step_shape(&m)).filter(|s| !s.is_empty()) {
+                        self.store.put_until(&format!("shape:{}", job_key(&j).trim_start_matches("job:")), serde_json::to_string(&shape).map_err(|e| e.to_string())?, now + JOB_KEPT_MS).await?;
+                    }
                     return Ok(Response::text(200, "ok"))
                 }
                 let key = format!("hello:{}", job_key(&j).trim_start_matches("job:"));
@@ -1508,7 +1532,12 @@ impl<'a> ControlPlane<'a> {
         // From a line's start, when the cut falls inside one.
         let from = log.len().saturating_sub(want);
         let from = if from == 0 { 0 } else { log[from..].iter().position(|b| *b == b'\n').map(|n| from + n + 1).unwrap_or(from) };
-        Ok(Response::json(&serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0, "steps": steps,
+        // Its steps' shape (which run in the background, in a parallel group, wait for which), as its runner was
+        // handed them: a run from a computer's from the message made here, a GitHub job's as its machine said.
+        let shape = if q("steps").is_none() { None } else if j.provider == "local" {
+            get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{}", j.local.as_deref().unwrap_or_default())).await?.map(|h| step_shape(&h.message))
+        } else { get_json::<Vec<serde_json::Value>>(self.store, &format!("shape:{}", key.trim_start_matches("job:"))).await? };
+        Ok(Response::json(&serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0, "steps": steps, "shape": shape,
             "source": source, "last_line_at": last_time(&log), "running": active(&j) })))
     }
 

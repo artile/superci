@@ -660,8 +660,30 @@ pub async fn given_network(http: &dyn Http, region: &str, creds: &Credentials, g
 /// Its security group's name, in its VPC.
 const NETWORK_GROUP: &str = "superci-machines";
 
-fn tagged(kind: &str, plane_id: &str) -> serde_json::Value {
-    serde_json::json!([{ "ResourceType": kind, "Tag": [{ "Key": "superci-plane", "Value": plane_id }, { "Key": "Name", "Value": format!("SuperCI {plane_id}") }] }])
+/// Whose a network is: one control plane's own (made before 0.19.13, tagged with its id), or the one SuperCI's
+/// control planes in an account share in a region (each region holds 5 VPCs unless AWS is asked for more).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Whose<'a> { Own(&'a str), Shared }
+
+impl Whose<'_> {
+    /// The tag that says so: as a filter, and on what is made.
+    fn tag(&self) -> (&'static str, &str) { match self { Whose::Own(id) => ("superci-plane", id), Whose::Shared => ("superci-network", "shared") } }
+    fn filter(&self) -> (String, String) { let (k, v) = self.tag(); (format!("tag:{k}"), v.to_string()) }
+    fn tagged(&self, kind: &str) -> serde_json::Value {
+        let ((k, v), name) = (self.tag(), match self { Whose::Own(id) => format!("SuperCI {id}"), Whose::Shared => "SuperCI".to_string() });
+        serde_json::json!([{ "ResourceType": kind, "Tag": [{ "Key": k, "Value": v }, { "Key": "Name", "Value": name }] }])
+    }
+}
+
+/// The VPC a control plane's machines use in a region, and whose it is: its own from before, else the shared one.
+async fn network_vpc<'a>(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &'a str, now_ms: u64) -> Result<Option<(String, Whose<'a>)>> {
+    for whose in [Whose::Own(plane_id), Whose::Shared] {
+        let (k, v) = whose.filter();
+        let vpcs = ec2(http, region, creds, "DescribeVpcs", serde_json::json!({ "Filter": filters(&[(&k, &v)]) }), now_ms).await?;
+        // (Two made at once: the one with the lowest id, as `make_network` keeps.)
+        if let Some(vpc) = pairs(&vpcs, "vpcId", "vpcId").into_iter().map(|(v, _)| v).min() { return Ok(Some((vpc.to_string(), whose))) }
+    }
+    Ok(None)
 }
 
 fn filters(f: &[(&str, &str)]) -> serde_json::Value {
@@ -673,10 +695,10 @@ fn pairs<'a>(xml: &'a str, first: &str, then: &str) -> Vec<(&'a str, &'a str)> {
     xml.split(&format!("<{first}>")).skip(1).filter_map(|chunk| Some((chunk.split('<').next()?, xml_tag(chunk, then).unwrap_or("")))).collect()
 }
 
-/// The control plane's network in a region, if it is there (whole: a subnet and its security group).
+/// The network a control plane's machines use in a region (its own from before, else the account's shared one), if it
+/// is there (whole: a subnet and its security group).
 pub async fn find_network(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, now_ms: u64) -> Result<Option<Network>> {
-    let vpcs = ec2(http, region, creds, "DescribeVpcs", serde_json::json!({ "Filter": filters(&[("tag:superci-plane", plane_id)]) }), now_ms).await?;
-    let Some(vpc) = xml_tag(&vpcs, "vpcId").map(str::to_string) else { return Ok(None) };
+    let Some((vpc, _)) = network_vpc(http, region, creds, plane_id, now_ms).await? else { return Ok(None) };
     let subnets = ec2(http, region, creds, "DescribeSubnets", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc)]) }), now_ms).await?;
     let subnets: Vec<(String, String)> = pairs(&subnets, "subnetId", "availabilityZone").into_iter().map(|(id, zone)| (zone.to_string(), id.to_string())).collect();
     let groups = ec2(http, region, creds, "DescribeSecurityGroups", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc), ("group-name", NETWORK_GROUP)]) }), now_ms).await?;
@@ -685,16 +707,20 @@ pub async fn find_network(http: &dyn Http, region: &str, creds: &Credentials, pl
     Ok(Some(Network { vpc, security_group, subnets, ..Default::default() }))
 }
 
-/// Makes (or completes) the control plane's network in a region; safe to repeat. With the account's own sign-in (the
-/// control plane's role cannot make networks).
+/// Makes (or completes) the network a control plane's machines use in a region; safe to repeat: its own from before
+/// when it has one, else the network SuperCI's control planes in the account share there (made by the first). With
+/// the account's own sign-in (the control plane's role cannot make networks).
 pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, now_ms: u64) -> Result<Network> {
     let call = |action: &'static str, params: serde_json::Value| ec2(http, region, creds, action, params, now_ms);
     let ok_if = |r: Result<String>, codes: &[&str]| match r { Err(e) if codes.iter().any(|c| e.starts_with(c)) => Ok(String::new()), r => r };
-    let mine = filters(&[("tag:superci-plane", plane_id)]);
-    let vpc = match xml_tag(&call("DescribeVpcs", serde_json::json!({ "Filter": mine })).await?, "vpcId") {
-        Some(v) => v.to_string(),
+    let found = network_vpc(http, region, creds, plane_id, now_ms).await?;
+    let whose = found.as_ref().map(|(_, w)| *w).unwrap_or(Whose::Shared);
+    let (tk, tv) = whose.filter();
+    let mine = filters(&[(&tk, &tv)]);
+    let vpc = match found {
+        Some((v, _)) => v,
         None => {
-            let made = xml_tag(&call("CreateVpc", serde_json::json!({ "CidrBlock": "10.212.0.0/16", "TagSpecification": tagged("vpc", plane_id) })).await?, "vpcId").ok_or("CreateVpc gave no id")?.to_string();
+            let made = xml_tag(&call("CreateVpc", serde_json::json!({ "CidrBlock": "10.212.0.0/16", "TagSpecification": whose.tagged("vpc") })).await?, "vpcId").ok_or("CreateVpc gave no id")?.to_string();
             // Made twice at once (two dashboards, a double click): the one with the lowest id stays, for both.
             let all = call("DescribeVpcs", serde_json::json!({ "Filter": mine })).await?;
             match pairs(&all, "vpcId", "vpcId").into_iter().map(|(v, _)| v).min() {
@@ -707,14 +733,14 @@ pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, pl
     let gateways = call("DescribeInternetGateways", serde_json::json!({ "Filter": mine })).await?;
     let gateway = match xml_tag(&gateways, "internetGatewayId") {
         Some(g) => g.to_string(),
-        None => xml_tag(&call("CreateInternetGateway", serde_json::json!({ "TagSpecification": tagged("internet-gateway", plane_id) })).await?, "internetGatewayId").ok_or("CreateInternetGateway gave no id")?.to_string(),
+        None => xml_tag(&call("CreateInternetGateway", serde_json::json!({ "TagSpecification": whose.tagged("internet-gateway") })).await?, "internetGatewayId").ok_or("CreateInternetGateway gave no id")?.to_string(),
     };
     if !gateways.contains(&format!("<vpcId>{vpc}</vpcId>")) {
         ok_if(call("AttachInternetGateway", serde_json::json!({ "InternetGatewayId": gateway, "VpcId": vpc })).await, &["Resource.AlreadyAssociated"])?;
     }
-    let route_table = match xml_tag(&call("DescribeRouteTables", serde_json::json!({ "Filter": filters(&[("tag:superci-plane", plane_id), ("vpc-id", &vpc)]) })).await?, "routeTableId") {
+    let route_table = match xml_tag(&call("DescribeRouteTables", serde_json::json!({ "Filter": filters(&[(&tk, &tv), ("vpc-id", &vpc)]) })).await?, "routeTableId") {
         Some(t) => t.to_string(),
-        None => xml_tag(&call("CreateRouteTable", serde_json::json!({ "VpcId": vpc, "TagSpecification": tagged("route-table", plane_id) })).await?, "routeTableId").ok_or("CreateRouteTable gave no id")?.to_string(),
+        None => xml_tag(&call("CreateRouteTable", serde_json::json!({ "VpcId": vpc, "TagSpecification": whose.tagged("route-table") })).await?, "routeTableId").ok_or("CreateRouteTable gave no id")?.to_string(),
     };
     ok_if(call("CreateRoute", serde_json::json!({ "RouteTableId": route_table, "DestinationCidrBlock": "0.0.0.0/0", "GatewayId": gateway })).await, &["RouteAlreadyExists"])?;
     // A subnet in each zone (spot capacity differs by zone), each a /20 of the VPC.
@@ -727,7 +753,7 @@ pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, pl
     let missing: Vec<String> = zones.into_iter().filter(|z| !subnets.iter().any(|(have, _)| have == z)).collect();
     for zone in &missing {
         let Some(cidr) = free.next() else { break };
-        let made = call("CreateSubnet", serde_json::json!({ "VpcId": vpc, "AvailabilityZone": zone, "CidrBlock": cidr, "TagSpecification": tagged("subnet", plane_id) })).await?;
+        let made = call("CreateSubnet", serde_json::json!({ "VpcId": vpc, "AvailabilityZone": zone, "CidrBlock": cidr, "TagSpecification": whose.tagged("subnet") })).await?;
         subnets.push((zone.clone(), xml_tag(&made, "subnetId").ok_or("CreateSubnet gave no id")?.to_string()));
     }
     for (_, subnet) in &subnets {
@@ -738,33 +764,42 @@ pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, pl
     let s3 = format!("com.amazonaws.{region}.s3");
     let endpoints = call("DescribeVpcEndpoints", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc), ("service-name", &s3)]) })).await;
     if endpoints.as_ref().is_ok_and(|e| !e.contains("<vpcEndpointId>")) {
-        let _ = call("CreateVpcEndpoint", serde_json::json!({ "VpcId": vpc, "ServiceName": s3, "VpcEndpointType": "Gateway", "RouteTableId": [route_table], "TagSpecification": tagged("vpc-endpoint", plane_id) })).await;
+        let _ = call("CreateVpcEndpoint", serde_json::json!({ "VpcId": vpc, "ServiceName": s3, "VpcEndpointType": "Gateway", "RouteTableId": [route_table], "TagSpecification": whose.tagged("vpc-endpoint") })).await;
     }
     // Nothing comes in (no inbound rules, not even from its own machines); everything may go out (AWS's default).
     let groups = call("DescribeSecurityGroups", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc), ("group-name", NETWORK_GROUP)]) })).await?;
     let security_group = match xml_tag(&groups, "groupId") {
         Some(g) => g.to_string(),
         None => xml_tag(&call("CreateSecurityGroup", serde_json::json!({ "GroupName": NETWORK_GROUP, "GroupDescription": "SuperCI job machines: nothing comes in", "VpcId": vpc,
-            "TagSpecification": tagged("security-group", plane_id) })).await?, "groupId").ok_or("CreateSecurityGroup gave no id")?.to_string(),
+            "TagSpecification": whose.tagged("security-group") })).await?, "groupId").ok_or("CreateSecurityGroup gave no id")?.to_string(),
     };
     subnets.sort();
     Ok(Network { vpc, security_group, subnets, ..Default::default() })
 }
 
-/// Removes the control plane's machines and network in a region (when the control plane is deleted); safe to repeat.
-/// Its machines are terminated first, and the network goes once they are (a few minutes at most).
-pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, now: &dyn Fn() -> u64, sleep: &dyn Fn(u64)) -> Result<()> {
+/// Removes a control plane's machines in a region (when it is deleted, or its AWS runners removed), and its own network
+/// there (from before 0.19.13); and the network SuperCI's control planes share there when `last` (no other control
+/// plane is left in the account, as the caller found) and no machine at all is in it. Safe to repeat. The machines
+/// are terminated first, and a network goes once they are (a few minutes at most).
+pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, last: bool, now: &dyn Fn() -> u64, sleep: &dyn Fn(u64)) -> Result<()> {
     let call = |action: &'static str, params: serde_json::Value| ec2(http, region, creds, action, params, now());
-    let mine = filters(&[("tag:superci-plane", plane_id)]);
-    let up = || call("DescribeInstances", serde_json::json!({ "Filter": [{ "Name": "tag:superci-plane", "Value": [plane_id] },
-        { "Name": "instance-state-name", "Value": ["pending", "running", "stopping", "stopped", "shutting-down"] }] }));
+    let alive = ["pending", "running", "stopping", "stopped", "shutting-down"];
+    let up = || call("DescribeInstances", serde_json::json!({ "Filter": [{ "Name": "tag:superci-plane", "Value": [plane_id] }, { "Name": "instance-state-name", "Value": alive }] }));
     let machines: Vec<String> = pairs(&up().await?, "instanceId", "instanceId").into_iter().map(|(i, _)| i.to_string()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     if !machines.is_empty() { call("TerminateInstances", serde_json::json!({ "InstanceId": machines })).await?; }
-    let vpcs = call("DescribeVpcs", serde_json::json!({ "Filter": mine })).await?;
-    let vpcs: Vec<String> = pairs(&vpcs, "vpcId", "vpcId").into_iter().map(|(v, _)| v.to_string()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-    if vpcs.is_empty() { return Ok(()) }
+    let mut doomed: Vec<(String, Whose)> = vec![];
+    for whose in [Whose::Own(plane_id), Whose::Shared].into_iter().filter(|w| last || matches!(w, Whose::Own(_))) {
+        let (k, v) = whose.filter();
+        for (vpc, _) in pairs(&call("DescribeVpcs", serde_json::json!({ "Filter": filters(&[(&k, &v)]) })).await?, "vpcId", "vpcId") {
+            if !doomed.iter().any(|(d, _)| d == vpc) { doomed.push((vpc.to_string(), whose)) }
+        }
+    }
+    if doomed.is_empty() { return Ok(()) }
     for _ in 0..40 { if !up().await?.contains("<instanceId>") { break } sleep(5_000) }
-    for vpc in vpcs {
+    for (vpc, whose) in doomed {
+        // (The shared one keeps any machine in it: another control plane's, one the caller did not know of.)
+        if whose == Whose::Shared && call("DescribeInstances", serde_json::json!({ "Filter": [{ "Name": "vpc-id", "Value": [&vpc] }, { "Name": "instance-state-name", "Value": alive }] })).await?.contains("<instanceId>") { continue }
+        let (tk, tv) = whose.filter();
         let in_vpc = filters(&[("vpc-id", &vpc)]);
         let gone = |r: Result<String>| match r { Err(e) if e.contains("NotFound") => Ok(()), r => r.map(|_| ()) };
         for (g, _) in pairs(&call("DescribeSecurityGroups", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc), ("group-name", NETWORK_GROUP)]) })).await?, "groupId", "groupId") {
@@ -775,7 +810,7 @@ pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, 
         }
         let endpoints: Vec<String> = pairs(&call("DescribeVpcEndpoints", serde_json::json!({ "Filter": filters(&[("vpc-id", &vpc)]) })).await.unwrap_or_default(), "vpcEndpointId", "vpcEndpointId").into_iter().map(|(e, _)| e.to_string()).collect();
         if !endpoints.is_empty() { gone(call("DeleteVpcEndpoints", serde_json::json!({ "VpcEndpointId": endpoints })).await)?; }
-        for (t, _) in pairs(&call("DescribeRouteTables", serde_json::json!({ "Filter": filters(&[("tag:superci-plane", plane_id), ("vpc-id", &vpc)]) })).await?, "routeTableId", "routeTableId") {
+        for (t, _) in pairs(&call("DescribeRouteTables", serde_json::json!({ "Filter": filters(&[(&tk, &tv), ("vpc-id", &vpc)]) })).await?, "routeTableId", "routeTableId") {
             gone(call("DeleteRouteTable", serde_json::json!({ "RouteTableId": t })).await)?;
         }
         for (g, _) in pairs(&call("DescribeInternetGateways", serde_json::json!({ "Filter": filters(&[("attachment.vpc-id", &vpc)]) })).await?, "internetGatewayId", "internetGatewayId") {
@@ -1309,7 +1344,9 @@ pub fn with_scratch(script: String, ramdisk: bool) -> String {
 /// `at`, where in it): GitHub gives a job's log only once it has ended. A runner that took more than ten seconds to listen for a job
 /// also says what it logged meanwhile (GitHub's runner keeps a log of its own under `_diag`): when the machine
 /// started it, each wait of two seconds or more with the line before and the line after, and its warnings and
-/// errors. So a slow one says where it waited: for its own start, for a name, for GitHub's answer.
+/// errors. So a slow one says where it waited: for its own start, for a name, for GitHub's answer. Once its job begins,
+/// the start of the runner's own log (`worker`), which has the job message it was handed: its steps' shape (which run
+/// in the background, in a parallel group, wait for which), for the job's page.
 const HELLO: &str = r#"# How the start went, said to the control plane (see where a slow one lost its time).
 ( superci_t2=$(date +%s%3N); curl -s -m 5 -X POST "HELLO_URL&boot=$superci_up&script=$superci_t0&read=${superci_t1:-0}&ready=$superci_t2&gh=$(cat /tmp/superci-gh 2>/dev/null)" > /dev/null 2>&1
   for i in $(seq 360); do grep -qs "Listening for Jobs" /var/log/superci.log && break; sleep 0.5; done
@@ -1322,7 +1359,7 @@ const HELLO: &str = r#"# How the start went, said to the control plane (see wher
         END { if (last != shown) print last }' | cut -c1-400 | head -c 20000 | curl -s -m 10 -X POST -H "content-type: text/plain" --data-binary @- "HELLO_URL&log=runner" > /dev/null 2>&1
     fi
   fi ) &
-(for i in $(seq 90);do pgrep -f Runner.Listener>/dev/null&&break;sleep 1;done;declare -A o;while :;do r=$(pgrep -f Runner.Listener);for f in /home/runner/_diag/pages/*.log;do [ -f "$f" ]||continue;n=${f##*/};s=$(stat -c %s "$f");p=${o[$n]:-0};[ "$s" -gt "$p" ]&&tail -c +$((p+1)) "$f"|head -c $((s-p))|curl -sf -m 10 --data-binary @- "HELLO_URL&live=$n&at=$p">/dev/null&&o[$n]=$s;done;[ -z "$r" ]&&break;sleep 2;done) &
+(for i in $(seq 90);do pgrep -f Runner.Listener>/dev/null&&break;sleep 1;done;declare -A o;while :;do r=$(pgrep -f Runner.Listener);for f in /home/runner/_diag/pages/*.log;do [ -f "$f" ]||continue;n=${f##*/};s=$(stat -c %s "$f");p=${o[$n]:-0};[ "$s" -gt "$p" ]&&tail -c +$((p+1)) "$f"|head -c $((s-p))|curl -sf -m 10 --data-binary @- "HELLO_URL&live=$n&at=$p">/dev/null&&o[$n]=$s;done;if [ "$w" != 1 ];then g=$(ls /home/runner/_diag/Worker_*.log 2>/dev/null|head -1);if [ -n "$w" ];then head -c 2000000 "$g"|curl -sf -m 20 --data-binary @- "HELLO_URL&worker=1">/dev/null&&w=1;elif grep -qs '"steps"' "$g";then w=0;fi;fi;[ -z "$r" ]&&break;sleep 2;done) &
 "#;
 
 /// A Linux machine's start-up script that also tells the control plane how its start went (`url`: a link only this
@@ -1586,8 +1623,9 @@ mod tests {
             let made = |kind: &str| self.made.borrow().iter().filter(|(k, _)| k == kind).map(|(_, id)| id.clone()).collect::<Vec<_>>();
             let make = |kind: &str, id: String| { self.made.borrow_mut().push((kind.into(), id.clone())); id };
             let body = match action.as_str() {
-                "DescribeVpcs" => made("vpc").iter().map(|v| format!("<item><vpcId>{v}</vpcId></item>")).collect(),
-                "CreateVpc" => format!("<vpc><vpcId>{}</vpcId></vpc>", make("vpc", "vpc-1".into())),
+                // (Each VPC with the tag it was made with, `vpc-1|key=value`; a tag filter honoured.)
+                "DescribeVpcs" => made("vpc").iter().filter(|v| get("Filter.1.Name").strip_prefix("tag:").is_none_or(|k| v.ends_with(&format!("|{k}={}", get("Filter.1.Value.1"))))).map(|v| format!("<item><vpcId>{}</vpcId></item>", v.split('|').next().unwrap())).collect(),
+                "CreateVpc" => { make("vpc", format!("vpc-1|{}={}", get("TagSpecification.1.Tag.1.Key"), get("TagSpecification.1.Tag.1.Value"))); "<vpc><vpcId>vpc-1</vpcId></vpc>".into() }
                 "DescribeInternetGateways" => made("igw").iter().map(|g| format!("<item><internetGatewayId>{g}</internetGatewayId>{}</item>", if made("attached").is_empty() { String::new() } else { "<attachmentSet><item><vpcId>vpc-1</vpcId></item></attachmentSet>".into() })).collect(),
                 "CreateInternetGateway" => format!("<internetGatewayId>{}</internetGatewayId>", make("igw", "igw-1".into())),
                 "AttachInternetGateway" => { make("attached", "igw-1".into()); "<return>true</return>".into() }
@@ -1622,8 +1660,25 @@ mod tests {
         ec2.calls.borrow_mut().clear();
         assert_eq!(futures::executor::block_on(make_network(&ec2, "us-east-1", &creds, "p1", 0)).unwrap(), n);
         assert!(!ec2.calls.borrow().iter().any(|c| c.starts_with("Create") && c != "CreateRoute" || c.starts_with("Attach")));
-        assert_eq!(futures::executor::block_on(find_network(&ec2, "us-east-1", &creds, "p1", 0)).unwrap(), Some(n));
+        assert_eq!(futures::executor::block_on(find_network(&ec2, "us-east-1", &creds, "p1", 0)).unwrap(), Some(n.clone()));
+        // It is the account's shared one: another control plane finds and uses it, making nothing.
+        assert!(ec2.made.borrow().iter().any(|(k, v)| k == "vpc" && v == "vpc-1|superci-network=shared"), "{:?}", ec2.made.borrow());
+        ec2.calls.borrow_mut().clear();
+        assert_eq!(futures::executor::block_on(make_network(&ec2, "us-east-1", &creds, "p2", 0)).unwrap(), n);
+        assert!(!ec2.calls.borrow().iter().any(|c| c == "CreateVpc"));
+        assert_eq!(futures::executor::block_on(find_network(&ec2, "us-east-1", &creds, "p2", 0)).unwrap(), Some(n));
     }
+
+    #[test]
+    fn a_control_plane_with_a_network_of_its_own_from_before_keeps_using_it() {
+        let (ec2, creds) = (Ec2::default(), Credentials { access_key_id: "A".into(), secret_access_key: "s".into(), session_token: None, expires_at_ms: u64::MAX });
+        ec2.made.borrow_mut().push(("vpc".into(), "vpc-old|superci-plane=old".into()));
+        ec2.made.borrow_mut().push(("vpc".into(), "vpc-1|superci-network=shared".into()));
+        assert_eq!(block_on_vpc(&ec2, &creds, "old"), Some(("vpc-old".to_string(), Whose::Own("old"))));
+        assert_eq!(block_on_vpc(&ec2, &creds, "new"), Some(("vpc-1".to_string(), Whose::Shared)));
+    }
+
+    fn block_on_vpc<'a>(ec2: &Ec2, creds: &Credentials, plane: &'a str) -> Option<(String, Whose<'a>)> { futures::executor::block_on(network_vpc(ec2, "us-east-1", creds, plane, 0)).unwrap() }
 
     #[test]
     fn iso_times() {

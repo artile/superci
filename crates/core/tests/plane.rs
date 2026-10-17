@@ -2702,6 +2702,16 @@ fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself()
     assert_eq!(page(&token, "aaaa_0000_1.log", 0, "2026-10-15T10:00:01.0000010Z Current runner version: '2.337.0'\n2026-10-15T10:00:05.0000010Z ##[group]Run npm test\n2026-10-15T10:00:06.0000010Z ok 1 - adds\n"), 200, "the job's own page: every step's lines again, a moment later");
     let got = json(&run(Request::new("GET", &format!("{PLANE_URL}/job/log?id=7")).with_header("authorization", "Bearer dashboard-session-key-1")));
     assert_eq!(got["log"].as_str().unwrap_or_else(|| panic!("{got}")), "2026-10-15T10:00:01.0000000Z Current runner version: '2.337.0'\n2026-10-15T10:00:05.0000000Z ##[group]Run npm test\n2026-10-15T10:00:06.0000000Z ok 1 - adds\n");
+    // The start of its runner's own log, once its job began: the job message in it gives its steps' shape (only with
+    // its link), as the job's log says it.
+    let message = include_str!("fixtures/runner/parallel.github.json");
+    let worker = format!("[2026-10-15 10:00:02Z INFO Worker] Waiting to receive the job message from the channel.\n[2026-10-15 10:00:02Z INFO Worker] Job message:\n {message}\n[2026-10-15 10:00:02Z INFO Worker] Starting the job {{\n");
+    let sent = |t: &str| run(Request::new("POST", &format!("{PLANE_URL}/hello?runner=superci-{PLANE_ID}-7&t={t}&worker=1")).with_body(worker.clone())).status;
+    assert_eq!((sent("wrong-wrong-wrong-wrong"), sent(&token)), (404, 200));
+    let got = json(&run(Request::new("GET", &format!("{PLANE_URL}/job/log?id=7&steps=1")).with_header("authorization", "Bearer dashboard-session-key-1")));
+    let shape = got["shape"].as_array().unwrap_or_else(|| panic!("{got}"));
+    assert_eq!((shape.len(), &shape[0]["id"], &shape[0]["bg"], &shape[11]["control"], &shape[11]["group"]), (14, &serde_json::json!("server"), &serde_json::json!(true), &serde_json::json!("wait"), &serde_json::json!("__parallel_0")));
+    assert_eq!(shape[11]["targets"], serde_json::json!(["__parallel_0_0", "second", "__parallel_0_2"]));
     let text = kept["log"].as_str().unwrap();
     assert!(text.starts_with("[2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()\n... 30 s ...\n[2026-10-13 22:56:41Z WARN") && !text.contains('\u{7}') && text.len() < 16_100 && text.lines().all(|l| l.len() <= 300), "{text}");
     assert_eq!(kept["listening_ms"], 1_790_000_011_000u64, "what it said before stays");

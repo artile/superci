@@ -20,8 +20,57 @@ pub fn view(job: &Value, got: &Value, going: bool) -> Value {
         _ => github(got, log),
     };
     let count = |k: &str| steps.iter().map(|s| s.lines.iter().filter(|l| l.1 == k).count()).sum::<usize>();
-    json!({ "going": going, "truncated": got["truncated"], "error": got["error"], "errors": count("e"), "warnings": count("w"),
-        "steps": steps.iter().map(|s| json!({ "name": s.name, "state": s.state, "ms": s.ms, "lines": s.lines.iter().map(|(t, k, h)| json!([t, k, h])).collect::<Vec<_>>() })).collect::<Vec<_>>() })
+    let (errors, warnings) = (count("e"), count("w"));
+    let shaped = shaped(steps, got["shape"].as_array().map(Vec::as_slice).unwrap_or_default());
+    json!({ "going": going, "truncated": got["truncated"], "error": got["error"], "errors": errors, "warnings": warnings,
+        "steps": shaped.iter().map(|(s, shape)| {
+            let mut v = json!({ "name": s.name, "state": s.state, "ms": s.ms, "lines": s.lines.iter().map(|(t, k, h)| json!([t, k, h])).collect::<Vec<_>>() });
+            if let Some(o) = shape.as_object() { for (k, x) in o { v[k] = x.clone() } }
+            v
+        }).collect::<Vec<_>>() })
+}
+
+/// The steps with their shape (`bg`: runs in the background; `child`: a step of the parallel group just before it;
+/// `group`: a parallel group's own row, with how many steps it has; `control`: `wait`, `wait-all` or `cancel`, with
+/// the names of the steps it names), as GitHub shows them: a parallel group's row first, its steps under it. By their
+/// order, from the steps the runner was handed (`Set up job` comes before them; post steps after).
+fn shaped(steps: Vec<Step>, shape: &[Value]) -> Vec<(Step, Value)> {
+    let from = usize::from(steps.first().is_some_and(|s| s.name == "Set up job"));
+    if shape.is_empty() || steps.len() < from + shape.len() { return steps.into_iter().map(|s| (s, Value::Null)).collect() }
+    let names: std::collections::HashMap<String, String> = shape.iter().zip(&steps[from..]).filter_map(|(sh, st)| Some((sh["id"].as_str()?.to_string(), st.name.clone()))).collect();
+    let mut out: Vec<(Step, Value)> = vec![];
+    let mut held: Vec<(Step, Value)> = vec![];
+    let mut steps: Vec<Option<Step>> = steps.into_iter().map(Some).collect();
+    let n = steps.len();
+    for i in 0..n {
+        let Some(step) = steps[i].take() else { continue };
+        if !(from..from + shape.len()).contains(&i) { out.push((step, Value::Null)); continue }
+        let sh = &shape[i - from];
+        let mut v = json!({});
+        if sh["bg"] == true { v["bg"] = true.into() }
+        match (sh["control"].as_str(), sh["group"].as_str()) {
+            // A parallel group's steps: held until its own row, which goes before them.
+            (None, Some(_)) => { v["child"] = true.into(); held.push((step, v)); continue }
+            (Some(_), Some(_)) => {
+                let kids: Vec<(Step, Value)> = std::mem::take(&mut held);
+                let mut row = json!({ "group": kids.len() });
+                if kids.iter().all(|(_, k)| k["bg"] == true) { row["bg"] = true.into() }
+                out.push((step, row));
+                out.extend(kids);
+                continue
+            }
+            (Some(c), None) => {
+                v["control"] = c.into();
+                v["targets"] = sh["targets"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).map(|t| names.get(t).cloned().unwrap_or_else(|| t.to_string())).collect::<Vec<_>>().into();
+            }
+            (None, None) => {}
+        }
+        // (A group's steps whose own row never came: as they are.)
+        out.append(&mut held);
+        out.push((step, v));
+    }
+    out.append(&mut held);
+    out
 }
 
 /// A run from a computer: its steps as its runner said them, each with its log.
@@ -259,6 +308,34 @@ pub fn ansi_html(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A job with background steps, waits and a parallel group, shaped by the message GitHub handed its runner (as
+    /// recorded): the group's row before its steps, each marked, waits naming the steps they wait for by name.
+    #[test]
+    fn steps_run_side_by_side_are_shown_as_github_shows_them() {
+        let message: Value = serde_json::from_str(include_str!("../../core/tests/fixtures/runner/parallel.github.json")).unwrap();
+        let shape = superci_core::plane::step_shape(&message);
+        let names = ["Set up job", "Start a server", "Run echo two; sleep 2", "Run echo three", "Run echo while they run", "Wait for two", "Wait", "Stop the server", "Wait for all",
+            "First", "Run echo second", "Run actions/checkout@v4", "Parallel group", "Run echo after", "What the runner was handed", "Post Run actions/checkout@v4", "Complete job"];
+        let steps: Vec<Value> = names.iter().enumerate().map(|(i, n)| json!({ "name": n, "number": i + 1, "status": "completed", "conclusion": "success" })).collect();
+        let v = view(&json!({ "provider": "" }), &json!({ "steps": steps, "shape": shape, "log": "" }), false);
+        let rows: Vec<String> = v["steps"].as_array().unwrap().iter().map(|s| {
+            let mut r = s["name"].as_str().unwrap().to_string();
+            if s["bg"] == true { r += " [bg]" }
+            if s["child"] == true { r = format!("  {r}") }
+            if let Some(n) = s["group"].as_u64() { r += &format!(" [parallel, {n}]") }
+            if let Some(c) = s["control"].as_str() { r += &format!(" [{c}: {}]", s["targets"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect::<Vec<_>>().join(", ")) }
+            r
+        }).collect();
+        assert_eq!(rows, ["Set up job", "Start a server [bg]", "Run echo two; sleep 2 [bg]", "Run echo three [bg]", "Run echo while they run", "Wait for two [wait: Run echo two; sleep 2]",
+            "Wait [wait: Run echo two; sleep 2]", "Stop the server [cancel: Start a server]", "Wait for all [wait-all: ]", "Parallel group [bg] [parallel, 3]", "  First [bg]", "  Run echo second [bg]",
+            "  Run actions/checkout@v4 [bg]", "Run echo after", "What the runner was handed", "Post Run actions/checkout@v4", "Complete job"]);
+        // Without a shape (a job from before, a machine that could not say it): as they are.
+        let plain = view(&json!({ "provider": "" }), &json!({ "steps": steps, "log": "" }), false);
+        assert_eq!(plain["steps"][12]["name"], "Parallel group");
+        assert!(plain["steps"][12]["group"].is_null());
+    }
+
     use super::*;
 
     #[test]
