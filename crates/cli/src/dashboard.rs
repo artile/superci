@@ -2332,7 +2332,8 @@ impl Dashboard {
         self.keyed.extend(done);
         let mut tidy: Vec<Box<dyn FnOnce() + Send>> = vec![];
         for p in &unkeyed {
-            let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DEVICE_KEY_").and_then(|r| r.split('_').next()?.parse::<u64>().ok()).is_some_and(|until| until < now)) };
+            // (And the keys an older SuperCI on another device hands under the old name, which nothing here reads.)
+            let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DEVICE_KEY_").or_else(|| n.strip_prefix("DASHBOARD_KEY_")).and_then(|r| r.split('_').next()?.parse::<u64>().ok()).is_some_and(|until| until < now)) };
             match p.clone() {
                 Plane::Cloudflare { account_id, script, .. } => if let Ok(cf) = self.cloudflare() {
                     tidy.push(Box::new(move || for old in expired(cf.secret_names(&account_id, &script).unwrap_or_default()) { let _ = cf.delete_secret(&account_id, &script, &old); }));
