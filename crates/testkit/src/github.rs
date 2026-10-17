@@ -322,9 +322,11 @@ impl GitHub {
             // (A personal account's App registers its runners in each repository: the same, there.)
             ("POST", ["orgs", OWNER, "actions", "runners", "generate-jitconfig"] | ["repos", OWNER, "app", "actions", "runners", "generate-jitconfig"]) => {
                 let body: Value = serde_json::from_slice(&r.body).ok()?;
+                let name = body["name"].as_str()?.to_string();
+                // A name it has already (not deleted) is refused, as GitHub refuses it.
+                if h.runners.values().any(|n| *n == name) { return ok(409, json!({ "message": format!("Already exists - A runner with the name {name} already exists."), "documentation_url": "https://docs.github.com/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-an-organization", "status": "409" })) }
                 h.next += 1;
                 let id = 20 + h.next;
-                let name = body["name"].as_str()?.to_string();
                 h.runners.insert(id, name.clone());
                 let labels: Vec<Value> = body["labels"].as_array()?.iter().enumerate().map(|(i, l)| json!({ "id": i + 1, "name": l, "type": "custom" })).collect();
                 ok(201, json!({ "runner": { "id": id, "name": name, "os": "unknown", "status": "offline", "busy": false, "labels": labels },
