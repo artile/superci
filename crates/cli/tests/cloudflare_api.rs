@@ -54,6 +54,22 @@ fn a_cloudflare_control_plane_is_deployed_given_its_containers_shown_and_deleted
     assert_eq!(served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == "CONTAINERS").map(|(_, v)| v).as_deref(), Some("on"));
     let (ok, said) = run(&["runners", "list", "--plane=cfplane00001"]);
     assert!(ok && said.contains("1. cloudflare"), "{said}");
+    // Secrets on Cloudflare: the Worker hands its control plane those a run is given with each request, so a
+    // control plane there keeps 12, about 4.8 KB each; past either, refused before anything is written.
+    {
+        let mut kept = served.aws.worker_secrets.lock().unwrap();
+        let worker = kept.entry("superci".into()).or_default();
+        for i in 0..12 { worker.insert(format!("SECRET_KEPT{i}_ALL"), serde_json::json!({ "name": format!("KEPT{i}"), "value": "v", "updated_ms": 1 }).to_string()); }
+    }
+    let secret = |name: &str, value: &str| {
+        let o = common::command(&home).args(["secrets", "create", name, "--value-env=THE_VALUE", "--plane=cfplane00001", "--json"]).env("THE_VALUE", value).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let said = secret("THIRTEENTH", "v");
+    assert!(said.contains("keeps 12 secrets at most"), "{said}");
+    let said = secret("BIGONE", &"\"".repeat(4000));
+    assert!(said.contains("about 4.8 KB at most"), "{said}");
+    served.aws.worker_secrets.lock().unwrap().get_mut("superci").unwrap().retain(|k, _| !k.starts_with("SECRET_"));
     // The dashboard: its Runners and Add runners pages, Cloudflare's spending read.
     step("05-dashboard");
     let (_child, link) = common::dashboard(&home);
