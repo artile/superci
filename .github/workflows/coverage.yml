@@ -26,6 +26,11 @@ jobs:
         run: cargo install --locked cargo-zigbuild worker-build
       - name: Build
         run: ./build.sh
+      - name: The kernel's EROFS (the layer store's setup test mounts its files from a container, which loads no module)
+        run: |
+          uname -r
+          grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
+          sudo modprobe erofs && grep erofs /proc/filesystems
       - name: The tests, measured
         # (In supercov's own copy of the repository: what ./build.sh built is found in this one.)
         env:
