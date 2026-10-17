@@ -88,7 +88,9 @@ pub struct Scope { pub name: String, pub write: bool }
 /// What a job may do in the cache: its repository's entries in these scopes, read in this order; and, for a run from
 /// a computer, which run's artifacts are its own.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Access { pub ns: String, pub scopes: Vec<Scope>, pub run: Option<String> }
+pub struct Access { pub ns: String, pub scopes: Vec<Scope>, pub run: Option<String>,
+    /// The job of a run from a computer the token is for (its id), which an artifact it keeps says it was kept by.
+    pub job: Option<String> }
 
 impl Access {
     fn writes_to(&self) -> Option<&Scope> { self.scopes.iter().find(|s| s.write) }
@@ -112,7 +114,7 @@ fn plain(s: &str) -> bool { !s.is_empty() && s.len() <= 512 && !s.chars().any(|c
 pub fn github_access(claims: &Value) -> Result<Access> {
     let repo = claims["repository_id"].as_str().map(str::to_string).or_else(|| claims["repository_id"].as_u64().map(|n| n.to_string())).ok_or("a token without its repository")?;
     if repo.is_empty() || !repo.bytes().all(|b| b.is_ascii_digit()) { return Err("a token without its repository".into()) }
-    Ok(Access { ns: format!("gh{repo}"), scopes: scopes(claims["ac"].as_str().unwrap_or("[]"))?, run: None })
+    Ok(Access { ns: format!("gh{repo}"), scopes: scopes(claims["ac"].as_str().unwrap_or("[]"))?, run: None, job: None })
 }
 
 /// The claims of a token the control plane gives a run from a computer, so its jobs reach the cache as GitHub's do:
@@ -133,7 +135,8 @@ pub fn local_access(claims: &Value) -> Result<Access> {
     let ns = claims["ns"].as_str().unwrap_or_default();
     if !(ns.starts_with("gh") || ns.starts_with("local-")) || !ns.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') { return Err("a token without its repository".into()) }
     let run = claims["run"].as_str().filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
-    Ok(Access { ns: ns.to_string(), scopes: scopes(claims["ac"].as_str().unwrap_or("[]"))?, run })
+    let job = claims["scp"].as_str().and_then(|s| s.rsplit(':').next()).filter(|j| !j.is_empty() && j.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
+    Ok(Access { ns: ns.to_string(), scopes: scopes(claims["ac"].as_str().unwrap_or("[]"))?, run, job })
 }
 
 /// A repository's entries for a run from a computer whose repository GitHub does not know (no App there).
@@ -152,6 +155,8 @@ pub struct Entry {
     #[serde(default)] pub done: bool,
     /// What a tool kept beside its artifact (Turbo: its signature and how long the task took), given back with it.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub meta: Option<String>,
+    /// An artifact's: the job that keeps it (its id, and its name in the run).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub by: Option<(String, String)>,
 }
 
 impl Entry {
@@ -327,12 +332,22 @@ pub fn artifact_name(name: &str) -> bool { plain(name) && name.len() <= 256 && !
 /// Where an artifact's pieces are: the run's, then the entry's own.
 pub fn artifact_ns(run: &str) -> String { format!("run-{run}") }
 
-pub async fn begin_artifact(store: &dyn Store, run: &str, name: &str, region: &str, now: u64) -> std::result::Result<(String, Entry), Refused> {
+/// A run's artifact begun by one of its jobs (`by`: its id and name). One of that name exists already: refused, as
+/// GitHub refuses it in a run, unless an earlier run of the same job kept it (a job started again, after AWS took
+/// back its spot machine, is a new attempt of it, which GitHub lets keep its artifacts anew): then this one takes
+/// its place.
+pub async fn begin_artifact(store: &dyn Store, run: &str, name: &str, region: &str, by: Option<(String, String)>, now: u64) -> std::result::Result<(String, Entry), Refused> {
     if !artifact_name(name) { return Err(Refused::Bad("an artifact's name GitHub would not take".into())) }
     let at = artifact_index(run, name);
-    let entry = Entry { id: crate::crypto::random_id(20).to_ascii_lowercase(), region: region.to_string(), made: now, used: now, ..Default::default() };
+    let entry = Entry { id: crate::crypto::random_id(20).to_ascii_lowercase(), region: region.to_string(), made: now, used: now, by: by.clone(), ..Default::default() };
     let text = serde_json::to_string(&entry).map_err(|e| Refused::Bad(e.to_string()))?;
-    if store.put_if_absent(&at, text).await.map_err(Refused::Bad)? { Ok((at, entry)) } else { Err(Refused::Exists) }
+    if store.put_if_absent(&at, text.clone()).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
+    let Some(was) = store.get(&at).await.map_err(Refused::Bad)? else { return Err(Refused::Exists) };
+    let earlier = serde_json::from_str::<Entry>(&was).ok().and_then(|e| e.by);
+    match (earlier, by) {
+        (Some((id0, n0)), Some((id1, n1))) if n0 == n1 && id0 != id1 && store.swap(&at, Some(&was), text).await.map_err(Refused::Bad)? => Ok((at, entry)),
+        _ => Err(Refused::Exists),
+    }
 }
 
 /// A run's artifact by its name (`done`: only a finished one).
@@ -375,7 +390,7 @@ pub fn ref_access(ns: &str, git_ref: &str, default_branch: &str) -> Option<Acces
     let mut scopes = vec![Scope { name: git_ref.to_string(), write: true }];
     let default = format!("refs/heads/{default_branch}");
     if !default_branch.is_empty() && default != git_ref && plain(&default) { scopes.push(Scope { name: default, write: false }) }
-    Some(Access { ns: ns.to_string(), scopes, run: None })
+    Some(Access { ns: ns.to_string(), scopes, run: None, job: None })
 }
 
 /// A GitLab project's entries: by its connection (a GitLab of its own) and the project's id there.
@@ -429,13 +444,22 @@ mod tests {
     #[test]
     fn a_runs_artifacts_by_name_once_each() {
         let store = Mem::default();
-        let (at, e) = run(begin_artifact(&store, "41", "report", "us-east-1", 5)).unwrap();
+        let (at, e) = run(begin_artifact(&store, "41", "report", "us-east-1", None, 5)).unwrap();
         assert!(run(artifact(&store, "41", "report", true)).unwrap().is_none(), "not finished yet");
-        assert_eq!(run(begin_artifact(&store, "41", "report", "us-east-1", 6)).unwrap_err(), Refused::Exists);
+        assert_eq!(run(begin_artifact(&store, "41", "report", "us-east-1", None, 6)).unwrap_err(), Refused::Exists);
         run(finish(&store, &at, &e, vec![("p1".into(), 9)])).unwrap();
         assert_eq!(run(artifacts(&store, "41")).unwrap().iter().map(|(n, e)| (n.as_str(), e.size)).collect::<Vec<_>>(), [("report", 9)]);
         assert!(run(artifacts(&store, "42")).unwrap().is_empty(), "another run's");
-        assert!(matches!(run(begin_artifact(&store, "41", "a/b", "us-east-1", 7)), Err(Refused::Bad(_))));
+        assert!(matches!(run(begin_artifact(&store, "41", "a/b", "us-east-1", None, 7)), Err(Refused::Bad(_))));
+        // A job started again (a new attempt of it, after AWS took back its spot machine) keeps its artifact anew; another
+        // job of the run, or the same attempt again, is refused as GitHub refuses it.
+        let by = |id: &str, name: &str| Some((id.to_string(), name.to_string()));
+        let (_, first) = run(begin_artifact(&store, "41", "playwright-artifacts", "us-east-1", by("100", "tests"), 8)).unwrap();
+        assert_eq!(run(begin_artifact(&store, "41", "playwright-artifacts", "us-east-1", by("100", "tests"), 9)).unwrap_err(), Refused::Exists);
+        assert_eq!(run(begin_artifact(&store, "41", "playwright-artifacts", "us-east-1", by("101", "lint"), 9)).unwrap_err(), Refused::Exists);
+        let (_, again) = run(begin_artifact(&store, "41", "playwright-artifacts", "us-east-1", by("102", "tests"), 10)).unwrap();
+        assert_ne!(first.id, again.id);
+        assert_eq!(run(begin_artifact(&store, "41", "playwright-artifacts", "us-east-1", None, 11)).unwrap_err(), Refused::Exists);
         let a = local_access(&local_claims("gh1", "computer", "refs/heads/main", "main", "41", "9")).unwrap();
         assert_eq!(a.run.as_deref(), Some("41"));
         assert_eq!(local_claims("gh1", "computer", "refs/heads/main", "main", "41", "9")["scp"], "Actions.Results:41:9");
@@ -455,7 +479,7 @@ mod tests {
         assert_eq!(pr().ns, "gh77");
         // The token GitHub gave a job (recorded): its one scope, read and write.
         let recorded = serde_json::json!({ "ac": "[{\"Scope\":\"refs/heads/main\",\"Permission\":3}]", "acsl": "10", "repository_id": "1000001", "run_id": "1" });
-        assert_eq!(github_access(&recorded).unwrap(), Access { ns: "gh1000001".into(), scopes: vec![Scope { name: "refs/heads/main".into(), write: true }], run: None });
+        assert_eq!(github_access(&recorded).unwrap(), Access { ns: "gh1000001".into(), scopes: vec![Scope { name: "refs/heads/main".into(), write: true }], run: None, job: None });
         assert!(github_access(&serde_json::json!({ "ac": "[]" })).is_err());
         assert!(github_access(&serde_json::json!({ "repository_id": "1", "ac": r#"[{"Scope":"a:b","Permission":3}]"# })).is_err());
     }
@@ -472,7 +496,7 @@ mod tests {
         assert!(run(lookup(&store, &main_branch(), "deps-bbb", &[], V, 0)).unwrap().is_none());
         assert_eq!(run(lookup(&store, &pr(), "deps-bbb", &[], V, 0)).unwrap().unwrap().index, "cache:gh77:refs/pull/5/merge:0123abcd:deps-bbb");
         // Read only: no save.
-        let reader = Access { ns: "gh77".into(), scopes: vec![Scope { name: "refs/heads/main".into(), write: false }], run: None };
+        let reader = Access { ns: "gh77".into(), scopes: vec![Scope { name: "refs/heads/main".into(), write: false }], run: None, job: None };
         assert_eq!(run(begin(&store, &reader, "x", V, "us-east-1", 3)).unwrap_err(), Refused::NoWrite);
     }
 

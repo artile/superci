@@ -25,8 +25,8 @@ const HELP: &[(&str, &str, &str)] = &[
         "It also asks Cloudflare to end its sign-in, and the control plane to forget this machine's key. Your control plane\nand runners keep working."),
     ("status", "  superci status                    The control plane in use: where, its version, whether jobs can run.",
         "With --json: the control plane, and under \"status\" everything it says of itself (repositories, runner providers,\nlimits, the latest jobs)."),
-    ("jobs", "  superci jobs list\n  superci jobs retrieve ID [--bytes=N] [--out=FILE] [--tests]\n  superci jobs retrieve --run=ID [--job=NAME] [--out=FILE] [--tests]",
-        "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed.\nretrieve  One job: how its start went step by step (what AWS was asked and answered, when its machine booted, when\n          its runner listened), and the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, four million at most). --out=FILE: its whole log into FILE, whatever its size. GitHub keeps a job's log once the job has ended.\n          --tests: its tests instead, from its whole log: the ones that failed, each with its file and error, and how many\n          passed, failed and were skipped (what Vitest, Jest, Playwright, pytest, cargo and Go say in their output)."),
+    ("jobs", "  superci jobs list [--run=ID]\n  superci jobs retrieve ID [--bytes=N] [--out=FILE] [--tests]\n  superci jobs retrieve --run=ID [--job=NAME] [--out=FILE] [--tests]",
+        "list      The latest jobs: each one's id, how it ended, where it ran, how long, its cost, and why it failed. --run=ID:\n          that run's jobs only.\nretrieve  One job: how its start went step by step (what AWS was asked and answered, when its machine booted, when\n          its runner listened), and the end of its log: GitHub's (read with your App's token) or GitLab's, as far back as --bytes\n          says (200000 unless given, four million at most). --out=FILE: its whole log into FILE, whatever its size. GitHub keeps a job's log once the job has ended.\n          --tests: its tests instead, from its whole log: the ones that failed, each with its file and error, and how many\n          passed, failed and were skipped (what Vitest, Jest, Playwright, pytest, cargo and Go say in their output)."),
     ("runs", "  superci runs list\n  superci runs retrieve ID [--tests]\n  superci runs create --workflow=FILE [--job=NAME] [--quiet] [--detach]\n  superci runs wait ID [--quiet]\n  superci runs cancel ID",
         "A run is a workflow's jobs together (on GitLab, a pipeline's).\n\nlist      The latest runs: each one's id, how it stands, how many of its jobs ran here, how long it took (from its\n          first job queued to its last one over), what its machines cost together, and the job that was over last:\n          the one the run waited for.\nretrieve  One run with its jobs (every attempt of it, when it was run again). --tests: each failed job's tests too,\n          from its whole log: the ones that failed, with their files and errors, and where its artifacts are.\ncreate    Runs a workflow's job from this computer, as GitHub would run it, on a machine as any job here: the working\n          tree as it is (what git tracks, and new files it does not ignore), with nothing pushed. --workflow=FILE runs its\n          jobs (each combination of a matrix a job of its own, each job once those it needs have ended); --job=NAME\n          runs that job and those it needs. --event=push|pull_request (push unless given), and what GitHub would give\n          it and cannot here: --secret=NAME=VALUE and --var=NAME=VALUE, as often as needed. It waits for the run and\n          prints its jobs' lines, then each step's result and time and what its machines cost; it fails when the run does.\n          --quiet: each step's result, and the last lines of one that failed, not every line (for a coding agent).\n          --detach: says the run's id and ends; `superci runs wait ID` follows it.\nwait      Follows a run from a computer to its end, as create does.\ncancel    Stops a run, as GitHub's Cancel does: its jobs not started end (one whose `if` holds after a cancel, as\n          `always()`, runs), and a running one is told to stop (its steps have five minutes), then its machine ends. A GitHub run is cancelled by GitHub, asked with your App's token.\n\nOnly the jobs SuperCI ran are counted: a run's jobs on other runners are not known here."),
     ("planes", "  superci planes list\n  superci planes create aws --region=us-east-1 [--account=ID] | cloudflare [--account=ID] | modal\n  superci planes update [ID]\n  superci planes move ID\n  superci planes allow [ID]\n  superci planes delete ID --confirm",
@@ -488,7 +488,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             }
             Ok(Done { said: status_lines(&v), data: v })
         }
-        ("jobs", "list") => jobs(),
+        ("jobs", "list") => jobs(args.get("run")),
         ("jobs", "retrieve") => {
             let id = w(2);
             // Or by its run and its name (`--run=ID --job=NAME`; the name may be left out when the run has one job), for
@@ -1594,11 +1594,14 @@ fn workspaces(args: &Args) -> Result<Done> {
     }
 }
 
-fn jobs() -> Result<Done> {
+/// The latest jobs (`run`: that run's only).
+fn jobs(run: Option<&str>) -> Result<Done> {
+    if run.is_some_and(|r| r.is_empty() || !r.bytes().all(|b| b.is_ascii_digit())) { return usage("--run takes a run's id (they are in `superci runs list`).") }
     let mut d = signed_in();
-    let jobs: Vec<Value> = view(&mut d)?.jobs().iter().map(job_words).collect();
+    let jobs: Vec<Value> = view(&mut d)?.jobs().iter().filter(|j| run.is_none_or(|r| j["run_id"].as_u64().is_some_and(|n| n.to_string() == r))).map(job_words).collect();
     let said = jobs.iter().take(40).map(job_line).collect::<Vec<_>>();
-    Ok(Done { said: if said.is_empty() { vec!["No jobs yet.".into()] } else { said }, data: json!({ "jobs": jobs }) })
+    let none = match run { Some(r) => format!("No jobs of run {r} among the latest this control plane keeps (ids are in `superci runs list`)."), None => "No jobs yet.".into() };
+    Ok(Done { said: if said.is_empty() { vec![none] } else { said }, data: json!({ "jobs": jobs }) })
 }
 
 /// A job in a line: its id, how it stands, what it is, and (its runner, how long, its cost, why it failed or waits).

@@ -371,7 +371,9 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
         // Over: once every step's lines are out (its log may come a while after: the runner sends steps' logs as it
         // can, a large one after the job has ended), or a minute later at most.
         if st["over"] == true && over_at.is_none() { over_at = Some(std::time::Instant::now()) }
-        if st["over"] == true && logs.iter().any(|l| !l.complete()) && over_at.is_some_and(|t| t.elapsed().as_secs() <= logs_wait_s()) { continue }
+        // (And for each step's result, which its runner may send after the job has ended too.)
+        let results_missing = jobs.iter().any(|j| j["result"].is_string() && !["skipped", "cancelled"].contains(&j["result"].as_str().unwrap_or_default()) && j["steps"].as_array().is_some_and(|ss| ss.iter().any(|s| s["result"].is_null() && s["start"].is_string())));
+        if st["over"] == true && (logs.iter().any(|l| !l.complete()) || results_missing) && over_at.is_some_and(|t| t.elapsed().as_secs() <= logs_wait_s()) { continue }
         if st["over"] == true {
             let (result, took) = (st["result"].as_str().unwrap_or_default().to_string(), began.elapsed().as_secs());
             // Each job's steps, how each went and how long it took; a failed step's last lines when they were not
@@ -381,6 +383,8 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 say(&format!("{}{}{} ({}{}{}): {}", crate::commands::JOB_LINE, j["name"].as_str().unwrap_or("job"), j["job_id"].as_str().map(|id| format!(" · job {id}")).unwrap_or_default(), j["machine"].as_str().unwrap_or("no machine"),
                     j["took_ms"].as_u64().map(|ms| format!(", {}", span(ms / 1000))).unwrap_or_default(), j["usd"].as_f64().map(|u| format!(", ${u:.3}")).unwrap_or_default(),
                     match (j["result"].as_str().unwrap_or("?"), j["error"].as_str().filter(|e| !e.is_empty())) { (r, Some(e)) => format!("{r} ({e})"), (r, None) => r.to_string() }));
+                // Started again: said, with its first attempt (its artifacts are kept anew by this one).
+                if let Some(first) = j["restarted"]["job_id"].as_str() { say(&format!("{}  Started again on an on-demand machine: {} (its first attempt was job {first}).", crate::commands::JOB_LINE, j["restarted"]["why"].as_str().unwrap_or("its machine ended"))) }
                 let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
                 steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
                 // Each step's whole log is read for its tests (its own log, else what its machine sent of it).
@@ -390,13 +394,18 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     block_on(http.send(r)).ok().filter(|r| r.status < 300).map(|r| r.body_text()).unwrap_or_default()
                 };
                 let mut all = String::new();
+                let mut failed_unsaid: Vec<String> = vec![];
                 for s in steps {
-                    let mark = match s["result"].as_str() { Some("succeeded") => "✓", Some("failed") => "✗", Some("skipped") | Some("cancelled") => "–", _ => "·" };
+                    // (A step whose result never came is judged by its own log: tests that failed there, failed.)
+                    let unsaid = s["result"].is_null();
+                    let text = if ["skipped", "cancelled"].contains(&s["result"].as_str().unwrap_or_default()) { String::new() } else { step_text(s) };
+                    let failed_here = s["result"] == "failed" || (unsaid && crate::test_results::read(&text).failed > 0);
+                    if failed_here && unsaid { failed_unsaid.push(s["name"].as_str().unwrap_or("step").to_string()) }
+                    let mark = match s["result"].as_str() { Some("succeeded") => "✓", Some("failed") => "✗", Some("skipped") | Some("cancelled") => "–", _ if failed_here => "✗", _ => "·" };
                     let time = match (s["start"].as_str().and_then(crate::log_view::seconds), s["finish"].as_str().and_then(crate::log_view::seconds)) { (Some(a), Some(b)) => format!(" {}", span(b.saturating_sub(a))), _ => String::new() };
                     say(&format!("{}  {mark} {}{time}", crate::commands::JOB_LINE, s["name"].as_str().unwrap_or("step")));
                     if ["skipped", "cancelled"].contains(&s["result"].as_str().unwrap_or_default()) { continue }
-                    let text = step_text(s);
-                    if how.quiet && s["result"] == "failed" {
+                    if how.quiet && failed_here {
                         // The tests it failed, each with its whole error (its last lines may be another's, or a
                         // teardown's), then those lines.
                         for f in &crate::test_results::read(&text).failures {
@@ -414,7 +423,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 }
                 // A failed job: which steps failed, said in words (all its tests may have passed: a type-check failed, say).
                 if j["result"] == "failure" {
-                    let failed: Vec<&str> = j["steps"].as_array().into_iter().flatten().filter(|s| s["result"] == "failed").filter_map(|s| s["name"].as_str()).collect();
+                    let failed: Vec<&str> = j["steps"].as_array().into_iter().flatten().filter(|s| s["result"] == "failed").filter_map(|s| s["name"].as_str()).chain(failed_unsaid.iter().map(String::as_str)).collect();
                     if !failed.is_empty() { say(&format!("{}  Failed: {}", crate::commands::JOB_LINE, failed.join(", "))) }
                 }
                 if let (Some(id), true) = (j["job_id"].as_str(), j["result"] == "failure") { say(&format!("{}  Its whole log: superci jobs retrieve {id} --out=job.log", crate::commands::JOB_LINE)) }

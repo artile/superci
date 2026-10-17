@@ -3306,6 +3306,13 @@ impl<'a> ControlPlane<'a> {
         self.timer.wake_in(60_000).await
     }
 
+    /// The job keeping an artifact of a run from a computer: its id, and its name in the run (the same when it is
+    /// started again).
+    async fn artifact_keeper(&self, access: &cache::Access) -> Result<Option<(String, String)>> {
+        let Some(id) = &access.job else { return Ok(None) };
+        Ok(get_json::<Job>(self.store, &format!("job:{id}")).await?.map(|j| (id.clone(), j.name)))
+    }
+
     /// The job a machine with the cache's link was started for (its record, else by its runner while that is kept).
     pub(crate) async fn job_of_machine(&self, machine: &cache::Machine) -> Result<Option<Job>> {
         if machine.job.starts_with("job:") { if let Some(j) = get_json::<Job>(self.store, &machine.job).await? { return Ok(Some(j)) } }
@@ -3897,6 +3904,8 @@ impl<'a> ControlPlane<'a> {
                 if record.as_ref().is_some_and(|r| r.interrupted) && said.as_deref() != Some("succeeded") && j["off_spot"] != true && run["cancelled"] != true {
                     j["state"] = "pending".into();
                     j["off_spot"] = true.into();
+                    // (Its first attempt, said with the run: its job, and why it is started again.)
+                    j["restarted"] = serde_json::json!({ "job_id": j["job_id"].clone(), "why": "AWS took back its spot machine" });
                     if let Some(o) = j.as_object_mut() { o.remove("job_id"); o.remove("token"); }
                     changed = true;
                     continue
@@ -4306,7 +4315,9 @@ impl<'a> ControlPlane<'a> {
             out.push(serde_json::json!({ "start": start, "job_id": record.as_ref().map(|r| r.job_id.to_string()), "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
                 "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next, "posts": posts, "steps": steps,
                 // What its machine cost, and how long the job ran.
-                "usd": record.as_ref().map(|r| job_usd(r, self.clock.now_ms())), "took_ms": record.as_ref().and_then(|r| Some(r.ended_ms.unwrap_or(self.clock.now_ms()).saturating_sub(r.started_ms?))) }));
+                "usd": record.as_ref().map(|r| job_usd(r, self.clock.now_ms())), "took_ms": record.as_ref().and_then(|r| Some(r.ended_ms.unwrap_or(self.clock.now_ms()).saturating_sub(r.started_ms?))),
+                // Started again (AWS took back its first machine): which job that was, and why.
+                "restarted": j["restarted"] }));
         }
         let jobs = run["jobs"].as_array().cloned().unwrap_or_default();
         let over = jobs.iter().all(|j| j["state"] == "done");
@@ -5128,7 +5139,7 @@ impl<'a> ControlPlane<'a> {
                 let (name, ns) = (body["name"].as_str().unwrap_or_default(), cache::artifact_ns(&run));
                 let missing = || Ok(Response::json(&serde_json::json!({ "ok": false, "why": "no such artifact" })).with_status(404));
                 match what {
-                    "artifact-begin" => match cache::begin_artifact(self.store, &run, name, &machine.region, now).await {
+                    "artifact-begin" => match cache::begin_artifact(self.store, &run, name, &machine.region, self.artifact_keeper(&access).await?, now).await {
                         Ok(_) => Ok(Response::json(&serde_json::json!({ "ok": true }))),
                         Err(cache::Refused::Exists) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": "an artifact of this name exists in the run" })).with_status(409)),
                         Err(cache::Refused::Bad(e)) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": e })).with_status(400)),

@@ -3614,7 +3614,7 @@ fn a_key_for_coding_agents_starts_runs_within_the_control_planes_own_limits() {
     for _ in 0..3 { let big = run("superci/cpu=64", key); assert_eq!(big.status, 200, "{}", big.body_text()); }
     // What its jobs kept with upload-artifact can be fetched from the computer: listed, then read through links to
     // the bucket, by whoever may look (a key that only reads too).
-    let (at, e) = block_on(superci_core::cache::begin_artifact(&store, &run_id, "coverage", "us-east-1", 5)).unwrap();
+    let (at, e) = block_on(superci_core::cache::begin_artifact(&store, &run_id, "coverage", "us-east-1", None, 5)).unwrap();
     block_on(superci_core::cache::finish(&store, &at, &e, vec![("p0".into(), 7), ("p1".into(), 3)])).unwrap();
     let look = |path: &str| block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}{path}")).with_header("authorization", "Bearer superci_read_0123456789abcdef0123456789abcdef")));
     let listed = look(&format!("/runs/{run_id}/artifacts"));

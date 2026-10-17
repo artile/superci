@@ -110,10 +110,22 @@ impl Browser {
 
     /// Clicks the first element `selector` names whose words contain `words` (any, when empty), as a person does: at
     /// its middle, with the mouse.
+    /// (Once it holds still and is what is at that point: a page still laying itself out, a card coming in above, would
+    /// take the click somewhere else.)
     pub fn click(&mut self, selector: &str, words: &str) {
-        let at = self.eval(&format!("(() => {{ const e = [...document.querySelectorAll({})].find(e => e.innerText.includes({}) || e.value === {1}); if (!e) return null;
-            e.scrollIntoView({{block: 'center'}}); const r = e.getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; }})()", json!(selector), json!(words)));
-        let Some([x, y]) = at.as_array().map(|a| [a[0].as_f64().unwrap(), a[1].as_f64().unwrap()]) else { panic!("nothing to click: {selector} {words:?} on {}", self.text("main")) };
+        let find = format!("(() => {{ const e = [...document.querySelectorAll({})].find(e => e.innerText.includes({}) || e.value === {1}); if (!e) return null;
+            e.scrollIntoView({{block: 'center'}}); const r = e.getBoundingClientRect(); const x = r.x + r.width / 2, y = r.y + r.height / 2; const at = document.elementFromPoint(x, y);
+            return [x, y, !!at && (at === e || e.contains(at) || at.contains(e))]; }})()", json!(selector), json!(words));
+        let mut last: Option<[f64; 2]> = None;
+        let until = Instant::now() + Duration::from_secs(5);
+        let (x, y) = loop {
+            let at = self.eval(&find);
+            let Some(a) = at.as_array() else { panic!("nothing to click: {selector} {words:?} on {}", self.text("main")) };
+            let here = [a[0].as_f64().unwrap(), a[1].as_f64().unwrap()];
+            if (last == Some(here) && a[2] == true) || Instant::now() > until { break (here[0], here[1]) }
+            last = Some(here);
+            std::thread::sleep(Duration::from_millis(100));
+        };
         for kind in ["mousePressed", "mouseReleased"] { self.call("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 })).unwrap(); }
     }
 

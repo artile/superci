@@ -662,6 +662,9 @@ fn a_job_whose_spot_machine_aws_took_back_is_started_again_off_spot_and_the_run_
     let out = cli.wait_with_output().unwrap();
     let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success() && said.contains("The run ended: success"), "{said}");
+    // Its summary says it was started again, and which job its first attempt was.
+    let first_id = first_job["job_id"].to_string();
+    assert!(said.contains(&format!("Started again on an on-demand machine: AWS took back its spot machine (its first attempt was job {first_id}).")), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1311,5 +1314,27 @@ fn a_run_with_a_run_key_gets_the_secrets_the_ci_keeps_and_says_which_it_names_th
     let handed = loop { if let Some((_, v)) = served.store.under("rjob:").into_iter().next() { break v } std::thread::sleep(std::time::Duration::from_millis(50)) };
     assert_eq!(handed["message"]["variables"]["KEPT"]["value"], "kept-value-0001");
     assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_step_whose_result_never_came_is_judged_by_its_own_lines_and_its_failed_test_named() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let (a, b) = ("aaaaaaaa-0000-0000-0000-000000000001", "bbbbbbbb-0000-0000-0000-000000000002");
+    runner.take();
+    runner.steps(&[(a, "Run make", 1, "completed", Some("succeeded"), Some(1)), (b, "Run the tests", 2, "inProgress", None, None)]);
+    let lines: Vec<String> = ["Running 2 tests using 1 worker", "  1) [chromium] › e2e/cart.spec.ts:4:3 › adds an item ───", "", "    Error: expected 2, got 1", "", "  1 failed", "  1 passed (2.0s)"].iter().map(|s| s.to_string()).collect();
+    runner.lines(b, 1, &lines);
+    // The job ends with that step's result never sent.
+    runner.finish("failed");
+    let out = cli.wait_with_output().unwrap();
+    let quiet = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!out.status.success(), "{quiet}");
+    assert!(quiet.contains("✗ Run the tests") && quiet.contains("✗ [chromium] adds an item (e2e/cart.spec.ts:4:3)") && quiet.contains("Error: expected 2, got 1"), "{quiet}");
+    assert!(quiet.contains("Failed: Run the tests") && quiet.contains("Tests: 1 failed, 1 passed (playwright)"), "{quiet}");
     let _ = std::fs::remove_dir_all(&dir);
 }

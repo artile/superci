@@ -2,6 +2,12 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.14
+- A job of a run from a computer started again after AWS took back its spot machine keeps its artifacts anew, as a new attempt of a job does at GitHub: its first attempt's `upload-artifact` of the same name made the second fail with a name conflict, failing the run though every test had passed. Another job of the run keeping an artifact of that name is still refused, as GitHub refuses it.
+- `superci runs create` says a job that was started again, and which job its first attempt was: "Started again on an on-demand machine: AWS took back its spot machine".
+- `superci jobs list --run=ID` lists that run's jobs (it took the flag and listed every run's).
+- A step whose result its runner never sent is judged by its own lines: tests that failed there mark it failed (✗, not ·), and each is named with its error, as for a step said to have failed. The summary also waits for steps' results as it waits for their logs (a minute at most).
+
 ## 0.19.13 — 2026-10-17
 - A job whose spot machine AWS takes back says why on GitHub: an error in its log and among its annotations, beside GitHub's "The runner has received a shutdown signal". Its row says plainly that SuperCI runs it again by itself, off spot machines, once its run has finished (GitHub runs a job again only then): "run again, off spot machines" read as something to do.
 - `superci jobs retrieve` gives a running job's log as far as it goes: GitHub has it only as far as its runner has sent it in blocks (minutes behind at times), and what its machine sent after that comes too. It says where the log came from and when its last line was written; `--out` says a running job's is its log so far. `--run=ID --job=NAME` without `--out` found the job and asked for no log.

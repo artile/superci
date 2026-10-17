@@ -183,6 +183,12 @@ fn a_run_its_job_and_the_control_plane_are_read_signed_in() {
     assert_eq!((one["state"].as_str(), one["run"].as_str(), one["job_list"][0]["job"].as_str(), one["job_list"][0]["ended"].as_str()), (Some("passed"), Some(".github/workflows/ci.yml"), Some("tests"), Some("passed")), "{got}");
     let said = text(&["runs", "retrieve", &run_id]);
     assert!(said.contains(".github/workflows/ci.yml") && said.contains("tests") && said.contains("passed"), "{said}");
+    // Its jobs, and none of another run's (`--run`).
+    let listed = json(&home, &["jobs", "list", &format!("--run={run_id}")]).1;
+    assert_eq!(listed["jobs"].as_array().map(|j| j.iter().map(|j| j["id"].to_string()).collect::<Vec<_>>()), Some(vec![job_id.clone()]), "{listed}");
+    assert!(json(&home, &["jobs", "list", "--run=12345"]).1["jobs"].as_array().is_some_and(|j| j.is_empty()));
+    assert!(text(&["jobs", "list", "--run=12345"]).contains("No jobs of run 12345 among the latest"));
+    assert_eq!(json(&home, &["jobs", "list", "--run=latest"]).0, 2);
     // Its job, with how its start went and its log (its last 1,000 bytes at least: here all of it).
     let job = json(&home, &["jobs", "retrieve", &job_id, "--bytes=200"]).1;
     assert_eq!(job["job"]["start"]["steps"].as_array().map(Vec::len), Some(2), "{job}");
