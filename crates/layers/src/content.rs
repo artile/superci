@@ -609,9 +609,33 @@ mod tests {
         assert_eq!(s.update(&i, &["labels.b".into(), "labels.a".into()]).unwrap().labels, i.labels);
         let found = |f: &str| { let mut n = 0; s.walk(&[f.to_string()], |_| { n += 1; Ok(()) }).unwrap(); n };
         assert_eq!((found("labels.b==2"), found(&format!("digest=={d}")), found("labels.a")), (1, 1, 0));
+        // All of them at once (`labels`), and a field that is not one to change.
+        i.labels = [("c".to_string(), "3".to_string()), ("gone".to_string(), String::new())].into_iter().collect();
+        assert_eq!(s.update(&i, &["labels".into()]).unwrap().labels, [("c".to_string(), "3".to_string())].into_iter().collect());
+        assert!(matches!(s.update(&i, &["size".into()]), Err(Error::InvalidArgument(m)) if m.starts_with("cannot update \"size\" field")));
         s.delete(&d).unwrap();
         s.delete(&d).unwrap();
         assert!(s.info(&d).unwrap_err().is_not_found());
+        assert!(s.update(&i, &[]).unwrap_err().is_not_found());
+        // A write started again from nothing (truncated), then committed as the new bytes; one closed is not truncated.
+        let fresh = b"written again from the start";
+        let f = Digest::of(Algorithm::Sha256, fresh);
+        let mut w = s.writer("r5", 0, None).unwrap();
+        w.write(b"some bytes that go").unwrap();
+        w.truncate(0).unwrap();
+        assert_eq!(w.status().offset, 0);
+        w.write(fresh).unwrap();
+        w.commit(fresh.len() as i64, Some(&f), None).unwrap();
+        assert_eq!(s.info(&f).unwrap().size, fresh.len() as i64);
+        let mut w = s.writer("r6", 0, None).unwrap();
+        w.close();
+        assert!(matches!(w.truncate(0), Err(Error::FailedPrecondition(m)) if m == "cannot truncate a closed writer"));
+        // A file fetched whole that is not the blob it was fetched as: thrown away, and refused.
+        let file = s.fetch_dir().unwrap().join("not-it");
+        std::fs::write(&file, b"something else").unwrap();
+        let other = Digest::of(Algorithm::Sha256, b"the blob asked for");
+        assert!(matches!(s.put_file(&other, &file), Err(Error::FailedPrecondition(m)) if m.starts_with("unexpected commit digest")));
+        assert!(!file.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
