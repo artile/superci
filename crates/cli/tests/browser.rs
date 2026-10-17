@@ -546,3 +546,53 @@ fn a_secret_for_runs_from_a_computer_is_added_in_settings_listed_without_its_val
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_jobs_page_says_what_it_had_from_the_caches_docker_images() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = home(&served);
+    played(&served, &home.join("checkout"));
+    // What its machine said after the job, on its record (see `layers-kept`).
+    {
+        let mut store = served.store.0.lock().unwrap();
+        let key = store.keys().find(|k| k.starts_with("job:")).cloned().unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+        j["images"] = serde_json::json!({ "served": 103, "served_bytes": 2_700_000_000u64, "pulled": 0, "pulled_bytes": 0, "uploaded": 0, "uploaded_bytes": 0, "at": 1 });
+        store.insert(key, j.to_string());
+    }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runs");
+    b.wait(&shows("Recent runs"));
+    b.click(".tabs a", "Jobs");
+    b.wait(&shows("Recent jobs"));
+    b.click("main a", "tests");
+    b.wait(&shows("Docker images"));
+    assert!(b.text("main").contains("103 layers from the cache (2.7 GB)"), "{}", b.text("main"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn keeping_docker_images_is_turned_off_and_on_in_settings() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let routing = || served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default();
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click(".side a", "Settings");
+    b.wait(&shows("A job's next run reads the images it pulled from your bucket"));
+    b.click(r#"form:has(input[value="cache_images"]) button"#, "Turn off");
+    until("images not kept", || routing().contains(r#""images_off":true"#));
+    b.wait(&shows("Docker pulls every image as it always has"));
+    b.click(r#"form:has(input[value="cache_images"]) button"#, "Turn on");
+    until("images kept again", || !routing().contains("images_off"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

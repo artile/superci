@@ -274,6 +274,19 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_
     assert!(p.lock().unwrap().asked.iter().any(|a| a == "POST /uploaded"));
     let said = p.lock().unwrap().kept.clone().unwrap();
     assert_eq!((said["served"].as_u64(), said["pulled"].as_u64(), said["pulled_bytes"].as_u64(), said["uploaded"].as_u64()), (Some(1), Some(1), Some(blob.len() as u64), Some(1)), "{said}");
+    // The image's own blobs (there at the machine's start) are not offered; containerd out of reach is said as such.
+    std::fs::write(s.dir.join("boot"), format!("{}\n", &lacked[7..])).unwrap();
+    p.lock().unwrap().uploaded.clear();
+    let again = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", s.socket.display()),
+        format!("--content={}", s.dir.join("content").display()), format!("--index={}", s.dir.join("index.json").display()), format!("--boot={}", s.dir.join("boot").display())]).output().unwrap();
+    assert!(again.status.success());
+    let said = p.lock().unwrap().kept.clone().unwrap();
+    assert_eq!((said["pulled"].as_u64(), said["uploaded"].as_u64()), (Some(0), Some(0)), "{said}");
+    let gone = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", s.dir.join("none.sock").display())]).output().unwrap();
+    assert!(gone.status.success(), "a keep never fails the machine's end");
+    assert!(p.lock().unwrap().kept.clone().unwrap()["error"].as_str().is_some_and(|e| e.starts_with("containerd: ")), "{:?}", p.lock().unwrap().kept);
+    let usage = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep", "--most=soon"]).output().unwrap();
+    assert_eq!(usage.status.code(), Some(2));
     // The index written again and SIGHUP: read again.
     std::fs::write(s.dir.join("index.json"), serde_json::json!({ "layers": {} }).to_string()).unwrap();
     unsafe { libc::kill(s.child.id() as i32, libc::SIGHUP); }

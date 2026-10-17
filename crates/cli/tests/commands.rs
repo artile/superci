@@ -833,3 +833,45 @@ fn the_devices_that_look_after_a_ci_are_listed_with_their_names_and_one_is_taken
     assert_ne!(gone.status(), 200, "its key no longer reaches the CI");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn what_a_job_had_from_the_caches_docker_images_is_said_and_keeping_them_is_turned_off_and_on() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    common::played(&served, &home.join("checkout"));
+    let job_id = json(&home, &["runs", "list"]).1["runs"][0]["job_ids"][0].to_string();
+    // What its machine said after the job (see `layers-kept`), on its record.
+    {
+        let mut store = served.store.0.lock().unwrap();
+        let key = format!("job:{job_id}");
+        let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+        j["images"] = serde_json::json!({ "served": 103, "served_bytes": 2_700_000_000u64, "pulled": 12, "pulled_bytes": 300_000_000u64, "uploaded": 12, "uploaded_bytes": 300_000_000u64, "at": 1 });
+        store.insert(key, j.to_string());
+    }
+    let (code, v) = json(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]);
+    assert_eq!((code, v["job"]["images"].as_str()), (0, Some("103 layers from the cache (2.7 GB); 12 layers pulled (300 MB), kept for the next job")), "{v}");
+    let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).stdout).into_owned();
+    assert!(said.contains("Docker images: 103 layers from the cache (2.7 GB); 12 layers pulled (300 MB), kept for the next job."), "{said}");
+    // One whose keeping failed says why.
+    {
+        let mut store = served.store.0.lock().unwrap();
+        let key = format!("job:{job_id}");
+        let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+        j["images"] = serde_json::json!({ "error": "containerd: connection refused", "at": 1 });
+        store.insert(key, j.to_string());
+    }
+    assert_eq!(json(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).1["job"]["images"], "not kept (containerd: connection refused)");
+    // Kept unless turned off; what is kept, said.
+    let said = |args: &[&str]| String::from_utf8_lossy(&superci(&home, args).stdout).into_owned();
+    assert!(said(&["caches", "retrieve"]).contains("Docker images: kept for each job's next run (Ubuntu 26.04 machines); none yet."), "{}", said(&["caches", "retrieve"]));
+    let (code, v) = json(&home, &["caches", "update", "--images=false"]);
+    assert_eq!(code, 0, "{v}");
+    let routing = served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default();
+    assert!(routing.contains(r#""images_off":true"#), "{routing}");
+    let (code, v) = json(&home, &["caches", "update", "--images=maybe"]);
+    assert!(code == 2 && v["error"].as_str().unwrap_or_default().contains("--images is true or false"), "{v}");
+    json(&home, &["caches", "update", "--images=true"]);
+    let routing = served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default();
+    assert!(!routing.contains("images_off"), "{routing}");
+    let _ = std::fs::remove_dir_all(&home);
+}
