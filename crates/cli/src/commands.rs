@@ -1003,7 +1003,20 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if w(2) != "aws" { return usage("Say which cloud's: `superci accounts retrieve aws` (the look is at AWS accounts; other clouds have nothing to look for yet).") }
             let mut d = signed_in();
             let (account, who, look) = d.look_at_aws(args.get("account").unwrap_or_default())?;
-            Ok(Done { said: aws_look_lines(&account, &who, &look), data: json!({ "cloud": "aws", "id": account, "signed_in_as": who, "kind": look.kind(), "allowed_regions": look.allowed_regions(), "organization": look.organization().map(|r| json!({ "management_account": r.management_account(), "policy": r.policy_id() })), "allows": look }) })
+            let mut said = aws_look_lines(&account, &who, &look);
+            // (And what SuperCI lets it spend, when its control plane is the one in use here.)
+            let plane = d.current().ok().flatten().filter(|v| v.status.as_ref().is_some_and(|s| s["aws"]["account_id"].as_str() == Some(account.as_str())));
+            let mut limits = plane.as_ref().map(|v| { let (lines, data) = other_limits(v); said.push(String::new()); said.extend(lines.into_iter().filter(|l| !l.contains("superci runners update"))); data["aws_account"].clone() });
+            // Its budget in AWS counts AWS's own bill, hours behind SuperCI's estimate: its emails follow that count.
+            if let (Some(v), Some(l)) = (plane.as_ref(), limits.as_mut().filter(|l| !l["aws_budget"].is_null())) {
+                if let Ok((_, creds)) = d.aws_account(&account) {
+                    if let Ok(Some(found)) = crate::aws_budget::with(&creds, &account, v.plane.plane_id(), |b| b.found()) {
+                        said.push(format!("  AWS has counted ${:.2} of its {} so far: its own bill, hours behind SuperCI's estimate. Its emails go at 80% and 100% of that count.", found.spent, superci_core::plane::dollars(found.amount)));
+                        l["aws_counted_usd"] = json!(found.spent);
+                    }
+                }
+            }
+            Ok(Done { said, data: json!({ "cloud": "aws", "id": account, "signed_in_as": who, "kind": look.kind(), "allowed_regions": look.allowed_regions(), "organization": look.organization().map(|r| json!({ "management_account": r.management_account(), "policy": r.policy_id() })), "allows": look, "limits": limits }) })
         }
         ("images", "list") => {
             let mut d = signed_in();
@@ -1324,8 +1337,13 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let v = view(&mut d)?;
             let routing = v.routing();
             let (cpu, hours, spent, today) = (routing.max_cpu.unwrap_or(superci_core::plane::MAX_CPU), routing.max_minutes.unwrap_or(superci_core::plane::MAX_JOB_MINUTES) / 60, v.spend_total(), v.spend_today_total());
-            Ok(Done { said: vec![month_line("The CI", spent, routing.monthly_usd), day_line(today, routing.daily_usd), format!("A label may ask for up to {cpu} CPUs."), format!("A job may run for up to {hours} hours (6 at most on Cloudflare, 24 on Modal).")],
-                data: json!({ "ok": true, "max_cpu": cpu, "max_hours": hours, "monthly_usd": routing.monthly_usd, "spent_usd": spent, "daily_usd": routing.daily_usd, "spent_today_usd": today }) })
+            // The CI's own, then every other limit spending counts against (a job is refused at the first one reached).
+            let (others, other_data) = other_limits(&v);
+            let mut said = vec![format!("{} (`superci limits update --monthly-usd=N --daily-usd=N`)", month_line("The CI", spent, routing.monthly_usd).trim_end_matches('.')), day_line(today, routing.daily_usd)];
+            said.extend(others);
+            said.extend([format!("A label may ask for up to {cpu} CPUs."), format!("A job may run for up to {hours} hours (6 at most on Cloudflare, 24 on Modal).")]);
+            Ok(Done { said, data: json!({ "ok": true, "max_cpu": cpu, "max_hours": hours, "monthly_usd": routing.monthly_usd, "spent_usd": spent, "daily_usd": routing.daily_usd, "spent_today_usd": today,
+                "aws_account": other_data["aws_account"], "providers": other_data["providers"] }) })
         }
         ("public_repos", "list") => {
             let allowed = view(&mut signed_in())?.routing().public_repos;
@@ -1416,6 +1434,32 @@ fn given_dollars(args: &Args, flag: &str, now: Option<f64>) -> Result<String> {
 
 /// A limit as a sentence has it: `$200`, or `without limit`.
 fn or_no_limit(usd: &str) -> String { if usd.is_empty() { "without limit".to_string() } else { format!("up to ${usd}") } }
+
+/// The other limits spending counts against, each with the command that changes it: the AWS account's for a month and
+/// a day (its providers together) with its budget in AWS itself, and each provider's own for a month. With what each
+/// has spent; as data too.
+fn other_limits(v: &crate::view::PlaneView) -> (Vec<String>, Value) {
+    let routing = v.routing();
+    let mut said = vec![];
+    let aws = v.status.as_ref().is_some_and(|s| !s["aws"].is_null()) || routing.account_usd.contains_key("aws");
+    let (month, day) = (routing.account_usd.get("aws").copied(), routing.account_daily_usd.get("aws").copied());
+    if aws {
+        said.push(format!("{} (`superci accounts update aws --monthly-usd=N --daily-usd=N`)", month_line("The AWS account", v.spend_account("aws"), month).trim_end_matches('.')));
+        if day.is_some() { said.push(format!("  {}", day_line(v.spend_today_account("aws"), day))) }
+        said.push(match &routing.aws_budget {
+            None => "No budget in AWS itself, so AWS sends no email at 80% or 100% (`superci accounts update aws --aws-budget=emails --email=ADDRESS` adds one).".to_string(),
+            Some(b) if b.stop => "In AWS itself: a budget that emails at 80% and 100% of the account's monthly limit, and stops new machines at 100%.".to_string(),
+            Some(_) => "In AWS itself: a budget that emails at 80% and 100% of the account's monthly limit.".to_string(),
+        });
+    }
+    let pools: Vec<Value> = routing.order.iter().filter_map(|p| p.monthly_usd.map(|cap| {
+        said.push(format!("{} spent ${:.2} this month, of {} allowed (`superci runners update {} --monthly-usd=N`).", superci_core::plane::cloud_name(&p.cloud), v.spend(&p.cloud), superci_core::plane::dollars(cap), p.cloud));
+        json!({ "cloud": p.cloud, "monthly_usd": cap, "spent_usd": v.spend(&p.cloud) })
+    })).collect();
+    let data = json!({ "aws_account": aws.then(|| json!({ "monthly_usd": month, "daily_usd": day, "spent_usd": v.spend_account("aws"), "spent_today_usd": v.spend_today_account("aws"),
+        "aws_budget": routing.aws_budget.as_ref().map(|b| if b.stop { "stops" } else { "emails" }) })), "providers": pools });
+    (said, data)
+}
 
 /// What was spent on machines today (UTC) and the day's limit, in a line.
 fn day_line(spent: f64, cap: Option<f64>) -> String {

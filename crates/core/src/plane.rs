@@ -659,7 +659,7 @@ const SPOT_NOT_ALLOWED_KEY: &str = "aws:spot-not-allowed";
 /// How a job fails when AWS lets the account run no GPU machines (followed by the quota to raise).
 const NO_GPU_QUOTA: &str = "AWS lets this account run no GPU machines yet: ask AWS for more in Service Quotas, ";
 
-fn cloud_name(cloud: &str) -> &str {
+pub fn cloud_name(cloud: &str) -> &str {
     match cloud { "aws" => "AWS", AWS_ON_DEMAND => "AWS on-demand", "cloudflare" => "Cloudflare", "modal" => "Modal", c => c }
 }
 
@@ -2293,20 +2293,20 @@ impl<'a> ControlPlane<'a> {
             // Its cloud account's limit for the month, its providers together.
             if let Some(cap) = routing.account_usd.get(account_of(cloud)) {
                 if account_spend(&spend, account_of(cloud)) >= *cap {
-                    let said = format!("the {} account reached its {} a month", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap));
+                    let said = format!("the {} account reached its {} a month (`superci accounts update {} --monthly-usd=N` raises it)", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap), account_of(cloud));
                     if !never.contains(&said) { never.push(said) }
                     continue
                 }
             }
             if let Some(cap) = routing.account_daily_usd.get(account_of(cloud)) {
                 if account_spend(&today, account_of(cloud)) >= *cap {
-                    let said = format!("the {} account reached its {} a day", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap));
+                    let said = format!("the {} account reached its {} a day (`superci accounts update {} --daily-usd=N` raises it)", cloud_name(account_of(cloud)).split(' ').next().unwrap_or_default(), dollars(*cap), account_of(cloud));
                     if !never.contains(&said) { never.push(said) }
                     continue
                 }
             }
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
-                if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month", dollars(cap))); continue }
+                if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month (`superci runners update {cloud} --monthly-usd=N` raises it)", dollars(cap))); continue }
             }
             if let Some(max) = pool.and_then(|p| p.max_jobs).or(Some(if cloud == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE })) {
                 if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }

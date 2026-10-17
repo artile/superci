@@ -1018,7 +1018,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     block_on(plane.handle(job_event("queued", 55, "acme/app", None)));
     let e = job(&store, 55)["error"].as_str().unwrap().to_string();
     assert_eq!(job(&store, 55)["state"], "failed", "{e}");
-    assert!(e.contains("nowhere to run") && e.matches("the AWS account reached its $3 a month").count() == 1, "{e}");
+    assert!(e.contains("nowhere to run") && e.matches("the AWS account reached its $3 a month (`superci accounts update aws --monthly-usd=N` raises it)").count() == 1, "{e}");
     // The whole CI's limit: at it no job starts anywhere, and the job says what to do.
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
@@ -1046,7 +1046,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(job_event("queued", 59, "acme/app", None)));
     let e = job(&store, 59)["error"].as_str().unwrap().to_string();
-    assert!(job(&store, 59)["state"] == "failed" && e.matches("the AWS account reached its $2.50 a day").count() == 1, "{e}");
+    assert!(job(&store, 59)["state"] == "failed" && e.matches("the AWS account reached its $2.50 a day (`superci accounts update aws --daily-usd=N` raises it)").count() == 1, "{e}");
     // What was spent on an earlier day of the month counts for the month, not for today.
     store.0.borrow_mut().insert("job:60".into(), serde_json::json!({ "job_id": 60, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_900_000_000u64, "launched_ms": 1_789_900_000_000u64, "ended_ms": 1_789_903_600_000u64,
         "installation_id": 42, "cloud": "aws", "usd_per_hour": 50.0, "seen_in_progress": true }).to_string());

@@ -1042,3 +1042,23 @@ fn github_is_disconnected_from_the_cli() {
     assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("is the first this control plane was connected with"), "{v}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Every limit spending counts against is listed, each with the command that changes it: the CI's, its AWS account's
+/// (for a month and a day, with whether AWS itself emails), and a provider's own.
+#[test]
+fn limits_retrieve_lists_every_limit_with_the_command_that_changes_it() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{}/ROUTING", superci_testkit::PLANE), &serde_json::json!({ "monthly_usd": 200.0, "account_usd": { "aws": 100.0 }, "account_daily_usd": { "aws": 10.0 },
+        "order": [{ "cloud": "aws" }, { "cloud": "cloudflare", "monthly_usd": 20.0 }] }).to_string());
+    let home = common::signed_in(&served);
+    let o = superci(&home, &["limits", "retrieve"]);
+    let said = String::from_utf8_lossy(&o.stdout).into_owned();
+    for line in ["The CI spent $0.00 on machines this month, of $200 allowed (`superci limits update --monthly-usd=N --daily-usd=N`)",
+        "The AWS account spent $0.00 on machines this month, of $100 allowed (`superci accounts update aws --monthly-usd=N --daily-usd=N`)", "Today (UTC): $0.00 of $10 allowed.",
+        "No budget in AWS itself, so AWS sends no email at 80% or 100%", "Cloudflare spent $0.00 this month, of $20 allowed (`superci runners update cloudflare --monthly-usd=N`)."] {
+        assert!(said.contains(line), "{line}\n\n{said}");
+    }
+    let (_, v) = json(&home, &["limits", "retrieve"]);
+    assert_eq!((v["aws_account"]["monthly_usd"].as_f64(), v["aws_account"]["daily_usd"].as_f64(), v["providers"][0]["cloud"].as_str()), (Some(100.0), Some(10.0), Some("cloudflare")), "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}

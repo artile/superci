@@ -3,6 +3,9 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.15
+- `superci limits retrieve` lists every limit spending counts against, each with the command that changes it: the CI's, its AWS account's for a month and a day (its spot and on-demand machines together), and a provider's own. It said "no limit is set" while the AWS account's limit was what refused jobs. `superci accounts retrieve aws` says the account's limits too.
+- Whether AWS itself emails is said with them: with no budget in AWS, nothing emails at 80% or 100% (`superci accounts update aws --aws-budget=emails --email=ADDRESS` adds one). With one, `superci accounts retrieve aws` says what AWS has counted against it so far. That is AWS's own bill, hours behind SuperCI's estimate, and its emails follow that count.
+- A job refused at an account's or a provider's limit says the command that raises it: "the AWS account reached its $100 a month (`superci accounts update aws --monthly-usd=N` raises it)".
 - `superci connections delete github OWNER` for the first organization a control plane was connected with says that its App stays while the control plane does (`superci leave` stops SuperCI); it said "That organization is not one added here".
 
 ## 0.19.14 — 2026-10-17
