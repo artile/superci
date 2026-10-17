@@ -1024,3 +1024,21 @@ fn commands_side_by_side_hand_one_key_between_them() {
     assert_eq!(keys.len(), before + 1, "{keys:?}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// GitHub disconnected from the CLI: --confirm needed; one not connected, and the control plane's own first App, said
+/// as such.
+#[test]
+fn github_is_disconnected_from_the_cli() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let owner = superci_testkit::github::OWNER;
+    let (code, v) = json(&home, &["connections", "delete", "github", owner]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("--confirm"), "{v}");
+    let (code, v) = json(&home, &["connections", "delete", "github", "globex", "--confirm"]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("globex is not connected here"), "{v}");
+    // The first App connected is the control plane's own: it stays with it, and that is said.
+    let (code, v) = json(&home, &["connections", "delete", "github", owner, "--confirm"]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("is the first this control plane was connected with"), "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}

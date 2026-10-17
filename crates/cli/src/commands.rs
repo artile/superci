@@ -1340,7 +1340,10 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             confirmed(args, &would)?;
             let mut d = ready()?;
             let apps = view(&mut d)?.status.as_ref().and_then(|s| s["apps"].as_array().cloned()).unwrap_or_default();
-            let app = apps.iter().find(|a| a["owner"].as_str().is_some_and(|o| o.eq_ignore_ascii_case(w(3)))).ok_or_else(|| format!("{} is not connected here.", w(3)))?;
+            let at = apps.iter().position(|a| a["owner"].as_str().is_some_and(|o| o.eq_ignore_ascii_case(w(3)))).ok_or_else(|| format!("{} is not connected here.", w(3)))?;
+            // (The first one connected is the control plane's own: it goes with the control plane.)
+            if at == 0 { return Err(format!("{}'s App is the first this control plane was connected with: it stays while the control plane does (`superci leave` stops SuperCI). Organizations added after it are removed this way.", w(3)).into()) }
+            let app = &apps[at];
             Ok(Done::said(apply!(d, args, would, "/github/remove", &[field("app", app["id"].as_u64().unwrap_or_default().to_string())])))
         }
         ("connections", "create") if w(2) == "gitlab" => {
