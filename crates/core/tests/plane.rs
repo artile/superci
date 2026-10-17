@@ -3626,6 +3626,22 @@ fn a_key_for_coding_agents_starts_runs_within_the_control_planes_own_limits() {
     // The dashboard sees which keys may start runs.
     let status = json(&block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/status")).with_header("authorization", "Bearer dashboard-session-key-1"))));
     assert_eq!(status["read_keys"], serde_json::json!([{ "name": "AGENT", "until_ms": 4_102_444_800_000u64, "runs": true }, { "name": "LOOKER", "until_ms": 4_102_444_800_000u64 }]));
+    // It cancels a run it may start (from a computer), and no run of GitHub's, whatever its id: a GitHub job's run
+    // known here is cancelled only with a dashboard's key.
+    block_on(plane.handle(labelled("queued", 77, "acme/app", None, "superci")));
+    let cancel = |id: &str, k: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs/{id}/cancel")).with_header("authorization", &format!("Bearer {k}")))).status;
+    assert_eq!(cancel("3", key), 404, "a GitHub run is not a key for agents' to cancel");
+    assert!(!clouds.calls.borrow().iter().any(|c| c.1.contains("/actions/runs/3/cancel")));
+    assert_eq!(cancel(&run_id, key), 200);
+    // A job cancelled before its machine took it keeps nothing of its secrets.
+    let workflow = "jobs:\n  test:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.TOKEN }}\n";
+    let made = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1")
+        .with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "secrets": [["TOKEN", "a-secret-value-0001"]] }).to_string())));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    let with_secret = json(&made)["run_id"].as_str().unwrap().to_string();
+    assert!(store.0.borrow().values().any(|v| v.contains("a-secret-value-0001")), "kept while the run goes");
+    assert_eq!(cancel(&with_secret, key), 200);
+    assert!(!store.0.borrow().values().any(|v| v.contains("a-secret-value-0001")), "nothing of it left once cancelled");
     // A key of the form 0.18.0 made (with limits of its own) is no key now.
     assert!(superci_core::plane::read_key("READ_KEY_4102444800_OLD", &format!("{}:runs:16:10", superci_core::crypto::sha256_hex(key.as_bytes()))).is_none());
 }

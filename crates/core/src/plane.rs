@@ -1043,6 +1043,13 @@ impl RunKey {
     fn of(more: &str) -> Option<RunKey> { (more == "runs").then(|| RunKey { name: String::new() }) }
 }
 
+/// A run's job with its secrets taken out of what is kept of its message (its variables marked secret, its masks):
+/// once it has ended, nothing of them is kept.
+fn forget_secrets(handed: &mut crate::runner_service::HandedJob) {
+    if let Some(vars) = handed.message.get_mut("variables").and_then(|v| v.as_object_mut()) { vars.retain(|_, v| v["isSecret"] != true) }
+    handed.message["mask"] = serde_json::json!([]);
+}
+
 /// The job message in a runner's own log (`_diag/Worker_*.log`: "Job message:", then the message as JSON).
 pub fn worker_message(log: &[u8]) -> Option<serde_json::Value> {
     let at = log.windows(12).position(|w| w == b"Job message:")?;
@@ -1317,7 +1324,7 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/runs/tree") if self.dashboard(&req) || self.run_key(&req).is_some() => self.tree_part(&url, &req, &plane_url).await,
             ("POST", "/runs") if self.dashboard(&req) => self.create_run(&req, &plane_url, None).await,
             ("POST", "/runs") if self.run_key(&req).is_some() => { let k = self.run_key(&req); self.create_run(&req, &plane_url, k).await }
-            ("POST", p) if p.starts_with("/runs/") && p.ends_with("/cancel") && (self.dashboard(&req) || self.run_key(&req).is_some()) => self.cancel_run(p, &plane_url).await,
+            ("POST", p) if p.starts_with("/runs/") && p.ends_with("/cancel") && (self.dashboard(&req) || self.run_key(&req).is_some()) => { let github_too = self.dashboard(&req); self.cancel_run(p, &plane_url, github_too).await }
             ("GET", p) if p.starts_with("/runs/") && p.ends_with("/artifacts") && self.reader(&req) => self.run_artifacts(p, &url, &plane_url).await,
             ("GET", p) if p.starts_with("/runs/") && p.ends_with("/log") && self.reader(&req) => self.run_log(p, &url).await,
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
@@ -4064,12 +4071,14 @@ impl<'a> ControlPlane<'a> {
     /// `POST /runs/<id>/cancel`: a run from a computer stopped, as GitHub cancels a run: its jobs not started yet end
     /// cancelled; a job whose runner has it is told to stop, as GitHub tells it (its steps stop, and it ends cancelled);
     /// one whose machine has not begun it yet has its machine ended at once.
-    async fn cancel_run(&self, path: &str, plane_url: &str) -> Result<Response> {
+    async fn cancel_run(&self, path: &str, plane_url: &str, github_too: bool) -> Result<Response> {
         let Some(id) = path.trim_start_matches("/runs/").trim_end_matches("/cancel").parse::<u64>().ok() else { return Ok(nothing_here()) };
         let key = format!("run:{id}");
         // A GitHub run (none of this control plane's own): GitHub cancels it, asked with the App's token for its
-        // repository; its jobs here end as GitHub tells (a machine whose job ended is ended).
+        // repository; its jobs here end as GitHub tells (a machine whose job ended is ended). Only with a dashboard's
+        // key: a key for coding agents cancels the runs it may start, from a computer, and no GitHub run.
         if self.store.get(&key).await?.is_none() {
+            if !github_too { return Ok(nothing_here()) }
             let mut known = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect::<Vec<_>>();
             known.extend(self.newest_jobs(200).await?);
             let Some(j) = known.into_iter().find(|j| j.run_id == id && j.provider.is_empty()) else { return Ok(nothing_here()) };
@@ -4106,8 +4115,9 @@ impl<'a> ControlPlane<'a> {
                 let Some(mut handed) = get_json::<crate::runner_service::HandedJob>(self.store, &handed_key).await? else { continue };
                 if handed.result.is_some() { continue }
                 if handed.taken { handed.cancel = true } else {
-                    // Not taken yet: nothing ran; its machine goes now.
+                    // Not taken yet: nothing ran; its machine goes now, and its secrets with it.
                     handed.result = Some("cancelled".into());
+                    forget_secrets(&mut handed);
                     ended.push(job_id);
                 }
                 put_json(self.store, &handed_key, &handed).await?;
@@ -4289,8 +4299,7 @@ impl<'a> ControlPlane<'a> {
                 }
                 // (Its secrets go with the job: nothing of them is kept once it has ended.)
                 let mut done = after.clone();
-                if let Some(vars) = done.message.get_mut("variables").and_then(|v| v.as_object_mut()) { vars.retain(|_, v| v["isSecret"] != true) }
-                done.message["mask"] = serde_json::json!([]);
+                forget_secrets(&mut done);
                 put_json(self.store, &key, &done).await?;
             }
         }
