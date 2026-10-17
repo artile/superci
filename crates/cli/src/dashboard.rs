@@ -8537,6 +8537,22 @@ mod tests {
             { "at": 3_700, "kind": "m8a.8xlarge", "zone": "us-east-1a", "spot": false, "said": "started", "ms": 900 }]);
         (many["machine_type"], many["on_demand"]) = ("m8a.8xlarge".into(), true.into());
         assert_eq!(job_start_lines(&many)[2], "    4.0 s  AWS gave a machine (no spot m8a.8xlarge; no spot machine in 14 other pools; on-demand m8a.8xlarge in us-east-1a)");
+        // A run from a computer's: the runner reaches the control plane, which gives it the job; one that has only
+        // listened so far; a GitHub job's runner that took its job before it said it listened.
+        let mut local = j.clone();
+        local["provider"] = "local".into();
+        let lines = job_start_lines(&local);
+        assert_eq!(&lines[lines.len() - 2..], ["    2.0 s  the runner started and reached the control plane", "    1.5 s  the control plane gave it the job"], "{lines:?}");
+        local["started_ms"] = serde_json::Value::Null;
+        assert!(job_start_lines(&local).last().unwrap().ends_with("the runner started and reached the control plane"));
+        let mut listening = j.clone();
+        listening["started_ms"] = serde_json::Value::Null;
+        assert!(job_start_lines(&listening).last().unwrap().ends_with("the runner started and reached GitHub"));
+        let mut quiet = j.clone();
+        quiet["machine"]["listening_ms"] = serde_json::Value::Null;
+        assert!(job_start_lines(&quiet).last().unwrap().ends_with("the runner started and took the job"));
+        quiet["started_ms"] = serde_json::Value::Null;
+        assert!(job_start_lines(&quiet).last().unwrap().ends_with("the runner's files were read from the image"));
         // A runner that was slow to reach GitHub: what it logged meanwhile comes after the steps.
         let mut slow = j.clone();
         slow["machine"]["log"] = "[2026-10-13 22:56:11Z INFO ConfigurationStore] HasCredentials()\n... 30 s ...\n[2026-10-13 22:56:41Z WARN GitHubActionsService] Attempt 1 of POST request failed".into();
