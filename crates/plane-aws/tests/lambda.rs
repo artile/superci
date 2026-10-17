@@ -77,7 +77,16 @@ impl Runtime {
 
 /// The program, started as Lambda starts it (`env`: what this function's are).
 struct Function(Child);
-impl Drop for Function { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+impl Drop for Function { fn drop(&mut self) { stop(&mut self.0) } }
+
+/// Stopped as Lambda stops it (SIGTERM), so a coverage tool's buffered evidence is written; killed if it stays.
+fn stop(c: &mut Child) {
+    unsafe { libc::kill(c.id() as i32, libc::SIGTERM); }
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until { if let Ok(Some(_)) = c.try_wait() { return } std::thread::sleep(Duration::from_millis(20)) }
+    let _ = c.kill();
+    let _ = c.wait();
+}
 
 fn start(runtime: &str, stand_in: &str, env: &[(&str, &str)]) -> Function {
     let mut c = Command::new(env!("CARGO_BIN_EXE_bootstrap"));

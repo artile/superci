@@ -19,7 +19,17 @@ use tonic::Code;
 fn digest(b: &[u8]) -> String { format!("sha256:{}", Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>()) }
 
 struct Service { child: Child, dir: std::path::PathBuf, socket: std::path::PathBuf }
-impl Drop for Service { fn drop(&mut self) { let _ = self.child.kill(); let _ = self.child.wait(); let _ = std::fs::remove_dir_all(&self.dir); } }
+impl Drop for Service {
+    // (Stopped as systemd stops it, SIGTERM, so a coverage tool's buffered evidence is written; killed if it stays.)
+    fn drop(&mut self) {
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM); }
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until && !matches!(self.child.try_wait(), Ok(Some(_))) { std::thread::sleep(Duration::from_millis(20)) }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
 
 fn start(name: &str, index: Option<&serde_json::Value>) -> Service {
     let dir = std::env::temp_dir().join(format!("superci-layers-service-{}-{name}", std::process::id()));

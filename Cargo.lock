@@ -1998,6 +1998,7 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "futures",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
