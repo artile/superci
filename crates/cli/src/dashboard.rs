@@ -906,6 +906,9 @@ pub fn images_said(j: &serde_json::Value) -> Option<String> {
     if n("failed") > 0 { why.push(format!("{} not uploaded ({})", layers(n("failed")), i["note"].as_str().filter(|s| !s.is_empty()).unwrap_or("failed"))) }
     let not_kept = if why.is_empty() { String::new() } else { format!(": {}", why.join(", ")) };
     let pulled = (n("pulled") > 0).then(|| format!("{} pulled ({}), {kept}{not_kept}", layers(n("pulled")), size_words(n("pulled_bytes"))));
+    // (The store not switched in on its machine: everything was pulled, and why is said.)
+    let off = i["off"].as_str().filter(|s| !s.is_empty()).map(|w| format!("the cache was not set up on its machine ({w})"));
+    let pulled = match (pulled, off) { (Some(p), Some(o)) => Some(format!("{p}; {o}")), (None, Some(o)) => Some(o), (p, None) => p };
     match (from, pulled) { (None, None) => None, (Some(a), None) | (None, Some(a)) => Some(a), (Some(a), Some(b)) => Some(format!("{a}; {b}")) }
 }
 

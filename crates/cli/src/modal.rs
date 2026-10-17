@@ -154,6 +154,7 @@ impl Client {
             let t: pb::AuthTokenGetResponse = self.unary("AuthTokenGet", pb::Empty {})?;
             self.auth_token = Some(t.token);
         }
+        #[cfg(debug_assertions)]
         let asked = message.encoded_len();
         let req = self.request(message, authed);
         let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
@@ -169,6 +170,7 @@ impl Client {
 
     /// A server stream, read to its end (or `limit` messages).
     fn stream<Q: prost::Message + Send + Sync + 'static, R: prost::Message + Default + Send + Sync + 'static>(&mut self, method: &'static str, message: Q, limit: usize) -> Result<Vec<R>> {
+        #[cfg(debug_assertions)]
         let asked = message.encoded_len();
         let req = self.request(message, true);
         let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;

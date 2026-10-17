@@ -27,7 +27,9 @@ const AT_ONCE: usize = 4;
 
 pub struct Options { pub link: String, pub socket: PathBuf, pub content: PathBuf, pub index: PathBuf, pub most: Duration,
     /// The blobs containerd had at the machine's start (one hex digest a line): its image's own, none of it offered.
-    pub boot: PathBuf }
+    pub boot: PathBuf,
+    /// Whether the store was switched in (see `setup::STATE`): what came from it counted only then.
+    pub state: PathBuf }
 
 /// A layer the job's images name: its digest, size, where it was pulled from.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,7 +79,9 @@ async fn infos(socket: &Path) -> Result<BTreeMap<String, (u64, HashMap<String, S
 pub struct Done { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub pulled_bytes: u64, pub uploaded: u64, pub uploaded_bytes: u64, pub had: u64, pub had_bytes: u64,
     /// Of the pulled and not kept, why: no whole file of it here, the control plane would not take it, its upload
     /// failed (the first failure's words in `note`).
-    pub missing: u64, pub missing_bytes: u64, pub refused: u64, pub failed: u64, pub note: String }
+    pub missing: u64, pub missing_bytes: u64, pub refused: u64, pub failed: u64, pub note: String,
+    /// Why the store was not switched in on this machine, when its setup said (nothing came from it then).
+    pub off: String }
 
 /// The keep (see the module); 0 whatever happened (a machine's end never waits on it beyond `most`).
 pub fn keep(o: &Options) -> i32 {
@@ -95,12 +99,18 @@ pub fn keep(o: &Options) -> i32 {
     let index = Index::load(&o.index).unwrap_or_default();
     let boot: std::collections::HashSet<String> = std::fs::read_to_string(&o.boot).unwrap_or_default().lines().map(|h| format!("sha256:{}", h.trim())).collect();
     let mut done = Done::default();
+    // (Switched in, or not: then everything was pulled as Docker pulls, what the store has too.)
+    let state = std::fs::read_to_string(&o.state).unwrap_or_default();
+    let on = state.starts_with("on");
+    done.off = state.strip_prefix("off: ").map(|w| w.trim().chars().take(200).collect()).unwrap_or_default();
     // (A layer from the store: counted as the index has it, whether or not containerd keeps its blob.)
-    for d in named(&infos).into_iter().filter(|d| !boot.contains(d)) { if let Some(l) = index.get(&d) { done.served += 1; done.served_bytes += l.size } }
+    if on { for d in named(&infos).into_iter().filter(|d| !boot.contains(d)) { if let Some(l) = index.get(&d) { done.served += 1; done.served_bytes += l.size } } }
     let mut offered = vec![];
-    for l in layers_of(&infos).into_iter().filter(|l| index.get(&l.digest).is_none() && !boot.contains(&l.digest)) {
+    for l in layers_of(&infos).into_iter().filter(|l| !(on && index.get(&l.digest).is_some()) && !boot.contains(&l.digest)) {
         done.pulled += 1;
         done.pulled_bytes += l.size;
+        // (Pulled though the store has it: it was not switched in. Kept already.)
+        if index.get(&l.digest).is_some() { done.had += 1; done.had_bytes += l.size; continue }
         // (Only a blob kept here whole.)
         if blob_path(&o.content, &l.digest).and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.len() == l.size) { offered.push(l) } else { done.missing += 1; done.missing_bytes += l.size }
     }
@@ -108,10 +118,10 @@ pub fn keep(o: &Options) -> i32 {
     let said = offer(&agent, &o.link, &o.content, offered, began + o.most);
     let (uploaded, bytes, had) = (said.uploaded, said.bytes, said.had);
     (done.uploaded, done.uploaded_bytes, done.refused, done.failed, done.note) = (uploaded, bytes, said.refused, said.failed, said.note);
-    (done.had, done.had_bytes) = (had.len() as u64, had.iter().filter_map(|d| sizes.get(d)).sum());
+    (done.had, done.had_bytes) = (done.had + had.len() as u64, done.had_bytes + had.iter().filter_map(|d| sizes.get(d)).sum::<u64>());
     let report = json!({ "served": done.served, "served_bytes": done.served_bytes, "pulled": done.pulled, "pulled_bytes": done.pulled_bytes,
         "uploaded": done.uploaded, "uploaded_bytes": done.uploaded_bytes, "had": done.had, "had_bytes": done.had_bytes,
-        "missing": done.missing, "missing_bytes": done.missing_bytes, "refused": done.refused, "failed": done.failed, "note": done.note, "seconds": (began.elapsed().as_secs_f64() * 10.0).round() / 10.0 });
+        "missing": done.missing, "missing_bytes": done.missing_bytes, "refused": done.refused, "failed": done.failed, "note": done.note, "off": done.off, "seconds": (began.elapsed().as_secs_f64() * 10.0).round() / 10.0 });
     eprintln!("superci-layers keep: {report}");
     if let Err(e) = post(&agent, &format!("{}/layers-kept", o.link), &report) { eprintln!("superci-layers keep: saying what was kept: {e}") }
     0

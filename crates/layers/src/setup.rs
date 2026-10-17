@@ -25,6 +25,15 @@ const KEPT: &str = ".superci-stock";
 const BIN: &str = "/usr/local/bin/superci-layers";
 const SOCKET: &str = "/run/superci-layers.sock";
 const INDEX: &str = "/etc/superci/layers.json";
+/// Whether the store was switched in: `on`, or `off: why` (the keep reads it after the job: what came from the store
+/// is counted only when it was on).
+pub const STATE: &str = "/run/superci-layers.state";
+
+/// Said where the keep finds it, and in the log.
+fn say_state(state: &str) {
+    println!("superci-layers: {state}");
+    let _ = std::fs::write(STATE, state);
+}
 
 pub struct Options {
     /// Where the index is fetched (the machine's own link to its control plane).
@@ -41,12 +50,12 @@ pub fn setup(o: &Options) -> i32 {
         Ok(said) => {
             println!("superci-layers: switched in {:.2} s: {said}; containerd and Docker start again beside the runner", began.elapsed().as_secs_f64());
             if let Err(e) = detached(&[std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| BIN.into()).as_str(), "setup-finish"]) {
-                println!("superci-layers: off: {e}");
+                say_state(&format!("off: {e}"));
                 let _ = put_back_before_restart();
             }
         }
         Err(e) => {
-            println!("superci-layers: off: {e}");
+            say_state(&format!("off: {e}"));
             if let Err(e) = put_back_before_restart() { println!("superci-layers: putting Docker back as it was: {e}") }
         }
     }
@@ -65,9 +74,9 @@ pub fn finish() -> i32 {
         check_containerd()
     })();
     match done {
-        Ok(()) => println!("superci-layers: on: Docker answered on it {:.1} s after the switch", began.elapsed().as_secs_f64()),
+        Ok(()) => say_state(&format!("on: Docker answered on it {:.1} s after the switch", began.elapsed().as_secs_f64())),
         Err(e) => {
-            println!("superci-layers: off: {e}");
+            say_state(&format!("off: {e}"));
             if let Err(e) = put_back() { println!("superci-layers: putting Docker back as it was: {e}") }
         }
     }
@@ -116,11 +125,13 @@ fn switch(o: &Options) -> Result<String, String> {
     let timed = |f: &dyn Fn() -> Result<String, String>| { let t = std::time::Instant::now(); (f(), t.elapsed().as_secs_f64()) };
     let (docker, erofs, disk, index) = std::thread::scope(|s| {
         let docker = s.spawn(|| timed(&|| docker_keeps_images_in_containerd().map(|_| String::new())));
-        let erofs = s.spawn(|| timed(&|| check_erofs(&o.root).map(|_| String::new())));
         let index = s.spawn(|| timed(&|| fetch_index(&o.index_url).map(|n| n.to_string())));
+        // (The disk first, then an EROFS file mounted where the layers' files will be: the kernel mounts one only from
+        // a filesystem that reads its pages itself, which memory's (tmpfs) does not.)
         let disk = timed(&|| store_disk(&o.disk, &files));
+        let erofs = timed(&|| check_erofs(&files).map(|_| String::new()));
         let stopped = |what: &str| (Err(format!("{what} stopped")), 0.0);
-        (docker.join().unwrap_or_else(|_| stopped("Docker's check")), erofs.join().unwrap_or_else(|_| stopped("the EROFS check")), disk, index.join().unwrap_or_else(|_| stopped("fetching the index")))
+        (docker.join().unwrap_or_else(|_| stopped("Docker's check")), erofs, disk, index.join().unwrap_or_else(|_| stopped("fetching the index")))
     });
     docker.0?;
     erofs.0?;
@@ -170,16 +181,40 @@ fn check_erofs(root: &Path) -> Result<(), String> {
 }
 
 /// The store's own disk for the layer files: made (ext4, no journal: it holds what can be fetched again) and
-/// mounted; with none, the machine's own disk.
+/// mounted; with none, the machine's own disk; and where that is memory (a job's files in memory: tmpfs, which the
+/// kernel mounts no EROFS file from), a disk in memory.
 fn store_disk(disk: &str, files: &Path) -> Result<String, String> {
-    let dev = match disk {
-        "none" => return Ok("the machine's disk".into()),
-        "auto" => match unused_ebs()? { Some(d) => d, None => return Ok("the machine's disk".into()) },
-        d => d.to_string(),
+    let given = match disk { "none" => None, "auto" => unused_ebs()?, d => Some(d.to_string()) };
+    let dev = match given {
+        Some(d) => d,
+        None if in_memory(files) => memory_disk()?,
+        None => return Ok("the machine's disk".into()),
     };
+    if dev.starts_with("/dev/ram") {
+        run("mkfs.ext4", &["-q", "-F", "-O", "^has_journal", &dev])?;
+        // (Discarded as files go: memory it held is given back.)
+        run("mount", &["-o", "noatime,discard", &dev, &files.to_string_lossy()])?;
+        return Ok(format!("memory ({dev})"))
+    }
     run("mkfs.ext4", &["-q", "-F", "-E", "lazy_itable_init=1,lazy_journal_init=1", "-O", "^has_journal", &dev])?;
     run("mount", &["-o", "noatime", &dev, &files.to_string_lossy()])?;
     Ok(dev)
+}
+
+/// Whether a folder is in memory (tmpfs).
+fn in_memory(path: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else { return false };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == 0x0102_1994 }
+}
+
+/// A disk in memory (`brd`) for the layers' files: as large as half the machine's memory, which it takes only as
+/// files are written (and gives back as they go).
+fn memory_disk() -> Result<String, String> {
+    let kib = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemTotal:")?.split_whitespace().next()?.parse::<u64>().ok())).unwrap_or(0) / 2;
+    if kib < 1 << 20 { return Err("too little memory for the layers' files".into()) }
+    run("modprobe", &["brd", "rd_nr=1", &format!("rd_size={kib}")])?;
+    Ok("/dev/ram0".into())
 }
 
 /// An EBS disk that is not the root's and has nothing on it (found by its model, not its name: NVMe names it).

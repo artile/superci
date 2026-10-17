@@ -910,6 +910,15 @@ fn what_a_job_had_from_the_caches_docker_images_is_said_and_keeping_them_is_turn
         store.insert(key, j.to_string());
     }
     assert_eq!(json(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).1["job"]["images"].as_str(), Some("12 layers pulled (900 MB), 8 of them kept for the next job (180 MB): 3 layers with no whole file on the machine (716 MB), 1 layer not uploaded (the bucket answered 403 Forbidden)"));
+    // The cache not set up on its machine: everything pulled, and why.
+    {
+        let mut store = served.store.0.lock().unwrap();
+        let key = format!("job:{job_id}");
+        let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+        j["images"] = serde_json::json!({ "pulled": 97, "pulled_bytes": 1_900_000_000u64, "had": 94, "had_bytes": 1_150_000_000u64, "uploaded": 3, "uploaded_bytes": 716_000_000u64, "off": "the kernel does not mount an EROFS file: Block device required (os error 15)", "at": 1 });
+        store.insert(key, j.to_string());
+    }
+    assert_eq!(json(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).1["job"]["images"].as_str(), Some("97 layers pulled (1.9 GB), kept for the next job; the cache was not set up on its machine (the kernel does not mount an EROFS file: Block device required (os error 15))"));
     // One whose keeping failed says why.
     {
         let mut store = served.store.0.lock().unwrap();

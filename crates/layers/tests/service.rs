@@ -267,8 +267,11 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_
     assert!(!p.lock().unwrap().asked.iter().any(|a| a.contains("layers-propose")), "nothing offered while the job runs");
     // After the job: offered and uploaded at the link the control plane gives, with the SHA-256 it said; what came
     // from the store and what was pulled, said.
+    // (Switched in, as its setup says on a machine.)
+    let state = s.dir.join("state");
+    std::fs::write(&state, "on: Docker answered on it 0.5 s after the switch").unwrap();
     let kept = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", s.socket.display()),
-        format!("--content={}", s.dir.join("content").display()), format!("--index={}", s.dir.join("index.json").display()), "--most=20".into()]).output().unwrap();
+        format!("--content={}", s.dir.join("content").display()), format!("--index={}", s.dir.join("index.json").display()), "--most=20".into(), format!("--state={}", state.display())]).output().unwrap();
     assert!(kept.status.success(), "{}", String::from_utf8_lossy(&kept.stderr));
     assert_eq!(p.lock().unwrap().uploaded.get(&lacked), Some(&blob), "{}", String::from_utf8_lossy(&kept.stderr));
     assert!(p.lock().unwrap().asked.iter().any(|a| a == "POST /uploaded"));
@@ -282,6 +285,14 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_
     assert!(again.status.success());
     let said = p.lock().unwrap().kept.clone().unwrap();
     assert_eq!((said["pulled"].as_u64(), said["uploaded"].as_u64()), (Some(0), Some(0)), "{said}");
+    // Not switched in on its machine (its setup said why): nothing came from the store, and why is said.
+    std::fs::write(&state, "off: the kernel does not mount an EROFS file: Block device required (os error 15)").unwrap();
+    let off = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", s.socket.display()),
+        format!("--content={}", s.dir.join("content").display()), format!("--index={}", s.dir.join("index.json").display()), format!("--state={}", state.display())]).output().unwrap();
+    assert!(off.status.success());
+    let said = p.lock().unwrap().kept.clone().unwrap();
+    assert_eq!((said["served"].as_u64(), said["served_bytes"].as_u64()), (Some(0), Some(0)), "{said}");
+    assert!(said["off"].as_str().is_some_and(|w| w.starts_with("the kernel does not mount an EROFS file")), "{said}");
     let gone = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", s.dir.join("none.sock").display())]).output().unwrap();
     assert!(gone.status.success(), "a keep never fails the machine's end");
     assert!(p.lock().unwrap().kept.clone().unwrap()["error"].as_str().is_some_and(|e| e.starts_with("containerd: ")), "{:?}", p.lock().unwrap().kept);

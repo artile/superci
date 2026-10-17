@@ -296,7 +296,8 @@ pub struct Job {
     /// Its disk's speed, when above what AWS includes (MiB a second, IOPS): counted in its price.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
-    /// Its machine has the layer store's own disk (`cache::STORE_DISK`: in its price; see `layers::plan`).
+    /// The layer store was set up on its machine (see `layers::plan`): on a disk of its own (`cache::STORE_DISK`, in its
+    /// price), or, for a job whose files are in memory or on its machine's own disk, there with them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub layers: bool,
     /// What it had from the cache's Docker images and what it pulled, as its machine said after it.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub images: Option<crate::layers::Images>,
@@ -2367,7 +2368,7 @@ impl<'a> ControlPlane<'a> {
         self.note_permission("aws", "Prices", &disk).await;
         let gb_month = disk.unwrap_or_else(|_| aws::disk_gb_month(&region));
         if let Ok(machine) = machine {
-            j.cost_usd = Some(j.earlier_usd + machine + (aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) + store_disk_usd_per_hour(gb_month, j.layers)) * hours);
+            j.cost_usd = Some(j.earlier_usd + machine + (aws::extras_usd_per_hour(gb_month, j.disk_gb.unwrap_or(60), j.disk_mibs.unwrap_or(DISK_MIBS_INCLUDED), j.disk_iops.unwrap_or(DISK_IOPS_INCLUDED), !j.private) + store_disk_usd_per_hour(gb_month, j.layers && !(j.ramdisk || j.local_disk))) * hours);
             j.cost_from = Some("prices".into());
         }
     }
@@ -2918,11 +2919,15 @@ impl<'a> ControlPlane<'a> {
                             let images = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26";
                             let used = if images { get_json::<crate::layers::Images>(self.store, &crate::layers::images_key(&job.repo, &job.workflow, &job.name)).await.ok().flatten() } else { None };
                             let setup = crate::layers::plan(used.as_ref(), now);
+                            // A job whose files are in memory or on its machine's own disk keeps the layers there
+                            // too (the store's folder is bound there with Docker's): no disk of their own, which
+                            // would be slower than either.
+                            let on_scratch = spec.scratch.is_some() && spec.os() == "linux";
                             let (user_data, set_up, keeps) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, &key, now).await;
                             job.layers = set_up;
                             job.keeps = keeps;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
-                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: job.layers.then_some(cache::STORE_DISK) };
+                                clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: (job.layers && !on_scratch).then_some(cache::STORE_DISK) };
                             let mut told = aws::Told::default();
                             let machine = aws::run_instance(self.http, &creds, &launch, now, &mut told).await;
                             if let Some(e) = told.fleet_refused.take() {
@@ -3011,7 +3016,7 @@ impl<'a> ControlPlane<'a> {
                         let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.ok() }
                             else { aws::spot_price(self.http, &region, Some(&machine.zone), &creds, &machine.kind, spec.os(), now).await.ok() };
                         let cpu = job.cpu.unwrap_or(4);
-                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers));
+                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers && !(spec.scratch.is_some() && spec.os() == "linux")));
                         job.region = Some(region);
                         job.zone = Some(machine.zone).filter(|z| !z.is_empty());
                         job.disk_gb = Some(disk_gb);

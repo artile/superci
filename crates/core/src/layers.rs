@@ -96,6 +96,8 @@ pub struct Images { #[serde(default)] pub served: u64, #[serde(default)] pub ser
     /// failed (the first failure's words).
     #[serde(default)] pub missing: u64, #[serde(default)] pub missing_bytes: u64, #[serde(default)] pub refused: u64, #[serde(default)] pub failed: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")] pub note: String,
+    /// Why the store was not switched in on its machine (nothing came from it), when its setup said.
+    #[serde(default, skip_serializing_if = "String::is_empty")] pub off: String,
     #[serde(default)] pub at: u64,
     /// Why nothing could be said (containerd out of reach).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub error: Option<String> }

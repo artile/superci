@@ -432,7 +432,9 @@ fn token_call(fields: &[(&str, &str)]) -> Result<Session> {
 /// Asks Cloudflare to end a sign-in (its token to renew with), as `wrangler logout` does. Whether Cloudflare said yes.
 pub fn end_sign_in(refresh: &str) -> bool {
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("client_id", OAUTH_CLIENT), ("token_type_hint", "refresh_token"), ("token", refresh)]).finish();
-    let Ok(mut r) = quick().post(&crate::aws::stand_in("https://dash.cloudflare.com/oauth2/revoke")).header("content-type", "application/x-www-form-urlencoded").send(body.clone()) else { return false };
+    let Ok(r) = quick().post(&crate::aws::stand_in("https://dash.cloudflare.com/oauth2/revoke")).header("content-type", "application/x-www-form-urlencoded").send(body.clone()) else { return false };
+    #[cfg(debug_assertions)]
+    let mut r = r;
     #[cfg(debug_assertions)]
     crate::aws::record(&superci_core::io::Request::new("POST", "https://dash.cloudflare.com/oauth2/revoke").with_body(body.into_bytes()), r.status().as_u16(), &[], r.body_mut().read_to_string().unwrap_or_default().as_bytes());
     r.status().is_success()

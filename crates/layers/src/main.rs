@@ -10,7 +10,7 @@ const HELP: &str = "superci-layers: containerd's snapshotter and content store f
                   comes (it never fails the start)
   superci-layers off
                   Docker as it comes again
-  superci-layers keep --link=URL [--most=SECONDS]
+  superci-layers keep --link=URL [--most=SECONDS] [--state=FILE]
                   after the job: the layers Docker pulled that the store lacks offered to the control plane at URL
                   and uploaded where it asks (for SECONDS at most, 180 unless said), and what came from the store said
   superci-layers [--root=…] …  the service itself:
@@ -73,7 +73,7 @@ fn main() {
         Some("setup-finish") => std::process::exit(setup::finish()),
         Some("keep") => {
             let mut o = keep::Options { link: String::new(), socket: "/run/containerd/containerd.sock".into(), content: "/var/lib/containerd/io.containerd.content.v1.content".into(),
-                index: "/etc/superci/layers.json".into(), most: std::time::Duration::from_secs(180), boot: "/run/superci-boot-blobs".into() };
+                index: "/etc/superci/layers.json".into(), most: std::time::Duration::from_secs(180), boot: "/run/superci-boot-blobs".into(), state: superci_layers::setup::STATE.into() };
             for arg in &argv[2..] {
                 match arg.split_once('=') {
                     Some(("--link", v)) => o.link = v.trim_end_matches('/').into(),
@@ -82,6 +82,7 @@ fn main() {
                     Some(("--content", v)) => o.content = v.into(),
                     Some(("--index", v)) => o.index = v.into(),
                     Some(("--boot", v)) => o.boot = v.into(),
+                    Some(("--state", v)) => o.state = v.into(),
                     _ => { eprintln!("{arg:?} is not understood\n\n{HELP}"); std::process::exit(2) }
                 }
             }
