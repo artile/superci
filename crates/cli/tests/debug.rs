@@ -117,3 +117,19 @@ fn a_job_is_served_to_a_runner_here_as_the_control_plane_serves_it() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `SUPERCI_RECORD=FILE`: what AWS answered each question, a line each, for the test kit (no header, so no credential).
+#[test]
+fn what_aws_answers_is_recorded_a_line_each_without_headers() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let file = common::temp("debug-record").join("recording.jsonl");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let o = common::command(&home).env("SUPERCI_RECORD", &file).args(["debug", "iam", "ListRoles", "MaxItems=1000", "--json"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let text = std::fs::read_to_string(&file).unwrap();
+    let line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(line["url"].as_str().unwrap().contains("iam.amazonaws.com") && line["asked"].as_str().unwrap().contains("Action=ListRoles") && line["status"] == 200 && line["answer"].as_str().unwrap().contains("ListRolesResponse"), "{line}");
+    assert!(!text.contains("ASIAEXAMPLE") && !text.to_lowercase().contains("authorization"), "{text}");
+    let _ = std::fs::remove_dir_all(&home);
+}
