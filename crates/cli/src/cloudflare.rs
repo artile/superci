@@ -409,8 +409,12 @@ pub fn authorize() -> (String, Pending) {
 
 fn token_call(fields: &[(&str, &str)]) -> Result<Session> {
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(fields).finish();
-    let mut r = agent().post(&crate::aws::stand_in("https://dash.cloudflare.com/oauth2/token")).header("content-type", "application/x-www-form-urlencoded").send(body).map_err(|e| e.to_string())?;
+    let mut r = agent().post(&crate::aws::stand_in("https://dash.cloudflare.com/oauth2/token")).header("content-type", "application/x-www-form-urlencoded").send(body.clone()).map_err(|e| e.to_string())?;
+    let status = r.status().as_u16();
     let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    #[cfg(debug_assertions)]
+    crate::aws::record(&superci_core::io::Request::new("POST", "https://dash.cloudflare.com/oauth2/token").with_body(body.into_bytes()), status, &[], text.as_bytes());
+    let _ = status;
     let v: Value = serde_json::from_str(&text).unwrap_or_default();
     let Some(access) = v["access_token"].as_str() else { return Err(format!("Cloudflare sign-in: {}", text.chars().take(200).collect::<String>())) };
     Ok(Session { access: access.into(), refresh: v["refresh_token"].as_str().map(str::to_string),
@@ -420,7 +424,10 @@ fn token_call(fields: &[(&str, &str)]) -> Result<Session> {
 /// Asks Cloudflare to end a sign-in (its token to renew with), as `wrangler logout` does. Whether Cloudflare said yes.
 pub fn end_sign_in(refresh: &str) -> bool {
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs([("client_id", OAUTH_CLIENT), ("token_type_hint", "refresh_token"), ("token", refresh)]).finish();
-    quick().post("https://dash.cloudflare.com/oauth2/revoke").header("content-type", "application/x-www-form-urlencoded").send(body).is_ok_and(|r| r.status().is_success())
+    let Ok(mut r) = quick().post(&crate::aws::stand_in("https://dash.cloudflare.com/oauth2/revoke")).header("content-type", "application/x-www-form-urlencoded").send(body.clone()) else { return false };
+    #[cfg(debug_assertions)]
+    crate::aws::record(&superci_core::io::Request::new("POST", "https://dash.cloudflare.com/oauth2/revoke").with_body(body.into_bytes()), r.status().as_u16(), &[], r.body_mut().read_to_string().unwrap_or_default().as_bytes());
+    r.status().is_success()
 }
 
 pub fn exchange(p: Pending, code: &str) -> Result<Session> {

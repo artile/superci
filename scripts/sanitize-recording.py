@@ -9,7 +9,7 @@ ids, resource ids, email addresses, and the sealed message AWS adds to a refusal
 public image ids, quota codes). Anything else that is the account's own (a control plane's id in a tag) is given with
 -r REAL=STAND-IN. Look through the result before keeping it.
 """
-import json, re, sys
+import json, re, sys, base64
 
 KEEP_ACCOUNTS = {"135269210855"}  # RunsOn's, whose public image jobs run on
 
@@ -39,7 +39,26 @@ def sanitize(text, of):
     text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "someone@example.com", text)
     # (AWS's sealed account of a refusal: only the account itself can open it, and it is the account's.)
     text = re.sub(r"(Encoded authorization failure message: )[A-Za-z0-9_+/=-]+", r"\1(removed)", text)
-    return text
+    return sign_ins(text, of)
+
+# A sign-in's own secrets (recorded only with SUPERCI_RECORD_SIGN_INS): each by a stand-in, in JSON and in a form.
+TOKENS = ("accessKeyId", "secretAccessKey", "sessionToken", "refreshToken", "access_token", "refresh_token", "code", "codeVerifier", "code_verifier", "token")
+
+def sign_ins(text, of):
+    for field in TOKENS:
+        text = re.sub(r'("%s"\s*:\s*")([^"]+)(")' % field, lambda m, f=field: m.group(1) + of("tok-" + f, m.group(2), lambda n: f"example-{f}-{n}") + m.group(3), text)
+        text = re.sub(r'(^|[?&])(%s=)([^&"\s]+)' % field, lambda m, f=field: m.group(1) + m.group(2) + of("tok-" + f, m.group(3), lambda n: f"example-{f}-{n}"), text)
+    # AWS's id token: its claims sanitized (they name the account and who signed in), signed by no one.
+    def jwt(m):
+        try:
+            pad = lambda p: p + "=" * (-len(p) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(pad(m.group(2))))
+            clean = json.loads(sanitize(json.dumps(claims), of))
+            enc = lambda v: base64.urlsafe_b64encode(json.dumps(v, separators=(",", ":")).encode()).decode().rstrip("=")
+            return m.group(1) + enc({"alg": "none"}) + "." + enc(clean) + ".example-signature" + m.group(3)
+        except ValueError:
+            return m.group(1) + "(removed)" + m.group(3)
+    return re.sub(r'("idToken"\s*:\s*")[A-Za-z0-9_-]+\.([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+(")', jwt, text)
 
 def main():
     args = sys.argv[1:]
