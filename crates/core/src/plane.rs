@@ -1080,6 +1080,10 @@ pub fn step_shape(message: &serde_json::Value) -> Vec<serde_json::Value> {
     }).collect()
 }
 
+/// What a request with a key this control plane does not take is answered: the key expired or was replaced, or the
+/// SuperCI that sent it is of another version than the control plane (which may read its keys by other names).
+pub const KEY_REFUSED: &str = "This control plane does not take this key: it has expired or was replaced, or this SuperCI is of another version than the control plane. Update SuperCI on your computer (npx @superci/cli@latest), or sign in again to hand it a new key";
+
 fn nothing_here() -> Response {
     Response::text(404, "SuperCI plane: nothing here (set up and changed from the SuperCI dashboard on your machine)")
 }
@@ -1357,8 +1361,17 @@ impl<'a> ControlPlane<'a> {
             // The cache's entries (by repository, or one repository's), and taking some out.
             ("GET", "/caches") if self.reader(&req) => self.caches(&url).await,
             ("POST", "/caches/delete") if self.dashboard(&req) => self.caches_delete(&req, &plane_url).await,
-            _ => Ok(nothing_here()),
+            _ => Ok(self.not_taken(&req)),
         }
+    }
+
+    /// What is not answered for the key a request came with: a key this control plane does not take, said as that (a
+    /// SuperCI older or newer than it, or a key replaced since), never as nothing being here; a read or run key it
+    /// takes, asking for what only a device's key may, said as that; with no key, nothing here.
+    fn not_taken(&self, req: &Request) -> Response {
+        if self.reader(req) || self.run_key(req).is_some() { return Response::text(403, "This key reads (a run key also starts runs from a computer): what was asked needs a device's key, from the SuperCI dashboard's computer") }
+        if req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).is_some_and(|k| k.len() >= 16) { return Response::text(401, &format!("{KEY_REFUSED} (SuperCI {VERSION})")) }
+        nothing_here()
     }
 
     /// An event for the control plane this one moved to, passed on as it came (its signature still holds there).
@@ -1635,7 +1648,7 @@ impl<'a> ControlPlane<'a> {
     /// What the dashboard shows, for a key a dashboard session set and that has not expired (or one that only reads):
     /// the App and where it is installed, the AWS connection, and recent jobs. Without a key it is like any unknown path.
     async fn status(&self, req: &Request) -> Result<Response> {
-        if !self.reader(req) { return Ok(nothing_here()); }
+        if !self.reader(req) { return Ok(self.not_taken(req)); }
         // `light`: asked only to see a setting take (after each change): without what GitHub has to be asked for.
         let light = url::Url::parse(&req.url).is_ok_and(|u| u.query_pairs().any(|(k, v)| k == "light" && v == "1"));
         let mut installations = vec![];
@@ -4992,7 +5005,8 @@ impl<'a> ControlPlane<'a> {
             return cache::ref_access(&ns, &if r["tag"] == true { format!("refs/tags/{git_ref}") } else { format!("refs/heads/{git_ref}") }, r["default_branch"].as_str().unwrap_or_default())
                 .ok_or_else(|| "a branch SuperCI does not keep".to_string())
         }
-        let job = self.by_runner(Some(&machine.runner)).await?.ok_or("no job on this machine")?;
+        // (After its job too, when its runner's record is gone: what a machine keeps is offered then.)
+        let job = self.job_of_machine(machine).await?.ok_or("no job on this machine")?;
         if job.provider == "local" {
             let run = get_json::<serde_json::Value>(self.store, &format!("run:{}", job.run_id)).await?.ok_or("its run is not kept")?;
             let who = run["by"].as_str().filter(|b| !b.is_empty() && b.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))).unwrap_or("computer");

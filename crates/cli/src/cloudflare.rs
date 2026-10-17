@@ -531,6 +531,16 @@ pub fn status(plane_url: &str, key: &str) -> Option<Value> { status_of(plane_url
 /// The same, to see a setting take: without where the App is installed (which GitHub is asked for each time).
 pub fn status_light(plane_url: &str, key: &str) -> Option<Value> { status_of(plane_url, key, "?light=1") }
 
+/// Why a control plane that answers gave no status for this key: its words when it said it does not take the key
+/// (401), else None (it answered otherwise, or not at all).
+pub fn refused(plane_url: &str, key: &str) -> Option<String> {
+    let key = &plane_key(key, plane_url);
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(10))).build().into();
+    let mut r = agent.get(&crate::aws::stand_in(&format!("{plane_url}/status?light=1"))).header("authorization", &format!("Bearer {key}")).call().ok()?;
+    let text = r.body_mut().read_to_string().ok()?;
+    match r.status().as_u16() { 401 | 404 => Some(text), _ => None }
+}
+
 fn status_of(plane_url: &str, key: &str, query: &str) -> Option<Value> {
     let key = &plane_key(key, plane_url);
     let mut r = quick().get(&crate::aws::stand_in(&format!("{plane_url}/status{query}"))).header("authorization", &format!("Bearer {key}")).call().ok()?;

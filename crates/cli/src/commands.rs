@@ -1,7 +1,7 @@
 //! SuperCI's commands: what the dashboard's pages do, from a terminal or a coding agent. A command that changes
 //! something fills in the form its page has and hands it to the dashboard's own code (`Dashboard::act`), so the two
-//! cannot differ; one that reads shows what the control plane says. Nothing is ever asked in the terminal: what a
-//! person must do first (a sign-in, in the browser) is said, with the command for it, and the status is 3.
+//! cannot differ; one that reads shows what the control plane says. Nothing is asked in the terminal (but a secret's
+//! value, typed hidden by a person at one): what a person must do first (a sign-in, in the browser) is said, with the command for it, and the status is 3.
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
@@ -58,7 +58,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("caches", "  superci caches retrieve\n  superci caches list [--repo=OWNER/NAME]\n  superci caches update [--enabled=true|false] [--size-gb=N] [--days=N] [--images=true|false]\n  superci caches delete --repo=OWNER/NAME [KEY] [--scope=REF] --confirm",
         "GitHub's cache for jobs on AWS, kept in a bucket of your control plane's in your account, in each region its machines\nrun in. Workflows do not change: actions/cache, the setup actions' caches and Docker's type=gha reach it as they reach\nGitHub's. A job reads and writes what GitHub would let it (a pull request writes only its own branch's).\n\nretrieve  Whether it is on, what it keeps, and each repository with what it keeps now.\nlist      Each repository with its entries and size; --repo: that repository's entries (key, branch, size, last use).\nupdate    --enabled=false: jobs use GitHub's own cache. --size-gb: what one repository keeps at most (25 unless set;\n          the least recently used go first). --days: how long an entry may go unused (7 unless set). An entry saved 30\n          days ago is saved anew whatever its use. --images=false: Docker pulls every image as it always has (they are\n          kept for each job's next run on Ubuntu 26.04 machines unless turned off).\ndelete    Takes a repository's entries out, all of them or KEY's (--scope: on that branch only, as refs/heads/main)."),
     ("secrets", "  superci secrets list\n  superci secrets create NAME [--repo=OWNER/NAME] [--branch=PATTERN] [--workflow=PATTERN] [--environment=NAME]\n  superci secrets update NAME [the same]\n  superci secrets delete NAME [the same] --confirm",
-        "Secrets kept for runs from a computer (`superci runs create`), as a repository's secrets are kept for its runs on\nGitHub. A run gets the ones its workflows name (${{ secrets.NAME }}) and nothing else; one it names that is not kept is\nempty, as on GitHub, and said before its jobs start. Jobs GitHub sends keep getting GitHub's own secrets.\n\nThey are written with this computer's sign-in into your control plane's own cloud (SSM on AWS, the Worker's secrets\non Cloudflare, a Dict on Modal) and are never read back out: `list` says names, where each may be used, when it was\nset and last given to a run, and who started that run. A run key (`superci keys create NAME --runs`) starts runs\nthat get them; nothing but a computer signed in changes them.\n\ncreate    Keeps NAME (letters, digits and _; not GITHUB_…), its value read from stdin or from the variable\n          --value-env names, never from the command: `printf %s \"$NPM_TOKEN\" | superci secrets create NPM_TOKEN`.\n          4 KB at most. --repo, --branch, --workflow (a file's name or path) and --environment (a job's\n          environment:) narrow where it may be used; patterns are GitHub's (release/*). The same name may be kept\n          for several scopes: a job gets the narrowest (an environment's, then a repository's, a workflow's, a\n          branch's). A value given with the run (--secret=NAME=VALUE) wins over all of them.\nupdate    A new value for NAME as kept for that scope.\ndelete    Takes it out."),
+        "Secrets kept for runs from a computer (`superci runs create`), as a repository's secrets are kept for its runs on\nGitHub. A run gets the ones its workflows name (${{ secrets.NAME }}) and nothing else; one it names that is not kept is\nempty, as on GitHub, and said before its jobs start. Jobs GitHub sends keep getting GitHub's own secrets.\n\nThey are written with this computer's sign-in into your control plane's own cloud (SSM on AWS, the Worker's secrets\non Cloudflare, a Dict on Modal) and are never read back out: `list` says names, where each may be used, when it was\nset and last given to a run, and who started that run. A run key (`superci keys create NAME --runs`) starts runs\nthat get them; nothing but a computer signed in changes them.\n\ncreate    Keeps NAME (letters, digits and _; not GITHUB_…), its value typed hidden when asked in a terminal, else read from\n          stdin or the variable --value-env names, never from the command (`printf %s \"$NPM_TOKEN\" | superci secrets create NPM_TOKEN`).\n          4 KB at most. --repo, --branch, --workflow (a file's name or path) and --environment (a job's\n          environment:) narrow where it may be used; patterns are GitHub's (release/*). The same name may be kept\n          for several scopes: a job gets the narrowest (an environment's, then a repository's, a workflow's, a\n          branch's). A value given with the run (--secret=NAME=VALUE) wins over all of them.\nupdate    A new value for NAME as kept for that scope.\ndelete    Takes it out."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30] [--runs]\n  superci keys delete NAME",
         "Read keys and run keys, for a coding agent or a script. (Each device that looks after the CI has a key of its own,\nits device key, listed here too.)\n\ncreate    Makes a read key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, a run key: it also starts runs from a computer (`superci runs create`), and nothing else. Its jobs keep\n          to this control plane's limits, as every job does (`superci limits`). For a coding agent that should run the\n          tests without pushing and without your sign-in.\ndelete    Ends one at once: a read or run key by its name, a computer key by its DEVICE_KEY_… name."),
     ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images update REGION [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
@@ -73,7 +73,7 @@ const FLAGS: &str = "  --param=value      What an operation takes (also `--param
   --workspace=ID     Which workspace, when several are kept on this machine (see `superci help workspaces`).
   --json             One JSON object: what was done or read, or \"error\" with \"needs\" (the command a person runs first).
   --dry-run          Checks a change and says what it would do, without doing it.
-  --confirm          Needed by what deletes something. Nothing is ever asked in the terminal.
+  --confirm          Needed by what deletes something. Nothing is asked in the terminal but a secret's value.
 
 Status: 0 done · 1 failed · 2 not a command, or not a whole one · 3 a person is needed first (see \"needs\").";
 
@@ -750,7 +750,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             // The value: never in the command itself (it would stay in the shell's history), but from a variable or stdin.
             let value = match args.get("value-env") {
                 Some(var) => std::env::var(var).map_err(|_| format!("{var} is not set."))?,
-                None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => return usage(format!("Give the value on stdin (`printf %s \"$TOKEN\" | superci secrets {op} {name}`, or `< file`), or by a variable's name: --value-env=TOKEN.")),
+                // A person at a terminal: asked for it, typed hidden (never in the command, never in the shell's history).
+                None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => rpassword::prompt_password(format!("{name}'s value (typed hidden; Enter when done): ")).map_err(|e| format!("The value could not be read: {e}"))?,
                 None => { let mut v = String::new(); std::io::Read::read_to_string(&mut std::io::stdin(), &mut v).map_err(|e| e.to_string())?; v.strip_suffix('\n').map(|x| x.strip_suffix('\r').unwrap_or(x).to_string()).unwrap_or(v) }
             };
             superci_core::secrets::valid_value(&value)?;
@@ -1125,7 +1126,15 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("planes", "update") => {
             let mut d = ready()?;
             let plane = in_use(&d)?;
-            apply!(d, args, format!("update the control plane {} to {DASHBOARD_VERSION}", if w(2).is_empty() { format!("in use ({})", plane.place()) } else { w(2).to_string() }), "/plane/update", &[field("plane", w(2))]);
+            let which = if w(2).is_empty() { format!("in use ({})", plane.place()) } else { w(2).to_string() };
+            // (One on this version already is deployed again: what this version has beside it is made where missing.)
+            let now = d.current().ok().flatten().and_then(|v| v.version);
+            let would = match now.as_deref() {
+                Some(v) if v == DASHBOARD_VERSION => format!("deploy the control plane {which} again: it is on {v} already; what this version has beside it is made where missing"),
+                Some(v) => format!("update the control plane {which} from {v} to {DASHBOARD_VERSION}"),
+                None => format!("update the control plane {which} to {DASHBOARD_VERSION}"),
+            };
+            apply!(d, args, would, "/plane/update", &[field("plane", w(2))]);
             Ok(Done::said(d.wait(Background::Update, steps)?))
         }
         ("planes", "move") => {
@@ -1137,6 +1146,13 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("planes", "allow") => {
             let mut d = ready()?;
             let plane = if w(2).is_empty() { in_use(&d)?.plane_id().to_string() } else { w(2).to_string() };
+            // (A dry run reads what its role lacks now, and says it.)
+            if args.has("dry-run") {
+                let lacks = d.role_lacks(&plane)?;
+                let said = if lacks.is_empty() { format!("The AWS role of the control plane {plane} has what this version asks for: nothing would change.") }
+                    else { format!("Would give the AWS role of the control plane {plane} what it lacks: {}.", lacks.iter().map(|n| format!("{} (since {})", n.what, n.since)).collect::<Vec<_>>().join("; ")) };
+                return Ok(Done { said: vec![said.clone()], data: json!({ "dry_run": true, "would": said, "lacks": lacks.iter().map(|n| json!({ "id": n.id, "what": n.what, "since": n.since })).collect::<Vec<_>>() }) })
+            }
             apply!(d, args, format!("give the AWS role of the control plane {plane} what this version asks for"), "/permissions/aws", &[field("plane", plane.clone())]);
             Ok(Done::said("Its AWS role has what this version asks for."))
         }

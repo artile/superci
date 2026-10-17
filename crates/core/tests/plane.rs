@@ -226,8 +226,8 @@ fn aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines() {
     assert!(!wakes.0.borrow().is_empty());
 
     // The dashboard's view, with its session key only.
-    assert_eq!(run(get("/status").with_header("authorization", "Bearer wrong-key-wrong-key")).status, 404);
-    assert_eq!(run(get("/status").with_header("authorization", "Bearer an-expired-session-key")).status, 404, "expired");
+    assert_eq!(run(get("/status").with_header("authorization", "Bearer wrong-key-wrong-key")).status, 401);
+    assert_eq!(run(get("/status").with_header("authorization", "Bearer an-expired-session-key")).status, 401, "expired");
     let status = json(&run(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")));
     assert_eq!((status["app"]["slug"].as_str(), status["installations"][0]["account"].as_str(), status["aws"]["connected"].as_bool()), (Some("superci-acme-abc123"), Some("acme"), Some(true)));
     assert_eq!((status["jobs"][0]["job_id"].as_u64(), status["jobs"][0]["state"].as_str(), status["jobs"][0]["machine_id"].as_str(), status["jobs"][0]["cloud"].as_str()), (Some(7), Some("done"), Some("i-0abc"), Some("aws")));
@@ -1256,7 +1256,7 @@ fn measured_costs_from_the_dashboard_settle_finished_cloudflare_jobs_only() {
     put(3, "cloudflare", "running");
     let post = |key: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/costs")).with_header("authorization", &format!("Bearer {key}"))
         .with_body(serde_json::json!({ "measured": { "job:1": 0.0123, "job:2": 9.0, "job:3": 1.0, "job:9": 1.0, "plane_url": 1.0 } }).to_string())));
-    assert_eq!(post("not-the-key-not-the-key").status, 404);
+    assert_eq!(post("not-the-key-not-the-key").status, 401);
     let r = post("dashboard-session-key-1");
     assert_eq!(json(&r)["kept"], 1);
     assert_eq!((job(&store, 1)["cost_usd"].as_f64(), job(&store, 1)["cost_from"].as_str()), (Some(0.0123), Some("measured")));
@@ -1304,7 +1304,7 @@ fn removed_aws_runners_take_no_jobs() {
     store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": "arn:aws:iam::123456789012:role/r", "connected": true }).to_string());
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let forget = |key: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/aws/forget")).with_header("authorization", &format!("Bearer {key}")).with_body("{}")));
-    assert_eq!(forget("wrong-key-wrong-key").status, 404, "the dashboard's only");
+    assert_eq!(forget("wrong-key-wrong-key").status, 401, "the dashboard's only");
     assert_eq!(forget("dashboard-session-key-1").status, 200);
     assert!(!store.0.borrow().contains_key("aws"));
     block_on(plane.handle(webhook("queued", None)));
@@ -2149,10 +2149,12 @@ fn a_key_that_only_reads_sees_the_status_and_a_jobs_log_and_changes_nothing() {
     assert_eq!((seen.status, json(&seen)["jobs"].as_array().map(Vec::len)), (200, Some(3)));
     assert!(json(&seen)["read_keys"].is_null(), "which keys there are is the dashboard's to see");
     assert_eq!(json(&ask("GET", "/status", dashboard))["read_keys"], serde_json::json!([{ "name": "AGENT", "until_ms": 1_800_000_000_000u64 }, { "name": "OLD", "until_ms": 1_700_000_000_000u64 }]));
-    for key in ["superci_read_one-that-ended", "superci_read_never-made-here", ""] { assert_eq!(ask("GET", "/status", key).status, 404, "{key}") }
-    // It changes nothing: what the dashboard's key may do is like any unknown path to it.
+    // One that ended or was never made: not taken, said as that; with none, nothing here.
+    for (key, status) in [("superci_read_one-that-ended", 401), ("superci_read_never-made-here", 401), ("", 404)] { assert_eq!(ask("GET", "/status", key).status, status, "{key}") }
+    assert!(String::from_utf8_lossy(&ask("GET", "/status", "superci_read_one-that-ended").body).starts_with(superci_core::plane::KEY_REFUSED));
+    // It changes nothing: what the dashboard's key may do is refused to it, as needing a device's key.
     for path in ["/costs", "/gitlab/projects", "/leave", "/aws/forget", "/move/export", "/github/uninstall", "/permissions/given"] {
-        assert_eq!(ask("POST", path, agent).status, 404, "{path}");
+        assert_eq!(ask("POST", path, agent).status, 403, "{path}");
     }
     assert_ne!(ask("POST", "/permissions/given", dashboard).status, 404);
 
@@ -2167,7 +2169,7 @@ fn a_key_that_only_reads_sees_the_status_and_a_jobs_log_and_changes_nothing() {
     assert!(json(&ask("GET", "/job/log?id=2", agent))["error"].as_str().unwrap().starts_with("GitHub has no log for it yet"));
     assert!(json(&ask("GET", "/job/log?id=99", agent))["error"].as_str().unwrap().starts_with("This control plane has no such job"));
     assert_eq!(json(&ask("GET", "/job/log?id=1977&gl=", agent))["log"], "$ make test\nok\n");
-    assert_eq!(ask("GET", "/job/log?id=1", "superci_read_one-that-ended").status, 404);
+    assert_eq!(ask("GET", "/job/log?id=1", "superci_read_one-that-ended").status, 401);
     assert_eq!(block_on(plane.handle(get("/job/log?id=1"))).status, 404);
 }
 
@@ -3605,7 +3607,7 @@ fn a_key_for_coding_agents_starts_runs_within_the_control_planes_own_limits() {
             .with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string())))
     };
     // A key that only reads starts nothing; this one starts runs, of the size the control plane allows, four at once.
-    assert_eq!(run("superci", "superci_read_0123456789abcdef0123456789abcdef").status, 404);
+    assert_eq!(run("superci", "superci_read_0123456789abcdef0123456789abcdef").status, 403);
     let made = run("superci", key);
     assert_eq!(made.status, 200, "{}", made.body_text());
     let run_id = json(&made)["run_id"].as_str().unwrap().to_string();
@@ -4567,7 +4569,7 @@ fn a_machine_that_keeps_its_jobs_images_is_not_ended_with_its_job_but_goes_off_b
     let run = |r: Request| block_on(plane.handle(r));
     let ended = || http.clouds.calls.borrow().iter().filter(|c| c.2.contains("Action=TerminateInstances")).count();
     for (id, label) in [(1, "superci/image=ubuntu26"), (2, "superci/image=ubuntu24")] {
-        run(labelled("queued", id, "acme/app", None, label));
+        run(if id == 1 { layered(1, 77, "acme/app") } else { labelled("queued", id, "acme/app", None, label) });
         let r = job(&store, id)["runner"].as_str().unwrap().to_string();
         run(labelled("in_progress", id, "acme/app", Some(&r), label));
         run(labelled("completed", id, "acme/app", Some(&r), label));
@@ -4575,6 +4577,13 @@ fn a_machine_that_keeps_its_jobs_images_is_not_ended_with_its_job_but_goes_off_b
     // Ubuntu 26.04's keeps its images after the job: not ended with it; Ubuntu 24.04's is, as before.
     assert_eq!((job(&store, 1)["keeps"].as_bool(), job(&store, 2)["keeps"].as_bool()), (Some(true), None));
     assert_eq!(ended(), 1);
+    // What it pulled is offered then, its runner's record gone with its job: still its job's, and asked for.
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("runner:")), "{:?}", store.0.borrow().keys().collect::<Vec<_>>());
+    let script = String::from_utf8(STANDARD.decode(field(&launches(&http.clouds)[0], "UserData")).unwrap()).unwrap();
+    let link = script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let digest = format!("sha256:{}", "c".repeat(64));
+    let offered = json(&run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/layers-propose")).with_body(serde_json::json!({ "layers": [{ "digest": digest, "size": 1000 }] }).to_string())));
+    assert_eq!(offered["layers"][&digest]["do"], "upload", "{offered}");
     // Still there once its time is up: ended by the sweep.
     let k = store.0.borrow().keys().find(|k| k.starts_with("keeping:")).cloned().expect("noted");
     block_on(plane.alarm()).unwrap();

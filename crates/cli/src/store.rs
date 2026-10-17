@@ -239,7 +239,12 @@ impl Store {
 
     /// What is kept (nothing, when there is no file or it cannot be read as this version writes it).
     pub fn read(&self) -> Kept {
-        std::fs::read(self.path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        let mut kept: Kept = std::fs::read(self.path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        // A key a SuperCI from before 0.19.13 wrote (it names them DASHBOARD_KEY_…): the same key under the name control
+        // planes read now, handed to each again under it. (Taken for one that has expired, it would be replaced, and
+        // the two versions would replace each other's keys at each command.)
+        if let Some(k) = kept.key.as_mut().filter(|k| k.name.starts_with("DASHBOARD_KEY_")) { k.name = k.name.replacen("DASHBOARD_KEY_", "DEVICE_KEY_", 1); k.planes.clear() }
+        kept
     }
 
     /// Writes what is kept: to a file beside it first, then moved over, so a stop midway leaves the last one whole.
@@ -295,7 +300,7 @@ mod tests {
         assert!(!store.read().signed_in() && !store.remove().unwrap());
         let kept = Kept { modal: Some(modal::Session { token_id: "ak-test".into(), token_secret: "as-test".into(), workspace: "acme".into() }),
             aws: Some(aws::Session::for_test("123456789012")),
-            key: Some(Key { name: "DASHBOARD_KEY_1_AB".into(), value: "k".into(), planes: vec!["p1".into()] }),
+            key: Some(Key { name: "DEVICE_KEY_1_AB".into(), value: "k".into(), planes: vec!["p1".into()] }),
             plane: Some(Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: "https://x.lambda-url.us-east-1.on.aws".into(), plane_id: "p1".into(), label: "superci".into() }), ..Default::default() };
         store.write(&kept).unwrap();
         let back = store.read();
@@ -303,6 +308,9 @@ mod tests {
         assert_eq!(back.modal.unwrap().workspace, "acme");
         assert_eq!(back.aws.unwrap().account_id, "123456789012");
         assert!(back.key == kept.key && back.plane == kept.plane);
+        // One a SuperCI from before 0.19.13 wrote: the same key under its new name, to be handed again under it.
+        store.write(&Kept { key: Some(Key { name: "DASHBOARD_KEY_1794848867_4HXLAV".into(), value: "k".into(), planes: vec!["p1".into()] }), ..Default::default() }).unwrap();
+        assert!(store.read().key == Some(Key { name: "DEVICE_KEY_1794848867_4HXLAV".into(), value: "k".into(), planes: vec![] }));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

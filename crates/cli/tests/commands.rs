@@ -405,7 +405,8 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
         (&["runners", "delete", "aws", "--only-here", "--confirm", "--dry-run"], "leaving what SuperCI made for it there"),
         (&["runners", "create", "aws", "--dry-run"], "let aws run jobs for the control plane in use"),
         (&["planes", "delete", "testplane0002", "--confirm", "--dry-run"], "delete the control plane testplane0002"),
-        (&["planes", "allow", "--dry-run"], "give the AWS role of the control plane testplane0001"),
+        (&["planes", "allow", "--dry-run"], "The AWS role of the control plane testplane0001 has what this version asks for: nothing would change."),
+        (&["planes", "update", "--dry-run"], &format!("deploy the control plane in use (AWS · 111111111111 · us-east-1) again: it is on {} already", env!("CARGO_PKG_VERSION"))),
         (&["leave", "--confirm", "--dry-run"], "stop SuperCI"),
         (&["leave", "--plane=testplane0001", "--confirm", "--dry-run"], "stop the control plane testplane0001"),
     ] {
@@ -888,6 +889,17 @@ fn what_a_job_had_from_the_caches_docker_images_is_said_and_keeping_them_is_turn
     assert_eq!((code, v["job"]["images"].as_str()), (0, Some("103 layers from the cache (2.7 GB); 12 layers pulled (300 MB), kept for the next job")), "{v}");
     let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).stdout).into_owned();
     assert!(said.contains("Docker images: 103 layers from the cache (2.7 GB); 12 layers pulled (300 MB), kept for the next job."), "{said}");
+    // Pulled and not uploaded (or only some): said as that, never as kept.
+    for (uploaded, said) in [(0, "12 layers pulled (300 MB), none uploaded to the cache"), (5, "12 layers pulled (300 MB), 5 of them kept for the next job (120 MB)")] {
+        {
+            let mut store = served.store.0.lock().unwrap();
+            let key = format!("job:{job_id}");
+            let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+            j["images"] = serde_json::json!({ "pulled": 12, "pulled_bytes": 300_000_000u64, "uploaded": uploaded, "uploaded_bytes": 120_000_000u64 * (uploaded > 0) as u64, "at": 1 });
+            store.insert(key, j.to_string());
+        }
+        assert_eq!(json(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).1["job"]["images"].as_str(), Some(said));
+    }
     // One whose keeping failed says why.
     {
         let mut store = served.store.0.lock().unwrap();
@@ -942,5 +954,55 @@ fn a_control_plane_that_lost_this_computers_key_is_found_again_and_handed_a_new_
     assert!(keys.len() == 1 && keys[0] != "DEVICE_KEY_4102444800_TEST", "{keys:?}");
     let kept = std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap();
     assert!(kept.contains(&keys[0]), "{kept}");
+    // It said which device it is on, as a dashboard's key does (the CI's Keys name it).
+    let noted = served.store.under(&format!("dkey:{}", keys[0]));
+    assert!(noted.first().is_some_and(|(_, v)| v["device"].as_str().is_some_and(|d| !d.is_empty())), "{noted:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A key a SuperCI from before 0.19.13 kept (as DASHBOARD_KEY_…, which control planes no longer read): this version
+/// keeps it under the new name and hands it under it, instead of taking it for one that expired.
+#[test]
+fn a_key_an_older_superci_kept_is_kept_and_handed_under_the_new_name() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let plane = superci_testkit::PLANE;
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{plane}/DEVICE_KEY_4102444800_TEST"));
+    served.aws.put(&format!("/superci/{plane}/DASHBOARD_KEY_4102444800_TEST"), &served.key);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let kept = std::fs::read_to_string(&file).unwrap().replace("DEVICE_KEY_4102444800_TEST", "DASHBOARD_KEY_4102444800_TEST");
+    std::fs::write(&file, kept).unwrap();
+    let (code, v) = json(&home, &["runs", "list"]);
+    assert_eq!(code, 0, "{v}");
+    // (Kept under the new name, and handed under it: the test kit's key, not a folder's, is replaced as well.)
+    let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let name = kept["key"]["name"].as_str().unwrap_or_default();
+    assert!(name.starts_with("DEVICE_KEY_"), "{kept}");
+    assert!(served.aws.settings(plane).iter().any(|(k, _)| k == name));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane that answers and does not take this computer's key is said as that, with what to do: never as
+/// "no runs yet" or a run not there.
+#[test]
+fn a_control_plane_that_does_not_take_this_computers_key_says_why() {
+    let served = serve(|_| {});
+    let home = common::home(&served);
+    let plane = superci_testkit::PLANE;
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{plane}/DEVICE_KEY_4102444800_TEST"));
+    let said = |args: &[&str]| { let (code, v) = json(&home, args); assert_ne!(code, 0, "{args:?}: {v}"); v["error"].as_str().unwrap_or_default().to_string() };
+    // Replaced or expired (no sign-in here to hand a new one).
+    for args in [&["runs", "list"][..], &["runs", "retrieve", "12345"]] {
+        let e = said(args);
+        assert!(e.contains("does not take this computer's key") && e.contains("superci login"), "{args:?}: {e}");
+    }
+    // Of a version from before the new names: it reads the key under its old name.
+    *served.aws.old_version.lock().unwrap() = Some("0.19.11".into());
+    let e = said(&["runs", "list"]);
+    assert!(e.contains("runs SuperCI 0.19.11, which reads this computer's key under its old name"), "{e}");
+    // Newer than this SuperCI: update it.
+    *served.aws.old_version.lock().unwrap() = Some("99.0.0".into());
+    let e = said(&["runs", "list"]);
+    assert!(e.contains("newer than this SuperCI") && e.contains("npx @superci/cli@latest"), "{e}");
     let _ = std::fs::remove_dir_all(&home);
 }

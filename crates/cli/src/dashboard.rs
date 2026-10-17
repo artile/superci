@@ -198,7 +198,7 @@ impl Update {
 }
 
 const UPDATE_CLOUDFLARE: [&str; 3] = ["Uploading the new version", "Giving it its address", "Waiting for the new version"];
-const UPDATE_AWS: [&str; 6] = ["Updating its role", "Checking its table", "Uploading the new function", "Checking its address", "Checking its schedule", "Waiting for the new version"];
+const UPDATE_AWS: [&str; 6] = ["Updating its role", "Checking its table", "Uploading the new functions (the control plane and its Docker image converter)", "Checking its address", "Checking its schedule", "Waiting for the new version"];
 const UPDATE_MODAL: [&str; 3] = ["Building the new version", "Deploying it", "Waiting for the new version"];
 
 /// A move: to which control plane, the step it is at, and how it ended (with what did not come along).
@@ -509,6 +509,12 @@ fn key_until(name: &str) -> u64 { name.strip_prefix("DEVICE_KEY_").and_then(|r| 
 /// One from before reads DASHBOARD_KEY_… and AGENTS: this device's key is handed to it under the old name too, until
 /// its update moves them (see `renames`).
 const NAMES_SINCE: &str = "0.19.13";
+
+/// Which device a key just handed is on, for the CI's Keys (a command's key as a dashboard's): said once the control
+/// plane takes it, a moment after it is written.
+fn say_device(url: &str, key: &str) {
+    for _ in 0..3 { if cloudflare::plane_post(url, key, "/keys/hello", &serde_json::json!({ "device": computer_name() })).is_ok() { return } std::thread::sleep(Duration::from_millis(1000)) }
+}
 
 /// Whether the control plane at this address is from before `NAMES_SINCE`.
 fn before_names(url: &str) -> bool { cloudflare::health(url).and_then(|h| h["version"].as_str().map(str::to_string)).is_some_and(|v| view::older(Some(&v), NAMES_SINCE)) }
@@ -887,7 +893,13 @@ pub fn images_said(j: &serde_json::Value) -> Option<String> {
     let n = |k: &str| i[k].as_u64().unwrap_or(0);
     let layers = |c: u64| if c == 1 { "1 layer".to_string() } else { format!("{c} layers") };
     let from = (n("served") > 0).then(|| format!("{} from the cache ({})", layers(n("served")), size_words(n("served_bytes"))));
-    let pulled = (n("pulled") > 0).then(|| format!("{} pulled ({}), kept for the next job", layers(n("pulled")), size_words(n("pulled_bytes"))));
+    // (What was uploaded is what the next job has from it: pulled and not uploaded is said as that.)
+    let kept = match (n("uploaded"), n("pulled")) {
+        (0, _) => "none uploaded to the cache".to_string(),
+        (up, all) if up >= all => "kept for the next job".to_string(),
+        (up, _) => format!("{} of them kept for the next job ({})", up, size_words(n("uploaded_bytes"))),
+    };
+    let pulled = (n("pulled") > 0).then(|| format!("{} pulled ({}), {kept}", layers(n("pulled")), size_words(n("pulled_bytes"))));
     match (from, pulled) { (None, None) => None, (Some(a), None) | (None, Some(a)) => Some(a), (Some(a), Some(b)) => Some(format!("{a}; {b}")) }
 }
 
@@ -1320,7 +1332,12 @@ impl Dashboard {
         // (One that says it moved away is no longer the one in use: found again below.)
         if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some() && (v.moved_to.is_none() || only_reading)) { return Ok(Some(v)) }
         // Nothing to find it again with: as it answers now (not at all, or without taking the key any more).
-        if only_reading { return match self.kept_plane.clone() { Some(p) => Ok(Some(view::plane_view(&p, Some(&self.status_key)))), None => Err(self.nowhere().into()) } }
+        if only_reading {
+            let Some(p) = self.kept_plane.clone() else { return Err(self.nowhere().into()) };
+            let v = view::plane_view(&p, Some(&self.status_key));
+            if let Some(why) = self.key_refused(&v) { return Err(why) }
+            return Ok(Some(v))
+        }
         // Not known yet, or its key is gone there: found again (and handed the key) with the sign-ins.
         self.keyed.clear();
         self.discover()?;
@@ -1333,7 +1350,22 @@ impl Dashboard {
         // Just handed the key: its whole status, once it takes it (a few tries).
         for _ in 0..8 { if !v.online || v.status.is_some() || !self.keyed.contains(p.plane_id()) { break } std::thread::sleep(Duration::from_millis(1500)); v.status = cloudflare::status(p.url(), &self.status_key) }
         self.keep();
+        if let Some(why) = self.key_refused(&v) { return Err(why) }
         Ok(Some(v))
+    }
+
+    /// A control plane that answers and does not take this computer's key: why, and what to do (never "no runs").
+    /// One from before `NAMES_SINCE` reads the key under its old name, which only a sign-in can hand it.
+    fn key_refused(&self, v: &PlaneView) -> Option<String> {
+        if !v.online || v.status.is_some() { return None }
+        let said = cloudflare::refused(v.plane.url(), &self.status_key)?;
+        if v.version.is_some() && view::older(v.version.as_deref(), NAMES_SINCE) {
+            return Some(format!("The control plane runs SuperCI {}, which reads this computer's key under its old name. Sign in again where it runs (`superci login`) so it is handed that way, or update the control plane (`superci planes update`).", v.version.as_deref().unwrap_or("of an older version")))
+        }
+        if said.starts_with(superci_core::plane::KEY_REFUSED) && view::older(Some(DASHBOARD_VERSION), v.version.as_deref().unwrap_or_default()) {
+            return Some(format!("The control plane runs SuperCI {}, newer than this SuperCI ({DASHBOARD_VERSION}), and does not take its key: update SuperCI (npx @superci/cli@latest).", v.version.as_deref().unwrap_or_default()))
+        }
+        Some("The control plane does not take this computer's key (it expired or was replaced). Sign in again where it runs (`superci login`) to hand it a new one.".to_string())
     }
 
     /// Every control plane found in the clouds signed in to, the one in use marked.
@@ -2305,8 +2337,9 @@ impl Dashboard {
         let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
         let before: Vec<bool> = planes.iter().map(|p| before_names(p.url())).collect();
         if !planes.iter().zip(&before).all(|(p, b)| writer.put(p, &name, &cloudflare::plane_key(&new, p.url())).is_ok() && (!b || writer.put(p, &old_key_name(&name), &cloudflare::plane_key(&new, p.url())).is_ok())) { return }
-        let old = std::mem::replace(&mut self.status_secret, name);
-        for (p, b) in planes.iter().zip(&before) { let _ = writer.drop(p, &old); if *b { let _ = writer.drop(p, &old_key_name(&old)); } }
+        for p in &planes { say_device(p.url(), &new) }
+        // (The key it replaces ends by itself: a command still running with it, here or in another terminal, goes on.)
+        self.status_secret = name;
         self.status_key = new;
         self.keyed = planes.iter().map(|p| p.plane_id().to_string()).collect();
     }
@@ -2325,6 +2358,7 @@ impl Dashboard {
                 writer.put(p, name, &cloudflare::plane_key(key, p.url()))?;
                 // (One not updated yet reads it under the old name.)
                 if before_names(p.url()) { writer.put(p, &old_key_name(name), &cloudflare::plane_key(key, p.url()))? }
+                say_device(p.url(), key);
                 Ok::<(), String>(())
             }).ok().map(|_| p.plane_id().to_string())) }).collect();
             hs.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
@@ -4548,6 +4582,16 @@ mark();load()})();</script>"#;
         let connection = format!(r#"<section class="card"><div class="card-head"><h2>Connection</h2></div><div class="picks"><div class="pick act">{}<span><strong>{}</strong><small>A token in your control plane's secrets (scopes api, create_runner, manage_runner). Disconnecting removes the webhooks here, then the token.</small></span><span class="pick-end"><button type="button" class="button secondary sm" onclick="document.getElementById('gl-token').showModal()">New token</button><form method="post" action="/gitlab/disconnect">{hidden}<button class="button danger sm">Disconnect</button></form></span></div></div>{}</section>"#,
             logo("gitlab", 36), esc(&host), gitlab_token_dialog(&which, &url));
         format!(r#"{bar}<div class="cards">{projects}{connection}</div>"#)
+    }
+
+    /// What a control plane's AWS role lacks of what this version asks for, read now (`superci planes allow --dry-run`).
+    pub fn role_lacks(&mut self, plane_id: &str) -> Result<Vec<&'static superci_core::permissions::Need>> {
+        let p = self.planes.iter().find(|p| p.plane_id() == plane_id).cloned().ok_or_else(|| format!("No control plane {plane_id} here (ids are in `superci planes list`)."))?;
+        let v = view::plane_view(&p, Some(&self.status_key));
+        let account = aws_account(&v).ok_or("Its machines do not run in an AWS account: it has no AWS role to give anything.")?;
+        let (account, creds) = self.aws_account(&account)?;
+        let regions = v.status.as_ref().map(status_regions).unwrap_or_else(|| v.aws_regions());
+        aws::runner_role_missing(&creds, &account, plane_id, &regions)
     }
 
     /// What a control plane's AWS role was found to lack (empty unless read while signed in to its account).
