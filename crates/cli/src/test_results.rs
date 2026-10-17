@@ -171,7 +171,7 @@ fn runner_name(r: &str) -> &'static str {
 
 /// A line of Playwright's list of tests as they end (`  ✓  3 [chromium] › e2e/a.spec.ts:4:3 › logs in (2.1s)`): its
 /// mark, the test's name (with its project) and its file.
-fn listed(s: &str) -> Option<(char, String, String)> {
+fn listed(s: &str) -> Option<(char, String, String, bool)> {
     let mark = s.chars().next().filter(|c| ['✓', '✘', '-'].contains(c))?;
     let rest = s[mark.len_utf8()..].trim_start();
     let rest = rest.split_once(' ').filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()).map(|(_, r)| r.trim_start()).unwrap_or(rest);
@@ -185,6 +185,7 @@ fn listed(s: &str) -> Option<(char, String, String)> {
     // (Without its time and a retry's mark, as Playwright adds them: "(2.1s)", "(345ms)", "(1.2m)", "(retry #1)".
     // Nothing else in brackets: "(old layout)" is the test's own title.)
     let mut title = title.trim().to_string();
+    let mut retry = false;
     let added = |inner: &str| {
         let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'.') && s.bytes().next().is_some_and(|b| b.is_ascii_digit());
         inner.strip_prefix("retry #").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -192,10 +193,12 @@ fn listed(s: &str) -> Option<(char, String, String)> {
     };
     for _ in 0..2 {
         let Some(open) = title.rfind(" (").filter(|_| title.ends_with(')')) else { break };
-        if !added(&title[open + 2..title.len() - 1]) { break }
+        let inner = &title[open + 2..title.len() - 1];
+        if !added(inner) { break }
+        retry |= inner.starts_with("retry #");
         title.truncate(open);
     }
-    Some((mark, match project { Some(p) => format!("[{p}] {title}"), None => title }, file.trim().to_string()))
+    Some((mark, match project { Some(p) => format!("[{p}] {title}"), None => title }, file.trim().to_string(), retry))
 }
 
 /// A runner's word that it ran no test because none matched (its runner, and the note), from one of its lines.
@@ -253,11 +256,12 @@ fn read_lines(lines: &[String]) -> Tests {
         if playwright {
             // (Its first line: Playwright ran here, though it may say nothing more.)
             if s.starts_with("Running ") && s.contains(" using ") && s.contains("worker") { runner(&mut t, "playwright"); continue }
-            if let Some((mark, name, file)) = listed(s) {
+            if let Some((mark, name, file, retry)) = listed(s) {
                 runner(&mut t, "playwright");
                 let outcome = match mark { '✓' => "passed", '✘' => "failed", _ => "skipped" };
-                match listed_order.iter().position(|(n, f, _)| *n == name && *f == file) {
-                    // (Run again: failed before and passed now is flaky.)
+                // A retry is the same run of the test again (failed before and passed now is flaky); the same title
+                // with no retry's mark is a run of its own (`--repeat-each`), counted as Playwright counts it.
+                match listed_order.iter().rposition(|(n, f, _)| *n == name && *f == file).filter(|_| retry) {
                     Some(at) => { let was = listed_order[at].2; listed_order[at].2 = if was == "failed" && outcome == "passed" { "flaky" } else { outcome } }
                     None => listed_order.push((name, file, outcome)),
                 }
@@ -360,6 +364,14 @@ mod tests {
         assert_eq!((t.runners.clone(), t.passed, t.failed, t.skipped), (vec!["vitest"], 41, 1, 2));
         assert_eq!((t.failures[0].name.as_str(), t.failures[0].file.as_deref()), ("sums > adds two numbers", Some("src/sum.test.ts")));
         assert!(t.failures[0].error.starts_with("AssertionError: expected 3 to be 4") && t.failures[0].error.contains("+ Received"), "{}", t.failures[0].error);
+    }
+
+    #[test]
+    fn each_run_of_a_repeated_test_is_counted_as_playwright_counts_it_and_a_retry_is_the_same_run() {
+        // `--repeat-each=3`: the same title three times, no retry's mark; a test failed then passed on its retry.
+        let log = "Running 4 tests using 1 worker\n  ✘  1 [chromium] › e2e/a.spec.ts:3:1 › known bug (1.0s)\n  ✘  2 [chromium] › e2e/a.spec.ts:3:1 › known bug (1.0s)\n  ✘  3 [chromium] › e2e/a.spec.ts:3:1 › known bug (1.1s)\n  ✘  4 [chromium] › e2e/b.spec.ts:5:1 › sometimes (2.0s)\n  ✓  5 [chromium] › e2e/b.spec.ts:5:1 › sometimes (retry #1) (1.9s)\n\n  1 flaky\n  3 passed (8.0s)";
+        let t = read(log);
+        assert_eq!((t.failed_as_expected, t.flaky, t.failed_as_expected_tests.len()), (3, 1, 3));
     }
 
     #[test]
@@ -478,10 +490,11 @@ mod tests {
         assert_eq!(marked(&long_mark).0, "");
         assert_eq!(marked("[a[b] text").0, "");
         assert_eq!(marked("[slot 1] › text").0, "");
-        // Playwright's list: without a project, with a file but no line, a retry passed (flaky), passed then failed.
+        // Playwright's list: without a project, with a file but no line, a retry passed (flaky), passed then failed
+        // with no retry's mark (two runs of it, as `--repeat-each` makes).
         let t = read("Running 4 tests using 1 worker\n  ✓  1 e2e/a.spec.ts:3:1 › one (1s)\n  ✓  2 e2e/a.spec.ts › no line (1s)\n  ✘  3 [p] › e2e/b.spec.ts:1:1 › two (1s)\n  ✓  4 [p] › e2e/b.spec.ts:1:1 › two (retry #1) (1s)\n  ✓  5 [p] › e2e/c.spec.ts:1:1 › three (1s)\n  ✘  6 [p] › e2e/c.spec.ts:1:1 › three (1s)\n  ✓  [p] › e2e/d.spec.ts:2:2 › four\n  - [p] e2e/x.spec.ts:1:1 no separator\n  3 passed (4s)");
         let ran: Vec<(&str, &str)> = t.ran.iter().map(|r| (r.name.as_str(), r.outcome)).collect();
-        assert_eq!(ran, [("one", "passed"), ("[p] two", "flaky"), ("[p] three", "failed as expected"), ("[p] four", "passed")]);
+        assert_eq!(ran, [("one", "passed"), ("[p] two", "flaky"), ("[p] three", "passed"), ("[p] three", "failed as expected"), ("[p] four", "passed")]);
         // Playwright's summary that is not one: too many words, or a word it does not say.
         let t = read("Running 1 test using 1 worker\n  2 passed but slowly today\n  2 tests\n  1 passed (1s)");
         assert_eq!(t.passed, 1);
