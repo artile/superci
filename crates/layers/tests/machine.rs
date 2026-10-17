@@ -26,15 +26,19 @@ fn here() -> bool {
     true
 }
 
-/// What measures the tests, carried into a container: its settings, and its folder mounted at the same path.
-fn measured() -> Vec<String> {
+/// What measures the tests, carried into a container: its settings, and (`mounts`, for starting one) its folder
+/// mounted at the same path.
+fn measured_with(mounts: bool) -> Vec<String> {
     let mut args = vec![];
     for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("SUPERCOV_")) {
-        if k.ends_with("_DIR") { std::fs::create_dir_all(&v).ok(); args.extend(["-v".to_string(), format!("{v}:{v}")]) }
+        if k.ends_with("_DIR") && mounts { std::fs::create_dir_all(&v).ok(); args.extend(["-v".to_string(), format!("{v}:{v}")]) }
         args.extend(["-e".to_string(), format!("{k}={v}")]);
     }
     args
 }
+fn measured() -> Vec<String> { measured_with(true) }
+/// The same for a command in a container already started with them (`docker exec` takes no mounts).
+fn measured_env() -> Vec<String> { measured_with(false) }
 
 fn image(file: &str, tag: &str) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/e2e");
@@ -78,18 +82,18 @@ fn setup_switches_a_machines_docker_to_the_layers_service_and_off_puts_it_back()
     // The store's index, served on the machine (a layer it has; its file is not asked for here).
     m.sh(r#"mkdir -p /srv && echo '{"layers": {"sha256:0000000000000000000000000000000000000000000000000000000000000001": {"size": 1, "erofs": {"size": 1}, "blob": {}}}}' > /srv/layers.json && (setsid python3 -m http.server 8000 -d /srv >/dev/null 2>&1 &) && sleep 1"#);
     // Switched: the service under systemd, containerd and Docker on it (started again beside, as beside a runner).
-    let o = m.exec(&measured(), &["/usr/local/bin/superci-layers", "setup", "--index-url=http://127.0.0.1:8000/layers.json", "--disk=none"]);
+    let o = m.exec(&measured_env(), &["/usr/local/bin/superci-layers", "setup", "--index-url=http://127.0.0.1:8000/layers.json", "--disk=none"]);
     let said = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(o.status.success() && said.contains("superci-layers: switched in"), "{said}{}", String::from_utf8_lossy(&o.stderr));
     m.sh("for i in $(seq 120); do [ \"$(docker info -f '{{.Driver}}' 2>/dev/null)\" = superci ] && exit 0; sleep 0.5; done; cat /var/log/superci-layers.log; exit 1");
     assert_eq!(m.sh("systemctl is-active superci-layers"), "active");
     assert!(m.sh("cat /var/log/superci-layers.log").contains("Docker answered on it"), "{}", m.sh("cat /var/log/superci-layers.log"));
     // Off: Docker as it came.
-    let o = m.exec(&measured(), &["/usr/local/bin/superci-layers", "off"]);
+    let o = m.exec(&measured_env(), &["/usr/local/bin/superci-layers", "off"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
     m.sh(&format!("for i in $(seq 120); do [ \"$(docker info -f '{{{{.Driver}}}}' 2>/dev/null)\" = '{stock}' ] && exit 0; sleep 0.5; done; exit 1"));
     // An index that cannot be had: nothing switched, Docker as it comes, and the start not failed.
-    let o = m.exec(&measured(), &["/usr/local/bin/superci-layers", "setup", "--index-url=http://127.0.0.1:9/none.json", "--disk=none"]);
+    let o = m.exec(&measured_env(), &["/usr/local/bin/superci-layers", "setup", "--index-url=http://127.0.0.1:9/none.json", "--disk=none"]);
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("superci-layers: off: "), "{}", String::from_utf8_lossy(&o.stdout));
     assert_eq!(m.sh("docker info -f '{{.Driver}}'"), stock);
 }

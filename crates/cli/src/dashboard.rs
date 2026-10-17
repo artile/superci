@@ -5446,6 +5446,8 @@ fn changelog() -> Vec<(String, String, Vec<String>)> {
             out.push((v.trim().to_string(), date.trim().to_string(), vec![]));
         } else if let (Some(item), Some(last)) = (line.strip_prefix("- "), out.last_mut()) { last.2.push(item.to_string()) }
     }
+    // (A version newer than this dashboard, not released yet in a build from the repository, is not one to offer.)
+    out.retain(|(v, _, _)| !view::older(Some(DASHBOARD_VERSION), v));
     out
 }
 
