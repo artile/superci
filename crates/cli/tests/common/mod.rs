@@ -21,7 +21,7 @@ pub fn home(served: &Served) -> std::path::PathBuf {
     let ws = home.join("workspaces/default");
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(ws.join("sign-ins.json"), serde_json::json!({
-        "key": { "name": "DASHBOARD_KEY_4102444800_TEST", "value": served.key, "planes": ["testplane0001"] },
+        "key": { "name": "DEVICE_KEY_4102444800_TEST", "value": served.key, "planes": ["testplane0001"] },
         "plane": { "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": served.url, "plane_id": "testplane0001", "label": "superci" } },
     }).to_string()).unwrap();
     home

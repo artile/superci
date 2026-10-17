@@ -135,7 +135,7 @@ fn gitlab_is_connected_and_a_project_switched_on_and_off_in_the_browser() {
 #[test]
 fn a_gitlab_job_asking_for_windows_or_only_modal_is_said_to_have_nowhere_to_run() {
     // Modal's sandboxes beside Cloudflare's containers: neither runs Docker for GitLab on Windows, and Modal runs none.
-    let served = serve(|c| { c.containers = true; c.agents = vec![superci_core::plane::Agent { cloud: "modal".into(), url: "https://acme--superci-runners.modal.run".into() }]; });
+    let served = serve(|c| { c.containers = true; c.launchers = vec![superci_core::plane::Launcher { cloud: "modal".into(), url: "https://acme--superci-runners.modal.run".into() }]; });
     served.connect_gitlab();
     for (tags, why) in [(&["superci/os=windows"][..], "runs no GitLab jobs on Windows"), (&["superci/provider=modal"], "Modal runs no Docker")] {
         let (id, pending) = served.gitlab.pending("test", tags, served.now_ms());

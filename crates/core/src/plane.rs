@@ -73,10 +73,10 @@ pub struct Config {
     pub cloudflare_image: Option<String>,
     /// Set by each dashboard session on your machine (through the cloud's API): keys to read `/status`, each with
     /// the time it expires (ms).
-    pub dashboard_keys: Vec<(u64, String)>,
-    /// The same keys by name (`DASHBOARD_KEY_<expires>_<random>`, as kept), for whoever looks after the CI to see
+    pub device_keys: Vec<(u64, String)>,
+    /// The same keys by name (`DEVICE_KEY_<expires>_<random>`, as kept), for whoever looks after the CI to see
     /// which computers have one.
-    pub dashboard_key_names: Vec<(String, String)>,
+    pub device_key_names: Vec<(String, String)>,
     /// Keys that only read (`superci keys create`, for a coding agent or a script that should look and not change):
     /// each with the time it expires (ms), its name, and the SHA-256 of the key (the key itself is not kept here).
     /// Set through the cloud's API like the dashboard's, as READ_KEY_<expires, unix seconds>_<NAME>.
@@ -85,8 +85,8 @@ pub struct Config {
     /// someone who controls this cloud account can ask): the old one hands over its settings with it, the new one
     /// takes its history and GitLab's project runners with it.
     pub move_token: Option<String>,
-    /// Runner bridges in other clouds (Cloudflare containers, Modal sandboxes), set from the dashboard.
-    pub agents: Vec<Agent>,
+    /// Launchers in other clouds (Cloudflare containers, Modal sandboxes), set from the dashboard.
+    pub launchers: Vec<Launcher>,
     /// Where jobs run, set from the dashboard (workflows only say `runs-on: <label>`).
     pub routing: Routing,
     /// Machines started by this control plane itself: containers (a Cloudflare control plane with its container
@@ -135,15 +135,15 @@ impl Config {
         // One for each further organization's GitHub App: GITHUB_APP_<its id>.
         self.more_apps = named("GITHUB_APP_").filter_map(|(_, v)| serde_json::from_str::<crate::github::App>(v).ok()).filter(|a| app.as_ref().is_none_or(|f| f.id != a.id)).collect();
         self.app = app;
-        self.agents = get("AGENTS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+        self.launchers = get("LAUNCHERS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
         self.routing = get("ROUTING").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
         self.gitlab = get("GITLAB").and_then(|v| serde_json::from_str(v).ok());
         // One for each further GitLab connection: GITLAB_<its name>.
         self.more_gitlabs = named("GITLAB_").filter_map(|(_, v)| serde_json::from_str::<crate::gitlab::GitLab>(v).ok()).filter(|g| crate::gitlab::valid_id(&g.id)).collect();
         self.machine = get("MACHINE").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
-        // One per dashboard session: DASHBOARD_KEY_<expires, unix seconds>_<random>.
-        self.dashboard_keys = named("DASHBOARD_KEY_").filter_map(|(n, v)| Some((n.strip_prefix("DASHBOARD_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.clone()))).collect();
-        self.dashboard_key_names = named("DASHBOARD_KEY_").filter(|(_, v)| !v.is_empty()).map(|(n, v)| (n.to_string(), v.clone())).collect();
+        // One per dashboard session: DEVICE_KEY_<expires, unix seconds>_<random>.
+        self.device_keys = named("DEVICE_KEY_").filter_map(|(n, v)| Some((n.strip_prefix("DEVICE_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.clone()))).collect();
+        self.device_key_names = named("DEVICE_KEY_").filter(|(_, v)| !v.is_empty()).map(|(n, v)| (n.to_string(), v.clone())).collect();
         // One per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
         self.read_keys = named("READ_KEY_").filter_map(|(n, v)| read_key(n, v)).collect();
         self.move_token = get("MOVE_TOKEN").map(str::to_string);
@@ -184,11 +184,11 @@ impl Config {
             aws_networks: HashMap::new(),
             cloudflare_location: "enam".into(),
             cloudflare_image: None,
-            dashboard_keys: Vec::new(),
-            dashboard_key_names: Vec::new(),
+            device_keys: Vec::new(),
+            device_key_names: Vec::new(),
             read_keys: Vec::new(),
             move_token: None,
-            agents: Vec::new(),
+            launchers: Vec::new(),
             routing: Routing::default(),
             containers: false,
             aws_own: None,
@@ -590,8 +590,8 @@ const SEVERAL: &str = "no provider could start its machine: ";
 const CANCEL_MS: u64 = 6 * 60_000;
 
 /// A place refusing what a job asks, as it would any job asking the same (no hiccup): no GPU machines allowed in the
-/// AWS account, or a runner bridge refusing the request (Modal: no GPUs without a payment method).
-fn refuses_alike(e: &str) -> bool { e.starts_with(NO_GPU_QUOTA) || e.contains(" runner bridge: 400 ") || e.starts_with("Modal refused: ") }
+/// AWS account, or a launcher refusing the request (Modal: no GPUs without a payment method).
+fn refuses_alike(e: &str) -> bool { e.starts_with(NO_GPU_QUOTA) || e.contains(" launcher: 400 ") || e.starts_with("Modal refused: ") }
 
 /// How a try ends when AWS has no spot machine for a job and nothing else in the order can run it (followed by what
 /// each region said): the job waits, and is tried again, rather than failing.
@@ -660,15 +660,15 @@ pub const AWS_ON_DEMAND: &str = "aws-on-demand";
 /// The place in the order a job's machine counts toward (its limits and its spend).
 fn place_of(j: &Job) -> &str { if j.cloud == "aws" && j.on_demand { AWS_ON_DEMAND } else { &j.cloud } }
 
-/// A runner bridge in another cloud: it starts one runner per request from this control plane, which it trusts the way
-/// AWS does, by this control plane's signed tokens (issuer = the control plane's URL, audience = the agent's URL).
+/// A launcher in another cloud: it starts one runner per request from this control plane, which it trusts the way
+/// AWS does, by this control plane's signed tokens (issuer = the control plane's URL, audience = the launcher's URL).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Agent { pub cloud: String, pub url: String }
+pub struct Launcher { pub cloud: String, pub url: String }
 
 /// Where jobs run. A job naming a cloud in its label (`superci/provider=aws`) runs only there; else the first rule whose
 /// repository pattern matches ("owner/repo", "owner/*" or "*") names its only cloud; else the places in `order` are tried
 /// top to bottom: the first that can run the job's machine and is within its limits takes it. Without an order: the
-/// default cloud, else every connected cloud (AWS, Cloudflare, agents).
+/// default cloud, else every connected cloud (AWS, Cloudflare, launchers).
 ///
 /// AWS is two places: `aws`, its spot machines, and `AWS_ON_DEMAND`, its on-demand ones (right after `aws` unless the
 /// order puts it elsewhere, or turns it off). A job goes to the next place that can run it when the one before cannot
@@ -804,7 +804,7 @@ impl Routing {
     pub fn pool(&self, cloud: &str) -> Option<&Pool> { self.order.iter().find(|p| p.cloud == cloud) }
 }
 
-enum Runner { Aws(AwsConnection), Agent(Agent), Own }
+enum Runner { Aws(AwsConnection), Launcher(Launcher), Own }
 
 /// Where a job goes: a place now, later (every place that could run it is full, over its limit or offline), or nowhere
 /// (no connected place can run its machine), each with why.
@@ -1108,8 +1108,8 @@ impl<'a> ControlPlane<'a> {
         let url = url::Url::parse(&req.url).map_err(|e| e.to_string())?;
         let plane_url = origin(&req.url);
         if get_json::<String>(self.store, "plane_url").await?.as_deref() != Some(plane_url.as_str()) { put_json(self.store, "plane_url", &plane_url).await? }
-        // A computer's key in use: noted (ten minutes apart at most), for whoever looks after the CI to see.
-        if let Some(name) = self.dashboard_key_name(&req) { let _ = self.note_key(&name, None).await; }
+        // A device key in use: noted (ten minutes apart at most), for whoever looks after the CI to see.
+        if let Some(name) = self.device_key_name(&req) { let _ = self.note_key(&name, None).await; }
         match (req.method.as_str(), url.path()) {
             ("GET", "/.well-known/openid-configuration") => Ok(Response::json(&serde_json::json!({
                 "issuer": plane_url, "jwks_uri": format!("{plane_url}/.well-known/jwks.json"), "response_types_supported": ["id_token"],
@@ -1117,7 +1117,7 @@ impl<'a> ControlPlane<'a> {
             ("GET", "/.well-known/jwks.json") => Ok(Response::json(&serde_json::json!({ "keys": [self.identity().await?.signing.public_jwk()?] }))),
             ("GET", "/health") => {
                 let aws = self.aws_connection().await?.is_some_and(|a| a.connected);
-                let runners = aws || !self.config.agents.is_empty() || self.own_containers();
+                let runners = aws || !self.config.launchers.is_empty() || self.own_containers();
                 let moved_to = get_json::<String>(self.store, "moved_to").await?;
                 let mut health = serde_json::json!({ "plane": self.config.plane_id, "label": self.config.label, "version": VERSION, "github": self.config.app.is_some(), "gitlab": self.config.gitlabs().next().is_some(), "installed": self.installed().await, "aws": aws, "runners": runners });
                 // Moved: another control plane took over (the dashboard shows it as not in use). Standby: taking over,
@@ -1127,12 +1127,12 @@ impl<'a> ControlPlane<'a> {
                 Ok(Response::json(&health))
             }
             ("GET", "/status") => self.status(&req).await,
-            // The computers that look after this CI, each with its key (which says what it is called once).
+            // The devices that look after this CI, each with its key (which says what it is called once).
             ("POST", "/keys/hello") if self.dashboard(&req) => {
-                let computer: String = serde_json::from_slice::<serde_json::Value>(&req.body).ok().and_then(|b| b["computer"].as_str().map(str::to_string)).unwrap_or_default()
+                let device: String = serde_json::from_slice::<serde_json::Value>(&req.body).ok().and_then(|b| b["device"].as_str().map(str::to_string)).unwrap_or_default()
                     .chars().filter(|c| !c.is_control()).take(64).collect();
-                let Some(name) = self.dashboard_key_name(&req) else { return Ok(nothing_here()) };
-                self.note_key(&name, Some(computer.trim())).await?;
+                let Some(name) = self.device_key_name(&req) else { return Ok(nothing_here()) };
+                self.note_key(&name, Some(device.trim())).await?;
                 Ok(Response::text(200, "ok"))
             }
             ("GET", "/keys") if self.dashboard(&req) => self.keys().await,
@@ -1478,38 +1478,38 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Whether a request carries a dashboard session's key that has not expired.
-    /// The name of the dashboard key a request came with (`DASHBOARD_KEY_<expires>_<random>`), if it is one.
-    fn dashboard_key_name(&self, req: &Request) -> Option<String> {
+    /// The name of the dashboard key a request came with (`DEVICE_KEY_<expires>_<random>`), if it is one.
+    fn device_key_name(&self, req: &Request) -> Option<String> {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).filter(|g| g.len() >= 16)?;
         if !self.dashboard(req) { return None }
-        self.config.dashboard_key_names.iter().find(|(_, v)| safe_eq(given.as_bytes(), v.as_bytes())).map(|(n, _)| n.clone())
+        self.config.device_key_names.iter().find(|(_, v)| safe_eq(given.as_bytes(), v.as_bytes())).map(|(n, _)| n.clone())
     }
 
-    /// A dashboard key's use, noted as its record (`dkey:<name>`: the computer it is on, when it was first and last
-    /// used), kept until a day after the key ends; at most every ten minutes, unless it says what its computer is called.
-    async fn note_key(&self, name: &str, computer: Option<&str>) -> Result<()> {
+    /// A device key's use, noted as its record (`dkey:<name>`: the device it is on, when it was first and last
+    /// used), kept until a day after the key ends; at most every ten minutes, unless it says what its device is called.
+    async fn note_key(&self, name: &str, device: Option<&str>) -> Result<()> {
         let now = self.clock.now_ms();
-        if computer.is_none() && self.cache.key_seen.borrow().get(name).is_some_and(|at| now.saturating_sub(*at) < 600_000) { return Ok(()) }
+        if device.is_none() && self.cache.key_seen.borrow().get(name).is_some_and(|at| now.saturating_sub(*at) < 600_000) { return Ok(()) }
         self.cache.key_seen.borrow_mut().insert(name.to_string(), now);
         let at = format!("dkey:{name}");
         let mut v = get_json::<serde_json::Value>(self.store, &at).await?.unwrap_or_else(|| serde_json::json!({ "first_ms": now }));
         v["last_ms"] = now.into();
-        if let Some(c) = computer.filter(|c| !c.is_empty()) { v["computer"] = c.into() }
-        let until = name.strip_prefix("DASHBOARD_KEY_").and_then(|r| r.split('_').next()).and_then(|t| t.parse::<u64>().ok()).map(|t| t * 1000 + 86_400_000).unwrap_or(now + 31 * 86_400_000);
+        if let Some(c) = device.filter(|c| !c.is_empty()) { v["device"] = c.into() }
+        let until = name.strip_prefix("DEVICE_KEY_").and_then(|r| r.split('_').next()).and_then(|t| t.parse::<u64>().ok()).map(|t| t * 1000 + 86_400_000).unwrap_or(now + 31 * 86_400_000);
         self.store.put_until(&at, v.to_string(), until).await
     }
 
-    /// Every key this CI takes: each computer's (its dashboard: the computer it is on, when it was made and last
+    /// Every key this CI takes: each device key (its dashboard: the device it is on, when it was made and last
     /// used, until when it lasts) and those that only read or start runs (read and run keys, made for coding agents and scripts).
     async fn keys(&self) -> Result<Response> {
-        let mut computers = vec![];
-        for (name, _) in &self.config.dashboard_key_names {
-            let until = name.strip_prefix("DASHBOARD_KEY_").and_then(|r| r.split('_').next()).and_then(|t| t.parse::<u64>().ok()).map(|t| t * 1000);
+        let mut devices = vec![];
+        for (name, _) in &self.config.device_key_names {
+            let until = name.strip_prefix("DEVICE_KEY_").and_then(|r| r.split('_').next()).and_then(|t| t.parse::<u64>().ok()).map(|t| t * 1000);
             let seen = get_json::<serde_json::Value>(self.store, &format!("dkey:{name}")).await?.unwrap_or_default();
-            computers.push(serde_json::json!({ "name": name, "until_ms": until, "computer": seen["computer"], "first_ms": seen["first_ms"], "last_ms": seen["last_ms"] }));
+            devices.push(serde_json::json!({ "name": name, "until_ms": until, "device": seen["device"], "first_ms": seen["first_ms"], "last_ms": seen["last_ms"] }));
         }
         let read: Vec<serde_json::Value> = self.config.read_keys.iter().map(|(until, name, kept)| serde_json::json!({ "name": name, "until_ms": until, "runs": kept.split_once(':').and_then(|(_, more)| RunKey::of(more)).is_some() })).collect();
-        Ok(Response::json(&serde_json::json!({ "computers": computers, "read": read })))
+        Ok(Response::json(&serde_json::json!({ "devices": devices, "read": read })))
     }
 
     /// The secrets this CI keeps (see `secrets`), for whoever looks after it: each one's name, scope, when it was set
@@ -1527,7 +1527,7 @@ impl<'a> ControlPlane<'a> {
     fn dashboard(&self, req: &Request) -> bool {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         let now = self.clock.now_ms();
-        self.config.dashboard_keys.iter().any(|(until, key)| *until > now && key.len() >= 16 && safe_eq(given.as_bytes(), key.as_bytes()))
+        self.config.device_keys.iter().any(|(until, key)| *until > now && key.len() >= 16 && safe_eq(given.as_bytes(), key.as_bytes()))
     }
 
     /// How long a job's machine lives in a cloud, in minutes: the longest a job may run as set (six hours unless set),
@@ -1671,7 +1671,7 @@ impl<'a> ControlPlane<'a> {
             "aws_networks": self.config.aws_networks,
             "cloudflare_location": self.config.cloudflare_location,
             "cloudflare_image": self.config.cloudflare_image,
-            "agents": self.config.agents,
+            "launchers": self.config.launchers,
             "containers": self.own_containers(),
             "own_cloud": self.config.own_cloud,
             "gitlab": self.config.gitlab.as_ref().map(|g| serde_json::json!({ "url": g.url })),
@@ -2229,7 +2229,7 @@ impl<'a> ControlPlane<'a> {
         let mut connected = vec![];
         if aws.is_some() { connected.extend(["aws".to_string(), AWS_ON_DEMAND.to_string()]) }
         if self.own_containers() { connected.push(self.config.own_cloud.clone()) }
-        for a in &self.config.agents { if !connected.contains(&a.cloud) { connected.push(a.cloud.clone()) } }
+        for a in &self.config.launchers { if !connected.contains(&a.cloud) { connected.push(a.cloud.clone()) } }
         // The order as set; places connected since then come after it (AWS's on-demand machines: right after its spot ones).
         let mut order: Vec<String> = routing.order.iter().map(|p| p.cloud.clone()).collect();
         for c in &connected {
@@ -2262,7 +2262,7 @@ impl<'a> ControlPlane<'a> {
             let runner = match cloud.as_str() {
                 "aws" | AWS_ON_DEMAND => aws.clone().map(|a| (Capacity::aws(), Runner::Aws(a))),
                 c if c == self.config.own_cloud && self.own_containers() => Some((capacity_of(c), Runner::Own)),
-                c => self.config.agents.iter().find(|a| a.cloud == c).map(|a| (if c == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() }, Runner::Agent(a.clone()))),
+                c => self.config.launchers.iter().find(|a| a.cloud == c).map(|a| (if c == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() }, Runner::Launcher(a.clone()))),
             };
             // Limits from the order: turned off, jobs at once, spend this month.
             let pool = routing.pool(cloud);
@@ -2310,8 +2310,8 @@ impl<'a> ControlPlane<'a> {
             else { Placement::Fail(format!("nowhere to run {}: {}", spec.describe(), never.join("; "))) })
     }
 
-    /// One call to a runner bridge, with a token this control plane signs for it alone.
-    async fn agent_call(&self, plane_url: &str, a: &Agent, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+    /// One call to a launcher, with a token this control plane signs for it alone.
+    async fn launcher_call(&self, plane_url: &str, a: &Launcher, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         let secs = self.clock.now_ms() / 1000;
         let token = self.identity().await?.signing.jwt(&serde_json::json!({ "iss": plane_url, "sub": format!("plane:{}", self.config.plane_id), "aud": a.url, "iat": secs, "exp": secs + 120 }))?;
         let req = Request::new("POST", &format!("{}{path}", a.url)).with_header("authorization", &format!("Bearer {token}"))
@@ -2320,9 +2320,9 @@ impl<'a> ControlPlane<'a> {
         if r.status >= 300 {
             // What it said (FastAPI's `detail`), else its answer as it came.
             let said = serde_json::from_slice::<serde_json::Value>(&r.body).ok().and_then(|v| v["detail"].as_str().map(str::to_string)).unwrap_or_else(|| r.body_text());
-            return Err(format!("{} runner bridge: {} {}", a.cloud, r.status, said.chars().take(300).collect::<String>()));
+            return Err(format!("{} launcher: {} {}", a.cloud, r.status, said.chars().take(300).collect::<String>()));
         }
-        serde_json::from_slice(&r.body).map_err(|e| format!("{} runner bridge: {e}", a.cloud))
+        serde_json::from_slice(&r.body).map_err(|e| format!("{} launcher: {e}", a.cloud))
     }
 
     /// Ends the machine that ran (or would have run) a job, wherever it is.
@@ -2378,8 +2378,8 @@ impl<'a> ControlPlane<'a> {
             }
         } else if j.cloud == self.config.own_cloud && self.own_containers() {
             if let Some(c) = self.containers { let _ = c.stop(id).await; }
-        } else if let Some(agent) = self.config.agents.iter().find(|a| a.cloud == j.cloud) {
-            let _ = self.agent_call(plane_url, agent, "/stop", serde_json::json!({ "id": id })).await;
+        } else if let Some(launcher) = self.config.launchers.iter().find(|a| a.cloud == j.cloud) {
+            let _ = self.launcher_call(plane_url, launcher, "/stop", serde_json::json!({ "id": id })).await;
         }
     }
 
@@ -2743,7 +2743,7 @@ impl<'a> ControlPlane<'a> {
                 }
                 Placement::Fail(why) => { intrinsic = spec.cloud.is_some() || self.config.routing.rule_for(&job.repo).is_none(); return Err(why) }
             };
-            let cloud_of = |r: &Runner| match r { Runner::Aws(_) => "aws".to_string(), Runner::Agent(a) => a.cloud.clone(), Runner::Own => self.config.own_cloud.clone() };
+            let cloud_of = |r: &Runner| match r { Runner::Aws(_) => "aws".to_string(), Runner::Launcher(a) => a.cloud.clone(), Runner::Own => self.config.own_cloud.clone() };
             job.state = "launching".into();
             job.error = None;
             job.cloud = cloud_of(&places[0].1);
@@ -2988,7 +2988,7 @@ impl<'a> ControlPlane<'a> {
                         if self.config.own_cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
                         Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, self.machine_minutes(&self.config.own_cloud), size).await?, machine_name(size)))
                     }.await,
-                    Runner::Agent(a) => async {
+                    Runner::Launcher(a) => async {
                         let size = if a.cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() }.fit(&spec)?;
                         job.cpu = Some(size.cpu);
                         job.usd_per_hour = match a.cloud.as_str() { "cloudflare" => Some(cloudflare_usd_per_hour(size)), "modal" => Some(modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu)), _ => None };
@@ -2997,8 +2997,8 @@ impl<'a> ControlPlane<'a> {
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
                         for (k, v) in work.json().as_object().into_iter().flatten() { body[k] = v.clone() }
-                        let v = self.agent_call(plane_url, &a, "/launch", body).await?;
-                        Ok(Tried::Started(v["id"].as_str().ok_or("runner bridge answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
+                        let v = self.launcher_call(plane_url, &a, "/launch", body).await?;
+                        Ok(Tried::Started(v["id"].as_str().ok_or("launcher answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
                     }.await,
                 };
                 match tried {
@@ -3144,7 +3144,7 @@ impl<'a> ControlPlane<'a> {
                         job.cpu.unwrap_or(4), aws::SPOT_CPU_QUOTA)
                 }
             };
-            // No GPU machines allowed in the AWS account, or a runner bridge refusing what was asked (Modal: no GPUs
+            // No GPU machines allowed in the AWS account, or a launcher refusing what was asked (Modal: no GPUs
             // without a payment method): every job asking for it fails alike, at once.
             if !e.starts_with(SEVERAL) && refuses_alike(&e) { intrinsic = true; job.cloud = String::new() }
             // No spot machine anywhere and no other place for it: it waits for one, however long (as for a place that is full).
@@ -3187,10 +3187,10 @@ impl<'a> ControlPlane<'a> {
             return;
         }
         // Where it may run, cheapest and soonest first (no runner is registered at GitHub when there is no place for it).
-        enum Place { Own, Agent(Agent), Aws(AwsConnection) }
+        enum Place { Own, Launcher(Launcher), Aws(AwsConnection) }
         let mut places = vec![];
         if self.own_containers() { places.push(Place::Own) }
-        for c in ["cloudflare", "modal"] { if let Some(a) = self.config.agents.iter().find(|a| a.cloud == c) { places.push(Place::Agent(a.clone())) } }
+        for c in ["cloudflare", "modal"] { if let Some(a) = self.config.launchers.iter().find(|a| a.cloud == c) { places.push(Place::Launcher(a.clone())) } }
         if let Ok(Some(a)) = self.aws_connection().await.map(|a| a.filter(|a| a.connected)) { places.push(Place::Aws(a)) }
         if places.is_empty() { return }
         let Some(app) = self.app_of(job) else { return };
@@ -3217,10 +3217,10 @@ impl<'a> ControlPlane<'a> {
             let started: Result<()> = async {
                 match place {
                     Place::Own => self.containers.ok_or("no containers")?.start(&name, &work, 10, size).await.map(|_| ()),
-                    Place::Agent(a) => {
+                    Place::Launcher(a) => {
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": 10, "cpu": 1, "ram_gb": 4, "disk_gb": 8, "location": self.config.cloudflare_location });
                         for (k, v) in work.json().as_object().into_iter().flatten() { body[k] = v.clone() }
-                        self.agent_call(plane_url, &a, "/launch", body).await.map(|_| ())
+                        self.launcher_call(plane_url, &a, "/launch", body).await.map(|_| ())
                     }
                     Place::Aws(a) => {
                         let creds = self.aws_creds(plane_url, &a).await?;
@@ -3804,8 +3804,8 @@ impl<'a> ControlPlane<'a> {
         let stored = crate::secrets::for_run(&kept, &r.repository, crate::secrets::branch_of(&r.reference), &r.path, named.as_ref());
         let missing: Vec<String> = named.iter().flatten().filter(|n| !r.secrets.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)) && !stored.iter().any(|s| &s.name == *n)).cloned().collect();
         // Each one's use, noted for whoever looks after the CI: the run, its workflow and branch, and who started it.
-        let by = match &key { Some(k) => Some(k.name.clone()), None => match self.dashboard_key_name(req) {
-            Some(n) => get_json::<serde_json::Value>(self.store, &format!("dkey:{n}")).await?.and_then(|v| v["computer"].as_str().map(str::to_string)),
+        let by = match &key { Some(k) => Some(k.name.clone()), None => match self.device_key_name(req) {
+            Some(n) => get_json::<serde_json::Value>(self.store, &format!("dkey:{n}")).await?.and_then(|v| v["device"].as_str().map(str::to_string)),
             None => None,
         } };
         for (setting, s) in &self.config.secrets {

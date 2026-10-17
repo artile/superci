@@ -313,7 +313,7 @@ fn each_command_says_what_it_needs_and_what_it_would_do_and_changes_nothing() {
     let home = common::signed_in(&served);
     // (Its settings, without this computer's own keys: a command with a cloud sign-in hands the control plane one
     // of its own the first time it reaches it, as signing in does.)
-    let settings = || served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| !k.starts_with("DASHBOARD_KEY_")).collect::<Vec<_>>();
+    let settings = || served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| !k.starts_with("DEVICE_KEY_")).collect::<Vec<_>>();
     let before = settings();
     // What a command needs and is not given: said, as a usage error (exit 2).
     for (args, said) in [
@@ -583,7 +583,7 @@ fn a_control_plane_is_deployed_to_aws_from_the_dashboard_as_aws_answered_a_real_
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     // Its settings written for it (the key the dashboard reads it with among them).
     let settings = served.aws.settings("deployplane1");
-    assert!(settings.iter().any(|(k, _)| k.starts_with("DASHBOARD_KEY_")), "{:?}", settings.iter().map(|(k, _)| k).collect::<Vec<_>>());
+    assert!(settings.iter().any(|(k, _)| k.starts_with("DEVICE_KEY_")), "{:?}", settings.iter().map(|(k, _)| k).collect::<Vec<_>>());
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -661,7 +661,7 @@ fn another_ci_in_the_same_account_is_listed_apart_and_a_workspace_of_its_own_pic
     served.aws.put("/superci/testplane0002/OWNERS", "github:globex");
     let home = common::signed_in(&served);
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
-    let keys = || served.aws.settings("testplane0002").iter().filter(|(k, _)| k.starts_with("DASHBOARD_KEY_")).count();
+    let keys = || served.aws.settings("testplane0002").iter().filter(|(k, _)| k.starts_with("DEVICE_KEY_")).count();
     let keys_before = keys();
     // Commands are for this workspace's CI, with nothing named; the other one is not this workspace's to name.
     let (code, v) = json(&home, &["planes", "allow", "--dry-run"]);
@@ -742,7 +742,7 @@ fn workspaces_are_listed_made_renamed_and_forgotten_from_the_cli() {
     let (ok, said) = text(&["workspaces", "delete", "acme", "--confirm"]);
     assert!(ok && said.contains("The workspace acme is forgotten on this machine.") && !home.join("workspaces/acme").exists(), "{said}");
     // The one with a control plane: its key leaves the control plane as it is signed out.
-    let keys = || served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| k.starts_with("DASHBOARD_KEY_")).count();
+    let keys = || served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| k.starts_with("DEVICE_KEY_")).count();
     let before = keys();
     let (ok, said) = text(&["workspaces", "delete", "default", "--confirm"]);
     assert!(ok && said.contains("The workspace default is forgotten"), "{said}");
@@ -808,27 +808,27 @@ fn secrets_are_kept_for_runs_from_a_computer_from_stdin_or_a_variable_listed_wit
 }
 
 #[test]
-fn the_computers_that_look_after_a_ci_are_listed_with_their_names_and_one_is_taken_out() {
+fn the_devices_that_look_after_a_ci_are_listed_with_their_names_and_one_is_taken_out() {
     let served = serve(|_| {});
     let home = common::signed_in(&served);
     // Another computer's dashboard, which said what it is called.
     let other = "dashboard-key-of-another-computer-0002";
-    served.aws.put(&format!("/superci/{}/DASHBOARD_KEY_4102444800_OTHER2", superci_testkit::PLANE), other);
-    let hello = ureq::post(&format!("{}/keys/hello", served.url)).header("authorization", &format!("Bearer {other}")).send_json(serde_json::json!({ "computer": "Ada's laptop" })).unwrap();
+    served.aws.put(&format!("/superci/{}/DEVICE_KEY_4102444800_OTHER2", superci_testkit::PLANE), other);
+    let hello = ureq::post(&format!("{}/keys/hello", served.url)).header("authorization", &format!("Bearer {other}")).send_json(serde_json::json!({ "device": "Ada's laptop" })).unwrap();
     assert_eq!(hello.status(), 200);
     // Listed: this one (its own key) and the other, by name.
     let (code, v) = json(&home, &["keys", "list"]);
-    let computers = v["computers"].as_array().unwrap_or_else(|| panic!("{v}"));
-    assert!(code == 0 && computers.iter().any(|c| c["name"] == "DASHBOARD_KEY_4102444800_TEST" && c["this_computer"] == true), "{v}");
-    assert!(computers.iter().any(|c| c["name"] == "DASHBOARD_KEY_4102444800_OTHER2" && c["computer"] == "Ada's laptop" && c["last_used_ms"].is_u64()), "{v}");
+    let devices = v["devices"].as_array().unwrap_or_else(|| panic!("{v}"));
+    assert!(code == 0 && devices.iter().any(|c| c["name"] == "DEVICE_KEY_4102444800_TEST" && c["this_device"] == true), "{v}");
+    assert!(devices.iter().any(|c| c["name"] == "DEVICE_KEY_4102444800_OTHER2" && c["device"] == "Ada's laptop" && c["last_used_ms"].is_u64()), "{v}");
     let o = superci(&home, &["keys", "list"]);
     assert!(String::from_utf8_lossy(&o.stdout).contains("Ada's laptop"), "{}", String::from_utf8_lossy(&o.stdout));
     // This computer's own is not taken out here (logout does that); the other one is.
-    let (code, v) = json(&home, &["keys", "delete", "DASHBOARD_KEY_4102444800_TEST"]);
+    let (code, v) = json(&home, &["keys", "delete", "DEVICE_KEY_4102444800_TEST"]);
     assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("this computer's own key"), "{v}");
-    let (code, v) = json(&home, &["keys", "delete", "DASHBOARD_KEY_4102444800_OTHER2"]);
+    let (code, v) = json(&home, &["keys", "delete", "DEVICE_KEY_4102444800_OTHER2"]);
     assert!(code == 0, "{v}");
-    assert!(!served.aws.settings(superci_testkit::PLANE).iter().any(|(k, _)| k == "DASHBOARD_KEY_4102444800_OTHER2"), "gone from the CI");
+    assert!(!served.aws.settings(superci_testkit::PLANE).iter().any(|(k, _)| k == "DEVICE_KEY_4102444800_OTHER2"), "gone from the CI");
     let gone = ureq::get(&format!("{}/keys", served.url)).header("authorization", &format!("Bearer {other}")).config().http_status_as_error(false).build().call().unwrap();
     assert_ne!(gone.status(), 200, "its key no longer reaches the CI");
     let _ = std::fs::remove_dir_all(&home);

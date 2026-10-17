@@ -1,6 +1,6 @@
 //! A SuperCI control plane on Cloudflare: the Worker forwards every request to one Durable Object, whose storage, alarms and
 //! outbound fetch back the runtime-neutral control plane (superci-core). With Cloudflare runners added, it also starts
-//! the jobs' containers itself: one `JobRunner` Durable Object with a container per job, sized for it (no separate agent).
+//! the jobs' containers itself: one `JobRunner` Durable Object with a container per job, sized for it (no separate launcher).
 use async_trait::async_trait;
 use superci_core::plane::{Cache, Config, ControlPlane};
 use superci_core::io::{self, Clock, Containers, Http, Store, Timer, Work, Ending};
@@ -18,7 +18,7 @@ const VOUCHED: &str = "x-superci-key-until";
 /// Durable Object keeps the ones it started with until it restarts, which can take half a minute after a change).
 /// One from outside is dropped: only the Worker sets it.
 const SETTINGS: &str = "x-superci-settings";
-const SETTING_NAMES: [&str; 15] = ["LABELS", "NAME", "GITHUB_APP", "GITLAB", "AGENTS", "ROUTING", "MACHINE", "CONTAINERS", "AWS_CONNECT", "AWS_REGIONS", "AWS_NETWORKS", "CF_LOCATION", "CF_IMAGE", "MOVE_TOKEN", "INSTANCE_TYPES"];
+const SETTING_NAMES: [&str; 15] = ["LABELS", "NAME", "GITHUB_APP", "GITLAB", "LAUNCHERS", "ROUTING", "MACHINE", "CONTAINERS", "AWS_CONNECT", "AWS_REGIONS", "AWS_NETWORKS", "CF_LOCATION", "CF_IMAGE", "MOVE_TOKEN", "INSTANCE_TYPES"];
 
 /// JSON with every character outside ASCII escaped, so it can travel in a header.
 fn ascii_json(v: &serde_json::Value) -> String {
@@ -51,7 +51,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let bearer = headers.get("authorization")?.and_then(|a| a.strip_prefix("Bearer ").map(str::to_string)).unwrap_or_default();
     if bearer.len() >= 16 {
         let now = js_sys::Date::now() as u64;
-        if let Some((until, _)) = dashboard_keys(&env).into_iter().find(|(until, k)| *until > now && superci_core::crypto::safe_eq(k.as_bytes(), bearer.as_bytes())) {
+        if let Some((until, _)) = device_keys(&env).into_iter().find(|(until, k)| *until > now && superci_core::crypto::safe_eq(k.as_bytes(), bearer.as_bytes())) {
             headers.set(VOUCHED, &until.to_string())?;
         }
     }
@@ -73,11 +73,11 @@ fn more_apps(values: impl Iterator<Item = String>, first: Option<&superci_core::
     apps
 }
 
-/// The dashboard sessions' keys: one secret each, DASHBOARD_KEY_<expires, unix seconds>_<random>.
-fn dashboard_keys(env: &Env) -> Vec<(u64, String)> {
+/// The dashboard sessions' keys: one secret each, DEVICE_KEY_<expires, unix seconds>_<random>.
+fn device_keys(env: &Env) -> Vec<(u64, String)> {
     let names = js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>());
     names.iter().filter_map(|n| n.as_string()).filter_map(|n| {
-        let until: u64 = n.strip_prefix("DASHBOARD_KEY_")?.split('_').next()?.parse().ok()?;
+        let until: u64 = n.strip_prefix("DEVICE_KEY_")?.split('_').next()?.parse().ok()?;
         Some((until * 1000, env.secret(&n).ok()?.to_string()))
     }).collect()
 }
@@ -225,9 +225,9 @@ impl PlaneObject {
         if let Some(v) = secret("LABELS") { c.set_labels(&v) }
         if let Some(v) = secret("NAME") { c.set_name(&v) }
         if let Some(v) = var("INSTANCE_TYPES") { c.instance_types = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
-        c.dashboard_keys = dashboard_keys(&self.env);
+        c.device_keys = device_keys(&self.env);
         c.read_keys = read_keys(&self.env);
-        c.agents = secret("AGENTS").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+        c.launchers = secret("LAUNCHERS").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
         c.routing = secret("ROUTING").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
         c.gitlab = secret("GITLAB").and_then(|v| serde_json::from_str(&v).ok());
         c.machine = secret("MACHINE").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
@@ -268,7 +268,7 @@ impl DurableObject for PlaneObject {
         let mut config = self.config(fresh.as_ref());
         // A key the Worker vouched for (it reads the secrets fresh).
         if let (Some(until), Some(key)) = (req.headers().get(VOUCHED)?.and_then(|u| u.parse::<u64>().ok()), req.headers().get("authorization")?.and_then(|a| a.strip_prefix("Bearer ").map(str::to_string))) {
-            config.dashboard_keys.push((until, key));
+            config.device_keys.push((until, key));
         }
         let (store, timer) = (Ending(DoStore(&self.state)), DoTimer(&self.state));
         let plane = ControlPlane { store: &store, http: &FetchHttp, clock: &WorkerClock, timer: &timer, config: &config, cache: &self.cache, containers: Some(&Runners(&self.env, config.cloudflare_location.clone(), config.cloudflare_image.clone())) };

@@ -69,8 +69,8 @@ impl PlaneView {
     /// Where the first App's GitHub is, when not github.com.
     pub fn app_host(&self) -> Option<String> { self.status.as_ref().and_then(|s| s["app"]["host"].as_str().map(str::to_string)) }
     pub fn app_owner(&self) -> Option<String> { self.status.as_ref().and_then(|s| s["app"]["owner"].as_str().map(str::to_string)) }
-    pub fn agents(&self) -> Vec<superci_core::plane::Agent> {
-        self.status.as_ref().and_then(|s| serde_json::from_value(s["agents"].clone()).ok()).unwrap_or_default()
+    pub fn launchers(&self) -> Vec<superci_core::plane::Launcher> {
+        self.status.as_ref().and_then(|s| serde_json::from_value(s["launchers"].clone()).ok()).unwrap_or_default()
     }
     pub fn routing(&self) -> superci_core::plane::Routing {
         self.status.as_ref().and_then(|s| serde_json::from_value(s["routing"].clone()).ok()).unwrap_or_default()
@@ -102,7 +102,7 @@ impl PlaneView {
     /// The clouds connected for jobs, AWS first.
     pub fn clouds(&self) -> Vec<String> {
         let own = self.status.as_ref().and_then(|s| s["own_cloud"].as_str().map(str::to_string)).unwrap_or_else(|| "cloudflare".into());
-        let mut c: Vec<String> = self.aws.then(|| "aws".to_string()).into_iter().chain(self.own_containers().then_some(own)).chain(self.agents().into_iter().map(|a| a.cloud)).collect();
+        let mut c: Vec<String> = self.aws.then(|| "aws".to_string()).into_iter().chain(self.own_containers().then_some(own)).chain(self.launchers().into_iter().map(|a| a.cloud)).collect();
         c.dedup();
         c
     }

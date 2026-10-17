@@ -1,5 +1,5 @@
 //! Modal from the dashboard. Modal's API is gRPC (modal_proto/api.proto, Apache-2.0); this speaks only the few calls
-//! the dashboard needs: the browser sign-in (what `modal token new` does), and deploying the runner bridge, which runs
+//! the dashboard needs: the browser sign-in (what `modal token new` does), and deploying the launcher, which runs
 //! Modal's own `modal deploy` in a short-lived sandbox. Runner sandboxes themselves are started by the deployed agent
 //! with Modal's official Python SDK. Messages are declared by hand with the protocol's field numbers.
 use std::io::{BufRead, BufReader, Write};
@@ -71,7 +71,7 @@ mod pb {
 }
 
 /// This month at Modal, as Modal bills it: what the workspace was metered and billed (after its plan's credits and
-/// allowances), and how much of the metered cost was SuperCI's own apps (control planes and runner bridges).
+/// allowances), and how much of the metered cost was SuperCI's own apps (control planes and launchers).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Month { pub metered: f64, pub billed: f64, pub superci: f64 }
 
@@ -238,14 +238,14 @@ pub fn wait(p: &Pending, seconds: f32) -> Result<Option<Session>> {
     Ok((!r.timeout).then(|| Session { token_id: r.token_id, token_secret: r.token_secret, workspace: r.workspace_username }))
 }
 
-/// Deploys the runner bridge for one control plane (Modal's `modal deploy`, run in a sandbox in your workspace) and
+/// Deploys the launcher for one control plane (Modal's `modal deploy`, run in a sandbox in your workspace) and
 /// returns its URL. The agent trusts only that control plane (its keys pinned here).
 pub fn deploy_runners(session: &Session, plane_url: &str, plane_id: &str, keys: &serde_json::Value) -> Result<String> {
     let name = format!("superci-runners-{plane_id}");
     let trust = serde_json::json!({ "issuer": plane_url, "subject": format!("plane:{plane_id}"), "keys": keys });
     use base64::Engine;
-    let agent = include_str!("modal_agent.py").replace("__TRUST__", &base64::engine::general_purpose::STANDARD.encode(trust.to_string())).replace("__NAME__", &name);
-    let suffix = modal_deploy(session, &agent, None)?;
+    let launcher = include_str!("modal_launcher.py").replace("__TRUST__", &base64::engine::general_purpose::STANDARD.encode(trust.to_string())).replace("__NAME__", &name);
+    let suffix = modal_deploy(session, &launcher, None)?;
     Ok(format!("https://{}--{name}.{suffix}", session.workspace))
 }
 
@@ -313,14 +313,14 @@ fn pickle_str(s: &str) -> Result<Vec<u8>> {
 
 /// Runs Modal's own `modal deploy` on `script` in a short-lived sandbox in the workspace (with `file`, if any, at
 /// /tmp/superci-plane); returns the workspace's web address suffix.
-/// Deletes a Modal control plane (its app and its two Dicts) and the runner bridge made for a control plane, with
+/// Deletes a Modal control plane (its app and its two Dicts) and the launcher made for a control plane, with
 /// Modal's own client in a sandbox. Safe to repeat.
 pub fn delete_plane(session: &Session, plane_id: &str) -> Result<()> {
     let app = plane_app(plane_id);
     modal_run(session, &format!("modal app stop --yes {app} || true; modal dict delete --yes {app}-state || true; modal dict delete --yes {app}-settings || true; modal app stop --yes superci-runners-{plane_id} || true"), "", None).map(|_| ())
 }
 
-/// Deletes the runner bridge made for a control plane elsewhere.
+/// Deletes the launcher made for a control plane elsewhere.
 pub fn delete_runners(session: &Session, plane_id: &str) -> Result<()> {
     modal_run(session, &format!("modal app stop --yes superci-runners-{plane_id} || true"), "", None).map(|_| ())
 }

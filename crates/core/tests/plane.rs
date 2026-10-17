@@ -11,7 +11,7 @@ use futures::executor::block_on;
 use sha2::{Digest, Sha256};
 use superci_core::crypto::{hex, hmac_sha256};
 use superci_core::github::App;
-use superci_core::plane::{role_arn, Agent, Cache, Config, ControlPlane, Pool, Routing, Rule};
+use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing, Rule};
 use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer};
 
 #[derive(Default)]
@@ -168,7 +168,7 @@ fn aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines() {
     config.app = Some(app());
     config.aws_region = Some("us-east-1".into());
     config.aws_connect_token = Some("connect-token-0001".into());
-    config.dashboard_keys = vec![(1_700_000_000_000, "an-expired-session-key".into()), (1_800_000_000_000, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(1_700_000_000_000, "an-expired-session-key".into()), (1_800_000_000_000, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     let role = role_arn("123456789012", PLANE_ID);
@@ -238,7 +238,7 @@ fn routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_toke
     let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.agents = vec![Agent { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.launchers = vec![Launcher { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
     config.routing = Routing { default: Some("cloudflare".into()), rules: vec![Rule { repo: "acme/heavy".into(), cloud: "modal".into() }], order: vec![], ..Default::default() };
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
@@ -372,10 +372,10 @@ fn moving_hands_everything_to_the_new_control_plane_once_and_the_old_one_says_wh
     let (old_store, new_store, clouds, wakes, cache, cache2) = (Mem::default(), Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), Cache::default());
     let mut old_config = Config::new(PLANE_ID.into());
     old_config.app = Some(app());
-    old_config.dashboard_keys = vec![(u64::MAX, key.into())];
+    old_config.device_keys = vec![(u64::MAX, key.into())];
     old_config.move_token = Some("move-token-out-0123456789".into());
     let mut new_config = Config::new("newplane0001".into());
-    new_config.dashboard_keys = vec![(u64::MAX, key.into())];
+    new_config.device_keys = vec![(u64::MAX, key.into())];
     new_config.move_token = Some("move-token-in-0123456789".into());
     let old = ControlPlane { store: &old_store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &old_config, cache: &cache, containers: None };
     const NEW_URL: &str = "https://superci.other-account.workers.dev";
@@ -691,7 +691,7 @@ fn an_app_renamed_on_github_is_known_by_its_new_address() {
     let (store, clouds, wakes, cache) = (Mem::default(), Renamed { clouds: FakeClouds::default() }, Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     assert_eq!(app().slug, "superci-acme-abc123");
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let status = json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
@@ -766,7 +766,7 @@ fn a_machine_refused_by_the_accounts_own_budget_is_said_as_that_and_is_no_missin
         let mut config = Config::new(PLANE_ID.into());
         config.app = Some(app());
         (config.aws_own, config.aws_own_creds) = own_aws();
-        config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+        config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
         config.routing.aws_budget = Some(superci_core::plane::AwsBudget { stop: true });
         let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
         let status = || json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
@@ -878,7 +878,7 @@ fn a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price() {
     let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.agents = vec![Agent { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
     config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "modal".into(), max_jobs: None, monthly_usd: None }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=any")));
@@ -1038,7 +1038,7 @@ fn limits_make_jobs_wait_or_move_down_the_order() {
     store.0.borrow_mut().insert("job:60".into(), serde_json::json!({ "job_id": 60, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": 1_789_900_000_000u64, "launched_ms": 1_789_900_000_000u64, "ended_ms": 1_789_903_600_000u64,
         "installation_id": 42, "cloud": "aws", "usd_per_hour": 50.0, "seen_in_progress": true }).to_string());
     config.routing.account_daily_usd.insert("aws".into(), 4.0);
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(job_event("queued", 61, "acme/app", None)));
     assert_eq!(job(&store, 61)["state"], "launched", "{}", job(&store, 61));
@@ -1247,7 +1247,7 @@ fn measured_costs_from_the_dashboard_settle_finished_cloudflare_jobs_only() {
     let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.dashboard_keys = vec![(1_800_000_000_000, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(1_800_000_000_000, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let put = |id: u64, cloud: &str, state: &str| store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "at_ms": 1_789_999_000_000u64,
         "ended_ms": 1_789_999_300_000u64, "launched_ms": 1_789_999_000_000u64, "installation_id": 42, "cloud": cloud, "seen_in_progress": true, "usd_per_hour": 0.4 }).to_string());
@@ -1272,7 +1272,7 @@ fn jobs_nothing_here_can_run_fail_at_once() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.containers = true;
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-0123".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-0123".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let run = |r: Request| block_on(plane.handle(r));
     let fails = || own.0.borrow().iter().filter(|c| c.contains(" fail ")).cloned().collect::<Vec<_>>();
@@ -1300,7 +1300,7 @@ fn removed_aws_runners_take_no_jobs() {
     let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": "arn:aws:iam::123456789012:role/r", "connected": true }).to_string());
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let forget = |key: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/aws/forget")).with_header("authorization", &format!("Bearer {key}")).with_body("{}")));
@@ -1467,7 +1467,7 @@ fn cloudflare_runners_get_githubs_full_image_by_its_address_when_set() {
     let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.agents = vec![Agent { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.launchers = vec![Launcher { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
     config.cloudflare_image = image_address("https://images.example.com/ubuntu-24.04");
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(webhook("queued", None)));
@@ -1773,7 +1773,7 @@ fn a_github_enterprise_server_is_asked_at_its_own_address() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(App { id: 7, owner: "corp".into(), slug: "superci-corp".into(), host: Some("ghe.corp.example".into()), ..app() });
     config.containers = true;
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
     let event = |job: u64, action: &str, runner: Option<&str>| {
         let payload = serde_json::json!({ "action": action, "workflow_job": { "id": job, "run_id": 3, "labels": ["superci"], "runner_name": runner }, "repository": { "full_name": "corp/api", "private": true }, "installation": { "id": 77 } }).to_string();
@@ -1886,7 +1886,7 @@ fn several_gitlabs_are_kept_apart_each_with_its_own_token_and_secret() {
     let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
     let mut config = Config::new(PLANE_ID.into());
     config.containers = true;
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
     config.more_gitlabs = vec![superci_core::gitlab::GitLab { url: "https://gitlab.corp.example".into(), token: "glpat-corp".into(), hook_secret: "hook-secret-corp-0123456789".into(), id: "corp".into() }];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
@@ -2012,14 +2012,14 @@ fn with_on_demand_turned_off_and_nothing_else_in_the_order_the_job_waits_for_a_s
 
 #[test]
 fn a_provider_that_cannot_start_the_machine_sends_the_job_to_the_next_in_the_order() {
-    // Cloudflare's runner bridge fails every launch (a hiccup of its own). The order: Cloudflare, then AWS.
+    // Cloudflare's launcher fails every launch (a hiccup of its own). The order: Cloudflare, then AWS.
     let down = std::cell::Cell::new(true);
     let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (down.get() && r.url == "https://runners.acme.workers.dev/launch").then(|| Response::new(503, "text/plain", "containers temporarily unavailable")));
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.agents = vec![Agent { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.launchers = vec![Launcher { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
     config.routing.order = ["cloudflare", "aws", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
@@ -2042,7 +2042,7 @@ fn a_provider_that_cannot_start_the_machine_sends_the_job_to_the_next_in_the_ord
     let j = job(&store, 7);
     let e = j["error"].as_str().unwrap().to_string();
     assert_eq!((j["state"].as_str(), j["retries"].as_u64()), (Some("waiting"), Some(1)), "{j}");
-    assert!(e.contains("no provider could start its machine: Cloudflare: cloudflare runner bridge: 503 containers temporarily unavailable; AWS: UnauthorizedOperation") && !e.contains("AWS on-demand"), "said once for AWS: {e}");
+    assert!(e.contains("no provider could start its machine: Cloudflare: cloudflare launcher: 503 containers temporarily unavailable; AWS: UnauthorizedOperation") && !e.contains("AWS on-demand"), "said once for AWS: {e}");
     assert_eq!(j["failed_at"], serde_json::json!(["cloudflare", "aws", "aws-on-demand"]));
     block_on(plane.alarm()).unwrap();
     block_on(plane.alarm()).unwrap();
@@ -2057,7 +2057,7 @@ fn a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fa
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.agents = vec![Agent { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://runners.acme.workers.dev".into() }];
     config.routing.order = ["modal", "aws", "aws-on-demand"].iter().map(|c| Pool { regions: vec![], off: false, cloud: c.to_string(), max_jobs: None, monthly_usd: None }).collect();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/gpu=any")));
@@ -2075,7 +2075,7 @@ fn a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fa
     let j = job(&store, 7);
     let e = j["error"].as_str().unwrap().to_string();
     assert_eq!((j["state"].as_str(), j["retries"].as_u64().unwrap_or(0)), (Some("failed"), 0), "{j}");
-    assert!(e.starts_with("no provider could start its machine: Modal: modal runner bridge: 400 GPUs need a payment method; AWS: AWS lets this account run no GPU machines yet"), "{e}");
+    assert!(e.starts_with("no provider could start its machine: Modal: modal launcher: 400 GPUs need a payment method; AWS: AWS lets this account run no GPU machines yet"), "{e}");
 }
 
 #[test]
@@ -2130,12 +2130,12 @@ fn a_key_that_only_reads_sees_the_status_and_a_jobs_log_and_changes_nothing() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
-    config.dashboard_keys = vec![(1_800_000_000_000, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(1_800_000_000_000, "dashboard-session-key-1".into())];
     // As the runtimes read them from where they are stored: a name that says when it ends, the key's SHA-256.
     config.read_keys = [("READ_KEY_1800000000_AGENT", hash("superci_read_the-agents-key")), ("READ_KEY_1700000000_OLD", hash("superci_read_one-that-ended"))].iter()
         .filter_map(|(n, v)| superci_core::plane::read_key(n, v)).collect();
     assert_eq!(config.read_keys.len(), 2);
-    assert!(superci_core::plane::read_key("READ_KEY_1800000000_AGENT", "").is_none() && superci_core::plane::read_key("READ_KEY_soon_AGENT", &hash("x")).is_none() && superci_core::plane::read_key("DASHBOARD_KEY_1800000000_AB", &hash("x")).is_none());
+    assert!(superci_core::plane::read_key("READ_KEY_1800000000_AGENT", "").is_none() && superci_core::plane::read_key("READ_KEY_soon_AGENT", &hash("x")).is_none() && superci_core::plane::read_key("DEVICE_KEY_1800000000_AB", &hash("x")).is_none());
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     for (id, state) in [(1u64, "failed"), (2, "running")] {
         store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "at_ms": 1_789_999_000_000u64, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
@@ -2252,7 +2252,7 @@ fn a_control_plane_answers_to_the_labels_set_for_it_the_new_one_and_the_ones_bef
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.set_labels(r#"["acmeci","superci"]"#);
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     assert_eq!(json(&run(get("/health")))["label"], "acmeci");
@@ -2280,7 +2280,7 @@ fn a_control_plane_is_called_what_it_is_named_where_people_read_it() {
     // The status says it; a job nothing can run says so under that name; the App for an organization starts with it.
     let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
     config.app = Some(app());
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     assert_eq!(json(&run(get("/status").with_header("authorization", "Bearer dashboard-session-key-1")))["name"], "AcmeCI");
@@ -2655,7 +2655,7 @@ fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself()
     let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     (config.aws_own, config.aws_own_creds) = own_aws();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
@@ -3530,7 +3530,7 @@ fn a_run_from_a_computer_gets_its_machine_and_its_runner_takes_the_job_from_the_
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
@@ -3594,7 +3594,7 @@ fn a_key_for_coding_agents_starts_runs_within_the_control_planes_own_limits() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     config.read_keys = vec![superci_core::plane::read_key("READ_KEY_4102444800_AGENT", &format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes()))).unwrap(),
         superci_core::plane::read_key("READ_KEY_4102444800_LOOKER", &superci_core::crypto::sha256_hex(b"superci_read_0123456789abcdef0123456789abcdef")).unwrap()];
     config.routing.max_cpu = Some(64);
@@ -3658,7 +3658,7 @@ fn the_secrets_a_ci_keeps_go_to_the_runs_from_a_computer_that_name_them_the_narr
         (superci_core::secrets::setting(name, &s.scope), serde_json::to_string(&s).unwrap())
     };
     config.read_settings(&[
-        ("DASHBOARD_KEY_4102444800_abc".into(), "dashboard-session-key-1".into()),
+        ("DEVICE_KEY_4102444800_abc".into(), "dashboard-session-key-1".into()),
         kept("TOKEN", "token-all-0001", serde_json::json!({})),
         kept("TOKEN", "token-app-0002", serde_json::json!({ "repo": "Acme/App" })),
         kept("TOKEN", "token-prod-0003", serde_json::json!({ "environment": "production" })),
@@ -3670,7 +3670,7 @@ fn the_secrets_a_ci_keeps_go_to_the_runs_from_a_computer_that_name_them_the_narr
         ("MOVE_TOKEN".into(), "move-token-0123456789".into()),
     ]);
     assert_eq!(config.secrets.len(), 7);
-    block_on(store.put("dkey:DASHBOARD_KEY_4102444800_abc", serde_json::json!({ "computer": "Build Mac" }).to_string())).unwrap();
+    block_on(store.put("dkey:DEVICE_KEY_4102444800_abc", serde_json::json!({ "device": "Build Mac" }).to_string())).unwrap();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let workflow = "jobs:\n  test:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.token }} ${{ secrets.NPM_TOKEN }} ${{ secrets.MISSING }} ${{ secrets.OTHER }}\n  deploy:\n    runs-on: superci\n    environment:\n      name: ${{ 'production' }}\n    steps:\n      - run: echo ${{ secrets.TOKEN }}\n";
     let made = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1")
@@ -3724,7 +3724,7 @@ fn a_run_from_a_computer_of_several_jobs_starts_each_once_what_it_needs_has_ende
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
@@ -3806,7 +3806,7 @@ fn a_machine_keeps_githubs_cache_in_its_regions_bucket_as_its_jobs_token_allows(
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     run(webhook("queued", None));
@@ -4354,7 +4354,7 @@ fn a_working_tree_goes_to_the_control_planes_bucket_in_one_and_its_checkout_is_s
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r.with_header("authorization", "Bearer dashboard-session-key-1")));
     // A link to put the whole tree in the bucket: nothing of it goes through the store.
@@ -4447,7 +4447,7 @@ fn jobs_kept_before_their_indexes_are_indexed_once_and_each_job_is_counted_in_it
     let clock = MovingClock(std::cell::Cell::new(t));
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    config.dashboard_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let seed = |id: u64, state: &str, at: u64, took_s: Option<u64>, usd: Option<f64>| serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "label": "superci", "app_id": 99, "state": state, "at_ms": at, "installation_id": 42,
         "cloud": "aws", "usd_per_hour": 1.0, "seen_in_progress": true, "began": true, "launched_ms": at, "started_ms": at + 10_000, "runner": format!("superci-{PLANE_ID}-{id}"),
         "ended_ms": took_s.map(|s| at + 10_000 + s * 1000), "cost_usd": usd });

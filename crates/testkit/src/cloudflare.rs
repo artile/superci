@@ -23,7 +23,7 @@ pub fn serve_cloudflare() -> Option<CloudflarePlane> {
     let read = format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes()));
     let child = Command::new(wrangler).current_dir(&worker)
         .args(["dev", "--local", "--ip", "127.0.0.1", "--port", &port.to_string(), "--show-interactive-dev-session=false", "--persist-to", &dir.display().to_string(),
-            "--var", &format!("PLANE_ID:{plane}"), "--var", &format!("DASHBOARD_KEY_4102444800_TEST:{key}"), "--var", &format!("READ_KEY_4102444800_AGENT:{read}")])
+            "--var", &format!("PLANE_ID:{plane}"), "--var", &format!("DEVICE_KEY_4102444800_TEST:{key}"), "--var", &format!("READ_KEY_4102444800_AGENT:{read}")])
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).process_group(0).spawn().ok()?;
     let p = CloudflarePlane { url: format!("http://127.0.0.1:{port}"), plane, key, run_key, child, dir };
     // Up once it answers (its first answer builds the Worker in the runtime: a few seconds).

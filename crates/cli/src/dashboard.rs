@@ -262,6 +262,15 @@ impl Writer {
         }
     }
 
+    /// The names of a control plane's settings, where its cloud lists them (Modal's Dict is not listed: none).
+    fn names(&self, plane: &Plane) -> Vec<String> {
+        match plane {
+            Plane::Cloudflare { account_id, script, .. } => self.cf.as_ref().and_then(|c| c.secret_names(account_id, script).ok()).unwrap_or_default(),
+            Plane::Aws { region, plane_id, .. } => self.aws.as_ref().and_then(|c| aws_plane::secret_names(c, region, plane_id).ok()).unwrap_or_default(),
+            _ => vec![],
+        }
+    }
+
     /// Removes a setting (Modal's is emptied: its settings are entries of one Dict).
     fn drop(&self, plane: &Plane, name: &str) -> Result<()> {
         self.own.check(plane)?;
@@ -493,8 +502,29 @@ fn day(unix: u64) -> String {
     format!("{:04}-{m:02}-{d:02}", yoe + era * 400 + if m <= 2 { 1 } else { 0 })
 }
 
-/// When a key ends, from the name it is stored under in a control plane (`DASHBOARD_KEY_<unix seconds>_<random>`).
-fn key_until(name: &str) -> u64 { name.strip_prefix("DASHBOARD_KEY_").and_then(|r| r.split('_').next()?.parse().ok()).unwrap_or(0) }
+/// When a key ends, from the name it is stored under in a control plane (`DEVICE_KEY_<unix seconds>_<random>`).
+fn key_until(name: &str) -> u64 { name.strip_prefix("DEVICE_KEY_").and_then(|r| r.split('_').next()?.parse().ok()).unwrap_or(0) }
+
+/// The version from which control planes read their devices' keys as DEVICE_KEY_… and their launchers as LAUNCHERS.
+/// One from before reads DASHBOARD_KEY_… and AGENTS: this device's key is handed to it under the old name too, until
+/// its update moves them (see `renames`).
+const NAMES_SINCE: &str = "0.19.13";
+
+/// Whether the control plane at this address is from before `NAMES_SINCE`.
+fn before_names(url: &str) -> bool { cloudflare::health(url).and_then(|h| h["version"].as_str().map(str::to_string)).is_some_and(|v| view::older(Some(&v), NAMES_SINCE)) }
+
+/// This device's key under the name a control plane from before `NAMES_SINCE` reads.
+fn old_key_name(name: &str) -> String { name.replacen("DEVICE_KEY_", "DASHBOARD_KEY_", 1) }
+
+/// What updating a control plane from before `NAMES_SINCE` moves, from what it says (its status) and the names of its
+/// settings: its launchers, written as LAUNCHERS before the new version is deployed (so that it never runs without
+/// them); and, once that runs, AGENTS and every DASHBOARD_KEY_… taken out (each device's dashboard hands its key
+/// anew as DEVICE_KEY_…).
+fn renames(status: &serde_json::Value, names: &[String]) -> (Vec<(String, String)>, Vec<String>) {
+    let puts = status["agents"].as_array().filter(|a| !a.is_empty()).map(|a| vec![("LAUNCHERS".to_string(), serde_json::Value::Array(a.clone()).to_string())]).unwrap_or_default();
+    let drops = names.iter().filter(|n| *n == "AGENTS" || n.starts_with("DASHBOARD_KEY_")).cloned().collect();
+    (puts, drops)
+}
 
 fn ago(at_ms: u64) -> String {
     let s = now_ms().saturating_sub(at_ms) / 1000;
@@ -1025,7 +1055,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -1049,7 +1079,7 @@ impl Dashboard {
             // (One from before each control plane had a key of its own goes on working until it can be replaced
             // everywhere: see `renew_folder_key`.)
             Some(k) => { d.status_key = k.value; d.status_secret = k.name; d.keyed = k.planes.into_iter().collect() }
-            None => d.status_secret = format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()),
+            None => d.status_secret = format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()),
         }
         // The control plane in use is listed at once: its pages are read with the kept key, whether or not its
         // cloud's sign-in still stands (AWS ends one after twelve hours).
@@ -1361,8 +1391,8 @@ impl Dashboard {
     pub fn status_key_value(&self) -> String { self.status_key.clone() }
 
     /// Another computer's key taken out of the CI in use (its dashboard stops reaching it); never this one's own.
-    pub fn drop_computer_key(&mut self, name: &str) -> Result<()> {
-        if !name.starts_with("DASHBOARD_KEY_") || !name[14..].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { return Err("That is not a computer's key (names are in `superci keys list`).".into()) }
+    pub fn drop_device_key(&mut self, name: &str) -> Result<()> {
+        if !name.starts_with("DEVICE_KEY_") || !name[11..].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { return Err("That is not a device key (names are in `superci keys list`).".into()) }
         if name == self.status_secret { return Err("That is this computer's own key: `superci logout` takes it out.".into()) }
         let plane = self.plane()?;
         self.drop_secret(&plane, name)
@@ -1447,6 +1477,7 @@ impl Dashboard {
             have.retain(|p| self.keyed.contains(p.plane_id()));
             let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
             for p in have {
+                if before_names(p.url()) { let _ = writer.drop(&p, &old_key_name(&self.status_secret)); }
                 match writer.drop(&p, &self.status_secret) {
                     Ok(()) => said.push(format!("The control plane ({}) no longer takes this machine's key.", p.place())),
                     Err(_) => said.push(format!("The control plane ({}) still has this machine's key; it ends by itself by {}.", p.place(), day(key_until(&self.status_secret)))),
@@ -1475,7 +1506,7 @@ impl Dashboard {
         self.cf_accounts.clear();
         self.keyed.clear();
         self.status_key = folder_key();
-        self.status_secret = format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase());
+        self.status_secret = format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase());
         self.kept_as = serde_json::to_string(&self.kept()).unwrap_or_default();
         Ok(said)
     }
@@ -1516,7 +1547,7 @@ impl Dashboard {
         if about.picture_of != self.picture_owner { (about.picture, about.picture_of) = (String::new(), String::new()) }
         // Which computer this session's key is on, said once a session (for the CI's Keys).
         if self.hello_sent.insert(v.plane.plane_id().to_string()) {
-            let _ = cloudflare::plane_post(v.plane.url(), &self.status_key, "/keys/hello", &serde_json::json!({ "computer": computer_name() }));
+            let _ = cloudflare::plane_post(v.plane.url(), &self.status_key, "/keys/hello", &serde_json::json!({ "device": computer_name() }));
         }
         // Whose jobs it runs, kept in it where its account's sign-in reads it (before anything of this computer's
         // is in it: what a workspace picking among an account's CIs shows), once it changes.
@@ -2257,11 +2288,12 @@ impl Dashboard {
             if self.keyed.is_empty() { self.status_key = folder_key() }
             return;
         }
-        let (new, name) = (folder_key(), format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()));
+        let (new, name) = (folder_key(), format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 30 * 86_400, superci_core::crypto::random_id(6).to_uppercase()));
         let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
-        if !planes.iter().all(|p| writer.put(p, &name, &cloudflare::plane_key(&new, p.url())).is_ok()) { return }
+        let before: Vec<bool> = planes.iter().map(|p| before_names(p.url())).collect();
+        if !planes.iter().zip(&before).all(|(p, b)| writer.put(p, &name, &cloudflare::plane_key(&new, p.url())).is_ok() && (!b || writer.put(p, &old_key_name(&name), &cloudflare::plane_key(&new, p.url())).is_ok())) { return }
         let old = std::mem::replace(&mut self.status_secret, name);
-        for p in &planes { let _ = writer.drop(p, &old); }
+        for (p, b) in planes.iter().zip(&before) { let _ = writer.drop(p, &old); if *b { let _ = writer.drop(p, &old_key_name(&old)); } }
         self.status_key = new;
         self.keyed = planes.iter().map(|p| p.plane_id().to_string()).collect();
     }
@@ -2276,13 +2308,18 @@ impl Dashboard {
         let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
         let (name, key) = (self.status_secret.clone(), self.status_key.clone());
         let done: Vec<String> = std::thread::scope(|s| {
-            let hs: Vec<_> = unkeyed.iter().map(|p| { let (writer, name, key) = (&writer, &name, &key); s.spawn(move || timed(&format!("{}: hand it this session's key", p.place()), || writer.put(p, name, &cloudflare::plane_key(key, p.url()))).ok().map(|_| p.plane_id().to_string())) }).collect();
+            let hs: Vec<_> = unkeyed.iter().map(|p| { let (writer, name, key) = (&writer, &name, &key); s.spawn(move || timed(&format!("{}: hand it this session's key", p.place()), || {
+                writer.put(p, name, &cloudflare::plane_key(key, p.url()))?;
+                // (One not updated yet reads it under the old name.)
+                if before_names(p.url()) { writer.put(p, &old_key_name(name), &cloudflare::plane_key(key, p.url()))? }
+                Ok::<(), String>(())
+            }).ok().map(|_| p.plane_id().to_string())) }).collect();
             hs.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
         });
         self.keyed.extend(done);
         let mut tidy: Vec<Box<dyn FnOnce() + Send>> = vec![];
         for p in &unkeyed {
-            let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DASHBOARD_KEY_").and_then(|r| r.split('_').next()?.parse::<u64>().ok()).is_some_and(|until| until < now)) };
+            let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DEVICE_KEY_").and_then(|r| r.split('_').next()?.parse::<u64>().ok()).is_some_and(|until| until < now)) };
             match p.clone() {
                 Plane::Cloudflare { account_id, script, .. } => if let Ok(cf) = self.cloudflare() {
                     tidy.push(Box::new(move || for old in expired(cf.secret_names(&account_id, &script).unwrap_or_default()) { let _ = cf.delete_secret(&account_id, &script, &old); }));
@@ -2521,9 +2558,9 @@ impl Dashboard {
                 } else if own_containers {
                     self.put_secret(&plane, "CONTAINERS", "off")?;
                 } else {
-                    let mut agents: Vec<superci_core::plane::Agent> = serde_json::from_value(status["agents"].clone()).unwrap_or_default();
-                    agents.retain(|a| a.cloud != cloud);
-                    self.put_secret(&plane, "AGENTS", &serde_json::to_string(&agents).map_err(|e| e.to_string())?)?;
+                    let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
+                    launchers.retain(|a| a.cloud != cloud);
+                    self.put_secret(&plane, "LAUNCHERS", &serde_json::to_string(&launchers).map_err(|e| e.to_string())?)?;
                 }
                 let c = cloud.clone();
                 let forgotten = wait_for(plane.url(), &self.status_key, move |s| !provider_connected(s, &c));
@@ -2553,8 +2590,8 @@ impl Dashboard {
                     (_, _) if own_containers => {}
                     ("modal", false) => if let Some(m) = &self.modal { if let Err(e) = modal::delete_runners(m, &id) { left.push(format!("its Modal app superci-runners-{id} ({e})")) } },
                     ("modal", true) => left.push(format!("the Modal app superci-runners-{id} in your workspace")),
-                    (_, false) => { let cf = cf.as_ref().ok_or("Sign in with Cloudflare first")?; for (a, _) in self.cf_accounts.clone() { if let Err(e) = cf.delete_runners(&a, &id) { left.push(format!("its Cloudflare runner bridge ({e})")) } } }
-                    (_, true) => left.push(format!("the Cloudflare runner bridge superci-runners-{id}")),
+                    (_, false) => { let cf = cf.as_ref().ok_or("Sign in with Cloudflare first")?; for (a, _) in self.cf_accounts.clone() { if let Err(e) = cf.delete_runners(&a, &id) { left.push(format!("its Cloudflare launcher ({e})")) } } }
+                    (_, true) => left.push(format!("the Cloudflare launcher superci-runners-{id}")),
                 }
                 self.views = None;
                 self.flash = Some(format!("Removed {name}.{}", if left.is_empty() { String::new() } else { format!(" Left: {}.", left.join("; ")) }));
@@ -2938,8 +2975,12 @@ impl Dashboard {
                     return Ok(message(409, &format!("{running} job{} running on Cloudflare", if running == 1 { " is" } else { "s are" }), "Update when they finish: the update gives Cloudflare's containers a new setup, which would stop them."))
                 }
                 if lock(&self.updating).as_ref().is_some_and(|u| u.result.is_none()) { return Ok(Response::redirect(&format!("/{}", safe_return(&field("next"))))) }
+                // One from before `NAMES_SINCE` says its launchers as `agents`, and keeps them and its devices' keys under
+                // the old names: the update moves them (see `renames`).
+                let before = before_names(plane.url());
+                let launchers = if before { status["agents"].clone() } else { status["launchers"].clone() };
                 // In the background, its steps shown where its Update button was (the sidebar, the Control plane page).
-                let cf = if matches!(plane, Plane::Cloudflare { .. }) || status["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")) { self.cloudflare().ok() } else { None };
+                let cf = if matches!(plane, Plane::Cloudflare { .. }) || launchers.as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")) { self.cloudflare().ok() } else { None };
                 let creds = if matches!(plane, Plane::Aws { .. }) { Some(self.aws_creds()?) } else { None };
                 let session = if matches!(plane, Plane::Modal { .. }) { Some(self.modal.clone().ok_or("Sign in with Modal first.")?) } else { None };
                 let cf_account = self.cf_accounts.first().map(|a| a.0.clone());
@@ -2947,10 +2988,10 @@ impl Dashboard {
                     Plane::Seen { .. } => return Ok(message(400, "Sign in where this control plane runs to update it", "")) };
                 let state = self.updating.clone();
                 let containers = status["containers"] == true;
-                let cf_agent = status["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare"));
-                // Its runner bridge in Cloudflare is updated with it, when Cloudflare is signed in to: a sign-in
+                let cf_launcher = launchers.as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare"));
+                // Its launcher in Cloudflare is updated with it, when Cloudflare is signed in to: a sign-in
                 // that is over stops nothing else, and is said with the result.
-                let note = if cf_agent && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare runner bridge was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
+                let note = if cf_launcher && !matches!(plane, Plane::Cloudflare { .. }) && cf.is_none() { format!("Its Cloudflare launcher was not updated: {}", if self.cf_ended { "the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more." } else { "Cloudflare is not signed in to here. Sign in (`superci login cloudflare`) and update once more." }) } else { String::new() };
                 *lock(&state) = Some(Update { plane: plane.plane_id().to_string(), steps, at: 0, result: None, ended_ms: 0, note });
                 // Signed in to the AWS account its machines run in: the update also gives its runner role what this
                 // version asks for (an AWS control plane's own update does that already).
@@ -2963,17 +3004,24 @@ impl Dashboard {
                 // An AWS control plane whose AWS runners were removed keeps them off.
                 let aws_runners = !status["aws"].is_null();
                 let (aws_missing, key) = (self.aws_missing.clone(), self.status_key.clone());
+                let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+                let (puts, drops) = if before {
+                    // (Modal's settings are not listed: its old names are taken out by name.)
+                    let names = if matches!(plane, Plane::Modal { .. }) { vec!["AGENTS".to_string(), old_key_name(&self.status_secret)] } else { writer.names(&plane) };
+                    renames(&status, &names)
+                } else { (vec![], vec![]) };
                 std::thread::spawn(move || {
                     let step = |n: usize| if let Some(u) = lock(&state).as_mut() { u.at = n };
                     let result = (|| -> Result<()> {
+                        for (name, value) in &puts { writer.put(&plane, name, value)? }
                         let url = match &plane {
                             Plane::Cloudflare { account_id, script, label, .. } => cf.as_ref().ok_or("Sign in with Cloudflare first.")?.deploy_with(account_id, script, label, containers, &step)?.url,
                             Plane::Aws { account_id, region, plane_id, label, .. } => aws_plane::deploy_with(creds.as_ref().ok_or("Sign in with AWS first.")?, account_id, region, plane_id, label, aws_runners, &step)?.url,
                             Plane::Modal { plane_id, label, .. } => modal::deploy_plane(session.as_ref().ok_or("Sign in with Modal first.")?, plane_id, label, &step)?,
                             Plane::Seen { .. } => return Err("Sign in where this control plane runs to update it".into()),
                         };
-                        // A separate Cloudflare runner bridge (for a control plane elsewhere) is updated with it.
-                        if let (true, Some(cf), Some(account)) = (cf_agent && !matches!(plane, Plane::Cloudflare { .. }), &cf, &cf_account) { cf.deploy_runners(account, plane.url(), plane.plane_id())?; }
+                        // A separate Cloudflare launcher (for a control plane elsewhere) is updated with it.
+                        if let (true, Some(cf), Some(account)) = (cf_launcher && !matches!(plane, Plane::Cloudflare { .. }), &cf, &cf_account) { cf.deploy_runners(account, plane.url(), plane.plane_id())?; }
                         // An AWS control plane's machines get their own network in each of its regions too.
                         if let (Plane::Aws { .. }, Some(creds), true) = (&plane, &creds, aws_runners) { aws::make_networks(creds, plane.plane_id(), &regions)?; }
                         if let Some((creds, account)) = &aws_give {
@@ -2984,6 +3032,8 @@ impl Dashboard {
                         // The old version keeps answering for a few seconds after a deploy: wait for this one.
                         step(steps.len() - 1);
                         wait_for_version(&url, DASHBOARD_VERSION);
+                        // The old names, once the new version runs (it reads only the new ones).
+                        for name in &drops { let _ = writer.drop(&plane, name); }
                         Ok(())
                     })();
                     if result.is_ok() { lock(side()).clear() }
@@ -3109,18 +3159,18 @@ impl Dashboard {
             ("POST", "/runners/modal") => {
                 let plane = self.plane()?;
                 let session = self.modal.clone().ok_or("Sign in with Modal first.")?;
-                let Some(mut agents) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Vec<superci_core::plane::Agent>>(s["agents"].clone()).ok()) else {
+                let Some(mut launchers) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Vec<superci_core::plane::Launcher>>(s["launchers"].clone()).ok()) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
                 let keys: serde_json::Value = ureq::get(&crate::aws::stand_in(&format!("{}/.well-known/jwks.json", plane.url()))).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
-                eprintln!("Deploying the Modal runner bridge (the first time builds a small image in your workspace)…");
+                eprintln!("Deploying the Modal launcher (the first time builds a small image in your workspace)…");
                 let url = modal::deploy_runners(&session, plane.url(), plane.plane_id(), &keys)?;
                 // Its first answer can take a few seconds (a cold start).
                 for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(std::time::Duration::from_secs(3)) }
-                agents.retain(|a| a.cloud != "modal");
-                agents.push(superci_core::plane::Agent { cloud: "modal".into(), url });
-                self.put_secret(&plane, "AGENTS", &serde_json::to_string(&agents).map_err(|e| e.to_string())?)?;
-                wait_for(plane.url(), &self.status_key, |s| s["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "modal")));
+                launchers.retain(|a| a.cloud != "modal");
+                launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
+                self.put_secret(&plane, "LAUNCHERS", &serde_json::to_string(&launchers).map_err(|e| e.to_string())?)?;
+                wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "modal")));
                 Ok(Response::redirect("/?p=runners"))
             }
             ("POST", "/runners/cloudflare") => {
@@ -3135,18 +3185,18 @@ impl Dashboard {
                     Plane::Cloudflare { account_id, script, label, .. } => {
                         cf.deploy(account_id, script, label, true)?;
                         self.put_secret(&plane, "CONTAINERS", "on")?;
-                        // A separate Cloudflare agent from before is no longer needed.
-                        let mut agents: Vec<superci_core::plane::Agent> = serde_json::from_value(status["agents"].clone()).unwrap_or_default();
-                        if agents.iter().any(|a| a.cloud == "cloudflare") {
-                            agents.retain(|a| a.cloud != "cloudflare");
-                            self.put_secret(&plane, "AGENTS", &serde_json::to_string(&agents).map_err(|e| e.to_string())?)?;
+                        // A separate Cloudflare launcher from before is no longer needed.
+                        let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
+                        if launchers.iter().any(|a| a.cloud == "cloudflare") {
+                            launchers.retain(|a| a.cloud != "cloudflare");
+                            self.put_secret(&plane, "LAUNCHERS", &serde_json::to_string(&launchers).map_err(|e| e.to_string())?)?;
                             let _ = cf.delete_runners(account_id, plane.plane_id());
                         }
-                        wait_for(plane.url(), &self.status_key, |s| s["containers"] == true && !s["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
+                        wait_for(plane.url(), &self.status_key, |s| s["containers"] == true && !s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
                     }
-                    // A control plane elsewhere cannot start Cloudflare containers: a small runner bridge in Cloudflare does.
+                    // A control plane elsewhere cannot start Cloudflare containers: a small launcher in Cloudflare does.
                     _ => {
-                        let mut agents: Vec<superci_core::plane::Agent> = serde_json::from_value(status["agents"].clone()).unwrap_or_default();
+                        let mut launchers: Vec<superci_core::plane::Launcher> = serde_json::from_value(status["launchers"].clone()).unwrap_or_default();
                         // Which Cloudflare account its runners go into: the only one the sign-in reaches, or the one
                         // named. Never just the first of several (it may be another company's).
                         let account = match (self.cf_accounts.as_slice(), field("account")) {
@@ -3157,10 +3207,10 @@ impl Dashboard {
                                 all.len(), esc(&all.iter().map(|a| format!("{} ({})", a.1, a.0)).collect::<Vec<_>>().join(", "))))),
                         };
                         let url = cf.deploy_runners(&account, plane.url(), plane.plane_id())?;
-                        agents.retain(|a| a.cloud != "cloudflare");
-                        agents.push(superci_core::plane::Agent { cloud: "cloudflare".into(), url });
-                        self.put_secret(&plane, "AGENTS", &serde_json::to_string(&agents).map_err(|e| e.to_string())?)?;
-                        wait_for(plane.url(), &self.status_key, |s| s["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
+                        launchers.retain(|a| a.cloud != "cloudflare");
+                        launchers.push(superci_core::plane::Launcher { cloud: "cloudflare".into(), url });
+                        self.put_secret(&plane, "LAUNCHERS", &serde_json::to_string(&launchers).map_err(|e| e.to_string())?)?;
+                        wait_for(plane.url(), &self.status_key, |s| s["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == "cloudflare")));
                     }
                 }
                 Ok(Response::redirect("/?p=runners"))
@@ -3206,7 +3256,7 @@ impl Dashboard {
             }
             ("POST", "/keys/remove") => {
                 if !field("read").is_empty() { self.revoke_key(&field("read"))?; return Ok(Response::redirect("/?p=settings")) }
-                match self.drop_computer_key(&field("name")) {
+                match self.drop_device_key(&field("name")) {
                     Ok(()) => Ok(Response::redirect("/?p=settings")),
                     Err(e) => Ok(message(409, "That key was not taken out", &format!("{} Nothing has changed.", esc(&e)))),
                 }
@@ -4120,9 +4170,9 @@ mark();load()})();</script>"#;
             return format!(r#"<div class="bar"><h1 class="page-title">Add runners</h1></div><div class="cards"><section class="card">{}</section></div>"#,
                 empty_state(&icon("lock"), "Set up a control plane first", "Runners connect to a control plane: it registers each job's runner with GitHub and starts the machine.", r#"<a class="button primary" href="/?p=plane">Set up a control plane</a>"#))
         };
-        let agent = |cloud: &str| v.agents().into_iter().any(|a| a.cloud == cloud);
+        let launcher = |cloud: &str| v.launchers().into_iter().any(|a| a.cloud == cloud);
         let added = pill("good", "Added");
-        let cloudflare = if agent("cloudflare") || (matches!(v.plane, Plane::Cloudflare { .. }) && v.own_containers()) { added.clone() }
+        let cloudflare = if launcher("cloudflare") || (matches!(v.plane, Plane::Cloudflare { .. }) && v.own_containers()) { added.clone() }
             else if self.cf.is_some() { row_form("/runners/cloudflare", "", "Add") } else { connect_action("cloudflare") };
         // AWS: a region picked for you (with why), what the account may run there, and one click; another region if needed.
         let aws = if v.aws { added.clone() }
@@ -4132,12 +4182,12 @@ mark();load()})();</script>"#;
             format!(r#"<form method="post" action="/aws/connect" class="aws-add"><details class="change"><summary class="button secondary sm">Change region</summary><select name="region" aria-label="Region">{}</select></details><button class="button primary sm">Add</button></form>"#,
                 region_select_options("us-east-1", &self.quotas, &closest(Some(v)), self.aws_look()))
         } else { connect_action("aws") };
-        // A Modal control plane starts sandboxes itself; one elsewhere gets a small runner bridge in your Modal workspace.
+        // A Modal control plane starts sandboxes itself; one elsewhere gets a small launcher in your Modal workspace.
         let own_modal = matches!(v.plane, Plane::Modal { .. });
-        let modal = if agent("modal") || (own_modal && v.own_containers()) { added } else if own_modal { row_form("/runners/modal-own", "", "Add") } else if self.modal.is_some() { row_form("/runners/modal", "", "Add") }
+        let modal = if launcher("modal") || (own_modal && v.own_containers()) { added } else if own_modal { row_form("/runners/modal-own", "", "Add") } else if self.modal.is_some() { row_form("/runners/modal", "", "Add") }
             else if self.modal_pending.is_some() { format!(r#"{}<form method="post" action="/modal/signin"><input type="hidden" name="next"><button class="button secondary sm">Open again</button></form>"#, pill("open", "Waiting for Modal")) }
             else { connect_action("modal") };
-        let containers = if matches!(v.plane, Plane::Cloudflare { .. }) { "Containers, one per job, started by your control plane." } else { "Containers, one per job, through a small runner bridge in your Cloudflare." };
+        let containers = if matches!(v.plane, Plane::Cloudflare { .. }) { "Containers, one per job, started by your control plane." } else { "Containers, one per job, through a small launcher in your Cloudflare." };
         let aws_what = match &self.aws {
             Some(a) if !v.aws => {
                 let quota = match self.quotas.get("us-east-1") { Some(Ok(n)) => format!("<br>{}", quota_text("us-east-1", *n)), _ => String::new() };
@@ -4310,7 +4360,7 @@ mark();load()})();</script>"#;
             dialogs.push_str(&format!(r#"<dialog class="dlg" id="rename-workspace" onclick="if(event.target===this)this.close()"><div class="dlg-body"><div class="dlg-head">{}<span><strong>Workspace id</strong><small>What <code>--workspace</code> takes in commands.</small></span>{close}</div><form method="post" action="/workspaces/rename" class="limit-do"><input type="hidden" name="w" value="{name}"><input name="id" value="{name}" aria-label="Its id" autofocus onfocus="this.select()" pattern="[a-z][a-z0-9\-]{{1,23}}" title="2 to 24 lowercase letters, digits and dashes" required spellcheck="false" autocomplete="off" autocapitalize="none"><button class="button primary sm">Save</button></form></div></dialog>"#, logo(ICON_WORKSPACE)));
         }
         // (Nothing to sign out of in a workspace that is signed in nowhere.)
-        if self.signed_in_as().is_some() || self.aws_ended { rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>This computer</strong><small>{who} Signing out removes this workspace's sign-ins from it; your runners keep working.</small></span><form method="post" action="/signout"><button class="button secondary sm">Sign out</button></form></div>"#, logo(ICON_SIGNOUT))) }
+        if self.signed_in_as().is_some() || self.aws_ended { rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>This device</strong><small>{who} Signing out removes this workspace's sign-ins from it; your runners keep working.</small></span><form method="post" action="/signout"><button class="button secondary sm">Sign out</button></form></div>"#, logo(ICON_SIGNOUT))) }
         // With other workspaces beside it, this one can be forgotten here.
         if root.is_some_and(|r| crate::store::listed(&r, Some(&self.workspace())).len() > 1) {
             rows.push(format!(r#"<div class="default-machine">{}<span class="dm-main"><strong>Remove this workspace</strong><small>Forgets {called} on this computer. Nothing in its clouds is deleted.</small></span><button type="button" class="button danger sm" onclick="document.getElementById('remove-workspace').showModal()">Remove</button></div>"#, logo(ICON_REMOVE)));
@@ -4336,20 +4386,20 @@ mark();load()})();</script>"#;
         let ago = |ms: Option<u64>| ms.map(|t| ago_words(now_ms().saturating_sub(t))).unwrap_or_else(|| "not yet".into());
         let left = |until: Option<u64>| until.map(|u| match u.saturating_sub(now_ms()) / 86_400_000 { 0 => "ends today".to_string(), 1 => "1 more day".into(), d => format!("{d} more days") }).unwrap_or_default();
         let mut rows = String::new();
-        for c in k["computers"].as_array().into_iter().flatten() {
+        for c in k["devices"].as_array().into_iter().flatten() {
             let name = c["name"].as_str().unwrap_or_default();
             let mine = name == self.status_secret;
-            let who = c["computer"].as_str().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| "A computer".into());
+            let who = c["device"].as_str().filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| "A device".into());
             let made = c["until_ms"].as_u64().map(|u| ago_words(now_ms().saturating_sub(u.saturating_sub(30 * 86_400_000)))).unwrap_or_default();
-            let end = if mine { pill("good", "This computer") } else { format!(r#"<form method="post" action="/keys/remove" onsubmit="return confirm('Remove this computer key? Its dashboard stops reaching this CI until it opens again with its sign-in.')"><input type="hidden" name="name" value="{}"><button class="button secondary sm">Remove</button></form>"#, esc(name)) };
-            rows.push_str(&format!(r#"<div class="limit"><div class="limit-text"><strong>{}</strong><small>Computer key · made {made} · last used {}</small></div><div class="limit-do">{end}</div></div>"#, esc(&who), ago(c["last_ms"].as_u64())));
+            let end = if mine { pill("good", "This device") } else { format!(r#"<form method="post" action="/keys/remove" onsubmit="return confirm('Remove this device key? Its dashboard stops reaching this CI until it opens again with its sign-in.')"><input type="hidden" name="name" value="{}"><button class="button secondary sm">Remove</button></form>"#, esc(name)) };
+            rows.push_str(&format!(r#"<div class="limit"><div class="limit-text"><strong>{}</strong><small>Device key · made {made} · last used {}</small></div><div class="limit-do">{end}</div></div>"#, esc(&who), ago(c["last_ms"].as_u64())));
         }
         for r in k["read"].as_array().into_iter().flatten() {
             let name = r["name"].as_str().unwrap_or_default();
             rows.push_str(&format!(r#"<div class="limit"><div class="limit-text"><strong>{}</strong><small>{} · {}</small></div><div class="limit-do"><form method="post" action="/keys/remove"><input type="hidden" name="read" value="{}"><button class="button secondary sm">Remove</button></form></div></div>"#,
                 esc(&name.to_lowercase()), if r["runs"] == true { "Run key: reads and starts runs from a computer" } else { "Read key: reads only" }, left(r["until_ms"].as_u64()), esc(name)));
         }
-        format!(r#"<section class="card"><div class="card-head"><h2>Keys</h2><span class="card-sub">Who reaches this CI: each computer's key, and read and run keys made for coding agents and scripts. Anyone signed in to its cloud account can add their own.</span></div><div class="limits">{rows}</div></section>"#)
+        format!(r#"<section class="card"><div class="card-head"><h2>Keys</h2><span class="card-sub">Who reaches this CI: each device's key, and read and run keys made for coding agents and scripts. Anyone signed in to its cloud account can add their own.</span></div><div class="limits">{rows}</div></section>"#)
     }
 
     /// One run's page: how it stands, how long it took (its first job queued to its last over), what its machines cost,
@@ -4596,7 +4646,7 @@ mark();load()})();</script>"#;
         views
     }
 
-    /// Deletes a control plane from its cloud, and the runner bridges and AWS role made for it in other clouds (those
+    /// Deletes a control plane from its cloud, and the launchers and AWS role made for it in other clouds (those
     /// this session is signed in to). Returns what could not be removed, in words.
     fn delete_plane(&mut self, plane: &Plane, status: &serde_json::Value) -> Result<Vec<String>> {
         self.own().check(plane)?;
@@ -4613,12 +4663,12 @@ mark();load()})();</script>"#;
             Plane::Modal { plane_id, .. } => modal::delete_plane(self.modal.as_ref().ok_or("Sign in with Modal first.")?, plane_id)?,
             Plane::Seen { .. } => return Err("Sign in where this control plane runs to delete it.".into()),
         }
-        let agent = |c: &str| status["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c));
-        if agent("cloudflare") && !matches!(plane, Plane::Cloudflare { .. }) {
-            match self.cloudflare() { Ok(cf) => for (a, _) in self.cf_accounts.clone() { let _ = cf.delete_runners(&a, plane.plane_id()); }, Err(_) => left.push("Its Cloudflare runner bridge (sign in with Cloudflare to remove it).".to_string()) }
+        let launcher = |c: &str| status["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c));
+        if launcher("cloudflare") && !matches!(plane, Plane::Cloudflare { .. }) {
+            match self.cloudflare() { Ok(cf) => for (a, _) in self.cf_accounts.clone() { let _ = cf.delete_runners(&a, plane.plane_id()); }, Err(_) => left.push("Its Cloudflare launcher (sign in with Cloudflare to remove it).".to_string()) }
         }
-        if agent("modal") && !matches!(plane, Plane::Modal { .. }) {
-            match &self.modal { Some(m) => { let _ = modal::delete_runners(m, plane.plane_id()); } None => left.push("Its Modal runner bridge (sign in with Modal to remove it).".into()) }
+        if launcher("modal") && !matches!(plane, Plane::Modal { .. }) {
+            match &self.modal { Some(m) => { let _ = modal::delete_runners(m, plane.plane_id()); } None => left.push("Its Modal launcher (sign in with Modal to remove it).".into()) }
         }
         if let (Some(account), false) = (status["aws"]["account_id"].as_str(), matches!(plane, Plane::Aws { .. })) {
             match (&mut self.aws, account) {
@@ -4641,11 +4691,11 @@ mark();load()})();</script>"#;
     /// The runner providers of the control plane in use (`from`), and how each comes along to `to`.
     fn carry_plan(&self, from: &PlaneView, to: &PlaneView) -> Vec<Carry> {
         let st = from.status.clone().unwrap_or_default();
-        let agent = |c: &str| st["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c));
+        let launcher = |c: &str| st["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c));
         let own = |c: &str| st["containers"] == true && st["own_cloud"] == c;
         let mut plan = vec![];
-        if own("cloudflare") || agent("cloudflare") { plan.push(if self.cf.is_some() { Carry::Comes("cloudflare") } else { Carry::NeedsSignIn("cloudflare") }) }
-        if own("modal") || agent("modal") { plan.push(if self.modal.is_some() { Carry::Comes("modal") } else { Carry::NeedsSignIn("modal") }) }
+        if own("cloudflare") || launcher("cloudflare") { plan.push(if self.cf.is_some() { Carry::Comes("cloudflare") } else { Carry::NeedsSignIn("cloudflare") }) }
+        if own("modal") || launcher("modal") { plan.push(if self.modal.is_some() { Carry::Comes("modal") } else { Carry::NeedsSignIn("modal") }) }
         if from.aws {
             let account = st["aws"]["account_id"].as_str().unwrap_or_default().to_string();
             plan.push(match &to.plane {
@@ -4716,7 +4766,7 @@ mark();load()})();</script>"#;
             rows.push_str(&row("aws", &sub, end));
         }
         // Cloudflare and Modal: what each sign-in asks for (nothing kept in the account to fall behind).
-        let uses = |cloud: &str| v.plane.cloud() == cloud || (st["containers"] == true && st["own_cloud"] == cloud) || st["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == cloud));
+        let uses = |cloud: &str| v.plane.cloud() == cloud || (st["containers"] == true && st["own_cloud"] == cloud) || st["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == cloud));
         if uses("cloudflare") {
             rows.push_str(&if self.cf.is_some() { row("cloudflare", "Your sign-in covers it", ok()) } else { row("cloudflare", "Asked for when you sign in", signin("cloudflare")) });
         }
@@ -4831,7 +4881,7 @@ mark();load()})();</script>"#;
         // In use.
         let updating_used = updating.as_ref().is_some_and(|u| u.plane == v.plane.plane_id() && !matches!(u.result, Some(Ok(_))));
         let state = if !v.online { pill("bad", "not answering") } else if v.outdated() || updating_used { update(used, v) } else { format!(r#"<span class="mono faint">{}</span>"#, esc(&v.version_name())) };
-        dialogs.push_str(&format!(r#"<dialog class="dlg" id="leave" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/leave" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Stopping…'"><div class="dlg-head"><span class="logo warn-mark">{ICON_ALERT}</span><span><strong>Stop using SuperCI?</strong><small>For good, from every cloud</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><ul class="checks stays"><li>–<span>GitHub's App is uninstalled and GitLab's projects stop sending jobs here (their webhooks and SuperCI's runners are removed).</span></li><li>–<span>Every control plane is deleted, with its history, and the runner bridges and AWS roles made for them.</span></li><li>–<span>Jobs with <code>runs-on: superci</code> then wait for a runner: change them back first.</span></li></ul><label class="field"><span>Type <code>superci</code> to confirm</span><input type="text" name="confirm" autocomplete="off" required pattern="superci"></label><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Stop using SuperCI</button></div></form></dialog>"#));
+        dialogs.push_str(&format!(r#"<dialog class="dlg" id="leave" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/leave" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Stopping…'"><div class="dlg-head"><span class="logo warn-mark">{ICON_ALERT}</span><span><strong>Stop using SuperCI?</strong><small>For good, from every cloud</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><ul class="checks stays"><li>–<span>GitHub's App is uninstalled and GitLab's projects stop sending jobs here (their webhooks and SuperCI's runners are removed).</span></li><li>–<span>Every control plane is deleted, with its history, and the launchers and AWS roles made for them.</span></li><li>–<span>Jobs with <code>runs-on: superci</code> then wait for a runner: change them back first.</span></li></ul><label class="field"><span>Type <code>superci</code> to confirm</span><input type="text" name="confirm" autocomplete="off" required pattern="superci"></label><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Stop using SuperCI</button></div></form></dialog>"#));
         let state = if matches!(v.plane, Plane::Seen { .. }) { signin_button(v.plane.cloud(), &format!("Sign in with {}", provider_name(v.plane.cloud())), false) } else { state };
         let leave = if signed_in(v) { menu(&[("Stop using SuperCI…", "leave".to_string())]) } else { String::new() };
         let mut rows = row(" current", v, format!(r#"{state}{}{leave}"#, pill("accent", "In use")));
@@ -4865,7 +4915,7 @@ mark();load()})();</script>"#;
             let items = if signed_in(o) && !o.serves_its_own() { vec![("Delete…", format!("delete-{i}"))] } else { vec![] };
             let what = match o.plane { Plane::Cloudflare { .. } => "its Worker, its storage and its containers", Plane::Aws { .. } => "its function, table, schedule, parameters and role", _ => "its app and its Dicts" };
             if !o.serves_its_own() {
-                dialogs.push_str(&format!(r#"<dialog class="dlg" id="delete-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/delete" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Deleting…'"><input type="hidden" name="plane" value="{}"><div class="dlg-head">{}<span><strong>Delete {}?</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><p class="note">This deletes {what} from {}, and the runner bridges made for it. The control plane in use, your jobs and your history are not touched.</p><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Delete</button></div></form></dialog>"#,
+                dialogs.push_str(&format!(r#"<dialog class="dlg" id="delete-{i}" onclick="if(event.target===this)this.close()"><form method="post" action="/plane/delete" class="dlg-body" onsubmit="var b=this.querySelector('.danger');b.disabled=true;b.textContent='Deleting…'"><input type="hidden" name="plane" value="{}"><div class="dlg-head">{}<span><strong>Delete {}?</strong><small>{}</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><p class="note">This deletes {what} from {}, and the launchers made for it. The control plane in use, your jobs and your history are not touched.</p><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button danger sm">Delete</button></div></form></dialog>"#,
                 esc(o.plane.plane_id()), logo(provider(o), 36), esc(&o.plane.place()), esc(o.plane.url().trim_start_matches("https://")), provider_name(provider(o))));
             }
             let end = if upd.is_empty() || end == upd { end } else { format!("{upd}{end}") };
@@ -5107,7 +5157,7 @@ fn running_on(status: &serde_json::Value, cloud: &str) -> usize {
 fn provider_connected(status: &serde_json::Value, cloud: &str) -> bool {
     match cloud {
         "aws" => status["aws"]["connected"] == true,
-        c => (status["containers"] == true && status["own_cloud"].as_str().unwrap_or("cloudflare") == c) || status["agents"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c)),
+        c => (status["containers"] == true && status["own_cloud"].as_str().unwrap_or("cloudflare") == c) || status["launchers"].as_array().is_some_and(|a| a.iter().any(|a| a["cloud"] == c)),
     }
 }
 
@@ -5123,7 +5173,7 @@ fn remove_dialog(v: &PlaneView, cloud: &str, i: usize, signed_in: &[&str]) -> St
         "aws" => vec!["Its machines, and their network in each region".into(), if matches!(v.plane, Plane::Aws { .. }) { format!("The machines' policy on the role superci-plane-{id} (the control plane's own role stays)") } else { format!("The role superci-plane-{id} and its identity provider, in account {account}") }],
         _ if own => vec![],
         "modal" => vec![format!("The app superci-runners-{id} in your Modal workspace, and its sandboxes")],
-        _ => vec![format!("The runner bridge superci-runners-{id} in your Cloudflare account, and its containers")],
+        _ => vec![format!("The launcher superci-runners-{id} in your Cloudflare account, and its containers")],
     };
     let what = if deleted.is_empty() { format!(r#"<p class="note">Nothing is deleted: your control plane stops starting {}.</p>"#, if cloud == "modal" { "sandboxes" } else { "containers" }) }
         else { format!(r#"<p class="note">Deleted in {name}:</p><ul class="needs">{}</ul>"#, deleted.iter().map(|d| format!("<li><span>{}</span></li>", esc(d))).collect::<String>()) };
@@ -5626,7 +5676,7 @@ fn clouds_card(v: &PlaneView, signed_in: &[&str]) -> String {
                 let field = if st.get("cloudflare_location").is_some() { format!(r#"<label class="field"><span>GitHub's full image (experimental)</span><input type="url" name="image" value="{}" placeholder="https://… (empty: the small image)"><small>Jobs then run inside GitHub's own runner image, with everything it has, loaded from this address as it is read and checked piece by piece (an address as <code>image-reader pack</code> names it). Empty: GitHub's small runner image, with few tools.</small></label>"#, esc(&image)) } else { String::new() };
                 (name.clone(), if image.is_empty() { "GitHub's small runner image".into() } else { "GitHub's full image (experimental)".to_string() }, field)
             }
-            _ => (name.clone(), "Its runner bridge starts the sandboxes".to_string(), String::new()),
+            _ => (name.clone(), "Its launcher starts the sandboxes".to_string(), String::new()),
         };
         let n = 100 + i;
         rows.push_str(&format!(r#"<li class="pool still">{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now"></span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{n}').showModal()">{ICON_GEAR}</button></li>"#,
@@ -6782,8 +6832,8 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
 
     // 2. The runner providers: the same clouds, started by the new one (the old one keeps its own).
     step(1);
-    let mut agents: Vec<superci_core::plane::Agent> = cloudflare::status(to.url(), key).and_then(|s| serde_json::from_value(s["agents"].clone()).ok()).unwrap_or_default();
-    let agents_before = agents.len();
+    let mut launchers: Vec<superci_core::plane::Launcher> = cloudflare::status(to.url(), key).and_then(|s| serde_json::from_value(s["launchers"].clone()).ok()).unwrap_or_default();
+    let launchers_before = launchers.len();
     let mut left = vec![];
     for c in plan {
         match c {
@@ -6794,8 +6844,8 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
                 }
                 _ => {
                     let url = w.cf.as_ref().ok_or("Sign in with Cloudflare first.")?.deploy_runners(cf_account.as_deref().ok_or("no Cloudflare account")?, to.url(), to.plane_id())?;
-                    agents.retain(|a| a.cloud != "cloudflare");
-                    agents.push(superci_core::plane::Agent { cloud: "cloudflare".into(), url });
+                    launchers.retain(|a| a.cloud != "cloudflare");
+                    launchers.push(superci_core::plane::Launcher { cloud: "cloudflare".into(), url });
                 }
             },
             Carry::Comes("modal") => match to {
@@ -6804,8 +6854,8 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
                     let keys: serde_json::Value = ureq::get(&crate::aws::stand_in(&format!("{}/.well-known/jwks.json", to.url()))).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
                     let url = modal::deploy_runners(w.modal.as_ref().ok_or("Sign in with Modal first.")?, to.url(), to.plane_id(), &keys)?;
                     for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(Duration::from_secs(3)) }
-                    agents.retain(|a| a.cloud != "modal");
-                    agents.push(superci_core::plane::Agent { cloud: "modal".into(), url });
+                    launchers.retain(|a| a.cloud != "modal");
+                    launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
                 }
             },
             // AWS: a Cloudflare control plane assumes its own role in the account (one in AWS uses its own).
@@ -6826,8 +6876,8 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
             _ => {}
         }
     }
-    if agents.len() != agents_before || plan.iter().any(|c| matches!(c, Carry::Comes("cloudflare") | Carry::Comes("modal"))) {
-        w.put(to, "AGENTS", &serde_json::to_string(&agents).map_err(|e| e.to_string())?)?;
+    if launchers.len() != launchers_before || plan.iter().any(|c| matches!(c, Carry::Comes("cloudflare") | Carry::Comes("modal"))) {
+        w.put(to, "LAUNCHERS", &serde_json::to_string(&launchers).map_err(|e| e.to_string())?)?;
     }
     // The new one says each provider it was given is there, before any job is sent to it: a control plane given its
     // containers a moment ago starts again with them, and until it has, a job for them would find none.
@@ -7370,7 +7420,7 @@ mod tests {
         let mut d = with_cloudflare(&[("a1", "Acme Inc.")]);
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         d.planes = vec![plane.clone()];
-        let view = PlaneView { plane, online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(serde_json::json!({ "containers": true, "agents": [] })) };
+        let view = PlaneView { plane, online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(serde_json::json!({ "containers": true, "launchers": [] })) };
         let html = d.render("add-runners", &[view.clone()], None);
         preview("add-runners", &html);
         assert!(html.contains(r#"<div class="pick act">"#) && html.contains("Added") && html.contains(r#"action="/aws/signin""#) && html.contains(r#"action="/modal/signin""#));
@@ -7452,7 +7502,7 @@ mod tests {
         moved.moved_to = Some(other.plane.url().into());
         let mut took_over = other.clone();
         took_over.github = true;
-        took_over.status = Some(serde_json::json!({ "containers": false, "agents": [], "jobs": [] }));
+        took_over.status = Some(serde_json::json!({ "containers": false, "launchers": [], "jobs": [] }));
         assert_eq!(view::in_use(&[moved.clone(), took_over.clone()]), 1);
         let html = d.render("planes", &[moved, took_over], None);
         preview("planes-moved", &html);
@@ -7512,7 +7562,7 @@ mod tests {
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         d.planes = vec![plane.clone()];
         let perms = serde_json::json!({ "organization_self_hosted_runners": "write", "actions": "write", "metadata": "read" });
-        let status = serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "agents": [], "jobs": [],
+        let status = serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": [], "jobs": [],
             "app": { "id": 1, "slug": "superci-acme-p1", "owner": "acme", "org": true },
             "apps": [{ "id": 1, "slug": "superci-acme-p1", "owner": "acme", "org": true, "permissions": perms },
                      { "id": 2, "slug": "superci-beta-p1", "owner": "beta", "org": true, "permissions": { "organization_self_hosted_runners": "write", "actions": "read", "metadata": "read" } }],
@@ -7633,7 +7683,7 @@ mod tests {
         let mut d = with_cloudflare(&[("a1", "Acme Inc.")]);
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         d.planes = vec![plane.clone()];
-        let status = serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "agents": [{ "cloud": "modal", "url": "https://acme--superci-runners-p1.modal.run" }], "permissions": {} });
+        let status = serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": [{ "cloud": "modal", "url": "https://acme--superci-runners-p1.modal.run" }], "permissions": {} });
         let view = PlaneView { plane, online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(status) };
         assert!(!d.render("planes", &[view.clone()], None).contains("data-refresh"));
         d.modal_pending = Some(modal::Pending::for_test());
@@ -7647,7 +7697,7 @@ mod tests {
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         d.planes = vec![plane.clone()];
         let status = serde_json::json!({
-            "containers": true, "own_cloud": "cloudflare", "agents": [{ "cloud": "modal", "url": "https://acme--superci-runners-p1.modal.run" }],
+            "containers": true, "own_cloud": "cloudflare", "launchers": [{ "cloud": "modal", "url": "https://acme--superci-runners-p1.modal.run" }],
             "aws": { "account_id": "123456789012", "region": "us-east-1", "connected": true }, "aws_regions": ["us-east-1"],
             "routing": { "rules": [], "order": [{ "cloud": "aws" }, { "cloud": "cloudflare" }, { "cloud": "modal" }] },
             "jobs": [{ "job_id": 7, "run_id": 70, "repo": "acme/app", "state": "running", "cloud": "modal", "at_ms": 1 }],
@@ -7712,7 +7762,7 @@ mod tests {
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         d.planes = vec![plane.clone()];
         let status = serde_json::json!({
-            "containers": true, "agents": [{ "cloud": "modal", "url": "https://acme--superci-runners.modal.run" }],
+            "containers": true, "launchers": [{ "cloud": "modal", "url": "https://acme--superci-runners.modal.run" }],
             "aws": { "account_id": "123456789012", "region": "us-east-1" }, "aws_regions": ["us-east-1", "us-east-2"], "cloudflare_location": "auto",
             "aws_networks": { "us-east-2": { "subnets": ["subnet-0aaaaaaaa"], "security_groups": ["sg-0cccccccc"], "private": true } },
             // An order from before computers were set aside: their pools are left out.
@@ -7863,7 +7913,7 @@ mod tests {
         let job = |id: u64, cloud: &str, state: &str, started: Option<u64>, ended: Option<u64>, per_hour: f64, cpu: u32| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "at_ms": t,
             "runner": null, "runner_id": null, "installation_id": 1, "cloud": cloud, "machine_id": "m", "machine_type": null, "error": null, "seen_in_progress": started.is_some(),
             "usd_per_hour": per_hour, "started_ms": started, "ended_ms": ended, "launched_ms": t, "cpu": cpu });
-        let status = serde_json::json!({ "containers": true, "agents": [], "jobs": [
+        let status = serde_json::json!({ "containers": true, "launchers": [], "jobs": [
             // A container whose job was cancelled before it began: its memory and disk while its runner waited (7 minutes at
             // $0.112/h: $0.40/h less 4 CPUs, billed only as used).
             job(1, "cloudflare", "cancelled", None, Some(t + 420_000), 0.4, 4),
@@ -7905,7 +7955,7 @@ mod tests {
         let mut d = with_cloudflare(&[("a1", "Acme Inc.")]);
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         d.planes = vec![plane.clone()];
-        let status = |denied: serde_json::Value| serde_json::json!({ "containers": true, "agents": [], "jobs": [],
+        let status = |denied: serde_json::Value| serde_json::json!({ "containers": true, "launchers": [], "jobs": [],
             "app": { "id": 1, "slug": "superci-acme", "owner": "acme", "org": true },
             "installations": [{ "id": 42, "account": "acme", "selection": "all", "permissions": { "organization_self_hosted_runners": "write", "metadata": "read" } }],
             "aws": { "account_id": "123456789012", "region": "us-east-1", "connected": true }, "gitlab": { "url": "https://gitlab.com" },
@@ -8108,7 +8158,7 @@ mod tests {
         // Cloudflare signed in again elsewhere, and a new key: both taken in.
         let mut other = store.read();
         other.cloudflare = with_cloudflare(&[("a2", "Initech")]).cf.clone();
-        other.key = Some(crate::store::Key { name: "DASHBOARD_KEY_9999999999_ABCDEF".into(), value: "a-new-folder-key-0001".into(), planes: vec!["https://a.example".into()] });
+        other.key = Some(crate::store::Key { name: "DEVICE_KEY_9999999999_ABCDEF".into(), value: "a-new-folder-key-0001".into(), planes: vec!["https://a.example".into()] });
         store.write(&other).unwrap();
         d.take_in();
         assert!(d.cf.is_some() && d.status_key == "a-new-folder-key-0001" && d.keyed.contains("https://a.example"));
@@ -8155,7 +8205,7 @@ mod tests {
         assert_eq!(cloudflare::plane_key("a-key-that-only-reads-0001", "https://a.example"), "a-key-that-only-reads-0001");
         let dir = std::env::temp_dir().join(format!("superci-keys-{}", random_token(6)));
         let store = Store::at(&dir);
-        let name = format!("DASHBOARD_KEY_{}_ABCDEF", now_ms() / 1000 + 20 * 86_400);
+        let name = format!("DEVICE_KEY_{}_ABCDEF", now_ms() / 1000 + 20 * 86_400);
         store.write(&crate::store::Kept { modal: Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() }),
             key: Some(crate::store::Key { name: name.clone(), value: "an-old-shared-key-value-0001".into(), planes: vec!["abcdef123456".into()] }), ..Default::default() }).unwrap();
         // A key kept from before (one value in every control plane) goes on working until every control plane
@@ -8238,6 +8288,20 @@ mod tests {
     }
 
     #[test]
+    fn updating_a_control_plane_from_before_the_new_names_moves_its_launchers_and_takes_the_old_names_out() {
+        let status = serde_json::json!({ "agents": [{ "cloud": "modal", "url": "https://acme--superci-runners.modal.run" }] });
+        let names: Vec<String> = ["AGENTS", "DASHBOARD_KEY_4102444800_AB12CD", "DEVICE_KEY_4102444800_AB12CD", "READ_KEY_4102444800_AGENT", "ROUTING"].iter().map(|s| s.to_string()).collect();
+        let (puts, drops) = renames(&status, &names);
+        assert_eq!(puts, [("LAUNCHERS".to_string(), r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#.to_string())]);
+        assert_eq!(drops, ["AGENTS", "DASHBOARD_KEY_4102444800_AB12CD"]);
+        // None to move: nothing written.
+        assert!(renames(&serde_json::json!({ "agents": [] }), &[]).0.is_empty());
+        assert_eq!(old_key_name("DEVICE_KEY_4102444800_AB12CD"), "DASHBOARD_KEY_4102444800_AB12CD");
+        assert_eq!(key_until("DEVICE_KEY_4102444800_AB12CD"), 4_102_444_800);
+        assert_eq!(key_until("DASHBOARD_KEY_4102444800_AB12CD"), 0, "a key kept under the old name is made anew");
+    }
+
+    #[test]
     fn it_answers_only_on_this_computers_address_and_changes_only_from_its_own_pages() {
         let shared = hub_of(with_cloudflare(&[("a1", "Acme Inc.")]), &"k".repeat(32));
         let req = |host: &str, origin: Option<&str>| Req { method: "POST".into(), path: "/routing".into(), query: vec![], cookie: Some("k".repeat(32)), last: None, body: b"action=max_cpu&max_cpu=8".to_vec(), host: host.into(), origin: origin.map(str::to_string),
@@ -8264,7 +8328,7 @@ mod tests {
         let d = with_cloudflare(&[("a1", "Acme Inc.")]);
         let plane = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         let mut view = PlaneView { plane, online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
-            status: Some(serde_json::json!({ "containers": true, "agents": [], "jobs": [], "app": { "slug": "superci-acme", "owner": "acme", "org": true }, "installations": [{ "account": "acme", "repositories": "all" }] })) };
+            status: Some(serde_json::json!({ "containers": true, "launchers": [], "jobs": [], "app": { "slug": "superci-acme", "owner": "acme", "org": true }, "installations": [{ "account": "acme", "repositories": "all" }] })) };
         let html = d.render("repos", &[view.clone()], None);
         preview("repos", &html);
         // GitHub connected, GitLab one click away (its row's button opens its three steps), more hosts folded as coming.
@@ -8314,7 +8378,7 @@ mod tests {
         assert!(gh.contains(r#"aria-label="Add an organization""#) && gh.contains("<h2>Where is your GitHub?</h2>") && gh.contains("GitHub Enterprise") && gh.contains(r#"<div class="perm-field" data-own hidden><input type="text" name="host""#)
             && gh.contains(r#"name="login" placeholder="your-organization" required"#) && gh.contains(">Continue on GitHub</button>"));
         // Not connected yet: the same dialog, as connecting.
-        let fresh = PlaneView { github: false, installed: false, status: Some(serde_json::json!({ "containers": true, "agents": [], "jobs": [] })), ..view.clone() };
+        let fresh = PlaneView { github: false, installed: false, status: Some(serde_json::json!({ "containers": true, "launchers": [], "jobs": [] })), ..view.clone() };
         let first = d.render("repos", &[fresh.clone()], None);
         assert!(first.contains(r#"onclick="document.getElementById('gh-add').showModal()">Connect</button>"#) && dialog(&first, "gh-add").contains(r#"aria-label="Connect GitHub""#) && first.matches(r#"id="gh-add""#).count() == 1);
         assert!(html.contains("More code hosts") && html.contains("Bitbucket") && html.contains(r#"href="/?p=workflows""#) && !html.contains("runs-on: superci"));
@@ -8339,7 +8403,7 @@ mod tests {
         assert!(overview.contains("Connect GitHub or GitLab") && overview.contains(r#"<a class="button primary" href="/?p=repos">Finish on Repositories</a>"#) && !overview.contains("open=gl-add") && !overview.contains(r#"class="pick"#));
         // GitLab connected (jobs link to it): ready.
         view.gitlab = true;
-        view.status = Some(serde_json::json!({ "containers": true, "agents": [], "gitlab": { "url": "https://gitlab.com" },
+        view.status = Some(serde_json::json!({ "containers": true, "launchers": [], "gitlab": { "url": "https://gitlab.com" },
             "jobs": [{ "job_id": 1977, "run_id": 2366, "repo": "acme/app", "state": "done", "at_ms": now_ms() - 60_000, "provider": "gitlab", "cloud": "cloudflare", "machine_id": "m",
                 "installation_id": 0, "runner": null, "runner_id": null, "machine_type": "2cpu-8gb", "error": null, "seen_in_progress": true }] }));
         assert!(view.ready());
@@ -8388,7 +8452,7 @@ mod tests {
         let words = run_words(first);
         assert_eq!((words["state"].as_str(), words["took"].as_str(), words["jobs"].as_u64(), words["last"]["job"].as_str(), words["job_ids"].to_string()), (Some("failed"), Some("9m 17s"), Some(3), Some("E2E (1/2)"), "[1,2,3]".to_string()));
         // The Jobs page has them under Runs, beside the jobs one by one.
-        let status = serde_json::json!({ "containers": true, "agents": [], "aws": { "account_id": "1", "region": "us-east-1" }, "jobs": jobs });
+        let status = serde_json::json!({ "containers": true, "launchers": [], "aws": { "account_id": "1", "region": "us-east-1" }, "jobs": jobs });
         let view = PlaneView { plane, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(status) };
         let page = d.render("runs", &[view.clone()], None);
         preview("runs", &page);
@@ -8466,7 +8530,7 @@ mod tests {
             "runner": null, "runner_id": null, "installation_id": 1, "cloud": cloud, "machine_id": if cloud.is_empty() { serde_json::Value::Null } else { "m".into() }, "machine_type": "4cpu-12gb", "error": error, "seen_in_progress": wait.is_some(),
             "usd_per_hour": 0.4, "started_ms": wait.map(|w| t + w), "ended_ms": wait.map(|w| t + w + took), "launched_ms": t, "cpu": 4,
             "name": (["", "test", "lint", "build", "e2e", "deploy", "e2e"][id as usize % 7]), "workflow": "ci" }) };
-        let status = serde_json::json!({ "containers": true, "agents": [], "aws": { "account_id": "1", "region": "us-east-1" }, "jobs": [
+        let status = serde_json::json!({ "containers": true, "launchers": [], "aws": { "account_id": "1", "region": "us-east-1" }, "jobs": [
             job(1, "done", "cloudflare", Some(8_000), 21_000, None), job(2, "done", "cloudflare", Some(9_000), 30_000, None), job(3, "done", "aws", Some(45_000), 240_000, None),
             job(4, "failed", "cloudflare", None, 0, Some("runner container: 502 the container cannot be kept running: JsValue(Error: Container connection temporarily unavailable)")),
             job(5, "waiting", "", None, 0, Some("waiting: Cloudflare runs 20 at once")), job(6, "failed", "cloudflare", None, 0, Some("runner container: 502 the container cannot be kept running")) ] });
@@ -8506,7 +8570,7 @@ mod tests {
             "launched_ms": t, "cloud": "cloudflare", "machine_id": "m", "machine_type": "4cpu-12gb", "cpu": 4, "usd_per_hour": 0.4, "name": format!("job{id}"), "workflow": "ci", "installation_id": 1, "runner": null, "runner_id": null, "error": null });
         let usage = |runs: bool| { let mut u = serde_json::json!({ "jobs": 3, "ran": 3, "not_ran": 0, "machine_minutes": 3.0, "billed_minutes": 3, "usd": 0.02, "host_usd": 0.05, "steps": (0..24).map(|i| serde_json::json!({ "ran": if i == 23 { 3 } else { 0 }, "not_ran": 0, "runs": if i == 23 { 2 } else { 0 }, "minutes": 0.0, "usd": 0.0, "host_usd": 0.0 })).collect::<Vec<_>>() }); if runs { u["runs"] = 2.into() } u };
         let view = |runs: bool| PlaneView { plane: plane.clone(), online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
-            status: Some(serde_json::json!({ "containers": true, "agents": [], "jobs": [job(1, 7), job(2, 7), job(3, 8)], "usage": { "day": usage(runs), "week": usage(runs), "month": usage(runs) } })) };
+            status: Some(serde_json::json!({ "containers": true, "launchers": [], "jobs": [job(1, 7), job(2, 7), job(3, 8)], "usage": { "day": usage(runs), "week": usage(runs), "month": usage(runs) } })) };
         let html = d.render("overview", &[view(true)], None);
         preview("overview-runs", &html);
         // Runs counted, their jobs beside them; the latest runs listed, all of them a click away.
@@ -8525,9 +8589,9 @@ mod tests {
         let cf = Plane::Cloudflare { account_id: "a1".into(), account_name: "Acme Inc.".into(), script: "superci".into(), url: "https://superci.acme.workers.dev".into(), plane_id: "p1".into(), label: "superci".into() };
         let aws_plane = Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: "https://x.lambda-url.us-east-1.on.aws".into(), plane_id: "p2".into(), label: "superci".into() };
         let from = PlaneView { plane: cf, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
-            status: Some(serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "agents": [{ "cloud": "modal", "url": "https://m" }], "aws": { "account_id": "123456789012", "region": "us-east-1" }, "jobs": [] })) };
+            status: Some(serde_json::json!({ "containers": true, "own_cloud": "cloudflare", "launchers": [{ "cloud": "modal", "url": "https://m" }], "aws": { "account_id": "123456789012", "region": "us-east-1" }, "jobs": [] })) };
         let to = PlaneView { plane: aws_plane, online: true, github: false, installed: false, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(serde_json::json!({ "jobs": [] })) };
-        // Cloudflare's containers come (a runner bridge there for the new one); Modal needs a sign-in first; AWS is the new one's own account.
+        // Cloudflare's containers come (a launcher there for the new one); Modal needs a sign-in first; AWS is the new one's own account.
         assert_eq!(d.carry_plan(&from, &to), vec![Carry::Comes("cloudflare"), Carry::NeedsSignIn("modal"), Carry::Comes("aws")]);
         assert!(d.move_dialog(0, &from, &to).contains(r#"<button class="button primary sm" disabled>Move</button>"#), "not before the sign-in");
         d.modal = Some(modal::Session { token_id: "ak".into(), token_secret: "as".into(), workspace: "acme".into() });
@@ -8680,7 +8744,7 @@ mod tests {
         assert!(given.signed_in_as().unwrap().contains("Cloudflare (a token given for this run)") && store.read().cloudflare.is_none());
         // A key about to end is not taken up again.
         let mut kept = store.read();
-        kept.key.as_mut().unwrap().name = format!("DASHBOARD_KEY_{}_ABCDEF", now_ms() / 1000 + 3600);
+        kept.key.as_mut().unwrap().name = format!("DEVICE_KEY_{}_ABCDEF", now_ms() / 1000 + 3600);
         store.write(&kept).unwrap();
         assert!(Dashboard::signed_in(Some(store.clone())).status_key != d.status_key);
         // Signed in nowhere any more (a sign-in that ended): nothing is left on this machine.
@@ -8725,14 +8789,14 @@ mod tests {
         let mut steps = vec![];
         assert_eq!(d.wait(Background::Update, &mut |s: &str| steps.push(s.to_string())).unwrap_err(), "AccessDenied: lambda:UpdateFunctionCode");
         assert_eq!(steps, UPDATE_AWS[..3], "a stop says the steps up to where it stopped");
-        // An update that left a part out (its runner bridge in Cloudflare, whose sign-in is over) says so with its
+        // An update that left a part out (its launcher in Cloudflare, whose sign-in is over) says so with its
         // result, to a command and on the pages: the rest was updated.
-        let left = "Its Cloudflare runner bridge was not updated: the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more.";
+        let left = "Its Cloudflare launcher was not updated: the Cloudflare sign-in has expired. Sign in again (`superci login cloudflare`) and update once more.";
         *lock(&d.updating) = Some(Update { plane: "abcdef123456".into(), steps: &UPDATE_AWS, at: 3, result: Some(Ok(())), ended_ms: now_ms() - 11 * 60_000, note: left.into() });
         assert_eq!(d.wait(Background::Update, &mut |_| {}).unwrap(), format!("Updated to {DASHBOARD_VERSION}. {left}"));
         let updated = PlaneView { plane: d.plane_in_use().unwrap(), online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(DASHBOARD_VERSION.into()), status: None };
         let card = side_update(&updated, lock(&d.updating).as_ref(), &[], true);
-        assert!(card.contains(&format!("Updated to {DASHBOARD_VERSION}")) && card.contains("Its Cloudflare runner bridge was not updated: the Cloudflare sign-in has expired."), "{card}");
+        assert!(card.contains(&format!("Updated to {DASHBOARD_VERSION}")) && card.contains("Its Cloudflare launcher was not updated: the Cloudflare sign-in has expired."), "{card}");
         assert_eq!(d.wait(Background::Move, &mut |_| {}).unwrap_err(), "no move was started");
     }
 

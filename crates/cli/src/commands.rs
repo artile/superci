@@ -60,7 +60,7 @@ const HELP: &[(&str, &str, &str)] = &[
     ("secrets", "  superci secrets list\n  superci secrets create NAME [--repo=OWNER/NAME] [--branch=PATTERN] [--workflow=PATTERN] [--environment=NAME]\n  superci secrets update NAME [the same]\n  superci secrets delete NAME [the same] --confirm",
         "Secrets kept for runs from a computer (`superci runs create`), as a repository's secrets are kept for its runs on\nGitHub. A run gets the ones its workflows name (${{ secrets.NAME }}) and nothing else; one it names that is not kept is\nempty, as on GitHub, and said before its jobs start. Jobs GitHub sends keep getting GitHub's own secrets.\n\nThey are written with this computer's sign-in into your control plane's own cloud (SSM on AWS, the Worker's secrets\non Cloudflare, a Dict on Modal) and are never read back out: `list` says names, where each may be used, when it was\nset and last given to a run, and who started that run. A run key (`superci keys create NAME --runs`) starts runs\nthat get them; nothing but a computer signed in changes them.\n\ncreate    Keeps NAME (letters, digits and _; not GITHUB_…), its value read from stdin or from the variable\n          --value-env names, never from the command: `printf %s \"$NPM_TOKEN\" | superci secrets create NPM_TOKEN`.\n          4 KB at most. --repo, --branch, --workflow (a file's name or path) and --environment (a job's\n          environment:) narrow where it may be used; patterns are GitHub's (release/*). The same name may be kept\n          for several scopes: a job gets the narrowest (an environment's, then a repository's, a workflow's, a\n          branch's). A value given with the run (--secret=NAME=VALUE) wins over all of them.\nupdate    A new value for NAME as kept for that scope.\ndelete    Takes it out."),
     ("keys", "  superci keys list\n  superci keys create NAME [--days=30] [--runs]\n  superci keys delete NAME",
-        "Read keys and run keys, for a coding agent or a script. (Each computer that looks after the CI has a key of its own,\nits computer key, listed here too.)\n\ncreate    Makes a read key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, a run key: it also starts runs from a computer (`superci runs create`), and nothing else. Its jobs keep\n          to this control plane's limits, as every job does (`superci limits`). For a coding agent that should run the\n          tests without pushing and without your sign-in.\ndelete    Ends one at once: a read or run key by its name, a computer key by its DASHBOARD_KEY_… name."),
+        "Read keys and run keys, for a coding agent or a script. (Each device that looks after the CI has a key of its own,\nits device key, listed here too.)\n\ncreate    Makes a read key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, a run key: it also starts runs from a computer (`superci runs create`), and nothing else. Its jobs keep\n          to this control plane's limits, as every job does (`superci limits`). For a coding agent that should run the\n          tests without pushing and without your sign-in.\ndelete    Ends one at once: a read or run key by its name, a computer key by its DEVICE_KEY_… name."),
     ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images update REGION [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
         "The image AWS machines start from (GitHub's own runner image, published for AWS by RunsOn in most regions).\n\nlist      Each region the AWS account can use: whether the image is published there, or your own copy is.\ncreate    Copies the image into a region it is not published in, so that jobs can start there. Where to copy\n          from is read from its maker's public list; --from names a region and an image instead. AWS takes about\n          ten minutes. The copy is kept in your account's storage there (about $1.50 a month).\nupdate    Copies the newest build in, where your copy is of an older one (its maker builds the image anew every\n          week or two; `list` says when one is out). Jobs start from the older copy until the new one is\n          there; the older one is then removed.\ndelete    Removes your copy from a region, with its storage."),
     ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces update ID --plane=PLANE\n  superci workspaces delete ID --confirm",
@@ -764,15 +764,15 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 }).collect() };
             // Each computer's that looks after this CI (its dashboard), when the control plane can say.
             let mine = d.status_key_name();
-            let computers: Vec<Value> = crate::cloudflare::plane_get(v.plane.url(), &d.status_key_value(), "/keys").ok().and_then(|k| k["computers"].as_array().cloned()).unwrap_or_default().into_iter()
-                .map(|c| json!({ "name": c["name"], "computer": c["computer"], "this_computer": c["name"].as_str() == Some(mine.as_str()), "last_used_ms": c["last_ms"], "until_ms": c["until_ms"] })).collect();
+            let devices: Vec<Value> = crate::cloudflare::plane_get(v.plane.url(), &d.status_key_value(), "/keys").ok().and_then(|k| k["devices"].as_array().cloned()).unwrap_or_default().into_iter()
+                .map(|c| json!({ "name": c["name"], "device": c["device"], "this_device": c["name"].as_str() == Some(mine.as_str()), "last_used_ms": c["last_ms"], "until_ms": c["until_ms"] })).collect();
             let mut said = said;
-            if !computers.is_empty() {
+            if !devices.is_empty() {
                 said.push(String::new());
-                said.push("Computer keys: each computer that looks after it (`superci keys delete NAME` takes one out):".into());
-                said.extend(computers.iter().map(|c| format!("{:<34} {}{}", c["name"].as_str().unwrap_or_default(), c["computer"].as_str().filter(|n| !n.is_empty()).unwrap_or("a computer"), if c["this_computer"] == true { " (this one)" } else { "" })));
+                said.push("Device keys: each device that looks after it (`superci keys delete NAME` takes one out):".into());
+                said.extend(devices.iter().map(|c| format!("{:<34} {}{}", c["name"].as_str().unwrap_or_default(), c["device"].as_str().filter(|n| !n.is_empty()).unwrap_or("a device"), if c["this_device"] == true { " (this one)" } else { "" })));
             }
-            Ok(Done { said, data: json!({ "keys": keys, "computers": computers }) })
+            Ok(Done { said, data: json!({ "keys": keys, "devices": devices }) })
         }
         ("keys", "create") => {
             if w(2).is_empty() { return usage("Give it a name: `superci keys create agent`.") }
@@ -800,9 +800,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             in_use(&d)?;
             if let Some(done) = dry(args, &format!("end the key named {}", w(2)), "keys", &[]) { return Ok(done) }
             // A computer's (its dashboard's), or one that only reads.
-            if w(2).starts_with("DASHBOARD_KEY_") {
-                d.drop_computer_key(w(2))?;
-                return Ok(Done::said(format!("The computer key {} is taken out: that computer's dashboard no longer reaches this CI until it opens again with its sign-in.", w(2))))
+            if w(2).starts_with("DEVICE_KEY_") {
+                d.drop_device_key(w(2))?;
+                return Ok(Done::said(format!("The device key {} is taken out: that device's dashboard no longer reaches this CI until it opens again with its sign-in.", w(2))))
             }
             d.revoke_key(w(2))?;
             Ok(Done::said(format!("The key {} no longer reads.", w(2).to_lowercase())))
@@ -1160,7 +1160,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let mut d = ready()?;
             let plane = in_use(&d)?;
             // As the Add runners page does: a control plane starts machines in its own cloud itself; elsewhere it is
-            // connected (AWS: a role it may assume; Cloudflare, Modal: a small runner bridge there).
+            // connected (AWS: a role it may assume; Cloudflare, Modal: a small launcher there).
             let (path, fields) = match (cloud, &plane) {
                 ("aws", Plane::Aws { .. }) => ("/runners/aws-own", vec![]),
                 ("aws", _) => match args.get("region") { Some(r) => ("/aws/connect", vec![field("region", r)]), None => return usage("Say where its machines start: `superci runners create aws --region=us-east-1`.") },

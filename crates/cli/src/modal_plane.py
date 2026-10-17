@@ -81,7 +81,7 @@ class Plane:
         values, at = self.cached
         # A dashboard key not seen yet (a new session set it a moment ago), or a move's step (it needs what the
         # dashboard wrote a moment ago): read again now, at most every second.
-        unknown = fresh or (len(bearer) >= 16 and not any(k.startswith("DASHBOARD_KEY_") and v == bearer for k, v in values.items()))
+        unknown = fresh or (len(bearer) >= 16 and not any(k.startswith("DEVICE_KEY_") and v == bearer for k, v in values.items()))
         if time.time() - at > (1 if unknown else 10):
             values = {k: v async for k, v in settings.items.aio()}
             self.cached = (values, time.time())

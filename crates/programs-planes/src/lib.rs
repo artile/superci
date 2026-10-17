@@ -1,10 +1,10 @@
-//! The control planes SuperCI puts in a cloud (AWS, Modal, Cloudflare) and its runner bridge for Cloudflare, built, for the superci program to carry.
+//! The control planes SuperCI puts in a cloud (AWS, Modal, Cloudflare) and its launcher for Cloudflare, built, for the superci program to carry.
 
 /// Cloudflare's control plane (a Worker): its script.
 pub const WORKER_JS: &[u8] = include_bytes!(env!("WORKER_JS"));
 /// and its WebAssembly.
 pub const WORKER_WASM: &[u8] = include_bytes!(env!("WORKER_WASM"));
-/// Cloudflare's runner bridge: its script.
+/// Cloudflare's launcher: its script.
 pub const RUNNERS_JS: &[u8] = include_bytes!(env!("RUNNERS_JS"));
 /// and its WebAssembly.
 pub const RUNNERS_WASM: &[u8] = include_bytes!(env!("RUNNERS_WASM"));

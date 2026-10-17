@@ -142,7 +142,7 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     *github.aws.lock().unwrap() = Some(aws.clone());
     let (key, run_key) = ("dashboard-key-for-tests-0001".to_string(), "superci_run_0123456789abcdef0123456789abcdef".to_string());
     // Its keys, as a deploy and `superci keys create agent --runs` leave them.
-    aws.put(&format!("/superci/{plane}/DASHBOARD_KEY_4102444800_TEST"), &key);
+    aws.put(&format!("/superci/{plane}/DEVICE_KEY_4102444800_TEST"), &key);
     aws.put(&format!("/superci/{plane}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
     aws.put(&format!("/superci/{plane}/CONTAINERS"), "on");
     let clock = Now::default();

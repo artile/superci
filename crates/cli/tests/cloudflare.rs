@@ -13,7 +13,7 @@ fn home(p: &CloudflarePlane) -> std::path::PathBuf {
     let ws = home.join("workspaces/default");
     std::fs::create_dir_all(&ws).unwrap();
     std::fs::write(ws.join("sign-ins.json"), serde_json::json!({
-        "key": { "name": "DASHBOARD_KEY_4102444800_TEST", "value": p.key, "planes": [p.plane] },
+        "key": { "name": "DEVICE_KEY_4102444800_TEST", "value": p.key, "planes": [p.plane] },
         "plane": { "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": format!("superci-plane-{}", p.plane), "url": p.url, "plane_id": p.plane, "label": "superci" } },
     }).to_string()).unwrap();
     home

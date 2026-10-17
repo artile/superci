@@ -267,7 +267,7 @@ impl Cloudflare {
         Ok(())
     }
 
-    /// The Cloudflare runner bridge for one control plane: a Worker trusting only that control plane's tokens, with one
+    /// The Cloudflare launcher for one control plane: a Worker trusting only that control plane's tokens, with one
     /// container per job, sized for it. Safe to repeat. Returns its URL.
     pub fn deploy_runners(&self, a: &str, plane_url: &str, plane_id: &str) -> Result<String> {
         let name = format!("superci-runners-{plane_id}");
@@ -299,7 +299,7 @@ impl Cloudflare {
         Ok(url)
     }
 
-    /// Removes a control plane's separate Cloudflare runner bridge: its container applications and its Worker.
+    /// Removes a control plane's separate Cloudflare launcher: its container applications and its Worker.
     pub fn delete_runners(&self, a: &str, plane_id: &str) -> Result<()> {
         let name = format!("superci-runners-{plane_id}");
         self.delete_app(a, &name)?;
@@ -308,7 +308,7 @@ impl Cloudflare {
     }
 
     /// Deletes a control plane from the account: its container application (its containers stop), its Worker with its
-    /// storage, and a runner bridge made for it. Safe to repeat.
+    /// storage, and a launcher made for it. Safe to repeat.
     pub fn delete_plane(&self, a: &str, script: &str, plane_id: &str) -> Result<()> {
         self.delete_app(a, &jobs_app(script))?;
         match self.call("DELETE", &format!("/accounts/{a}/workers/scripts/{script}?force=true"), None) {
@@ -545,7 +545,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::time::Instant;
 
-    /// A Cloudflare runner bridge (deployed for this check only, trusting a key made here) starts a runner with a
+    /// A Cloudflare launcher (deployed for this check only, trusting a key made here) starts a runner with a
     /// 3-minute bound; nobody stops it, and its container ends by itself (SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_LIVE_CF_ACCOUNT).
     #[test]
     #[ignore]

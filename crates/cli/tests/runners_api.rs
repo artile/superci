@@ -1,5 +1,5 @@
 //! Runner providers across clouds: a control plane in AWS given AWS's machines, Cloudflare's containers and Modal's
-//! sandboxes through runner bridges, then everything moved to a Cloudflare control plane (AWS's machines through a role
+//! sandboxes through launchers, then everything moved to a Cloudflare control plane (AWS's machines through a role
 //! it is given), and both deleted, AWS, Cloudflare and Modal answering as they answered a real account (`fixtures/
 //! runners`, recorded 2026-10-16 with throwaway control planes, deleted after); each control plane served here.
 mod common;
@@ -35,7 +35,7 @@ fn an_aws_control_plane_gets_every_providers_runners_then_moves_to_cloudflare_as
     {
         let mut w = served.aws.workers.lock().unwrap();
         w.insert("superci.acme.workers.dev".into(), cf.url.clone());
-        // (The runner bridges' health, which the dashboard waits for once each is deployed: a server here answers.)
+        // (The launchers' health, which the dashboard waits for once each is deployed: a server here answers.)
         for agent in ["acmeorg--superci-runners-awsplane0001.modal.run", "acmeorg--superci-runners-cfplane00004.modal.run", "superci-runners-awsplane0001.acme.workers.dev"] { w.insert(agent.into(), cf.url.clone()); }
     }
     let home = common::signed_in(&served);
@@ -64,7 +64,7 @@ fn an_aws_control_plane_gets_every_providers_runners_then_moves_to_cloudflare_as
     step("04-modal-agent");
     let (ok, said) = run("", &["runners", "create", "modal", "--plane=awsplane0001"]);
     assert!(ok && said.contains("modal runs jobs now."), "{said}");
-    let agents = served.aws.settings("awsplane0001").into_iter().find(|(k, _)| k == "AGENTS").map(|(_, v)| v).unwrap_or_default();
+    let agents = served.aws.settings("awsplane0001").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
     assert!(agents.contains("\"cloud\":\"cloudflare\"") && agents.contains("\"cloud\":\"modal\""), "{agents}");
     let (ok, said) = run("", &["runners", "list", "--plane=awsplane0001"]);
     assert!(ok && said.contains("aws ") && said.contains("cloudflare") && said.contains("modal"), "{said}");

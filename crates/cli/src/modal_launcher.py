@@ -1,4 +1,4 @@
-# A SuperCI runner bridge in your Modal workspace: one sandbox per job (GitHub's runner, registered just in time
+# A SuperCI launcher in your Modal workspace: one sandbox per job (GitHub's runner, registered just in time
 # for that job), started when your control plane asks. It trusts that control plane the way AWS does: a token it signed
 # (ES256, its public keys pinned here when the dashboard set this agent up), for this agent's URL, from its subject.
 # Deployed by the SuperCI dashboard with Modal's own `modal deploy`; the sandboxes are Modal's official SDK.
