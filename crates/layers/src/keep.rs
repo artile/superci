@@ -71,9 +71,10 @@ async fn infos(socket: &Path) -> Result<BTreeMap<String, (u64, HashMap<String, S
     Ok(out)
 }
 
-/// What a keep did: what came from the store, what was pulled, what was uploaded.
+/// What a keep did: what came from the store, what was pulled, what was uploaded, and what of the pulled the store had
+/// already (or has on its way: its next job gets it all the same).
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct Done { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub pulled_bytes: u64, pub uploaded: u64, pub uploaded_bytes: u64 }
+pub struct Done { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub pulled_bytes: u64, pub uploaded: u64, pub uploaded_bytes: u64, pub had: u64, pub had_bytes: u64 }
 
 /// The keep (see the module); 0 whatever happened (a machine's end never waits on it beyond `most`).
 pub fn keep(o: &Options) -> i32 {
@@ -100,10 +101,12 @@ pub fn keep(o: &Options) -> i32 {
         // (Only a blob kept here whole.)
         if blob_path(&o.content, &l.digest).and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.len() == l.size) { offered.push(l) }
     }
-    let (uploaded, bytes) = offer(&agent, &o.link, &o.content, offered, began + o.most);
+    let sizes: std::collections::HashMap<String, u64> = offered.iter().map(|l| (l.digest.clone(), l.size)).collect();
+    let (uploaded, bytes, had) = offer(&agent, &o.link, &o.content, offered, began + o.most);
     (done.uploaded, done.uploaded_bytes) = (uploaded, bytes);
+    (done.had, done.had_bytes) = (had.len() as u64, had.iter().filter_map(|d| sizes.get(d)).sum());
     let report = json!({ "served": done.served, "served_bytes": done.served_bytes, "pulled": done.pulled, "pulled_bytes": done.pulled_bytes,
-        "uploaded": done.uploaded, "uploaded_bytes": done.uploaded_bytes, "seconds": (began.elapsed().as_secs_f64() * 10.0).round() / 10.0 });
+        "uploaded": done.uploaded, "uploaded_bytes": done.uploaded_bytes, "had": done.had, "had_bytes": done.had_bytes, "seconds": (began.elapsed().as_secs_f64() * 10.0).round() / 10.0 });
     eprintln!("superci-layers keep: {report}");
     if let Err(e) = post(&agent, &format!("{}/layers-kept", o.link), &report) { eprintln!("superci-layers keep: saying what was kept: {e}") }
     0
@@ -121,18 +124,19 @@ fn post(agent: &ureq::Agent, url: &str, body: &Value) -> Result<Value, String> {
 }
 
 /// The layers offered (fifty at a time), then those the control plane asks for uploaded, `AT_ONCE` at a time, until
-/// `until`: how many were, and their bytes.
-fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, until: Instant) -> (u64, u64) {
+/// `until`: how many were, their bytes, and the layers it said it has already.
+fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, until: Instant) -> (u64, u64, Vec<String>) {
     let mut asked: Vec<(String, Value)> = vec![];
+    let mut had: Vec<String> = vec![];
     let mut uploaded_at = String::new();
     for chunk in offered.chunks(50) {
         let body = json!({ "layers": chunk.iter().map(|l| json!({ "digest": l.digest, "size": l.size, "sources": l.sources })).collect::<Vec<_>>() });
         match post(agent, &format!("{link}/layers-propose"), &body) {
             Ok(answer) => {
                 uploaded_at = answer["uploaded"].as_str().unwrap_or_default().to_string();
-                for (d, a) in answer["layers"].as_object().into_iter().flatten() { if a["do"] == "upload" { asked.push((d.clone(), a.clone())) } }
+                for (d, a) in answer["layers"].as_object().into_iter().flatten() { if a["do"] == "upload" { asked.push((d.clone(), a.clone())) } else if a["do"] == "have" { had.push(d.clone()) } }
             }
-            Err(e) => { eprintln!("superci-layers keep: offering layers: {e}"); return (0, 0) }
+            Err(e) => { eprintln!("superci-layers keep: offering layers: {e}"); return (0, 0, vec![]) }
         }
     }
     let next = std::sync::Mutex::new(asked.into_iter());
@@ -155,7 +159,8 @@ fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, 
             });
         }
     });
-    total.into_inner().unwrap()
+    let (n, bytes) = total.into_inner().unwrap();
+    (n, bytes, had)
 }
 
 /// The blob put at the link the control plane gave, with the headers it said (given up at `until`).

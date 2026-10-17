@@ -893,11 +893,11 @@ pub fn images_said(j: &serde_json::Value) -> Option<String> {
     let n = |k: &str| i[k].as_u64().unwrap_or(0);
     let layers = |c: u64| if c == 1 { "1 layer".to_string() } else { format!("{c} layers") };
     let from = (n("served") > 0).then(|| format!("{} from the cache ({})", layers(n("served")), size_words(n("served_bytes"))));
-    // (What was uploaded is what the next job has from it: pulled and not uploaded is said as that.)
-    let kept = match (n("uploaded"), n("pulled")) {
-        (0, _) => "none uploaded to the cache".to_string(),
-        (up, all) if up >= all => "kept for the next job".to_string(),
-        (up, _) => format!("{} of them kept for the next job ({})", up, size_words(n("uploaded_bytes"))),
+    // (What the next job has from it: what was uploaded, and what the cache had already. Pulled and neither: said.)
+    let kept = match (n("uploaded") + n("had"), n("pulled")) {
+        (0, _) => "none kept for the next job".to_string(),
+        (k, all) if k >= all => "kept for the next job".to_string(),
+        (k, _) => format!("{k} of them kept for the next job ({})", size_words(n("uploaded_bytes") + n("had_bytes"))),
     };
     let pulled = (n("pulled") > 0).then(|| format!("{} pulled ({}), {kept}", layers(n("pulled")), size_words(n("pulled_bytes"))));
     match (from, pulled) { (None, None) => None, (Some(a), None) | (None, Some(a)) => Some(a), (Some(a), Some(b)) => Some(format!("{a}; {b}")) }

@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.15
+- A job's Docker images count what the cache had already among what was kept: a layer pulled that the cache had (from another run, or another repository's public one) is there for the next job too, and was said as "none uploaded to the cache". Its machine says those apart (`had`).
 - `superci limits retrieve` lists every limit spending counts against, each with the command that changes it: the CI's, its AWS account's for a month and a day (its spot and on-demand machines together), and a provider's own. It said "no limit is set" while the AWS account's limit was what refused jobs. `superci accounts retrieve aws` says the account's limits too.
 - Whether AWS itself emails is said with them: with no budget in AWS, nothing emails at 80% or 100% (`superci accounts update aws --aws-budget=emails --email=ADDRESS` adds one). With one, `superci accounts retrieve aws` says what AWS has counted against it so far. That is AWS's own bill, hours behind SuperCI's estimate, and its emails follow that count.
 - A job refused at an account's or a provider's limit says the command that raises it: "the AWS account reached its $100 a month (`superci accounts update aws --monthly-usd=N` raises it)".

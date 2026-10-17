@@ -890,12 +890,13 @@ fn what_a_job_had_from_the_caches_docker_images_is_said_and_keeping_them_is_turn
     let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).stdout).into_owned();
     assert!(said.contains("Docker images: 103 layers from the cache (2.7 GB); 12 layers pulled (300 MB), kept for the next job."), "{said}");
     // Pulled and not uploaded (or only some): said as that, never as kept.
-    for (uploaded, said) in [(0, "12 layers pulled (300 MB), none uploaded to the cache"), (5, "12 layers pulled (300 MB), 5 of them kept for the next job (120 MB)")] {
+    // (Kept: what was uploaded, and what the cache had already.)
+    for (uploaded, had, said) in [(0, 0, "12 layers pulled (300 MB), none kept for the next job"), (5, 0, "12 layers pulled (300 MB), 5 of them kept for the next job (120 MB)"), (2, 10, "12 layers pulled (300 MB), kept for the next job")] {
         {
             let mut store = served.store.0.lock().unwrap();
             let key = format!("job:{job_id}");
             let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
-            j["images"] = serde_json::json!({ "pulled": 12, "pulled_bytes": 300_000_000u64, "uploaded": uploaded, "uploaded_bytes": 120_000_000u64 * (uploaded > 0) as u64, "at": 1 });
+            j["images"] = serde_json::json!({ "pulled": 12, "pulled_bytes": 300_000_000u64, "uploaded": uploaded, "uploaded_bytes": 120_000_000u64 * (uploaded > 0) as u64, "had": had, "had_bytes": 25_000_000u64 * had, "at": 1 });
             store.insert(key, j.to_string());
         }
         assert_eq!(json(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).1["job"]["images"].as_str(), Some(said));
