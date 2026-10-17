@@ -2348,10 +2348,21 @@ impl Dashboard {
     /// have expired are removed afterwards, in the background: the page does not wait for that.
     fn key_planes(&mut self) {
         self.renew_folder_key();
-        let unkeyed: Vec<Plane> = self.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. }) && !self.keyed.contains(p.plane_id())).cloned().collect();
-        if unkeyed.is_empty() { return }
-        // Handed to each at once.
+        let unkeyed = |d: &Dashboard| -> Vec<Plane> { d.planes.iter().filter(|p| !matches!(p, Plane::Seen { .. }) && !d.keyed.contains(p.plane_id())).cloned().collect() };
+        if unkeyed(self).is_empty() { return }
+        // (Its sign-ins renewed first: that takes the lock below too.)
         let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+        // One SuperCI at a time on this computer (commands run side by side): a key made meanwhile by another one, and
+        // written, is taken instead of handing one more; this one's is written before the next goes on.
+        let held = self.store.clone().and_then(|s| s.renewing());
+        if self.keyed.is_empty() {
+            if let Some(k) = self.store.as_ref().and_then(|s| s.read().key).filter(|k| k.name != self.status_secret && key_until(&k.name) > now_ms() / 1000 + 86_400) {
+                (self.status_key, self.status_secret, self.keyed) = (k.value, k.name, k.planes.into_iter().collect());
+            }
+        }
+        let unkeyed = unkeyed(self);
+        if unkeyed.is_empty() { return self.keep() }
+        // Handed to each at once.
         let (name, key) = (self.status_secret.clone(), self.status_key.clone());
         let done: Vec<String> = std::thread::scope(|s| {
             let hs: Vec<_> = unkeyed.iter().map(|p| { let (writer, name, key) = (&writer, &name, &key); s.spawn(move || timed(&format!("{}: hand it this session's key", p.place()), || {
@@ -2364,6 +2375,8 @@ impl Dashboard {
             hs.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
         });
         self.keyed.extend(done);
+        self.keep();
+        drop(held);
         let mut tidy: Vec<Box<dyn FnOnce() + Send>> = vec![];
         for p in &unkeyed {
             // (And the keys an older SuperCI on another device hands under the old name, which nothing here reads.)

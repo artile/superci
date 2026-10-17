@@ -1006,3 +1006,21 @@ fn a_control_plane_that_does_not_take_this_computers_key_says_why() {
     assert!(e.contains("newer than this SuperCI") && e.contains("npx @superci/cli@latest"), "{e}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Commands started side by side on a computer with no key yet (a coding agent's, several at once) hand the control
+/// plane one key between them, not one each: the first makes it, the others take it.
+#[test]
+fn commands_side_by_side_hand_one_key_between_them() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept.as_object_mut().unwrap().remove("key");
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let before = served.aws.settings(superci_testkit::PLANE).iter().filter(|(k, _)| k.starts_with("DEVICE_KEY_")).count();
+    let children: Vec<_> = (0..6).map(|_| common::command(&home).args(["runs", "list", "--json"]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()).collect();
+    for c in children { let o = c.wait_with_output().unwrap(); assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)); }
+    let keys: Vec<String> = served.aws.settings(superci_testkit::PLANE).into_iter().map(|(k, _)| k).filter(|k| k.starts_with("DEVICE_KEY_")).collect();
+    assert_eq!(keys.len(), before + 1, "{keys:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
