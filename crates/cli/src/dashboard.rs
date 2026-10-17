@@ -7337,6 +7337,30 @@ mod tests {
         assert!(r.status == 303 && lock(&d.deploying).is_none() && d.plane_page().contains("Set up a control plane"));
     }
 
+    /// An account whose refusals are not its organization's: spot refused by the sign-in's own permissions and a
+    /// region by a rule AWS did not name are said as "Restricted", each with whose rule it is; with several accounts
+    /// signed in and none named, which one is asked.
+    #[test]
+    fn refusals_by_the_sign_in_or_unsaid_are_said_as_restricted_and_several_accounts_need_one_named() {
+        let mut d = Dashboard::new();
+        d.aws = Some(aws::Session::for_test("111111111111"));
+        let mut look = looked(include_str!("../fixtures/aws/project-activated/look.jsonl"));
+        let refused = |by| aws::Answer::Refused(superci_core::aws::Refusal { action: "ec2:RunInstances".into(), by, policy: String::new() });
+        look.spot = Some(refused(superci_core::aws::By::Identity));
+        for (_, answer) in look.regions.iter_mut() { if matches!(answer, aws::Answer::Refused(_)) { *answer = refused(superci_core::aws::By::Unsaid) } }
+        d.aws_looks.insert("111111111111".into(), (now_ms(), look));
+        let section = d.aws_account_section();
+        for said in ["<small>Some of what SuperCI does there is refused: see below.</small>", r#"<span class="pill open"><i></i>Restricted</span>"#,
+            "<small>The other 11 are refused. AWS did not say by whose rule.</small></dd></div>",
+            "<dt>Spot machines</dt><dd>Not allowed<small>By the permissions of the role or user signed in as. Jobs run on on-demand machines, at about twice the price.</small>"] {
+            assert!(section.contains(said), "{said}\n\n{section}");
+        }
+        assert!(!section.contains("How to allow more"), "{section}");
+        d.aws_others.push(aws::Session::for_test("222222222222"));
+        assert_eq!(d.aws_account("").unwrap_err(), "Say which account: 111111111111, 222222222222.");
+        assert!(d.aws_account("333333333333").unwrap_err().contains("not signed in to account 333333333333"));
+    }
+
     #[test]
     fn an_organizations_picture_is_asked_for_at_the_start_and_once_a_day() {
         let mut d = Dashboard::new();
