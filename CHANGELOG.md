@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.13
+## 0.19.13 — 2026-10-17
 - A job whose spot machine AWS takes back says why on GitHub: an error in its log and among its annotations, beside GitHub's "The runner has received a shutdown signal". Its row says plainly that SuperCI runs it again by itself, off spot machines, once its run has finished (GitHub runs a job again only then): "run again, off spot machines" read as something to do.
 - `superci jobs retrieve` gives a running job's log as far as it goes: GitHub has it only as far as its runner has sent it in blocks (minutes behind at times), and what its machine sent after that comes too. It says where the log came from and when its last line was written; `--out` says a running job's is its log so far. `--run=ID --job=NAME` without `--out` found the job and asked for no log.
 - A machine other than the first choice says why, with the price: "Not the first choice: AWS had no spot c8a.16xlarge in us-east-1a ($0.135 an hour)", now in `superci runs create` and `superci jobs list` too. When the first choice has no machine, AWS is asked for the cheapest of the others of that size it has room in (it took the one it had most room in: an r8a.16xlarge at nearly three times a c8a's price).
