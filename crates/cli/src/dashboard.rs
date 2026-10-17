@@ -926,7 +926,9 @@ pub fn job_start(j: &serde_json::Value) -> serde_json::Value {
         return serde_json::json!({ "steps": steps.iter().map(|(what, ms, more)| serde_json::json!({ "what": what, "ms": ms, "more": more })).collect::<Vec<_>>(), "asked": asks_said(j) })
     };
     let asked = asks_said(j);
-    step(if j["cloud"] == "aws" { "AWS gave a machine" } else { "its machine was asked for" }, heard, launched, asked.clone());
+    // (A wait for room under the account's spot limit first: said apart, as SuperCI's, not AWS's.)
+    let asked_at = match n(&j["spot_waited_ms"]) { Some(w) if heard + w <= launched => { step("waited for room under your AWS spot limit", heard, heard + w, String::new()); heard + w } _ => heard };
+    step(if j["cloud"] == "aws" { "AWS gave a machine" } else { "its machine was asked for" }, asked_at, launched, asked.clone());
     let m = &j["machine"];
     match (n(&m["script_ms"]), m["boot_s"].as_f64()) {
         (Some(script), Some(boot)) => {
@@ -8607,6 +8609,9 @@ mod tests {
         let before = serde_json::json!({ "job_id": 8, "state": "done", "cloud": "aws", "machine_id": "i-2", "machine_type": "m8a.xlarge", "at_ms": t, "launched_ms": t + 3_400, "started_ms": t + 16_500 });
         assert_eq!(job_start_lines(&before), vec!["Its start: 17 s from queued to running", "    3.4 s  AWS gave a machine", "     13 s  its machine booted and its runner took the job"]);
         assert!(job_start_lines(&serde_json::json!({ "job_id": 9, "state": "waiting", "at_ms": t })).is_empty());
+        // One that waited for room under the account's spot limit first: that wait said apart from AWS's part.
+        let waited = serde_json::json!({ "job_id": 10, "state": "done", "cloud": "aws", "machine_id": "i-3", "machine_type": "c8a.4xlarge", "at_ms": t, "spot_waited_ms": 67_500, "launched_ms": t + 70_000, "started_ms": t + 80_000 });
+        assert_eq!(job_start_lines(&waited), vec!["Its start: 1m 20s from queued to running", "    1m 7s  waited for room under your AWS spot limit", "    2.5 s  AWS gave a machine", "     10 s  its machine booted and its runner took the job"]);
         // The first choice had no spot machine, and the others were asked in one request: what AWS chose among them.
         let mut many = j.clone();
         many["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), { "at": 800, "kind": "r8a.8xlarge", "zone": "us-east-1d", "spot": true, "said": "started", "ms": 2_900, "pools": 14 }]);

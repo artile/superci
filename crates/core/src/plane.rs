@@ -359,6 +359,8 @@ pub struct Job {
     /// Since when it waits for spot at the account's spot limit, while SuperCI's own machines that just ended still
     /// count toward it (`SPOT_LIMIT_WAIT_MS` at most, then the next place in the order).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub spot_limit_wait: Option<u64>,
+    /// How long it waited for that before its machine was asked for (its start says the wait apart from AWS's part).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub spot_waited_ms: Option<u64>,
     /// What machines it had before this one cost (each one that never took it, stopped for a new one: `again`).
     #[serde(default, skip_serializing_if = "is_zero_f64")] pub earlier_usd: f64,
     /// Kept off spot machines, and the account's on-demand limit did not let its machine start: asked on a spot
@@ -3120,7 +3122,7 @@ impl<'a> ControlPlane<'a> {
                 }
             };
             job.state = "launched".into();
-            job.spot_limit_wait = None;
+            if let Some(since) = job.spot_limit_wait.take() { job.spot_waited_ms = Some(began.saturating_sub(since)) }
             job.launched_ms = Some(self.clock.now_ms());
             job.machine_id = Some(machine_id);
             // Its CPUs are the machine's (AWS may give a larger size than asked when the family has no such size).

@@ -2880,7 +2880,7 @@ fn a_job_sent_on_demand_by_the_spot_limit_notes_when_machines_just_ended_still_c
     clock.0.set(clock.0.get() + 20_000);
     block_on(plane.alarm()).unwrap();
     let j = job(&store, 22);
-    assert_eq!((j["state"].as_str(), j.get("on_demand"), j.get("spot_limit_wait")), (Some("launched"), None, None), "{j}");
+    assert_eq!((j["state"].as_str(), j.get("on_demand"), j.get("spot_limit_wait"), j["spot_waited_ms"].as_u64()), (Some("launched"), None, None, Some(40_000)), "{j}");
     // At the limit for two minutes: on-demand then (as soon as nothing of its own ended within them).
     full.set(true);
     run(job_event("queued", 24, "acme/app", None));
