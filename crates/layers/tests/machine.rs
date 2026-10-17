@@ -84,6 +84,13 @@ fn setup_switches_a_machines_docker_to_the_layers_service_and_off_puts_it_back()
     // Switched: the service under systemd, containerd and Docker on it (started again beside, as beside a runner).
     let o = m.exec(&measured_env(), &["/usr/local/bin/superci-layers", "setup", "--index-url=http://127.0.0.1:8000/layers.json", "--disk=none"]);
     let said = String::from_utf8_lossy(&o.stdout).into_owned();
+    // (A kernel before 6.12, as GitHub's runners have, mounts no EROFS file: said, and Docker left as it comes, as on
+    // such a machine. Ubuntu 26.04's mounts them.)
+    if said.contains("the kernel does not mount an EROFS file") {
+        assert!(o.status.success() && said.contains("superci-layers: off: "), "{said}");
+        assert_eq!(m.sh("docker info -f '{{.Driver}}'"), stock);
+        return
+    }
     assert!(o.status.success() && said.contains("superci-layers: switched in"), "{said}{}", String::from_utf8_lossy(&o.stderr));
     m.sh("for i in $(seq 120); do [ \"$(docker info -f '{{.Driver}}' 2>/dev/null)\" = superci ] && exit 0; sleep 0.5; done; cat /var/log/superci-layers.log; exit 1");
     assert_eq!(m.sh("systemctl is-active superci-layers"), "active");
