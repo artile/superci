@@ -7,9 +7,11 @@ fn the_runners_node_points_actions_here_and_keeps_every_variable() {
     let dir = std::env::temp_dir().join(format!("superci-cache-wrap-{}", std::process::id()));
     let bin = dir.join("node20/bin");
     std::fs::create_dir_all(&bin).unwrap();
-    // The "real Node" here prints what it was given: its environment (env itself, no shell in between; a link, as
-    // macOS stops a copy of its own programs).
-    std::os::unix::fs::symlink("/usr/bin/env", bin.join("node")).unwrap();
+    // The "real Node" here prints what it was given: its environment (not through a shell, which drops a variable with
+    // a dash in its name; not env itself, which on Ubuntu 26.04 is one program for all of coreutils, telling which by
+    // the name it is run as, here "node").
+    std::fs::write(bin.join("node"), "#!/usr/bin/env python3\nimport os\nfor k, v in os.environ.items(): print(f'{k}={v}')\n").unwrap();
+    std::fs::set_permissions(bin.join("node"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let program = env!("CARGO_BIN_EXE_superci-cache");
     for _ in 0..2 { assert!(Command::new(program).args(["wrap", dir.to_str().unwrap()]).status().unwrap().success()) }
     assert!(bin.join("node.real").exists());
