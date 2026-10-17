@@ -71,15 +71,7 @@ fn to_stand_in(mut r: Request) -> Request {
 }
 
 /// An outside address, or (in a debug build with `SUPERCI_STAND_IN`) the stand-in's for it.
-pub fn stand_in(url: &str) -> String {
-    #[cfg(debug_assertions)]
-    if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
-        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".signin.aws.amazon.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h == "gitlab.com" || h == "api.cloudflare.com" || h == "dash.cloudflare.com" || h == "registry.cloudflare.com" || h == "ghcr.io" || h.ends_with(".workers.dev") || h == "api.modal.com" || h.ends_with(".modal.run"))) {
-            return format!("{}/{rest}", at.trim_end_matches('/'));
-        }
-    }
-    url.to_string()
-}
+pub fn stand_in(url: &str) -> String { superci_core::io::stand_in(url) }
 
 /// How an error starts when AWS says a sign-in is over (see `Session::credentials`).
 pub const ENDED: &str = "Your AWS sign-in has ended";

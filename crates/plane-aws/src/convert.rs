@@ -207,7 +207,7 @@ pub fn convert(http: &(dyn Http + Sync), creds: &Credentials, job: &Job, mkfs: &
                 (url, headers, None)
             }
         };
-        let mut request = agent().get(&url);
+        let mut request = agent().get(&superci_core::io::stand_in(&url));
         for (k, v) in &headers { request = request.header(k.as_str(), v.as_str()) }
         let response = request.call().map_err(|e| format!("fetching the blob: {e}"))?;
         if response.status() != 200 { return Err(format!("fetching the blob: HTTP {}", response.status())) }

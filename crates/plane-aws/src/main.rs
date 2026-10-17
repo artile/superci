@@ -30,8 +30,10 @@ struct Blocking(ureq::Agent, ureq::Agent);
 #[async_trait(?Send)]
 impl Http for Blocking {
     async fn send(&self, r: Request) -> io::Result<Response> {
-        let mut builder = ureq::http::Request::builder().method(r.method.as_str()).uri(r.url.as_str());
-        for (k, v) in &r.headers { builder = builder.header(k.as_str(), v.as_str()) }
+        // (In a test, the clouds' stand-in: see `io::stand_in`.)
+        let url = io::stand_in(&r.url);
+        let mut builder = ureq::http::Request::builder().method(r.method.as_str()).uri(url.as_str());
+        for (k, v) in &r.headers { if url == r.url || !k.eq_ignore_ascii_case("host") { builder = builder.header(k.as_str(), v.as_str()) } }
         let request = builder.body(r.body.clone()).map_err(|e| e.to_string())?;
         let mut response = if r.no_follow { &self.1 } else { &self.0 }.run(request).map_err(|e| format!("{} {}: {e}", r.method, r.url))?;
         let headers = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect();
@@ -225,7 +227,7 @@ const SOON_MS: u64 = 30_000;
 /// answer; that call waits out the time and sweeps (see `main`). One such call is on its way at a time, however
 /// many jobs ask (claimed in the table): a sweep is for every job, and asks for the next itself while any waits.
 /// Where it may not call itself (a role from before), the schedule does it, as it did.
-struct Scheduled<'a> { http: &'a Blocking, store: &'a Dynamo<'a>, region: &'a str, function: &'a str,
+struct Scheduled<'a> { http: &'a dyn Http, store: &'a Dynamo<'a>, region: &'a str, function: &'a str,
     /// What is to be done once the request at hand is answered (see `main`).
     later: &'a std::cell::RefCell<Vec<String>> }
 
@@ -471,6 +473,57 @@ mod tests {
     }
 
     fn store(fake: &FakeDynamo) -> Dynamo<'_> { Dynamo { http: fake, table: "superci-plane-t".into(), region: "us-east-1".into(), old: std::cell::Cell::new(None) } }
+
+    /// Lambda taking (or refusing) the function's calls to itself; DynamoDB as above.
+    #[derive(Default)]
+    struct Lambda { refuse: std::cell::Cell<bool>, called: RefCell<Vec<Request>> }
+    #[async_trait(?Send)]
+    impl Http for Lambda {
+        async fn send(&self, r: Request) -> io::Result<Response> {
+            self.called.borrow_mut().push(r);
+            Ok(Response::new(if self.refuse.get() { 403 } else { 202 }, "application/json", "{}"))
+        }
+    }
+
+    #[test]
+    fn a_sweep_sooner_than_the_schedules_is_one_call_to_itself_at_a_time() {
+        let fake = FakeDynamo::default();
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
+        let s = store(&fake);
+        let (lambda, later) = (Lambda::default(), RefCell::new(vec![]));
+        let timer = Scheduled { http: &lambda, store: &s, region: "us-east-1", function: "superci-plane-t", later: &later };
+        // Later than half a minute: the schedule's minute does it.
+        block_on(timer.wake_in(60_000)).unwrap();
+        assert!(lambda.called.borrow().is_empty());
+        // Sooner: one call, not waited for, signed, saying when.
+        block_on(timer.wake_in(20_000)).unwrap();
+        let called = lambda.called.borrow()[0].clone();
+        assert_eq!((called.url.as_str(), called.header("x-amz-invocation-type")), ("https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-t/invocations", Some("Event")));
+        assert!(called.header("authorization").is_some_and(|a| a.contains("/us-east-1/lambda/aws4_request")));
+        let at = serde_json::from_slice::<Value>(&called.body).unwrap()["at"].as_u64().unwrap();
+        assert!(at >= now_ms() + 19_000 && at <= now_ms() + 20_000);
+        // Another asked for meanwhile: the one on its way does for both.
+        block_on(timer.wake_in(1_000)).unwrap();
+        assert_eq!(lambda.called.borrow().len(), 1);
+        // One noted long ago never came: a call again.
+        block_on(s.put(WAKING, (now_ms() - 120_000).to_string())).unwrap();
+        block_on(timer.wake_in(1_000)).unwrap();
+        assert_eq!(lambda.called.borrow().len(), 2);
+        // Refused (a role from before, which may not call itself): its note taken away, the schedule does it.
+        block_on(s.delete(WAKING)).unwrap();
+        lambda.refuse.set(true);
+        block_on(timer.wake_in(1_000)).unwrap();
+        assert_eq!(block_on(s.get(WAKING)).unwrap(), None);
+        // A function with no name (not on Lambda) calls nothing; what is left for later is kept for after the answer.
+        let none = Scheduled { http: &lambda, store: &s, region: "us-east-1", function: "", later: &later };
+        block_on(none.wake_in(1_000)).unwrap();
+        assert_eq!(lambda.called.borrow().len(), 3);
+        assert!(timer.later("start job:1"));
+        assert_eq!(*later.borrow(), ["start job:1"]);
+        let began = Instant::now();
+        block_on(timer.pause(30));
+        assert!(began.elapsed() >= Duration::from_millis(30));
+    }
 
     #[test]
     fn it_keeps_each_kind_of_record_in_a_partition_of_its_own_and_does_what_every_store_does() {

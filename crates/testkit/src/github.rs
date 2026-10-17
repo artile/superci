@@ -234,7 +234,14 @@ impl GitHub {
             let missing = || Response::new(404, "application/xml", format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>{}</Key></Error>", path.trim_start_matches('/')));
             return Some(match r.method.as_str() {
                 "PUT" if h.refuse_puts => Response::new(403, "application/xml", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>"),
-                "PUT" => { h.objects.insert(key, r.body.clone()); Response::new(200, "application/xml", "") }
+                // (A copy within S3: `x-amz-copy-source: /bucket/key`.)
+                "PUT" => match r.header("x-amz-copy-source").map(|c| c.trim_start_matches('/').to_string()) {
+                    Some(from) => match h.objects.get(&from).cloned() {
+                        Some(b) => { h.objects.insert(key, b); Response::new(200, "application/xml", "<CopyObjectResult><ETag>\"copied\"</ETag></CopyObjectResult>") }
+                        None => missing(),
+                    },
+                    None => { h.objects.insert(key, r.body.clone()); Response::new(200, "application/xml", "") }
+                },
                 "HEAD" => if h.objects.contains_key(&key) { Response::new(200, "application/octet-stream", "") } else { Response::new(404, "application/xml", "") },
                 // (A range of it, as S3 answers one: 206 with those bytes.)
                 "GET" => match (h.objects.get(&key), r.header("range").and_then(|v| v.strip_prefix("bytes=")).and_then(|v| v.split_once('-'))) {

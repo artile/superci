@@ -262,6 +262,11 @@ pub struct Aws {
     /// Workers on workers.dev, by host (`superci.acme.workers.dev`), and the control plane on this computer each stands
     /// for (its address).
     pub workers: Arc<Mutex<BTreeMap<String, String>>>,
+    /// DynamoDB's items, by table, partition and sort key (`p`, `k`: an AWS control plane's table), as its item calls
+    /// keep them.
+    pub items: Arc<Mutex<BTreeMap<(String, String, String), Value>>>,
+    /// Lambda functions called without waiting (`Event`): each function's name and what it was given.
+    pub invoked: Arc<Mutex<Vec<(String, Value)>>>,
 }
 
 /// What a request asks AWS to do: its target (JSON APIs) or its Action (query APIs).
@@ -438,6 +443,12 @@ impl Aws {
         if url.contains(".signin.aws.amazon.com/v1/token") {
             return (400, json!({ "error": "INVALID_REQUEST", "message": "The request is missing a required parameter, includes an invalid parameter value, or is otherwise malformed." }))
         }
+        // Lambda, a function called without waiting for it (the control plane's own sweep, its converter).
+        if let Some(function) = url.split("/2015-03-31/functions/").nth(1).and_then(|f| f.strip_suffix("/invocations")) {
+            self.invoked.lock().unwrap().push((function.to_string(), a));
+            return (202, json!({}))
+        }
+        if let Some(op) = target.strip_prefix("DynamoDB_20120810.") { if let Some(answered) = self.dynamo(op, &a) { return answered } }
         match target {
             "AmazonSSM.PutParameter" => {
                 if self.params.lock().unwrap().contains_key(&name) && a["Overwrite"] != true { return (400, json!({ "__type": "ParameterAlreadyExists" })) }
@@ -468,6 +479,54 @@ impl Aws {
             }
             _ => (400, json!({ "__type": "SuperCITestkitUnknown", "message": format!("the test kit's AWS has no answer for {target} at {url}") })),
         }
+    }
+}
+
+impl Aws {
+    /// DynamoDB's item calls, as DynamoDB answers them (a page of a query is 25 items at most, so callers page); none
+    /// for its other calls (a table made or deleted: as recorded).
+    fn dynamo(&self, op: &str, a: &Value) -> Option<(u16, Value)> {
+        let table = a["TableName"].as_str().unwrap_or_default().to_string();
+        let key = |table: &str, k: &Value| (table.to_string(), k["p"]["S"].as_str().unwrap_or_default().to_string(), k["k"]["S"].as_str().unwrap_or_default().to_string());
+        let failed = |kind: &str| (400, json!({ "__type": format!("com.amazonaws.dynamodb.v20120810#{kind}"), "message": "The conditional request failed" }));
+        let mut items = self.items.lock().unwrap();
+        Some(match op {
+            "GetItem" => (200, items.get(&key(&table, &a["Key"])).map(|i| json!({ "Item": i })).unwrap_or(json!({}))),
+            "PutItem" => {
+                let at = key(&table, &a["Item"]);
+                let held = items.get(&at);
+                let allowed = match a["ConditionExpression"].as_str() {
+                    Some("attribute_not_exists(k)") => held.is_none(),
+                    Some("v = :was") => held.is_some_and(|h| h["v"] == a["ExpressionAttributeValues"][":was"]),
+                    _ => true,
+                };
+                if !allowed { return Some(failed("ConditionalCheckFailedException")) }
+                items.insert(at, a["Item"].clone());
+                (200, json!({}))
+            }
+            "DeleteItem" => { items.remove(&key(&table, &a["Key"])); (200, json!({})) }
+            "Query" => {
+                let vals = &a["ExpressionAttributeValues"];
+                let (p, prefix) = (vals[":p"]["S"].as_str().unwrap_or_default(), vals[":k"]["S"].as_str().unwrap_or(""));
+                let mut hits: Vec<&Value> = items.iter().filter(|((t, ip, ik), _)| *t == table && ip == p && ik.starts_with(prefix)).map(|(_, i)| i).collect();
+                if a["ScanIndexForward"] == false { hits.reverse() }
+                let start = a["ExclusiveStartKey"]["k"]["S"].as_str().map(|after| hits.iter().position(|i| i["k"]["S"] == after).map(|x| x + 1).unwrap_or(0)).unwrap_or(0);
+                let page = a["Limit"].as_u64().unwrap_or(25).min(25) as usize;
+                let shown: Vec<Value> = hits.iter().skip(start).take(page).map(|i| (*i).clone()).collect();
+                let mut out = json!({ "Items": shown, "Count": shown.len() });
+                if start + page < hits.len() { out["LastEvaluatedKey"] = json!({ "p": { "S": p }, "k": shown.last().map(|i| i["k"].clone()).unwrap_or_default() }) }
+                (200, out)
+            }
+            "BatchGetItem" => {
+                let mut responses = serde_json::Map::new();
+                for (t, ask) in a["RequestItems"].as_object().into_iter().flatten() {
+                    let found: Vec<Value> = ask["Keys"].as_array().into_iter().flatten().filter_map(|k| items.get(&key(t, k)).cloned()).collect();
+                    responses.insert(t.clone(), Value::Array(found));
+                }
+                (200, json!({ "Responses": responses, "UnprocessedKeys": {} }))
+            }
+            _ => return None,
+        })
     }
 }
 

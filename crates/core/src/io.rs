@@ -259,3 +259,16 @@ pub fn form(body: &[u8]) -> Vec<(String, String)> {
 pub fn field<'a>(fields: &'a [(String, String)], name: &str) -> &'a str {
     fields.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).unwrap_or("")
 }
+
+/// An outside address, or, in a debug build with `SUPERCI_STAND_IN=URL`, the stand-in's for it (`superci_testkit`'s,
+/// as `URL/<the host>/<path>`): AWS, GitHub's API, where GitHub keeps logs, gitlab.com, Cloudflare's API and Modal's.
+/// What tests run (the CLI, the dashboard, the AWS control plane's program) reaches no cloud.
+pub fn stand_in(url: &str) -> String {
+    #[cfg(debug_assertions)]
+    if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
+        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".signin.aws.amazon.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h == "gitlab.com" || h == "api.cloudflare.com" || h == "dash.cloudflare.com" || h == "registry.cloudflare.com" || h == "ghcr.io" || h.ends_with(".workers.dev") || h == "api.modal.com" || h.ends_with(".modal.run"))) {
+            return format!("{}/{rest}", at.trim_end_matches('/'));
+        }
+    }
+    url.to_string()
+}

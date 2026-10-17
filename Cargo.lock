@@ -2001,6 +2001,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "superci-core",
+ "superci-testkit",
  "ureq",
  "zstd",
 ]
