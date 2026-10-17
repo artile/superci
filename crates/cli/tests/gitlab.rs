@@ -280,3 +280,41 @@ fn a_failed_gitlab_jobs_log_with_times_streams_and_nested_sections_is_shown_in_i
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The same from the CLI: connected with a token named by its variable, a project switched on and off, all of them
+/// on at once, and disconnected (with --confirm).
+#[test]
+fn gitlab_is_connected_from_the_cli_and_its_projects_switched() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let run = |args: &[&str], token: Option<&str>| {
+        let mut c = common::command(&home);
+        c.env_remove("SUPERCI_GITLAB_TOKEN");
+        if let Some(t) = token { c.env("ACME_GITLAB_TOKEN", t); }
+        let o = c.args(args).output().unwrap();
+        (o.status.code().unwrap_or(-1), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)))
+    };
+    let (code, said) = run(&["connections", "create", "gitlab", "--token-env=ACME_GITLAB_TOKEN"], None);
+    assert!(code == 2 && said.contains("Give the GitLab token by name: ACME_GITLAB_TOKEN"), "{code} {said}");
+    let (code, said) = run(&["connections", "create", "gitlab", "--token-env=ACME_GITLAB_TOKEN", "--dry-run"], Some(gitlab::TOKEN));
+    assert!(code == 0 && said.contains("connect https://gitlab.com with the token in ACME_GITLAB_TOKEN"), "{code} {said}");
+    let (code, said) = run(&["connections", "create", "gitlab", "--token-env=ACME_GITLAB_TOKEN"], Some(gitlab::TOKEN));
+    assert!(code == 0 && said.contains("GitLab is connected."), "{code} {said}");
+    let project = gitlab::PROJECT.to_string();
+    for (args, expect) in [(&["projects", "update", &project, "--enabled=true"][..], "Its jobs come here now"), (&["projects", "update", &project, "--enabled=false"], "Its jobs no longer come here"),
+        (&["projects", "update", "--all", "--enabled=true"], "Its jobs come here now")] {
+        let (code, said) = run(args, None);
+        assert!(code == 0 && said.contains(expect), "{args:?}: {code} {said}");
+    }
+    assert_eq!(json(&home, &["projects", "list"]).1["projects"][0]["enabled"], true);
+    for (args, expect) in [(&["projects", "update", &project][..], "Say which way"), (&["projects", "update", "--all", "--enabled=false"], "one at a time"), (&["projects", "update", "--enabled=true"], "Say which")] {
+        let (code, said) = run(args, None);
+        assert!(code == 2 && said.contains(expect), "{args:?}: {code} {said}");
+    }
+    let (code, said) = run(&["connections", "delete", "gitlab"], None);
+    assert!(code != 0 && said.contains("--confirm"), "{code} {said}");
+    let (code, said) = run(&["connections", "delete", "gitlab", "--confirm"], None);
+    assert!(code == 0 && said.contains("GitLab is disconnected."), "{code} {said}");
+    assert_eq!(served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "GITLAB").map(|(_, v)| v).as_deref(), Some("off"));
+    let _ = std::fs::remove_dir_all(&home);
+}
