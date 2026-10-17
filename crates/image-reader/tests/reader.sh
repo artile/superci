@@ -18,7 +18,8 @@ start() { # root dir, cache name, extra args
   for i in $(seq 1 100); do ls /mnt/$2/file/* >/dev/null 2>&1 && break; sleep 0.05; done
   mount -t squashfs -o loop,ro /mnt/$2/file/* /mnt/$2/lower 2>/mnt/$2/mounterr
 }
-sums() { (cd /mnt/$1/lower && find . -type f | sort | xargs sha256sum 2>&1); }
+# (Each file by itself: some sha256sum stop at the first file they cannot read.)
+sums() { (cd /mnt/$1/lower && find . -type f | sort | while read -r f; do sha256sum "$f" 2>&1; done); }
 stat_of() { sleep 1.2; python3 -c "import json,sys; print(json.load(open('/mnt/$1/cache/stats.json')).get('$2'))"; }
 
 # 1. As published: every file reads as it was packed; each piece checked; the hot list fetched.
