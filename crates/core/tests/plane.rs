@@ -4042,7 +4042,8 @@ fn the_plan_for_a_jobs_machine_follows_what_its_last_run_used() {
     let used = |served_bytes: u64, pulled_bytes: u64, at: u64| Images { served_bytes, pulled_bytes, at, ..Default::default() };
     assert!(!plan(None, now), "nothing known: Docker as it comes");
     assert!(!plan(Some(&used(0, 0, now)), now), "no images used");
-    assert!(plan(Some(&used(1 << 30, 0, now)), now) && plan(Some(&used(0, 1 << 20, now)), now));
+    assert!(plan(Some(&used(1 << 30, 0, now)), now) && plan(Some(&used(200 << 20, 56 << 20, now)), now));
+    assert!(!plan(Some(&used(3 << 20, 70 << 20, now)), now), "small images: as fast pulled");
     assert!(!plan(Some(&used(1 << 30, 0, now - 8 * 86_400_000)), now), "a week old: not counted");
 }
 

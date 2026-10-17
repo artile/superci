@@ -95,12 +95,16 @@ pub struct Images { #[serde(default)] pub served: u64, #[serde(default)] pub ser
 /// How long a repository's last word counts for its next machine (the cache's days, at most).
 pub const PLAN_MS: u64 = 7 * 86_400_000;
 
+/// The images a job uses, at least, for its machine to have them from the store: smaller ones are pulled about as fast
+/// (a pull of them is mostly asking the registry), and the store's switch at the machine's start would be waited for.
+pub const PLAN_BYTES: u64 = 256 << 20;
+
 /// What a machine of a job gets, from what the job's last run had and pulled (`Images`): the store set up at its start,
-/// on a disk of its own, only when that run used images; else Docker exactly as it comes (nothing to be had, nothing
-/// to wait for, nothing to pay for). (Kept in memory instead, a layer that did not fit was pulled as usual after its
+/// on a disk of its own, only when that run used `PLAN_BYTES` of images; else Docker exactly as it comes (nothing to
+/// wait for, nothing to pay for). (Kept in memory instead, a layer that did not fit was pulled as usual after its
 /// fetch had begun: slower than no store.)
 pub fn plan(last: Option<&Images>, now: u64) -> bool {
-    last.filter(|l| now.saturating_sub(l.at) < PLAN_MS).is_some_and(|l| l.served_bytes + l.pulled_bytes > 0)
+    last.filter(|l| now.saturating_sub(l.at) < PLAN_MS).is_some_and(|l| l.served_bytes + l.pulled_bytes >= PLAN_BYTES)
 }
 
 /// Where the last word of a job of a repository is kept: by its repository, workflow and name (each job of a workflow,
