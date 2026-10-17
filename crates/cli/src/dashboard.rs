@@ -8891,7 +8891,11 @@ mod tests {
         // With any cloud: the dashboard's own first screen asks which.
         let mut any = Dashboard::new().for_task(Task::Login(None));
         assert!(any.task_page().is_none() && any.task_done().is_none());
-        // A GitHub App: done when GitHub comes back from choosing its repositories.
+        // A GitHub App: its tab's first load starts it (here with no control plane to make it for: said).
+        let mut fresh = Dashboard::new().for_task(Task::GitHub { login: "acme".into(), host: String::new(), started: false, done: false });
+        let first = fresh.task_page().unwrap();
+        assert!(matches!(fresh.task, Some(Task::GitHub { started: true, .. })) && first.status == 500 && String::from_utf8_lossy(&first.body).contains("no control plane yet"), "{}", first.status);
+        // Done when GitHub comes back from choosing its repositories.
         let mut g = Dashboard::new().for_task(Task::GitHub { login: "acme".into(), host: String::new(), started: true, done: false });
         assert!(g.task_done().is_none() && String::from_utf8(g.task_page().unwrap().body).unwrap().contains("Finish on GitHub"));
         let _ = g.handle(&Req { method: "GET".into(), path: "/github/installed".into(), query: vec![], cookie: None, last: None, body: vec![], host: String::new(), origin: None, fetch_site: None });
