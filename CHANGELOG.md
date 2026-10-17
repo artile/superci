@@ -2,11 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.16
+## 0.19.16 — 2026-10-18
 - Docker images are kept and served on machines whose files are in memory (`superci/scratch=ramdisk`). The cache was never switched in there: the kernel mounts no EROFS file from memory's filesystem, so its setup turned it off, while each job still said its layers came from the cache (it counted what the cache's index listed). The layers' files now go on a disk in memory, with no disk of their own beside it (and none in the price). A job says layers came from the cache only when they did, and says why the cache was off when it was. On a 16-CPU machine with files in memory, a local Supabase starts in 27 s instead of 32 s, with 6.2 GB of memory used instead of 11.6 (the images are no longer held both compressed and unpacked).
 - A machine gets every layer's link with the cache's index at its start, and fetches the layers its job's last run used right away, before Docker asks for them (106 layers, 3 GB, in 3.3 s): its pull then finds them there. It asked for links layer by layer as Docker pulled, and a burst of those waited seconds on the control plane. Layers a job used are kept in the cache as long as jobs use them, as before.
 
-## 0.19.15 — 2026-10-17
 - The cache converts up to 64 of a region's Docker image layers at once (it was 16, the rest a minute apart), so a stack's images (a hundred layers) are there for its next run, not filled over five.
 - A job's Docker images say why what was pulled was not kept: no whole file of it on the machine, the cache would not take it, or its upload failed (with the failure's words).
 - A job's Docker images count what the cache had already among what was kept: a layer pulled that the cache had (from another run, or another repository's public one) is there for the next job too, and was said as "none uploaded to the cache". Its machine says those apart (`had`).
