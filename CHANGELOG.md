@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.14
+## 0.19.14 — 2026-10-17
 - A job of a run from a computer started again after AWS took back its spot machine keeps its artifacts anew, as a new attempt of a job does at GitHub: its first attempt's `upload-artifact` of the same name made the second fail with a name conflict, failing the run though every test had passed. Another job of the run keeping an artifact of that name is still refused, as GitHub refuses it.
 - `superci runs create` says a job that was started again, and which job its first attempt was: "Started again on an on-demand machine: AWS took back its spot machine".
 - `superci jobs list --run=ID` lists that run's jobs (it took the flag and listed every run's).
