@@ -51,6 +51,14 @@ impl Containerd {
         Ok(id)
     }
 
+    /// A blob's labels in a namespace (where it was pulled from: `containerd.io/distribution.source.<registry>`).
+    pub async fn labels(&self, namespace: &str, digest: &str) -> Result<HashMap<String, String>, String> {
+        let ch = self.channel().await?;
+        let req = Self::with_namespace(capi::InfoRequest { digest: digest.to_string() }, namespace, None)?;
+        let info = capi::content_client::ContentClient::new(ch).info(req).await.map_err(|e| e.message().to_string())?.into_inner();
+        Ok(info.info.map(|i| i.labels.into_iter().collect()).unwrap_or_default())
+    }
+
     /// `digest` (of `size` bytes) made known in `namespace`; known already is no error. As containerd's own client
     /// writes content it may have: the write's status first, then a commit at the offset that says (containerd
     /// counts shared content as written whole; a commit at offset 0 would start it over).

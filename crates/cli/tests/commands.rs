@@ -223,6 +223,8 @@ fn the_control_plane_is_updated_as_aws_answered_a_real_account() {
     // Its new function went up; its role, table, address and schedule were checked.
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
     assert!(asked.iter().any(|a| a.starts_with("PUT https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0001/code")), "{asked:?}");
+    // The layer store's converter beside it, made (new in this version), not tried again when it fails.
+    assert!(asked.iter().any(|a| a == "PUT https://lambda.us-east-1.amazonaws.com/2019-09-25/functions/superci-plane-testplane0001-convert/event-invoke-config"), "{asked:?}");
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -251,6 +253,7 @@ fn another_control_plane_is_deleted_as_aws_answered_a_real_account_and_the_one_i
     assert!(!served.aws.settings(superci_testkit::PLANE).is_empty());
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap(), a["asked"].as_str().unwrap().chars().take(80).collect::<String>())).collect();
     for gone in ["DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0002", "superci-plane-testplane0002\"}", "Action=DeleteRole&Version=2010-05-08&RoleName=superci-plane-testplane0002",
+        "DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0002-convert", "/aws/lambda/superci-plane-testplane0002-convert",
         "DELETE https://superci-plane-testplane0002-us-east-1.s3.us-east-1.amazonaws.com/ "] {
         assert!(asked.iter().any(|a| a.contains(gone)), "{gone}: {asked:?}");
     }
@@ -576,6 +579,7 @@ fn a_control_plane_is_deployed_to_aws_from_the_dashboard_as_aws_answered_a_real_
     assert!(listed.is_some(), "{}", common::words(&plane_page));
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
     assert!(asked.iter().any(|a| a == "POST https://lambda.us-east-1.amazonaws.com/2015-03-31/functions"), "{asked:?}");
+    assert!(asked.iter().any(|a| a == "GET https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-deployplane1-convert/configuration"), "the layer store's converter made beside it: {asked:?}");
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     // Its settings written for it (the key the dashboard reads it with among them).
     let settings = served.aws.settings("deployplane1");

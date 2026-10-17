@@ -15,6 +15,8 @@ use superci_core::aws::{self, Credentials};
 use superci_core::io::{self, Clock, Http, Request, Response, Store, Timer};
 use superci_core::plane::{Cache, Config, ControlPlane};
 
+mod convert;
+
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
 fn agent(redirects: u32) -> ureq::Agent {
@@ -313,8 +315,25 @@ fn response(r: Response) -> Value {
     json!({ "statusCode": r.status, "headers": headers, "body": STANDARD.encode(&r.body), "isBase64Encoded": true })
 }
 
+/// The converter's loop (see `convert`): one layer a request, answered with what was made.
+fn converter(api: &str) -> ! {
+    let (http, runtime) = (Blocking(agent(10), agent(0)), ureq::Agent::from(ureq::Agent::config_builder().http_status_as_error(false).build()));
+    let mkfs = format!("{}/mkfs.erofs", std::env::var("LAMBDA_TASK_ROOT").unwrap_or_else(|_| "/var/task".into()));
+    loop {
+        let Ok(mut next) = runtime.get(&format!("http://{api}/2018-06-01/runtime/invocation/next")).call() else { continue };
+        let id = next.headers().get("lambda-runtime-aws-request-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        let event: Value = next.body_mut().read_json().unwrap_or_default();
+        let done = match serde_json::from_value::<convert::Job>(event) {
+            Ok(job) => { let done = convert::convert(&http, &own_credentials(), &job, &mkfs, std::path::Path::new("/tmp")); eprintln!("superci: {done}"); done }
+            Err(e) => json!({ "error": format!("not a layer to convert: {e}") }),
+        };
+        let _ = runtime.post(&format!("http://{api}/2018-06-01/runtime/invocation/{id}/response")).send_json(done);
+    }
+}
+
 fn main() {
     let api = std::env::var("AWS_LAMBDA_RUNTIME_API").expect("runs in AWS Lambda");
+    if std::env::var("SUPERCI_CONVERTER").is_ok_and(|v| v == "1") { converter(&api) }
     let region = std::env::var("AWS_REGION").unwrap_or_default();
     let (http, runtime) = (Blocking(agent(10), agent(0)), ureq::Agent::from(ureq::Agent::config_builder().http_status_as_error(false).build()));
     let table = std::env::var("TABLE").unwrap_or_default();

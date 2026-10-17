@@ -20,6 +20,10 @@ fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX
 
 pub fn name(plane_id: &str) -> String { format!("superci-plane-{plane_id}") }
 
+/// The layer store's converter beside it: its function and its role (which may only read and write the layer store's
+/// part of the buckets: it reads registries' and machines' blobs, and runs mkfs.erofs on them).
+pub fn converter_name(plane_id: &str) -> String { format!("superci-plane-{plane_id}-convert") }
+
 struct Api<'a> { http: Blocking, creds: &'a Credentials, region: String }
 
 impl Api<'_> {
@@ -44,6 +48,12 @@ pub struct Deployed { pub url: String }
 /// The function's memory, and so its share of a CPU (Lambda gives a whole one at 1769 MB): at 1024 MB it starts and
 /// answers several times faster than at 256 MB, and is paid by the millisecond, so it costs about the same.
 const MEMORY_MB: u32 = 1024;
+
+/// The converter's: the most every account may give (new accounts may give no more), its disk the most there is
+/// (a blob and its EROFS file at once), and the longest a function may run.
+const CONVERTER_MEMORY_MB: u32 = 3008;
+const CONVERTER_DISK_MB: u32 = 10240;
+const CONVERTER_SECONDS: u32 = 900;
 
 /// What a new control plane's deploy does, in order, as the dashboard shows it (the last step is the dashboard's own wait).
 pub const DEPLOY_STEPS: [&str; 6] = ["Creating its permissions (an IAM role)", "Creating its storage (a DynamoDB table)", "Uploading it (a Lambda function)", "Giving it its address", "Scheduling its check for waiting jobs and leftover machines, every minute", "Waiting for it to answer"];
@@ -70,6 +80,8 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         { "Sid": "Logs", "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": format!("arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{name}:*") },
         // Itself, and nothing else: a sweep sooner than the schedule's minute (a start tried again, jobs waiting for room).
         { "Sid": "WakeItself", "Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": format!("arn:aws:lambda:{region}:{account_id}:function:{name}") },
+        // The layer store's converter, given a layer at a time.
+        { "Sid": "Convert", "Effect": "Allow", "Action": "lambda:InvokeFunction", "Resource": format!("arn:aws:lambda:{region}:{account_id}:function:{}", converter_name(plane_id)) },
     ] });
     a.iam("PutRolePolicy", json!({ "RoleName": name, "PolicyName": "control-plane", "PolicyDocument": own.to_string() }))?;
     if runners {
@@ -122,6 +134,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         if !last.is_empty() { return Err(last) }
     }
     wait_ready(&a, &name)?;
+    deploy_converter(&a, account_id, region, plane_id, &zip)?;
 
     // Its URL, open to GitHub (the control plane checks every webhook's signature itself).
     step(3);
@@ -143,6 +156,42 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     // The role's description is how the dashboard finds this control plane again (IAM is global; Lambda is regional).
     a.iam("UpdateRole", json!({ "RoleName": name, "Description": format!("Runs the SuperCI control plane {url} (Lambda, {region}, runs-on {label}).") }))?;
     Ok(Deployed { url })
+}
+
+/// The layer store's converter: its role (S3, only the layer store's part of this control plane's buckets, and its
+/// logs), and its function, made from the same package (created, or its code and size set again). Async calls are
+/// not tried again: the control plane asks again for what did not come.
+fn deploy_converter(a: &Api, account_id: &str, region: &str, plane_id: &str, zip: &str) -> Result<()> {
+    let name = converter_name(plane_id);
+    let trust = json!({ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }] });
+    ok_if(a.iam("CreateRole", json!({ "RoleName": name, "AssumeRolePolicyDocument": trust.to_string(), "Description": format!("Converts Docker layers for the SuperCI control plane {plane_id} (Lambda, {region})."),
+        "Tags": { "member": [{ "Key": "superci-plane", "Value": plane_id }] } })), &["EntityAlreadyExists"])?;
+    let own = json!({ "Version": "2012-10-17", "Statement": [
+        { "Sid": "LayerStore", "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"], "Resource": format!("arn:aws:s3:::superci-plane-{plane_id}-*/layers/*") },
+        { "Sid": "Logs", "Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": format!("arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/{name}:*") },
+    ] });
+    a.iam("PutRolePolicy", json!({ "RoleName": name, "PolicyName": "converter", "PolicyDocument": own.to_string() }))?;
+    let config = json!({ "MemorySize": CONVERTER_MEMORY_MB, "Timeout": CONVERTER_SECONDS, "EphemeralStorage": { "Size": CONVERTER_DISK_MB }, "Environment": { "Variables": { "SUPERCI_CONVERTER": "1" } } });
+    if a.lambda("GET", &format!("/2015-03-31/functions/{name}"), None).is_ok() {
+        a.lambda("PUT", &format!("/2015-03-31/functions/{name}/code"), Some(json!({ "ZipFile": zip, "Architectures": ["arm64"] })))?;
+        wait_ready(a, &name)?;
+        a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(config))?;
+    } else {
+        let mut create = json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap", "Role": format!("arn:aws:iam::{account_id}:role/{name}"),
+            "Code": { "ZipFile": zip }, "Description": "SuperCI layer store converter", "Tags": { "superci-plane": plane_id } });
+        for (k, v) in config.as_object().unwrap() { create[k] = v.clone() }
+        let mut last = String::new();
+        for attempt in 0..12 {
+            match a.lambda("POST", "/2015-03-31/functions", Some(create.clone())) {
+                Ok(_) => { last.clear(); break }
+                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; std::thread::sleep(Duration::from_secs(3 + attempt)) }
+                Err(e) => return Err(e),
+            }
+        }
+        if !last.is_empty() { return Err(last) }
+    }
+    wait_ready(a, &name)?;
+    a.lambda("PUT", &format!("/2019-09-25/functions/{name}/event-invoke-config"), Some(json!({ "MaximumRetryAttempts": 0 }))).map(|_| ())
 }
 
 /// Deletes the control plane `plane_id` from `region`: its schedule, function, table, parameters, logs and role. Safe
@@ -177,6 +226,8 @@ fn delete_in_region(creds: &Credentials, region: &str, plane_id: &str) -> Result
     ok_if(events("RemoveTargets", json!({ "Rule": name, "Ids": ["plane"] })), &gone)?;
     ok_if(events("DeleteRule", json!({ "Name": name })), &gone)?;
     ok_if(a.lambda("DELETE", &format!("/2015-03-31/functions/{name}"), None), &gone)?;
+    ok_if(a.lambda("DELETE", &format!("/2015-03-31/functions/{}", converter_name(plane_id)), None), &gone)?;
+    ok_if(a.target("logs", &format!("logs.{region}.amazonaws.com"), "Logs_20140328.DeleteLogGroup", "1.1", json!({ "logGroupName": format!("/aws/lambda/{}", converter_name(plane_id)) })), &gone)?;
     ok_if(a.target("dynamodb", &format!("dynamodb.{region}.amazonaws.com"), "DynamoDB_20120810.DeleteTable", "1.0", json!({ "TableName": name })), &gone)?;
     for _ in 0..20 {
         let names: Vec<String> = secret_names(creds, region, plane_id)?.into_iter().map(|n| format!("/superci/{plane_id}/{n}")).collect();
@@ -191,6 +242,8 @@ fn delete_role(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> 
     let name = name(plane_id);
     let gone = ["ResourceNotFoundException", "NoSuchEntity", "ParameterNotFound"];
     for policy in ["control-plane", "runner-machines"] { ok_if(a.iam("DeleteRolePolicy", json!({ "RoleName": name, "PolicyName": policy })), &gone)?; }
+    ok_if(a.iam("DeleteRolePolicy", json!({ "RoleName": converter_name(plane_id), "PolicyName": "converter" })), &gone)?;
+    ok_if(a.iam("DeleteRole", json!({ "RoleName": converter_name(plane_id) })), &gone)?;
     ok_if(a.iam("DeleteRole", json!({ "RoleName": name })), &gone)
 }
 

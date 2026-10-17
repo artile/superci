@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod docker;
 pub mod github;
 pub mod gitlab;
+pub mod layers;
 pub mod plane;
 pub mod io;
 pub mod page;

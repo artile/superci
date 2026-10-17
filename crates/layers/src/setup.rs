@@ -196,7 +196,8 @@ fn fetch_index(url: &str) -> Result<usize, String> {
     if res.status().as_u16() != 200 { return Err(format!("the index: the control plane answered {}", res.status())) }
     let text = res.into_body().with_config().limit(64 << 20).read_to_string().map_err(|e| format!("the index: {e}"))?;
     let index: crate::index::Index = serde_json::from_str(&text).map_err(|e| format!("the index: {e}"))?;
-    if index.layers.is_empty() { return Err("the store has no layers for this machine yet".into()) }
+    // (None yet is fine while the machine may propose what it pulls: the store fills from machines.)
+    if index.layers.is_empty() && index.propose.is_none() { return Err("the store has no layers for this machine yet".into()) }
     std::fs::create_dir_all(Path::new(INDEX).parent().unwrap()).map_err(|e| e.to_string())?;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(INDEX).map_err(|e| format!("{INDEX}: {e}"))?;

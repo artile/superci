@@ -16,6 +16,7 @@ pub mod index;
 pub mod meta;
 pub mod mount;
 pub mod overlay;
+pub mod propose;
 pub mod server;
 pub mod setup;
 pub mod store;
@@ -139,6 +140,8 @@ fn main() {
                 }
             }
         });
+        // (What it pulls that the store lacks, proposed once pulls stop.)
+        tokio::spawn(propose::run(layers.clone()));
         eprintln!("superci-layers: answering on {}", a.socket.display());
         notify_ready();
         if let Err(e) = server.await { eprintln!("superci-layers: {e}"); std::process::exit(1) }

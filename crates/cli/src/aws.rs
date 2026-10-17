@@ -610,7 +610,8 @@ pub fn connected_planes(creds: &Credentials) -> Result<Vec<FoundPlane>> {
     loop {
         let xml = futures::executor::block_on(aws::iam(&http, creds, "ListRoles", serde_json::json!({ "MaxItems": 1000, "Marker": marker }), now_ms()))?;
         for role in xml.split("<member>").skip(1) {
-            let Some(id) = aws::xml_tag(role, "RoleName").and_then(|n| n.strip_prefix("superci-plane-")) else { continue };
+            // (A plane's id is letters and digits: `superci-plane-<id>-convert` is its converter's.)
+            let Some(id) = aws::xml_tag(role, "RoleName").and_then(|n| n.strip_prefix("superci-plane-")).filter(|id| id.bytes().all(|b| b.is_ascii_alphanumeric())) else { continue };
             let description = aws::xml_tag(role, "Description").unwrap_or_default();
             let url = description.split("SuperCI control plane ").nth(1).and_then(|r| r.split(' ').next()).unwrap_or_default().to_string();
             // "Runs the SuperCI control plane <url> (Lambda, <region>, runs-on <label>)."

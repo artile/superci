@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds everything the SuperCI binary carries inside it, then the binary: the Cloudflare control plane and runner
-# agent (WebAssembly), the AWS control plane (a Lambda package for arm64), the Modal control plane's program (Linux
-# x86_64), the cache program for machines (Linux x86_64 and arm64), and the CLI.
+# agent (WebAssembly), the AWS control plane (a Lambda package for arm64, with mkfs.erofs for its converter), the
+# Modal control plane's program (Linux x86_64), the cache program for machines (Linux x86_64 and arm64), and the CLI.
 # Needs: Rust, worker-build (cargo install worker-build), zig with cargo-zigbuild, zip.
 set -e
 cd "$(dirname "$0")"
@@ -10,7 +10,9 @@ cd "$(dirname "$0")"
 cargo zigbuild --release --target aarch64-unknown-linux-musl -p superci-plane-aws
 mkdir -p crates/plane-aws/build
 rm -f crates/plane-aws/build/bootstrap.zip
-(cd target/aarch64-unknown-linux-musl/release && zip -q -j ../../../crates/plane-aws/build/bootstrap.zip bootstrap)
+# With mkfs.erofs beside it, for the layer store's converter (the same package as a second function).
+scripts/mkfs-erofs/build.sh target/mkfs-erofs/out
+zip -q -j crates/plane-aws/build/bootstrap.zip target/aarch64-unknown-linux-musl/release/bootstrap target/mkfs-erofs/out/mkfs.erofs target/mkfs-erofs/out/mkfs.erofs.LICENSES
 cargo zigbuild --release --target x86_64-unknown-linux-musl -p superci-plane-modal
 mkdir -p crates/plane-modal/build
 cp target/x86_64-unknown-linux-musl/release/superci-plane crates/plane-modal/build/superci-plane

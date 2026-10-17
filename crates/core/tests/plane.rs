@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use futures::executor::block_on;
+use sha2::{Digest, Sha256};
 use superci_core::crypto::{hex, hmac_sha256};
 use superci_core::github::App;
 use superci_core::plane::{role_arn, Agent, Cache, Config, ControlPlane, Pool, Routing, Rule};
@@ -3799,30 +3800,83 @@ fn a_label_asking_for_more_than_allowed_is_said_so() {
     assert!(small.too_large(&spec(None, Some(65))).is_some() && small.too_large(&spec(Some(8), Some(64))).is_none());
 }
 
-/// A bucket with this version's `superci-cache` and `superci-layers`, and the layer store's index.
-struct WithLayers { clouds: FakeClouds }
+/// A bucket with this version's `superci-cache` and `superci-layers` and objects put in it (kept with their headers),
+/// the registries as they answered (`fixtures/registries`: Docker Hub, GHCR and ECR Public, recorded 2026-10-17), and
+/// Lambda taking calls for the converter.
+#[derive(Default)]
+struct WithLayers { clouds: FakeClouds, objects: RefCell<BTreeMap<String, (Vec<u8>, Vec<(String, String)>)>>, converted: RefCell<Vec<serde_json::Value>>, deleted: RefCell<Vec<String>> }
+const REGISTRIES: &str = include_str!("fixtures/registries/answers.jsonl");
+const BUCKET: &str = "https://superci-plane-abc123def456-us-east-1.s3.us-east-1.amazonaws.com/";
 #[async_trait(?Send)]
 impl Http for WithLayers {
     async fn send(&self, r: Request) -> io::Result<Response> {
-        let bucket = format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/");
-        if r.method == "HEAD" && (r.url == format!("{bucket}{}", superci_core::cache::program_key("x86_64")) || r.url == format!("{bucket}{}", superci_core::cache::layers_key("x86_64"))) {
+        if r.method == "HEAD" && (r.url == format!("{BUCKET}{}", superci_core::cache::program_key("x86_64")) || r.url == format!("{BUCKET}{}", superci_core::cache::layers_key("x86_64"))) {
             return Ok(Response::new(200, "application/octet-stream", ""));
         }
-        if r.method == "GET" && r.url == format!("{bucket}{}", superci_core::cache::LAYERS_INDEX) {
+        if let Some(key) = r.url.strip_prefix(BUCKET).filter(|k| k.starts_with("layers/")) {
             assert!(r.header("authorization").is_some_and(|a| a.contains("/us-east-1/s3/aws4_request")));
-            let index = serde_json::json!({ "layers": {
-                "sha256:aaa": { "size": 100, "erofs": { "key": "layers/aaa.erofs", "size": 200, "digest": "sha256:eee" }, "blob": { "key": "layers/aaa.blob" }, "usage": { "size": 4096, "inodes": 3 } },
-                "sha256:bbb": { "size": 10, "erofs": { "key": "layers/bbb.erofs", "size": 20 }, "blob": { "key": "layers/bbb.blob" } } } });
-            return Ok(Response::new(200, "application/json", index.to_string()));
+            let mut objects = self.objects.borrow_mut();
+            return Ok(match (r.method.as_str(), objects.get(key)) {
+                ("GET", Some((body, _))) => Response::new(200, "application/json", body.clone()),
+                ("HEAD", Some((body, headers))) => {
+                    let mut res = Response::new(200, "application/octet-stream", "").with_header("content-length", &body.len().to_string());
+                    if r.header("x-amz-checksum-mode") == Some("ENABLED") { for (k, v) in headers { res = res.with_header(k, v) } }
+                    res
+                }
+                ("DELETE", _) => { objects.remove(key); self.deleted.borrow_mut().push(key.to_string()); Response::new(204, "text/plain", "") }
+                _ => Response::new(404, "application/xml", "<Error><Code>NoSuchKey</Code></Error>"),
+            });
+        }
+        if let Some(function) = r.url.strip_prefix("https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/").and_then(|f| f.strip_suffix("/invocations")) {
+            assert_eq!((function, r.header("x-amz-invocation-type")), (format!("superci-plane-{PLANE_ID}-convert").as_str(), Some("Event")));
+            assert!(r.header("authorization").is_some_and(|a| a.contains("/us-east-1/lambda/aws4_request")), "signed with its own role");
+            self.converted.borrow_mut().push(serde_json::from_slice(&r.body).unwrap());
+            return Ok(Response::new(202, "application/json", ""));
+        }
+        if r.url.contains("docker.io/") || r.url.starts_with("https://ghcr.io/") || r.url.starts_with("https://public.ecr.aws/") {
+            // (A private repository answers alike whatever blob is asked for: as it answered for the one recorded.)
+            let url = match r.url.split_once("/acme-private-xyz/app/blobs/") { Some((at, _)) => format!("{at}/acme-private-xyz/app/blobs/sha256:53f8f5e03afd86ade91b7aa57a749f5a3d1419c113be5d8c10e7ee61bb5ab887"), None => r.url.clone() };
+            let answer = REGISTRIES.lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|a| a["method"] == r.method.as_str() && a["url"] == url.as_str() && a["authorization"].as_str() == r.header("authorization") && a["range"].as_str() == r.header("range"))
+                .unwrap_or_else(|| panic!("the registries were not asked {} {} ({:?})", r.method, r.url, r.header("authorization")));
+            assert!(r.no_follow || r.url.contains("/token"), "a registry's redirect is an answer, not followed");
+            let mut res = Response::new(answer["status"].as_u64().unwrap() as u16, "application/json", answer["body"].as_str().unwrap().to_string());
+            for (k, v) in answer["headers"].as_object().unwrap() { res = res.with_header(k, v.as_str().unwrap()) }
+            return Ok(res);
         }
         self.clouds.send(r).await
     }
 }
 
+impl WithLayers {
+    /// What a machine uploading at a link would leave (S3 keeps the SHA-256 it was given with it).
+    fn uploaded(&self, link: &serde_json::Value, body: &[u8]) {
+        let key = link["url"].as_str().unwrap().strip_prefix(BUCKET).unwrap().split('?').next().unwrap().to_string();
+        self.objects.borrow_mut().insert(key, (body.to_vec(), vec![("x-amz-checksum-sha256".into(), STANDARD.encode(Sha256::digest(body)))]));
+    }
+    /// What the converter would write when done with a layer it was given (a blob from staging taken from there).
+    fn converter_done(&self, job: &serde_json::Value, error: Option<&str>) {
+        let done = match error {
+            Some(e) => serde_json::json!({ "digest": job["digest"], "error": e }),
+            None => serde_json::json!({ "digest": job["digest"], "size": job["size"], "diff_id": "sha256:d1ff", "erofs": { "key": job["erofs_key"], "size": 9000, "digest": "sha256:e0f5" }, "blob": { "key": job["blob_key"], "size": job["size"] } }),
+        };
+        let mut objects = self.objects.borrow_mut();
+        if let Some(staged) = job["source"]["key"].as_str() { objects.remove(staged); }
+        objects.insert(job["done_key"].as_str().unwrap().to_string(), (done.to_string().into_bytes(), vec![]));
+    }
+}
+
+/// A queued job on Ubuntu 26.04 of a repository GitHub says the id and branch of (the layers it may read are its own).
+fn layered(job: u64, repo_id: u64, repo: &str) -> Request {
+    let payload = serde_json::json!({ "action": "queued", "workflow_job": { "id": job, "run_id": 3, "labels": ["superci/image=ubuntu26"], "head_branch": "main" }, "repository": { "id": repo_id, "full_name": repo, "private": true, "default_branch": "main" }, "installation": { "id": 42 } }).to_string();
+    let sig = format!("sha256={}", hex(&hmac_sha256(b"whsec", payload.as_bytes())));
+    Request::new("POST", &format!("{PLANE_URL}/webhook")).with_header("x-github-event", "workflow_job").with_header("x-hub-signature-256", &sig).with_body(payload)
+}
+
 #[test]
 fn the_layer_store_switches_ubuntu_26_machines_to_superci_layers_with_a_disk_of_its_own() {
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
-    let http = WithLayers { clouds: FakeClouds::default() };
+    let http = WithLayers::default();
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
@@ -3848,12 +3902,7 @@ fn the_layer_store_switches_ubuntu_26_machines_to_superci_layers_with_a_disk_of_
     let p = get("layers-program");
     assert!(p.status == 302 && p.header("location").unwrap().contains(&format!("/superci/layers-{}-x86_64?X-Amz-", superci_core::plane::VERSION)));
     let index = json(&get("layers.json"));
-    let a = &index["layers"]["sha256:aaa"];
-    assert!(a["erofs"]["url"].as_str().unwrap().contains("/layers/aaa.erofs?X-Amz-") && a["blob"]["url"].as_str().unwrap().contains("/layers/aaa.blob?X-Amz-"), "{index}");
-    assert_eq!((a["size"].as_u64(), a["erofs"]["size"].as_u64(), a["erofs"]["digest"].as_str(), a["usage"]["inodes"].as_u64()), (Some(100), Some(200), Some("sha256:eee"), Some(3)));
-    assert_eq!(index["refresh"]["url"], format!("{PLANE_URL}/cache/{link}/layers-links"));
-    let again = json(&run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/layers-links")).with_body(r#"{"digests": ["sha256:bbb"]}"#)));
-    assert_eq!(again["layers"].as_object().unwrap().keys().collect::<Vec<_>>(), ["sha256:bbb"]);
+    assert_eq!(index, serde_json::json!({ "layers": {}, "refresh": { "url": format!("{PLANE_URL}/cache/{link}/layers-links"), "token": "" }, "propose": format!("{PLANE_URL}/cache/{link}/layers-propose") }));
     assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/cache/someone-elses-link-here/layers.json"))).status, 404);
     // Ubuntu 24.04 (Docker 28): as before, no store, no second disk.
     run(labelled("queued", 2, "acme/app", None, "superci/image=ubuntu24"));
@@ -3863,9 +3912,114 @@ fn the_layer_store_switches_ubuntu_26_machines_to_superci_layers_with_a_disk_of_
 }
 
 #[test]
+fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithLayers::default();
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.cache.layers = true;
+    let plane = ControlPlane { store: &store, http: &http, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let link = || {
+        let script = String::from_utf8(STANDARD.decode(field(&launches(&http.clouds).pop().expect("a machine"), "UserData")).unwrap()).unwrap();
+        script.split(&format!("c='{PLANE_URL}/cache/")).nth(1).unwrap().split('\'').next().unwrap().to_string()
+    };
+    run(layered(1, 77, "acme/app"));
+    let app = link();
+    run(layered(2, 88, "acme/other"));
+    let other = link();
+    let post = |link: &str, what: &str, body: serde_json::Value| run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/{what}")).with_body(body.to_string()));
+    let get = |link: &str, what: &str| json(&run(Request::new("GET", &format!("{PLANE_URL}/cache/{link}/{what}"))));
+    let digests = |index: &serde_json::Value| index["layers"].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    // Alpine's layer, which Docker Hub serves to anyone (as it answered); a private one; one too large; not a digest.
+    const ALPINE: &str = "sha256:53f8f5e03afd86ade91b7aa57a749f5a3d1419c113be5d8c10e7ee61bb5ab887";
+    const REDIS: &str = "sha256:16333ee0c00fc65e025a2a4f839703ad37a74728832977fbdf080984de1b8e5a";
+    let blob = b"a private layer's blob".repeat(100);
+    let private = format!("sha256:{}", hex(&Sha256::digest(&blob)));
+    let big = format!("sha256:{}", "b".repeat(64));
+    let answers = json(&post(&app, "layers-propose", serde_json::json!({ "layers": [
+        { "digest": ALPINE, "size": 3792075, "sources": [{ "registry": "ghcr.io", "repository": "actions/actions-runner" }, { "registry": "docker.io", "repository": "library/alpine" }] },
+        { "digest": private, "size": blob.len(), "sources": [{ "registry": "docker.io", "repository": "acme-private-xyz/app" }, { "registry": "ghcr.io", "repository": "acme-private-xyz/app" }, { "registry": "registry.acme.internal", "repository": "app" }] },
+        { "digest": REDIS, "size": 3626020, "sources": [{ "registry": "public.ecr.aws", "repository": "docker/library/redis" }] },
+        { "digest": big, "size": 5u64 << 30 }, { "digest": "sha256:nope", "size": 1 }] })));
+    assert_eq!((answers["layers"][ALPINE]["do"].as_str(), answers["layers"][REDIS]["do"].as_str(), answers["layers"][&big]["do"].as_str(), answers["layers"].get("sha256:nope")), (Some("named"), Some("named"), Some("no"), None), "{answers}");
+    assert_eq!(http.converted.borrow()[1]["source"], serde_json::json!({ "url": format!("https://public.ecr.aws/v2/docker/library/redis/blobs/{REDIS}"), "headers": { "authorization": "Bearer TOKEN-ecr" } }), "ECR Public's, which answers no HEAD for a blob");
+    assert_eq!(answers["uploaded"], format!("{PLANE_URL}/cache/{app}/layers-uploaded"));
+    // Public: the converter fetches it from Docker Hub itself, with a token for pulling it.
+    let given = http.converted.borrow()[0].clone();
+    assert_eq!(given["source"], serde_json::json!({ "url": format!("https://registry-1.docker.io/v2/library/alpine/blobs/{ALPINE}"), "headers": { "authorization": "Bearer TOKEN-alpine" } }));
+    assert_eq!((given["region"].as_str(), given["bucket"].as_str(), given["size"].as_u64()), (Some("us-east-1"), Some(format!("superci-plane-{PLANE_ID}-us-east-1").as_str()), Some(3792075)));
+    assert_eq!((given["erofs_key"].as_str().unwrap(), given["blob_key"].as_str().unwrap(), given["done_key"].as_str().unwrap()), (&format!("layers/{}.erofs", &ALPINE[7..])[..], &format!("layers/{}.blob", &ALPINE[7..])[..], &format!("layers/done/{}.json", &ALPINE[7..])[..]));
+    // Private: a link that takes only a body of its SHA-256.
+    let up = answers["layers"][&private].clone();
+    let sum = STANDARD.encode(Sha256::digest(&blob));
+    assert_eq!((up["do"].as_str(), up["headers"]["x-amz-checksum-sha256"].as_str()), (Some("upload"), Some(sum.as_str())), "{up}");
+    assert!(up["url"].as_str().unwrap().starts_with(&format!("{BUCKET}layers/staging/{}-", &private[7..])) && up["url"].as_str().unwrap().contains("X-Amz-SignedHeaders=host%3Bx-amz-checksum-sha256"), "{up}");
+    // Proposed again while it is converted: later. Something else at the link: refused.
+    assert_eq!(json(&post(&other, "layers-propose", serde_json::json!({ "layers": [{ "digest": ALPINE, "size": 3792075 }] })))["layers"][ALPINE]["do"], "later");
+    http.uploaded(&up, &blob[1..]);
+    assert_eq!(post(&app, "layers-uploaded", serde_json::json!({ "id": up["id"] })).status, 409);
+    assert_eq!(post(&other, "layers-uploaded", serde_json::json!({ "id": up["id"] })).status, 404, "another repository's machine was not given it");
+    http.uploaded(&up, &blob);
+    assert_eq!(json(&post(&app, "layers-uploaded", serde_json::json!({ "id": up["id"] })))["do"], "converting");
+    let staged = http.converted.borrow()[2].clone();
+    assert!(staged["source"]["key"].as_str().unwrap().starts_with(&format!("layers/staging/{}-", &private[7..])) && staged["digest"] == private.as_str(), "{staged}");
+    // The converter is done with both: the sweep records them. Each repository reads what it may.
+    http.converter_done(&given, None);
+    http.converter_done(&staged, None);
+    block_on(plane.alarm()).unwrap();
+    assert!(http.objects.borrow().keys().all(|k| !k.starts_with("layers/done/")), "what the converter said is read once");
+    let index = get(&app, "layers.json");
+    let mut both = vec![ALPINE.to_string(), private.clone()];
+    both.sort();
+    assert_eq!(digests(&index), both);
+    assert_eq!(index["layers"][ALPINE], serde_json::json!({ "size": 3792075, "erofs": { "url": "", "size": 9000, "digest": "sha256:e0f5" }, "blob": { "url": "" } }), "links come when asked for");
+    assert_eq!(digests(&get(&other, "layers.json")), [ALPINE]);
+    let links = |link: &str| json(&post(link, "layers-links", serde_json::json!({ "digests": [ALPINE, private] })));
+    let theirs = links(&other);
+    assert_eq!(digests(&theirs), [ALPINE], "a private layer of another repository answers as one the store lacks");
+    assert!(theirs["layers"][ALPINE]["erofs"]["url"].as_str().unwrap().starts_with(&format!("{BUCKET}layers/{}.erofs?X-Amz-", &ALPINE[7..])) && theirs["layers"][ALPINE]["blob"]["url"].as_str().unwrap().contains(".blob?X-Amz-"));
+    assert_eq!(digests(&links(&app)), both);
+    // The other repository has the private layer too: it shows it (an upload), then reads it, with no second conversion.
+    let theirs = json(&post(&other, "layers-propose", serde_json::json!({ "layers": [{ "digest": private, "size": blob.len() }] })))["layers"][&private].clone();
+    assert_eq!(theirs["do"], "upload");
+    http.uploaded(&theirs, &blob);
+    assert_eq!(json(&post(&other, "layers-uploaded", serde_json::json!({ "id": theirs["id"] })))["do"], "granted");
+    assert_eq!(http.converted.borrow().len(), 3);
+    assert!(http.objects.borrow().keys().all(|k| !k.starts_with("layers/staging/")), "its blob is not kept twice");
+    assert_eq!(digests(&get(&other, "layers.json")), both);
+    assert_eq!(json(&post(&app, "layers-propose", serde_json::json!({ "layers": [{ "digest": private, "size": blob.len() }] })))["layers"][&private]["do"], "have");
+    // A layer the converter refused is not asked for again for a while.
+    let odd_blob = b"an unusual tar".repeat(10);
+    let odd = format!("sha256:{}", hex(&Sha256::digest(&odd_blob)));
+    let propose_odd = || json(&post(&app, "layers-propose", serde_json::json!({ "layers": [{ "digest": odd, "size": odd_blob.len() }] })))["layers"][&odd].clone();
+    let up = propose_odd();
+    http.uploaded(&up, &odd_blob);
+    post(&app, "layers-uploaded", serde_json::json!({ "id": up["id"] }));
+    http.converter_done(&http.converted.borrow()[3].clone(), Some("mkfs.erofs refused the layer"));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(propose_odd()["do"], "no");
+    // Six days on, Alpine is used again; two days later the private layer (unused a week) goes with its files, and
+    // Docker Hub is asked again whether Alpine is still public (its word is a week old).
+    // (Each on a machine of its day: a machine's link lasts as long as its job may.)
+    clock.0.set(clock.0.get() + 6 * 86_400_000 + 3_600_000);
+    run(layered(3, 88, "acme/other"));
+    assert_eq!(digests(&json(&post(&link(), "layers-links", serde_json::json!({ "digests": [ALPINE] })))), [ALPINE]);
+    clock.0.set(clock.0.get() + 2 * 86_400_000);
+    block_on(plane.alarm()).unwrap();
+    assert!(http.deleted.borrow().contains(&format!("layers/{}.erofs", &private[7..])) && http.deleted.borrow().contains(&format!("layers/{}.blob", &private[7..])), "{:?}", http.deleted.borrow());
+    run(layered(4, 77, "acme/app"));
+    assert_eq!(digests(&get(&link(), "layers.json")), [ALPINE]);
+    let alpine: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("layer:us-east-1:{ALPINE}")]).unwrap();
+    assert_eq!(alpine["public"]["checked"].as_u64(), Some(clock.0.get()), "asked again");
+}
+
+#[test]
 fn the_layer_store_is_off_unless_turned_on() {
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
-    let http = WithLayers { clouds: FakeClouds::default() };
+    let http = WithLayers::default();
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();

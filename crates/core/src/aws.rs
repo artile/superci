@@ -86,23 +86,43 @@ pub fn sigv4(method: &str, url: &str, headers: &[(String, String)], body: &[u8],
 /// A link that does one S3 request (`method` on `url`, an object's address) for `expires_s` seconds, signed in its
 /// query (Signature Version 4, the body unsigned): whoever holds it may do that and nothing else. `url`'s path must be
 /// plain (letters, digits, `/-_.`), as SuperCI's object names are.
-pub fn presign(method: &str, url: &str, creds: &Credentials, region: &str, expires_s: u64, now_ms: u64) -> Result<String> {
+pub fn presign(method: &str, url: &str, creds: &Credentials, region: &str, expires_s: u64, now_ms: u64) -> Result<String> { presign_with(method, url, creds, region, expires_s, now_ms, &[]) }
+
+/// The same, with headers the request must carry as they are (an upload's `x-amz-checksum-sha256`: S3 then takes
+/// only a body of that SHA-256).
+pub fn presign_with(method: &str, url: &str, creds: &Credentials, region: &str, expires_s: u64, now_ms: u64, headers: &[(&str, &str)]) -> Result<String> {
     let u = url::Url::parse(url).map_err(|e| e.to_string())?;
     if !u.path().bytes().all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b)) || u.query().is_some() { return Err("an object name SuperCI does not make".into()) }
     let host = u.host_str().unwrap_or("").to_string();
     let date = amz_date(now_ms);
     let scope = format!("{}/{region}/s3/aws4_request", &date[..8]);
+    let mut signed: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string())).collect();
+    signed.push(("host".into(), host.clone()));
+    signed.sort();
+    let names = signed.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
     let mut query = vec![("X-Amz-Algorithm".to_string(), "AWS4-HMAC-SHA256".to_string()), ("X-Amz-Credential".into(), format!("{}/{scope}", creds.access_key_id)),
-        ("X-Amz-Date".into(), date.clone()), ("X-Amz-Expires".into(), expires_s.to_string()), ("X-Amz-SignedHeaders".into(), "host".into())];
+        ("X-Amz-Date".into(), date.clone()), ("X-Amz-Expires".into(), expires_s.to_string()), ("X-Amz-SignedHeaders".into(), names.clone())];
     if let Some(t) = &creds.session_token { query.push(("X-Amz-Security-Token".into(), t.clone())) }
     let mut encoded: Vec<(String, String)> = query.iter().map(|(k, v)| (rfc3986(k), rfc3986(v))).collect();
     encoded.sort();
     let canonical_query = encoded.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
-    let canonical = format!("{method}\n{}\n{canonical_query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD", u.path());
+    let canonical = format!("{method}\n{}\n{canonical_query}\n{}\n{names}\nUNSIGNED-PAYLOAD", u.path(), signed.iter().map(|(k, v)| format!("{k}:{v}\n")).collect::<String>());
     let to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
     let mut key = hmac_sha256(format!("AWS4{}", creds.secret_access_key).as_bytes(), date[..8].as_bytes());
     for part in [region, "s3", "aws4_request"] { key = hmac_sha256(&key, part.as_bytes()); }
     Ok(format!("{}://{host}{}?{canonical_query}&X-Amz-Signature={}", u.scheme(), u.path(), hex(&hmac_sha256(&key, to_sign.as_bytes()))))
+}
+
+/// A function called without waiting for it (Lambda's `Event` call): whether Lambda took it.
+pub async fn invoke_later(http: &dyn Http, region: &str, function: &str, body: &serde_json::Value, creds: &Credentials, now_ms: u64) -> Result<()> {
+    let url = format!("https://lambda.{region}.amazonaws.com/2015-03-31/functions/{function}/invocations");
+    let body = body.to_string();
+    let headers = sigv4("POST", &url, &[("content-type".into(), "application/json".into()), ("x-amz-invocation-type".into(), "Event".into())], body.as_bytes(), creds, region, "lambda", &amz_date(now_ms))?;
+    let mut req = Request::new("POST", &url).with_body(body);
+    req.headers = headers;
+    let r = http.send(req).await?;
+    if r.status >= 300 { return Err(format!("{function}: {}", serde_json::from_slice::<serde_json::Value>(&r.body).ok().and_then(|v| v["Message"].as_str().or(v["message"].as_str()).map(str::to_string)).unwrap_or_else(|| format!("HTTP {}", r.status)))) }
+    Ok(())
 }
 
 /// One signed S3 request (S3 also wants the body's hash as a header); its answer, whatever its status.
@@ -773,7 +793,8 @@ pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, 
 
 /// The control plane's cache bucket in a region (see `cache`): made when missing, private (as AWS makes every new
 /// bucket: no public access, no ACLs, encrypted), and with a rule of its own that removes any object older than
-/// `cache::BUCKET_DAYS` (what the control plane's index no longer knows of goes that way too). Safe to repeat.
+/// `cache::BUCKET_DAYS` (what the control plane's index no longer knows of goes that way too), and blobs machines
+/// put in the layer store's staging after a day. Safe to repeat.
 pub async fn make_bucket(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, now_ms: u64) -> Result<()> {
     let bucket = crate::cache::bucket(plane_id, region);
     let url = format!("https://{bucket}.s3.{region}.amazonaws.com/");
@@ -789,7 +810,7 @@ pub async fn make_bucket(http: &dyn Http, region: &str, creds: &Credentials, pla
         403 => return Err(format!("AccessDenied: the bucket {bucket} is not reachable with this sign-in (or is someone else's)")),
         s => return Err(format!("HTTP {s}: the bucket {bucket}")),
     }
-    let rule = format!(r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>superci-cache</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>{}</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"#, crate::cache::BUCKET_DAYS);
+    let rule = format!(r#"<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>superci-cache</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><Days>{}</Days></Expiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule><Rule><ID>superci-layers-staging</ID><Filter><Prefix>{}</Prefix></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>"#, crate::cache::BUCKET_DAYS, crate::layers::STAGING);
     let sum = b64(&crate::crypto::sha256(rule.as_bytes()));
     said(s3(http, "PUT", &format!("{url}?lifecycle"), region, creds, rule.into_bytes(), &[("x-amz-sdk-checksum-algorithm", "SHA256"), ("x-amz-checksum-sha256", &sum)], now_ms).await?)?;
     Ok(())

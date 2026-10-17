@@ -2,8 +2,9 @@
 # Docker with superci-layers as containerd's snapshotter and content store, against Docker as it comes: the same
 # work done each way (pull, run, build, commit, save, load, push, pull back, prune), and what can be compared
 # (image ids, what `docker save` writes) the same; once with no store, once with the images' layers served from a
-# store (their EROFS files made here as SuperCI's converter makes them, in a local bucket; one link broken, that
-# layer pulled as usual). Then superci-layers and containerd started again mid-way, and everything still there.
+# store (their EROFS files made here as SuperCI's converter makes them, in a local bucket; their links asked for when
+# used; one link broken, that layer pulled as usual; one image's layers not in the store, proposed and uploaded once
+# pulled). Then superci-layers and containerd started again mid-way, and everything still there.
 # In a privileged container (see Dockerfile), with superci-layers at /superci-layers.
 set -Eeuo pipefail
 trap 'echo "FAILED at line $LINENO: $BASH_COMMAND" >&2; for f in /var/log/superci-layers.log /var/log/containerd.log /var/log/dockerd.log; do echo "== $f"; tail -30 "$f"; done' ERR
@@ -116,19 +117,23 @@ docker save $ALPINE $BUSYBOX $POSTGRES | tar -x -C /root/oci
 python3 - <<'PY' > /root/layers.txt
 import json, os
 seen = set()
-def walk(d):
+def walk(d, image):
     p = f"/root/oci/blobs/sha256/{d.split(':')[1]}"
     if not os.path.exists(p): return  # (another platform's: not saved)
     b = json.load(open(p))
-    for m in b.get("manifests", []): walk(m["digest"])
+    for m in b.get("manifests", []): walk(m["digest"], image)
     for l in b.get("layers", []):
         if l["digest"] not in seen and l["mediaType"].endswith("gzip"):
-            seen.add(l["digest"]); print(l["digest"], l["size"])
-for m in json.load(open("/root/oci/index.json"))["manifests"]: walk(m["digest"])
+            seen.add(l["digest"]); print(l["digest"], l["size"], image)
+for m in json.load(open("/root/oci/index.json"))["manifests"]: walk(m["digest"], m.get("annotations", {}).get("io.containerd.image.name", ""))
 PY
+# (Busybox's layers are not in the store: pulled as usual, then proposed and uploaded.)
+grep " $BUSYBOX\$" /root/layers.txt | cut -d' ' -f1 > /root/not-stored.txt
+[ -s /root/not-stored.txt ]
+grep -v " $BUSYBOX\$" /root/layers.txt > /root/stored.txt
 echo '{"layers": {' > /root/index.json
 n=0; total=0
-while read -r d size; do
+while read -r d size _; do
   h=${d#sha256:}
   mkfs.erofs --quiet --tar=f --ungzip --aufs -zlz4hc -C131072 -Enoinline_data -T0 --mkfs-time -U 39bb3f52-5f38-4d6c-a25a-5ea4cc1d8b11 "/root/bucket/$h.erofs" "/root/oci/blobs/sha256/$h"
   cp "/root/oci/blobs/sha256/$h" "/root/bucket/$h.blob"
@@ -138,13 +143,15 @@ while read -r d size; do
   [ $n -gt 0 ] && echo , >> /root/index.json
   printf '"%s": {"size": %s, "erofs": {"url": "%s", "size": %s, "digest": "sha256:%s"}, "blob": {"url": "http://127.0.0.1:8000/%s.blob"}}' "$d" "$size" "$url" "$es" "$ed" "$h" >> /root/index.json
   n=$((n+1)); total=$((total+es))
-done < /root/layers.txt
+done < /root/stored.txt
 echo '}}' >> /root/index.json
 jq -e '.layers | length' /root/index.json > /dev/null
-echo "  $n layers, $((total/1024)) KB of EROFS files; one link broken: $broken"
+echo "  $n layers, $((total/1024)) KB of EROFS files; one link broken: $broken; not in the store: $(wc -l < /root/not-stored.txt)"
+# The machine's index has no links: they are asked for when a layer is used (the bucket's /links has them).
+mv /root/index.json /root/bucket/index.links.json
+jq '.layers |= map_values(.erofs.url = "" | .blob.url = "") | .refresh = {"url": "http://127.0.0.1:8000/links", "token": ""} | .propose = "http://127.0.0.1:8000/propose"' /root/bucket/index.links.json > /root/index.store.json
 python3 /bucket.py /root/bucket &
 
-mv /root/index.json /root/index.store.json
 sed 's|^disabled_plugins = \[\(.*\)\]|disabled_plugins = [\1, "io.containerd.content.v1.content"]|; s|\["", |[|' /root/config.stock.toml > "$CONF"
 grep -q 'io.containerd.content.v1.content' "$CONF" || echo 'disabled_plugins = ["io.containerd.content.v1.content"]' >> "$CONF"
 printf '\n[proxy_plugins]\n  [proxy_plugins.superci]\n    type = "snapshot"\n    address = "/run/superci-layers.sock"\n  [proxy_plugins.superci-content]\n    type = "content"\n    address = "/run/superci-layers.sock"\n' >> "$CONF"
@@ -175,6 +182,15 @@ usual=$(grep -c "pulled as usual" /var/log/superci-layers.log || true)
 echo "  served from the store: $served; pulled as usual: $usual; blobs read from the store: $(grep -c 'read from the store' /var/log/superci-layers.log || true)"
 grep "pulled as usual" /var/log/superci-layers.log | grep -q "$broken" || { echo "the broken layer was not pulled as usual" >&2; exit 1; }
 [ "$served" -ge 3 ] && [ "$usual" -ge 1 ]
+# Busybox's layers, which the store lacks: proposed (with where they came from) once pulls stopped, and uploaded whole.
+for i in $(seq 60); do [ "$(sort -u /root/bucket/uploaded.txt 2>/dev/null | wc -l)" -ge "$(wc -l < /root/not-stored.txt)" ] && break; sleep 1; done
+while read -r d; do
+  grep -q "^$d .*public.ecr.aws/docker/library/busybox" /root/bucket/proposed.txt || { echo "$d was not proposed with its source" >&2; cat /root/bucket/proposed.txt >&2; exit 1; }
+  grep -q "^$d " /root/bucket/uploaded.txt || { echo "$d was not uploaded" >&2; exit 1; }
+  [ "sha256:$(sha256sum "/root/bucket/staging/${d#sha256:}" | cut -c1-64)" = "$d" ]
+done < /root/not-stored.txt
+! cut -d' ' -f1 /root/stored.txt | grep -q -F -f - /root/bucket/proposed.txt || { echo "a layer the store has was proposed" >&2; exit 1; }
+echo "  proposed and uploaded: $(sort -u /root/bucket/uploaded.txt | wc -l) layer(s); links asked for: yes"
 
 want stock && want superci || { T "passed (the store's run)"; exit 0; }
 T "the same each way"

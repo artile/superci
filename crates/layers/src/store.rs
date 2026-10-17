@@ -58,6 +58,11 @@ pub struct StoreSide {
     containerd: Option<Containerd>,
     started: Nanos,
     pub stats: Stats,
+    /// Layers pulled as Docker pulls them (the index lacks them), by namespace, not yet proposed; and when the last
+    /// was (proposed once pulls have stopped for a while).
+    pulled: Mutex<Vec<(String, String)>>,
+    last_pull: Mutex<Option<std::time::Instant>>,
+    proposed: Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Default)]
@@ -82,6 +87,7 @@ impl Layers {
             erofs: Mutex::new(HashMap::new()), blobs: Mutex::new(HashMap::new()), targets: Mutex::new(HashMap::new()),
             at_once: tokio::sync::Semaphore::new(o.layers_at_once.max(1)), parallel: o.parallel.max(1), agent: crate::fetch::agent(),
             containerd: o.containerd.map(Containerd::new), started: crate::meta::now(), stats: Stats::default(),
+            pulled: Mutex::new(vec![]), last_pull: Mutex::new(None), proposed: Mutex::new(Default::default()),
         };
         let l = Layers { overlay, content, store: Some(side) };
         l.recover()?;
@@ -132,7 +138,12 @@ impl Layers {
     async fn serve(self: Arc<Self>, key: &str, parent: &str, labels: &BTreeMap<String, String>) -> Option<Error> {
         let st = self.store.as_ref()?;
         let (target, digest) = (labels.get(REF)?, labels.get(LAYER_DIGEST)?);
-        let Some(layer) = st.index.read().unwrap().get(digest).cloned() else { st.stats.pulled.fetch_add(1, Ordering::Relaxed); return None };
+        let Some(layer) = st.index.read().unwrap().get(digest).cloned() else {
+            st.stats.pulled.fetch_add(1, Ordering::Relaxed);
+            if let Some(ns) = key.split('/').next().filter(|n| !n.is_empty()) { st.pulled.lock().unwrap().push((ns.to_string(), digest.clone())) }
+            *st.last_pull.lock().unwrap() = Some(std::time::Instant::now());
+            return None
+        };
         // (Two pulls of one layer at once: one serves it, the other finds it served.)
         let lock = st.targets.lock().unwrap().entry(format!("{parent}\n{target}")).or_default().clone();
         let _one = lock.lock().await;
@@ -143,6 +154,11 @@ impl Layers {
             l.overlay.walk(&[filter], |_| { found = true; Ok(()) }).map(|_| found)
         }).await.ok()?.ok()?;
         if found { return Some(Error::AlreadyExists(format!("target snapshot {target:?}"))) }
+        // (Links for the image's layers the index has, asked for at once: the first of its layers to come.)
+        let image: Vec<String> = labels.get(IMAGE_LAYERS).map(|all| all.split(',').filter(|d| !d.is_empty()).map(str::to_string).collect()).unwrap_or_default();
+        let unlinked: Vec<String> = { let i = st.index.read().unwrap(); image.iter().chain([digest]).filter(|d| i.get(d).is_some_and(|l| l.erofs.url.is_empty())).cloned().collect() };
+        if !unlinked.is_empty() { let l = self.clone(); let _ = tokio::task::spawn_blocking(move || l.store.as_ref().unwrap().refresh_many(&unlinked)).await; }
+        let layer = st.index.read().unwrap().get(digest).cloned().unwrap_or(layer);
         if let Some(all) = labels.get(IMAGE_LAYERS) {
             for d in all.split(',').filter(|d| !d.is_empty() && *d != digest) {
                 let layer = st.index.read().unwrap().get(d).cloned();
@@ -335,34 +351,56 @@ impl StoreSide {
     fn fetch_erofs_blocking(&self, digest: &str, layer: &Layer, file: &std::path::Path) -> std::result::Result<(), String> {
         let tmp = file.with_extension("erofs.part");
         let link = IndexLink { st: self, digest: digest.to_string(), erofs: true };
+        let began = std::time::Instant::now();
         let n = crate::fetch::fetch(&self.agent, &link, layer.erofs.size, &tmp, self.parallel, layer.erofs.digest.as_deref())?;
         std::fs::rename(&tmp, file).map_err(|e| e.to_string())?;
         self.stats.bytes.fetch_add(n, Ordering::Relaxed);
+        eprintln!("superci-layers: {digest}'s file ({:.1} MB) fetched in {:.2} s", n as f64 / 1e6, began.elapsed().as_secs_f64());
         Ok(())
     }
 
     /// New links for a layer, from the control plane (`index.refresh`).
-    fn refresh(&self, digest: &str) -> bool {
+    fn refresh(&self, digest: &str) -> bool { self.refresh_many(&[digest.to_string()]) }
+
+    /// The same for several at once: whether the first came.
+    fn refresh_many(&self, digests: &[String]) -> bool {
         let Some(r) = self.index.read().unwrap().refresh.clone() else { return false };
-        let body = serde_json::json!({ "digests": [digest] }).to_string();
+        let began = std::time::Instant::now();
+        let _said = Said(began, digests.len());
+        let body = serde_json::json!({ "digests": digests }).to_string();
         let res = self.agent.post(&r.url).header("authorization", format!("Bearer {}", r.token)).header("content-type", "application/json").send(body.as_bytes());
         let Ok(res) = res else { return false };
         if res.status().as_u16() != 200 { return false }
         let Ok(text) = res.into_body().read_to_string() else { return false };
         let Ok(fresh) = serde_json::from_str::<Index>(&text) else { return false };
-        let Some(layer) = fresh.layers.get(digest).cloned() else { return false };
-        self.index.write().unwrap().layers.insert(digest.to_string(), layer);
-        true
+        let mut index = self.index.write().unwrap();
+        for (d, layer) in fresh.layers { if digests.contains(&d) { index.layers.insert(d, layer); } }
+        digests.first().is_some_and(|d| index.layers.get(d).is_some_and(|l| !l.erofs.url.is_empty()))
     }
+
+    /// Layers pulled as Docker pulls them, once pulls have stopped for `quiet` (each proposed once).
+    pub fn take_pulled(&self, quiet: std::time::Duration) -> Vec<(String, String)> {
+        if !self.last_pull.lock().unwrap().is_some_and(|t| t.elapsed() >= quiet) { return vec![] }
+        let mut proposed = self.proposed.lock().unwrap();
+        let taken: Vec<(String, String)> = std::mem::take(&mut *self.pulled.lock().unwrap()).into_iter().filter(|(_, d)| proposed.insert(d.clone())).collect();
+        taken
+    }
+
+    pub fn containerd(&self) -> Option<&Containerd> { self.containerd.as_ref() }
 }
+
+/// Says how long asking for links took, however the asking ends.
+struct Said(std::time::Instant, usize);
+impl Drop for Said { fn drop(&mut self) { eprintln!("superci-layers: links for {} layer(s) asked for in {:.2} s", self.1, self.0.elapsed().as_secs_f64()) } }
 
 /// A layer's file (its EROFS file or its blob) as the index links it, signed again when refused.
 struct IndexLink<'a> { st: &'a StoreSide, digest: String, erofs: bool }
 
 impl crate::fetch::Link for IndexLink<'_> {
     fn url(&self) -> String {
-        let i = self.st.index.read().unwrap();
-        i.get(&self.digest).map(|l| if self.erofs { l.erofs.url.clone() } else { l.blob.url.clone() }).unwrap_or_default()
+        let read = || { let i = self.st.index.read().unwrap(); i.get(&self.digest).map(|l| if self.erofs { l.erofs.url.clone() } else { l.blob.url.clone() }).unwrap_or_default() };
+        // (No link yet: asked for.)
+        match read() { u if u.is_empty() && self.st.refresh(&self.digest) => read(), u => u }
     }
     fn refresh(&self) -> bool { self.st.refresh(&self.digest) }
 }

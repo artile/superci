@@ -1,0 +1,413 @@
+//! The layer store: Docker's image layers kept in each region's cache bucket, each as its blob (the compressed tar a
+//! registry serves) and as an EROFS file a machine mounts instead of unpacking it (see the `layers` crate, the
+//! program on machines). The control plane fills it and decides who reads what.
+//!
+//! A machine that pulled layers the store lacks proposes them, after its pull. A layer a public registry serves to
+//! anyone (asked as Docker asks, with no sign-in) is fetched by the converter from the registry itself, and every
+//! repository may read it. Any other the machine uploads to the bucket's staging, at a link that takes only a body
+//! of the layer's SHA-256 (so the upload proves the repository has it), and only that repository may read it: it is
+//! granted, and every other repository has to upload it too. A layer the store has is never shown to a repository
+//! that may not read it, and asking for one answers as for a layer the store lacks.
+//!
+//! The converter (the AWS control plane's second function) writes what it made beside the files (`layers/done/`),
+//! which the sweep reads. Records, in the store's kinds:
+//!   `layer:<region>:<digest>`  a layer in a region's bucket (`Layer`)
+//!   `lgrant:<ns>:<digest>`     a repository that showed it has a layer (until `cache::MAX_AGE_DAYS` later)
+//!   `lconv:<region>:<digest>`  a conversion asked for and not heard of yet (`Converting`)
+//!   `lmiss:<region>:<digest>`  a layer not converted (refused, too large), not asked for again for a while
+//!   `lup:<id>`                 an upload link given (`Upload`)
+//! A layer goes when unused for the cache's days, or made `cache::MAX_AGE_DAYS` ago (the bucket's own rule removes
+//! its files soon after: the next pull proposes it again), and the least recently used go first past a region's
+//! `REGION_BYTES`.
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::io::{get_json, Request, Response, Result};
+use crate::plane::ControlPlane;
+use crate::{aws, cache};
+
+/// A blob larger than this is not converted (as the converter says).
+pub const MOST_BYTES: u64 = 4 << 30;
+/// Conversions under way at once in a region at most (more are answered "later": the machine asks again).
+pub const AT_ONCE: usize = 16;
+/// A conversion not heard of within this is taken as lost (the converter runs 15 minutes at most).
+pub const CONVERT_MS: u64 = 20 * 60_000;
+/// A registry's word that a layer is public, taken for this long; then asked again.
+pub const PUBLIC_MS: u64 = 7 * 86_400_000;
+/// A layer the converter refused is not asked for again within this.
+pub const REFUSED_MS: u64 = 7 * 86_400_000;
+/// An upload link lasts this long.
+pub const UPLOAD_MS: u64 = 3_600_000;
+/// What a region keeps at most, the least recently used going first.
+pub const REGION_BYTES: u64 = 200 << 30;
+/// Layers a machine proposes in one request at most.
+pub const PROPOSED_MOST: usize = 50;
+/// Where machines put blobs to be converted (the bucket removes what is left there after a day).
+pub const STAGING: &str = "layers/staging/";
+
+/// A registry that said a layer is public: where, and when it said so.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Public { pub registry: String, pub repository: String, pub checked: u64 }
+
+/// A layer in a region's bucket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Layer {
+    pub size: u64,
+    pub diff_id: String,
+    pub erofs: cache::StoredFile,
+    pub blob: cache::StoredFile,
+    /// When it was made, and last read (a link signed for it), ms.
+    pub made: u64,
+    pub used: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub public: Option<Public>,
+}
+
+impl Layer {
+    fn current(&self, now: u64) -> bool { now.saturating_sub(self.made) < cache::MAX_AGE_DAYS as u64 * 86_400_000 }
+    fn is_public(&self, now: u64) -> bool { self.public.as_ref().is_some_and(|p| now.saturating_sub(p.checked) < PUBLIC_MS) }
+    fn bytes(&self) -> u64 { self.blob.size.unwrap_or(self.size) + self.erofs.size.unwrap_or(0) }
+}
+
+/// A conversion asked for: when, its blob's size, and the registry it came from (a layer from staging has none).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Converting { pub at: u64, pub size: u64, #[serde(default)] pub public: Option<Public> }
+
+/// An upload link given to a machine: for which layer, of which repository, to where.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Upload { pub region: String, pub digest: String, pub size: u64, pub ns: String, pub key: String }
+
+pub fn layer_key(region: &str, digest: &str) -> String { format!("layer:{region}:{digest}") }
+fn grant_key(ns: &str, digest: &str) -> String { format!("lgrant:{ns}:{digest}") }
+fn converting_key(region: &str, digest: &str) -> String { format!("lconv:{region}:{digest}") }
+fn refused_key(region: &str, digest: &str) -> String { format!("lmiss:{region}:{digest}") }
+
+/// A blob's digest as registries give it (`sha256:` and 64 hex digits).
+pub fn is_digest(d: &str) -> bool { d.len() == 71 && d.starts_with("sha256:") && d[7..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
+
+/// A layer's files in the bucket: its EROFS file, its blob, and what the converter says of it.
+pub fn files(digest: &str) -> (String, String, String) {
+    let hex = &digest[7..];
+    (format!("layers/{hex}.erofs"), format!("layers/{hex}.blob"), format!("layers/done/{hex}.json"))
+}
+
+/// The registry a public layer is fetched from: only the well-known public ones (a machine's word picks one, never
+/// any address), by the host Docker reaches it at.
+pub fn registry_host(registry: &str) -> Option<&str> {
+    let plain = !registry.is_empty() && registry.len() < 100 && registry.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+    match registry {
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => Some("registry-1.docker.io"),
+        "ghcr.io" | "public.ecr.aws" | "quay.io" | "mcr.microsoft.com" | "registry.gitlab.com" | "registry.k8s.io" | "gcr.io" => Some(registry),
+        r if plain && (r.ends_with(".gcr.io") || r.ends_with("-docker.pkg.dev")) && !r.starts_with('.') && !r.starts_with('-') => Some(registry),
+        _ => None,
+    }
+}
+
+/// `key="value"` pairs of a `WWW-Authenticate: Bearer …` header.
+fn bearer_challenge(header: &str) -> Option<Vec<(String, String)>> {
+    let rest = header.trim().strip_prefix("Bearer ").or_else(|| header.trim().strip_prefix("bearer "))?;
+    let mut out = vec![];
+    let mut s = rest;
+    while let Some(eq) = s.find('=') {
+        let k = s[..eq].trim().trim_start_matches(',').trim().to_ascii_lowercase();
+        let v = s[eq + 1..].trim_start();
+        let (value, after) = match v.strip_prefix('"') { Some(q) => { let end = q.find('"')?; (&q[..end], &q[end + 1..]) } None => { let end = v.find(',').unwrap_or(v.len()); (&v[..end], &v[end..]) } };
+        out.push((k, value.to_string()));
+        s = after;
+    }
+    Some(out)
+}
+
+/// Whether a registry serves a layer to anyone: asked as Docker asks with no sign-in (a token for pulling, then the
+/// blob's first byte). The blob's address and the headers to fetch it with when it does; a refusal, a limit or a fault
+/// all mean "not public".
+pub async fn public_source(http: &dyn crate::io::Http, registry: &str, repository: &str, digest: &str) -> Option<Value> {
+    let host = registry_host(registry)?;
+    if !is_digest(digest) || repository.is_empty() || repository.len() > 255 || repository.starts_with('/') || repository.contains("..")
+        || !repository.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-/".contains(&b)) { return None }
+    let url = format!("https://{host}/v2/{repository}/blobs/{digest}");
+    // (Its first byte, its redirect not followed: some registries answer no HEAD for a blob, ECR Public among them.)
+    let head = |auth: Option<String>| {
+        let mut r = Request::new("GET", &url).with_header("range", "bytes=0-0");
+        r.no_follow = true;
+        if let Some(a) = auth { r.headers.push(("authorization".into(), a)) }
+        r
+    };
+    let found = |status: u16| status == 200 || status == 206 || (300..400).contains(&status);
+    let first = http.send(head(None)).await.ok()?;
+    if found(first.status) { return Some(json!({ "url": url, "headers": {} })) }
+    if first.status != 401 { return None }
+    let challenge = bearer_challenge(first.header("www-authenticate")?)?;
+    let realm = challenge.iter().find(|(k, _)| k == "realm").map(|(_, v)| v.clone())?;
+    if !realm.starts_with("https://") { return None }
+    let mut token_url = url::Url::parse(&realm).ok()?;
+    {
+        let mut q = token_url.query_pairs_mut();
+        if let Some((_, service)) = challenge.iter().find(|(k, _)| k == "service") { q.append_pair("service", service); }
+        q.append_pair("scope", &format!("repository:{repository}:pull"));
+    }
+    let t = http.send(Request::new("GET", token_url.as_str())).await.ok()?;
+    if t.status != 200 { return None }
+    let body: Value = serde_json::from_slice(&t.body).ok()?;
+    let token = body["token"].as_str().or(body["access_token"].as_str()).filter(|t| !t.is_empty())?.to_string();
+    let second = http.send(head(Some(format!("Bearer {token}")))).await.ok()?;
+    found(second.status).then(|| json!({ "url": url, "headers": { "authorization": format!("Bearer {token}") } }))
+}
+
+/// One proposed layer, as a machine says it.
+#[derive(Debug, Clone, Deserialize)]
+struct Proposed { digest: String, size: u64, #[serde(default)] sources: Vec<Source> }
+
+#[derive(Debug, Clone, Deserialize)]
+struct Source { registry: String, repository: String }
+
+impl ControlPlane<'_> {
+    /// The repository of a machine's job (none yet, or one SuperCI keeps no cache for: public layers only), and the
+    /// layers it was granted.
+    async fn layer_reader(&self, machine: &cache::Machine) -> Result<(Option<String>, HashSet<String>)> {
+        let Ok(access) = self.machine_access(machine).await else { return Ok((None, HashSet::new())) };
+        let prefix = format!("lgrant:{}:", access.ns);
+        let granted = self.store.list(&prefix).await?.into_iter().map(|(k, _)| k[prefix.len()..].to_string()).collect();
+        Ok((Some(access.ns), granted))
+    }
+
+    /// A machine's index: the layers in its region's bucket its repository may read, without links (asked for when a
+    /// layer is used, `layers-links`), and where to propose what it pulls.
+    pub(crate) async fn layers_index(&self, machine: &cache::Machine, link: &str, now: u64) -> Result<Response> {
+        let (_, granted) = self.layer_reader(machine).await?;
+        let mut layers = serde_json::Map::new();
+        for (k, v) in self.store.list(&format!("layer:{}:", machine.region)).await? {
+            let Ok(l) = serde_json::from_str::<Layer>(&v) else { continue };
+            let digest = k.rsplit_once(":sha256:").map(|(_, h)| format!("sha256:{h}")).unwrap_or_default();
+            if !l.current(now) || !(l.is_public(now) || granted.contains(&digest)) { continue }
+            let mut erofs = json!({ "url": "", "size": l.erofs.size.unwrap_or(0) });
+            if let Some(d) = &l.erofs.digest { erofs["digest"] = d.clone().into() }
+            layers.insert(digest, json!({ "size": l.size, "erofs": erofs, "blob": { "url": "" } }));
+        }
+        Ok(Response::json(&json!({ "layers": layers, "refresh": { "url": format!("{link}/layers-links"), "token": "" }, "propose": format!("{link}/layers-propose") })))
+    }
+
+    /// Links to layers' files (`{"digests": [...]}`), only for those the machine's repository may read; each layer's
+    /// use noted (once a day at most).
+    pub(crate) async fn layers_links(&self, machine: &cache::Machine, link: &str, creds: &aws::Credentials, body: &[u8], now: u64) -> Result<Response> {
+        let wanted: Vec<String> = serde_json::from_slice::<Value>(body).ok().and_then(|b| b["digests"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().filter(|d| is_digest(d)).map(str::to_string)).take(500).collect())).unwrap_or_default();
+        let (_, granted) = self.layer_reader(machine).await?;
+        let keys: Vec<String> = wanted.iter().map(|d| layer_key(&machine.region, d)).collect();
+        let bucket = cache::bucket(&self.config.plane_id, &machine.region);
+        let sign = |key: &str| aws::presign("GET", &aws::s3_url(&bucket, &machine.region, key), creds, &machine.region, cache::LINK_SECONDS, now);
+        let mut layers = serde_json::Map::new();
+        for ((d, key), got) in wanted.iter().zip(&keys).zip(self.store.get_many(&keys).await?) {
+            let Some(mut l) = got.and_then(|v| serde_json::from_str::<Layer>(&v).ok()) else { continue };
+            if !l.current(now) || !(l.is_public(now) || granted.contains(d)) { continue }
+            let mut erofs = json!({ "url": sign(&l.erofs.key)?, "size": l.erofs.size.unwrap_or(0) });
+            if let Some(digest) = &l.erofs.digest { erofs["digest"] = digest.clone().into() }
+            layers.insert(d.clone(), json!({ "size": l.size, "erofs": erofs, "blob": { "url": sign(&l.blob.key)? } }));
+            if now.saturating_sub(l.used) > 86_400_000 { l.used = now; self.store.put(key, serde_json::to_string(&l).map_err(|e| e.to_string())?).await? }
+        }
+        Ok(Response::json(&json!({ "layers": layers, "refresh": { "url": format!("{link}/layers-links"), "token": "" } })))
+    }
+
+    /// The converter given a layer (see `convert` in the AWS control plane): only a control plane on AWS has one.
+    async fn convert(&self, region: &str, digest: &str, size: u64, source: Value, now: u64) -> Result<()> {
+        let (Some((_, home)), Some(creds)) = (&self.config.aws_own, &self.config.aws_own_creds) else { return Err("only a control plane on AWS converts layers".into()) };
+        let (erofs_key, blob_key, done_key) = files(digest);
+        let job = json!({ "digest": digest, "size": size, "region": region, "bucket": cache::bucket(&self.config.plane_id, region), "source": source, "erofs_key": erofs_key, "blob_key": blob_key, "done_key": done_key });
+        aws::invoke_later(self.http, home, &format!("superci-plane-{}-convert", self.config.plane_id), &job, creds, now).await
+    }
+
+    /// An upload link for a layer (to staging, taking only a body of its SHA-256), noted for `layers-uploaded`.
+    async fn upload_link(&self, machine: &cache::Machine, ns: &str, digest: &str, size: u64, creds: &aws::Credentials, now: u64) -> Result<Value> {
+        let id = crate::crypto::random_token(18);
+        let key = format!("{STAGING}{}-{id}", &digest[7..]);
+        let sum = crate::crypto::b64(&(0..32).map(|i| u8::from_str_radix(&digest[7 + 2 * i..9 + 2 * i], 16).unwrap_or(0)).collect::<Vec<u8>>());
+        let url = aws::presign_with("PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &machine.region), &machine.region, &key), creds, &machine.region, UPLOAD_MS / 1000, now, &[("x-amz-checksum-sha256", &sum)])?;
+        let up = Upload { region: machine.region.clone(), digest: digest.to_string(), size, ns: ns.to_string(), key };
+        self.store.put_until(&format!("lup:{id}"), serde_json::to_string(&up).map_err(|e| e.to_string())?, now + UPLOAD_MS).await?;
+        Ok(json!({ "do": "upload", "url": url, "headers": { "x-amz-checksum-sha256": sum }, "id": id }))
+    }
+
+    /// Layers a machine pulled that the store lacks (`{"layers": [{"digest", "size", "sources": [{"registry",
+    /// "repository"}]}]}`), each answered: `have` (its repository may read it already), `named` (public: the
+    /// converter fetches it from the registry), `upload` (a link to put its blob at, then `layers-uploaded`), `later`
+    /// (being converted, or too many at once) or `no`.
+    pub(crate) async fn layers_propose(&self, machine: &cache::Machine, link: &str, creds: &aws::Credentials, body: &[u8], now: u64) -> Result<Response> {
+        let proposed: Vec<Proposed> = serde_json::from_slice::<Value>(body).ok().and_then(|b| serde_json::from_value(b["layers"].clone()).ok()).unwrap_or_default();
+        let (ns, granted) = self.layer_reader(machine).await?;
+        let mut converting = self.store.list(&format!("lconv:{}:", machine.region)).await?.len();
+        // (Only a control plane on AWS has a converter: elsewhere the store keeps what it has, and takes nothing new.)
+        let converts = self.config.aws_own.is_some() && self.config.aws_own_creds.is_some();
+        let proposed: Vec<Proposed> = proposed.into_iter().filter(|p| is_digest(&p.digest)).take(PROPOSED_MOST).collect();
+        let keys: Vec<String> = proposed.iter().map(|p| layer_key(&machine.region, &p.digest)).collect();
+        let records = self.store.get_many(&keys).await?;
+        let mut answers = serde_json::Map::new();
+        for (p, record) in proposed.iter().zip(records) {
+            let layer = record.and_then(|v| serde_json::from_str::<Layer>(&v).ok()).filter(|l| l.current(now));
+            let answer = if p.size == 0 || p.size > MOST_BYTES {
+                json!({ "do": "no" })
+            } else if let Some(l) = layer {
+                if l.is_public(now) || granted.contains(&p.digest) { json!({ "do": "have" }) }
+                else if let Some(ns) = &ns { self.upload_link(machine, ns, &p.digest, p.size, creds, now).await? }
+                else { json!({ "do": "no" }) }
+            } else if self.store.get(&converting_key(&machine.region, &p.digest)).await?.is_some() {
+                json!({ "do": "later" })
+            } else if !converts || self.store.get(&refused_key(&machine.region, &p.digest)).await?.is_some() {
+                json!({ "do": "no" })
+            } else if converting >= AT_ONCE {
+                json!({ "do": "later" })
+            } else {
+                let mut named = None;
+                for s in p.sources.iter().take(4) {
+                    if let Some(source) = public_source(self.http, &s.registry, &s.repository, &p.digest).await { named = Some((s, source)); break }
+                }
+                match (named, &ns) {
+                    // (A converter that refuses the call: asked again later, as when it has enough at once.)
+                    (Some((s, source)), _) => match self.convert(&machine.region, &p.digest, p.size, source, now).await {
+                        Err(e) => { let _ = self.store.put("layers-convert-error", e).await; json!({ "do": "later" }) }
+                        Ok(()) => {
+                            let c = Converting { at: now, size: p.size, public: Some(Public { registry: s.registry.clone(), repository: s.repository.clone(), checked: now }) };
+                            self.store.put_until(&converting_key(&machine.region, &p.digest), serde_json::to_string(&c).map_err(|e| e.to_string())?, now + CONVERT_MS * 2).await?;
+                            converting += 1;
+                            json!({ "do": "named" })
+                        }
+                    },
+                    (None, Some(ns)) => self.upload_link(machine, ns, &p.digest, p.size, creds, now).await?,
+                    (None, None) => json!({ "do": "no" }),
+                }
+            };
+            answers.insert(p.digest.clone(), answer);
+        }
+        Ok(Response::json(&json!({ "layers": answers, "uploaded": format!("{link}/layers-uploaded") })))
+    }
+
+    /// A blob put at an upload link (`{"id"}`): its repository granted the layer, and the layer converted from it
+    /// when the store lacks it (else the blob goes).
+    pub(crate) async fn layers_uploaded(&self, machine: &cache::Machine, creds: &aws::Credentials, body: &[u8], now: u64) -> Result<Response> {
+        let id = serde_json::from_slice::<Value>(body).ok().and_then(|b| b["id"].as_str().map(str::to_string)).unwrap_or_default();
+        if id.len() < 16 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Ok(Response::text(400, "say which upload")) }
+        let Some(up) = get_json::<Upload>(self.store, &format!("lup:{id}")).await? else { return Ok(Response::text(404, "no such upload")) };
+        // (Another repository's link is not one this machine was given.)
+        let (ns, _) = self.layer_reader(machine).await?;
+        if up.region != machine.region || ns.as_deref() != Some(up.ns.as_str()) { return Ok(Response::text(404, "no such upload")) }
+        let url = aws::s3_url(&cache::bucket(&self.config.plane_id, &up.region), &up.region, &up.key);
+        // (S3 took it only with that SHA-256, as the link said; asked again all the same.)
+        let head = aws::s3(self.http, "HEAD", &url, &up.region, creds, vec![], &[("x-amz-checksum-mode", "ENABLED")], now).await?;
+        let sum = crate::crypto::b64(&(0..32).map(|i| u8::from_str_radix(&up.digest[7 + 2 * i..9 + 2 * i], 16).unwrap_or(0)).collect::<Vec<u8>>());
+        if head.status != 200 { return Ok(Response::text(409, "nothing was uploaded there")) }
+        if head.header("content-length").and_then(|l| l.parse::<u64>().ok()) != Some(up.size) || head.header("x-amz-checksum-sha256") != Some(sum.as_str()) {
+            let _ = aws::s3(self.http, "DELETE", &url, &up.region, creds, vec![], &[], now).await;
+            return Ok(Response::text(409, "not that layer"))
+        }
+        self.store.delete(&format!("lup:{id}")).await?;
+        self.store.put_until(&grant_key(&up.ns, &up.digest), now.to_string(), now + cache::MAX_AGE_DAYS as u64 * 86_400_000).await?;
+        let has = get_json::<Layer>(self.store, &layer_key(&up.region, &up.digest)).await?.is_some_and(|l| l.current(now));
+        let converting = self.store.get(&converting_key(&up.region, &up.digest)).await?.is_some();
+        if has || converting {
+            let _ = aws::s3(self.http, "DELETE", &url, &up.region, creds, vec![], &[], now).await;
+            return Ok(Response::json(&json!({ "do": "granted" })))
+        }
+        if let Err(e) = self.convert(&up.region, &up.digest, up.size, json!({ "key": up.key }), now).await {
+            // (Its repository keeps the grant; the blob goes, and the layer is proposed again by a later pull.)
+            let _ = self.store.put("layers-convert-error", e).await;
+            let _ = aws::s3(self.http, "DELETE", &url, &up.region, creds, vec![], &[], now).await;
+            return Ok(Response::json(&json!({ "do": "later" })))
+        }
+        let c = Converting { at: now, size: up.size, public: None };
+        self.store.put_until(&converting_key(&up.region, &up.digest), serde_json::to_string(&c).map_err(|e| e.to_string())?, now + CONVERT_MS * 2).await?;
+        Ok(Response::json(&json!({ "do": "converting" })))
+    }
+
+    /// At each sweep while conversions are under way: what the converter made, recorded (or what it refused, not asked
+    /// for again for a while); one not heard of in time, given up. Once an hour, the store's upkeep (see the module).
+    pub(crate) async fn sweep_layers(&self, plane_url: &str, now: u64) -> Result<()> {
+        let converting = self.store.list("lconv:").await?;
+        let hour = self.store.get("layers-swept").await?.and_then(|v| v.parse::<u64>().ok()).is_none_or(|at| now.saturating_sub(at) >= 3_600_000);
+        if converting.is_empty() && !hour { return Ok(()) }
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(()) };
+        let creds = self.aws_creds(plane_url, &a).await?;
+        for (k, v) in converting {
+            let Some((region, digest)) = k.strip_prefix("lconv:").and_then(|r| r.split_once(':')) else { continue };
+            let Ok(c) = serde_json::from_str::<Converting>(&v) else { self.store.delete(&k).await?; continue };
+            let (_, _, done_key) = files(digest);
+            let url = aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &done_key);
+            let got = aws::s3(self.http, "GET", &url, region, &creds, vec![], &[], now).await?;
+            if got.status == 404 {
+                if now.saturating_sub(c.at) > CONVERT_MS { self.store.delete(&k).await?; self.store.put_until(&refused_key(region, digest), "not heard of in time".into(), now + 3_600_000).await? }
+                continue
+            }
+            if got.status != 200 { continue }
+            let done: Value = serde_json::from_slice(&got.body).unwrap_or_default();
+            match done["error"].as_str() {
+                Some(e) => self.store.put_until(&refused_key(region, digest), e.chars().take(300).collect(), now + REFUSED_MS).await?,
+                None => {
+                    let file = |f: &Value| cache::StoredFile { key: f["key"].as_str().unwrap_or_default().to_string(), size: f["size"].as_u64(), digest: f["digest"].as_str().map(str::to_string) };
+                    let l = Layer { size: c.size, diff_id: done["diff_id"].as_str().unwrap_or_default().to_string(), erofs: file(&done["erofs"]), blob: file(&done["blob"]), made: now, used: now, public: c.public.clone() };
+                    if done["digest"] == digest && !l.erofs.key.is_empty() && !l.blob.key.is_empty() {
+                        self.store.put(&layer_key(region, digest), serde_json::to_string(&l).map_err(|e| e.to_string())?).await?;
+                    }
+                }
+            }
+            let _ = aws::s3(self.http, "DELETE", &url, region, &creds, vec![], &[], now).await;
+            self.store.delete(&k).await?;
+        }
+        if hour { self.store.put("layers-swept", now.to_string()).await?; self.layers_upkeep(&creds, now).await?; }
+        Ok(())
+    }
+
+    /// Layers that go (made too long ago, unused for the cache's days, past a region's room) taken out, their files
+    /// deleted; registries asked again of public layers whose word is a week old (a few each time).
+    async fn layers_upkeep(&self, creds: &aws::Credentials, now: u64) -> Result<()> {
+        let unused = self.config.routing.cache.unused_ms();
+        let mut by_region: std::collections::BTreeMap<String, Vec<(String, Layer)>> = Default::default();
+        for (k, v) in self.store.list("layer:").await? {
+            let Some(region) = k.strip_prefix("layer:").and_then(|r| r.split(':').next()) else { continue };
+            if let Ok(l) = serde_json::from_str::<Layer>(&v) { by_region.entry(region.to_string()).or_default().push((k.clone(), l)) }
+        }
+        let mut asked = 0;
+        for (region, mut layers) in by_region {
+            layers.sort_by_key(|(_, l)| std::cmp::Reverse(l.used));
+            let mut kept = 0u64;
+            for (k, mut l) in layers {
+                let goes = !l.current(now) || now.saturating_sub(l.used) > unused || kept + l.bytes() > REGION_BYTES;
+                if goes {
+                    for key in [&l.erofs.key, &l.blob.key] {
+                        let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, key), &region, creds, vec![], &[], now).await;
+                    }
+                    self.store.delete(&k).await?;
+                    continue
+                }
+                kept += l.bytes();
+                let stale = l.public.as_ref().filter(|p| now.saturating_sub(p.checked) >= PUBLIC_MS).cloned();
+                if let Some(p) = stale.filter(|_| asked < 20) {
+                    asked += 1;
+                    let digest = k.rsplit_once(":sha256:").map(|(_, h)| format!("sha256:{h}")).unwrap_or_default();
+                    l.public = public_source(self.http, &p.registry, &p.repository, &digest).await.map(|_| Public { checked: now, ..p });
+                    self.store.put(&k, serde_json::to_string(&l).map_err(|e| e.to_string())?).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_well_known_public_registries_are_asked() {
+        assert_eq!(registry_host("docker.io"), Some("registry-1.docker.io"));
+        assert_eq!(registry_host("europe-west1-docker.pkg.dev"), Some("europe-west1-docker.pkg.dev"));
+        assert_eq!(registry_host("eu.gcr.io"), Some("eu.gcr.io"));
+        for refused in ["169.254.169.254", "localhost:5000", "registry.example.com", "evil.com/x.gcr.io", "", "-docker.pkg.dev"] { assert_eq!(registry_host(refused), None, "{refused}") }
+        assert!(is_digest(&format!("sha256:{}", "a".repeat(64))) && !is_digest(&format!("sha256:{}", "A".repeat(64))) && !is_digest("sha256:aa"));
+    }
+
+    #[test]
+    fn a_registry_s_challenge_is_read_as_docker_reads_it() {
+        let c = bearer_challenge(r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull""#).unwrap();
+        assert_eq!(c, [("realm".to_string(), "https://auth.docker.io/token".to_string()), ("service".into(), "registry.docker.io".into()), ("scope".into(), "repository:library/alpine:pull".into())]);
+        assert_eq!(bearer_challenge(r#"Bearer realm="https://ghcr.io/token",service=ghcr.io"#).unwrap()[1], ("service".to_string(), "ghcr.io".to_string()));
+        assert!(bearer_challenge(r#"Basic realm="x""#).is_none());
+    }
+}

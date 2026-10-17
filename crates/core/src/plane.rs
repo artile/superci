@@ -1277,7 +1277,7 @@ impl<'a> ControlPlane<'a> {
             ("GET", p) if p.starts_with("/runs/") && self.reader(&req) => self.run_status(p, &url).await,
             (_, p) if p.starts_with("/runner/") => self.for_runner(&req, &plane_url, &url).await,
             // A machine's `superci-cache` (with the link only it has), for a job's cache.
-            ("POST", p) if p.starts_with("/cache/") && p.ends_with("/layers-links") => self.layers_route(&plane_url, p, Some(&req)).await,
+            ("POST", p) if p.starts_with("/cache/") && (p.ends_with("/layers-links") || p.ends_with("/layers-propose") || p.ends_with("/layers-uploaded")) => self.layers_route(&plane_url, p, Some(&req)).await,
             ("POST", p) if p.starts_with("/cache/") => self.cache_route(&req, &plane_url, p).await,
             ("GET", p) if p.starts_with("/cache/") && p.ends_with("/program") => self.cache_program(&plane_url, p).await,
             // The cache's part of a Linux machine's start (its start-up script fetches it: AWS takes 16 KB of that).
@@ -1743,7 +1743,7 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Credentials for the connected role: a token this control plane signs as its own identity provider, exchanged with STS.
-    async fn aws_creds(&self, plane_url: &str, a: &AwsConnection) -> Result<Credentials> {
+    pub(crate) async fn aws_creds(&self, plane_url: &str, a: &AwsConnection) -> Result<Credentials> {
         if a.role_arn.is_empty() { return self.config.aws_own_creds.clone().ok_or_else(|| "no AWS credentials in this runtime".to_string()); }
         let now = self.clock.now_ms();
         if let Some(c) = self.cache.creds.borrow().as_ref() { if c.expires_at_ms > now + 300_000 { return Ok(c.clone()); } }
@@ -1947,7 +1947,7 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// The AWS account machines run in: this control plane's own when it runs in AWS, else the one connected by role.
-    async fn aws_connection(&self) -> Result<Option<AwsConnection>> {
+    pub(crate) async fn aws_connection(&self) -> Result<Option<AwsConnection>> {
         if let Some((account_id, region)) = &self.config.aws_own {
             if self.config.aws_runners_off { return Ok(None) }
             return Ok(Some(AwsConnection { account_id: account_id.clone(), region: region.clone(), role_arn: String::new(), connected: true, error: None }));
@@ -4549,6 +4549,8 @@ impl<'a> ControlPlane<'a> {
         }
         // The cache: what goes (over a repository's limit, unused for a week, never finished), once an hour.
         if let Err(e) = self.sweep_cache(&plane_url, now).await { let _ = self.store.put("cache-sweep-error", e).await; }
+        // The layer store: what the converter made, and once an hour what goes.
+        if let Err(e) = self.sweep_layers(&plane_url, now).await { let _ = self.store.put("layers-sweep-error", e).await; }
         self.redeliver_failed().await;
         self.untold_gitlab(&plane_url, now).await;
         let moved_lately = self.untold(&plane_url, now).await;
@@ -4732,40 +4734,37 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// A machine's `superci-layers` (with its link): `layers` the script that fetches and runs it, `layers-program`
-    /// on to this version's program in its region's bucket, `layers.json` the layer store's index with signed links to
-    /// its files, and `layers-links` (`{"digests": [...]}`) the same for those layers again (links run out).
+    /// on to this version's program in its region's bucket, `layers.json` the layer store's index (see `layers`),
+    /// `layers-links` links to layers' files, `layers-propose` and `layers-uploaded` what it pulled that the store lacks.
     async fn layers_route(&self, plane_url: &str, path: &str, req: Option<&Request>) -> Result<Response> {
         let now = self.clock.now_ms();
         let (token, what) = path.trim_start_matches("/cache/").split_once('/').unwrap_or_default();
         let Some(machine) = cache::machine(self.store, token, now).await? else { return Ok(nothing_here()) };
         if !self.config.routing.cache.layers { return Ok(nothing_here()) }
         let link = format!("{plane_url}/cache/{token}");
-        if what == "layers" { return Ok(Response::new(200, "text/x-shellscript", aws::layers_script(&link))) }
+        match what {
+            "layers" => return Ok(Response::new(200, "text/x-shellscript", aws::layers_script(&link))),
+            "layers.json" => return self.layers_index(&machine, &link, now).await,
+            _ => {}
+        }
         let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(nothing_here()) };
         let creds = self.aws_creds(plane_url, &a).await?;
-        let bucket = cache::bucket(&self.config.plane_id, &machine.region);
-        if what == "layers-program" {
-            let url = aws::s3_url(&bucket, &machine.region, &cache::layers_key(&machine.arch));
-            return Ok(Response::redirect(&aws::presign("GET", &url, &creds, &machine.region, 600, now)?).with_status(302));
+        let body = req.map(|r| r.body.as_slice()).unwrap_or_default();
+        match what {
+            "layers-program" => {
+                let url = aws::s3_url(&cache::bucket(&self.config.plane_id, &machine.region), &machine.region, &cache::layers_key(&machine.arch));
+                Ok(Response::redirect(&aws::presign("GET", &url, &creds, &machine.region, 600, now)?).with_status(302))
+            }
+            "layers-links" => self.layers_links(&machine, &link, &creds, body, now).await,
+            "layers-propose" => self.layers_propose(&machine, &link, &creds, body, now).await,
+            "layers-uploaded" => self.layers_uploaded(&machine, &creds, body, now).await,
+            _ => Ok(nothing_here()),
         }
-        let got = aws::s3(self.http, "GET", &aws::s3_url(&bucket, &machine.region, cache::LAYERS_INDEX), &machine.region, &creds, vec![], &[], now).await?;
-        if got.status == 404 { return Ok(Response::json(&serde_json::json!({ "layers": {} }))) }
-        if got.status != 200 { return Err(format!("the layer store's index: S3 answered {}", got.status).into()) }
-        #[derive(serde::Deserialize)]
-        struct Stored { #[serde(default)] layers: std::collections::BTreeMap<String, cache::StoredLayer> }
-        let stored: Stored = serde_json::from_slice(&got.body).map_err(|e| format!("the layer store's index: {e}"))?;
-        let wanted: Option<Vec<String>> = match req {
-            Some(r) => Some(serde_json::from_slice::<serde_json::Value>(&r.body).ok().and_then(|b| b["digests"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().map(str::to_string)).take(500).collect())).unwrap_or_default()),
-            None => None,
-        };
-        let sign = |key: &str| aws::presign("GET", &aws::s3_url(&bucket, &machine.region, key), &creds, &machine.region, cache::LINK_SECONDS, now).map_err(|e| e.to_string());
-        let index = cache::machine_index(&stored.layers, wanted.as_deref(), &sign, &format!("{link}/layers-links"))?;
-        Ok(Response::json(&index))
     }
 
     /// What the job on a machine may do in the cache, asked without a token (see `cache::branch_access`): a GitHub
     /// job's, by what GitHub said of it; a run from a computer's, as its token would say it.
-    async fn machine_access(&self, machine: &cache::Machine) -> Result<cache::Access> {
+    pub(crate) async fn machine_access(&self, machine: &cache::Machine) -> Result<cache::Access> {
         // A GitLab machine: the job its runner took, as GitLab said when it began (none yet: nothing to write).
         if let Some(local) = machine.runner.strip_prefix("gl:") {
             let at = format!("glrunner:{local}");

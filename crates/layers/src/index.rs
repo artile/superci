@@ -1,6 +1,7 @@
 //! What SuperCI's store has for this machine: each layer by its blob's digest (the compressed tar a registry
-//! serves), with its EROFS file and its blob at signed links. Written by the machine's start from what the control
-//! plane answered; a layer the index lacks is pulled as Docker pulls it.
+//! serves), with its EROFS file and its blob (their links asked for when a layer is used, see `refresh`). Written by
+//! the machine's start from what the control plane answered; a layer the index lacks is pulled as Docker pulls it,
+//! and proposed to the store afterwards (`propose`).
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -8,6 +9,8 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct File {
+    /// Its link (none until asked for).
+    #[serde(default)]
     pub url: String,
     pub size: u64,
     /// The file's own digest (`sha256:…`), checked before it is used.
@@ -30,7 +33,7 @@ pub struct Layer {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct Link { pub url: String }
+pub struct Link { #[serde(default)] pub url: String }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
 pub struct Usage { pub size: i64, pub inodes: i64 }
@@ -46,6 +49,9 @@ pub struct Index {
     pub layers: HashMap<String, Layer>,
     #[serde(default)]
     pub refresh: Option<Refresh>,
+    /// Where layers pulled that the index lacks are proposed (`POST {"layers": [...]}`, see `propose`).
+    #[serde(default)]
+    pub propose: Option<String>,
 }
 
 impl Index {
