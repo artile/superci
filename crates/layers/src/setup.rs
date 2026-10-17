@@ -163,15 +163,11 @@ fn check_erofs(root: &Path) -> Result<(), String> {
 }
 
 /// The store's own disk for the layer files: made (ext4, no journal: it holds what can be fetched again) and
-/// mounted; with none (`auto`: a repository whose images fit), memory, a quarter of it at most (a file that would
-/// not fit leaves its layer to be pulled as usual); `none`, the machine's own disk.
+/// mounted; with none, the machine's own disk.
 fn store_disk(disk: &str, files: &Path) -> Result<String, String> {
     let dev = match disk {
         "none" => return Ok("the machine's disk".into()),
-        "auto" => match unused_ebs()? {
-            Some(d) => d,
-            None => { run("mount", &["-t", "tmpfs", "-o", "size=25%,mode=0700", "tmpfs", &files.to_string_lossy()])?; return Ok("memory".into()) }
-        },
+        "auto" => match unused_ebs()? { Some(d) => d, None => return Ok("the machine's disk".into()) },
         d => d.to_string(),
     };
     run("mkfs.ext4", &["-q", "-F", "-E", "lazy_itable_init=1,lazy_journal_init=1", "-O", "^has_journal", &dev])?;

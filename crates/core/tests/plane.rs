@@ -4007,12 +4007,11 @@ fn ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has
     assert_eq!(kept(&first, 0, 300 << 20).status, 200);
     assert_eq!(job(&store, 1)["images"]["pulled_bytes"], 300u64 << 20);
     assert_eq!(kept("someone-elses-link-here", 0, 1).status, 404);
-    // The next: the store from its start, its files in memory (they fit in a quarter of it).
-    let (script, launch) = machine(2, "superci/image=ubuntu26");
+    // The next: the store from its start, on a disk of its own, in its price.
+    let (script, _) = machine(2, "superci/image=ubuntu26");
     assert!(script.contains("/layers|bash||(systemctl restart docker &>/dev/null &)") && !script.contains("\n(systemctl restart docker &>/dev/null &)") && script.find("/layers|bash").unwrap() < script.find("cd /home/runner && ").unwrap() && script.contains("$f keep"), "{script}");
-    assert!(field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
-    assert_eq!(job(&store, 2)["layers"], serde_json::Value::Null);
-    // One whose images would not fit: a disk of the store's own, in its price.
+    assert_eq!(job(&store, 2)["layers"], true);
+    // Again, after a run that used images.
     kept(&link_of(&script), 40, 4 << 30);
     let (script, launch) = machine(3, "superci/image=ubuntu26");
     assert!(script.contains("/layers|bash"));
@@ -4037,16 +4036,14 @@ fn ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has
 }
 
 #[test]
-fn the_plan_for_a_repositorys_machine_follows_what_its_last_job_used() {
+fn the_plan_for_a_jobs_machine_follows_what_its_last_run_used() {
     use superci_core::layers::{plan, Images};
     let now = 1_790_000_000_000;
     let used = |served_bytes: u64, pulled_bytes: u64, at: u64| Images { served_bytes, pulled_bytes, at, ..Default::default() };
-    assert_eq!(plan(None, 8, now), (false, false), "nothing known: Docker as it comes");
-    assert_eq!(plan(Some(&used(0, 0, now)), 8, now), (false, false), "no images used");
-    assert_eq!(plan(Some(&used(1 << 30, 0, now)), 8, now), (true, false), "1 GB of blobs (1.5 GB of files) in 8 GB of memory");
-    assert_eq!(plan(Some(&used(1 << 30, 1 << 30, now)), 8, now), (true, true), "3 GB of files: more than a quarter of 8 GB");
-    assert_eq!(plan(Some(&used(1 << 30, 1 << 30, now)), 32, now), (true, false));
-    assert_eq!(plan(Some(&used(1 << 30, 0, now - 8 * 86_400_000)), 8, now), (false, false), "a week old: not counted");
+    assert!(!plan(None, now), "nothing known: Docker as it comes");
+    assert!(!plan(Some(&used(0, 0, now)), now), "no images used");
+    assert!(plan(Some(&used(1 << 30, 0, now)), now) && plan(Some(&used(0, 1 << 20, now)), now));
+    assert!(!plan(Some(&used(1 << 30, 0, now - 8 * 86_400_000)), now), "a week old: not counted");
 }
 
 #[test]

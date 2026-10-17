@@ -92,7 +92,7 @@ pub fn keep(o: &Options) -> i32 {
     let boot: std::collections::HashSet<String> = std::fs::read_to_string(&o.boot).unwrap_or_default().lines().map(|h| format!("sha256:{}", h.trim())).collect();
     let mut done = Done::default();
     // (A layer from the store: counted as the index has it, whether or not containerd keeps its blob.)
-    for d in named(&infos) { if let Some(l) = index.get(&d) { done.served += 1; done.served_bytes += l.size } }
+    for d in named(&infos).into_iter().filter(|d| !boot.contains(d)) { if let Some(l) = index.get(&d) { done.served += 1; done.served_bytes += l.size } }
     let mut offered = vec![];
     for l in layers_of(&infos).into_iter().filter(|l| index.get(&l.digest).is_none() && !boot.contains(&l.digest)) {
         done.pulled += 1;
