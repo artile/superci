@@ -10,8 +10,9 @@ set -Eeuo pipefail
 trap 'echo "FAILED at line $LINENO: $BASH_COMMAND" >&2; for f in /var/log/superci-layers.log /var/log/containerd.log /var/log/dockerd.log; do echo "== $f"; tail -30 "$f"; done' ERR
 T() { echo "== $(date +%T) $*"; }
 CONF=/etc/containerd/config.toml
-# The images: Docker's official ones from AWS's public mirror (Docker Hub limits anonymous pulls).
-L=public.ecr.aws/docker/library
+# The images: Docker's official ones from AWS's public mirror (Docker Hub limits anonymous pulls), or the mirror
+# IMAGES names (CI uses Google's: ECR Public limits what one address pulls in a month, and GitHub's runners share theirs).
+L=${IMAGES:-public.ecr.aws/docker/library}
 ALPINE=$L/alpine:3.22 BUSYBOX=$L/busybox:1.37 POSTGRES=$L/postgres:17-alpine REGISTRY=$L/registry:2
 cp "$CONF" /root/config.stock.toml
 mkdir -p /etc/docker /root/out
@@ -185,7 +186,7 @@ grep "pulled as usual" /var/log/superci-layers.log | grep -q "$broken" || { echo
 # Busybox's layers, which the store lacks: proposed (with where they came from) once pulls stopped, and uploaded whole.
 for i in $(seq 60); do [ "$(sort -u /root/bucket/uploaded.txt 2>/dev/null | wc -l)" -ge "$(wc -l < /root/not-stored.txt)" ] && break; sleep 1; done
 while read -r d; do
-  grep -q "^$d .*public.ecr.aws/docker/library/busybox" /root/bucket/proposed.txt || { echo "$d was not proposed with its source" >&2; cat /root/bucket/proposed.txt >&2; exit 1; }
+  grep -q "^$d .*$L/busybox" /root/bucket/proposed.txt || { echo "$d was not proposed with its source" >&2; cat /root/bucket/proposed.txt >&2; exit 1; }
   grep -q "^$d " /root/bucket/uploaded.txt || { echo "$d was not uploaded" >&2; exit 1; }
   [ "sha256:$(sha256sum "/root/bucket/staging/${d#sha256:}" | cut -c1-64)" = "$d" ]
 done < /root/not-stored.txt
