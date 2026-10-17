@@ -74,7 +74,10 @@ async fn infos(socket: &Path) -> Result<BTreeMap<String, (u64, HashMap<String, S
 /// What a keep did: what came from the store, what was pulled, what was uploaded, and what of the pulled the store had
 /// already (or has on its way: its next job gets it all the same).
 #[derive(Debug, Default, Clone, PartialEq)]
-pub struct Done { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub pulled_bytes: u64, pub uploaded: u64, pub uploaded_bytes: u64, pub had: u64, pub had_bytes: u64 }
+pub struct Done { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub pulled_bytes: u64, pub uploaded: u64, pub uploaded_bytes: u64, pub had: u64, pub had_bytes: u64,
+    /// Of the pulled and not kept, why: no whole file of it here, the control plane would not take it, its upload
+    /// failed (the first failure's words in `note`).
+    pub missing: u64, pub missing_bytes: u64, pub refused: u64, pub failed: u64, pub note: String }
 
 /// The keep (see the module); 0 whatever happened (a machine's end never waits on it beyond `most`).
 pub fn keep(o: &Options) -> i32 {
@@ -99,14 +102,16 @@ pub fn keep(o: &Options) -> i32 {
         done.pulled += 1;
         done.pulled_bytes += l.size;
         // (Only a blob kept here whole.)
-        if blob_path(&o.content, &l.digest).and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.len() == l.size) { offered.push(l) }
+        if blob_path(&o.content, &l.digest).and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.len() == l.size) { offered.push(l) } else { done.missing += 1; done.missing_bytes += l.size }
     }
     let sizes: std::collections::HashMap<String, u64> = offered.iter().map(|l| (l.digest.clone(), l.size)).collect();
-    let (uploaded, bytes, had) = offer(&agent, &o.link, &o.content, offered, began + o.most);
-    (done.uploaded, done.uploaded_bytes) = (uploaded, bytes);
+    let said = offer(&agent, &o.link, &o.content, offered, began + o.most);
+    let (uploaded, bytes, had) = (said.uploaded, said.bytes, said.had);
+    (done.uploaded, done.uploaded_bytes, done.refused, done.failed, done.note) = (uploaded, bytes, said.refused, said.failed, said.note);
     (done.had, done.had_bytes) = (had.len() as u64, had.iter().filter_map(|d| sizes.get(d)).sum());
     let report = json!({ "served": done.served, "served_bytes": done.served_bytes, "pulled": done.pulled, "pulled_bytes": done.pulled_bytes,
-        "uploaded": done.uploaded, "uploaded_bytes": done.uploaded_bytes, "had": done.had, "had_bytes": done.had_bytes, "seconds": (began.elapsed().as_secs_f64() * 10.0).round() / 10.0 });
+        "uploaded": done.uploaded, "uploaded_bytes": done.uploaded_bytes, "had": done.had, "had_bytes": done.had_bytes,
+        "missing": done.missing, "missing_bytes": done.missing_bytes, "refused": done.refused, "failed": done.failed, "note": done.note, "seconds": (began.elapsed().as_secs_f64() * 10.0).round() / 10.0 });
     eprintln!("superci-layers keep: {report}");
     if let Err(e) = post(&agent, &format!("{}/layers-kept", o.link), &report) { eprintln!("superci-layers keep: saying what was kept: {e}") }
     0
@@ -123,24 +128,34 @@ fn post(agent: &ureq::Agent, url: &str, body: &Value) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 
+/// What an offer came to: how many were uploaded and their bytes, the layers the store had already, how many it
+/// would not take, how many uploads failed, and the first failure's words.
+#[derive(Default)]
+struct Offered { uploaded: u64, bytes: u64, had: Vec<String>, refused: u64, failed: u64, note: String }
+
 /// The layers offered (fifty at a time), then those the control plane asks for uploaded, `AT_ONCE` at a time, until
-/// `until`: how many were, their bytes, and the layers it said it has already.
-fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, until: Instant) -> (u64, u64, Vec<String>) {
+/// `until`.
+fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, until: Instant) -> Offered {
     let mut asked: Vec<(String, Value)> = vec![];
-    let mut had: Vec<String> = vec![];
+    let mut out = Offered::default();
+    let total_offered = offered.len() as u64;
     let mut uploaded_at = String::new();
     for chunk in offered.chunks(50) {
         let body = json!({ "layers": chunk.iter().map(|l| json!({ "digest": l.digest, "size": l.size, "sources": l.sources })).collect::<Vec<_>>() });
         match post(agent, &format!("{link}/layers-propose"), &body) {
             Ok(answer) => {
                 uploaded_at = answer["uploaded"].as_str().unwrap_or_default().to_string();
-                for (d, a) in answer["layers"].as_object().into_iter().flatten() { if a["do"] == "upload" { asked.push((d.clone(), a.clone())) } else if a["do"] == "have" { had.push(d.clone()) } }
+                for (d, a) in answer["layers"].as_object().into_iter().flatten() {
+                    match a["do"].as_str() { Some("upload") => asked.push((d.clone(), a.clone())), Some("have") => out.had.push(d.clone()), _ => out.refused += 1 }
+                }
             }
-            Err(e) => { eprintln!("superci-layers keep: offering layers: {e}"); return (0, 0, vec![]) }
+            Err(e) => { eprintln!("superci-layers keep: offering layers: {e}"); return Offered { failed: total_offered, note: format!("offering them: {e}"), ..out } }
         }
     }
+    let asked_n = asked.len() as u64;
     let next = std::sync::Mutex::new(asked.into_iter());
     let total = std::sync::Mutex::new((0u64, 0u64));
+    let first_error = std::sync::Mutex::new(String::new());
     std::thread::scope(|s| {
         for _ in 0..AT_ONCE {
             s.spawn(|| loop {
@@ -154,13 +169,16 @@ fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, 
                         t.0 += 1;
                         t.1 += n;
                     }
-                    Err(e) => eprintln!("superci-layers keep: {digest} not uploaded: {e}"),
+                    Err(e) => { eprintln!("superci-layers keep: {digest} not uploaded: {e}"); let mut f = first_error.lock().unwrap(); if f.is_empty() { *f = e.chars().take(200).collect() } }
                 }
             });
         }
     });
     let (n, bytes) = total.into_inner().unwrap();
-    (n, bytes, had)
+    // (Asked for and not uploaded: failed, or out of time.)
+    let failed = asked_n - n;
+    let note = first_error.into_inner().unwrap();
+    Offered { uploaded: n, bytes, failed, note: if note.is_empty() && failed > 0 { "out of time".into() } else { note }, ..out }
 }
 
 /// The blob put at the link the control plane gave, with the headers it said (given up at `until`).

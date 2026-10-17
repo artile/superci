@@ -901,6 +901,15 @@ fn what_a_job_had_from_the_caches_docker_images_is_said_and_keeping_them_is_turn
         }
         assert_eq!(json(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).1["job"]["images"].as_str(), Some(said));
     }
+    // Why the rest was not kept, as its machine said.
+    {
+        let mut store = served.store.0.lock().unwrap();
+        let key = format!("job:{job_id}");
+        let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+        j["images"] = serde_json::json!({ "pulled": 12, "pulled_bytes": 900_000_000u64, "uploaded": 8, "uploaded_bytes": 180_000_000u64, "missing": 3, "missing_bytes": 716_000_000u64, "failed": 1, "note": "the bucket answered 403 Forbidden", "at": 1 });
+        store.insert(key, j.to_string());
+    }
+    assert_eq!(json(&home, &["jobs", "retrieve", &job_id, "--bytes=100"]).1["job"]["images"].as_str(), Some("12 layers pulled (900 MB), 8 of them kept for the next job (180 MB): 3 layers with no whole file on the machine (716 MB), 1 layer not uploaded (the bucket answered 403 Forbidden)"));
     // One whose keeping failed says why.
     {
         let mut store = served.store.0.lock().unwrap();

@@ -33,8 +33,9 @@ use crate::{aws, cache};
 /// A blob larger than this is not converted (as the converter says).
 pub const MOST_BYTES: u64 = 4 << 30;
 /// Conversions under way at once in a region at most (more wait in the control plane's queue, `lwant:`, and start at
-/// its sweeps as these end: the machine that pulled them may be gone by then).
-pub const AT_ONCE: usize = 16;
+/// its sweeps, a minute apart, as these end): a stack's images (a hundred layers) all at once, so that its next run has
+/// them. (Lambda queues what is past an account's concurrency, and runs it as room comes.)
+pub const AT_ONCE: usize = 64;
 /// How long a layer waits in the queue at most (a staged blob is kept a day).
 pub const WANTED_MS: u64 = 86_400_000;
 /// A conversion not heard of within this is taken as lost (the converter runs 15 minutes at most).
@@ -90,7 +91,12 @@ pub struct Wanted { pub at: u64, pub size: u64, pub source: Value, #[serde(defau
 pub struct Images { #[serde(default)] pub served: u64, #[serde(default)] pub served_bytes: u64, #[serde(default)] pub pulled: u64, #[serde(default)] pub pulled_bytes: u64,
     #[serde(default)] pub uploaded: u64, #[serde(default)] pub uploaded_bytes: u64,
     /// Of the pulled, those the store had already (or had on their way): the next job has them too.
-    #[serde(default)] pub had: u64, #[serde(default)] pub had_bytes: u64, #[serde(default)] pub at: u64,
+    #[serde(default)] pub had: u64, #[serde(default)] pub had_bytes: u64,
+    /// Of the pulled and not kept, why: no whole file of it on the machine, the store would not take it, its upload
+    /// failed (the first failure's words).
+    #[serde(default)] pub missing: u64, #[serde(default)] pub missing_bytes: u64, #[serde(default)] pub refused: u64, #[serde(default)] pub failed: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")] pub note: String,
+    #[serde(default)] pub at: u64,
     /// Why nothing could be said (containerd out of reach).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub error: Option<String> }
 

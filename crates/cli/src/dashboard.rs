@@ -899,7 +899,13 @@ pub fn images_said(j: &serde_json::Value) -> Option<String> {
         (k, all) if k >= all => "kept for the next job".to_string(),
         (k, _) => format!("{k} of them kept for the next job ({})", size_words(n("uploaded_bytes") + n("had_bytes"))),
     };
-    let pulled = (n("pulled") > 0).then(|| format!("{} pulled ({}), {kept}", layers(n("pulled")), size_words(n("pulled_bytes"))));
+    // Why the rest was not kept, when the machine said.
+    let mut why = vec![];
+    if n("missing") > 0 { why.push(format!("{} with no whole file on the machine ({})", layers(n("missing")), size_words(n("missing_bytes")))) }
+    if n("refused") > 0 { why.push(format!("{} the cache would not take", layers(n("refused")))) }
+    if n("failed") > 0 { why.push(format!("{} not uploaded ({})", layers(n("failed")), i["note"].as_str().filter(|s| !s.is_empty()).unwrap_or("failed"))) }
+    let not_kept = if why.is_empty() { String::new() } else { format!(": {}", why.join(", ")) };
+    let pulled = (n("pulled") > 0).then(|| format!("{} pulled ({}), {kept}{not_kept}", layers(n("pulled")), size_words(n("pulled_bytes"))));
     match (from, pulled) { (None, None) => None, (Some(a), None) | (None, Some(a)) => Some(a), (Some(a), Some(b)) => Some(format!("{a}; {b}")) }
 }
 
