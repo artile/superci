@@ -460,6 +460,10 @@ pub fn job_key(j: &Job) -> String { if j.provider == "gitlab" { format!("job:gl{
 
 /// How long a job's record is kept once it is over (the dashboard's history; spend and usage are kept by the day).
 pub const JOB_KEPT_MS: u64 = 90 * 86_400_000;
+
+/// The lines of one job given at most in one answer of a run's status (their records' size): what is left comes at
+/// the next ask.
+const RUN_LINES_BYTES: usize = 1_500_000;
 /// How long a job stays among the live ones once nothing more is done for it (machines counted against an account's
 /// limits a little longer than they run).
 const LIVE_AFTER_MS: u64 = 30 * 60_000;
@@ -4132,9 +4136,14 @@ impl<'a> ControlPlane<'a> {
             // with the number of each one's whole log (for what the runner did not send as it went).
             let (mut posts, mut steps) = (vec![], vec![]);
             if let Some(token) = j["token"].as_str() {
+                // (So much at most in one answer, the rest at the next ask from `next`: a runtime's answer holds
+                // six MB, and a run that is followed from its start, or read after it ended, can have more.)
+                let mut bytes = 0;
                 for (k, v) in self.store.list(&format!("rline:{token}:")).await? {
                     let n = k.rsplit(':').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
                     if n <= from { continue }
+                    if bytes > RUN_LINES_BYTES { break }
+                    bytes += v.len();
                     let (step, start, those) = crate::runner_service::feed(&v);
                     lines.extend(those.iter().cloned());
                     posts.push(serde_json::json!({ "step": step, "start": start, "lines": those }));

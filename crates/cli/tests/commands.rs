@@ -648,8 +648,8 @@ fn the_first_control_plane_deployed_in_a_named_workspace_is_called_what_the_work
 }
 
 #[test]
-fn with_two_live_control_planes_a_command_or_a_change_says_which_one_it_is_for() {
-    // Two control planes in the account, each serving GitHub (two CIs, side by side).
+fn another_ci_in_the_same_account_is_listed_apart_and_a_workspace_of_its_own_picks_it() {
+    // Two control planes in the account, each serving GitHub (two CIs, side by side): the workspace looks after its own.
     let served = serve(|_| {});
     served.connect_github();
     // (The other reads its settings in the account, where the dashboard writes them.)
@@ -657,40 +657,46 @@ fn with_two_live_control_planes_a_command_or_a_change_says_which_one_it_is_for()
     let other = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
     for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
     served.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+    served.aws.put("/superci/testplane0002/NAME", "GlobexCI");
+    served.aws.put("/superci/testplane0002/OWNERS", "github:globex");
     let home = common::signed_in(&served);
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
-    // A command for a control plane names one; with none named it says so and names them; one named that is not
-    // there stops it.
+    let keys = || served.aws.settings("testplane0002").iter().filter(|(k, _)| k.starts_with("DASHBOARD_KEY_")).count();
+    let keys_before = keys();
+    // Commands are for this workspace's CI, with nothing named; the other one is not this workspace's to name.
     let (code, v) = json(&home, &["planes", "allow", "--dry-run"]);
-    let error = v["error"].as_str().unwrap_or_default().to_string();
-    assert!(code != 0 && error.contains("2 control planes are live here. Name one") && error.contains("testplane0002"), "{v}");
+    assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains(superci_testkit::PLANE), "{v}");
     let (code, v) = json(&home, &["planes", "allow", "--dry-run", "--plane=testplane0002"]);
-    assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains("testplane0002"), "{v}");
-    let (code, v) = json(&home, &["planes", "allow", "--dry-run", "--plane=nowhere00000"]);
     assert!(code != 0, "{v}");
-    // Listed, both live (a listing asks for none to be named).
+    assert_eq!(json(&home, &["jobs", "list"]).0, 0);
+    // Listed apart, with its name and whose jobs it runs (read from the account, before anything of this computer's
+    // is in it); its settings are not touched.
     let (code, planes) = json(&home, &["planes", "list"]);
-    assert!(code == 0 && planes["control_planes"].as_array().unwrap().iter().filter(|p| p["live"] == true).count() == 2, "{planes}");
+    assert!(code == 0 && planes["control_planes"].as_array().unwrap().len() == 1 && planes["control_planes"][0]["in_use"] == true, "{planes}");
+    assert_eq!((planes["found"][0]["id"].as_str(), planes["found"][0]["name"].as_str(), planes["found"][0]["owners"].as_str()), (Some("testplane0002"), Some("GlobexCI"), Some("github:globex")), "{planes}");
     let o = superci(&home, &["planes", "list"]);
-    assert!(String::from_utf8_lossy(&o.stdout).contains("testplane0002"), "{}", String::from_utf8_lossy(&o.stdout));
-    // Once both are known here, a command that reads names one too.
-    let (code, v) = json(&home, &["jobs", "list"]);
-    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("Name one"), "{v}");
-    assert_eq!(json(&home, &["jobs", "list", "--plane=testplane0001"]).0, 0);
-    // The dashboard: a change on no control plane's page is refused; on one's page it is that one's; a page of one
-    // not known here is said.
+    let said = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(said.contains("Other CIs in your signed-in clouds, not this workspace's:") && said.contains("testplane0002") && said.contains("GlobexCI"), "{said}");
+    assert_eq!(keys(), keys_before, "no key of this computer's in another CI");
+    // A workspace of its own: made, signed in to the same account, and it picks that CI.
+    assert!(superci(&home, &["workspaces", "create", "Globex"]).status.success());
+    let mine = std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap();
+    let mut theirs: serde_json::Value = serde_json::from_str(&mine).unwrap();
+    for k in ["plane", "planes_more", "key", "cloudflare", "modal"] { theirs.as_object_mut().unwrap().remove(k); }
+    std::fs::write(home.join("workspaces/globex/sign-ins.json"), theirs.to_string()).unwrap();
+    let (code, v) = json(&home, &["planes", "list", "--workspace=globex"]);
+    assert!(code == 0 && v["control_planes"].as_array().unwrap().is_empty() && v["found"].as_array().unwrap().len() == 2, "found, none taken in: {v}");
+    let (code, v) = json(&home, &["workspaces", "update", "globex", "--plane=testplane0002"]);
+    assert!(code == 0 && v["plane"] == "testplane0002", "{v}");
+    let (_, v) = json(&home, &["planes", "list", "--workspace=globex"]);
+    assert_eq!((v["control_planes"][0]["id"].as_str(), v["found"][0]["id"].as_str()), (Some("testplane0002"), Some(superci_testkit::PLANE)), "{v}");
+    assert_eq!(keys(), keys_before + 1, "its key written in the CI it picked");
+    // One that looks after a CI already takes no second one.
+    let (code, v) = json(&home, &["workspaces", "update", "default", "--plane=testplane0002"]);
+    assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("looks after a CI already"), "{v}");
+    // The dashboard: the other CI is offered as the workspace that looks after it.
     let (_child, link) = common::dashboard(&home);
-    // (Both listed, each to open.)
-    assert!((0..40).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=planes&fragment=1").1).matches("Open").count() >= 2 }));
-    let (status, _, said) = common::post(&link, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
-    assert!(status == 409 && common::words(&said).contains("Which control plane?"), "{status} {}", common::words(&said));
-    let (status, _, _) = common::post(&link, "/routing?c=testplane0002", &[("action", "max_cpu"), ("max_cpu", "16")]);
-    assert_eq!(status, 303);
-    let routing: serde_json::Value = serde_json::from_str(&served.aws.settings("testplane0002").into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default()).unwrap_or_default();
-    assert_eq!(routing["max_cpu"], 16, "{routing}");
-    assert!(served.aws.settings(superci_testkit::PLANE).iter().all(|(k, _)| k != "ROUTING"), "the other one's unchanged");
-    let (status, _, said) = common::post(&link, "/routing?c=nowhere00000", &[("action", "max_cpu"), ("max_cpu", "16")]);
-    assert!(status == 404 && common::words(&said).contains("That control plane is not known here"), "{status}");
+    assert!((0..40).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); let w = common::words(&common::part(&link, "/?p=planes&fragment=1").1); w.contains("Other CIs in your signed-in accounts") && w.contains("GlobexCI") && w.contains("Open Globex") }));
     let _ = std::fs::remove_dir_all(&home);
 }
 

@@ -272,7 +272,24 @@ pub fn delete_secret(creds: &Credentials, region: &str, plane_id: &str, secret: 
     ok_if(api(creds, region).ssm("DeleteParameter", json!({ "Name": format!("/superci/{plane_id}/{secret}") })), &["ParameterNotFound"])
 }
 
+/// The names of all the control plane's secrets (SSM gives them ten at a time).
 pub fn secret_names(creds: &Credentials, region: &str, plane_id: &str) -> Result<Vec<String>> {
-    let v = api(creds, region).ssm("GetParametersByPath", json!({ "Path": format!("/superci/{plane_id}/"), "WithDecryption": false, "MaxResults": 10 }))?;
-    Ok(v["Parameters"].as_array().into_iter().flatten().filter_map(|p| p["Name"].as_str()?.rsplit('/').next().map(str::to_string)).collect())
+    let (a, mut names, mut next) = (api(creds, region), vec![], None::<String>);
+    loop {
+        let mut body = json!({ "Path": format!("/superci/{plane_id}/"), "WithDecryption": false, "MaxResults": 10 });
+        if let Some(n) = &next { body["NextToken"] = json!(n) }
+        let v = a.ssm("GetParametersByPath", body)?;
+        names.extend(v["Parameters"].as_array().into_iter().flatten().filter_map(|p| p["Name"].as_str()?.rsplit('/').next().map(str::to_string)));
+        next = v["NextToken"].as_str().map(str::to_string);
+        if next.is_none() { return Ok(names) }
+    }
+}
+
+/// What a control plane says of itself to whoever may read its account (before any key of this computer's is in it):
+/// its name and whose jobs it runs (`NAME`, `OWNERS`), none for what is not set.
+pub fn about(creds: &Credentials, region: &str, plane_id: &str) -> Result<(Option<String>, Option<String>)> {
+    let names: Vec<String> = ["NAME", "OWNERS"].iter().map(|n| format!("/superci/{plane_id}/{n}")).collect();
+    let v = api(creds, region).ssm("GetParameters", json!({ "Names": names, "WithDecryption": true }))?;
+    let get = |n: &str| v["Parameters"].as_array().into_iter().flatten().find(|p| p["Name"].as_str().is_some_and(|x| x.ends_with(&format!("/{n}")))).and_then(|p| p["Value"].as_str()).filter(|s| !s.is_empty()).map(str::to_string);
+    Ok((get("NAME"), get("OWNERS")))
 }

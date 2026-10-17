@@ -459,6 +459,12 @@ impl Aws {
                 Some(p) => (200, json!({ "Parameter": one(&name, p, a["WithDecryption"] == true) })),
                 None => not_found(),
             },
+            "AmazonSSM.GetParameters" => {
+                let p = self.params.lock().unwrap();
+                let (mut found, mut not) = (vec![], vec![]);
+                for n in a["Names"].as_array().into_iter().flatten().filter_map(|n| n.as_str()) { match p.get(n) { Some(v) => found.push(one(n, v, a["WithDecryption"] == true)), None => not.push(n) } }
+                (200, json!({ "Parameters": found, "InvalidParameters": not }))
+            }
             "AmazonSSM.DeleteParameter" => match self.params.lock().unwrap().remove(&name) { Some(_) => (200, json!({})), None => not_found() },
             "AmazonSSM.DeleteParameters" => {
                 let mut p = self.params.lock().unwrap();

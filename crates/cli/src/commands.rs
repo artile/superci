@@ -61,7 +61,7 @@ const HELP: &[(&str, &str, &str)] = &[
         "Keys that only read, for a coding agent or a script.\n\ncreate    Makes a key and shows it once. With it and the control plane's address, anything that looks works with no\n          sign-in on that machine, and nothing can be changed:\n            SUPERCI_PLANE=https://… SUPERCI_KEY=superci_read_… superci jobs list\n          Only the key's SHA-256 is kept, in your control plane. It ends by itself (30 days unless --days says\n          otherwise, 366 at most).\n          With --runs, the key also starts runs from a computer (`superci runs create`), and nothing else. Its jobs keep\n          to this control plane's limits, as every job does (`superci limits`). For a coding agent that should run the\n          tests without pushing and without your sign-in.\ndelete    Ends one at once."),
     ("images", "  superci images list [--account=ID]\n  superci images create REGION [--from=REGION:IMAGE] [--account=ID]\n  superci images update REGION [--account=ID]\n  superci images delete REGION --confirm [--account=ID]",
         "The image AWS machines start from (GitHub's own runner image, published for AWS by RunsOn in most regions).\n\nlist      Each region the AWS account can use: whether the image is published there, or your own copy is.\ncreate    Copies the image into a region it is not published in, so that jobs can start there. Where to copy\n          from is read from its maker's public list; --from names a region and an image instead. AWS takes about\n          ten minutes. The copy is kept in your account's storage there (about $1.50 a month).\nupdate    Copies the newest build in, where your copy is of an older one (its maker builds the image anew every\n          week or two; `list` says when one is out). Jobs start from the older copy until the new one is\n          there; the older one is then removed.\ndelete    Removes your copy from a region, with its storage."),
-    ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces delete ID --confirm",
+    ("workspaces", "  superci workspaces list\n  superci workspaces create NAME\n  superci workspaces update ID --id=NEW\n  superci workspaces update ID --plane=PLANE\n  superci workspaces delete ID --confirm",
         "A workspace has its own sign-ins to its clouds, and through them its own control plane, runners and repositories.\nNothing of one is seen from another. There is one (`default`) until you make more. With several, a command says\nwhich, by its id: --workspace=ID, or SUPERCI_WORKSPACE=ID for a whole terminal. A command that names none stops\nand lists them.\n\ncreate    Makes an empty one called NAME (AcmeCI, Build Farm), which its CI is called too. Its id is made from the\n          name (acmeci, build-farm). Then `superci login --workspace=ID`.\nupdate    Gives one another id. What it is called is `superci name update`.\ndelete    Signs it out and forgets it on this machine. Nothing in its clouds is deleted: its control plane and\n          runners keep working (`superci leave --workspace=ID --confirm` stops them first)."),
     ("leave", "  superci leave --confirm           Stops using SuperCI: what it made in your clouds is deleted.",
         "GitHub and GitLab stop sending jobs, then the control plane is deleted with what was made for it, and with it the\nones that serve nothing. Another one that serves a code host of its own is left as it is: `--plane=ID` stops that\none by itself. The GitHub App itself is deleted on GitHub; change `runs-on: superci` back in your workflows first.\nWith several workspaces it takes --workspace=ID on the command itself, never from SUPERCI_WORKSPACE."),
@@ -1479,8 +1479,19 @@ fn workspaces(args: &Args) -> Result<Done> {
             store::Store::under(&root, &id).set_about(&store::About { name: name.clone(), ..Default::default() })?;
             Ok(Done { said: vec![format!("The workspace {name} is made, with nothing in it yet. Its id is {id}."), format!("Sign in to its clouds: `superci login --workspace={id}`, or open it: `superci dashboard --workspace={id}`.")], data: json!({ "ok": true, "workspace": id, "name": name }) })
         }
+        // A CI found in its signed-in clouds, taken as its own (while it has none).
+        "update" if args.get("plane").is_some() => {
+            if id.is_empty() { return usage("Say which: `superci workspaces update ID --plane=PLANE`.") }
+            known(&id)?;
+            let plane = args.get("plane").unwrap_or_default().trim().to_string();
+            if let Some(done) = dry(args, &format!("have the workspace {id} look after the control plane {plane}"), "workspaces", &[]) { return Ok(done) }
+            let mut d = Dashboard::signed_in(Some(store::Store::under(&root, &id)));
+            d.all()?;
+            let said = d.join(&plane).map_err(|(_, e)| format!("{e}. Its CIs: `superci planes list --workspace={id}`."))?;
+            Ok(Done { said: vec![said], data: json!({ "ok": true, "workspace": id, "plane": plane }) })
+        }
         "update" => {
-            let Some(to) = args.get("id").map(|n| n.trim().to_lowercase()) else { return usage("Say its new id: `superci workspaces update ID --id=NEW`.") };
+            let Some(to) = args.get("id").map(|n| n.trim().to_lowercase()) else { return usage("Say its new id: `superci workspaces update ID --id=NEW` (or the CI it looks after: `--plane=PLANE`).") };
             if id.is_empty() { return usage("Say which: `superci workspaces update ID --id=NEW`.") }
             known(&id)?;
             store::valid_id(&to)?;
@@ -1584,11 +1595,17 @@ fn planes() -> Result<Done> {
     let several = views.iter().filter(|v| v.serves_its_own()).count() > 1;
     let list: Vec<Value> = views.iter().enumerate().map(|(i, v)| { let mut p = plane_json(v); p["in_use"] = (!several && i == used).into(); p["live"] = v.serves_its_own().into(); p }).collect();
     let mut said: Vec<String> = list.iter().map(|p| format!("{}  {:<44} {}{}", p["id"].as_str().unwrap_or_default(), p["where"].as_str().unwrap_or_default(), p["version"].as_str().unwrap_or("not answering"), if p["in_use"] == true { "  in use" } else if several && p["live"] == true { "  live" } else { "" })).collect();
-    if said.is_empty() { said.push(format!("No control plane in the clouds signed in to. {}", NO_PLANE.trim_start_matches("There is no control plane yet. "))) }
+    // Other CIs in the same clouds: listed apart, never this workspace's (a workspace looks after one CI).
+    let found: Vec<Value> = d.found().into_iter().map(|(p, name, owners)| json!({ "id": p.plane_id(), "cloud": p.cloud(), "where": p.place(), "url": p.url(), "name": name, "owners": owners })).collect();
+    if said.is_empty() && found.is_empty() { said.push(format!("No control plane in the clouds signed in to. {}", NO_PLANE.trim_start_matches("There is no control plane yet. "))) }
+    if !found.is_empty() {
+        said.push(if list.is_empty() { "Found in your signed-in clouds (`superci workspaces update ID --plane=PLANE` uses one in a workspace):".to_string() } else { "Other CIs in your signed-in clouds, not this workspace's:".to_string() });
+        said.extend(found.iter().map(|f| format!("{}  {:<44} {}", f["id"].as_str().unwrap_or_default(), f["where"].as_str().unwrap_or_default(), f["name"].as_str().unwrap_or("not named"))));
+    }
     // A sign-in that is over: said once, beside what the others reach.
     let notes = d.ended_notes();
     said.extend(notes.iter().cloned());
-    let mut data = json!({ "control_planes": list });
+    let mut data = json!({ "control_planes": list, "found": found });
     if !notes.is_empty() { data["notes"] = json!(notes) }
     Ok(Done { said, data })
 }

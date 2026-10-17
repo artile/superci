@@ -41,6 +41,9 @@ fn an_aws_control_plane_gets_every_providers_runners_then_moves_to_cloudflare_as
     let home = common::signed_in(&served);
     let file = home.join("workspaces/default/sign-ins.json");
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    // (The workspace looks after the one the recording has in the account: the one served here, as it is called there.)
+    kept["plane"]["Aws"]["plane_id"] = "otherplane01".into();
+    kept["key"]["planes"] = serde_json::json!(["otherplane01"]);
     kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
     kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
     std::fs::write(&file, kept.to_string()).unwrap();

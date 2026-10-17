@@ -113,7 +113,9 @@ pub fn workspaces_in(root: &std::path::Path) -> Vec<String> {
 }
 
 /// A workspace in a line of a list: read from what it keeps, nothing asked of any cloud.
-pub struct Listed { pub id: String, pub name: String, pub hosts: Vec<(String, String)>, pub picture: String, pub place: String, pub signed_in: bool }
+pub struct Listed { pub id: String, pub name: String, pub hosts: Vec<(String, String)>, pub picture: String, pub place: String, pub signed_in: bool,
+    /// The control plane it looks after (none yet: empty).
+    pub plane_id: String }
 
 impl Listed {
     /// What it is called where people read it: its name, or its id until it has one.
@@ -128,7 +130,8 @@ pub fn listed(root: &std::path::Path, also: Option<&str>) -> Vec<Listed> {
     names.into_iter().map(|id| {
         let store = Store::under(root, &id);
         let (kept, about) = (store.read(), store.about());
-        Listed { name: about.name, hosts: about.hosts, picture: about.picture, place: kept.plane.as_ref().map(|p| p.place()).unwrap_or_default(), signed_in: kept.signed_in(), id }
+        Listed { name: about.name, hosts: about.hosts, picture: about.picture, place: kept.plane.as_ref().map(|p| p.place()).unwrap_or_default(), signed_in: kept.signed_in(),
+            plane_id: kept.plane.as_ref().map(|p| p.plane_id().to_string()).unwrap_or_default(), id }
     }).collect()
 }
 

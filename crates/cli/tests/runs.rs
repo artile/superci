@@ -69,6 +69,38 @@ fn a_run_from_a_computer_prints_every_line_once_in_order_and_ends_with_how_each_
 }
 
 /// Plays a one-step run to its end: `lines` as they come (all of them), its whole log, and how it ended.
+#[test]
+fn a_long_runs_lines_come_a_few_mb_at_a_time_and_every_one_is_printed_when_it_is_followed_after_it_ended() {
+    // Two MB of lines, sent as a runner sends them (a hundred at a time), the run over before it is followed: its
+    // status gives them in more than one answer (a runtime's holds six MB), and every one is printed, in order.
+    let served = serve(|_| {});
+    let dir = checkout();
+    assert!(superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap().status.success());
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let a = "cccccccc-0000-0000-0000-000000000003";
+    let lines: Vec<String> = (1..=4000).map(|n| format!("line {n:04} {}", "x".repeat(490))).collect();
+    runner.take();
+    runner.steps(&[(a, "Run make test", 1, "inProgress", None, None)]);
+    for (k, chunk) in lines.chunks(100).enumerate() { runner.lines(a, k as u64 * 100 + 1, chunk); }
+    runner.log(1, &lines.iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n"));
+    runner.steps(&[(a, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+    runner.finish("succeeded");
+    // Asked from the start: a part, and where to ask from next; from there, the rest.
+    let status = |after: u64| -> serde_json::Value { ureq::get(&format!("{}/runs/{run}?after={after}", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).call().unwrap().body_mut().read_json().unwrap() };
+    let first = status(0);
+    let (got, next) = (first["jobs"][0]["lines"].as_array().unwrap().len(), first["jobs"][0]["next"].as_u64().unwrap());
+    assert!(got > 0 && got < 4000, "{got} lines in the first answer");
+    assert_eq!(got + status(next)["jobs"][0]["lines"].as_array().unwrap().len(), 4000);
+    let out = superci(&served, &dir, &["runs", "wait", &run]).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{}{}", said.chars().take(500).collect::<String>(), String::from_utf8_lossy(&out.stderr));
+    let printed: Vec<&str> = said.lines().filter_map(|l| l.split("line ").nth(1)).map(|l| &l[..4]).collect();
+    assert_eq!(printed.len(), 4000, "every line once");
+    assert!(printed.windows(2).all(|w| w[0] < w[1]), "in order");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn play(served: &superci_testkit::Served, run: &str, lines: &[String], result: &str) {
     let runner = loop { if let Some(r) = Runner::of_run(served, run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
     let a = "cccccccc-0000-0000-0000-000000000003";
@@ -89,7 +121,8 @@ fn run_of(served: &superci_testkit::Served) -> String {
 
 fn superci(served: &superci_testkit::Served, dir: &std::path::Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_superci"));
-    c.current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // (A run over waits 3 seconds at most for steps' logs here, where a minute would only slow the tests.)
+    c.current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_LOGS_WAIT_S", "3").stdout(Stdio::piped()).stderr(Stdio::piped());
     c
 }
 
@@ -269,6 +302,8 @@ fn a_step_with_no_log_of_its_own_still_gives_its_tests_and_quiet_says_each_failu
     // Quiet: the failure with its whole error, and what the tests came to.
     assert!(quiet.contains("✗ [chromium] saves (e2e/settings.spec.ts:9:3)") && quiet.contains("Error: expect(received).toEqual(expected)") && quiet.contains("- expected line 20"), "{quiet}");
     assert!(quiet.contains("Tests: 1 failed, 2 passed (playwright)"), "{quiet}");
+    // Waited for that step's log a while; it never came: the counts said to be from what came.
+    assert!(quiet.contains(&format!("(Counted from what came: 1 step's log had not come. `superci runs retrieve {run} --tests` counts it once it is here.)")), "{quiet}");
     // Its tests read from the job's whole log, the step with no log of its own in it.
     let o = superci(&served, &dir, &["runs", "retrieve", &run, "--tests", "--json"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
     let got: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));

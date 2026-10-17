@@ -62,6 +62,13 @@ pub struct Dashboard {
     picture_owner: String,
     kept_as: String,
     kept_plane: Option<Plane>,
+    /// Control planes found in the signed-in clouds that are not this workspace's (another CI in the same account, a
+    /// teammate's): offered, never taken in by themselves (a workspace looks after one CI; see `join`).
+    found: Vec<Plane>,
+    /// What each one found says of itself before it is used here (its name, whose jobs it runs, its label, version).
+    found_about: HashMap<String, FoundAbout>,
+    /// Whose jobs each control plane runs as last written into it (`OWNERS`), by its id: written again when that changes.
+    owners_written: HashMap<String, String>,
     keep_failed: bool,
     /// A kept AWS sign-in turned out to have ended (AWS ends one after twelve hours at most).
     aws_ended: bool,
@@ -198,6 +205,18 @@ struct Move { to: String, at: usize, result: Option<Result<Vec<String>>>, ended_
 const MOVE_STEPS: [&str; 4] = ["Copying your settings and history", "Bringing your runner providers", "Switching GitHub and GitLab over", "Checking it answers"];
 
 /// Writes control planes' secrets from a background thread, with the sign-ins it was given.
+/// A control plane found in a signed-in cloud, as it says of itself to that cloud's sign-in (its name and whose jobs
+/// it runs, kept where the account's sign-in reads them: AWS's) and to anyone (its label and version).
+#[derive(Clone, Default)]
+struct FoundAbout { name: Option<String>, owners: Option<String>, label: Option<String>, version: Option<String>,
+    /// Whether GitHub or GitLab sends it jobs (it is a CI), as it answered; one that does not is a place set up and never used.
+    serves: bool }
+
+/// Whose jobs a control plane runs, as kept in `OWNERS` (`github:acme,gitlab:gitlab.com`), in words.
+fn owners_said(owners: &str) -> String {
+    owners.split(',').filter_map(|o| o.split_once(':')).map(|(kind, name)| format!("{} {name}", if kind == "gitlab" { "GitLab" } else { "GitHub" })).collect::<Vec<_>>().join(", ")
+}
+
 struct Writer { cf: Option<cloudflare::Cloudflare>, aws: Option<superci_core::aws::Credentials>, modal: Option<modal::Session>, own: Own }
 
 /// Whose the sign-ins kept are: the AWS account, the Cloudflare accounts the login reaches (none: not asked yet), the
@@ -995,7 +1014,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{OAUTH_PORT}"), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DASHBOARD_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -1366,6 +1385,7 @@ impl Dashboard {
         (self.picture_owner, self.picture_asked_ms) = (String::new(), 0);
         (self.aws_ended, self.cf_ended, self.modal_ended, self.looked_cf, self.looked_aws, self.looked_modal) = (false, false, false, false, false, false);
         (self.planes, self.selected, self.kept_plane, self.preloaded, self.views) = (vec![], 0, None, None, None);
+        (self.found, self.found_about) = (vec![], HashMap::new());
         self.cf_accounts.clear();
         self.keyed.clear();
         self.status_key = folder_key();
@@ -1408,6 +1428,15 @@ impl Dashboard {
         // Whose picture it shows: the first organization on github.com (see `picture_due`). Another one's goes.
         self.picture_owner = apps.iter().find(|a| a["host"].as_str().is_none_or(str::is_empty)).and_then(|a| a["owner"].as_str()).unwrap_or_default().to_string();
         if about.picture_of != self.picture_owner { (about.picture, about.picture_of) = (String::new(), String::new()) }
+        // Whose jobs it runs, kept in it where its account's sign-in reads it (before anything of this computer's
+        // is in it: what a workspace picking among an account's CIs shows), once it changes.
+        let owners = about.hosts.iter().map(|(kind, name)| format!("{kind}:{name}")).collect::<Vec<_>>().join(",");
+        if !owners.is_empty() && self.owners_written.get(v.plane.plane_id()) != Some(&owners) {
+            let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
+            // (Tried once a session: without its cloud's sign-in here, the next session that has it writes it.)
+            let _ = writer.put(&v.plane, "OWNERS", &owners);
+            self.owners_written.insert(v.plane.plane_id().to_string(), owners);
+        }
         self.set_about(about);
     }
 
@@ -1984,13 +2013,15 @@ impl Dashboard {
             looked.extend(accounts.iter().map(|(id, _)| format!("cloudflare:{id}")));
             there.extend(planes.iter().map(|p| p.plane_id().to_string()));
             self.cf_accounts = accounts;
+            self.found.retain(|p| !matches!(p, Plane::Cloudflare { .. }));
             for h in planes {
-                match self.planes.iter().position(|x| x.plane_id() == h.plane_id()) { Some(i) => self.planes[i] = h, None => self.planes.push(h) }
+                match self.planes.iter().position(|x| x.plane_id() == h.plane_id()) { Some(i) => self.planes[i] = h, None => self.found.push(h) }
             }
             self.looked_cf = true;
         }
         for (found, (_, account_id)) in aws_found.into_iter().zip(aws) {
             looked.push(format!("aws:{account_id}"));
+            self.found.retain(|p| !matches!(p, Plane::Aws { account_id: a, .. } if *a == account_id));
             for f in found? {
                 // (Only over HTTPS; and in a debug build, a test's control plane on this computer.)
                 if !(f.url.starts_with("https://") || (cfg!(debug_assertions) && f.url.starts_with("http://127.0.0.1:"))) { continue }
@@ -1999,20 +2030,23 @@ impl Dashboard {
                     Some((region, label)) => Plane::Aws { account_id: account_id.clone(), region, url: f.url, plane_id: f.plane_id, label },
                     None => Plane::Seen { url: f.url, plane_id: f.plane_id },
                 };
-                // What runs here replaces what was only seen from here; otherwise the first sighting stays.
+                // What runs here replaces what was only seen from here; otherwise the first sighting stays. One not
+                // this workspace's is offered (one only seen from here, a control plane elsewhere, is not).
                 match self.planes.iter().position(|p| p.plane_id() == found.plane_id()) {
                     Some(i) if matches!(self.planes[i], Plane::Seen { .. }) => self.planes[i] = found,
                     Some(_) => {}
-                    None => self.planes.push(found),
+                    None if !matches!(found, Plane::Seen { .. }) && !self.found.iter().any(|p| p.plane_id() == found.plane_id()) => self.found.push(found),
+                    None => {}
                 }
             }
             self.looked_aws = true;
         }
         if let Some(found) = modal_found {
             if let Some(m) = &self.modal { looked.push(format!("modal:{}", m.workspace)) }
+            self.found.retain(|p| !matches!(p, Plane::Modal { .. }));
             for found in found? {
                 there.push(found.plane_id().to_string());
-                match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) { Some(i) => self.planes[i] = found, None => self.planes.push(found) }
+                match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) { Some(i) => self.planes[i] = found, None => self.found.push(found) }
             }
             self.looked_modal = true;
         }
@@ -2032,8 +2066,85 @@ impl Dashboard {
             self.views = None;
         }
         if self.preloaded.as_ref().is_some_and(|id| self.planes.iter().find(|p| p.plane_id() == id).is_none_or(|p| looked.contains(&home(p)))) { self.preloaded = None }
+        self.learn_found();
         self.key_planes();
         Ok(())
+    }
+
+    /// A CI found in the signed-in clouds taken as this workspace's: only while it has none (a workspace looks after one
+    /// CI; another is a workspace of its own). Its key is written into it as into any control plane. What is said, or
+    /// why not (a status and words).
+    pub fn join(&mut self, plane_id: &str) -> std::result::Result<String, (u16, String)> {
+        let Some(i) = self.found.iter().position(|p| p.plane_id() == plane_id) else { return Err((404, format!("{plane_id} is not a control plane found in your signed-in clouds"))) };
+        if self.planes.iter().any(|p| !matches!(p, Plane::Seen { .. })) { return Err((409, "This workspace looks after a CI already: make a workspace for the other one, sign in there and pick it".into())) }
+        let p = self.found.remove(i);
+        self.planes.retain(|x| x.plane_id() != p.plane_id());
+        self.planes.push(p.clone());
+        self.select(self.planes.len() - 1);
+        self.kept_plane = Some(p.clone());
+        self.views = None;
+        self.key_planes();
+        self.keep();
+        Ok(format!("This workspace looks after {} now.", p.place()))
+    }
+
+    /// The control planes found in the signed-in clouds that are not this workspace's, with what each says of itself.
+    pub fn found(&self) -> Vec<(Plane, Option<String>, Option<String>)> {
+        self.found.iter().map(|p| { let a = self.found_about.get(p.plane_id()).cloned().unwrap_or_default(); (p.clone(), a.name, a.owners) }).collect()
+    }
+
+    /// What each control plane found and not yet asked says of itself (at once, each in its own thread).
+    fn learn_found(&mut self) {
+        let mut creds: Vec<(String, superci_core::aws::Credentials)> = vec![];
+        for s in self.aws.iter_mut().chain(self.aws_others.iter_mut()) { if let Ok(c) = s.credentials() { creds.push((s.account_id.clone(), c)) } }
+        let asked: Vec<Plane> = self.found.iter().filter(|p| !self.found_about.contains_key(p.plane_id())).cloned().collect();
+        let learnt: Vec<(String, FoundAbout)> = std::thread::scope(|s| {
+            let hs: Vec<_> = asked.iter().map(|p| { let creds = &creds; s.spawn(move || {
+                let health = cloudflare::health(p.url()).unwrap_or_default();
+                // (One not answering is taken as a CI: nothing of it is taken in by guess.)
+                let serves = health.is_null() || health["github"] == true || health["gitlab"] == true || health["moved_to"].is_string();
+                let mut a = FoundAbout { label: health["label"].as_str().map(str::to_string), version: health["version"].as_str().map(str::to_string), serves, ..Default::default() };
+                if let Plane::Aws { account_id, region, plane_id, .. } = p {
+                    if let Some((_, c)) = creds.iter().find(|(id, _)| id == account_id) { if let Ok((name, owners)) = aws_plane::about(c, region, plane_id) { (a.name, a.owners) = (name, owners) } }
+                }
+                (p.plane_id().to_string(), a)
+            }) }).collect();
+            hs.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        self.found_about.extend(learnt);
+        // Beside a CI this workspace looks after, a place set up and never used (what a move goes to, a deploy that
+        // stopped) is this workspace's, as before: moved to, or deleted, from here. Only a CI is another's.
+        if self.planes.iter().any(|p| !matches!(p, Plane::Seen { .. })) {
+            let unused: Vec<Plane> = self.found.iter().filter(|p| self.found_about.get(p.plane_id()).is_some_and(|a| !a.serves)).cloned().collect();
+            for p in unused { self.found.retain(|f| f.plane_id() != p.plane_id()); self.planes.push(p) }
+        }
+    }
+
+    /// The control planes found in the signed-in clouds that are not this workspace's, each with what it says of
+    /// itself and its one action: use it here (while this workspace looks after none), or open the workspace on this
+    /// computer that looks after it. Nothing when none was found.
+    fn found_card(&self) -> String {
+        if self.found.is_empty() { return String::new() }
+        let me = self.store.as_ref().map(|s| s.workspace()).unwrap_or_default();
+        let others: Vec<crate::store::Listed> = crate::store::root().map(|r| crate::store::listed(&r, None)).unwrap_or_default().into_iter().filter(|l| l.id != me && !l.plane_id.is_empty()).collect();
+        let mine = self.planes.iter().any(|p| !matches!(p, Plane::Seen { .. }));
+        let rows: String = self.found.iter().map(|p| {
+            let a = self.found_about.get(p.plane_id()).cloned().unwrap_or_default();
+            let title = a.name.clone().unwrap_or_else(|| format!("A CI ({})", p.plane_id()));
+            let mut what = vec![p.place()];
+            if let Some(o) = a.owners.as_deref().map(owners_said).filter(|o| !o.is_empty()) { what.push(o) }
+            if let Some(l) = &a.label { what.push(format!("runs-on {l}")) }
+            if let Some(v) = &a.version { what.push(v.clone()) }
+            let end = match others.iter().find(|l| l.plane_id == p.plane_id()) {
+                Some(l) => format!(r#"<a class="button secondary sm" href="/?w={}">Open {}</a>"#, esc(&l.id), esc(l.title())),
+                None if !mine => row_form("/plane/join", &format!(r#"<input type="hidden" name="plane" value="{}">"#, esc(p.plane_id())), "Use this one"),
+                None => r#"<span class="note">Another CI</span>"#.to_string(),
+            };
+            format!(r#"<div class="pick act">{}<span><strong>{}</strong><small>{}</small></span><span class="pick-end">{end}</span></div>"#, logo(p.cloud(), 36), esc(&title), esc(&what.join(" · ")))
+        }).collect();
+        let (head, note) = if mine { ("Other CIs in your signed-in accounts", "A workspace looks after one CI. To look after one of these too, make a workspace for it (the switcher, New workspace…) and pick it there.") }
+            else { ("CIs in your signed-in accounts", "Use one of these in this workspace (teammates each use it from their own computer), or set up a new one below.") };
+        format!(r#"<h2 class="list-title">{head}</h2><p class="note" style="margin:-4px 0 14px">{note}</p><div class="picks page">{rows}</div>"#)
     }
 
     /// A key kept from before each control plane had one of its own is the same value in every control plane that
@@ -2627,9 +2738,11 @@ impl Dashboard {
             }
             // Deleting a control plane not in use (never the one in use; never one a move is under way to).
             ("POST", "/plane/delete") => {
-                let plane = self.planes.iter().find(|p| p.plane_id() == field("plane")).cloned().ok_or("That control plane is not known here")?;
+                // (This workspace's, or one found beside it that serves no code host: a place set up and never used.)
+                let plane = self.planes.iter().chain(self.found.iter()).find(|p| p.plane_id() == field("plane")).cloned().ok_or("That control plane is not known here")?;
                 let key = self.status_key.clone();
-                if self.plane().is_ok_and(|p| p.plane_id() == plane.plane_id()) { return Ok(message(409, "This control plane is in use", "Move to another one first, or stop using SuperCI.")) }
+                // (One that moved away handed over: it is in use no more, whatever else is left here.)
+                if self.plane().is_ok_and(|p| p.plane_id() == plane.plane_id()) && view::plane_view(&plane, None).moved_to.is_none() { return Ok(message(409, "This control plane is in use", "Move to another one first, or stop using SuperCI.")) }
                 if lock(&self.moving).as_ref().is_some_and(|m| m.result.is_none() && m.to == plane.plane_id()) { return Ok(message(409, "A move to it is under way", "")) }
                 // One that GitHub or GitLab sends jobs to is a CI of its own (another team's, reached with the same
                 // sign-ins): never deleted from beside it. One that moved away, or stands by for a move, is not.
@@ -2643,6 +2756,12 @@ impl Dashboard {
                 self.flash = Some(format!("Deleted {}.{}", plane.place(), left.iter().map(|l| format!(" Left: {l}")).collect::<String>()));
                 Ok(Response::redirect("/?p=planes"))
             }
+            // A CI found in the signed-in clouds, taken as this workspace's: only while it has none (a workspace looks
+            // after one CI; another is a workspace of its own). Its key is written into it as for any control plane.
+            ("POST", "/plane/join") => match self.join(&field("plane")) {
+                Ok(said) => { self.flash = Some(said); Ok(Response::redirect("/?p=planes")) }
+                Err((status, title)) => Ok(message(status, &title, "Nothing has changed.")),
+            },
             // Stopping SuperCI: GitHub and GitLab stop sending jobs, then the control plane is deleted with what was
             // made for it, and with it the ones that serve nothing (places it could have moved to, ones it moved
             // from). A control plane that serves a code host of its own is another CI: left as it is. The GitHub App
@@ -3620,14 +3739,18 @@ mark();load()})();</script>"#;
             return format!(r#"<div class="bar"><h1 class="page-title">Setting up your control plane</h1></div><div class="cards">{progress}</div>"#)
         }
         let rows = self.plane_rows();
+        let found = self.found_card();
         let copying = if self.aws.as_ref().and_then(|a| self.aws_copying.get(&a.account_id)).is_some_and(|c| !c.is_empty()) { r#"<div data-refresh="10"></div>"# } else { "" };
-        format!(r#"{copying}<div class="bar"><h1 class="page-title">Set up a control plane</h1></div><p class="note" style="margin-bottom:22px">The always-on part GitHub and GitLab send jobs to, in your own cloud account. Runners can be on other clouds too.</p><div class="picks page">{rows}</div>{}"#, self.aws_account_section())
+        let new_one = if found.is_empty() { String::new() } else { r#"<h2 class="list-title">A new one</h2>"#.to_string() };
+        format!(r#"{copying}<div class="bar"><h1 class="page-title">Set up a control plane</h1></div><p class="note" style="margin-bottom:22px">The always-on part GitHub and GitLab send jobs to, in your own cloud account. Runners can be on other clouds too.</p>{found}{new_one}<div class="picks page">{rows}</div>{}"#, self.aws_account_section())
     }
 
     /// Where a control plane can be set up: a row per cloud with its one action (connect, then set up); an account
     /// that has one already is not offered again.
     fn plane_rows(&self) -> String {
-        let rows = self.setup_actions(&self.planes).into_iter().map(|(cloud, what, action)| provider_row(cloud, &what, &action.unwrap_or_else(|| pill("good", "Has your control plane")))).collect::<String>();
+        // (A Cloudflare account holds one: one found there, another CI's, takes it.)
+        let taken: Vec<Plane> = self.planes.iter().chain(self.found.iter().filter(|p| matches!(p, Plane::Cloudflare { .. }))).cloned().collect();
+        let rows = self.setup_actions(&taken).into_iter().map(|(cloud, what, action)| provider_row(cloud, &what, &action.unwrap_or_else(|| pill("good", "Has your control plane")))).collect::<String>();
         format!("{rows}{}", more_clouds(&PLANE_SOON))
     }
 
@@ -4505,6 +4628,8 @@ mark();load()})();</script>"#;
     fn planes_page(&self, views: &[PlaneView]) -> String {
         let bar = r#"<div class="bar"><h1 class="page-title">Control plane</h1></div>"#;
         if views.is_empty() {
+            let found = self.found_card();
+            if !found.is_empty() { return format!(r#"{bar}{found}<p class="note" style="margin-top:14px"><a href="/?p=plane">Or set up a new one</a></p>"#) }
             return format!(r#"{bar}<div class="cards"><section class="card">{}</section></div>"#, empty_state(&ICON_PLANE.replace("<svg", r#"<svg class="ic""#), "No control plane yet", "Set one up in Cloudflare, AWS or Modal; it takes a minute.", r#"<a class="button primary" href="/?p=plane">Set up a control plane</a>"#))
         }
         let used = view::in_use(views);
@@ -4627,8 +4752,8 @@ mark();load()})();</script>"#;
         let ended = match &self.flash { Some(f) => format!(r#"{ended}<div class="notice">{}<span>{}</span></div>"#, icon("check"), esc(f)), None => ended };
         let (perms, perm_dialogs) = if v.online { self.permissions_card(v) } else { (String::new(), String::new()) };
         let dialogs = format!("{dialogs}{perm_dialogs}");
-        format!(r#"{}{bar}{ended}<p class="note" style="margin:-4px 0 18px">GitHub and GitLab send their jobs to the control plane in use. To move it, set one up in another cloud and Move here: everything comes along.</p><div class="picks page">{rows}</div>{}{perms}{dialogs}"#,
-            if moving || self.deploy_running() { r#"<div data-refresh="2"></div>"# } else { "" }, self.aws_account_section())
+        format!(r#"{}{bar}{ended}<p class="note" style="margin:-4px 0 18px">GitHub and GitLab send their jobs to the control plane in use. To move it, set one up in another cloud and Move here: everything comes along.</p><div class="picks page">{rows}</div>{}{perms}{}{dialogs}"#,
+            if moving || self.deploy_running() { r#"<div data-refresh="2"></div>"# } else { "" }, self.aws_account_section(), self.found_card())
     }
 
     /// Move here's confirmation: what comes along, what needs a sign-in first, what stays; then Move.
@@ -6345,7 +6470,7 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
             None => return message(404, "That control plane is not known here", "Open the dashboard again and pick one from the list. Nothing has changed."),
         },
         None => {
-            let apart = ["/signout", "/aws/signin", "/cloudflare/signin", "/modal/", "/plane/aws", "/plane/cloudflare", "/plane/modal", "/plane/start-over", "/aws/image", "/plane/delete", "/connect/", "/oauth/", "/github/callback", "/github/installed"];
+            let apart = ["/signout", "/aws/signin", "/cloudflare/signin", "/modal/", "/plane/aws", "/plane/cloudflare", "/plane/modal", "/plane/start-over", "/aws/image", "/plane/delete", "/plane/join", "/connect/", "/oauth/", "/github/callback", "/github/installed"];
             if !apart.iter().any(|a| req.path.starts_with(a)) && d.planes.len() > 1 {
                 let views = d.views.clone().map(|(v, _)| v).unwrap_or_else(|| d.planes.iter().map(|p| view::plane_view(p, None)).collect());
                 if view::several(&views).is_some() { return message(409, "Which control plane?", "Several control planes are live here. Open one from the list and do this on its pages. Nothing has changed.") }

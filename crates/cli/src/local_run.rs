@@ -101,6 +101,14 @@ fn tar_of(root: &Path, files: &[Vec<u8>], compress: bool) -> Result<Vec<u8>> {
 /// Each run's changes are kept as a layer on what came before: at most this many layers, then all of it again.
 const MOST_LAYERS: usize = 8;
 
+/// How long a run that is over is waited for, at most, for each step's own log (seconds): a minute, or in a test what
+/// `SUPERCI_LOGS_WAIT_S` says (a debug build).
+fn logs_wait_s() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("SUPERCI_LOGS_WAIT_S").ok().and_then(|v| v.parse().ok()) { return s }
+    60
+}
+
 /// What this computer kept of a repository's last run on a control plane: the whole tree it sent once (`name`) and
 /// what each run since sent on top of it (`layers`), each file's hash as of that last run, and when it was.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -356,9 +364,10 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             if ended && (logs[i].complete() || give_up) { said_state(say, state, &mut last[i]) }
             after[i] = j["next"].as_u64().unwrap_or(after[i]);
         }
-        // Over: once every step's lines are out (its log may come a moment after), or a little later at most.
+        // Over: once every step's lines are out (its log may come a while after: the runner sends steps' logs as it
+        // can, a large one after the job has ended), or a minute later at most.
         if st["over"] == true && over_at.is_none() { over_at = Some(std::time::Instant::now()) }
-        if st["over"] == true && logs.iter().any(|l| !l.complete()) && over_at.is_some_and(|t| t.elapsed().as_secs() <= 15) { continue }
+        if st["over"] == true && logs.iter().any(|l| !l.complete()) && over_at.is_some_and(|t| t.elapsed().as_secs() <= logs_wait_s()) { continue }
         if st["over"] == true {
             let (result, took) = (st["result"].as_str().unwrap_or_default().to_string(), began.elapsed().as_secs());
             // Each job's steps, how each went and how long it took; a failed step's last lines when they were not
@@ -405,13 +414,17 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     if !failed.is_empty() { say(&format!("{}  Failed: {}", crate::commands::JOB_LINE, failed.join(", "))) }
                 }
                 if let (Some(id), true) = (j["job_id"].as_str(), j["result"] == "failure") { say(&format!("{}  Its whole log: superci jobs retrieve {id} --out=job.log", crate::commands::JOB_LINE)) }
-                // What its tests came to, passed or not, and what a runner said of them as a whole.
+                // What its tests came to, passed or not, and what a runner said of them as a whole. A step whose own
+                // log has not come is read from the lines its runner sent as it went, some dropped: its tests are
+                // not all counted, and that is said.
                 let tests = crate::test_results::read(&all);
+                let unlogged = j["steps"].as_array().into_iter().flatten().filter(|s| ["succeeded", "failed"].contains(&s["result"].as_str().unwrap_or_default()) && s["log"].is_null()).count();
                 if !tests.runners.is_empty() {
                     let t = serde_json::to_value(&tests).unwrap_or_default();
                     say(&format!("{}  {}", crate::commands::JOB_LINE, crate::commands::totals_line(&t)));
                     for l in crate::commands::process_lines(&t, "  ").into_iter().chain(crate::commands::ran_lines(&t, "  ")).chain(crate::commands::expected_lines(&t, "  ")) { say(&format!("{}{l}", crate::commands::JOB_LINE)) }
                     for n in &tests.notes { say(&format!("{}  {n}", crate::commands::JOB_LINE)) }
+                    if unlogged > 0 { say(&format!("{}  (Counted from what came: {unlogged} step{} log{} had not come. `superci runs retrieve {run} --tests` counts {} once {} here.)", crate::commands::JOB_LINE, if unlogged == 1 { "'s" } else { "s'" }, if unlogged == 1 { "" } else { "s" }, if unlogged == 1 { "it" } else { "them" }, if unlogged == 1 { "it is" } else { "they are" })) }
                 }
             }
             let said = format!("The run ended: {result}, {} after it was {}, ${usd:.3} of machines.", span(took), if sent_here { "sent" } else { "followed from here" });
