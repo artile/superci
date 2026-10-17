@@ -104,7 +104,10 @@ pub fn keep(o: &Options) -> i32 {
     let on = state.starts_with("on");
     done.off = state.strip_prefix("off: ").map(|w| w.trim().chars().take(200).collect()).unwrap_or_default();
     // (A layer from the store: counted as the index has it, whether or not containerd keeps its blob.)
-    if on { for d in named(&infos).into_iter().filter(|d| !boot.contains(d)) { if let Some(l) = index.get(&d) { done.served += 1; done.served_bytes += l.size } } }
+    let mut served_digests = vec![];
+    if on { for d in named(&infos).into_iter().filter(|d| !boot.contains(d)) { if let Some(l) = index.get(&d) { done.served += 1; done.served_bytes += l.size; served_digests.push(d) } } }
+    // (Every layer the job's images have, but the machine's own: fetched ahead at its next run's start.)
+    let used_digests: Vec<String> = layers_of(&infos).into_iter().map(|l| l.digest).filter(|d| !boot.contains(d)).take(500).collect();
     let mut offered = vec![];
     for l in layers_of(&infos).into_iter().filter(|l| !(on && index.get(&l.digest).is_some()) && !boot.contains(&l.digest)) {
         done.pulled += 1;
@@ -121,7 +124,7 @@ pub fn keep(o: &Options) -> i32 {
     (done.had, done.had_bytes) = (done.had + had.len() as u64, done.had_bytes + had.iter().filter_map(|d| sizes.get(d)).sum::<u64>());
     let report = json!({ "served": done.served, "served_bytes": done.served_bytes, "pulled": done.pulled, "pulled_bytes": done.pulled_bytes,
         "uploaded": done.uploaded, "uploaded_bytes": done.uploaded_bytes, "had": done.had, "had_bytes": done.had_bytes,
-        "missing": done.missing, "missing_bytes": done.missing_bytes, "refused": done.refused, "failed": done.failed, "note": done.note, "off": done.off, "seconds": (began.elapsed().as_secs_f64() * 10.0).round() / 10.0 });
+        "missing": done.missing, "missing_bytes": done.missing_bytes, "refused": done.refused, "failed": done.failed, "note": done.note, "off": done.off, "served_digests": served_digests, "used": used_digests, "seconds": (began.elapsed().as_secs_f64() * 10.0).round() / 10.0 });
     eprintln!("superci-layers keep: {report}");
     if let Err(e) = post(&agent, &format!("{}/layers-kept", o.link), &report) { eprintln!("superci-layers keep: saying what was kept: {e}") }
     0

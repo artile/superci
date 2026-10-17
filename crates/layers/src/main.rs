@@ -135,13 +135,14 @@ fn main() {
             let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
             while hup.recv().await.is_some() {
                 match index::Index::load(&index_path) {
-                    Ok(i) => { eprintln!("superci-layers: {} layers in the store's index", i.layers.len()); l.reload(i) }
+                    Ok(i) => { eprintln!("superci-layers: {} layers in the store's index", i.layers.len()); l.reload(i); l.fetch_ahead() }
                     Err(e) => eprintln!("superci-layers: the index was not read again: {e}"),
                 }
             }
         });
         eprintln!("superci-layers: answering on {}", a.socket.display());
         notify_ready();
+        layers.fetch_ahead();
         if let Err(e) = server.await { eprintln!("superci-layers: {e}"); std::process::exit(1) }
     });
 }

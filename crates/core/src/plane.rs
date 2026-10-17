@@ -4980,13 +4980,13 @@ impl<'a> ControlPlane<'a> {
         let Some(machine) = cache::machine(self.store, token, now).await? else { return Ok(nothing_here()) };
         if self.config.routing.cache.images_off { return Ok(nothing_here()) }
         let link = format!("{plane_url}/cache/{token}");
-        match what {
-            "layers" => return Ok(Response::new(200, "text/x-shellscript", aws::layers_script(&link))),
-            "layers.json" => return self.layers_index(&machine, &link, now).await,
-            _ => {}
-        }
-        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(nothing_here()) };
+        if what == "layers" { return Ok(Response::new(200, "text/x-shellscript", aws::layers_script(&link))) }
+        let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else {
+            // (Not connected to AWS: the index without links, which can then not be asked for either.)
+            return if what == "layers.json" { self.layers_index(&machine, &link, None, now).await } else { Ok(nothing_here()) }
+        };
         let creds = self.aws_creds(plane_url, &a).await?;
+        if what == "layers.json" { return self.layers_index(&machine, &link, Some(&creds), now).await }
         let body = req.map(|r| r.body.as_slice()).unwrap_or_default();
         match what {
             "layers-program" => {

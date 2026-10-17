@@ -4133,8 +4133,18 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
     let mut both = vec![ALPINE.to_string(), private.clone()];
     both.sort();
     assert_eq!(digests(&index), both);
-    assert_eq!(index["layers"][ALPINE], serde_json::json!({ "size": 3792075, "erofs": { "url": "", "size": 9000, "digest": "sha256:e0f5" }, "blob": { "url": "" } }), "links come when asked for");
+    // Each with its links signed, so that nothing is asked for while Docker pulls.
+    let alpine = &index["layers"][ALPINE];
+    assert_eq!((alpine["size"].as_u64(), alpine["erofs"]["size"].as_u64(), alpine["erofs"]["digest"].as_str()), (Some(3792075), Some(9000), Some("sha256:e0f5")), "{alpine}");
+    assert!(alpine["erofs"]["url"].as_str().unwrap().starts_with(&format!("{BUCKET}layers/{}.erofs?X-Amz-", &ALPINE[7..])) && alpine["blob"]["url"].as_str().unwrap().contains(".blob?X-Amz-"), "{alpine}");
     assert_eq!(digests(&get(&other, "layers.json")), [ALPINE]);
+    // What a job's run used, its next machine fetches ahead as its store starts (kept with the repository's record,
+    // not on the job's own).
+    assert_eq!(index["layers"][ALPINE]["ahead"], false, "nothing used yet");
+    assert_eq!(post(&app, "layers-kept", serde_json::json!({ "served": 0, "pulled": 1, "used": [ALPINE, "not-a-digest"] })).status, 200);
+    assert_eq!(get(&app, "layers.json")["layers"][ALPINE]["ahead"], true);
+    assert_eq!(get(&other, "layers.json")["layers"][ALPINE]["ahead"], false, "another job's run is not this one's");
+    assert!(job(&store, 1)["images"].get("used").is_none(), "{}", job(&store, 1)["images"]);
     let links = |link: &str| json(&post(link, "layers-links", serde_json::json!({ "digests": [ALPINE, private] })));
     let theirs = links(&other);
     assert_eq!(digests(&theirs), [ALPINE], "a private layer of another repository answers as one the store lacks");

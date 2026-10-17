@@ -98,9 +98,15 @@ pub struct Images { #[serde(default)] pub served: u64, #[serde(default)] pub ser
     #[serde(default, skip_serializing_if = "String::is_empty")] pub note: String,
     /// Why the store was not switched in on its machine (nothing came from it), when its setup said.
     #[serde(default, skip_serializing_if = "String::is_empty")] pub off: String,
+    /// Every layer the job's images had (kept with the repository's record, not the job's): fetched ahead at its next
+    /// machine's start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub used: Vec<String>,
     #[serde(default)] pub at: u64,
     /// Why nothing could be said (containerd out of reach).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub error: Option<String> }
+
+/// The layers' files fetched ahead at a machine's start, at most (what its job's last run used).
+pub const AHEAD_BYTES: u64 = 16 << 30;
 
 /// How long a repository's last word counts for its next machine (the cache's days, at most).
 pub const PLAN_MS: u64 = 7 * 86_400_000;
@@ -224,16 +230,28 @@ impl ControlPlane<'_> {
 
     /// A machine's index: the layers in its region's bucket its repository may read, without links (asked for when a
     /// layer is used, `layers-links`).
-    pub(crate) async fn layers_index(&self, machine: &cache::Machine, link: &str, now: u64) -> Result<Response> {
+    /// Each with its links signed (`creds`: signing is a computation, nothing asked of AWS): the machine asks for
+    /// none while Docker pulls (asked for one by one, a burst of them waited seconds on control planes starting).
+    pub(crate) async fn layers_index(&self, machine: &cache::Machine, link: &str, creds: Option<&aws::Credentials>, now: u64) -> Result<Response> {
         let (_, granted) = self.layer_reader(machine).await?;
+        let bucket = cache::bucket(&self.config.plane_id, &machine.region);
+        let sign = |key: &str| -> Result<String> { match creds { Some(c) => aws::presign("GET", &aws::s3_url(&bucket, &machine.region, key), c, &machine.region, cache::LINK_SECONDS, now), None => Ok(String::new()) } };
+        // What its job's last run used: fetched ahead as the machine's store starts (`AHEAD_BYTES` at most).
+        let used: HashSet<String> = match self.job_of_machine(machine).await? {
+            Some(j) if !j.repo.is_empty() => get_json::<Images>(self.store, &images_key(&j.repo, &j.workflow, &j.name)).await?.map(|i| i.used.into_iter().collect()).unwrap_or_default(),
+            _ => HashSet::new(),
+        };
+        let mut ahead_bytes = 0u64;
         let mut layers = serde_json::Map::new();
         for (k, v) in self.store.list(&format!("layer:{}:", machine.region)).await? {
             let Ok(l) = serde_json::from_str::<Layer>(&v) else { continue };
             let digest = k.rsplit_once(":sha256:").map(|(_, h)| format!("sha256:{h}")).unwrap_or_default();
             if !l.current(now) || !(l.is_public(now) || granted.contains(&digest)) { continue }
-            let mut erofs = json!({ "url": "", "size": l.erofs.size.unwrap_or(0) });
+            let mut erofs = json!({ "url": sign(&l.erofs.key)?, "size": l.erofs.size.unwrap_or(0) });
             if let Some(d) = &l.erofs.digest { erofs["digest"] = d.clone().into() }
-            layers.insert(digest, json!({ "size": l.size, "erofs": erofs, "blob": { "url": "" } }));
+            let ahead = used.contains(&digest) && ahead_bytes + l.erofs.size.unwrap_or(0) <= AHEAD_BYTES;
+            if ahead { ahead_bytes += l.erofs.size.unwrap_or(0) }
+            layers.insert(digest, json!({ "size": l.size, "erofs": erofs, "blob": { "url": sign(&l.blob.key)? }, "ahead": ahead }));
         }
         Ok(Response::json(&json!({ "layers": layers, "refresh": { "url": format!("{link}/layers-links"), "token": "" } })))
     }
@@ -376,9 +394,19 @@ impl ControlPlane<'_> {
     pub(crate) async fn layers_kept(&self, machine: &cache::Machine, body: &[u8], now: u64) -> Result<Response> {
         let Ok(mut said) = serde_json::from_slice::<Images>(body) else { return Ok(Response::text(400, "not what was kept")) };
         said.at = now;
+        // The layers it had from the store: used (once a day at most), so that they stay while jobs use them (their
+        // links came with the index: nothing else says so).
+        let served: Vec<String> = serde_json::from_slice::<Value>(body).ok().and_then(|b| b["served_digests"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().filter(|d| is_digest(d)).map(str::to_string)).take(500).collect())).unwrap_or_default();
+        let keys: Vec<String> = served.iter().map(|d| layer_key(&machine.region, d)).collect();
+        for (key, got) in keys.iter().zip(self.store.get_many(&keys).await?) {
+            let Some(mut l) = got.and_then(|v| serde_json::from_str::<Layer>(&v).ok()) else { continue };
+            if now.saturating_sub(l.used) > 86_400_000 { l.used = now; self.store.put(key, serde_json::to_string(&l).map_err(|e| e.to_string())?).await? }
+        }
         let Some(mut job) = self.job_of_machine(machine).await? else { return Ok(Response::text(404, "no job of this machine")) };
+        said.used.retain(|d| is_digest(d));
+        said.used.truncate(500);
         if !job.repo.is_empty() { self.store.put_until(&images_key(&job.repo, &job.workflow, &job.name), serde_json::to_string(&said).map_err(|e| e.to_string())?, now + PLAN_MS).await?; }
-        job.images = Some(said);
+        job.images = Some(Images { used: vec![], ..said });
         self.keep_job(&job).await?;
         Ok(Response::json(&json!({})))
     }

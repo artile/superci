@@ -30,6 +30,9 @@ pub struct Layer {
     /// mounted file when not given.
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// The job's last run used it: its file fetched as the store starts, before Docker asks for it.
+    #[serde(default)]
+    pub ahead: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

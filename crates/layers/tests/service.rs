@@ -304,3 +304,17 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_
     let until = Instant::now() + Duration::from_secs(10);
     while !s.log().contains("0 layers in the store's index") { assert!(Instant::now() < until, "{}", s.log()); tokio::time::sleep(Duration::from_millis(50)).await }
 }
+
+/// A layer the job's last run used (`ahead` in the index, its link signed in it): its file fetched as the store
+/// starts, before anything asks for it, with no link asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn layers_the_last_run_used_are_fetched_as_the_store_starts() {
+    let (used, erofs) = (digest(b"a layer the last run used"), vec![9u8; 200_000]);
+    let (p, at) = plane([(format!("{used}.erofs"), erofs.clone())].into_iter().collect());
+    let index = serde_json::json!({ "layers": { &used: { "size": 25, "erofs": { "url": format!("{at}/files/{used}.erofs"), "size": erofs.len() }, "blob": {}, "ahead": true } }, "refresh": { "url": format!("{at}/links"), "token": "" } });
+    let s = start("ahead", Some(&index));
+    let until = Instant::now() + Duration::from_secs(10);
+    while !s.log().contains("1 layers' files (0 MB) fetched ahead in") { assert!(Instant::now() < until, "{}", s.log()); tokio::time::sleep(Duration::from_millis(50)).await }
+    let asked = p.lock().unwrap().asked.clone();
+    assert!(asked.iter().any(|a| a.starts_with(&format!("GET /files/{used}.erofs"))) && !asked.iter().any(|a| a == "POST /links"), "{asked:?}");
+}

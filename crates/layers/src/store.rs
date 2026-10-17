@@ -298,6 +298,24 @@ impl Layers {
         }).await.clone()
     }
 
+    /// The files of the layers the job's last run used (`ahead`), fetched now, a few at once, before Docker asks for
+    /// them: its pull then finds them here (one that asks meanwhile waits for the same fetch).
+    pub fn fetch_ahead(self: &Arc<Self>) {
+        let Some(st) = &self.store else { return };
+        let ahead: Vec<(String, Layer)> = st.index.read().unwrap().layers.iter().filter(|(_, l)| l.ahead).map(|(d, l)| (d.clone(), l.clone())).collect();
+        if ahead.is_empty() { return }
+        let (n, bytes) = (ahead.len(), ahead.iter().map(|(_, l)| l.erofs.size).sum::<u64>());
+        let began = std::time::Instant::now();
+        let left = Arc::new(std::sync::atomic::AtomicUsize::new(n));
+        for (digest, layer) in ahead {
+            let (me, left) = (self.clone(), left.clone());
+            tokio::spawn(async move {
+                if let Err(e) = me.erofs(&digest, &layer).await { eprintln!("superci-layers: {digest} not fetched ahead: {e}") }
+                if left.fetch_sub(1, Ordering::Relaxed) == 1 { eprintln!("superci-layers: {n} layers' files ({:.0} MB) fetched ahead in {:.2} s", bytes as f64 / 1e6, began.elapsed().as_secs_f64()) }
+            });
+        }
+    }
+
     /// The layers SuperCI's store has, read again (the machine's start writes it, then says so with SIGHUP).
     pub fn reload(&self, index: Index) {
         if let Some(st) = &self.store { *st.index.write().unwrap() = index }
