@@ -30,8 +30,11 @@ use crate::{aws, cache};
 
 /// A blob larger than this is not converted (as the converter says).
 pub const MOST_BYTES: u64 = 4 << 30;
-/// Conversions under way at once in a region at most (more are answered "later": the machine asks again).
+/// Conversions under way at once in a region at most (more wait in the control plane's queue, `lwant:`, and start at
+/// its sweeps as these end: the machine that pulled them may be gone by then).
 pub const AT_ONCE: usize = 16;
+/// How long a layer waits in the queue at most (a staged blob is kept a day).
+pub const WANTED_MS: u64 = 86_400_000;
 /// A conversion not heard of within this is taken as lost (the converter runs 15 minutes at most).
 pub const CONVERT_MS: u64 = 20 * 60_000;
 /// A registry's word that a layer is public, taken for this long; then asked again.
@@ -74,6 +77,11 @@ impl Layer {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Converting { pub at: u64, pub size: u64, #[serde(default)] pub public: Option<Public> }
 
+/// A conversion waiting for room (see `AT_ONCE`): since when, its blob's size, where the converter reads it (a registry,
+/// or a blob uploaded to staging), and its registry when public.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Wanted { pub at: u64, pub size: u64, pub source: Value, #[serde(default)] pub public: Option<Public> }
+
 /// An upload link given to a machine: for which layer, of which repository, to where.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Upload { pub region: String, pub digest: String, pub size: u64, pub ns: String, pub key: String }
@@ -82,6 +90,7 @@ pub fn layer_key(region: &str, digest: &str) -> String { format!("layer:{region}
 fn grant_key(ns: &str, digest: &str) -> String { format!("lgrant:{ns}:{digest}") }
 fn converting_key(region: &str, digest: &str) -> String { format!("lconv:{region}:{digest}") }
 fn refused_key(region: &str, digest: &str) -> String { format!("lmiss:{region}:{digest}") }
+fn wanted_key(region: &str, digest: &str) -> String { format!("lwant:{region}:{digest}") }
 
 /// A blob's digest as registries give it (`sha256:` and 64 hex digits).
 pub fn is_digest(d: &str) -> bool { d.len() == 71 && d.starts_with("sha256:") && d[7..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
@@ -216,6 +225,25 @@ impl ControlPlane<'_> {
         aws::invoke_later(self.http, home, &format!("superci-plane-{}-convert", self.config.plane_id), &job, creds, now).await
     }
 
+    /// A layer converted now when the region has room (its record of being converted made), else queued; `converting`
+    /// counts the region's conversions under way. Whether it is converting (else queued).
+    async fn convert_or_queue(&self, region: &str, digest: &str, w: Wanted, converting: &mut usize, now: u64) -> Result<bool> {
+        if *converting < AT_ONCE {
+            // (A converter that refuses the call: queued, as when it has enough at once.)
+            match self.convert(region, digest, w.size, w.source.clone(), now).await {
+                Ok(()) => {
+                    let c = Converting { at: now, size: w.size, public: w.public };
+                    self.store.put_until(&converting_key(region, digest), serde_json::to_string(&c).map_err(|e| e.to_string())?, now + CONVERT_MS * 2).await?;
+                    *converting += 1;
+                    return Ok(true)
+                }
+                Err(e) => { let _ = self.store.put("layers-convert-error", e).await; }
+            }
+        }
+        self.store.put_until(&wanted_key(region, digest), serde_json::to_string(&w).map_err(|e| e.to_string())?, now + WANTED_MS).await?;
+        Ok(false)
+    }
+
     /// An upload link for a layer (to staging, taking only a body of its SHA-256), noted for `layers-uploaded`.
     async fn upload_link(&self, machine: &cache::Machine, ns: &str, digest: &str, size: u64, creds: &aws::Credentials, now: u64) -> Result<Value> {
         let id = crate::crypto::random_token(18);
@@ -249,30 +277,34 @@ impl ControlPlane<'_> {
                 if l.is_public(now) || granted.contains(&p.digest) { json!({ "do": "have" }) }
                 else if let Some(ns) = &ns { self.upload_link(machine, ns, &p.digest, p.size, creds, now).await? }
                 else { json!({ "do": "no" }) }
-            } else if self.store.get(&converting_key(&machine.region, &p.digest)).await?.is_some() {
-                json!({ "do": "later" })
             } else if !converts || self.store.get(&refused_key(&machine.region, &p.digest)).await?.is_some() {
                 json!({ "do": "no" })
-            } else if converting >= AT_ONCE {
-                json!({ "do": "later" })
             } else {
-                let mut named = None;
-                for s in p.sources.iter().take(4) {
-                    if let Some(source) = public_source(self.http, &s.registry, &s.repository, &p.digest).await { named = Some((s, source)); break }
-                }
-                match (named, &ns) {
-                    // (A converter that refuses the call: asked again later, as when it has enough at once.)
-                    (Some((s, source)), _) => match self.convert(&machine.region, &p.digest, p.size, source, now).await {
-                        Err(e) => { let _ = self.store.put("layers-convert-error", e).await; json!({ "do": "later" }) }
-                        Ok(()) => {
-                            let c = Converting { at: now, size: p.size, public: Some(Public { registry: s.registry.clone(), repository: s.repository.clone(), checked: now }) };
-                            self.store.put_until(&converting_key(&machine.region, &p.digest), serde_json::to_string(&c).map_err(|e| e.to_string())?, now + CONVERT_MS * 2).await?;
-                            converting += 1;
-                            json!({ "do": "named" })
+                // Converting or queued already: public, nothing more to do; else this repository's own upload grants it.
+                let under_way = match self.store.get(&converting_key(&machine.region, &p.digest)).await? {
+                    Some(v) => serde_json::from_str::<Converting>(&v).ok().map(|c| c.public.is_some()),
+                    None => self.store.get(&wanted_key(&machine.region, &p.digest)).await?.and_then(|v| serde_json::from_str::<Wanted>(&v).ok()).map(|w| w.public.is_some()),
+                };
+                match under_way {
+                    Some(true) => json!({ "do": "named" }),
+                    Some(false) => match &ns { Some(ns) => self.upload_link(machine, ns, &p.digest, p.size, creds, now).await?, None => json!({ "do": "no" }) },
+                    None => {
+                        let mut named = None;
+                        for s in p.sources.iter().take(4) {
+                            if let Some(source) = public_source(self.http, &s.registry, &s.repository, &p.digest).await { named = Some((s, source)); break }
                         }
-                    },
-                    (None, Some(ns)) => self.upload_link(machine, ns, &p.digest, p.size, creds, now).await?,
-                    (None, None) => json!({ "do": "no" }),
+                        match (named, &ns) {
+                            // Public: the converter reads it from its registry, now or once there is room.
+                            (Some((s, source)), _) => {
+                                let w = Wanted { at: now, size: p.size, source, public: Some(Public { registry: s.registry.clone(), repository: s.repository.clone(), checked: now }) };
+                                self.convert_or_queue(&machine.region, &p.digest, w, &mut converting, now).await?;
+                                json!({ "do": "named" })
+                            }
+                            // Else uploaded at once, while its machine is there (converted once there is room).
+                            (None, Some(ns)) => self.upload_link(machine, ns, &p.digest, p.size, creds, now).await?,
+                            (None, None) => json!({ "do": "no" }),
+                        }
+                    }
                 }
             };
             answers.insert(p.digest.clone(), answer);
@@ -301,19 +333,14 @@ impl ControlPlane<'_> {
         self.store.delete(&format!("lup:{id}")).await?;
         self.store.put_until(&grant_key(&up.ns, &up.digest), now.to_string(), now + cache::MAX_AGE_DAYS as u64 * 86_400_000).await?;
         let has = get_json::<Layer>(self.store, &layer_key(&up.region, &up.digest)).await?.is_some_and(|l| l.current(now));
-        let converting = self.store.get(&converting_key(&up.region, &up.digest)).await?.is_some();
-        if has || converting {
+        let under_way = self.store.get(&converting_key(&up.region, &up.digest)).await?.is_some() || self.store.get(&wanted_key(&up.region, &up.digest)).await?.is_some();
+        if has || under_way {
             let _ = aws::s3(self.http, "DELETE", &url, &up.region, creds, vec![], &[], now).await;
             return Ok(Response::json(&json!({ "do": "granted" })))
         }
-        if let Err(e) = self.convert(&up.region, &up.digest, up.size, json!({ "key": up.key }), now).await {
-            // (Its repository keeps the grant; the blob goes, and the layer is proposed again by a later pull.)
-            let _ = self.store.put("layers-convert-error", e).await;
-            let _ = aws::s3(self.http, "DELETE", &url, &up.region, creds, vec![], &[], now).await;
-            return Ok(Response::json(&json!({ "do": "later" })))
-        }
-        let c = Converting { at: now, size: up.size, public: None };
-        self.store.put_until(&converting_key(&up.region, &up.digest), serde_json::to_string(&c).map_err(|e| e.to_string())?, now + CONVERT_MS * 2).await?;
+        // Converted now, or once there is room (the staged blob stays a day).
+        let mut converting = self.store.list(&format!("lconv:{}:", up.region)).await?.len();
+        self.convert_or_queue(&up.region, &up.digest, Wanted { at: now, size: up.size, source: json!({ "key": up.key }), public: None }, &mut converting, now).await?;
         Ok(Response::json(&json!({ "do": "converting" })))
     }
 
@@ -321,8 +348,9 @@ impl ControlPlane<'_> {
     /// for again for a while); one not heard of in time, given up. Once an hour, the store's upkeep (see the module).
     pub(crate) async fn sweep_layers(&self, plane_url: &str, now: u64) -> Result<()> {
         let converting = self.store.list("lconv:").await?;
+        let wanted = self.store.list("lwant:").await?;
         let hour = self.store.get("layers-swept").await?.and_then(|v| v.parse::<u64>().ok()).is_none_or(|at| now.saturating_sub(at) >= 3_600_000);
-        if converting.is_empty() && !hour { return Ok(()) }
+        if converting.is_empty() && wanted.is_empty() && !hour { return Ok(()) }
         let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(()) };
         let creds = self.aws_creds(plane_url, &a).await?;
         for (k, v) in converting {
@@ -349,6 +377,19 @@ impl ControlPlane<'_> {
             }
             let _ = aws::s3(self.http, "DELETE", &url, region, &creds, vec![], &[], now).await;
             self.store.delete(&k).await?;
+        }
+        // The queue, oldest first, as far as each region has room.
+        let mut queued: Vec<(String, String, Wanted)> = wanted.into_iter().filter_map(|(k, v)| {
+            let (region, digest) = k.strip_prefix("lwant:")?.split_once(':')?;
+            Some((region.to_string(), digest.to_string(), serde_json::from_str::<Wanted>(&v).ok()?))
+        }).collect();
+        queued.sort_by_key(|(_, _, w)| w.at);
+        let mut room: std::collections::HashMap<String, usize> = Default::default();
+        for (region, digest, w) in queued {
+            let converting = match room.get_mut(&region) { Some(n) => n, None => { let n = self.store.list(&format!("lconv:{region}:")).await?.len(); room.entry(region.clone()).or_insert(n) } };
+            if *converting >= AT_ONCE { continue }
+            self.store.delete(&wanted_key(&region, &digest)).await?;
+            if !self.convert_or_queue(&region, &digest, w, converting, now).await? { break }
         }
         if hour { self.store.put("layers-swept", now.to_string()).await?; self.layers_upkeep(&creds, now).await?; }
         Ok(())

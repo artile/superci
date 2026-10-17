@@ -4055,8 +4055,8 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
     let sum = STANDARD.encode(Sha256::digest(&blob));
     assert_eq!((up["do"].as_str(), up["headers"]["x-amz-checksum-sha256"].as_str()), (Some("upload"), Some(sum.as_str())), "{up}");
     assert!(up["url"].as_str().unwrap().starts_with(&format!("{BUCKET}layers/staging/{}-", &private[7..])) && up["url"].as_str().unwrap().contains("X-Amz-SignedHeaders=host%3Bx-amz-checksum-sha256"), "{up}");
-    // Proposed again while it is converted: later. Something else at the link: refused.
-    assert_eq!(json(&post(&other, "layers-propose", serde_json::json!({ "layers": [{ "digest": ALPINE, "size": 3792075 }] })))["layers"][ALPINE]["do"], "later");
+    // Proposed again while it is converted: nothing more to do (public). Something else at the link: refused.
+    assert_eq!(json(&post(&other, "layers-propose", serde_json::json!({ "layers": [{ "digest": ALPINE, "size": 3792075 }] })))["layers"][ALPINE]["do"], "named");
     http.uploaded(&up, &blob[1..]);
     assert_eq!(post(&app, "layers-uploaded", serde_json::json!({ "id": up["id"] })).status, 409);
     assert_eq!(post(&other, "layers-uploaded", serde_json::json!({ "id": up["id"] })).status, 404, "another repository's machine was not given it");
@@ -4099,6 +4099,22 @@ fn machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may() {
     http.converter_done(&http.converted.borrow()[3].clone(), Some("mkfs.erofs refused the layer"));
     block_on(plane.alarm()).unwrap();
     assert_eq!(propose_odd()["do"], "no");
+    // With as many conversions under way as a region takes, a public layer waits in the control plane's queue: its
+    // machine has nothing more to do (and may be gone before there is room); a sweep starts it once there is.
+    store.0.borrow_mut().remove(&format!("lconv:us-east-1:{REDIS}"));
+    let busy: Vec<String> = (0..superci_core::layers::AT_ONCE).map(|i| format!("lconv:us-east-1:sha256:{i:064x}")).collect();
+    for k in &busy { store.0.borrow_mut().insert(k.clone(), serde_json::json!({ "at": clock.0.get(), "size": 1 }).to_string()); }
+    let asked = http.converted.borrow().len();
+    let redis = json(&post(&app, "layers-propose", serde_json::json!({ "layers": [{ "digest": REDIS, "size": 3626020, "sources": [{ "registry": "public.ecr.aws", "repository": "docker/library/redis" }] }] })));
+    assert_eq!(redis["layers"][REDIS]["do"], "named");
+    assert_eq!(http.converted.borrow().len(), asked, "not converted yet");
+    assert!(store.0.borrow().contains_key(&format!("lwant:us-east-1:{REDIS}")));
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(http.converted.borrow().len(), asked, "still no room");
+    for k in &busy { store.0.borrow_mut().remove(k); }
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(http.converted.borrow().last().unwrap()["digest"], REDIS);
+    assert!(!store.0.borrow().contains_key(&format!("lwant:us-east-1:{REDIS}")) && store.0.borrow().contains_key(&format!("lconv:us-east-1:{REDIS}")));
     // Six days on, Alpine is used again; two days later the private layer (unused a week) goes with its files, and
     // Docker Hub is asked again whether Alpine is still public (its word is a week old).
     // (Each on a machine of its day: a machine's link lasts as long as its job may.)
