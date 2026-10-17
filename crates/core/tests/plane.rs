@@ -4634,3 +4634,46 @@ fn gitlabs_projects_follow_a_move_and_leaving_takes_their_webhooks_and_its_runne
     assert!(!http.clouds.calls.borrow().iter().any(|c| c.1 == "https://gitlab.example/api/v4/runners/57"), "another GitLab's runner is not this one's to take");
     assert!(!store.0.borrow().contains_key("glrunner:56") && store.0.borrow().contains_key("glrunner:other:57"));
 }
+
+/// The fake clouds with CloudWatch answering what a machine sent (`sum` bytes), or refusing (a role from before).
+struct Sent { clouds: FakeClouds, sum: Option<f64> }
+#[async_trait(?Send)]
+impl Http for Sent {
+    async fn send(&self, r: Request) -> io::Result<Response> {
+        if r.url.starts_with("https://monitoring.") {
+            return Ok(match self.sum {
+                Some(s) => Response::new(200, "text/xml", format!("<GetMetricStatisticsResponse><GetMetricStatisticsResult><Datapoints><member><Sum>{}</Sum></member><member><Sum>{}</Sum></member></Datapoints></GetMetricStatisticsResult></GetMetricStatisticsResponse>", s / 2.0, s / 2.0)),
+                None => Response::new(403, "text/xml", "<ErrorResponse><Error><Code>AccessDenied</Code><Message>not authorized to perform: cloudwatch:GetMetricStatistics</Message></Error></ErrorResponse>"),
+            })
+        }
+        self.clouds.send(r).await
+    }
+}
+
+#[test]
+fn what_a_machine_sent_to_the_internet_is_added_to_its_jobs_cost_once_cloudwatch_has_counted_it() {
+    for (sum, said) in [(Some(2e9), Some(2.0)), (None, Some(-1.0))] {
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let http = Sent { clouds: FakeClouds::default(), sum };
+        let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let plane = ControlPlane { store: &store, http: &http, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        let run = |r: Request| block_on(plane.handle(r));
+        run(webhook("queued", None));
+        let runner = format!("superci-{PLANE_ID}-7");
+        run(webhook("in_progress", Some(&runner)));
+        run(webhook("completed", Some(&runner)));
+        let before = job(&store, 7)["cost_usd"].as_f64().unwrap();
+        // Not yet: CloudWatch counts a while after.
+        block_on(plane.alarm()).unwrap();
+        assert!(job(&store, 7).get("sent_gb").is_none());
+        clock.0.set(clock.0.get() + 13 * 60_000);
+        block_on(plane.alarm()).unwrap();
+        let j = job(&store, 7);
+        assert_eq!(j["sent_gb"].as_f64(), said, "{j}");
+        let added = if said == Some(2.0) { 2.0 * superci_core::aws::DATA_OUT_USD_PER_GB } else { 0.0 };
+        assert!((j["cost_usd"].as_f64().unwrap() - (before + added)).abs() < 1e-9, "{j}");
+    }
+}
