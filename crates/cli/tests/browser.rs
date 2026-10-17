@@ -459,3 +459,39 @@ fn steps_run_side_by_side_are_shown_nested_with_what_they_are_as_github_shows_th
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_new_workspace_signed_in_to_an_account_with_cis_in_it_picks_one_and_looks_after_it() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Two CIs in the account: the default workspace's, and Globex's (named, whose jobs it runs said where the
+    // account's sign-in reads them).
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    served.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+    served.aws.put("/superci/testplane0002/NAME", "GlobexCI");
+    served.aws.put("/superci/testplane0002/OWNERS", "github:globex");
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    // A new workspace, signed in to the same account (as its sign-in would leave it), nothing of its own yet.
+    std::fs::create_dir_all(home.join("workspaces/globex")).unwrap();
+    let mut theirs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+    for k in ["plane", "planes_more", "key"] { theirs.as_object_mut().unwrap().remove(k); }
+    std::fs::write(home.join("workspaces/globex/sign-ins.json"), theirs.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{}&w=globex", link));
+    // Which CI: both, each named; the default workspace's opens that workspace, the other is used here.
+    b.wait(&shows("Which CI?"));
+    b.wait(&shows("GlobexCI"));
+    let words = b.text("main");
+    assert!(words.contains("GitHub globex") && (words.contains("Open Test") || words.contains("Open default")), "{words}");
+    if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { b.screenshot(&std::path::Path::new(&dir).join("which-ci.png")) }
+    b.click("main button", "Use this one");
+    b.wait(&shows("This workspace looks after"));
+    let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/globex/sign-ins.json")).unwrap()).unwrap();
+    assert_eq!(kept["plane"]["Aws"]["plane_id"], "testplane0002", "{kept}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

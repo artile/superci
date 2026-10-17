@@ -3703,6 +3703,11 @@ mark();load()})();</script>"#;
             let gate = format!("{}{says}", self.gate(section, last));
             return if self.modal_pending.is_some() { format!(r#"<div data-refresh="3"></div>{gate}"#) } else { gate }
         }
+        // Signed in, no CI of its own yet, and CIs found in its accounts: which one this workspace looks after (or a
+        // new one) comes first.
+        if views.is_empty() && !self.found.is_empty() && !["plane", "planes", "settings", "changes"].contains(&section) {
+            return format!(r#"<div class="bar"><h1 class="page-title">Which CI?</h1></div>{}<p class="note" style="margin-top:14px"><a href="/?p=plane">Or set up a new one</a></p>"#, self.found_card())
+        }
         // Several control planes live and this page names none: the list of them, to open one. (Setting a new one
         // up belongs to none of them.) A page that names one shows that one.
         if section == "all" || (view::several(views).is_some() && section != "plane") {
