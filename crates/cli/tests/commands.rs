@@ -881,3 +881,19 @@ fn what_a_job_had_from_the_caches_docker_images_is_said_and_keeping_them_is_turn
     assert!(!routing.contains("images_off"), "{routing}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_control_plane_deleted_in_its_cloud_is_dropped_from_the_workspace() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    assert!(String::from_utf8_lossy(&superci(&home, &["planes", "list"]).stdout).contains(superci_testkit::PLANE));
+    // Deleted elsewhere (by someone else, or in AWS's console): the account has no role of it any more.
+    let none = serde_json::json!({ "method": "POST", "url": "https://iam.amazonaws.com/", "target": "", "asked": "Action=ListRoles&Version=2010-05-08&MaxItems=1000", "status": 200,
+        "answer": "<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles></Roles></ListRolesResult></ListRolesResponse>" });
+    served.aws.replaying(&format!("{none}\n{none}\n{none}\n{none}\n"), &[]);
+    let said = String::from_utf8_lossy(&superci(&home, &["planes", "list"]).stdout).into_owned();
+    assert!(!said.contains(superci_testkit::PLANE), "{said}");
+    let kept = std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap();
+    assert!(!kept.contains(&format!("\"plane_id\":\"{}\"", superci_testkit::PLANE)), "{kept}");
+    let _ = std::fs::remove_dir_all(&home);
+}
