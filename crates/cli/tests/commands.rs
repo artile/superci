@@ -235,6 +235,29 @@ fn the_control_plane_is_updated_as_aws_answered_a_real_account() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A control plane from before 0.19.13 reads its launchers as AGENTS and its devices' keys as DASHBOARD_KEY_…: its
+/// update writes LAUNCHERS before the new version goes up, and takes the old names out once that answers.
+#[test]
+fn a_control_plane_from_before_the_new_names_has_its_settings_moved_by_its_update() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    let launchers = r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#;
+    let plane = superci_testkit::PLANE;
+    served.aws.put(&format!("/superci/{plane}/AGENTS"), launchers);
+    served.aws.put(&format!("/superci/{plane}/DASHBOARD_KEY_4102444800_TEST"), &served.key);
+    served.aws.put(&format!("/superci/{plane}/DASHBOARD_KEY_1700000000_GONE"), "a-key-of-another-device");
+    *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && said.contains(&format!("Updated to {}", env!("CARGO_PKG_VERSION"))), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    let names: Vec<(String, String)> = served.aws.settings(plane);
+    assert!(names.iter().any(|(k, v)| k == "LAUNCHERS" && v == launchers), "{names:?}");
+    assert!(!names.iter().any(|(k, _)| k == "AGENTS" || k.starts_with("DASHBOARD_KEY_")), "{names:?}");
+    assert!(names.iter().any(|(k, _)| k.starts_with("DEVICE_KEY_")), "{names:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn another_control_plane_is_deleted_as_aws_answered_a_real_account_and_the_one_in_use_is_not() {
     // The one in use, and another beside it in the same account (as the recording had them).

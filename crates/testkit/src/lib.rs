@@ -152,13 +152,19 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
         block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
         for stream in listener.incoming().flatten() {
             let mut config = Config::new(id.clone());
-            let settings = a.settings(&id);
+            let mut settings = a.settings(&id);
+            // (One from before reads its launchers and its devices' keys under their old names, and not the new ones.)
+            if a.old_version.lock().unwrap().is_some() {
+                settings = settings.into_iter().filter(|(k, _)| k != "LAUNCHERS" && !k.starts_with("DEVICE_KEY_"))
+                    .map(|(k, v)| (if k == "AGENTS" { "LAUNCHERS".into() } else { k.replacen("DASHBOARD_KEY_", "DEVICE_KEY_", 1) }, v)).collect();
+            }
             // (Its machines are its own containers, as a Cloudflare or Modal control plane's are: on until removed.)
             config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
             config.read_settings(&settings);
             configure(&mut config);
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
-            let _ = answer(&plane, &u, stream);
+            let old = a.old_version.lock().unwrap().clone();
+            let _ = answer(&plane, &u, stream, old);
         }
     });
     let gitlab = github.gitlab.clone();
@@ -195,7 +201,8 @@ fn write(mut out: TcpStream, status: u16, headers: &[(String, String)], body: &[
 }
 
 /// One request on its connection, answered by the control plane, then the connection closed.
-fn answer(plane: &ControlPlane, base: &str, stream: TcpStream) -> std::io::Result<()> {
+/// (One said to be of an older version answers as that version did.)
+fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<String>) -> std::io::Result<()> {
     let (method, target, headers, body) = read(&stream)?;
     if target == "/__testkit/upkeep" {
         return match block_on(plane.alarm()) { Ok(()) => write(stream, 200, &[], b"ok"), Err(e) => write(stream, 500, &[], e.as_bytes()) };
@@ -203,7 +210,12 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream) -> std::io::Resul
     let mut req = Request::new(&method, &format!("{base}{target}")).with_body(body);
     for (k, v) in headers { req = req.with_header(&k, &v) }
     let res = block_on(plane.handle(req));
-    write(stream, res.status, &res.headers, &res.body)
+    let body = match (old, target.split('?').next().unwrap_or_default(), serde_json::from_slice::<Value>(&res.body)) {
+        (Some(version), "/health", Ok(mut v)) => { v["version"] = json!(version); v.to_string().into_bytes() }
+        (Some(_), "/status", Ok(mut v)) => { if let Some(o) = v.as_object_mut() { let l = o.remove("launchers").unwrap_or_default(); o.insert("agents".into(), l); } v.to_string().into_bytes() }
+        _ => res.body,
+    };
+    write(stream, res.status, &res.headers, &body)
 }
 
 /// A DictUpdateRequest's entries (`updates`, field 2: each a key, field 1, and a value, field 2), each pickled as
@@ -267,6 +279,9 @@ pub struct Aws {
     pub items: Arc<Mutex<BTreeMap<(String, String, String), Value>>>,
     /// Lambda functions called without waiting (`Event`): each function's name and what it was given.
     pub invoked: Arc<Mutex<Vec<(String, Value)>>>,
+    /// A control plane not updated yet: while set, it says this version and answers as one from before 0.19.13 did
+    /// (its launchers as `agents`). Its function's code uploaded again (an update) ends it.
+    pub old_version: Arc<Mutex<Option<String>>>,
 }
 
 /// What a request asks AWS to do: its target (JSON APIs) or its Action (query APIs).
@@ -404,6 +419,7 @@ impl Aws {
                 (status, a) => (status, vec![], a.to_string()),
             },
         };
+        if method == "PUT" && url.contains("/functions/superci-plane-") && url.ends_with("/code") && status == 200 { *self.old_version.lock().unwrap() = None }
         if status == 400 && answer.contains("SuperCITestkitUnknown") { self.unanswered.lock().unwrap().push(format!("{target} {url} {}", asked.chars().take(200).collect::<String>())) }
         self.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": target, "asked": asked, "status": status, "answer": answer }));
         (status, headers, answer)
