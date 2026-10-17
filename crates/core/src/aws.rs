@@ -778,17 +778,24 @@ pub async fn make_network(http: &dyn Http, region: &str, creds: &Credentials, pl
 }
 
 /// Removes a control plane's machines in a region (when it is deleted, or its AWS runners removed), and its own network
-/// there (from before 0.19.13); and the network SuperCI's control planes share there when `last` (no other control
-/// plane is left in the account, as the caller found) and no machine at all is in it. Safe to repeat. The machines
-/// are terminated first, and a network goes once they are (a few minutes at most).
-pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, last: bool, now: &dyn Fn() -> u64, sleep: &dyn Fn(u64)) -> Result<()> {
+/// there (from before 0.19.13); and the network SuperCI's control planes share there when none of the `others` (the
+/// account's other control planes, as the caller found them) uses it (each has a network of its own there) and no
+/// machine at all is in it. Safe to repeat. The machines are terminated first, and a network goes once they are.
+pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &str, others: &[String], now: &dyn Fn() -> u64, sleep: &dyn Fn(u64)) -> Result<()> {
     let call = |action: &'static str, params: serde_json::Value| ec2(http, region, creds, action, params, now());
     let alive = ["pending", "running", "stopping", "stopped", "shutting-down"];
     let up = || call("DescribeInstances", serde_json::json!({ "Filter": [{ "Name": "tag:superci-plane", "Value": [plane_id] }, { "Name": "instance-state-name", "Value": alive }] }));
     let machines: Vec<String> = pairs(&up().await?, "instanceId", "instanceId").into_iter().map(|(i, _)| i.to_string()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     if !machines.is_empty() { call("TerminateInstances", serde_json::json!({ "InstanceId": machines })).await?; }
+    // (Another control plane with no network of its own here uses the shared one: asked only where there is one.)
+    let (sk, sv) = Whose::Shared.filter();
+    let mut shared_used = !call("DescribeVpcs", serde_json::json!({ "Filter": filters(&[(&sk, &sv)]) })).await?.contains("<vpcId>");
+    for o in others.iter().filter(|_| !shared_used) {
+        let (k, v) = Whose::Own(o).filter();
+        if !call("DescribeVpcs", serde_json::json!({ "Filter": filters(&[(&k, &v)]) })).await?.contains("<vpcId>") { shared_used = true; break }
+    }
     let mut doomed: Vec<(String, Whose)> = vec![];
-    for whose in [Whose::Own(plane_id), Whose::Shared].into_iter().filter(|w| last || matches!(w, Whose::Own(_))) {
+    for whose in [Whose::Own(plane_id), Whose::Shared].into_iter().filter(|w| !shared_used || matches!(w, Whose::Own(_))) {
         let (k, v) = whose.filter();
         for (vpc, _) in pairs(&call("DescribeVpcs", serde_json::json!({ "Filter": filters(&[(&k, &v)]) })).await?, "vpcId", "vpcId") {
             if !doomed.iter().any(|(d, _)| d == vpc) { doomed.push((vpc.to_string(), whose)) }

@@ -273,13 +273,14 @@ fn make_cache(http: &Blocking, region: &str, creds: &Credentials, plane_id: &str
 /// there), and is no network left behind.
 pub fn delete_networks(creds: &Credentials, plane_id: &str, regions: &[&str]) -> Result<()> {
     let sleep = |ms: u64| std::thread::sleep(std::time::Duration::from_millis(ms));
-    // The network SuperCI's control planes share goes with the last of them in the account (one elsewhere whose
-    // machines run here has a role here too).
-    let last = !connected_planes(creds)?.iter().any(|p| p.plane_id != plane_id);
+    // The network SuperCI's control planes share goes once none of the others in the account uses it (one elsewhere
+    // whose machines run here has a role here too).
+    let others: Vec<String> = connected_planes(creds)?.into_iter().map(|p| p.plane_id).filter(|p| p != plane_id).collect();
+    let others = &others;
     let done: Vec<Result<()>> = std::thread::scope(|s| {
         let each: Vec<_> = regions.iter().map(|r| s.spawn(move || {
             let http = Blocking::new();
-            match futures::executor::block_on(aws::delete_network(&http, r, creds, plane_id, last, &now_ms, &sleep)) {
+            match futures::executor::block_on(aws::delete_network(&http, r, creds, plane_id, others, &now_ms, &sleep)) {
                 Err(e) if kept_out_by_organization(&e) => return Ok(()),
                 done => done.map_err(|e| format!("{r}: {e}"))?,
             }
