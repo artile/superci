@@ -2880,7 +2880,7 @@ impl<'a> ControlPlane<'a> {
                             // the start only for a repository whose last job used images, with a disk of its own only
                             // when they would not fit in memory (see `layers::plan`); kept after every job.
                             let images = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26";
-                            let used = if images { get_json::<crate::layers::Images>(self.store, &crate::layers::images_key(&job.repo)).await.ok().flatten() } else { None };
+                            let used = if images { get_json::<crate::layers::Images>(self.store, &crate::layers::images_key(&job.repo, &job.workflow, &job.name)).await.ok().flatten() } else { None };
                             let (setup, disk) = crate::layers::plan(used.as_ref(), spec.ram_gb.unwrap_or(job.cpu.unwrap_or(4) * 2), now);
                             let (user_data, set_up) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, now).await;
                             job.layers = set_up && disk;

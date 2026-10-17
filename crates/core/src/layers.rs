@@ -17,7 +17,7 @@
 //!   `lmiss:<region>:<digest>`  a layer not converted (refused, too large), not asked for again for a while
 //!   `lwant:<region>:<digest>`  a conversion waiting for room (`Wanted`)
 //!   `lup:<id>`                 an upload link given (`Upload`)
-//!   `limg:<repo>`              what a repository's last job had from the store and pulled (`Images`)
+//!   `limg:<repo>:<job>`        what a repository's last job of a workflow and name had and pulled (`Images`)
 //! A layer goes when unused for the cache's days, or made `cache::MAX_AGE_DAYS` ago (the bucket's own rule removes
 //! its files soon after: the next pull proposes it again), and the least recently used go first past a region's
 //! `REGION_BYTES`.
@@ -85,7 +85,7 @@ pub struct Converting { pub at: u64, pub size: u64, #[serde(default)] pub public
 pub struct Wanted { pub at: u64, pub size: u64, pub source: Value, #[serde(default)] pub public: Option<Public> }
 
 /// What a job had from the store and what it pulled, as its machine said after the job (layers and their blobs'
-/// bytes): on the job's record, and the last of a repository's (`limg:<repo>`, for its next machine, see `plan`).
+/// bytes): on the job's record, and the last of a job of a repository's (`images_key`, for its next machine, see `plan`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Images { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub pulled_bytes: u64, pub uploaded: u64, pub uploaded_bytes: u64, #[serde(default)] pub at: u64 }
 
@@ -103,7 +103,11 @@ pub fn plan(last: Option<&Images>, ram_gb: u32, now: u64) -> (bool, bool) {
     (true, bytes * 3 / 2 > (ram_gb as u64) << 28)
 }
 
-pub fn images_key(repo: &str) -> String { format!("limg:{}", repo.to_ascii_lowercase()) }
+/// Where the last word of a job of a repository is kept: by its repository, workflow and name (each job of a workflow,
+/// each combination of a matrix, uses images of its own; a lint job's says nothing of the tests').
+pub fn images_key(repo: &str, workflow: &str, name: &str) -> String {
+    format!("limg:{}:{}", repo.to_ascii_lowercase(), &crate::crypto::sha256_hex(format!("{workflow}\n{name}").as_bytes())[..16])
+}
 
 /// An upload link given to a machine: for which layer, of which repository, to where.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -359,7 +363,7 @@ impl ControlPlane<'_> {
         let Ok(mut said) = serde_json::from_slice::<Images>(body) else { return Ok(Response::text(400, "not what was kept")) };
         said.at = now;
         let Some(mut job) = self.job_of_runner(&machine.runner).await? else { return Ok(Response::text(404, "no job of this machine")) };
-        if !job.repo.is_empty() { self.store.put_until(&images_key(&job.repo), serde_json::to_string(&said).map_err(|e| e.to_string())?, now + PLAN_MS).await?; }
+        if !job.repo.is_empty() { self.store.put_until(&images_key(&job.repo, &job.workflow, &job.name), serde_json::to_string(&said).map_err(|e| e.to_string())?, now + PLAN_MS).await?; }
         job.images = Some(said);
         self.keep_job(&job).await?;
         Ok(Response::json(&json!({})))
