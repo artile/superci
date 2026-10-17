@@ -162,6 +162,11 @@ fn runners_limits_the_cache_and_keys_are_set_and_read_back() {
     // It reads with no sign-in.
     let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).args(["jobs", "list", "--json"]).env("SUPERCI_HOME", common::temp("bare")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &secret).output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // A read key beside it, said as each is.
+    ok(&["keys", "create", "reader"]);
+    let listed = String::from_utf8_lossy(&superci(&home, &["keys", "list"]).stdout).into_owned();
+    assert!(listed.lines().any(|l| l.starts_with("builder") && l.contains("run key: reads and starts runs")) && listed.lines().any(|l| l.starts_with("reader") && l.contains("read key, until")), "{listed}");
+    ok(&["keys", "delete", "reader"]);
     ok(&["keys", "delete", "builder"]);
     assert!(!ok(&["keys", "list"])["keys"].as_array().unwrap().iter().any(|k| k["name"] == "builder"));
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
@@ -809,6 +814,8 @@ fn secrets_are_kept_for_runs_from_a_computer_from_stdin_or_a_variable_listed_wit
     assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("already"), "{v}");
     let (code, v) = given(&["secrets", "create", "NPM_TOKEN", "--repo=acme/app", "--branch=release/*", "--value-env=MY_NPM"], "", &[("MY_NPM", "npm-value-0002")]);
     assert!(code == 0, "{v}");
+    let (code, v) = given(&["secrets", "create", "OTHER", "--value-env=NOT_SET_HERE"], "", &[]);
+    assert!(code != 0 && v["error"] == "NOT_SET_HERE is not set.", "{v}");
     let settings = kept();
     assert_eq!(settings.iter().map(|(k, _)| k.as_str()).filter(|k| *k == "SECRET_NPM_TOKEN_ALL").count(), 1, "{settings:?}");
     assert!(settings.iter().any(|(_, v)| v.contains("\"value\":\"npm-value-0001\"")) && settings.iter().any(|(_, v)| v.contains("npm-value-0002") && v.contains("release/*")), "{settings:?}");
