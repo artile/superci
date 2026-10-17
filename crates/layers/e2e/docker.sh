@@ -186,7 +186,9 @@ grep "pulled as usual" /var/log/superci-layers.log | grep -q "$broken" || { echo
 # Nothing offered while the job runs. After it (as a machine does before it goes off): Busybox's layers, which the
 # store lacks, offered with where they came from and uploaded whole; what came from the store said.
 [ ! -e /root/bucket/proposed.txt ] || { echo "offered during the job" >&2; exit 1; }
-/superci-layers keep --link=http://127.0.0.1:8000 --index=/root/index.json --most=60 >> /var/log/superci-layers.log 2>&1
+# (The store switched in, as its setup says on a machine: what came from it is counted then only.)
+echo "on: started by this test" > /root/layers.state
+/superci-layers keep --link=http://127.0.0.1:8000 --index=/root/index.json --most=60 --state=/root/layers.state >> /var/log/superci-layers.log 2>&1
 jq -e '.served >= 3 and .pulled >= 1 and .uploaded >= 1' /root/bucket/kept.json > /dev/null || { echo "kept: $(cat /root/bucket/kept.json)" >&2; exit 1; }
 while read -r d; do
   grep -q "^$d .*$L/busybox" /root/bucket/proposed.txt || { echo "$d was not offered with its source" >&2; cat /root/bucket/proposed.txt >&2; exit 1; }
