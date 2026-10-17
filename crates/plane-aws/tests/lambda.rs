@@ -247,3 +247,28 @@ fn a_request_it_cannot_answer_is_an_error_to_lambda_and_the_next_one_is_answered
     assert_eq!(runtime.invoke(json!({ "superci": "sweep" })), ("response".to_string(), json!({ "swept": true })));
     drop(f);
 }
+
+#[test]
+fn a_queued_job_gets_its_machine_after_the_webhook_is_answered_as_aws_answered() {
+    // The App in its settings; GitHub's stand-in beside AWS's; AWS answering as it did on Test (its first spot pool
+    // full, then a fleet that gave a machine).
+    let aws = aws();
+    let github = aws.github.lock().unwrap().clone().unwrap();
+    *github.aws.lock().unwrap() = Some(aws.clone());
+    aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &GitHub::app().to_string());
+    aws.replaying(include_str!("../../cli/fixtures/aws/launch/spot.jsonl"), &[]);
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, &aws.url, &[("PLANE_ID", PLANE), ("TABLE", TABLE), ("RUNNER_REGION", "us-east-1"), ("AWS_LAMBDA_FUNCTION_NAME", TABLE)]);
+    let (id, (body, signature)) = github.queue("tests", "superci/cpu=2", now_ms());
+    let began = Instant::now();
+    let (kind, answer) = runtime.invoke(url_event("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": signature, "content-type": "application/json" }), &String::from_utf8(body).unwrap()));
+    assert_eq!((kind.as_str(), answer["statusCode"].as_u64()), ("response", Some(202)), "taken: {answer}");
+    // Answered first (GitHub waits ten seconds at most); the machine asked of AWS after, before the next request.
+    let job = loop {
+        if let Some(j) = item(&aws, &format!("job:{id}")).map(|v| serde_json::from_str::<Value>(&v).unwrap()).filter(|j| j["machine_id"].is_string() || j["state"] == "failed") { break j }
+        assert!(began.elapsed() < Duration::from_secs(30), "{:?}", aws.unanswered.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!((job["cloud"].as_str(), job["machine_id"].as_str(), job["machine_type"].as_str(), job["zone"].as_str()), (Some("aws"), Some("i-00000000000000001"), Some("c8a.large"), Some("us-east-1d")), "{job}\n{:?}", aws.unanswered.lock().unwrap());
+    assert!(github.unanswered.lock().unwrap().is_empty(), "{:?}", github.unanswered.lock().unwrap());
+}
