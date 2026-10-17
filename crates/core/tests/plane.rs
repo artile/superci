@@ -4003,8 +4003,7 @@ fn ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has
     let first = link_of(&script);
     let kept = |link: &str, served: u64, pulled_bytes: u64| run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/layers-kept"))
         .with_body(serde_json::json!({ "served": served, "served_bytes": served * 1000, "pulled": 5, "pulled_bytes": pulled_bytes, "uploaded": 5, "uploaded_bytes": pulled_bytes, "seconds": 3.1 }).to_string()));
-    let r = job(&store, 1)["runner"].as_str().unwrap().to_string();
-    run(labelled("in_progress", 1, "acme/app", Some(&r), "superci/image=ubuntu26"));
+    // (After its job: the runner's own record has gone by then; the machine's link knows its job.)
     assert_eq!(kept(&first, 0, 300 << 20).status, 200);
     assert_eq!(job(&store, 1)["images"]["pulled_bytes"], 300u64 << 20);
     assert_eq!(kept("someone-elses-link-here", 0, 1).status, 404);
@@ -4014,8 +4013,6 @@ fn ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has
     assert!(field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());
     assert_eq!(job(&store, 2)["layers"], serde_json::Value::Null);
     // One whose images would not fit: a disk of the store's own, in its price.
-    let r = job(&store, 2)["runner"].as_str().unwrap().to_string();
-    run(labelled("in_progress", 2, "acme/app", Some(&r), "superci/image=ubuntu26"));
     kept(&link_of(&script), 40, 4 << 30);
     let (script, launch) = machine(3, "superci/image=ubuntu26");
     assert!(script.contains("/layers|bash"));

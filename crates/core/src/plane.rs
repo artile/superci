@@ -2882,7 +2882,7 @@ impl<'a> ControlPlane<'a> {
                             let images = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26";
                             let used = if images { get_json::<crate::layers::Images>(self.store, &crate::layers::images_key(&job.repo, &job.workflow, &job.name)).await.ok().flatten() } else { None };
                             let (setup, disk) = crate::layers::plan(used.as_ref(), spec.ram_gb.unwrap_or(job.cpu.unwrap_or(4) * 2), now);
-                            let (user_data, set_up) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, now).await;
+                            let (user_data, set_up) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, &key, now).await;
                             job.layers = set_up && disk;
                             let launch = Launch { region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb, disk_mibs, disk_iops, tags: &tags, spot: !on_demand, os: spec.os(),
                                 clock: Some(self.clock), skip: &skip, avoid: &avoid, timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet, store_disk: job.layers.then_some(cache::STORE_DISK) };
@@ -3298,8 +3298,11 @@ impl<'a> ControlPlane<'a> {
         self.timer.wake_in(60_000).await
     }
 
-    /// The job a runner of this control plane's took (by its name).
-    pub(crate) async fn job_of_runner(&self, runner: &str) -> Result<Option<Job>> { self.by_runner(Some(runner).filter(|r| !r.is_empty())).await }
+    /// The job a machine with the cache's link was started for (its record, else by its runner while that is kept).
+    pub(crate) async fn job_of_machine(&self, machine: &cache::Machine) -> Result<Option<Job>> {
+        if machine.job.starts_with("job:") { if let Some(j) = get_json::<Job>(self.store, &machine.job).await? { return Ok(Some(j)) } }
+        self.by_runner(Some(machine.runner.as_str()).filter(|r| !r.is_empty())).await
+    }
 
     /// A job's record written again, under its key.
     pub(crate) async fn keep_job(&self, job: &Job) -> Result<()> { self.keep(&job_key(job), job).await }
@@ -4878,7 +4881,7 @@ impl<'a> ControlPlane<'a> {
     /// Docker's images and its program is in the bucket: kept after the job, and with `setup` served from the store
     /// from the start (the second value says so).
     #[allow(clippy::too_many_arguments)]
-    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, images: bool, setup: bool, creds: &Credentials, plane_url: &str, runner: &str, now: u64) -> (String, bool) {
+    async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, images: bool, setup: bool, creds: &Credentials, plane_url: &str, runner: &str, job: &str, now: u64) -> (String, bool) {
         // Which build of the program: by architecture, and Windows' of its own.
         let arch = match (os, arch) { ("windows", _) => "x86_64-windows", (_, "arm64") => "aarch64", _ => "x86_64" };
         if !["linux", "windows"].contains(&os) { return (user_data, false) }
@@ -4886,7 +4889,7 @@ impl<'a> ControlPlane<'a> {
         if self.config.routing.cache.off || !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return (user_data, false) }
         let token = crate::crypto::random_token(18);
         let until = now + (self.machine_minutes("aws") as u64 + 30) * 60_000;
-        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string() }).await.is_err() { return (user_data, false) }
+        if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string(), job: job.to_string() }).await.is_err() { return (user_data, false) }
         let link = format!("{plane_url}/cache/{token}");
         let with = if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data);
         // (GitHub's jobs only: GitLab's machines start Docker otherwise.)

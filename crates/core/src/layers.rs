@@ -362,7 +362,7 @@ impl ControlPlane<'_> {
     pub(crate) async fn layers_kept(&self, machine: &cache::Machine, body: &[u8], now: u64) -> Result<Response> {
         let Ok(mut said) = serde_json::from_slice::<Images>(body) else { return Ok(Response::text(400, "not what was kept")) };
         said.at = now;
-        let Some(mut job) = self.job_of_runner(&machine.runner).await? else { return Ok(Response::text(404, "no job of this machine")) };
+        let Some(mut job) = self.job_of_machine(machine).await? else { return Ok(Response::text(404, "no job of this machine")) };
         if !job.repo.is_empty() { self.store.put_until(&images_key(&job.repo, &job.workflow, &job.name), serde_json::to_string(&said).map_err(|e| e.to_string())?, now + PLAN_MS).await?; }
         job.images = Some(said);
         self.keep_job(&job).await?;

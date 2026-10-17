@@ -355,7 +355,10 @@ pub fn artifact_id(e: &Entry) -> u64 { u64::from_str_radix(&crate::crypto::sha25
 /// A machine's link to the cache: the region it runs in, its runner's name (which job it is on, as the control plane
 /// knows it), and until when the link works (its longest job).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Machine { pub region: String, pub arch: String, pub until: u64, #[serde(default)] pub runner: String }
+pub struct Machine { pub region: String, pub arch: String, pub until: u64, #[serde(default)] pub runner: String,
+    /// The record of the job it was started for (`job:…`): what it says after the job goes there (the runner's own
+    /// record goes when the job ends).
+    #[serde(default, skip_serializing_if = "String::is_empty")] pub job: String }
 
 /// What a job may do in the cache when it asks without a token of GitHub's (the tools on its machine: Turbo, Nx,
 /// Bazel), from what GitHub said of the job: its repository's entries, its branch's to write and read, then the
