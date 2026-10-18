@@ -880,3 +880,35 @@ fn everything_a_ci_has_comes_along_when_it_moves_to_another_control_plane_from_t
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn an_address_edited_by_hand_is_read_only_as_far_as_it_holds_what_it_may() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = home(&served);
+    played(&served, &home.join("checkout"));
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    let get = |b: &mut Browser, path: &str| -> (u16, String) {
+        let got = b.eval(&format!("fetch({path:?}, {{credentials: 'same-origin'}}).then(async r => [r.status, (await r.text()).replace(/<(style|script)[^>]*>[\\s\\S]*?<\\/\\1>/g, ' ').replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ')])"));
+        (got[0].as_u64().unwrap_or(0) as u16, got[1].as_str().unwrap_or_default().to_string())
+    };
+    // A run's and a job's address with what they may not hold: the rest is read, and nothing is found by it.
+    let (status, text) = get(&mut b, "/?p=run&repo=acme/my-app_1.x%20%3Cb%3E&id=12a3&fragment=1");
+    assert!(status == 200 && !text.contains("<b>"), "{text}");
+    let (status, text) = get(&mut b, "/?p=job&id=9x9&gl=ab-1Z%21&fragment=1");
+    assert!(status == 200 && text.contains("Not among the latest jobs"), "{text}");
+    let (status, _) = get(&mut b, "/?p=gitlab&g=ab1Z%21&fragment=1");
+    assert_eq!(status, 200);
+    // A control plane named in the address with what an id may not hold is no name: the page as without it.
+    for c in ["UPPER", "a234567890123456789012345", "has-dash"] {
+        let (status, text) = get(&mut b, &format!("/?c={c}&fragment=1"));
+        assert!(status == 200 && text.contains("Usage"), "{c}: {text}");
+    }
+    // One that holds only what it may, and is not known here: an action for it changes nothing and says so.
+    let (status, text) = post(&mut b, "/labels?c=nosuchplane1", &[("labels", "superci")]);
+    assert!(status == 404 && text.contains("That control plane is not known here"), "{status} {text}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

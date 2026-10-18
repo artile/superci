@@ -36,7 +36,8 @@ pub fn serve_cloudflare() -> Option<CloudflarePlane> {
         let _ = s.read_to_string(&mut out);
         out.starts_with("HTTP/1.1 200")
     };
-    for _ in 0..120 {
+    // (Two minutes: its first build, under a coverage tool, takes most of one.)
+    for _ in 0..240 {
         if healthy() { return Some(p) }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
