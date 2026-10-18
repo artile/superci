@@ -1638,13 +1638,17 @@ fn a_first_control_plane_is_set_up_in_aws_from_the_browser_started_over_once_and
     // With nothing answered by AWS it stops, and says so; started over, what it made is removed.
     let (got, text) = post(&mut b, "/plane/aws", &[("region", "us-east-1"), ("account", "111111111111")]);
     assert!(got < 400, "{got} {text}");
+    // (Asked again while it runs: the one under way, nothing more started.)
+    let (got, _) = post(&mut b, "/plane/aws", &[("region", "us-east-1"), ("account", "111111111111")]);
+    assert!(got < 500);
     let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Try again") { assert!(std::time::Instant::now() < end, "{}", common::words(&common::part(&link, "/?p=plane&fragment=1").1)); std::thread::sleep(std::time::Duration::from_millis(300)) }
     let (got, text) = post(&mut b, "/plane/start-over", &[]);
     assert!(got < 400, "{got} {text}");
     // As AWS answered a real one: made, and the overview leads on to connecting GitHub or GitLab.
     account.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", "deployplane1"), ("http://new-plane.test", &new.url)]);
-    let (got, text) = post(&mut b, "/plane/aws", &[("region", "us-east-1"), ("account", "111111111111")]);
+    // (Its id given, as Try again gives it: the names the first try made, again.)
+    let (got, text) = post(&mut b, "/plane/aws", &[("region", "us-east-1"), ("account", "111111111111"), ("plane", "deployplane1")]);
     assert!(got < 400, "{got} {text}");
     let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
@@ -9085,6 +9089,32 @@ fn control_planes_are_found_again_as_the_clouds_have_them_one_gone_none_found_or
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
     b.wait("document.querySelector('main') && document.querySelector('main').innerText.length > 0");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn with_several_workspaces_a_page_that_names_none_opens_on_the_one_shown_last() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let o = common::command(&home).args(["workspaces", "create", "globex"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    let base = link.split("/?").next().unwrap().to_string();
+    // A page with no workspace in its address: opened on one, its address naming it.
+    for path in ["/?p=runners", "/"] {
+        b.goto(&format!("{base}{path}"));
+        b.wait("document.querySelector('main') !== null");
+        let at = b.eval("location.href").as_str().unwrap_or_default().to_string();
+        assert!(at.contains("w="), "{path}: {at}");
+    }
+    // One named that is not kept here: said, nothing changed.
+    let (status, text) = { let got = b.eval(&format!("fetch('{base}/?w=nosuch&p=runners', {{credentials: 'same-origin'}}).then(async r => [r.status, await r.text()])")); (got[0].as_u64().unwrap_or(0), got[1].as_str().unwrap_or_default().to_string()) };
+    // (A page: the list of workspaces, to open one from.)
+    assert!(status >= 400 || text.contains("class=\"spaces\""), "{status}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
