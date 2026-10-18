@@ -1684,3 +1684,28 @@ fn cloudflare_jobs_estimated_costs_are_replaced_by_what_cloudflare_measured_once
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_ci_with_nothing_yet_moves_to_another_control_plane_from_the_browser_and_the_old_one_says_where() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // No code host, its name and labels as they come; another in the same account, reading its settings there.
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows(&new.url));
+    b.click("main button", "Move here");
+    b.wait("document.querySelector('dialog[open]') !== null");
+    b.click("dialog[open] button.primary", "");
+    until("moved", || !served.store.under("moved_to").is_empty());
+    let health: serde_json::Value = ureq::get(&format!("{}/health", served.url)).call().unwrap().body_mut().read_json().unwrap();
+    assert_eq!(health["moved_to"].as_str(), Some(new.url.as_str()), "{health}");
+    assert!(!served.aws.settings("testplane0002").iter().any(|(k, _)| k == "GITHUB_APP" || k == "NAME"), "nothing it did not have");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
