@@ -5034,6 +5034,37 @@ mod runs_suite_in_browser {
     }
 
     #[test]
+    fn a_job_in_an_environment_gets_its_secrets_a_call_names_what_it_gives_and_runs_on_another_runner_is_the_default_machine() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[
+            (".github/workflows/ci.yml", "jobs:\n  deploy:\n    runs-on: ubuntu-latest\n    environment:\n      name: production\n    steps:\n      - run: echo ${{ secrets.DEPLOY_KEY }}\n  build:\n    needs: deploy\n    uses: ./.github/workflows/build.yml\n    secrets:\n      TOKEN: ${{ secrets.DEPLOY_KEY }}\n"),
+            (".github/workflows/build.yml", "on:\n  workflow_call:\n    secrets:\n      TOKEN:\n        required: true\njobs:\n  compile:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.TOKEN }}\n"),
+        ]);
+        // Kept for production only, and for any run.
+        for (environment, value) in [(Some("production"), "production-value"), (None, "any-value")] {
+            let scope = superci_core::secrets::Scope { environment: environment.map(str::to_string), ..Default::default() };
+            let stored = superci_core::secrets::Stored { name: "DEPLOY_KEY".into(), value: value.into(), scope: scope.clone(), updated_ms: 1 };
+            served.aws.put(&format!("/superci/{}/{}", superci_testkit::PLANE, superci_core::secrets::setting("DEPLOY_KEY", &scope)), &serde_json::to_string(&stored).unwrap());
+        }
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        // Its environment's value; on the default machine (its runs-on names another runner).
+        let deploy = runner_of(&served, &run, "deploy");
+        let message = deploy.handed(&served);
+        assert_eq!(message["variables"]["DEPLOY_KEY"]["value"], "production-value", "{}", message["variables"]);
+        deploy.take();
+        deploy.finish("succeeded");
+        // The call's job: the secret its caller names, as it gives it.
+        let compile = runner_of(&served, &run, "build / compile");
+        assert_eq!(compile.handed(&served)["variables"]["TOKEN"]["value"], "any-value");
+        compile.take();
+        compile.finish("succeeded");
+        let _ = std::fs::remove_dir_all(&dir);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
     fn a_matrix_made_by_an_expression_is_read_once_the_job_it_needs_has_ended() {
         let served = serve(|_| {});
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  setup:\n    runs-on: superci\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo 'shards=[1,2,3]' >> $GITHUB_OUTPUT\n  test:\n    needs: setup\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.setup.outputs.shards) }}\n        os: [linux]\n    steps:\n      - run: echo shard ${{ matrix.shard }}\n")]);
