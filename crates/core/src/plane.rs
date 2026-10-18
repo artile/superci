@@ -3911,7 +3911,8 @@ impl<'a> ControlPlane<'a> {
         put_json(self.store, &format!("run:{run_id}"), &run).await?;
         if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
         let run = get_json::<serde_json::Value>(self.store, &format!("run:{run_id}")).await?.unwrap_or_default();
-        Ok(Response::json(&serde_json::json!({ "run_id": run_id.to_string(), "jobs": run["jobs"].as_array().map(|j| j.iter().map(|j| j["name"].clone()).collect::<Vec<_>>()).unwrap_or_default(), "missing_secrets": missing })))
+        // (`cache_own`: its repository is none GitHub knows here, so its cache is apart from what GitHub's jobs saved.)
+        Ok(Response::json(&serde_json::json!({ "run_id": run_id.to_string(), "jobs": run["jobs"].as_array().map(|j| j.iter().map(|j| j["name"].clone()).collect::<Vec<_>>()).unwrap_or_default(), "missing_secrets": missing, "cache_own": ns.starts_with("local-") })))
     }
 
     /// Moves a run from a computer on: notes how its started jobs ended, then starts each job whose needs have all

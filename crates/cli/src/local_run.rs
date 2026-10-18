@@ -138,8 +138,10 @@ fn base_path(plane: &str, root: &Path) -> Option<std::path::PathBuf> {
     Some(crate::store::root()?.join("trees").join(format!("{}.json", &key[..32])))
 }
 
-/// `owner/name` of the repository this checkout's `origin` is on GitHub (else the folder's name under `local/`).
-fn repository(root: &Path) -> String {
+/// `owner/name` of the repository this checkout's `origin` is on GitHub (else the folder's name under `local/`), or
+/// the one given (`--repo`).
+fn repository(root: &Path, given: Option<&str>) -> String {
+    if let Some(r) = given { return r.to_string() }
     let url = git(root, &["remote", "get-url", "origin"]).unwrap_or_default();
     let path = url.trim_end_matches(".git").rsplit_once("github.com").map(|(_, p)| p.trim_start_matches([':', '/']).to_string()).unwrap_or_default();
     if path.split('/').count() == 2 { path } else { format!("local/{}", root.file_name().and_then(|n| n.to_str()).unwrap_or("repository")) }
@@ -153,7 +155,9 @@ pub struct Follow { pub quiet: bool, pub detach: bool, pub dry_run: bool }
 /// The event a run from a computer is started as: `push`, `pull_request` (with its labels) or `workflow_dispatch`
 /// (with its inputs), and a file of JSON put over the payload made for it.
 #[derive(Clone, Default)]
-pub struct Event { pub name: String, pub labels: Vec<String>, pub inputs: Vec<(String, String)>, pub payload: Option<String> }
+pub struct Event { pub name: String, pub labels: Vec<String>, pub inputs: Vec<(String, String)>, pub payload: Option<String>,
+    /// The GitHub repository the run is of (`--repo=OWNER/NAME`), for a checkout whose `origin` does not say it.
+    pub repo: Option<String> }
 
 /// The event's payload as GitHub would send it (`github.event`), from the working tree and what was given, and a
 /// manual start's inputs, typed (`inputs`). What does not go together is refused, before anything is sent.
@@ -161,7 +165,7 @@ fn event_payload(root: &Path, text: &str, e: &Event, reference: &str, sha: &str,
     if !["push", "pull_request", "workflow_dispatch"].contains(&e.name.as_str()) { return Err(format!("--event is push, pull_request or workflow_dispatch, not “{}”.", e.name)) }
     if !e.labels.is_empty() && e.name != "pull_request" { return Err("--label is a pull request's label: --event=pull_request --label=NAME.".into()) }
     if !e.inputs.is_empty() && e.name != "workflow_dispatch" { return Err("--input is a manual start's input: --event=workflow_dispatch --input=NAME=VALUE.".into()) }
-    let repo = repository(root);
+    let repo = repository(root, e.repo.as_deref());
     let (owner, name) = repo.split_once('/').unwrap_or(("local", repo.as_str()));
     // (The default branch: origin's, else main.)
     let default_branch = git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).ok().and_then(|b| b.strip_prefix("origin/").map(str::to_string)).unwrap_or_else(|| "main".into());
@@ -300,13 +304,18 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
             called.insert(p.to_string(), t.into());
         }
     }
-    let body = json!({ "workflow": text, "path": path, "job": job, "repository": repository(&root), "ref": reference, "sha": sha,
+    let body = json!({ "workflow": text, "path": path, "job": job, "repository": repository(&root, event.repo.as_deref()), "ref": reference, "sha": sha,
         "actor": actor, "event_name": event.name, "event": payload, "inputs": inputs, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts, "layered": layered, "called": called });
     let made = call("POST", "/runs", body.to_string().into_bytes())?;
     let run = made["run_id"].as_str().unwrap_or_default().to_string();
     // Secrets its workflows name that this CI does not keep for it and that were not given: empty, as on GitHub.
     let missing: Vec<&str> = made["missing_secrets"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
     let missing_said = (!missing.is_empty()).then(|| format!("Not set in this CI, empty as on GitHub: {} (`superci secrets create NAME`, or --secret=NAME=VALUE).", missing.join(", ")));
+    // Its cache kept apart from what GitHub's jobs saved: why, and what to do.
+    let repo = repository(&root, event.repo.as_deref());
+    let cache_said = (made["cache_own"] == true).then(|| if repo.starts_with("local/") { "Its cache is its own: this checkout has no GitHub remote, so it does not read what GitHub's jobs saved. --repo=OWNER/NAME names its repository.".to_string() }
+        else { format!("Its cache is its own: GitHub's App is not installed on {repo}, so it does not read what GitHub's jobs saved.") });
+    let notes = match (missing_said, cache_said) { (Some(m), Some(c)) => Some(format!("{m}\n{c}")), (m, c) => m.or(c) };
     // The tree still to send goes while the machine starts; the control plane is told once it is all there. Not
     // sent: the run is cancelled (its machine would wait for it).
     let sending = pending.map(|(link, bytes, base)| {
@@ -329,9 +338,9 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     };
     if how.detach {
         sent(sending)?;
-        return Ok(Done { said: missing_said.into_iter().chain([format!("Run {run} of {path} started. Follow it: superci runs wait {run}")]).collect(), data: json!({ "run_id": run, "jobs": made["jobs"], "missing_secrets": missing }) })
+        return Ok(Done { said: notes.into_iter().chain([format!("Run {run} of {path} started. Follow it: superci runs wait {run}")]).collect(), data: json!({ "run_id": run, "jobs": made["jobs"], "missing_secrets": missing, "cache_own": made["cache_own"] == true }) })
     }
-    if let Some(m) = &missing_said { say(m) }
+    if let Some(m) = &notes { say(m) }
     say(&format!("Run {run} of {path}, on machines of this control plane's"));
     let followed = follow(plane, key, &run, how, std::time::Instant::now(), true, say);
     sent(sending)?;

@@ -5461,6 +5461,54 @@ mod runs_suite_in_browser {
     }
 
     #[test]
+    fn a_run_from_a_computer_restores_what_github_jobs_saved_once_its_repository_is_known_and_says_when_its_cache_is_its_own() {
+        // GitHub's App connected (the repository known by its id), the bucket ready.
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+            c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+        });
+        served.connect_github();
+        let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+        served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+        let gh_link = "machine-cache-link-000000000003";
+        served.store.0.lock().unwrap().insert(format!("cachem:{gh_link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner" }).to_string());
+        let cache = |link: &str, what: &str, body: serde_json::Value| { let (s, _, b) = http("POST", &format!("{}/cache/{link}/{what}", served.url), body.to_string().as_bytes()); (s, serde_json::from_slice::<serde_json::Value>(&b).unwrap_or_default()) };
+        let s3 = |method: &str, url: &str, body: &[u8]| http(method, &format!("{}/{}", served.aws.url, url.trim_start_matches("https://")), body);
+        let version = "a".repeat(64);
+        // A GitHub job on main saves the test times.
+        let main = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "197814629", "ac": serde_json::json!([{ "Scope": "refs/heads/main", "Permission": 3 }]).to_string(), "exp": 4_102_444_800u64 }));
+        assert_eq!(cache(gh_link, "begin", serde_json::json!({ "token": main, "key": "test-times-1", "version": version })).1["ok"], true);
+        let (_, signed) = cache(gh_link, "sign", serde_json::json!({ "token": main, "key": "test-times-1", "version": version, "names": ["p00000"] }));
+        assert_eq!(s3("PUT", signed["urls"][0].as_str().unwrap(), b"times").0, 200);
+        assert_eq!(cache(gh_link, "finish", serde_json::json!({ "token": main, "key": "test-times-1", "version": version, "pieces": [["p00000", 5]] })).1["size"], 5);
+        // A checkout with no GitHub remote (a copy of the repository): its cache is its own, and it says so.
+        let dir = checkout();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string();
+        assert!(o.status.success() && said.contains("Its cache is its own: this checkout has no GitHub remote") && said.contains("--repo=OWNER/NAME"), "{said}{}", String::from_utf8_lossy(&o.stderr));
+        let first = run_of(&served);
+        assert!(served.store.under(&format!("run:{first}"))[0].1["cache"]["ns"].as_str().unwrap_or_default().starts_with("local-"));
+        let o = superci(&served, &dir, &["runs", "cancel", &first]).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        // A --repo that is no repository: refused, nothing started.
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme", "--detach"]).output().unwrap();
+        assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("--repo is a GitHub repository, OWNER/NAME"), "{}", String::from_utf8_lossy(&o.stderr));
+        // Named with --repo (as its origin would say it): the repository's entries, as GitHub's jobs saved them.
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme/app", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("Its cache is its own"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = served.store.under("run:").into_iter().map(|(k, _)| k.trim_start_matches("run:").to_string()).find(|k| *k != first).unwrap();
+        let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let token = runner.handed(&served)["resources"]["endpoints"][0]["authorization"]["parameters"]["AccessToken"].as_str().unwrap().to_string();
+        let machine = served.machines.0.lock().unwrap().last().unwrap().clone();
+        let link = "machine-cache-link-000000000004";
+        served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": machine }).to_string());
+        let kept = served.store.under(&format!("run:{run}"))[0].1.clone();
+        let (_, hit) = cache(link, "lookup", serde_json::json!({ "token": token, "key": "test-times-2", "restore_keys": ["test-times-"], "version": version }));
+        assert_eq!((hit["hit"].as_bool(), hit["key"].as_str()), (Some(true), Some("test-times-1")), "{hit}\nrun cache: {} ref {} repository {}", kept["cache"], kept["ref"], kept["repository"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_run_from_a_computers_job_saves_and_restores_its_cache_keeps_artifacts_and_they_are_fetched_from_the_computer() {
         // A control plane with its own AWS account and its bucket ready; the job's machine given its link to the cache.
         let served = serve(|c| {
