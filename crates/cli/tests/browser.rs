@@ -1500,6 +1500,11 @@ fn gitlabs_are_connected_one_and_another_and_again_from_the_browser_and_what_is_
         assert!(got == 400 && text.contains(said), "{fields:?}: {got} {text}");
         assert!(gitlabs().is_empty());
     }
+    // A GitHub App to start for a name that is none, at an address that is none, for a name GitHub does not know.
+    for (fields, said) in [(&[("login", "not a name!")][..], "That is not a GitHub name"), (&[("login", "acme"), ("host", "not an address!")], "Check the address of your GitHub"), (&[("login", "nobody-here-at-all")], "Check the name")] {
+        let (got, text) = post(&mut b, "/github/start", fields);
+        assert!(got == 400 && text.contains(said), "{fields:?}: {got} {text}");
+    }
     // The first, another beside it, and the first again (its webhooks given the new secret).
     for which in ["new", "new", ""] {
         let (got, text) = post(&mut b, "/gitlab/connect", &[("url", "https://gitlab.com"), ("token", &token), ("which", which)]);
