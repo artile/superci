@@ -665,6 +665,9 @@ fn a_cloudflare_sign_in_cloudflare_no_longer_takes_is_said_on_every_page_as_clou
         b.click(".side a", "Control plane");
         b.wait(&format!("{} && {}", shows("Your Cloudflare sign-in has expired"), shows("AWS · 111111111111")));
         assert!(b.eval("[...document.querySelectorAll('main a, main button')].some(e => e.innerText.includes('Sign in with Cloudflare'))") == true, "due {due}");
+        // Something that needs Cloudflare, asked for now: said that the sign-in ended, nothing done.
+        let (got, text) = post(&mut b, "/runners/cloudflare", &[]);
+        assert!(got >= 400 && text.contains("Cloudflare sign-in has expired"), "due {due}: {got} {text}");
         assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
@@ -721,6 +724,9 @@ fn a_modal_sign_in_modal_no_longer_takes_is_said_on_every_page_as_modal_answered
     b.wait(&shows("Set up"));
     b.click(".side a", "Control plane");
     b.wait(&format!("{} && {}", shows("Modal no longer accepts your sign-in"), shows("AWS · 111111111111")));
+    // Something that needs Modal, asked for now: said that the sign-in ended, nothing done.
+    let (got, text) = post(&mut b, "/runners/modal", &[]);
+    assert!(got >= 400 && text.contains("Modal no longer accepts"), "{got} {text}");
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);

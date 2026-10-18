@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.17
+- A change in the dashboard that needs a sign-in that ended says so, as commands do (it said to sign in, or that something went wrong).
 - Adding a label on a control plane too old for more labels says to update it (it said the control plane had not answered yet).
 - Updating a control plane that does not take this computer's key says why (it said the control plane had not answered yet).
 - A dashboard page whose control plane does not take this computer's key says why after half a minute (a control plane from before 0.19.13 reads the key under its old name; a key that expired; a newer control plane), with what to do. It kept saying "Reading your control plane…".

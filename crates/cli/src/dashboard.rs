@@ -1256,6 +1256,13 @@ impl Dashboard {
     }
 
     /// The same of Modal's.
+    /// A change that needs a cloud, after that cloud ended the sign-in kept here: said as that (else as it was said).
+    fn ended_said(&self, e: String) -> String {
+        let (cf, modal) = (self.cf_ended && self.cf.is_none(), self.modal_ended && self.modal.is_none());
+        if self.aws_ended && e.contains("Sign in with AWS") { AWS_ENDED.to_string() } else if (cf && e.contains("Sign in with Cloudflare")) || (!self.cf_given && cloudflare::over(&e)) { CF_ENDED.to_string() }
+            else if (modal && e.contains("Sign in with Modal")) || (!self.modal_given && e.contains(modal::ENDED)) { MODAL_ENDED.to_string() } else { e }
+    }
+
     fn modal_over(&mut self) {
         if self.modal_given { return }
         (self.modal, self.modal_ended, self.views) = (None, true, None);
@@ -1281,10 +1288,7 @@ impl Dashboard {
         self.views = None;
         let answer = self.handle(&req);
         self.keep();
-        // A change that needs AWS, after AWS ended the sign-in kept here: said as that.
-        let (cf, modal) = (self.cf_ended && self.cf.is_none(), self.modal_ended && self.modal.is_none());
-        let ended = |e: String| if self.aws_ended && e.contains("Sign in with AWS") { AWS_ENDED.to_string() } else if (cf && e.contains("Sign in with Cloudflare")) || (!self.cf_given && cloudflare::over(&e)) { CF_ENDED.to_string() }
-            else if (modal && e.contains("Sign in with Modal")) || (!self.modal_given && e.contains(modal::ENDED)) { MODAL_ENDED.to_string() } else { e };
+        let ended = |e: String| self.ended_said(e);
         let answer = answer.map_err(ended)?;
         let said = SAID.with(|s| s.borrow_mut().take()).map(|(_, heading, text)| { let text = plain(&text); if text.is_empty() { heading } else { format!("{}: {text}", heading.trim_end_matches('.')) } });
         match (answer.status, said) {
@@ -6808,7 +6812,7 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
             Err(e) => println!("{} {} → failed: {e}", req.method, req.path),
         }
     }
-    r.unwrap_or_else(|e| message(500, "Something went wrong", &esc(&e)))
+    r.unwrap_or_else(|e| message(500, "Something went wrong", &esc(&d.ended_said(e))))
 }
 
 /// A change to a control plane restarts it (a new secret is a new version): waits (up to 20 s) until it shows the
