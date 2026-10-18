@@ -1546,9 +1546,12 @@ fn gitlabs_are_connected_one_and_another_and_again_from_the_browser_and_what_is_
         assert!(got < 400, "{which}: {got} {text}");
     }
     assert_eq!(gitlabs().len(), 2, "{:?}", gitlabs());
-    // Repositories lists them both.
+    // Repositories lists them both, and Permissions has a row for each.
     b.goto(&format!("{link}&p=repos"));
     b.wait(&reads("GitLab"));
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("Permissions"));
+    assert!(b.eval("document.querySelector('main').innerText").as_str().unwrap().matches("GitLab").count() >= 2);
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -2151,4 +2154,17 @@ fn the_limits_card_on_control_planes_from_before_its_limits_says_what_they_lack(
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
     }
+}
+
+#[test]
+fn a_control_plane_with_a_modal_launcher_and_modal_not_signed_in_says_its_runners_work_without_it() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("Optional: its runners work without it"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
 }
