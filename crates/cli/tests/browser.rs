@@ -932,3 +932,51 @@ fn the_github_app_installed_everywhere_on_some_repositories_or_nowhere_yet_is_sa
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+fn removing_a_runner_provider_is_refused_while_it_runs_jobs_or_its_cloud_is_not_signed_in_and_says_what_is_left() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A control plane whose own AWS account runs jobs and with Cloudflare's containers too, GitHub connected, a job
+    // running on Cloudflare.
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    let (id, queued) = served.github.queue("test", "superci/provider=cloudflare", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
+    // With this computer's key alone (no cloud signed in).
+    let home = home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runners");
+    b.wait(&shows("Runner providers"));
+    for (fields, status, said) in [
+        (&[("cloud", "cloudflare"), ("plane", "anotherplane")][..], 409, "Another control plane is in use now"),
+        (&[("cloud", "elsewhere")], 400, "Unknown provider"),
+        (&[("cloud", "cloudflare")], 409, "1 job is running on Cloudflare"),
+        (&[("cloud", "aws")], 403, "Sign in with AWS first"),
+    ] {
+        let (got, text) = post(&mut b, "/runners/remove", fields);
+        assert!(got == status && text.contains(said), "{fields:?}: {got} {text}");
+    }
+    // Signed in, AWS from SuperCI only: forgotten here, and what is left in the account said.
+    let _ = child.kill();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "aws"), ("only", "on")]);
+    assert!(got < 400, "{got} {text}");
+    until("AWS forgotten", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_RUNNERS" && v == "off"));
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&page_shows("the role superci-plane-"));
+    // Cloudflare with its running job stopped: its containers off.
+    let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "cloudflare"), ("stop", "on")]);
+    assert!(got < 400, "{got} {text}");
+    until("Cloudflare's containers off", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "CONTAINERS" && v == "off"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
