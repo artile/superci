@@ -5474,6 +5474,48 @@ mod runs_suite_in_browser {
     }
 
     #[test]
+    fn workflows_that_do_not_hold_are_refused_where_they_are_checked_and_ones_that_do_start() {
+        let served = serve(|_| {});
+        let wf = |jobs: &str| format!("on:\n  push:\n  workflow_dispatch:\n    inputs:\n      count:\n        type: number\n      color:\n        type: choice\n        options: [red, blue]\n      must:\n        required: true\n        default: x\n      flag:\n        type: boolean\njobs:\n{jobs}");
+        // (Each a job `t` on SuperCI's runner.)
+        let job = |rest: &str| wf(&format!("  t:\n    runs-on: superci\n{rest}"));
+        let cases: Vec<(String, &[&str], bool)> = vec![
+            (job("    steps:\n      - name: nothing to do\n"), &[], false),
+            (job("    steps:\n      - run: echo\n        background: perhaps\n"), &[], false),
+            (job("    steps:\n      - run: echo\n        id: a\n      - wait: [b]\n"), &[], false),
+            (job("    steps:\n      - wait: [a]\n        run: echo\n"), &[], false),
+            (job("    steps:\n      - wait-all: true\n        if: always()\n"), &[], false),
+            (job("    steps:\n      - parallel: []\n"), &[], false),
+            (job("    steps:\n      - parallel:\n          - run: echo a\n        name: two keys\n"), &[], false),
+            (job("    steps:\n      - parallel:\n          - parallel:\n              - run: echo\n"), &[], false),
+            (job("    steps: []\n"), &[], false),
+            (job("    strategy:\n      matrix: [1, 2]\n    steps:\n      - run: echo\n"), &[], false),
+            (job("    strategy:\n      matrix:\n        os: linux\n    steps:\n      - run: echo\n"), &[], false),
+            (job("    strategy:\n      matrix:\n        os: [a]\n        include: 3\n    steps:\n      - run: echo\n"), &[], false),
+            // Good ones: a matrix with include and exclude, a block run, flow lists, quoted text, background steps.
+            (job("    strategy:\n      matrix:\n        os: [linux, windows]\n        node: [20, 22]\n        include:\n          - os: linux\n            extra: yes\n        exclude:\n          - os: windows\n            node: 20\n    steps:\n      - run: |\n          echo \"${{ matrix.os }}\"\n          echo 'two'\n      - run: echo one\n        id: one\n        background: true\n      - wait: [one]\n      - parallel:\n          - run: echo a\n          - run: echo b\n      - cancel: one\n"), &[], true),
+            // A manual start's inputs: a number that is none, an option not offered, a flag that is neither, all well.
+            (job("    steps:\n      - run: echo\n"), &["--event=workflow_dispatch", "--input=count=many"], false),
+            (job("    steps:\n      - run: echo\n"), &["--event=workflow_dispatch", "--input=color=green"], false),
+            (job("    steps:\n      - run: echo\n"), &["--event=workflow_dispatch", "--input=flag=maybe"], false),
+            (job("    steps:\n      - run: echo\n"), &["--event=workflow_dispatch", "--input=count=3", "--input=color=red", "--input=flag=true"], true),
+            ("jobs:\n  t:\n    runs-on: superci\n    steps:\n      - run: echo\n".to_string(), &["--event=workflow_dispatch"], false),
+        ];
+        for (i, (text, extra, ok)) in cases.iter().enumerate() {
+            let dir = checkout_with(&[(".github/workflows/ci.yml", text.as_str())]);
+            // (Started: what the computer checks is refused here; what the control plane checks, as it starts the job.)
+            let mut args = vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"];
+            args.extend(extra.iter().copied());
+            let o = superci(&served, &dir, &args).output().unwrap();
+            let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"), "case {i}: {said}");
+            if *ok { assert!(o.status.success(), "case {i}: {said}\n{text}") }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
     fn a_matrix_made_by_an_expression_is_read_once_the_job_it_needs_has_ended() {
         let served = serve(|_| {});
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  setup:\n    runs-on: superci\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo 'shards=[1,2,3]' >> $GITHUB_OUTPUT\n  test:\n    needs: setup\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.setup.outputs.shards) }}\n        os: [linux]\n    steps:\n      - run: echo shard ${{ matrix.shard }}\n")]);
