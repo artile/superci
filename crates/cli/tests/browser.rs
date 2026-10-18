@@ -9728,6 +9728,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["workspaces", "create"], vec!["workspaces", "create", "Globex", "--dry-run"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "list"], vec!["status", "--workspace=globex"],
         vec!["workspaces", "update", "globex", "--id=initech", "--dry-run"], vec!["workspaces", "update", "globex", "--id=initech"], vec!["workspaces", "update", "initech", "--plane=testplane0001", "--dry-run"], vec!["workspaces", "update"],
         vec!["workspaces", "delete", "initech"], vec!["workspaces", "delete", "initech", "--confirm", "--dry-run"], vec!["workspaces", "delete", "initech", "--confirm"], vec!["workspaces", "delete", "nosuch", "--confirm"],
+        vec!["artifacts", "list"], vec!["artifacts", "list", "--run=abc"], vec!["artifacts", "retrieve", &by_run], vec!["artifacts", "list", &by_run], vec!["artifacts", "retrieve", "report", &by_run],
         vec!["caches", "update"], vec!["limits", "update", "--max-hours=3"], vec!["limits", "update", "--daily-usd=5"], vec!["machine", "update", "--cpu=3", "--ram=1"], vec!["machine", "update", "--disk=1"],
         vec!["secrets", "create", "LISTED", "--value-env=HOME"], vec!["secrets", "list"], vec!["secrets", "list", "--json"], vec!["secrets", "delete", "LISTED", "--confirm"],
         // Help, a resource alone, what is no command.
@@ -9745,6 +9746,12 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let empty = common::temp("no-workspaces");
     std::fs::create_dir_all(&empty).unwrap();
     let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).args(["workspaces", "list"]).env("SUPERCI_HOME", &empty).output().unwrap();
+    // (A control plane with no runs yet: said so.)
+    let quiet = serve(|_| {});
+    let quiet_home = signed_in(&quiet);
+    let r = common::command(&quiet_home).args(["runs", "list"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&r.stdout).contains("No runs yet"), "{}", String::from_utf8_lossy(&r.stdout));
+    let _ = std::fs::remove_dir_all(&quiet_home);
     assert!(String::from_utf8_lossy(&o.stdout).contains("None yet") || o.status.code().is_some_and(|c| c <= 3));
     let _ = std::fs::remove_dir_all(&empty);
     let (code, said) = cli(&["workspaces", "list"]);
