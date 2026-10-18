@@ -9151,6 +9151,33 @@ fn with_several_workspaces_a_page_that_names_none_opens_on_the_one_shown_last() 
 }
 
 #[test]
+fn the_public_repositories_are_read_from_github_once_a_while_and_github_failing_is_no_list() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    served.github.set_public(true);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    // Read from GitHub, then within five minutes from what was read.
+    for _ in 0..2 {
+        b.goto(&format!("{link}&p=settings"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Settings")));
+    }
+    let _ = child.kill();
+    // GitHub failing to list them (minutes on): no list, the page as it is.
+    let served = serve(|_| {});
+    served.connect_github();
+    served.github.set_public(true);
+    served.github.fail("GET", "/installation/repositories", 502, "Server Error");
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Settings")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
