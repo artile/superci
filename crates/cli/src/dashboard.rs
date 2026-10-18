@@ -6311,7 +6311,8 @@ fn usage_figures(u: &serde_json::Value, period: &str, jobs: &[serde_json::Value]
     let minutes = |m: f64| if m >= 6000.0 { format!("{:.0} h", m / 60.0) } else if m >= 100.0 { format!("{:.0} min", m) } else { format!("{:.1} min", m) };
     let host = if jobs.iter().any(|j| j["provider"] == "gitlab") && jobs.iter().any(|j| j["provider"] != "gitlab") { "GitHub and GitLab" } else if jobs.iter().any(|j| j["provider"] == "gitlab") { "GitLab" } else { "GitHub" };
     let minutes_spark = spark((0..count).map(|i| (s(i, "minutes"), 0.0, format!("{}: {}", step_name(i), minutes(s(i, "minutes"))))).collect());
-    let minutes_kpi = kpi(minutes(f("machine_minutes")), "machine minutes", minutes_spark, format!("{} min as {host} {} them", n("billed_minutes"), if host.contains(" and ") { "bill" } else { "bills" }));
+    // (Its label in the unit its figure is in: hours from 6,000 minutes on.)
+    let minutes_kpi = kpi(minutes(f("machine_minutes")), if f("machine_minutes") >= 6000.0 { "machine hours" } else { "machine minutes" }, minutes_spark, format!("{} min as {host} {} them", n("billed_minutes"), if host.contains(" and ") { "bill" } else { "bills" }));
     // The wait for a machine: each step's median.
     let secs = |ms: u64| if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { format!("{} min", ms / 60_000) };
     let wait_spark = spark((0..count).map(|i| { let m = steps[i]["wait_median_ms"].as_u64(); (m.unwrap_or(0) as f64, 0.0, match m { Some(m) => format!("{}: {} median", step_name(i), secs(m)), None => format!("{}: no jobs", step_name(i)) }) }).collect());

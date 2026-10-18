@@ -1821,3 +1821,42 @@ fn the_default_machine_and_keys_forms_take_only_what_they_may_and_the_machine_is
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn overview_sums_up_a_single_gitlab_job_and_a_day_of_long_ones() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // One GitLab job alone (one run, it ran); and from GitHub three jobs of 40 hours each (over 6,000 minutes).
+    for case in ["one gitlab job", "long jobs"] {
+        let served = serve(|_| {});
+        served.connect_github();
+        served.connect_gitlab();
+        if case == "one gitlab job" {
+            let (gid, p) = served.gitlab.pending("gl-test", &["superci"], served.now_ms());
+            served.gitlab_webhook(p);
+            served.gitlab_webhook(served.gitlab.running(gid, served.now_ms()));
+            served.later(30_000);
+            served.gitlab_webhook(served.gitlab.finish(gid, "success", "ok", served.now_ms()));
+        } else {
+            for n in 0..3 {
+                let (id, q) = served.github.queue(&format!("soak{n}"), "superci", served.now_ms());
+                served.webhook(q);
+                served.webhook(served.github.start(id));
+                served.later(40 * 3_600_000);
+                served.webhook(served.github.finish(id, "success", "ok", served.now_ms()));
+            }
+        }
+        let home = home(&served);
+        let (mut child, link) = dashboard(&home);
+        b.goto(&link);
+        if case == "one gitlab job" {
+            b.wait(&format!("{} && {}", reads("1 job"), reads("as GitLab bills them")));
+            b.click("main a, main button", "7 days");
+            b.wait(&reads("1 job"));
+        } else {
+            b.click("main a, main button", "7 days");
+            b.wait(&format!("{} && {}", reads("3 jobs"), reads("machine hours")));
+        }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
