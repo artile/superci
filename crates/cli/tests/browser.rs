@@ -2654,6 +2654,38 @@ fn a_change_needing_a_cloud_noted_as_ended_or_given_for_the_run_says_which() {
 }
 
 #[test]
+fn removing_aws_or_modal_while_signed_in_says_each_part_its_cloud_would_not_delete() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"modal"}],"account_usd":{"aws":100.0},"aws_budget":{"stop":false}}"#);
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    // AWS refusing each part: its role's policy, its budget, its network.
+    served.aws.fail("DeleteRolePolicy", 500, &superci_testkit::ec2_error("ServiceFailure", "Service failure"), None);
+    served.aws.fail("budgets", 500, &superci_testkit::json_error("InternalErrorException", "internal error"), None);
+    served.aws.fail("DeleteVpc", 400, &superci_testkit::ec2_error("DependencyViolation", "has dependencies"), None);
+    served.aws.fail("api.modal.com", 503, "unavailable", None);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    for cloud in ["aws", "modal"] {
+        let (got, text) = post(&mut b, "/runners/remove", &[("cloud", cloud)]);
+        assert!(got < 500, "{cloud}: {got} {text}");
+    }
+    b.goto(&format!("{link}&p=runners"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
