@@ -387,6 +387,12 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
     let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "lift")]);
     assert!(status == 400 && common::words(&said).contains("There is no budget in AWS to lift"), "{status} {}", common::words(&said));
     assert!(routing().get("account_usd").is_none() && routing().get("aws_budget").is_none(), "{}", routing());
+    // AWS refusing the budget, as AWS words a refusal by the organization's policy: said plainly, nothing kept.
+    served.aws.fail("budgets.amazonaws.com", 400, &superci_testkit::json_error("AccessDeniedException", "User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: budgets:ModifyBudget on resource: arn:aws:budgets::111111111111:budget/superci-plane-testplane0001 with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-example001/service_control_policy/p-example1"), Some(1));
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails"), ("email", "ops@example.com")]);
+    let said = common::words(&said);
+    assert!(status == 502 && said.contains("AWS did not take the budget") && said.contains("the AWS organization the account is in does not allow it") && said.contains("p-example1"), "{status} {said}");
+    assert!(routing().get("account_usd").is_none() && routing().get("aws_budget").is_none(), "{}", routing());
 
     // Cloudflare's image, under Clouds: an address that is https and plain, else said.
     runners(&mut b);
