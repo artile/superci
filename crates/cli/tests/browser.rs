@@ -2447,7 +2447,13 @@ fn removing_a_cloudflare_or_modal_launcher_needs_its_sign_in_or_is_from_superci_
         for _ in 0..30 {
             b.goto(&format!("{link}&p=runners"));
             b.wait(&shows("Add provider"));
-            if b.text("body").contains(&left) { said = true; break }
+            // (Its note is shown once: read on this page until it has loaded, not on the next.)
+            for _ in 0..20 {
+                if b.text("body").contains(&left) { said = true; break }
+                if !b.eval("!!document.querySelector('[data-loading]')").as_bool().unwrap_or(false) && b.text("main").contains("Clouds") { break }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            if said || b.text("body").contains(&left) { said = true; break }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
         assert!(said, "{cloud}: {}", b.text("body"));
