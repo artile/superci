@@ -1125,6 +1125,9 @@ fn control_planes_are_set_up_in_cloudflare_and_modal_from_the_browser_and_delete
         b.wait(&shows("Move here"));
         let (got, text) = post(&mut b, "/plane/update", &[("plane", id)]);
         assert!(got < 400, "{id}: {got} {text}");
+        // (Asked again meanwhile: the one under way goes on, nothing more is started.)
+        let (got, _) = post(&mut b, "/plane/update", &[("plane", id)]);
+        assert!(got < 400);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
         while common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Updating") { assert!(std::time::Instant::now() < end, "{id} updated"); std::thread::sleep(std::time::Duration::from_millis(500)) }
         assert!(!common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("The update stopped"), "{}", common::words(&common::part(&link, "/?p=planes&fragment=1").1));
@@ -1294,6 +1297,9 @@ fn a_ci_whose_control_plane_is_in_a_cloud_not_signed_in_to_asks_for_that_sign_in
     b.wait(&shows("Your control plane is in Cloudflare"));
     b.goto(&format!("{link}&p=runners"));
     b.wait(&shows("Sign in with Cloudflare to see it"));
+    // Its update: not from here, without that sign-in.
+    let (got, text) = post(&mut b, "/plane/update", &[]);
+    assert!(got >= 400 && text.contains("Sign in where this control plane runs to update it"), "{got} {text}");
     b.goto(&format!("{link}&p=planes"));
     b.wait(&format!("{} && {}", reads("superci.acme.workers.dev Sign in with Cloudflare In use"), shows("A Lambda function with a table")));
     let _ = child.kill();
