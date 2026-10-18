@@ -9198,6 +9198,30 @@ fn the_public_repositories_are_read_from_github_once_a_while_and_github_failing_
 }
 
 #[test]
+fn sign_ins_not_completed_at_aws_or_started_on_another_port_for_cloudflare_are_said() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    // AWS's sign-in started, then turned down on AWS's page: said, nothing kept.
+    let (status, to, _) = common::post(&link, "/aws/signin", &[]);
+    assert!((300..400).contains(&status), "{status} {to}");
+    let state = url::Url::parse(&to).ok().and_then(|u| u.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned())).unwrap_or_default();
+    let (status, page) = common::part(&link, &format!("/oauth/callback?state={state}&error=access_denied"));
+    assert!(status == 400 && page.contains("AWS sign-in was not completed"), "{status} {}", common::words(&page));
+    // Cloudflare's, from a dashboard not on the port its sign-in comes back to: said, with what to do.
+    let (status, _, page) = common::post(&link, "/cloudflare/signin", &[]);
+    assert!(status == 409 && common::words(&page).contains("needs port 8976"), "{status} {}", common::words(&page));
+    // A Cloudflare sign-in coming back with no sign-in started, and one turned down: said.
+    let (status, page) = common::part(&link, "/oauth/callback?state=nothing-started&error=access_denied");
+    assert!(status == 400, "{status} {}", common::words(&page));
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
