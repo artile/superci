@@ -6225,6 +6225,12 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     // Its step's lines, as its machine sent them, in the log its page shows (GitHub has none yet).
     let view = b.eval(&format!("fetch('/job/view?id={id}', {{credentials: 'same-origin'}}).then(r => r.text())")).as_str().unwrap_or_default().to_string();
     assert!(view.contains("ok 1 - adds") && view.contains("Run npm test"), "{view}");
+    // GitHub has the first of its log by now (its runner sends it in blocks): GitHub's, then what its machine sent after.
+    let _ = served.github.finish(id, "success", "2026-10-15T10:00:04.5000000Z from GitHub's block\n", served.now_ms());
+    let raw = b.eval(&format!("fetch('/job/raw?id={id}', {{credentials: 'same-origin', redirect: 'manual'}}).then(r => r.status)"));
+    assert!(raw.as_u64().is_some(), "{raw}");
+    let view = b.eval(&format!("fetch('/job/view?id={id}', {{credentials: 'same-origin'}}).then(r => r.text())")).as_str().unwrap_or_default().to_string();
+    assert!(view.contains("from GitHub") && view.contains("ok 1 - adds"), "{view}");
     // AWS takes it back: said by its machine (with its own link), the job then failed by GitHub.
     assert_eq!(say(&format!("interrupted?runner={runner}&t=not-its-link-at-all-xx"), ""), 404);
     // (Its zone not kept, as on a record from before: no pool is put last for it.)
