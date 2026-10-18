@@ -2820,6 +2820,32 @@ fn labels_at_each_limit_and_in_each_combination_are_fitted_to_a_provider_or_refu
 }
 
 #[test]
+fn connecting_github_takes_a_name_and_a_host_as_github_would_and_refuses_what_is_not_one() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    for (fields, said) in [(vec![("login", "bad name!")], "not a GitHub name"), (vec![("login", "acme"), ("host", "localhost")], "not a host name"), (vec![("login", "acme"), ("host", "-x.com")], "not a host name"),
+        (vec![("login", "acme"), ("host", "x..com")], "not a host name"), (vec![("login", "acme"), ("host", "a b.com")], "not a host name"), (vec![("login", "acme"), ("host", "github.example.com/path")], "not a host name")] {
+        let (got, text) = post(&mut b, "/github/start", &fields);
+        assert!(got == 400 && text.contains(said), "{fields:?}: {got} {text}");
+    }
+    // Good names: GitHub's own (as typed in any case), and one at a host of its own.
+    for fields in [vec![("login", "acme"), ("host", "https://GitHub.com/")], vec![("login", "acme"), ("host", "github.example.com")], vec![("login", "acme")]] {
+        let (got, _) = post(&mut b, "/github/start", &fields);
+        assert!(got < 500, "{fields:?}: {got}");
+    }
+    // Back from GitHub with a state that is not this one's: said, nothing made.
+    let (status, page) = common::part(&link, "/github/callback?state=not-this-ones&code=x");
+    assert!(status == 400 && page.contains("expired"), "{status}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
