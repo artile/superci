@@ -1993,3 +1993,41 @@ fn a_job_whose_machine_could_not_start_is_counted_as_one_that_did_not_run_and_li
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn control_planes_that_stop_answering_after_they_did_are_said_so_and_come_back_when_they_answer() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The one in use (GitHub), and another in the account; both answering at first.
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("testplane0002", move |c| { let s = aws.settings("testplane0002"); if !s.is_empty() { c.read_settings(&s) } });
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    // (Read again on every page, and a passing miss not held over: as a minute or two later would be.)
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_LAST_GOOD_S", "1"), ("SUPERCI_KEY_WAIT_S", "1"), ("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads(&format!("{} Move here", other.url)));
+    // The other stops answering: its row says so (not "Move here").
+    other.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads(&format!("{} Not answering", other.url)));
+    // The one in use stops too: every page says so.
+    served.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    for p in ["overview", "runners", "jobs"] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait(&shows("Your control plane is not answering"));
+    }
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads(&format!("{} Not answering In use", served.url)));
+    // Answering again: its pages as before.
+    served.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

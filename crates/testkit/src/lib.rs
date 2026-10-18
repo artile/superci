@@ -71,7 +71,9 @@ impl Timer for NoTimer { async fn wake_in(&self, _ms: u64) -> io::Result<()> { O
 /// A control plane served on this computer: its address, its store, its machines, AWS as it finds it (its settings
 /// are SSM parameters there, `/superci/testplane0001/…`, read on every request), and a key with which the dashboard
 /// and the CLI reach it (and one for coding agents, which may also start runs).
-pub struct Served { pub plane: String, pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub github: GitHub, pub gitlab: GitLab, pub key: String, pub run_key: String, clock: Now }
+pub struct Served { pub plane: String, pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub github: GitHub, pub gitlab: GitLab, pub key: String, pub run_key: String, clock: Now,
+    /// It stopped answering (its connections closed at once), until this is set back.
+    pub down: Arc<std::sync::atomic::AtomicBool> }
 
 impl Served {
     /// Moves the control plane's time on by `ms`.
@@ -146,11 +148,13 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     aws.put(&format!("/superci/{plane}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
     aws.put(&format!("/superci/{plane}/CONTAINERS"), "on");
     let clock = Now::default();
-    let (s, m, a, u, c, g, id) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), plane.to_string());
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (s, m, a, u, c, g, id, dn) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), plane.to_string(), down.clone());
     std::thread::spawn(move || {
         let cache = Cache::default();
         block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
         for stream in listener.incoming().flatten() {
+            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
             let mut config = Config::new(id.clone());
             let mut settings = a.settings(&id);
             // (One from before reads its launchers and its devices' keys under their old names, and not the new ones.)
@@ -168,7 +172,7 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
         }
     });
     let gitlab = github.gitlab.clone();
-    Served { plane: plane.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock }
+    Served { plane: plane.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down }
 }
 
 /// A request as it arrived: method, target, headers, body.

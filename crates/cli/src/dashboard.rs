@@ -3759,7 +3759,7 @@ mark();load()})();</script>"#;
             let restarting = d.updating.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|u| d.views.as_ref().is_some_and(|(views, _)| views.iter().any(|v| u.restarting(v))));
             let same = same && !restarting;
             match d.views.clone() {
-                Some((views, at)) if same && pending.is_none() && quota_creds.is_none() && look_creds.is_none() && !expecting && now_ms() < at + 120_000 => {
+                Some((views, at)) if same && pending.is_none() && quota_creds.is_none() && look_creds.is_none() && !expecting && now_ms() < at + views_kept_ms() => {
                     look_again = now_ms() > at + 3_000;
                     if now_ms() > at + 3_000 && !d.refreshing {
                         d.refreshing = true;
@@ -4743,7 +4743,7 @@ mark();load()})();</script>"#;
             let id = v.plane.plane_id().to_string();
             // Not answering just now, but it did a moment ago: its last view stands (for a minute).
             if !v.online {
-                if let Some((good, at)) = self.last_good.get(&id).filter(|(_, at)| now_ms() < at + 60_000) { let _ = at; *v = good.clone(); }
+                if let Some((good, at)) = self.last_good.get(&id).filter(|(_, at)| now_ms() < at + last_good_ms()) { let _ = at; *v = good.clone(); }
             } else if v.status.is_some() {
                 self.last_good.insert(id.clone(), (v.clone(), now_ms()));
             }
@@ -5491,6 +5491,20 @@ fn key_wait_ms() -> u64 {
     #[cfg(debug_assertions)]
     if let Some(s) = std::env::var("SUPERCI_KEY_WAIT_S").ok().and_then(|v| v.parse::<u64>().ok()) { return s * 1000 }
     KEY_WAIT_MS
+}
+
+/// How long a reading of the control planes serves the pages asked for meanwhile, before they are read again.
+fn views_kept_ms() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("SUPERCI_VIEWS_S").ok().and_then(|v| v.parse::<u64>().ok()) { return s * 1000 }
+    120_000
+}
+
+/// How long a control plane that answered a moment ago and does not now is shown as it was (a passing miss).
+fn last_good_ms() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("SUPERCI_LAST_GOOD_S").ok().and_then(|v| v.parse::<u64>().ok()) { return s * 1000 }
+    60_000
 }
 
 fn section_title(section: &str) -> &'static str {
