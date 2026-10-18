@@ -8674,6 +8674,55 @@ fn each_address_a_machine_or_computer_calls_without_its_link_or_key_finds_nothin
 }
 
 #[test]
+fn sign_ins_made_or_ended_in_another_terminal_while_the_dashboard_runs_are_taken_in() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&page_shows("Usage"));
+    let change = |f: &dyn Fn(&mut serde_json::Value)| { let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap(); f(&mut kept); std::fs::write(&file, kept.to_string()).unwrap(); };
+    // `superci login` with Cloudflare and Modal in another terminal: this page has them on its next read.
+    change(&|k| {
+        k["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+        k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    });
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Control plane")));
+    // Then AWS signed out there, and its device key taken out: taken in as well.
+    change(&|k| { k.as_object_mut().unwrap().remove("aws"); k.as_object_mut().unwrap().remove("aws_more"); k["aws_ended"] = true.into(); });
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows("Control plane"));
+    change(&|k| { k.as_object_mut().unwrap().remove("key"); });
+    b.goto(&format!("{link}&p=overview"));
+    b.wait(&shows("Overview"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn control_planes_in_clouds_not_signed_in_or_not_answering_are_listed_as_they_stand() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    // The one in use in AWS; one in Modal (not signed in there) that answers, one in Cloudflare that does not.
+    let served = serve(|_| {});
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([
+        { "Modal": { "workspace": "acmeorg", "url": other.url, "plane_id": "testplane0002", "label": "" } },
+        { "Cloudflare": { "account_id": "0123456789abcdef0123456789abcdef", "account_name": "Acme", "script": "superci", "url": "http://127.0.0.1:9", "plane_id": "cfplane00009", "label": "" } }]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Control plane")));
+    b.wait(&format!("{} && {}", page_shows("Not answering"), page_shows("Sign in with Modal")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
