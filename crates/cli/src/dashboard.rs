@@ -78,6 +78,8 @@ pub struct Dashboard {
     /// takes its token): forgotten, and what the other sign-ins reach goes on (see `cf_over`).
     cf_ended: bool,
     modal_ended: bool,
+    /// The clouds that did not answer when last looked in ("Modal: …"): said on the pages, asked again on the next.
+    unanswered: Vec<String>,
     /// A sign-in to AWS came back in this run (what `superci login aws --add` waits for), and whether one is awaited
     /// although an account is signed in to already.
     aws_came: bool,
@@ -1093,7 +1095,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{}", oauth_port()), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -1244,6 +1246,7 @@ impl Dashboard {
         let mut notes = vec![];
         if self.cf_ended && self.cf.is_none() { notes.push("The Cloudflare sign-in has expired: what is in Cloudflare was not looked at. `superci login cloudflare` signs in again.".to_string()) }
         if self.modal_ended && self.modal.is_none() { notes.push("Modal no longer accepts the sign-in: what is in Modal was not looked at. `superci login modal` signs in again.".to_string()) }
+        for u in &self.unanswered { let (cloud, why) = u.split_once(": ").unwrap_or((u, "")); notes.push(format!("{cloud} did not answer ({why}): what is there was not looked at.")) }
         notes
     }
 
@@ -1255,14 +1258,17 @@ impl Dashboard {
         self.cf_accounts.clear();
     }
 
-    /// The same of Modal's.
-    /// A change that needs a cloud, after that cloud ended the sign-in kept here: said as that (else as it was said).
+    /// A change that needs a cloud, after that cloud ended the sign-in kept here: said as that; after it did not
+    /// answer, with what it said (else as it was said).
     pub(crate) fn ended_said(&self, e: String) -> String {
         let (cf, modal) = (self.cf_ended && self.cf.is_none(), self.modal_ended && self.modal.is_none());
         if self.aws_ended && e.contains("Sign in with AWS") { AWS_ENDED.to_string() } else if (cf && e.contains("Sign in with Cloudflare")) || (!self.cf_given && cloudflare::over(&e)) { CF_ENDED.to_string() }
-            else if (modal && e.contains("Sign in with Modal")) || (!self.modal_given && e.contains(modal::ENDED)) { MODAL_ENDED.to_string() } else { e }
+            else if (modal && e.contains("Sign in with Modal")) || (!self.modal_given && e.contains(modal::ENDED)) { MODAL_ENDED.to_string() }
+            else if let Some((cloud, why)) = self.unanswered.iter().filter_map(|u| u.split_once(": ")).find(|(cloud, _)| e.contains(&format!("Sign in with {cloud}"))) { format!("{cloud} did not answer: {why}") }
+            else { e }
     }
 
+    /// The same of Modal's.
     fn modal_over(&mut self) {
         if self.modal_given { return }
         (self.modal, self.modal_ended, self.views) = (None, true, None);
@@ -2144,7 +2150,10 @@ impl Dashboard {
         // Every cloud signed in to and not looked in yet, at once.
         // (A sign-in that is over is no reason not to look where the others reach: it is forgotten and said, see
         // `cf_over`, and the control planes known there stay listed.)
-        let cf = if self.cf.is_some() && !self.looked_cf { match self.cloudflare() { Ok(cf) => Some(cf), Err(e) if e == CF_ENDED => None, Err(e) => return Err(e) } } else { None };
+        // A cloud that does not answer is said, and looked in again next time; the others are looked in meanwhile.
+        self.unanswered.clear();
+        let mut unanswered = vec![];
+        let cf = if self.cf.is_some() && !self.looked_cf { match self.cloudflare() { Ok(cf) => Some(cf), Err(e) if e == CF_ENDED => None, Err(e) => { unanswered.push(format!("Cloudflare: {e}")); None } } } else { None };
         // Every AWS account signed in to: the one in hand, then the others.
         let mut aws: Vec<(superci_core::aws::Credentials, String)> = vec![];
         if !self.looked_aws {
@@ -2153,7 +2162,7 @@ impl Dashboard {
                 // Over on AWS's side (a sign-in lasts twelve hours at most, and one kept from yesterday has ended):
                 // forgotten, so the pages ask for it again.
                 Some((Err(e), _)) if e.starts_with(aws::ENDED) => { self.aws = None; self.aws_ended = true }
-                Some((Err(e), _)) => return Err(e),
+                Some((Err(e), _)) => unanswered.push(format!("AWS: {e}")),
                 None => {}
             }
             let mut ended = vec![];
@@ -2161,7 +2170,7 @@ impl Dashboard {
                 match s.credentials() {
                     Ok(creds) => aws.push((creds, s.account_id.clone())),
                     Err(e) if e.starts_with(aws::ENDED) => ended.push(s.account_id.clone()),
-                    Err(e) => return Err(e),
+                    Err(e) => unanswered.push(format!("AWS: {e}")),
                 }
             }
             self.aws_others.retain(|s| !ended.contains(&s.account_id));
@@ -2193,21 +2202,26 @@ impl Dashboard {
         // Cloudflare took the token no more (ended there, where renewing it still worked a moment ago): the same.
         let cf_found = match cf_found { Some(Err(e)) if cloudflare::over(&e) && !self.cf_given => { self.cf_over(); None } found => found };
         let modal_found = match modal_found { Some(Err(e)) if e.contains(modal::ENDED) && !self.modal_given => { self.modal_over(); None } found => found };
-        if let Some(found) = cf_found {
-            let (accounts, planes) = found?;
-            looked.extend(accounts.iter().map(|(id, _)| format!("cloudflare:{id}")));
-            there.extend(planes.iter().map(|p| p.plane_id().to_string()));
-            self.cf_accounts = accounts;
-            self.found.retain(|p| !matches!(p, Plane::Cloudflare { .. }));
-            for h in planes {
-                match self.planes.iter().position(|x| x.plane_id() == h.plane_id()) { Some(i) => self.planes[i] = h, None => self.found.push(h) }
+        match cf_found {
+            Some(Err(e)) => unanswered.push(format!("Cloudflare: {e}")),
+            Some(Ok((accounts, planes))) => {
+                looked.extend(accounts.iter().map(|(id, _)| format!("cloudflare:{id}")));
+                there.extend(planes.iter().map(|p| p.plane_id().to_string()));
+                self.cf_accounts = accounts;
+                self.found.retain(|p| !matches!(p, Plane::Cloudflare { .. }));
+                for h in planes {
+                    match self.planes.iter().position(|x| x.plane_id() == h.plane_id()) { Some(i) => self.planes[i] = h, None => self.found.push(h) }
+                }
+                self.looked_cf = true;
             }
-            self.looked_cf = true;
+            None => {}
         }
+        let asked_aws = !aws.is_empty();
         for (found, (_, account_id)) in aws_found.into_iter().zip(aws) {
+            let found = match found { Ok(f) => f, Err(e) => { unanswered.push(format!("AWS: {e}")); continue } };
             looked.push(format!("aws:{account_id}"));
             self.found.retain(|p| !matches!(p, Plane::Aws { account_id: a, .. } if *a == account_id));
-            for f in found? {
+            for f in found {
                 // (Only over HTTPS; and in a debug build, a test's control plane on this computer.)
                 if !(f.url.starts_with("https://") || (cfg!(debug_assertions) && f.url.starts_with("http://127.0.0.1:"))) { continue }
                 if f.lambda.is_some() { there.push(f.plane_id.clone()) }
@@ -2224,16 +2238,21 @@ impl Dashboard {
                     None => {}
                 }
             }
-            self.looked_aws = true;
         }
-        if let Some(found) = modal_found {
-            if let Some(m) = &self.modal { looked.push(format!("modal:{}", m.workspace)) }
-            self.found.retain(|p| !matches!(p, Plane::Modal { .. }));
-            for found in found? {
-                there.push(found.plane_id().to_string());
-                match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) { Some(i) => self.planes[i] = found, None => self.found.push(found) }
+        // (Every account looked in, or looked in again next time.)
+        if asked_aws && !unanswered.iter().any(|u| u.starts_with("AWS: ")) { self.looked_aws = true }
+        match modal_found {
+            Some(Err(e)) => unanswered.push(format!("Modal: {e}")),
+            Some(Ok(found)) => {
+                if let Some(m) = &self.modal { looked.push(format!("modal:{}", m.workspace)) }
+                self.found.retain(|p| !matches!(p, Plane::Modal { .. }));
+                for found in found {
+                    there.push(found.plane_id().to_string());
+                    match self.planes.iter().position(|x| x.plane_id() == found.plane_id()) { Some(i) => self.planes[i] = found, None => self.found.push(found) }
+                }
+                self.looked_modal = true;
             }
-            self.looked_modal = true;
+            None => {}
         }
         // A control plane kept from the last run: looked for where it lives and not there any more, it is gone.
         let home = |p: &Plane| match p {
@@ -2253,6 +2272,9 @@ impl Dashboard {
         if self.preloaded.as_ref().is_some_and(|id| self.planes.iter().find(|p| p.plane_id() == id).is_none_or(|p| looked.contains(&home(p)))) { self.preloaded = None }
         self.learn_found();
         self.key_planes();
+        // Nothing to show but that: said as the page (else a note on each page, see `others_ended_notice`).
+        if !unanswered.is_empty() && self.planes.is_empty() && self.found.is_empty() { return Err(unanswered.join("; ")) }
+        self.unanswered = unanswered;
         Ok(())
     }
 
@@ -3703,9 +3725,12 @@ mark();load()})();</script>"#;
             d.take_in();
             d.adopt_deploy();
             // Finding control planes after a sign-in asks the cloud once; afterwards this is instant.
-            if let Err(e) = d.discover() {
-                // A sign-in that ran out (Cloudflare's lasts an hour): forget it and ask again, where the user is.
-                if e.contains("(9109)") || e.contains("Invalid access token") || e.contains("sign-in expired") {
+            // A sign-in that ran out (Cloudflare's lasts an hour): forgotten and asked for again, where the user is,
+            // whether or not the other clouds answered.
+            let refused = |e: &str| e.contains("(9109)") || e.contains("Invalid access token") || e.contains("sign-in expired");
+            let failed = match d.discover() { Err(e) => Some(e), Ok(()) => d.unanswered.iter().find(|u| u.starts_with("Cloudflare: ") && refused(u)).cloned() };
+            if let Some(e) = failed {
+                if refused(&e) {
                     // (A token given in SUPERCI_CLOUDFLARE_TOKEN is no sign-in: signing in would not replace it.)
                     if d.cf_given {
                         return format!(r#"<div class="bar"><h1 class="page-title">Cloudflare refuses its token</h1></div><div class="cards"><section class="card">{}</section></div>"#,
@@ -3869,6 +3894,10 @@ mark();load()})();</script>"#;
         let mut out = String::new();
         if self.cf_ended && self.cf.is_none() { out.push_str(&format!(r#"<div class="notice warn"><span>Your Cloudflare sign-in has expired. Sign in again to see and change what is in Cloudflare.</span>{}</div>"#, signin_button("cloudflare", "Sign in with Cloudflare", false))) }
         if self.modal_ended && self.modal.is_none() { out.push_str(&format!(r#"<div class="notice warn"><span>Modal no longer accepts your sign-in. Sign in again to see and change what is in Modal.</span>{}</div>"#, signin_button("modal", "Sign in with Modal", false))) }
+        for u in &self.unanswered {
+            let (cloud, why) = u.split_once(": ").unwrap_or((u, ""));
+            out.push_str(&format!(r#"<div class="notice warn"><span>{} did not answer ({}). What is there is not shown; it is asked again on the next page.</span></div>"#, esc(cloud), esc(why)))
+        }
         out
     }
 

@@ -4,6 +4,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 
 ## 0.19.17
 - `superci planes create cloudflare` after the Cloudflare sign-in ended says it ended (it said to sign in), and a Modal token given in SUPERCI_MODAL_TOKEN_ID that Modal refuses is said as Modal refused it (it was dropped, and the command said to sign in).
+- A cloud that does not answer at all (Modal or Cloudflare down, say) is a note on each dashboard page, which shows what the other clouds have and keeps working: every page said "Could not reach your cloud", even with the control plane in AWS. `superci planes list` notes it too, and a command that needs that cloud says it did not answer (it said to sign in).
 - Overview says "1 job · 1 did not run" (it said "1 jobs").
 - Overview's machine time over 6,000 minutes is labelled machine hours (it said "120 h machine minutes").
 - `superci keys create --runs` on a control plane too old for run keys says to update it, and one that does not take this computer's key says why (both said it had not answered).

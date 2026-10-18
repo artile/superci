@@ -2002,9 +2002,9 @@ fn a_second_control_plane_given_a_code_host_of_its_own_makes_two_cis_listed_and_
 }
 
 #[test]
-fn a_cloud_that_does_not_answer_while_control_planes_are_looked_for_and_an_aws_sign_in_aws_will_not_renew_are_said() {
+fn a_cloud_that_does_not_answer_while_control_planes_are_looked_for_is_noted_and_an_aws_sign_in_aws_will_not_renew_is_said() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
-    // Cloudflare signed in, answering nothing: the page says it could not reach it, and offers to try again.
+    // Cloudflare signed in, answering nothing: said on the page, which shows the control plane in AWS all the same.
     let served = serve(|_| {});
     let home = signed_in(&served);
     let file = home.join("workspaces/default/sign-ins.json");
@@ -2013,7 +2013,7 @@ fn a_cloud_that_does_not_answer_while_control_planes_are_looked_for_and_an_aws_s
     std::fs::write(&file, kept.to_string()).unwrap();
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
-    b.wait(&format!("{} && {}", shows("Could not reach your cloud"), shows("Try again")));
+    b.wait(&format!("{} && {}", page_shows("Cloudflare did not answer ("), shows("AWS · 111111111111")));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
     // AWS's credentials due, and AWS not renewing them (its answer a refusal): the sign-in is said to have ended.
@@ -2286,6 +2286,37 @@ fn removing_a_cloudflare_or_modal_launcher_needs_its_sign_in_or_is_from_superci_
     }
     assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k == "LAUNCHERS" && v == "[]"));
     let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_cloud_that_answers_nothing_is_a_note_on_the_pages_which_keep_working() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A control plane in AWS with a Modal launcher; Modal signed in, and answering nothing at all.
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    for (p, said) in [("overview", "Usage"), ("runners", "Runner providers"), ("planes", "AWS · 111111111111")] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait(&format!("{} && {}", shows(said), page_shows("Modal did not answer (")));
+    }
+    // Its launcher removed all the same: forgotten, and its app said as left in Modal.
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "modal")]);
+    assert!(got < 400, "{got} {text}");
+    assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k == "LAUNCHERS" && v == "[]"));
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&page_shows(&format!("Left: its Modal app superci-runners-{PLANE}")));
+    let _ = child.kill();
+    // From the CLI: what it did, and the note.
+    let o = common::command(&home).args(["planes", "list"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("Modal did not answer ("), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
