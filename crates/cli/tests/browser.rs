@@ -881,6 +881,30 @@ fn a_cloudflare_sign_in_cloudflare_no_longer_takes_is_said_on_every_page_as_clou
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
     }
+    // Cloudflare's other words for a token it no longer takes: the same.
+    for said in ["Invalid access token", "Your sign-in expired"] {
+        let served = serve(|_| {});
+        let home = signed_in(&served);
+        served.aws.fail("api.cloudflare.com", 403, &serde_json::json!({ "success": false, "errors": [{ "code": 10000, "message": said }], "messages": [], "result": null }).to_string(), None);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["cloudflare"] = serde_json::json!({ "access": "example-access_token-ended", "expires_at_ms": 4102444800000u64, "refresh": "example-refresh_token-ended" });
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let (mut child, link) = dashboard(&home);
+        b.goto(&link);
+        b.wait(&page_shows("Sign in with Cloudflare"));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+    // A token given in SUPERCI_CLOUDFLARE_TOKEN that Cloudflare refuses: said as that token, no sign-in offered.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/cloudflare/sign-in/ended.jsonl"), &[]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_CLOUDFLARE_TOKEN", "example-access_token-ended")]);
+    b.goto(&link);
+    b.wait(&page_shows("SUPERCI_CLOUDFLARE_TOKEN"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 
