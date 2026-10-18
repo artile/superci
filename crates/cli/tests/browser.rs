@@ -6975,3 +6975,29 @@ fn a_gitlab_jobs_cache_is_kept_as_its_projects_once_its_job_began_and_settings_l
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// AWS's runners connected to a control plane outside AWS, as the stack the dashboard opens reports back: a forged
+/// report, one for another role, account or region refused; the right one taken once. Runners then shows AWS.
+#[test]
+fn aws_runners_are_connected_once_by_the_stacks_report_and_runners_shows_them() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| { c.aws_connect_token = Some("connect-token-for-tests-0001".into()); c.aws_region = Some("us-east-1".into()); });
+    // AWS's answer to the control plane taking its role (as STS documents it).
+    served.aws.fail("AssumeRoleWithWebIdentity", 200, "<AssumeRoleWithWebIdentityResponse xmlns=\"https://sts.amazonaws.com/doc/2011-06-15/\"><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>ASIAEXAMPLE000000001</AccessKeyId><SecretAccessKey>secret-for-tests</SecretAccessKey><SessionToken>token-for-tests</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials><SubjectFromWebIdentityToken>plane:testplane0001</SubjectFromWebIdentityToken><AssumedRoleUser><Arn>arn:aws:sts::123456789012:assumed-role/superci-plane-testplane0001/superci</Arn><AssumedRoleId>AROAEXAMPLE:superci</AssumedRoleId></AssumedRoleUser></AssumeRoleWithWebIdentityResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ResponseMetadata></AssumeRoleWithWebIdentityResponse>", None);
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let report = |token: &str, account: &str, region: &str, role: &str| agent.post(&format!("{}/aws/callback", served.url)).header("content-type", "application/json")
+        .send(serde_json::json!({ "token": token, "accountId": account, "region": region, "roleArn": role }).to_string()).unwrap().status().as_u16();
+    let role = |account: &str| format!("arn:aws:iam::{account}:role/superci-plane-{PLANE}");
+    assert_eq!(report("forged-token", "123456789012", "us-east-1", &role("123456789012")), 403);
+    assert_eq!(report("connect-token-for-tests-0001", "123456789012", "us-east-1", "arn:aws:iam::123456789012:role/someone-elses"), 400);
+    assert_eq!(report("connect-token-for-tests-0001", "12345678901", "us-east-1", &role("12345678901")), 400);
+    assert_eq!(report("connect-token-for-tests-0001", "123456789012", "eu-west-1", &role("123456789012")), 400);
+    assert_eq!(report("connect-token-for-tests-0001", "123456789012", "us-east-1", &role("123456789012")), 200);
+    assert_eq!(report("connect-token-for-tests-0001", "123456789012", "us-east-1", &role("123456789012")), 409, "the token works once");
+    let home = common::home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&format!("{} && {}", shows("Runner providers"), shows("AWS")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
