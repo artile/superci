@@ -1553,3 +1553,27 @@ fn a_gpu_job_on_an_account_with_no_gpu_quota_fails_saying_which_quota_and_a_type
     assert!(served.store.under("aws:unoffered:us-east-1:").len() >= 6, "a type a zone lacks is not asked there again: {:?}", served.store.under("aws:"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_job_with_the_accounts_spot_and_on_demand_limits_used_up_waits_saying_which_limits_as_aws_answered() {
+    // Spot refused for the account's count of spot machines, on-demand for its 64 vCPUs (as AWS answered Test while
+    // both were in use): the job waits for room, saying the account's limits keep its machine from starting.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/at-limits.jsonl"), &[("mixplane0001", superci_testkit::PLANE)]);
+    // (Only AWS: Cloudflare off in the order, nowhere else to go.)
+    served.aws.put(&format!("/superci/{}/ROUTING", superci_testkit::PLANE), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2\n    steps:\n      - run: make test\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let job = loop {
+        if let Some((_, j)) = served.store.under("job:").into_iter().next().filter(|(_, j)| j["state"] != "launching") { break j }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let asks = job["asks"].as_array().cloned().unwrap_or_default();
+    assert!(asks.iter().any(|a| a["said"] == "MaxSpotInstanceCountExceeded" && a["spot"] == true) && asks.iter().any(|a| a["said"] == "VcpuLimitExceeded" && a["spot"] == false), "{job}");
+    assert!(job["state"] == "waiting" && job["error"].as_str().unwrap_or_default().contains("Your AWS account's limits do not let this machine start"), "{job}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

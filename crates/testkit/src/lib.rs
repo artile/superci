@@ -542,7 +542,16 @@ impl Aws {
         // Of the newest recording that has it.
         let newest = same.iter().filter_map(|r| r["recording"].as_u64()).max().unwrap_or(0);
         let same: Vec<&Value> = same.into_iter().filter(|r| r["recording"].as_u64().unwrap_or(0) == newest).collect();
-        let key = format!("{method} {url} {target} {}", action(target, asked));
+        // (Of those, the ones asked most alike, by the names of what was asked: a spot request's answer for a spot
+        // request, an on-demand one's for an on-demand one.)
+        let names = |a: &str| -> std::collections::BTreeSet<String> { a.split('&').filter_map(|kv| kv.split('=').next()).map(|k| k.chars().filter(|c| !c.is_ascii_digit()).collect()).collect() };
+        let want = names(asked);
+        let alike = |r: &&Value| names(r["asked"].as_str().unwrap_or_default()).intersection(&want).count() as i64 - names(r["asked"].as_str().unwrap_or_default()).symmetric_difference(&want).count() as i64;
+        let best = same.iter().map(alike).max().unwrap_or(0);
+        let same: Vec<&Value> = if asked.contains('&') { same.into_iter().filter(|r| alike(r) == best).collect() } else { same };
+        // (Counted apart for each kind of the same call: a renewal's answers in their order, a first sign-in's in theirs.)
+        let kind = same.first().map(|r| names(r["asked"].as_str().unwrap_or_default()).into_iter().collect::<Vec<_>>().join(",")).unwrap_or_default();
+        let key = format!("{method} {url} {target} {} {kind}", action(target, asked));
         let mut given = self.replayed.lock().unwrap();
         let n = given.entry(key).or_insert(0);
         let found = same.get(*n).or(same.last())?;

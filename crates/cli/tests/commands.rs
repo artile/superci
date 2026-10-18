@@ -1247,3 +1247,52 @@ fn a_command_whose_cloud_sign_in_is_over_or_refused_says_which_and_what_to_do() 
     let (ok, said) = run(&[], &[("SUPERCI_MODAL_TOKEN_ID", "ak-superciendedrecording00"), ("SUPERCI_MODAL_TOKEN_SECRET", "as-superciendedrecording00")], modal_ended, &["planes", "create", "modal"]);
     assert!(!ok && said.contains("Token not found"), "{said}");
 }
+
+#[test]
+fn a_region_is_added_with_its_network_and_its_network_deleted_as_aws_answered_a_real_account() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = common::signed_in(&served);
+    let plane = superci_testkit::PLANE;
+    // Stockholm beside N. Virginia: its network made in the account first, then the control plane told.
+    served.aws.replaying(include_str!("../fixtures/aws/regions/add.jsonl"), &[("mixplane0001", plane)]);
+    let o = superci(&home, &["runners", "update", "aws", "--regions=us-east-1,eu-north-1"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let regions = served.aws.settings(plane).into_iter().find(|(k, _)| k == "AWS_REGIONS").map(|(_, v)| v).unwrap_or_default();
+    assert_eq!(regions, r#"["us-east-1","eu-north-1"]"#);
+    let asked = |action: &str| served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().unwrap_or_default().contains("eu-north-1") && a["asked"].as_str().unwrap_or_default().contains(&format!("Action={action}")));
+    assert!(asked("CreateVpc") && asked("CreateSubnet") && asked("CreateVpcEndpoint"), "its network made there");
+    // Its network there deleted (with its cache bucket), as removing AWS deletes it.
+    served.aws.replaying(include_str!("../fixtures/aws/regions/delete.jsonl"), &[("mixplane0001", plane)]);
+    let o = superci(&home, &["debug", "networks", "eu-north-1"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("deleted in eu-north-1"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(asked("DeleteVpc"), "its network deleted");
+    let o = superci(&home, &["debug", "networks", "mars-1"]);
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("Say which region"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_control_plane_is_updated_with_its_cloudflare_and_modal_launchers_as_a_real_account_answered() {
+    let served = serve(|_| {});
+    let plane = superci_testkit::PLANE;
+    served.aws.put(&format!("/superci/{plane}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners-testplane0001.modal.run"}]"#);
+    served.aws.put(&format!("/superci/{plane}/CONTAINERS"), "off");
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update-with-launchers.jsonl"), &[("mixplane0001", plane), ("http://new-plane.test", &served.url)]);
+    // (The launchers' health, which the update waits for: a server here answers for each.)
+    { let mut w = served.aws.workers.lock().unwrap(); for host in [format!("superci-runners-{plane}.acme.workers.dev"), format!("acmeorg--superci-runners-{plane}.modal.run")] { w.insert(host, served.url.clone()); } }
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("Updated to") && !said.contains("was not updated"), "{said}");
+    // Its Cloudflare launcher went up with it, on the image of GitHub's runner its containers run.
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap_or_default(), a["url"].as_str().unwrap_or_default())).collect();
+    assert!(asked.iter().any(|a| a.starts_with("PUT https://api.cloudflare.com/") && a.contains(&format!("/workers/scripts/superci-runners-{plane}"))), "{asked:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}

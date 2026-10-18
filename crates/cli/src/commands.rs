@@ -833,6 +833,17 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let left = crate::aws_plane::abandon(&creds, w(2), w(3));
             Ok(Done::said(if left.is_empty() { "nothing left".to_string() } else { format!("left: {}", left.join("; ")) }))
         }
+        // (The machines' network of the control plane in use in one region, deleted as removing AWS deletes it, and
+        // nothing else: `superci debug networks REGION`.)
+        #[cfg(debug_assertions)]
+        ("debug", "networks") => {
+            let mut d = signed_in();
+            let plane_id = view(&mut d)?.plane.plane_id().to_string();
+            let (_, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
+            if !superci_core::page::REGIONS.contains(&w(2)) { return usage("Say which region: `superci debug networks REGION`.") }
+            crate::aws::delete_networks(&creds, &plane_id, &[w(2)])?;
+            Ok(Done::said(format!("deleted in {}", w(2))))
+        }
         // (And the AWS account's own budget, each step by itself: `superci debug budget found|set USD EMAIL [stop]|lift|remove`.)
         #[cfg(debug_assertions)]
         ("debug", "budget") => {
