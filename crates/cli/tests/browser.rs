@@ -810,3 +810,34 @@ fn what_settings_forms_must_not_take_is_refused_or_left_out_and_nothing_else_cha
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn another_control_plane_s_row_says_what_can_be_done_with_it_as_it_stands() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // (The other one's address: served, or nothing answering there.)
+    for (case, said) in [("older", "Update to "), ("in use older", "Update the one in use first"), ("update fails", "The update stopped"), ("key refused", "reads this computer's key under its old name")] {
+        let served = serve(|_| {});
+        // (The other one reads its settings where the account keeps them, as a real one does: the key handed to it too.)
+        let aws = served.aws.clone();
+        // (Or, "key refused", its own: the key handed to it never reaches it.)
+        let shared = case != "key refused";
+        let other = superci_testkit::serve_as("testplane0002", move |c| { let s = aws.settings("testplane0002"); if shared && !s.is_empty() { c.read_settings(&s) } });
+        let home = signed_in(&served);
+        let url = if case == "not answering" { "http://127.0.0.1:9".to_string() } else { other.url.clone() };
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &url)]);
+        for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+        match case { "older" | "update fails" | "key refused" => *other.aws.old_version.lock().unwrap() = Some("0.9.2".into()), "in use older" => *served.aws.old_version.lock().unwrap() = Some("0.9.2".into()), _ => {} }
+        let (mut child, link) = dashboard(&home);
+        b.goto(&link);
+        b.wait(&page_shows("Overview"));
+        b.click(".side a", "Control plane");
+        b.wait(&shows(&url));
+        if case == "update fails" || case == "key refused" {
+            // (AWS has no answer for the update here: it stops, and says why, in its row.)
+            b.eval(&format!("[...document.querySelectorAll('main .pick, main .row, main li, main div')].reverse().find(r => r.innerText.includes({:?}) && [...r.querySelectorAll('button')].some(x => x.innerText.startsWith('Update to'))).querySelector('button').click(); true", url));
+        }
+        b.wait(&shows(said));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

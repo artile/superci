@@ -3042,6 +3042,8 @@ impl Dashboard {
                 self.own().check(&plane)?;
                 // What it runs now: whether its jobs' containers come along, and whether any would be cut short.
                 let Some(status) = status_soon(plane.url(), &self.status_key) else {
+                    // (One that answers and does not take this computer's key: why, and what to do.)
+                    if let Some(why) = self.key_refused(&view::plane_view(&plane, Some(&self.status_key))) { return Ok(message(403, "The control plane does not take this computer's key", &esc(&why))) }
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
                 let running = status["jobs"].as_array().into_iter().flatten().filter(|j| j["cloud"] == "cloudflare" && ["launching", "launched", "running"].contains(&j["state"].as_str().unwrap_or_default())).count();
