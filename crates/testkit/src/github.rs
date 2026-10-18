@@ -230,6 +230,16 @@ impl GitHub {
         self.event("in_progress", id)
     }
 
+    /// Taken by a runner that is none of this control plane's (another CI's, GitHub's own): its webhook.
+    pub fn start_elsewhere(&self, id: u64, runner: &str) -> (Vec<u8>, String) {
+        {
+            let mut h = self.hub.lock().unwrap();
+            let j = h.jobs.get_mut(&id).unwrap();
+            for (k, v) in [("status", json!("in_progress")), ("runner_id", json!(999_999)), ("runner_name", json!(runner)), ("runner_group_id", json!(1)), ("runner_group_name", json!("Default"))] { j[k] = v }
+        }
+        self.event("in_progress", id)
+    }
+
     /// It ended (`success`, `failure`), with its whole log.
     pub fn finish(&self, id: u64, conclusion: &str, log: &str, now_ms: u64) -> (Vec<u8>, String) {
         {
