@@ -206,6 +206,18 @@ impl GitHub {
         self.event("in_progress", id)
     }
 
+    /// Taken by the runner of this name (any registered here), as GitHub hands a job to any runner with its label:
+    /// its webhook, which a test may leave undelivered.
+    pub fn start_on(&self, id: u64, runner: &str) -> (Vec<u8>, String) {
+        {
+            let mut h = self.hub.lock().unwrap();
+            let rid = h.runners.iter().find(|(_, n)| n.as_str() == runner).map(|(i, _)| *i).expect("that runner registered");
+            let j = h.jobs.get_mut(&id).unwrap();
+            for (k, v) in [("status", json!("in_progress")), ("runner_id", json!(rid)), ("runner_name", json!(runner)), ("runner_group_id", json!(1)), ("runner_group_name", json!("Default"))] { j[k] = v }
+        }
+        self.event("in_progress", id)
+    }
+
     /// It ended (`success`, `failure`), with its whole log.
     pub fn finish(&self, id: u64, conclusion: &str, log: &str, now_ms: u64) -> (Vec<u8>, String) {
         {

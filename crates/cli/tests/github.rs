@@ -159,6 +159,40 @@ fn a_job_github_no_longer_waits_for_is_noticed_by_the_upkeep_and_its_machine_end
 }
 
 #[test]
+fn a_job_its_machine_began_whose_event_was_lost_is_seen_running_by_the_upkeep() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    served.webhook(queued);
+    // Its runner took it; GitHub's word of that never came.
+    let _ = served.github.start(id);
+    served.later(91_000);
+    served.upkeep();
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(job["state"] == "running" && job["machine_id"].is_string(), "{job}");
+}
+
+#[test]
+fn a_machine_whose_runner_took_another_job_untold_is_kept_running_it() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let (a, q) = served.github.queue("first", "superci", served.now_ms());
+    served.webhook(q);
+    let (b, q) = served.github.queue("second", "superci", served.now_ms());
+    served.webhook(q);
+    let runner_of = |id: u64| served.store.under(&format!("job:{id}"))[0].1["runner"].as_str().unwrap().to_string();
+    // The first's runner took the second, and the first ran elsewhere; neither event came.
+    let _ = served.github.start_on(b, &runner_of(a));
+    served.github.ended_untold(a);
+    served.later(91_000);
+    served.upkeep();
+    let (first, second) = (served.store.under(&format!("job:{a}"))[0].1.clone(), served.store.under(&format!("job:{b}"))[0].1.clone());
+    // The first's machine runs a job (its runner is busy): kept. The second's began nothing and its job is taken: ended.
+    assert_eq!(first["state"], "running", "{first}");
+    assert!(["swept", "done"].contains(&second["state"].as_str().unwrap()), "{second}");
+}
+
+#[test]
 fn a_webhook_not_signed_by_the_app_is_refused() {
     let served = serve(|_| {});
     served.connect_github();
