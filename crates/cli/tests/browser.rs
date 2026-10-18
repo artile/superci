@@ -8716,6 +8716,13 @@ fn signing_out_with_cloudflare_and_modal_signed_in_says_what_became_of_each_sign
 fn each_address_a_machine_or_computer_calls_without_its_link_or_key_finds_nothing_and_the_pages_stay() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
+    // Settings edited by hand into what they may not hold: read keys whose hash is none or whose rights are unknown,
+    // an image address a shell would read as more than a word. Each taken as none.
+    let hash = "a".repeat(64);
+    for (k, v) in [("READ_KEY_4102444800_short", "abc".to_string()), ("READ_KEY_4102444800_notahash", "z".repeat(64)), ("READ_KEY_4102444800_rights", format!("{hash}:everything")),
+        ("READ_KEY_4102444800_good", format!("{hash}:runs")), ("CF_IMAGE", "https://images.example.com/a b".to_string())] {
+        served.aws.put(&format!("/superci/{PLANE}/{k}"), &v);
+    }
     let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
     let token = "not-a-machines-link-000000";
     for (method, path) in [("POST", "/runs/12/cancel"), ("GET", "/runs/12/artifacts"), ("GET", "/runs/12/log"), ("GET", "/runs/12"), ("GET", "/runs/12/artifact"),
