@@ -6008,6 +6008,16 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     // A page with nothing in it, or named as no page is: nothing kept.
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live=aaaa_3333_1.log&at=0"), ""), 200);
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live={}.log&at=0", "a".repeat(120)), "x"), 200);
+    // Its runner's log as it comes, a bell and bytes that are no text among it: text kept, the rest left out; an empty
+    // one is nothing.
+    let raw = |q: &str, body: Vec<u8>| agent.post(&format!("{}/{q}", served.url)).send(body).map(|r| r.status().as_u16()).unwrap_or(0);
+    assert_eq!(raw(&format!("hello?runner={runner}&t={hello}&log=runner"), [b"[2026-10-13 22:56:40Z INFO Runner] Starting now
+".as_slice(), &[0xff, 0xfe], b" end
+"].concat()), 200);
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&log=runner"), ""), 200);
+    // Pages named with each kind of letter a page's name has; one with another kind is no page.
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live=Ab-9_x.y_1.log&at=0"), "2026-10-15T10:00:04.0000000Z early\n"), 200);
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live=a%2Fb_1.log&at=0"), "x"), 200);
     // Its runner's own log, while it waits for GitHub.
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&log=runner"), "[2026-10-13 22:56:41Z WARN GitHubActionsService] Attempt 1 of POST request failed (Socket Error: TryAgain).\n"), 200);
     // The job taken; a step's lines as they are written, before GitHub has any.
@@ -6032,6 +6042,9 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     b.goto(&format!("{link}&p=job&id={id}"));
     b.wait(&shows("Status"));
     b.wait(&format!("{} && {}", shows("AWS took back its spot machine"), shows("Failed")));
+    // Its notice again once its job has ended: its runner leads to no job any more.
+    assert_eq!(say(&format!("interrupted?runner={runner}&t={notice}"), ""), 404);
+    assert_eq!(served.store.under("spot:interrupted:").len(), 1);
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -6743,6 +6756,10 @@ fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_sa
     assert_eq!(say(&format!("interrupted?gl={back}&t={notice}")), 200);
     served.gitlab_webhook(served.gitlab.finish(back, "failed", "ERROR: Job failed: the runner was stopped", served.now_ms()));
     assert!(served.gitlab.asked.lock().unwrap().iter().any(|a| a.contains(&format!("/jobs/{back}/retry"))), "GitLab asked to run it again");
+    // Its machine's notice again, its job over: found by its id, nothing more noted.
+    let noted = served.store.under("spot:interrupted:").len();
+    assert_eq!(say(&format!("interrupted?gl={back}&t={notice}")), 200);
+    assert_eq!(served.store.under("spot:interrupted:").len(), noted);
     // Taken by another job's runner: its own machine's job then runs as the other job.
     let (x, p) = served.gitlab.pending("lint", &["superci"], served.now_ms()); served.gitlab_webhook(p);
     let (y, p) = served.gitlab.pending("build", &["superci"], served.now_ms()); served.gitlab_webhook(p);
