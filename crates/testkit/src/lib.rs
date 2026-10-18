@@ -482,6 +482,9 @@ impl Aws {
     /// `action` answered with this error from now on: `times` times, or every time.
     pub fn fail(&self, action: &str, status: u16, answer: &str, times: Option<u32>) { self.failing.lock().unwrap().push((action.to_string(), status, answer.to_string(), times)) }
 
+    /// No call answered with an error any more (each answered as before `fail`).
+    pub fn fail_none(&self) { self.failing.lock().unwrap().clear() }
+
     /// A parameter written as the dashboard writes one.
     pub fn put(&self, name: &str, value: &str) {
         let mut p = self.params.lock().unwrap();

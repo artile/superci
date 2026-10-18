@@ -2398,3 +2398,79 @@ fn a_page_whose_dashboard_stopped_keeps_what_it_showed_marked_stale_and_says_whe
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Jobs GitHub sends to a control plane whose AWS refuses their machines, for each kind of job and each pair of
+/// answers (its spot machine's, its on-demand one's), as AWS documents its errors: each job's page says what became
+/// of it, and the Jobs page lists them all.
+#[test]
+fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_refusals() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    // AWS only (its containers off in the order): a refusal is not passed on to Cloudflare.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    // What AWS answers that is not refused: as it answered Test (its images, network, a machine started).
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let refusal = |code: &str| match code {
+        "500" => (500, superci_testkit::ec2_error("InternalError", "An internal error has occurred")),
+        "UnauthorizedOperation" => (403, superci_testkit::ec2_error(code, "You are not authorized to perform this operation.")),
+        c => (400, superci_testkit::ec2_error(c, "no")),
+    };
+    // (A machine started last: what AWS refused is tried while none of this kind's are running.)
+    let answers = ["InsufficientInstanceCapacity", "VcpuLimitExceeded", "MaxSpotInstanceCountExceeded", "Unsupported", "UnauthorizedOperation", "500", ""];
+    let home = signed_in(&served);
+    // (Each page read anew: the jobs come between them.)
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let (mut said, mut later): (std::collections::BTreeMap<String, usize>, std::collections::BTreeMap<String, usize>) = Default::default();
+    for label in ["superci", "superci/spot=false", "superci/gpu=any", "superci/gpu=any/spot=false", "superci/cpu=2/arch=arm64"] {
+        let mut jobs = vec![];
+        for spot in answers {
+            for od in answers {
+                if label.contains("spot=false") && !spot.is_empty() { continue }
+                served.aws.fail_none();
+                // (Each case as if first: the pools AWS had no machine in a moment ago are not remembered.)
+                served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:") && !k.starts_with("aws:unoffered:") && !k.starts_with("aws:no-fleet") && !k.starts_with("spot:"));
+                if !spot.is_empty() { let (s, a) = refusal(spot); served.aws.fail("RunInstances|MarketType", s, &a, None); served.aws.fail("CreateFleet", s, &a, None) }
+                if !od.is_empty() { let (s, a) = refusal(od); served.aws.fail("RunInstances", s, &a, None) }
+                let (id, q) = served.github.queue(&format!("{label} {spot} {od}"), label, served.now_ms());
+                assert!(served.webhook(q) < 300);
+                jobs.push((id, spot, od));
+            }
+        }
+        served.aws.fail_none();
+        // Each job's state, as its page says it, and why when there is a why: at once, and once the sweeps have
+        // asked again (a sweep a minute, AWS answering as it answered Test).
+        let mut look = |said: &mut std::collections::BTreeMap<String, usize>| for (id, spot, od) in &jobs {
+            let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+            b.goto(&format!("{link}&p=job&id={id}"));
+            b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+            let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+            let state = job["state"].as_str().unwrap_or_default();
+            let why = job["error"].as_str().unwrap_or_default().trim_start_matches("waiting: ").split(" (").next().unwrap_or_default().chars().take(40).collect::<String>();
+            assert!(why.is_empty() || page.to_lowercase().contains(&why.to_lowercase()), "{label} spot {spot} on-demand {od}: {state} {why:?} not on its page:\n{page}");
+            *said.entry(format!("{state}: {}", job["error"].as_str().unwrap_or_default().chars().take(140).collect::<String>())).or_default() += 1;
+        };
+        look(&mut said);
+        for _ in 0..3 { served.later(61_000); served.upkeep(); }
+        look(&mut later);
+        // This kind's machines ended (their jobs done), and its waiting jobs given up, before the next kind.
+        for (id, _, _) in &jobs {
+            let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+            if job["machine_id"].is_string() { served.webhook(served.github.start(*id)); served.webhook(served.github.finish(*id, "success", "ok", served.now_ms())); }
+            else { served.webhook(served.github.cancel(*id, served.now_ms())); }
+        }
+    }
+    // Every kind of end the table has, among them.
+    // Every kind of end, among them: at once, and once asked again.
+    for kind in ["launched", "AWS lets this account run no GPU machines yet", "asking AWS's other spot pools", "Your AWS account's limits do not let this machine start", "no provider could start its machine",
+        "AWS had no room for it", "InternalError", "UnauthorizedOperation"] {
+        assert!(said.keys().any(|k| k.contains(kind)), "no job ended as {kind:?}: {said:#?}");
+    }
+    for kind in ["launched", "failed: "] { assert!(later.keys().any(|k| k.contains(kind)), "none {kind:?} later: {later:#?}") }
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
