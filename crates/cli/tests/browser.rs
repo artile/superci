@@ -6133,7 +6133,19 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     assert_eq!(say(&format!("hello?runner={runner}&t=not-its-link-at-all-xx&ready={now}"), ""), 404);
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&read={}&gh=999", now - 86_400_000), ""), 200);
     // By a GitLab job's id that is none, or no id at all: nothing.
-    for q in ["hello?gl=&t=x", "hello?gl=NOT-AN-ID&t=x", "hello?t=x", "interrupted?gl=NOT-AN-ID&t=x", "interrupted?t=x"] { assert_eq!(say(q, ""), 404, "{q}") }
+    for q in ["hello?gl=&t=x", "hello?gl=NOT-AN-ID&t=x", "hello?t=x", "interrupted?gl=NOT-AN-ID&t=x", "interrupted?t=x",
+        // (An id as GitLab's are written that is no job here; one with a letter no id has.)
+        "hello?gl=ab-12x&t=x", "hello?gl=ab!&t=x", "hello?gl=a-&t=x", "interrupted?gl=ab-12x&t=x", "interrupted?gl=ab!&t=x", "interrupted?gl=9-&t=x", "interrupted?gl=&t=x"] { assert_eq!(say(q, ""), 404, "{q}") }
+    // A link too short to be one of SuperCI's (a record from before, edited): taken as none.
+    let key = format!("job:{id}");
+    let edit = |f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap(); f(&mut j); m.insert(key.clone(), j.to_string()); };
+    edit(&|j| { j["hello"] = "short".into(); j["notice"] = "short".into(); });
+    assert_eq!(say(&format!("hello?runner={runner}&t=short"), ""), 404);
+    assert_eq!(say(&format!("interrupted?runner={runner}&t=short"), ""), 404);
+    edit(&|j| { j["hello"] = hello.clone().into(); j["notice"] = notice.clone().into(); });
+    // A page larger than any a machine sends, and one named as no page is: nothing kept.
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live=aaaa_4444_1.log&at=0"), &"x".repeat(4_000_001)), 200);
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live=aaaa_4444_1.txt&at=0"), "x"), 200);
     // The start of its runner's own log, with the job message in it: its steps' shape; one without: nothing made of it.
     let message = include_str!("../../core/tests/fixtures/runner/parallel.github.json");
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&worker=1"), &format!("[2026-10-15 10:00:02Z INFO Worker] Job message:\n {message}\n[2026-10-15 10:00:02Z INFO Worker] Starting the job {{\n")), 200);
@@ -6167,7 +6179,11 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     assert!(view.contains("ok 1 - adds") && view.contains("Run npm test"), "{view}");
     // AWS takes it back: said by its machine (with its own link), the job then failed by GitHub.
     assert_eq!(say(&format!("interrupted?runner={runner}&t=not-its-link-at-all-xx"), ""), 404);
+    // (Its zone not kept, as on a record from before: no pool is put last for it.)
+    edit(&|j| { j.as_object_mut().unwrap().remove("zone"); });
+    let pools = served.store.under("aws:pool:").len();
     assert_eq!(say(&format!("interrupted?runner={runner}&t={notice}"), ""), 200);
+    assert_eq!(served.store.under("aws:pool:").len(), pools);
     // Said again (its watch may say it twice): one record.
     assert_eq!(say(&format!("interrupted?runner={runner}&t={notice}"), ""), 200);
     assert_eq!(served.store.under("spot:interrupted:").len(), 1);
