@@ -2520,6 +2520,59 @@ mod runs_in_browser {
     use std::process::{Command, Stdio};
     use superci_testkit::Runner;
 
+    fn checkout_with(files: &[(&str, &str)]) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("superci-e2e-files-{}-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst), superci_core_free_id()));
+        for (p, text) in files { let f = dir.join(p); std::fs::create_dir_all(f.parent().unwrap()).unwrap(); std::fs::write(f, text).unwrap(); }
+        for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+        dir
+    }
+
+    /// A run with a called workflow, a matrix made by an expression, a job that may fail, one past its timeout and
+    /// one that runs always, played to its end: its page and its jobs' pages say how each went.
+    #[test]
+    fn a_run_with_calls_a_matrix_a_job_that_may_fail_and_a_timeout_is_followed_on_its_pages() {
+        let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+        let served = serve(|_| {});
+        let home = signed_in(&served);
+        let dir = checkout_with(&[
+            (".github/workflows/ci.yml", "jobs:\n  setup:\n    runs-on: superci\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo shards\n  build:\n    uses: ./.github/workflows/build.yml\n    with:\n      target: web\n  test:\n    needs: setup\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.setup.outputs.shards) }}\n    steps:\n      - run: echo shard ${{ matrix.shard }}\n  flaky:\n    runs-on: superci\n    continue-on-error: true\n    steps:\n      - run: exit 1\n  slow:\n    needs: flaky\n    runs-on: superci\n    timeout-minutes: 1\n    steps:\n      - run: sleep 600\n  report:\n    needs: [test, slow]\n    if: always()\n    runs-on: superci\n    steps:\n      - run: echo report\n"),
+            (".github/workflows/build.yml", "on:\n  workflow_call:\n    inputs:\n      target:\n        type: string\n        required: true\njobs:\n  compile:\n    runs-on: superci\n    steps:\n      - run: echo ${{ inputs.target }}\n"),
+        ]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let done = |name: &str, result: &str| { let r = runner_of(&served, &run, name); r.take(); r.finish(result); };
+        let setup = runner_of(&served, &run, "setup");
+        setup.take();
+        setup.finish_with("succeeded", &[("shards", "[1,2]")]);
+        done("build / compile", "succeeded");
+        done("test (1)", "succeeded");
+        done("test (2)", "failed");
+        done("flaky", "failed");
+        // The slow one runs past its minute: ended by the upkeep.
+        let slow = runner_of(&served, &run, "slow");
+        slow.take();
+        served.later(91_000);
+        served.upkeep();
+        done("report", "succeeded");
+        let (mut child, link) = dashboard(&home);
+        // The run's page: each job, and how it went.
+        b.goto(&format!("{link}&p=runs"));
+        b.wait(&shows(".github/workflows/ci.yml"));
+        b.click("main a", ".github/workflows/ci.yml");
+        b.wait(&format!("{} && {} && {}", shows("build / compile"), shows("test (2)"), shows("report")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().to_string();
+        for job in ["setup", "build / compile", "test (1)", "test (2)", "flaky", "slow", "report"] { assert!(page.contains(job), "{job} not on the run's page:\n{page}") }
+        assert!(page.contains("Failed"), "{page}");
+        // The one past its timeout: its page says so.
+        b.click("main a", "slow");
+        b.wait(&shows("timeout-minutes (1)"));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     fn checkout() -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!("superci-e2e-{}-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst), superci_core_free_id()));
