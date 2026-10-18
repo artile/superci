@@ -7138,6 +7138,27 @@ fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_sa
     // Cancelled while its machine starts.
     let (z, p) = served.gitlab.pending("deploy", &["superci"], served.now_ms()); served.gitlab_webhook(p);
     served.gitlab_webhook(served.gitlab.finish(z, "canceled", "", served.now_ms()));
+    // The job GitLab made of the one taken back, run again: off spot machines.
+    let (retried, p) = served.gitlab.pending("e2e", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(p) < 300);
+    assert!(state(retried)["no_spot"] == true, "{}", state(retried));
+    // Cancelled before this control plane knew of it: its pending event, behind, starts nothing.
+    let (unknown, p) = served.gitlab.pending("unknown", &["superci"], served.now_ms());
+    served.gitlab_webhook(served.gitlab.finish(unknown, "canceled", "", served.now_ms()));
+    assert!(served.store.0.lock().unwrap().contains_key(&format!("gone:gl{unknown}")));
+    let _ = served.gitlab_webhook(p);
+    // Cancelled while it waited for room, while its machine was asked for, once its machine came up (left idle for
+    // the sweep), and once over already.
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:gl{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let mut cancelled = vec![];
+    for (name, how, after) in [("waits", "waiting", "cancelled"), ("asked for", "launching", "cancelled"), ("came up", "", "orphan"), ("over", "over", "launched")] {
+        let (id, p) = served.gitlab.pending(name, &["superci"], served.now_ms());
+        assert!(served.gitlab_webhook(p) < 300);
+        match how { "" => {} "over" => edit(id, &|j| { j["over"] = true.into(); }), s => edit(id, &|j| { j["state"] = s.into(); }) }
+        served.gitlab_webhook(served.gitlab.finish(id, "canceled", "", served.now_ms()));
+        assert_eq!(state(id)["state"], after, "{name}: {}", state(id));
+        cancelled.push(id);
+    }
     served.aws.fail_none();
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
