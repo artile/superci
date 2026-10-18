@@ -1352,3 +1352,44 @@ fn a_first_control_plane_is_set_up_in_aws_from_the_browser_started_over_once_and
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn with_several_workspaces_each_page_and_change_says_which_and_one_is_renamed_and_forgotten() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    let get = |b: &mut Browser, path: &str| -> (u16, String) {
+        let got = b.eval(&format!("fetch({path:?}, {{credentials: 'same-origin', redirect: 'manual'}}).then(async r => [r.status, r.type === 'opaqueredirect' ? 'redirected' : (await r.text()).replace(/<(style|script)[^>]*>[\\s\\S]*?<\\/\\1>/g, ' ').replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ')])"));
+        (got[0].as_u64().unwrap_or(0) as u16, got[1].as_str().unwrap_or_default().to_string())
+    };
+    // A second one, made from the page.
+    let (got, _) = post(&mut b, "/workspaces", &[("name", "Globex")]);
+    assert!(got < 400);
+    assert!(home.join("workspaces/globex").exists());
+    // A page that names no workspace goes to one; one naming a workspace not kept here says so; the list of them.
+    assert_eq!(get(&mut b, "/?p=overview").1, "redirected");
+    let (status, text) = get(&mut b, "/?w=nowhere&p=overview&fragment=1");
+    assert!(status == 200 && text.contains("That workspace is not kept on this computer"), "{text}");
+    assert_eq!(get(&mut b, "/?w=nowhere&p=overview").1, "redirected");
+    let (status, text) = get(&mut b, "/workspaces");
+    assert!(status == 200 && text.contains("Globex"), "{text}");
+    // A change that names none: refused, nothing changed.
+    let (got, text) = post(&mut b, "/labels", &[("label", "acmeci")]);
+    assert!(got == 409 && text.contains("Which workspace?"), "{got} {text}");
+    let (got, text) = post(&mut b, "/workspaces/remove", &[]);
+    assert!(got == 409 && text.contains("Which workspace?"), "{got} {text}");
+    // Renamed: to its own id (nothing to do), to one another has (refused), to a new one; then forgotten.
+    let (got, _) = post(&mut b, "/workspaces/rename", &[("w", "globex"), ("id", "globex")]);
+    assert!(got < 400);
+    let (got, text) = post(&mut b, "/workspaces/rename", &[("w", "globex"), ("id", "default")]);
+    assert!(got == 400 && text.contains("There is a workspace with the id default already"), "{got} {text}");
+    let (got, _) = post(&mut b, "/workspaces/rename", &[("w", "globex"), ("id", "initech")]);
+    assert!(got < 400 && home.join("workspaces/initech").exists() && !home.join("workspaces/globex").exists());
+    let (got, _) = post(&mut b, "/workspaces/remove", &[("w", "initech")]);
+    assert!(got < 400 && !home.join("workspaces/initech").exists() && home.join("workspaces/default").exists());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
