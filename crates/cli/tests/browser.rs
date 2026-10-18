@@ -1045,6 +1045,14 @@ fn a_day_of_github_and_gitlab_jobs_is_summed_up_on_overview_for_a_day_a_week_and
     b.wait(&shows("lint"));
     b.click("main a", "lint");
     b.wait("document.querySelector('details.lstep')");
+    // A job's log asked for by an address that is no job's: refused. Each job's log opened (more than the few kept
+    // for their next opens), and a GitHub job's raw log.
+    let ask = |b: &mut Browser, path: &str| -> u64 { b.eval(&format!("fetch({path:?}, {{credentials: 'same-origin', redirect: 'manual'}}).then(r => r.status)")).as_u64().unwrap_or(0) };
+    assert_eq!(ask(&mut b, "/job/view?id=abc"), 400);
+    let ids: Vec<String> = served.store.under("job:").into_iter().filter_map(|(_, j)| j["job_id"].as_u64().map(|n| n.to_string())).collect();
+    assert!(ids.len() >= 5, "{ids:?}");
+    for id in &ids { assert!(ask(&mut b, &format!("/job/view?id={id}")) < 400) }
+    assert!(ask(&mut b, &format!("/job/raw?id={}", ids[0])) < 400);
     // Limits below what the day spent: at its limit, for the month and the day.
     let (got, text) = post(&mut b, "/routing", &[("action", "monthly_usd"), ("usd", "0.5"), ("daily", "0.25")]);
     assert!(got < 400, "{got} {text}");
