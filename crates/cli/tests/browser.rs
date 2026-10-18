@@ -1763,3 +1763,27 @@ fn signing_out_from_settings_ends_each_sign_in_and_hands_back_this_computers_key
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A control plane whose own account runs jobs, with a budget in AWS for its limit; AWS answering nothing more.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"account_usd":{"aws":100.0},"aws_budget":{"stop":false},"default":"aws","rules":[{"repo":"acme/*","cloud":"aws"}],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&shows("Runner providers"));
+    let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "aws")]);
+    assert!(got < 400, "{got} {text}");
+    // Forgotten: out of the order (on-demand with it), its rule and default gone, its budget too.
+    until("forgotten", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_RUNNERS" && v == "off"));
+    let routing: serde_json::Value = serde_json::from_str(&served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").unwrap().1).unwrap();
+    assert!(routing["order"].as_array().unwrap().iter().all(|p| p["cloud"] != "aws" && p["cloud"] != "aws-on-demand") && routing["rules"].as_array().unwrap().is_empty() && routing["aws_budget"].is_null(), "{routing}");
+    // Said on the page, with what could not be deleted there (AWS answering nothing): its role, its budget.
+    b.wait(&format!("{} && {}", page_shows("Removed AWS. Left:"), page_shows("its budget in AWS")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
