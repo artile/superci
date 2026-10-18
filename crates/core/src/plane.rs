@@ -3135,7 +3135,8 @@ impl<'a> ControlPlane<'a> {
                             if answers.is_empty() && !out_of_time && failures.iter().all(|(_, e)| refuses_alike(e)) { intrinsic = true; job.cloud = String::new() }
                             let mut said = vec![];
                             if !answers.is_empty() { said.push(format!("AWS had no room ({})", answers.join("; "))) }
-                            said.extend(failures.iter().map(|(place, e)| format!("{}: {e}", cloud_name(place))));
+                            // (A refusal that names its cloud already is said as it is: "AWS lets this account…", not "AWS: AWS lets…".)
+                            said.extend(failures.iter().map(|(place, e)| if e.starts_with(&format!("{} ", cloud_name(place))) { e.clone() } else { format!("{}: {e}", cloud_name(place)) }));
                             if out_of_time { said.push("out of time for more tries".into()) }
                             format!("{SEVERAL}{}", said.join("; "))
                         }

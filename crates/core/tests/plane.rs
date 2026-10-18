@@ -2096,7 +2096,7 @@ fn a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fa
     let j = job(&store, 7);
     let e = j["error"].as_str().unwrap().to_string();
     assert_eq!((j["state"].as_str(), j["retries"].as_u64().unwrap_or(0)), (Some("failed"), 0), "{j}");
-    assert!(e.starts_with("no provider could start its machine: Modal: modal launcher: 400 GPUs need a payment method; AWS: AWS lets this account run no GPU machines yet"), "{e}");
+    assert!(e.starts_with("no provider could start its machine: Modal: modal launcher: 400 GPUs need a payment method; AWS lets this account run no GPU machines yet"), "{e}");
 }
 
 #[test]
@@ -4800,4 +4800,45 @@ fn a_job_whose_machine_aws_refuses_is_told_why_by_what_aws_said() {
         let e = j["error"].as_str().unwrap_or_default();
         assert!(e.contains(said), "{label} ({spot}, {on_demand}): {e}");
     }
+}
+
+/// How a job ends up when AWS refuses its machines, for every kind of job and every pair of answers (its spot
+/// machine's, its on-demand one's), as AWS documents its errors: kept in `fixtures/launch-refusals.txt`, so a change in
+/// any of them shows as a change there. (`SUPERCI_WRITE_FIXTURES=1` writes it anew.)
+#[test]
+fn every_pair_of_aws_refusals_ends_each_kind_of_job_as_the_table_says() {
+    let answers = ["", "InsufficientInstanceCapacity", "VcpuLimitExceeded", "MaxSpotInstanceCountExceeded", "Unsupported", "InvalidParameterValue", "UnauthorizedOperation", "500"];
+    // (Each kind of job in a thread of its own: 144 control planes in all.)
+    let kinds = ["superci", "superci/spot=false", "superci/gpu=any", "superci/gpu=any/spot=false"];
+    let got: String = std::thread::scope(|s| kinds.map(|label| s.spawn(move || {
+        let mut got = String::new();
+        for spot in answers {
+            for od in answers {
+                if label.contains("spot=false") && !spot.is_empty() { continue }
+                let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+                    if !body.contains("Action=RunInstances") { return None }
+                    match if body.contains("MarketType=spot") { spot } else { od } {
+                        "" => None,
+                        "500" => Some(Response::new(500, "text/xml", "<Response><Errors><Error><Code>InternalError</Code><Message>An internal error has occurred</Message></Error></Errors></Response>")),
+                        code => Some(aws_refuses(code)),
+                    }
+                });
+                let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+                let mut config = Config::new(PLANE_ID.into());
+                config.app = Some(app());
+                (config.aws_own, config.aws_own_creds) = own_aws();
+                let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+                block_on(plane.handle(labelled("queued", 9, "acme/app", None, label)));
+                let j = job(&store, 9);
+                got.push_str(&format!("{label} | spot {} | on-demand {} => {}{}\n", if spot.is_empty() { "started" } else { spot }, if od.is_empty() { "started" } else { od }, j["state"].as_str().unwrap_or_default(),
+                    j["error"].as_str().map(|e| format!(": {e}")).unwrap_or_default()));
+            }
+        }
+        got
+    })).into_iter().map(|h| h.join().unwrap()).collect());
+    let at = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/launch-refusals.txt");
+    if std::env::var_os("SUPERCI_WRITE_FIXTURES").is_some() { std::fs::write(at, &got).unwrap() }
+    let want = std::fs::read_to_string(at).unwrap_or_default();
+    for (w, g) in want.lines().zip(got.lines()) { assert_eq!(w, g) }
+    assert_eq!(want.lines().count(), got.lines().count());
 }

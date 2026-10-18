@@ -296,7 +296,19 @@ pub struct Aws {
     /// A control plane not updated yet: while set, it says this version and answers as one from before 0.19.13 did
     /// (its launchers as `agents`). Its function's code uploaded again (an update) ends it.
     pub old_version: Arc<Mutex<Option<String>>>,
+    /// Calls answered with an error, by action (`RunInstances`, `AmazonSSM.PutParameter`, …): its status and answer,
+    /// and how many more times (none: every time). Written as AWS documents its errors, for what a test cannot have a
+    /// real account answer (throttling, a fault of AWS's).
+    pub failing: Arc<Mutex<Vec<(String, u16, String, Option<u32>)>>>,
 }
+
+/// EC2's error answer (and IAM's, STS's: the query APIs'), as AWS documents it.
+pub fn ec2_error(code: &str, message: &str) -> String {
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Response><Errors><Error><Code>{code}</Code><Message>{message}</Message></Error></Errors><RequestID>00000000-0000-4000-8000-00000000e001</RequestID></Response>")
+}
+
+/// A JSON API's error answer (SSM, DynamoDB, Lambda, …), as AWS documents it.
+pub fn json_error(kind: &str, message: &str) -> String { json!({ "__type": kind, "message": message }).to_string() }
 
 /// What a request asks AWS to do: its target (JSON APIs) or its Action (query APIs).
 fn action(target: &str, asked: &str) -> String {
@@ -467,6 +479,9 @@ impl Aws {
     /// A Worker's secrets, as a control plane there reads them (its settings).
     pub fn worker_settings(&self, script: &str) -> Vec<(String, String)> { self.worker_secrets.lock().unwrap().get(script).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default() }
 
+    /// `action` answered with this error from now on: `times` times, or every time.
+    pub fn fail(&self, action: &str, status: u16, answer: &str, times: Option<u32>) { self.failing.lock().unwrap().push((action.to_string(), status, answer.to_string(), times)) }
+
     /// A parameter written as the dashboard writes one.
     pub fn put(&self, name: &str, value: &str) {
         let mut p = self.params.lock().unwrap();
@@ -486,6 +501,20 @@ impl Aws {
     /// The same, with the answer's headers.
     pub fn handle_full(&self, method: &str, url: &str, target: &str, asked: &str) -> (u16, Vec<(String, String)>, String) {
         // (AWS's own public parameters, `/aws/service/…`, are not the account's: as a recording has them.)
+        let failed = {
+            let mut f = self.failing.lock().unwrap();
+            let doing = action(target, asked);
+            let i = f.iter().position(|(a, ..)| *a == doing || url.contains(a.as_str()));
+            i.map(|i| {
+                let got = (f[i].1, vec![], f[i].2.clone());
+                match &mut f[i].3 { Some(1) => { f.remove(i); } Some(n) => *n -= 1, None => {} }
+                got
+            })
+        };
+        if let Some((status, headers, answer)) = failed {
+            self.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": target, "asked": asked, "status": status, "answer": answer }));
+            return (status, headers, answer)
+        }
         let public = target == "AmazonSSM.GetParameter" && asked.contains("\"/aws/service/");
         let recorded = if public { self.replay(method, url, target, asked) } else { None };
         let (status, headers, answer) = match recorded {
