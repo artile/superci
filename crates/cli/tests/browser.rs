@@ -7291,6 +7291,48 @@ fn a_job_nothing_can_run_is_failed_by_a_small_runner_wherever_one_starts_and_its
     }
 }
 
+/// Jobs GitHub never told this control plane of (their events lost): found at a sweep by asking GitHub for the waiting
+/// jobs of the repositories that had jobs here, today's and a quieter one's, and given machines as if told. Each one's
+/// page then says how it stands.
+#[test]
+fn jobs_github_never_told_of_are_found_by_asking_and_started_and_their_pages_say_so() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let known = |id: u64| served.store.0.lock().unwrap().contains_key(&format!("job:{id}"));
+    // A job told of, in the repository; then one whose event never comes.
+    let (told, q) = served.github.queue("told", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let (lost, _) = served.github.queue("lost", "superci", served.now_ms());
+    served.upkeep();
+    assert!(!known(lost), "made a moment ago: its event may still come");
+    // Minutes on, the next look: found, and started as if told.
+    served.later(5 * 60_000);
+    served.upkeep();
+    assert!(known(lost), "found by asking");
+    // The repository quiet since (its last job two days ago): still asked, among the quieter ones.
+    let ago = served.now_ms() - 2 * 86_400_000;
+    for id in [told, lost] {
+        let mut m = served.store.0.lock().unwrap();
+        let k = format!("job:{id}");
+        let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
+        j["at_ms"] = ago.into();
+        m.insert(k, j.to_string());
+    }
+    let (quiet, _) = served.github.queue("after a quiet weekend", "superci", served.now_ms());
+    served.later(5 * 60_000);
+    served.upkeep();
+    assert!(known(quiet), "found in a quieter repository too");
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for id in [lost, quiet] {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// GitLab's jobs on AWS: one whose spot machine AWS takes back, retried at GitLab and run again off spot machines; an
 /// event delivered twice; one taken by another job's runner; one cancelled while its machine starts. Each job's page
 /// says how it went.
