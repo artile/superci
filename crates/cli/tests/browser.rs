@@ -7196,6 +7196,16 @@ fn cloudflare_containers_are_set_and_cloudflare_and_modal_control_planes_updated
     step("05-update-cf");
     assert!(post(&mut b, "/plane/update?c=cfplane00003", &[("plane", "cfplane00003")]).0 < 400);
     until_page(&mut b, &link, "c=cfplane00003&p=planes", "Updated to");
+    // Its secrets, kept as its Worker's: 4.8 KB each at most, 12 at most (it is handed them with each run).
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    // (Under a secret's 4 KB, but past Cloudflare's 5 KB once written: each quote is two characters there.)
+    let (got, text) = post(&mut b, "/secrets/add?c=cfplane00003", &[("name", "TOO_BIG"), ("value", &"\"".repeat(3000))]);
+    assert!(got == 409 && text.contains("about 4.8 KB at most"), "{got} {text}");
+    for n in 0..12 { let (got, text) = post(&mut b, "/secrets/add?c=cfplane00003", &[("name", &format!("SECRET_{n}")), ("value", "v")]); assert!(got < 400, "{n}: {got} {text}") }
+    let (got, text) = post(&mut b, "/secrets/add?c=cfplane00003", &[("name", "ONE_MORE"), ("value", "v")]);
+    assert!(got == 409 && text.contains("12 secrets at most"), "{got} {text}");
+    let (got, text) = post(&mut b, "/secrets/remove?c=cfplane00003", &[("name", "SECRET_0")]);
+    assert!(got < 400, "{got} {text}");
     drop(child);
     step("06-update-md");
     let (child, link) = open(&mut b, "");

@@ -413,7 +413,10 @@ impl Aws {
                         _ => {}
                     }
                 }
-                let (status, said, answer) = a.failed(&url, "", &asked).or_else(|| a.replay(&method, &url, "", &asked)).unwrap_or_else(|| {
+                // (A Worker's secret written or taken out, with no recording of it: answered as Cloudflare answers.)
+                let secret_op = path.contains("/workers/scripts/") && path.contains("/secrets") && ["PUT", "DELETE"].contains(&method.as_str());
+                let (status, said, answer) = a.failed(&url, "", &asked).or_else(|| a.replay(&method, &url, "", &asked))
+                    .or_else(|| secret_op.then(|| (200, vec![], json!({ "success": true, "errors": [], "messages": [], "result": null }).to_string()))).unwrap_or_else(|| {
                     a.unanswered.lock().unwrap().push(format!("{method} {url}"));
                     (404, vec![], json!({ "success": false, "errors": [{ "code": 0, "message": format!("the test kit's Cloudflare has no answer for {method} {url}") }] }).to_string())
                 });
