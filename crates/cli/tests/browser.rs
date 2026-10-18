@@ -1913,3 +1913,36 @@ fn a_second_control_plane_given_a_code_host_of_its_own_makes_two_cis_listed_and_
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_cloud_that_does_not_answer_while_control_planes_are_looked_for_and_an_aws_sign_in_aws_will_not_renew_are_said() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Cloudflare signed in, answering nothing: the page says it could not reach it, and offers to try again.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&format!("{} && {}", shows("Could not reach your cloud"), shows("Try again")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // AWS's credentials due, and AWS not renewing them (its answer a refusal): the sign-in is said to have ended.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["aws"]["creds"]["expires_at_ms"] = 0.into();
+    kept["aws"]["refresh_token"] = "superci-ended-refresh-token-for-a-recording".into();
+    kept["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    // (AWS's answer to a refresh token it does not take, as it answered.)
+    served.aws.replaying(include_str!("../fixtures/aws/sign-in/ended.jsonl"), &[]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&page_shows("AWS sign-in has ended"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
