@@ -5936,3 +5936,59 @@ mod dashboard_suite_in_browser {
         super::seen_in_browser(&served);
     }
 }
+
+/// A machine's own word, as a spot machine on AWS sends it: how its start went, its runner's log while it waits for
+/// GitHub, a step's lines as they are written, then AWS taking it back. Each is read on the job's page.
+#[test]
+fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_back_is_said_on_its_page() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    // (Behind its public address, as a deployed one is: its machines get links of their own.)
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    served.aws.fail_none();
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    let (runner, hello, notice) = (job["runner"].as_str().unwrap().to_string(), job["hello"].as_str().expect("a link to say how its start went").to_string(), job["notice"].as_str().expect("a link to say AWS takes it back").to_string());
+    let agent = ureq::Agent::new_with_defaults();
+    let say = |q: &str, body: &str| agent.post(&format!("{}/{q}", served.url)).send(body.to_string()).map(|r| r.status().as_u16()).unwrap_or_else(|e| match e { ureq::Error::StatusCode(c) => c, _ => 0 });
+    let now = served.now_ms();
+    // How its start went: booted, its script began, its runner ready and listening.
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&boot=6.61&script={}&read={}&ready={}", now - 9000, now - 8000, now - 7000), ""), 200);
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&listening={}&gh=12", now - 3000), ""), 200);
+    // Without its link: nothing.
+    assert_eq!(say(&format!("hello?runner={runner}&t=not-its-link-at-all-xx&ready={now}"), ""), 404);
+    // Its runner's own log, while it waits for GitHub.
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&log=runner"), "[2026-10-13 22:56:41Z WARN GitHubActionsService] Attempt 1 of POST request failed (Socket Error: TryAgain).\n"), 200);
+    // The job taken; a step's lines as they are written, before GitHub has any.
+    assert!(served.webhook(served.github.start(id)) < 300);
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live=aaaa_2222_1.log&at=0"), "2026-10-15T10:00:05.0000000Z ##[group]Run npm test\n2026-10-15T10:00:06.0000000Z ok 1 - adds\n"), 200);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&format!("{link}&p=job&id={id}"));
+    b.wait(&format!("{} && {}", shows("Its start"), shows("Running")));
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+    for said in ["6.6 s it booted", "GitHub refused the first connection; reachable after 12 s", "GitHub gave it the job", "Attempt 1 of POST request failed"] { assert!(page.contains(said), "no {said:?}:\n{page}") }
+    // Its step's lines, as its machine sent them, in the log its page shows (GitHub has none yet).
+    let view = b.eval(&format!("fetch('/job/view?id={id}', {{credentials: 'same-origin'}}).then(r => r.text())")).as_str().unwrap_or_default().to_string();
+    assert!(view.contains("ok 1 - adds") && view.contains("Run npm test"), "{view}");
+    // AWS takes it back: said by its machine (with its own link), the job then failed by GitHub.
+    assert_eq!(say(&format!("interrupted?runner={runner}&t=not-its-link-at-all-xx"), ""), 404);
+    assert_eq!(say(&format!("interrupted?runner={runner}&t={notice}"), ""), 200);
+    assert!(served.webhook(served.github.finish(id, "failure", "2026-10-15T10:00:07.0000000Z The runner has received a shutdown signal.", served.now_ms())) < 300);
+    b.goto(&format!("{link}&p=job&id={id}"));
+    b.wait(&shows("Status"));
+    b.wait(&format!("{} && {}", shows("AWS took back its spot machine"), shows("Failed")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+

@@ -72,6 +72,9 @@ impl Timer for NoTimer { async fn wake_in(&self, _ms: u64) -> io::Result<()> { O
 /// are SSM parameters there, `/superci/testplane0001/…`, read on every request), and a key with which the dashboard
 /// and the CLI reach it (and one for coding agents, which may also start runs).
 pub struct Served { pub plane: String, pub url: String, pub store: Shared, pub machines: Machines, pub aws: Aws, pub github: GitHub, pub gitlab: GitLab, pub key: String, pub run_key: String, clock: Now,
+    /// The address the control plane is told it answers at, when not this computer's (`https://…`, as behind a
+    /// deployed one's URL): its machines' links are made with it.
+    pub public: Arc<Mutex<Option<String>>>,
     /// It stopped answering (its connections closed at once), until this is set back.
     pub down: Arc<std::sync::atomic::AtomicBool> }
 
@@ -149,7 +152,8 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     aws.put(&format!("/superci/{plane}/CONTAINERS"), "on");
     let clock = Now::default();
     let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (s, m, a, u, c, g, id, dn) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), plane.to_string(), down.clone());
+    let public: Arc<Mutex<Option<String>>> = Arc::default();
+    let (s, m, a, u, c, g, id, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), plane.to_string(), down.clone(), public.clone());
     std::thread::spawn(move || {
         let cache = Cache::default();
         block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
@@ -168,11 +172,12 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
             configure(&mut config);
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let old = a.old_version.lock().unwrap().clone();
-            let _ = answer(&plane, &u, stream, old);
+            let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
+            let _ = answer(&plane, &base, stream, old);
         }
     });
     let gitlab = github.gitlab.clone();
-    Served { plane: plane.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down }
+    Served { plane: plane.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public }
 }
 
 /// A request as it arrived: method, target, headers, body.
