@@ -45,6 +45,16 @@ fn image(file: &str, tag: &str) {
     ok(&["build", "-q", "-f", &format!("{dir}/{file}"), "-t", tag, dir]);
 }
 
+/// The store's folder on this computer, removed when dropped: through a container, as what the machine wrote there
+/// as root this user may not remove (nor read: Cargo's folder is cached as a whole).
+struct Store(std::path::PathBuf);
+impl Drop for Store {
+    fn drop(&mut self) {
+        let _ = docker(&["run", "--rm", "-v", &format!("{}:/store", self.0.display()), "--entrypoint", "sh", "superci-layers-machine", "-c", "umount -R /store/* 2>/dev/null; rm -rf /store/* /store/.[!.]*"]);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A machine, running until dropped.
 struct Machine(String);
 impl Drop for Machine { fn drop(&mut self) { let _ = docker(&["rm", "-f", &self.0]); } }
@@ -73,8 +83,9 @@ fn setup_switches_a_machines_docker_to_the_layers_service_and_off_puts_it_back()
     // which neither a container's own overlay nor tmpfs is: /tmp is tmpfs on Ubuntu 26.04. Cargo's folder is on disk.)
     let store = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("superci-layers-store-{}", std::process::id()));
     std::fs::create_dir_all(&store).unwrap();
+    let store = Store(store);
     let mut args: Vec<String> = ["run", "-d", "--privileged", "--cgroupns=host", "-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw", "--tmpfs", "/run", "--tmpfs", "/run/lock", "--name", &name,
-        "-v", &format!("{bin}:/usr/local/bin/superci-layers:ro"), "-v", &format!("{}:/var/lib/superci-layers", store.display())].iter().map(|s| s.to_string()).collect();
+        "-v", &format!("{bin}:/usr/local/bin/superci-layers:ro"), "-v", &format!("{}:/var/lib/superci-layers", store.0.display())].iter().map(|s| s.to_string()).collect();
     args.extend(measured());
     args.push("superci-layers-machine".into());
     ok(&args.iter().map(String::as_str).collect::<Vec<_>>());

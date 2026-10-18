@@ -31,9 +31,11 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # (No cache of Zig's own: one of 250 MB a run filled the repository's cache, and the Rust cache was evicted.)
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          use-cache: false
       # (cargo-zigbuild built, downloaded; worker-build has no build to download: compiled once, then kept by the Rust
       # cache.)
       - uses: taiki-e/install-action@v2
