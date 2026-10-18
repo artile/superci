@@ -1014,7 +1014,7 @@ fn a_day_of_github_and_gitlab_jobs_is_summed_up_on_overview_for_a_day_a_week_and
     served.later(60_000);
     served.gitlab_webhook(served.gitlab.finish(gid, "success", "ok", served.now_ms()));
     gh("stuck", None, 0);
-    let home = home(&served);
+    let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
     b.wait(&format!("{} && {} && {} && {}", reads("5 jobs"), reads("4 ran"), reads("as GitHub and GitLab bill them"), reads("saved")));
@@ -1039,6 +1039,11 @@ fn a_day_of_github_and_gitlab_jobs_is_summed_up_on_overview_for_a_day_a_week_and
     b.wait(&shows("lint"));
     b.click("main a", "lint");
     b.wait("document.querySelector('details.lstep')");
+    // Limits below what the day spent: at its limit, for the month and the day.
+    let (got, text) = post(&mut b, "/routing", &[("action", "monthly_usd"), ("usd", "0.5"), ("daily", "0.25")]);
+    assert!(got < 400, "{got} {text}");
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&format!("{} && {}", reads("$0.80 of $0.50 At its limit"), reads("$0.80 of $0.25 today At its limit")));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
