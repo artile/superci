@@ -9701,6 +9701,18 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
     let home = signed_in(&served);
     let cli = |args: &[&str]| { let o = common::command(&home).args(args).env("GITLAB_TOKEN_FOR_TESTS", "gitlab-token-for-tests").output().unwrap(); (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    // Another, failed with what test runners write: cargo's, jest's, pytest's failures.
+    let tests_log = "2026-10-15T10:00:00.0000000Z ##[group]Run cargo test\n2026-10-15T10:00:01.0000000Z test api::adds ... ok\n2026-10-15T10:00:01.0000000Z test api::subtracts ... FAILED\n2026-10-15T10:00:02.0000000Z ---- api::subtracts stdout ----\n2026-10-15T10:00:02.0000000Z thread 'api::subtracts' panicked at src/api.rs:10:5:\n2026-10-15T10:00:02.0000000Z assertion `left == right` failed\n2026-10-15T10:00:02.0000000Z test result: FAILED. 1 passed; 1 failed; 0 ignored\n2026-10-15T10:00:03.0000000Z   ✕ renders the page (12 ms)\n2026-10-15T10:00:03.0000000Z FAILED tests/test_app.py::test_login - AssertionError: no\n2026-10-15T10:00:04.0000000Z ##[error]Process completed with exit code 101.\n";
+    let (tid, q) = served.github.queue("tests with failures", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(tid));
+    served.webhook(served.github.finish(tid, "failure", tests_log, served.now_ms()));
+    let tid_s = tid.to_string();
+    let trun = served.store.under(&format!("job:{tid}"))[0].1["run_id"].to_string();
+    for args in [vec!["jobs", "retrieve", tid_s.as_str(), "--tests"], vec!["runs", "retrieve", trun.as_str(), "--tests"], vec!["jobs", "retrieve", tid_s.as_str(), "--tests", "--json"]] {
+        let o = common::command(&home).args(&args).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string();
+        assert!(o.status.code().is_some_and(|c| c <= 3) && said.contains("subtracts"), "{args:?}: {said}{}", String::from_utf8_lossy(&o.stderr));
+    }
     let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
     let table: Vec<Vec<&str>> = vec![
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
