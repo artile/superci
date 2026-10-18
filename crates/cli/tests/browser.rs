@@ -9281,6 +9281,17 @@ fn signing_out_with_cloudflare_and_modal_signed_in_says_what_became_of_each_sign
     assert!(!file.exists(), "its sign-ins removed");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
+    // Signed out while Cloudflare's and Modal's sign-ins are given for the run by name: those are not SuperCI's to end.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_CLOUDFLARE_TOKEN", "cf-token-given"), ("SUPERCI_MODAL_TOKEN_ID", "ak-given"), ("SUPERCI_MODAL_TOKEN_SECRET", "as-given")]);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/signout", &[]);
+    assert!(got < 400, "{got} {text}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
