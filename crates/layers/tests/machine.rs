@@ -96,7 +96,8 @@ fn setup_switches_a_machines_docker_to_the_layers_service_and_off_puts_it_back()
         let (major, minor) = { let mut v = kernel.split(['.', '-']).map(|n| n.parse::<u32>().unwrap_or(0)); (v.next().unwrap_or(0), v.next().unwrap_or(0)) };
         assert!((major, minor) < (6, 12), "kernel {kernel} mounts EROFS files, yet: {said}");
         assert!(o.status.success() && said.contains("superci-layers: off: "), "{said}");
-        assert_eq!(m.sh("docker info -f '{{.Driver}}'"), stock);
+        // (Docker started again as it was: answering once it is up.)
+        m.sh(&format!("for i in $(seq 120); do [ \"$(docker info -f '{{{{.Driver}}}}' 2>/dev/null)\" = '{stock}' ] && exit 0; sleep 0.5; done; exit 1"));
         return
     }
     assert!(o.status.success() && said.contains("superci-layers: switched in"), "{said}{}", String::from_utf8_lossy(&o.stderr));
