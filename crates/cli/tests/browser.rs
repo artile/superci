@@ -2455,7 +2455,17 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
     // (Each page read anew: the jobs come between them.)
     let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
     let (mut said, mut later): (std::collections::BTreeMap<String, usize>, std::collections::BTreeMap<String, usize>) = Default::default();
-    for label in ["superci", "superci/spot=false", "superci/gpu=any", "superci/gpu=any/spot=false", "superci/cpu=2/arch=arm64"] {
+    // Each kind of job, and three setups beside: on-demand turned off, Cloudflare after AWS (a refusal passes the job
+    // on), and a second region (the first refusing, the second as answered).
+    let only_aws = r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#;
+    let kinds: Vec<(&str, &str, Option<&str>)> = vec![("superci", only_aws, None), ("superci/spot=false", only_aws, None), ("superci/gpu=any", only_aws, None), ("superci/gpu=any/spot=false", only_aws, None),
+        ("superci/cpu=2/arch=arm64", only_aws, None),
+        ("superci", r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]}"#, None),
+        ("superci", r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#, None),
+        ("superci", only_aws, Some(r#"["us-east-1","us-east-2"]"#))];
+    for (label, routing, regions) in kinds {
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), routing);
+        if let Some(r) = regions { served.aws.put(&format!("/superci/{PLANE}/AWS_REGIONS"), r) } else { served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/AWS_REGIONS")); }
         let mut jobs = vec![];
         for spot in answers {
             for od in answers {
@@ -2478,7 +2488,7 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
         served.aws.fail_none();
         // Each job's state, as its page says it, and why when there is a why: at once, and once the sweeps have
         // asked again (a sweep a minute, AWS answering as it answered Test).
-        let mut look = |said: &mut std::collections::BTreeMap<String, usize>| for (id, spot, od) in &jobs {
+        let mut look = |said: &mut std::collections::BTreeMap<String, usize>, every: usize| for (id, spot, od) in jobs.iter().step_by(every) {
             let job = served.store.under(&format!("job:{id}"))[0].1.clone();
             b.goto(&format!("{link}&p=job&id={id}"));
             b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
@@ -2488,9 +2498,10 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
             assert!(why.is_empty() || page.to_lowercase().contains(&why.to_lowercase()), "{label} spot {spot} on-demand {od}: {state} {why:?} not on its page:\n{page}");
             *said.entry(format!("{state}: {}", job["error"].as_str().unwrap_or_default().chars().take(140).collect::<String>())).or_default() += 1;
         };
-        look(&mut said);
+        look(&mut said, 1);
         for _ in 0..3 { served.later(61_000); served.upkeep(); }
-        look(&mut later);
+        // (Once asked again: every fifth, enough to see each kind of end.)
+        look(&mut later, 5);
         // This kind's machines ended (their jobs done), and its waiting jobs given up, before the next kind.
         for (id, _, _) in &jobs {
             let job = served.store.under(&format!("job:{id}"))[0].1.clone();
