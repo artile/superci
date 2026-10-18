@@ -6042,6 +6042,10 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     b.goto(&format!("{link}&p=job&id={id}"));
     b.wait(&shows("Status"));
     b.wait(&format!("{} && {}", shows("AWS took back its spot machine"), shows("Failed")));
+    // Its run over at GitHub: the next sweep asks GitHub to run the job again, off spot machines.
+    served.upkeep();
+    assert!(served.github.asked.lock().unwrap().iter().any(|a| a.contains(&format!("/actions/jobs/{id}/rerun"))), "{:?}", served.github.asked.lock().unwrap().iter().filter(|a| a.contains("rerun")).collect::<Vec<_>>());
+    assert_eq!(served.store.under(&format!("job:{id}"))[0].1["rerun"]["state"], "asked");
     // Its notice again once its job has ended: its runner leads to no job any more.
     assert_eq!(say(&format!("interrupted?runner={runner}&t={notice}"), ""), 404);
     assert_eq!(served.store.under("spot:interrupted:").len(), 1);
@@ -6873,5 +6877,51 @@ fn the_permissions_card_says_what_aws_refused_and_what_an_installation_has_not_a
     b.wait("[...document.querySelectorAll('dialog')].some(d => d.open && d.innerText.includes('Review request'))");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What a computer may send of a working tree for a run, as `superci runs create` sends it (with a run key): a tree's
+/// id and part said well or refused, a part over 5 MB refused, a base chain too long, a base the bucket no longer has.
+/// No run comes of any, as the Runs page says.
+#[test]
+fn a_working_trees_parts_are_taken_or_refused_and_no_run_comes_of_them() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let send = |served: &superci_testkit::Served, q: &str, body: Vec<u8>| { let mut r = agent.post(&format!("{}/runs/tree?{q}", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send(body).unwrap(); (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()) };
+    let tree = "tree-Ab_cd-0123456789xyz";
+    // No bucket: kept in pieces through the control plane.
+    let served = serve(|_| {});
+    for (q, status) in [("id=short&part=0", 400), ("id=tree-has!a-char-it-may-not&part=0", 400), (&format!("id={tree}&part=1000")[..], 400), ("part=0", 400)] {
+        assert_eq!(send(&served, q, vec![]).0, status, "{q}");
+    }
+    assert_eq!(send(&served, &format!("id={tree}&part=0"), vec![b'x'; 5_000_001]).0, 413);
+    let (status, said) = send(&served, &format!("id={tree}&part=0"), b"a part".to_vec());
+    assert!(status == 200 && said.contains("\"stored\":6"), "{status} {said}");
+    let (status, said) = send(&served, &format!("id={tree}&part=0&link=1"), vec![]);
+    assert!(status == 200 && said.contains("\"url\":null"), "no bucket, no link: {status} {said}");
+    let (status, said) = send(&served, &format!("id={tree}&part=0&sent=1"), vec![]);
+    assert!(status == 200 && said.contains("\"sent\":true"), "{status} {said}");
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runs"));
+    b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+    assert!(served.store.under("run:").is_empty());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // Its own AWS account's bucket: links to put a tree there; a base chain too long, or a base it no longer has.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    // (Its bucket ready: its cache program is there.)
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&later=1&keep=b0123456789abcdef"), vec![]);
+    assert!(status == 200 && said.contains("\"url\":\"https://") && said.contains("\"later\":true"), "{status} {said}");
+    let chain = (0..17).map(|i| format!("layer{i:04}")).collect::<Vec<_>>().join(",");
+    assert_eq!(send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base={chain}"), vec![]).0, 400);
+    let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base=bgone0123456789"), vec![]);
+    assert!(status == 200 && said.contains("\"base\":false"), "a base the bucket no longer has: {status} {said}");
+    let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&base=bgone0123456789"), vec![]);
+    assert!(status == 200 && said.contains("\"base\":false"), "{status} {said}");
+    assert!(served.store.under("run:").is_empty());
 }
 
