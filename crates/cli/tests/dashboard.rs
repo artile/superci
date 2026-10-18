@@ -58,7 +58,7 @@ fn an_aws_sign_in_is_kept_and_renewed_as_aws_answered_a_real_one() {
     let home = home(&served);
     std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
     let (mut child, link) = dashboard(&home);
-    let (_, to, page) = common::post(&link, "/aws/signin", &[("next", "?p=overview")]);
+    let (_, to, page) = common::post(&link, "/aws/signin", &[("next", "?p=overview"), ("w", "default")]);
     let at = if to.is_empty() { page } else { to };
     let state = at.split("state=").nth(1).and_then(|r| r.split(['&', '"']).next()).expect("a state").to_string();
     let (status, _, done) = common::get(&link, &format!("/oauth/callback?code=a-code-from-aws&state={state}"));
@@ -155,12 +155,15 @@ fn a_modal_sign_in_waits_for_its_approval_and_keeps_the_token_as_modal_answered_
 
 #[test]
 fn an_aws_sign_in_that_aws_does_not_finish_says_so_and_its_button_signs_in_again() {
+    // With one workspace kept, and with another beside it (its button then names the workspace it is for).
+    for several in [false, true] {
     let served = serve(|_| {});
     let home = home(&served);
     std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    if several { std::fs::create_dir_all(home.join("workspaces/globex")).unwrap(); std::fs::write(home.join("workspaces/globex/sign-ins.json"), "{}").unwrap(); }
     let (mut child, link) = dashboard(&home);
     // Signing in: AWS's page, with the state it comes back with.
-    let (_, to, page) = common::post(&link, "/aws/signin", &[("next", "?p=overview")]);
+    let (_, to, page) = common::post(&link, "/aws/signin", &[("next", "?p=overview"), ("w", "default")]);
     let at = if to.is_empty() { page } else { to };
     let state = at.split("state=").nth(1).and_then(|r| r.split(['&', '"']).next()).expect("a state").to_string();
     // AWS comes back, and then refuses its last step.
@@ -170,10 +173,11 @@ fn an_aws_sign_in_that_aws_does_not_finish_says_so_and_its_button_signs_in_again
     // Its button: on the dashboard's own address, signing in again (signed out of AWS first), then back where it was.
     let again = refused.split("class=\"button primary\" href=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().replace("&amp;", "&");
     assert!(again.starts_with("http://localhost:") && again.contains("/aws/again?next=") && again.contains("p%3Doverview"), "{again}");
-    let (status, to, _) = common::get(&link, &again[again.find("/aws/again").unwrap()..]);
-    assert!(status == 303 && to.contains("logout") && to.contains("state%3D"), "{status} {to}");
+    let (status, to, said) = common::get(&link, &again[again.find("/aws/again").unwrap()..]);
+    assert!(status == 303 && to.contains("logout") && to.contains("state%3D"), "several: {several}: {again} {status} {to} {}", words(&said));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 #[test]

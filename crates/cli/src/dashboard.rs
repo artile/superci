@@ -55,6 +55,9 @@ pub struct Dashboard {
     store: Option<Store>,
     /// The workspace's name as this dashboard's addresses carry it (`w`). Empty: the one pages without it are of.
     w: String,
+    /// Its name always, the first's too: what the addresses it hands out for coming back carry, since a request that
+    /// names no workspace is refused once several are kept (see `back_url`).
+    named: String,
     /// What the workspace is called and looks like in a list (kept beside its sign-ins), and when GitHub was last
     /// asked for its organization's picture.
     about: crate::store::About,
@@ -1095,7 +1098,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{}", oauth_port()), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), named: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -1667,8 +1670,9 @@ impl Dashboard {
     fn back_url(&self, query: &str) -> String {
         let query = query.trim_start_matches('/');
         let named = query.trim_start_matches('?').split('&').any(|kv| kv.starts_with("w="));
-        if self.w.is_empty() || named { return format!("{}/{query}", self.base) }
-        format!("{}/{query}{}w={}", self.base, if query.is_empty() { "?" } else { "&" }, self.w)
+        let w = if self.w.is_empty() { &self.named } else { &self.w };
+        if w.is_empty() || named { return format!("{}/{query}", self.base) }
+        format!("{}/{query}{}w={w}", self.base, if query.is_empty() { "?" } else { "&" })
     }
 
     /// Whether a sign-in or an App that comes back from elsewhere (see `respond`) was started in this workspace.
@@ -1996,6 +2000,7 @@ impl Dashboard {
         let name = self.workspace();
         let hub = Arc::new(Hub { root: self.store.as_ref().and_then(|s| s.root()).or_else(crate::store::root), key: self.key.clone(), base: self.base.clone(),
             first: Mutex::new((!several).then(|| name.clone())), boards: Mutex::new(HashMap::new()), opened: Mutex::new(None) });
+        self.named = name.clone();
         let shared = Arc::new(Mutex::new(self));
         if !several { lock(&hub.boards).insert(name, shared.clone()); }
         if for_task {
@@ -6554,7 +6559,7 @@ impl Hub {
         let mut boards = lock(&self.boards);
         if let Some(b) = boards.get(name) { return b.clone() }
         let mut d = Dashboard::signed_in(self.root.as_ref().map(|r| Store::under(r, name)));
-        (d.key, d.base, d.w) = (self.key.clone(), self.base.clone(), if first.as_deref() == Some(name) { String::new() } else { name.to_string() });
+        (d.key, d.base, d.w, d.named) = (self.key.clone(), self.base.clone(), if first.as_deref() == Some(name) { String::new() } else { name.to_string() }, name.to_string());
         let b = Arc::new(Mutex::new(d));
         boards.insert(name.to_string(), b.clone());
         b
@@ -6602,7 +6607,7 @@ impl Hub {
             return Err(e)
         }
         if let Some(b) = board {
-            { let mut d = lock(&b); d.store = Some(Store::under(root, &to)); if !d.w.is_empty() { d.w = to.clone() } }
+            { let mut d = lock(&b); d.store = Some(Store::under(root, &to)); d.named = to.clone(); if !d.w.is_empty() { d.w = to.clone() } }
             lock(&self.boards).insert(to.clone(), b);
         }
         let mut first = lock(&self.first);
