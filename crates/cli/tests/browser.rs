@@ -2785,6 +2785,41 @@ fn each_test_runners_failures_are_read_from_a_jobs_log_by_the_cli_and_the_job_pa
 }
 
 #[test]
+fn labels_at_each_limit_and_in_each_combination_are_fitted_to_a_provider_or_refused_saying_why() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare","max_jobs":100},{"cloud":"modal","max_jobs":100},{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let labels = ["superci/cpu=1", "superci/cpu=3", "superci/cpu=96", "superci/cpu=200", "superci/ram=1", "superci/ram=3000", "superci/cpu=4/ram=1", "superci/cpu=2/ram=64",
+        "superci/disk=10000", "superci/disk=20000", "superci/disk-speed=2000", "superci/disk-iops=20000", "superci/disk-speed=125/disk-iops=3000", "superci/disk-speed=9000",
+        "superci/arch=arm64/gpu=t4", "superci/os=windows/arch=arm64", "superci/os=windows/gpu=any", "superci/gpu=h100/cpu=2", "superci/gpu=b200", "superci/gpu=l4/ram=8", "superci/gpu=zz",
+        "superci/scratch=localdisk/os=windows", "superci/scratch=nowhere", "superci/family=m8a+r8a", "superci/family=c8gd/arch=x64", "superci/family=c8g", "superci/family=nope",
+        "superci/image=ubuntu24/os=windows", "superci/image=ubuntu99", "superci/provider=cloudflare/gpu=t4", "superci/provider=modal/cpu=64/ram=512", "superci/provider=modal/gpu=a100",
+        "superci/provider=cloudflare/cpu=8", "superci/provider=nowhere", "superci/spot=maybe", "superci/docker-cache=x", "superci/os=macos/arch=arm64", "superci/cpu=", "superci/=4", "superci/cpu=4/cpu=8"];
+    for label in labels {
+        let (id, q) = served.github.queue(label, label, served.now_ms());
+        assert!(served.webhook(q) < 300, "{label}");
+        let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+        assert!(job["state"].is_string(), "{label}: {job}");
+    }
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
@@ -9881,7 +9916,8 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["runners", "delete", "nowhere", "--confirm"], vec!["runners", "delete", "cloudflare"], vec!["runners", "create", "nowhere"], vec!["runners", "create"],
         // Labels, its name, the default machine, limits: nothing given, defaults, what does not hold.
         vec!["labels", "create"], vec!["labels", "create", "acmeci-big"], vec!["labels", "list"], vec!["labels", "delete", "acmeci-big", "--confirm"], vec!["labels", "delete"],
-        vec!["name", "update"], vec!["name", "update", "Acme CI", "--dry-run"], vec!["machine", "update"], vec!["machine", "update", "--cpu=default", "--ram=default"], vec!["machine", "update", "--cpu=0"],
+        vec!["name", "update"], vec!["name", "update", "Acme CI", "--dry-run"], vec!["name", "update", "a<b>"], vec!["name", "update", &"x".repeat(80)], vec!["name", "update", " "],
+        vec!["labels", "create", "Bad Label"], vec!["labels", "create", "superci/cpu=4"], vec!["labels", "create", &"l".repeat(80)], vec!["labels", "create", "-dash"], vec!["machine", "update"], vec!["machine", "update", "--cpu=default", "--ram=default"], vec!["machine", "update", "--cpu=0"],
         vec!["limits", "update"], vec!["limits", "update", "--max-cpu=16"], vec!["limits", "update", "--monthly-usd=inf"],
         vec!["accounts", "update", "aws"], vec!["accounts", "update", "aws", "--monthly-usd=100", "--budget=emails", "--email=ops@example.com", "--dry-run"], vec!["accounts", "retrieve", "aws", "--account=222222222222"],
         // Code hosts' connections, projects, control planes, images.
