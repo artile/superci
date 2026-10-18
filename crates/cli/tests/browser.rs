@@ -15,6 +15,9 @@ fn until(what: &str, holds: impl Fn() -> bool) {
 /// What the page shows (anywhere in it) holds `words`.
 fn page_shows(words: &str) -> String { format!("document.body && document.body.innerText.includes({})", serde_json::json!(words)) }
 
+/// The same, its lines and spaces read as single spaces (a figure and its label in elements of their own).
+fn reads(words: &str) -> String { format!("document.querySelector('main') && document.querySelector('main').innerText.replace(/\\s+/g, ' ').includes({})", serde_json::json!(words)) }
+
 /// What the page's main part shows holds `words`.
 fn shows(words: &str) -> String { format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words)) }
 
@@ -977,6 +980,42 @@ fn removing_a_runner_provider_is_refused_while_it_runs_jobs_or_its_cloud_is_not_
     let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "cloudflare"), ("stop", "on")]);
     assert!(got < 400, "{got} {text}");
     until("Cloudflare's containers off", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "CONTAINERS" && v == "off"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+
+#[test]
+fn a_day_of_github_and_gitlab_jobs_is_summed_up_on_overview_for_a_day_a_week_and_a_month() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A day's jobs: from GitHub a short pass, a failure, a two-hour pass and one still starting; from GitLab a pass.
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let gh = |name: &str, end: Option<&str>, ms: u64| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); served.webhook(q); if let Some(e) = end { served.webhook(served.github.start(id)); served.later(ms); served.webhook(served.github.finish(id, e, "log", served.now_ms())); } };
+    gh("build", Some("success"), 120_000);
+    gh("test", Some("failure"), 30_000);
+    gh("lint", Some("success"), 7_000_000);
+    let (gid, p) = served.gitlab.pending("gl-test", &["superci"], served.now_ms());
+    served.gitlab_webhook(p);
+    served.gitlab_webhook(served.gitlab.running(gid, served.now_ms()));
+    served.later(60_000);
+    served.gitlab_webhook(served.gitlab.finish(gid, "success", "ok", served.now_ms()));
+    gh("stuck", None, 0);
+    let home = home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&format!("{} && {} && {} && {}", reads("5 jobs"), reads("4 ran"), reads("as GitHub and GitLab bill them"), reads("saved")));
+    assert!(b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("machine minutes"));
+    for (period, word) in [("7 days", "7 days"), ("30 days", "30 days")] {
+        b.click("main a, main button", period);
+        b.wait(&format!("{} && !document.body.classList.contains('busy')", shows(word)));
+        b.wait(&reads("5 jobs"));
+    }
+    b.click("nav a", "Runs");
+    b.wait(&format!("{} && {}", shows("Pipeline"), shows("Failed")));
+    b.click(".tabs a", "Jobs");
+    b.wait(&format!("{} && {} && {}", shows("gl-test"), shows("Starting"), shows("116m")));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
