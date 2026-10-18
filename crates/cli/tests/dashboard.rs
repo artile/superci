@@ -303,3 +303,30 @@ fn changes_to_a_control_plane_that_does_not_answer_say_to_try_again() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Where the dashboard listens: the port asked for, refused when taken; else the usual one, or the next free one
+/// when another program has it (said, and how two share sign-ins); a Cloudflare sign-in needs the usual one itself.
+#[test]
+fn the_dashboard_listens_where_it_can_and_says_where_and_why_not() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    let home = home(&served);
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    // (The other address of the same port too, as another program listening on both would.)
+    let _taken6 = std::net::TcpListener::bind(format!("[::1]:{port}"));
+    let first_line = |c: &mut std::process::Child| -> String { std::io::BufReader::new(c.stdout.take().unwrap()).lines().map_while(Result::ok).take(2).collect::<Vec<_>>().join("\n") };
+    // Asked for a port that is taken: refused.
+    let o = common::command(&home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string()).output().unwrap();
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(&format!("port {port} is in use")), "{}", String::from_utf8_lossy(&o.stderr));
+    // Its usual port taken: the next one, said.
+    let mut c = common::command(&home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_OAUTH_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let said = first_line(&mut c);
+    let _ = c.kill();
+    assert!(said.contains(&format!("Port {port} is taken (another SuperCI?): this one is on ")) && said.contains("http://localhost:"), "{said}");
+    // A Cloudflare sign-in comes back to that port only: with it taken, said why it cannot start.
+    let o = common::command(&home).args(["login", "cloudflare", "--no-browser"]).env("SUPERCI_OAUTH_PORT", port.to_string()).output().unwrap();
+    let e = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+    assert!(!o.status.success() && e.contains(&format!("Cloudflare's sign-in comes back to port {port} only")), "{e}");
+    let _ = std::fs::remove_dir_all(&home);
+}
