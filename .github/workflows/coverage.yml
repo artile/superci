@@ -22,10 +22,13 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      # (Built programs, not compiled here each time.)
+      # (cargo-zigbuild built, downloaded; worker-build has no build to download: compiled once, then kept by the Rust
+      # cache.)
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild,worker-build
+          tool: cargo-zigbuild
+      - name: worker-build
+        run: cargo install --locked worker-build
       - name: Build
         run: ./build.sh
       - name: The kernel's EROFS (the layer store's setup test mounts its files from a container, which loads no module)

@@ -67,6 +67,7 @@ pub fn setup(o: &Options) -> i32 {
 pub fn finish() -> i32 {
     let began = std::time::Instant::now();
     let done = (|| -> Result<(), String> {
+        restartable();
         run("systemctl", &["restart", "containerd", "docker"])?;
         wait_for_docker()?;
         let driver = docker_info()?["Driver"].as_str().unwrap_or_default().to_string();
@@ -98,8 +99,13 @@ fn detached(argv: &[&str]) -> Result<(), String> {
 fn put_back_before_restart() -> Result<(), String> {
     restore_settings()?;
     let _ = run("systemctl", &["stop", "superci-layers"]);
+    restartable();
     detached(&["systemctl", "restart", "docker"])
 }
+
+/// containerd and Docker may be started again however often they were already: systemd starts Docker three times a
+/// minute at most (its unit's `StartLimitBurst`), and a machine's start, the switch and a put-back are three.
+fn restartable() { let _ = run("systemctl", &["reset-failed", "containerd", "docker"]); }
 
 /// Docker as it comes again (by hand, or after a failed switch).
 pub fn off() -> i32 {
@@ -388,6 +394,7 @@ fn put_back() -> Result<(), String> {
     restore_settings()?;
     // (Its unit is the machine's while it runs: stopped, it is gone.)
     let _ = run("systemctl", &["stop", "superci-layers"]);
+    restartable();
     run("systemctl", &["restart", "containerd"])?;
     run("systemctl", &["restart", "docker"])?;
     wait_for_docker()

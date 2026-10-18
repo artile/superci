@@ -111,7 +111,8 @@ fn setup_switches_a_machines_docker_to_the_layers_service_and_off_puts_it_back()
     // An index that cannot be had: nothing switched, Docker as it comes, and the start not failed.
     let o = m.exec(&measured_env(), &["/usr/local/bin/superci-layers", "setup", "--index-url=http://127.0.0.1:9/none.json", "--disk=none"]);
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("superci-layers: off: "), "{}", String::from_utf8_lossy(&o.stdout));
-    assert_eq!(m.sh("docker info -f '{{.Driver}}'"), stock);
+    // (Docker started again as it was: answering once it is up.)
+    m.sh(&format!("for i in $(seq 120); do [ \"$(docker info -f '{{{{.Driver}}}}' 2>/dev/null)\" = '{stock}' ] && exit 0; sleep 0.5; done; docker info -f '{{{{.Driver}}}}'; exit 1"));
 }
 
 #[test]

@@ -8,7 +8,8 @@ on:
 
 permissions:
   contents: read
-  # (A job that fails cancels the rest of the run: see each job's last step.)
+  # (The layers jobs, quick, cancel the rest of the run when they fail: see their last step. The tests job is the
+  # last over, so its failure is left a failure.)
   actions: write
 
 concurrency:
@@ -33,10 +34,13 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      # (Built programs, not compiled here each time.)
+      # (cargo-zigbuild built, downloaded; worker-build has no build to download: compiled once, then kept by the Rust
+      # cache.)
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild,worker-build
+          tool: cargo-zigbuild
+      - name: worker-build
+        run: cargo install --locked worker-build
       - name: Build
         run: ./build.sh
       - name: The tests
@@ -49,12 +53,6 @@ jobs:
         run: |
           SUPERCI_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
           "$RUNNER_TEMP/bin/superci" --version
-      # One job failed: the rest of the run is cancelled, so a failure is known at once.
-      - name: Stop the run
-        if: failure()
-        run: gh run cancel ${{ github.run_id }} --repo ${{ github.repository }}
-        env:
-          GH_TOKEN: ${{ github.token }}
 
   # superci-layers against containerd's own conformance suites for snapshotters and content stores (as root: the
   # snapshotter suite mounts overlays), directly and through containerd's metadata layer.

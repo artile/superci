@@ -74,10 +74,13 @@ jobs:
           package-manager-cache: false
       - name: The build's tools (zig)
         run: brew install zig
-      # (Built programs, not compiled here each time.)
+      # (cargo-zigbuild built, downloaded; worker-build has no build to download: compiled once, then kept by the Rust
+      # cache.)
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild,worker-build
+          tool: cargo-zigbuild
+      - name: worker-build
+        run: cargo install --locked worker-build
       - name: Build everything and pack the npm packages
         run: ./scripts/npm-pack.sh
       - name: Whether this commit's tests passed already (the Test workflow)
