@@ -296,9 +296,9 @@ pub struct Aws {
     /// A control plane not updated yet: while set, it says this version and answers as one from before 0.19.13 did
     /// (its launchers as `agents`). Its function's code uploaded again (an update) ends it.
     pub old_version: Arc<Mutex<Option<String>>>,
-    /// Calls answered with an error, by action (`RunInstances`, `AmazonSSM.PutParameter`, …): its status and answer,
-    /// and how many more times (none: every time). Written as AWS documents its errors, for what a test cannot have a
-    /// real account answer (throttling, a fault of AWS's).
+    /// Calls answered with an error, by action (`RunInstances`, `AmazonSSM.PutParameter`, …, or `Action|address part`):
+    /// its status and answer, and how many more times (none: every time). Written as AWS documents its errors, for what
+    /// a test cannot have a real account answer (throttling, a fault of AWS's, an organization's policy).
     pub failing: Arc<Mutex<Vec<(String, u16, String, Option<u32>)>>>,
 }
 
@@ -504,7 +504,9 @@ impl Aws {
         let failed = {
             let mut f = self.failing.lock().unwrap();
             let doing = action(target, asked);
-            let i = f.iter().position(|(a, ..)| *a == doing || url.contains(a.as_str()));
+            // (`Action|part of the address`: that action there only, `RunInstances|ec2.eu-west-1`; `DryRun=true` and
+            // the like match what was asked.)
+            let i = f.iter().position(|(a, ..)| a.split('|').all(|p| p == doing || url.contains(p) || asked.contains(p)));
             i.map(|i| {
                 let got = (f[i].1, vec![], f[i].2.clone());
                 match &mut f[i].3 { Some(1) => { f.remove(i); } Some(n) => *n -= 1, None => {} }

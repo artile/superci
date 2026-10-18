@@ -2326,3 +2326,45 @@ fn a_cloud_that_answers_nothing_is_a_note_on_the_pages_which_keep_working() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+
+/// What the AWS account card says of each kind of account, as AWS words its answers (an organization's policy, the
+/// role's permissions, an organization the account is in or manages, AWS not answering, no runner image there).
+#[test]
+fn the_aws_account_card_says_what_each_kind_of_account_allows_and_whose_rule_a_refusal_is() {
+    let Some(mut b) = Browser::open(1300, 1400) else { eprintln!("no Chrome here: skipped"); return };
+    let scp = |action: &str| superci_testkit::ec2_error("UnauthorizedOperation", &format!("You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: {action} with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-example001/service_control_policy/p-example1"));
+    let role = |action: &str| superci_testkit::ec2_error("UnauthorizedOperation", &format!("You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/ReadOnly/someone is not authorized to perform: {action} because no identity-based policy allows the {action} action"));
+    let org = |master: &str| serde_json::json!({ "Organization": { "Id": "o-example001", "Arn": "arn:aws:organizations::222222222222:organization/o-example001", "MasterAccountId": master, "MasterAccountArn": format!("arn:aws:organizations::{master}:account/o-example001/{master}") } }).to_string();
+    let others: Vec<String> = superci_core::page::REGIONS.iter().filter(|r| **r != "us-east-1").map(|r| format!("DescribeVpcs|ec2.{r}.")).collect();
+    type Fails = Vec<(String, u16, String)>;
+    let cases: Vec<(&str, Fails, &[&str])> = vec![
+        ("kept to one region by its organization", others.iter().map(|o| (o.clone(), 403, scp("ec2:DescribeVpcs"))).collect(),
+            &["Some regions", "SuperCI works there in N. Virginia. Its AWS organization keeps it out of the other regions.", "The other 11 are refused. By its AWS organization (policy p-example1).", "How to allow more", "Runner image\nIn N. Virginia"]),
+        ("spot refused by its organization", vec![("RunInstances|MarketType".into(), 403, scp("ec2:RunInstances"))],
+            &["Restricted", "Spot machines\nNot allowed\nBy its AWS organization (policy p-example1). Jobs run on on-demand machines, at about twice the price."]),
+        ("on-demand refused by the role", vec![("RunInstances|MarketType".into(), 412, superci_testkit::ec2_error("DryRunOperation", "Request would have succeeded, but DryRun flag is set.")), ("RunInstances".into(), 403, role("ec2:RunInstances"))],
+            &["Restricted", "On-demand machines\nNot allowed\nBy the permissions of the role or user signed in as."]),
+        ("a member of an organization", vec![("AWSOrganizationsV20161128.DescribeOrganization".into(), 200, org("222222222222"))],
+            &["Nothing refused", "Organization\no-example001", "Managed from account 222222222222"]),
+        ("its organization's management account", vec![("AWSOrganizationsV20161128.DescribeOrganization".into(), 200, org("111111111111"))],
+            &["The organization's management account. A CI is better kept in an account of its own.", "Another AWS account"]),
+        ("AWS not answering", vec![("DescribeVpcs".into(), 503, superci_testkit::ec2_error("Unavailable", "The service is unavailable. Please try again shortly."))],
+            &["Not known", "AWS did not answer when asked what this account allows"]),
+        ("the runner image in none of its regions", vec![("DescribeImages".into(), 200, "<DescribeImagesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>00000000-0000-4000-8000-000000000001</requestId><imagesSet/></DescribeImagesResponse>".into())],
+            &["Runner image\nNot in", "No job can start there until it is copied in"]),
+    ];
+    for (what, fails, says) in cases {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        for (action, status, answer) in fails { served.aws.fail(&action, status, &answer, None) }
+        let home = signed_in(&served);
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=add-runners"));
+        b.wait("document.getElementById('aws-account') && !document.body.innerText.includes('Asking AWS')");
+        let card = b.eval("document.getElementById('aws-account').nextElementSibling.innerText").as_str().unwrap_or_default().to_string();
+        for said in says { assert!(card.contains(said), "{what}: no {said:?} in\n{card}") }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
