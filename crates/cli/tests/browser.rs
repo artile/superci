@@ -1150,3 +1150,37 @@ fn the_aws_accounts_own_budget_set_raised_made_to_stop_lifted_and_removed_shows_
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn the_runner_image_is_copied_into_another_region_from_the_aws_accounts_section_as_aws_answered() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&page_shows("Overview"));
+    b.click(".side a", "Control plane");
+    b.wait(&shows("Copy into Canada"));
+    // Refused: a region not on the list, an account not signed in to.
+    for (fields, status, said) in [(&[("region", "mars-north-1")][..], 400, "Choose a region from the list"), (&[("region", "ca-central-1"), ("account", "222222222222")], 403, "Sign in with AWS first")] {
+        let (got, text) = post(&mut b, "/aws/image", fields);
+        assert!(got == status && text.contains(said), "{fields:?}: {got} {text}");
+    }
+    // Copied in (as a real account answered): the section says it is on its way.
+    served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[]);
+    let (got, text) = post(&mut b, "/aws/image", &[("account", "111111111111"), ("region", "ca-central-1"), ("next", "?p=planes")]);
+    assert!(got < 400, "{got} {text}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.contains("Action=CopyImage"))), "the copy asked for");
+    // (AWS then lists it as being made.)
+    served.aws.replaying(include_str!("../fixtures/aws/images/03-list-pending.jsonl"), &[]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows("It is being copied into Canada: about ten minutes"));
+    // A newer build asked for while a copy is still on its way: nothing more is copied.
+    served.aws.replaying(include_str!("../fixtures/aws/images/02-coming.jsonl"), &[]);
+    let (got, text) = post(&mut b, "/aws/image", &[("region", "ca-central-1"), ("newer", "1")]);
+    assert!(got < 400, "{got} {text}");
+    let copies = served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.contains("Action=CopyImage"))).count();
+    assert_eq!(copies, 1, "one copy asked for");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
