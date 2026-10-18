@@ -722,3 +722,91 @@ fn a_modal_sign_in_modal_no_longer_takes_is_said_on_every_page_as_modal_answered
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A form posted from the page itself (as a person who edited its fields could): the answer's status and words.
+fn post(b: &mut Browser, path: &str, fields: &[(&str, &str)]) -> (u16, String) {
+    let body = fields.iter().map(|(k, v)| format!("{}={}", k, v.replace('%', "%25").replace('&', "%26").replace('=', "%3D").replace(' ', "%20").replace('+', "%2B").replace('@', "%40"))).collect::<Vec<_>>().join("&");
+    let got = b.eval(&format!("fetch({path:?}, {{method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: {{'content-type': 'application/x-www-form-urlencoded'}}, body: {body:?}}}).then(async r => [r.status, r.type === 'opaqueredirect' ? 'redirected' : (await r.text()).replace(/<(style|script)[^>]*>[\\s\\S]*?<\\/\\1>/g, ' ').replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ')])"));
+    (got[0].as_u64().unwrap_or(0) as u16, got[1].as_str().unwrap_or_default().to_string())
+}
+
+#[test]
+fn what_settings_forms_must_not_take_is_refused_or_left_out_and_nothing_else_changes() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let routing = || served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").and_then(|(_, v)| serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_default();
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click(".side a", "Settings");
+    b.wait(&shows("Limits"));
+    // Refused, saying what it takes.
+    for (fields, said) in [
+        (&[("action", "account_usd"), ("account", "gcp"), ("usd", "10")][..], "Which account?"),
+        (&[("action", "account_usd"), ("account", "aws"), ("usd", "10"), ("budget", "sometimes")], "What AWS does at the limit is none, emails or stops"),
+        (&[("action", "account_usd"), ("account", "aws"), ("usd", "10"), ("budget", "lift")], "There is no budget in AWS to lift"),
+        (&[("action", "account_usd"), ("account", "aws"), ("usd", ""), ("budget", "emails")], "A budget in AWS needs the monthly limit"),
+        (&[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails"), ("email", "not an address")], "That is no email address"),
+        (&[("action", "add"), ("repo", "not a repository"), ("cloud", "aws")], "A repository is owner/name, owner/* or *"),
+        (&[("action", "max_hours"), ("max_hours", "0")], "From 1 to 120 hours"),
+        (&[("action", "max_hours"), ("max_hours", "121")], "From 1 to 120 hours"),
+        (&[("action", "public_add"), ("repo", "acme")], "A repository is owner/name or owner/*"),
+        (&[("action", "public_set"), ("repo", "acme/app"), ("repo", "no slash")], "A repository is owner/name"),
+        (&[("action", "cache_days"), ("days", "0")], "days"),
+        (&[("action", "order"), ("cloud_0", "elsewhere")], "Unknown provider"),
+        (&[("action", "order"), ("cloud_0", "aws"), ("cloud_1", "aws")], "Unknown provider"),
+        (&[("action", "order"), ("cloud_0", "aws"), ("out_0", "elsewhere")], "Unknown provider"),
+        (&[("action", "order"), ("out_0", "aws")], "Keep one provider in the order"),
+        (&[("action", "take_out"), ("cloud", "elsewhere")], "Unknown provider"),
+        (&[("action", "pool"), ("cloud", "elsewhere")], "Unknown provider"),
+        (&[("action", "pool"), ("cloud", "aws"), ("region_0", "mars-north-1")], "Choose a region from the list"),
+        (&[("action", "account"), ("cloud", "aws"), ("networks", "not networks")], "Check your networks"),
+        (&[("action", "pool"), ("cloud", "cloudflare"), ("image", "ftp://example.com/image")], "https://"),
+        (&[("action", "nothing-of-the-kind")], "Unknown change"),
+    ] {
+        let before = routing();
+        let (status, text) = post(&mut b, "/routing", fields);
+        assert!(status >= 400 && text.contains(said), "{fields:?}: {status} {text}");
+        assert_eq!(routing(), before, "{fields:?}: nothing changed");
+    }
+    // Left out: a limit that is no amount, a largest machine out of range (or the standard one).
+    for usd in ["-5", "abc", "0"] {
+        post(&mut b, "/routing", &[("action", "monthly_usd"), ("usd", usd)]);
+        until("the limit left out", || routing().get("monthly_usd").is_none_or(|v| v.is_null()));
+    }
+    for cpu in ["0", "500", "nope", "32"] {
+        post(&mut b, "/routing", &[("action", "max_cpu"), ("max_cpu", cpu)]);
+        until("no largest machine", || routing().get("max_cpu").is_none_or(|v| v.is_null()));
+    }
+    post(&mut b, "/routing", &[("action", "max_cpu"), ("max_cpu", "16")]);
+    until("the largest machine", || routing()["max_cpu"] == 16);
+    // A rule for every repository, and taken out; a public repository added once however often it is asked.
+    post(&mut b, "/routing", &[("action", "add"), ("repo", "*"), ("cloud", "aws")]);
+    until("the rule", || routing()["rules"].as_array().is_some_and(|r| r.iter().any(|r| r["repo"] == "*")));
+    post(&mut b, "/routing", &[("action", "remove"), ("repo", "*")]);
+    until("the rule gone", || !routing()["rules"].as_array().is_some_and(|r| r.iter().any(|r| r["repo"] == "*")));
+    // A provider's settings: what is no number left out, a region named twice once, Cloudflare's location.
+    let said = post(&mut b, "/routing", &[("action", "pool"), ("cloud", "aws"), ("max", "0"), ("usd", "-1"), ("region_0", "us-east-1"), ("region_1", ""), ("region_2", "us-east-1")]);
+    assert_eq!(said.1, "redirected", "{said:?}");
+    until("AWS's settings", || routing()["order"].as_array().is_some_and(|o| o.iter().any(|p| p["cloud"] == "aws" && p["max_jobs"].is_null() && p["monthly_usd"].is_null() && p["regions"] == serde_json::json!(["us-east-1"]))));
+    post(&mut b, "/routing", &[("action", "pool"), ("cloud", "aws"), ("max", "1000"), ("usd", "abc")]);
+    post(&mut b, "/routing", &[("action", "pool"), ("cloud", "aws"), ("max", "5"), ("usd", "20")]);
+    until("AWS's limits", || routing()["order"].as_array().is_some_and(|o| o.iter().any(|p| p["cloud"] == "aws" && p["max_jobs"] == 5 && p["monthly_usd"] == 20.0)));
+    post(&mut b, "/routing", &[("action", "pool"), ("cloud", "cloudflare"), ("location", "weur"), ("image", "")]);
+    until("Cloudflare's location", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "CF_LOCATION" && v == "weur"));
+    // The last provider in the order is not taken out.
+    let only = routing()["order"].as_array().map(|o| o.iter().filter(|p| p["off"] != true).count()).unwrap_or(0);
+    if only == 1 {
+        let cloud = routing()["order"].as_array().unwrap().iter().find(|p| p["off"] != true).unwrap()["cloud"].as_str().unwrap().to_string();
+        let (status, text) = post(&mut b, "/routing", &[("action", "take_out"), ("cloud", &cloud)]);
+        assert!(status >= 400 && text.contains("Keep one provider in the order"), "{status} {text}");
+    }
+    for _ in 0..2 { post(&mut b, "/routing", &[("action", "public_add"), ("repo", "acme/site")]); }
+    until("the public repository", || routing()["public_repos"].as_array().is_some_and(|r| r.iter().filter(|r| r.as_str().is_some_and(|s| s.eq_ignore_ascii_case("acme/site"))).count() == 1));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
