@@ -1265,3 +1265,46 @@ fn a_ci_whose_control_plane_is_in_a_cloud_not_signed_in_to_asks_for_that_sign_in
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn moves_deletions_and_labels_a_control_plane_cannot_take_are_refused_and_change_nothing() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The one in use (GitHub), and another in the account serving a code host of its own (GitLab).
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("testplane0002", move |c| { let s = aws.settings("testplane0002"); if !s.is_empty() { c.read_settings(&s) } });
+    other.connect_gitlab();
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&c={PLANE}&p=planes"));
+    b.wait(&page_shows("Control plane"));
+    // (What these change: its labels and its routing. This session's key is handed to it meanwhile.)
+    let settings = || served.aws.settings(PLANE).into_iter().filter(|(k, _)| k == "LABELS" || k == "ROUTING").collect::<Vec<_>>();
+    let before = settings();
+    for (path, fields, status, said) in [
+        ("/plane/delete", &[("plane", PLANE)][..], 409, "This control plane is in use"),
+        ("/labels", &[("action", "remove"), ("label", "nosuch")], 400, "It does not answer to that label"),
+        ("/labels", &[("action", "remove"), ("label", "superci")], 409, "This is its only label"),
+        ("/labels", &[("label", "Not A Label!")], 400, "That cannot be a label"),
+    ] {
+        let (got, text) = post(&mut b, &format!("{path}?c={PLANE}"), fields);
+        assert!(got == status && text.contains(said), "{path} {fields:?}: {got} {text}");
+    }
+    // Moving onto itself: nothing to do.
+    let (got, text) = post(&mut b, &format!("/plane/move?c={PLANE}"), &[("plane", PLANE)]);
+    assert!(got < 400, "{got} {text}");
+    assert_eq!(settings(), before, "nothing changed");
+    let _ = child.kill();
+    // A control plane too old for more labels: refused, saying to update it.
+    *served.aws.old_version.lock().unwrap() = Some("0.11.0".into());
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&c={PLANE}&p=settings"));
+    b.wait(&page_shows("Settings"));
+    let (got, text) = post(&mut b, &format!("/labels?c={PLANE}"), &[("label", "acmeci")]);
+    assert!(got == 409 && text.contains("Labels can be added from control plane 0.12.0 on"), "{got} {text}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

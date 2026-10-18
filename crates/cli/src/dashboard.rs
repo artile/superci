@@ -3296,11 +3296,12 @@ impl Dashboard {
             ("POST", "/labels") => {
                 let plane = self.plane()?;
                 let seen = view::plane_view(&plane, Some(&self.status_key));
+                // (Its version as it answers, before anything else of it is read: one that did not answer is not
+                // taken for an old one.)
+                if seen.version.is_some() && view::older(seen.version.as_deref(), "0.12.0") { return Ok(message(409, "Update the control plane first", "Labels can be added from control plane 0.12.0 on (Control plane → Update).")) }
                 let Some(status) = seen.status.clone().or_else(|| status_soon(plane.url(), &self.status_key)) else {
                     return Ok(message(503, "The control plane did not answer yet", "It is starting with a new setting. Try again in a few seconds."))
                 };
-                // (Its version as it answers: one that did not answer is not taken for an old one.)
-                if seen.version.is_some() && view::older(seen.version.as_deref(), "0.12.0") { return Ok(message(409, "Update the control plane first", "Labels can be added from control plane 0.12.0 on (Control plane → Update).")) }
                 let mut labels: Vec<String> = status["labels"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
                 if labels.is_empty() { labels.push(plane.label().to_string()) }
                 let label = field("label").to_ascii_lowercase();

@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.17
+- Adding a label on a control plane too old for more labels says to update it (it said the control plane had not answered yet).
 - Updating a control plane that does not take this computer's key says why (it said the control plane had not answered yet).
 - A dashboard page whose control plane does not take this computer's key says why after half a minute (a control plane from before 0.19.13 reads the key under its old name; a key that expired; a newer control plane), with what to do. It kept saying "Reading your control plane…".
 - `superci runs create` starts a run as GitHub's events would: its job conditions and `github.event` see the payload GitHub sends, made from the working tree (the branch, the commit, a pull request's head and base). `--label=NAME` gives the pull request labels (its action `labeled`), `--event=workflow_dispatch` with `--input=NAME=VALUE` starts it by hand (other inputs take their defaults, typed as the workflow says, a required one or a wrong value refused), and `--event-payload=FILE` puts JSON over the payload. `github.event` was empty, so a job that read it, a label's say, was always skipped. Update your control plane for it.
