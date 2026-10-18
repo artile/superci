@@ -2615,6 +2615,45 @@ fn the_debug_commands_answer_as_the_clouds_answered_and_the_pages_stay() {
 }
 
 #[test]
+fn a_change_needing_a_cloud_noted_as_ended_or_given_for_the_run_says_which() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // AWS's, Cloudflare's and Modal's sign-ins noted as ended (AWS's kept beside, as it was signed out): a change
+    // needing each says it ended.
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for k in ["aws", "aws_more"] { kept.as_object_mut().unwrap().remove(k); }
+    for k in ["aws_ended", "cloudflare_ended", "modal_ended"] { kept[k] = true.into(); }
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    for (path, fields) in [("/aws/image", vec![("region", "us-east-1")]), ("/plane/modal", vec![]), ("/runners/remove", vec![("cloud", "cloudflare")]), ("/runners/remove", vec![("cloud", "modal")]), ("/plane/aws", vec![("region", "us-east-1")])] {
+        let (got, text) = post(&mut b, path, &fields);
+        assert!(got >= 400 && (text.contains("ended") || text.contains("expired") || text.contains("no longer") || text.contains("Sign in")), "{path}: {got} {text}");
+    }
+    let _ = child.kill();
+    // Given for this run by name (SUPERCI_CLOUDFLARE_TOKEN, SUPERCI_MODAL_TOKEN_ID): what they refuse said as theirs.
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_CLOUDFLARE_TOKEN", "cf-token-given"), ("SUPERCI_MODAL_TOKEN_ID", "ak-given"), ("SUPERCI_MODAL_TOKEN_SECRET", "as-given")]);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    for (path, fields) in [("/runners/remove", vec![("cloud", "cloudflare")]), ("/runners/remove", vec![("cloud", "modal")]), ("/aws/image", vec![("region", "us-east-1")])] {
+        let (got, _) = post(&mut b, path, &fields);
+        assert!(got < 600, "{path}");
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
