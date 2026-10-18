@@ -2785,6 +2785,21 @@ fn each_test_runners_failures_are_read_from_a_jobs_log_by_the_cli_and_the_job_pa
         ("none matched", t(&["No tests found, exiting with code 1", "No test files found, exiting with code 1", "##[error]Process completed with exit code 1."])),
         ("none matched 2", t(&["Error: No tests found", "No test suite found in file src/a.test.ts", "ERROR: not found: tests/test_x.py::nothing", "======= no tests ran in 0.01s ======="])),
         ("nothing read", t(&["make: *** [Makefile:3: lint] Error 2", "##[error]Process completed with exit code 2."])),
+        // (GitLab's stream marks, colour codes, carriage returns, a byte-order mark, times that are not GitHub's.)
+        ("as gitlab writes", ["\u{feff}2026-10-15T10:00:00.000000Z 00O \u{1b}[31m FAIL \u{1b}[0m src/a.test.ts > adds\r", "2026-10-15T10:00:01.000000Z 01E+AssertionError: \u{1b}[1mboom\u{1b}[22m", "00O+      Tests  1 failed | 2 passed | 1 skipped | 1 todo (5)",
+            "2026-10-15T10:00:02 no zone mark in this line at all here", "12X not a mark", "12O-not a mark either", "1", "\u{1b}x not a colour", " FAIL  plain > not a file", "Tests  5 (5)", "Tests :1 failed (1)"].join("\n")),
+        ("long errors", t(&[&["  ● Suite › first", ""][..], &["    line"; 50][..], &["  ● Suite › second", "    one", "", "", "    after two blanks", "  ● Test suite failed to run", "  ● Console", "Tests:       2 failed, 1 skipped, 1 todo, 3 total"][..]].concat())),
+        ("playwright each way", t(&["Running 9 tests using 3 workers", "  ✓  e2e/c.spec.ts:3:1 › plain (345ms)", "  -  5 [firefox] › e2e/d.spec.ts:1:1 › skipped one", "  ✓  6 [webkit] › e2e/e.spec.ts:2:2 › layout (old layout) (1.2m)",
+            "  ✓  7 [webkit] › e2e/e.spec.ts:4:2 › slow (2h)", "  ✓  8 [webkit] › e2e/e.spec.ts:5:2 › odd (retry #x)", "  ✓  9 [webkit] › e2e/e.spec.ts:6:2 › odd2 (.5s)", "  ✓  x [webkit] › e2e/e.spec.ts:7:2 › no number (1s)",
+            "  ✘  10 [chromium] › e2e/f.spec.ts:1:1 › expected to fail (1s)", "  ✘  11 [chromium] › e2e/g.spec.ts:1:1 › again (1s)", "  ✘  12 [chromium] › e2e/g.spec.ts:1:1 › again (retry #1) (1s)",
+            "  ✓  13 [chromium] › e2e/g.spec.ts:2:1 › twice (1s)", "  ✓  14 [chromium] › e2e/g.spec.ts:2:1 › twice (1s)", "  ✓  15 [chromium] › e2e/a.spec.ts › no line", "  ✓  16 [chromium]", "  ✓  17 e2e/nofile › x",
+            "  1) [chromium] › e2e/g.spec.ts:1:1 › again ───", "    Error: no", "  2) [chromium] › short", "  1 failed", "  1 interrupted", "  2 did not run", "  1 skipped", "  1 passed in a sentence that is long", "  1 flaky"])),
+        ("pytest and cargo and go each way", t(&["= 2 passed in 0.10s =", "=== short test summary info in 1 passed ===", "====== 3 errors in 1.00s ======", "FAILED tests/a.py::test_x", "test lone ... FAILED", "test result: ok. 0 passed; 0 failed; 2 ignored",
+            "--- FAIL: TestA (0.01s)", "    --- FAIL: TestA/sub (0.00s)", "        a_test.go:3: inner", "    a_test.go:4: outer", "--- PASS: TestB (0.00s)"])),
+        ("ran nothing", t(&["[web] Running 0 tests using 1 worker", "[api] test result: ok. 0 passed; 0 failed; 0 ignored", "[web] › not a mark", "[ab]c not a mark", "[a] Error: No tests found", "[b] Error: No tests found"])),
+        ("many", t(&(0..450).map(|i| if i < 225 { format!("[one] FAILED tests/t.py::test_{i} - no") } else { format!("[two] FAILED tests/u.py::test_{i} - no") }).collect::<Vec<_>>().iter().map(String::as_str).collect::<Vec<_>>())),
+        ("many listed", t(&std::iter::once("Running 500 tests using 4 workers".to_string()).chain((0..250).map(|i| format!("  ✘  {i} [chromium] › e2e/m.spec.ts:{i}:1 › t{i} (1s)"))).chain((0..250).map(|i| format!("  ✓  {i} [chromium] › e2e/n.spec.ts:{i}:1 › t{i} (1s)"))).collect::<Vec<_>>().iter().map(String::as_str).collect::<Vec<_>>())),
+        ("many listed in two", t(&["[p] Running 2 tests using 1 worker".to_string(), "[q] Running 2 tests using 1 worker".to_string()].into_iter().chain((0..250).flat_map(|i| [format!("[p] ✘  {i} [chromium] › e2e/p.spec.ts:{i}:1 › t (1s)"), format!("[q] ✓  {i} [chromium] › e2e/q.spec.ts:{i}:1 › t (1s)"), format!("[q] ✘  {i} [chromium] › e2e/r.spec.ts:{i}:1 › t (1s)")])).collect::<Vec<_>>().iter().map(String::as_str).collect::<Vec<_>>())),
     ];
     let mut ids = vec![];
     for (name, log) in &logs {
