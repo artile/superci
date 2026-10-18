@@ -3697,6 +3697,8 @@ mark();load()})();</script>"#;
             let mut d = lock();
             if let Some(i) = plane { if i < d.planes.len() { d.selected = i } }
             if let Some(n) = new_here { d.show_setup = n }
+            // Sign-ins made elsewhere meanwhile (another terminal's `superci login`): this page has them already.
+            d.take_in();
             d.adopt_deploy();
             // Finding control planes after a sign-in asks the cloud once; afterwards this is instant.
             if let Err(e) = d.discover() {

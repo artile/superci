@@ -1709,3 +1709,30 @@ fn a_ci_with_nothing_yet_moves_to_another_control_plane_from_the_browser_and_the
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn sign_ins_made_elsewhere_while_the_dashboard_runs_are_taken_in_on_the_next_page() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.replaying(&[include_str!("../fixtures/cloudflare/01-look.jsonl"), include_str!("../fixtures/cloudflare/sign-in/usage.jsonl"), include_str!("../fixtures/modal/05-dashboard.jsonl")].concat(), &[]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("Cloudflare A Worker with its own storage Connect"));
+    // Signed in to Cloudflare and Modal elsewhere (another terminal's `superci login`): the next page has them.
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && {}", reads("A Worker with its own storage · "), reads("workspace acmeorg Set up")));
+    // AWS signed out elsewhere: the next page no longer has it.
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept.as_object_mut().unwrap().remove("aws");
+    std::fs::write(&file, kept.to_string()).unwrap();
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("Sign in"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
