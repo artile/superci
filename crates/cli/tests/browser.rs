@@ -1205,15 +1205,20 @@ fn what_an_aws_account_allows_is_said_in_its_section_as_real_accounts_answered()
         (include_str!("../fixtures/aws/project-activated/look.jsonl"), "The other 11 are refused. By its AWS organization"),
         (include_str!("../fixtures/aws/classic/look.jsonl"), "All 12 SuperCI works in"),
     ] {
-        let served = serve(|_| {});
+        // (Its control plane's own account runs jobs: AWS is a provider on Runners.)
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
         served.aws.replaying(look, &[]);
         let home = signed_in(&served);
         let (mut child, link) = dashboard(&home);
         b.goto(&format!("{link}&p=planes"));
         b.wait(&reads(said));
-        // And where machines are added, the same.
+        // And where machines are added, and on Runners its provider's row.
         b.goto(&format!("{link}&p=add-runners"));
         b.wait(&page_shows("Add a provider"));
+        b.goto(&format!("{link}&p=runners"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", reads("Runner providers")));
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
     }
