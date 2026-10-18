@@ -245,6 +245,38 @@ fn the_control_plane_is_updated_as_aws_answered_a_real_account() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+#[test]
+fn an_update_waits_for_jobs_on_cloudflare_says_a_launcher_it_could_not_update_and_what_aws_refused() {
+    // Two jobs running on its Cloudflare containers: the update waits for them.
+    let served = serve(|_| {});
+    served.connect_github();
+    for name in ["one", "two"] { let (id, q) = served.github.queue(name, "superci/provider=cloudflare", served.now_ms()); served.webhook(q); served.webhook(served.github.start(id)); }
+    let home = common::signed_in(&served);
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+    assert!(!o.status.success() && said.contains("2 jobs are running on Cloudflare"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+    // A launcher in Cloudflare, which is not signed in to here: the control plane is updated, the launcher said as not.
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{}/LAUNCHERS", superci_testkit::PLANE), r#"[{"cloud":"cloudflare","url":"https://superci-runners.acme.workers.dev"}]"#);
+    served.aws.put(&format!("/superci/{}/CONTAINERS", superci_testkit::PLANE), "off");
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("Its Cloudflare launcher was not updated: Cloudflare is not signed in to here."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+    // AWS refusing its new code (as AWS words a throttled call): said, as AWS said it.
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.fail(&format!("functions/superci-plane-{}/code", superci_testkit::PLANE), 429, &superci_testkit::json_error("TooManyRequestsException", "Rate exceeded"), None);
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("Rate exceeded"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A control plane from before 0.19.13 reads its launchers as AGENTS and its devices' keys as DASHBOARD_KEY_…: its
 /// update writes LAUNCHERS before the new version goes up, and takes the old names out once that answers.
 #[test]
