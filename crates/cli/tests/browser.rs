@@ -9641,6 +9641,13 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         let (code, said) = cli(args);
         assert!((0..=3).contains(&code) && !said.contains("panicked"), "{args:?}: {code} {said}");
     }
+    // The control plane named by its id, by its address, and by what is neither; and how long each part took.
+    for plane in [PLANE.to_string(), served.url.clone(), format!("{}/", served.url), "nosuchplane1".to_string()] {
+        let (code, said) = cli(&["status", &format!("--plane={plane}")]);
+        assert!((0..=3).contains(&code) && !said.contains("panicked"), "{plane}: {code} {said}");
+    }
+    let o = common::command(&home).args(["status"]).env("SUPERCI_TIMING", "1").output().unwrap();
+    assert!(o.status.code().is_some_and(|c| c <= 3), "{}", String::from_utf8_lossy(&o.stderr));
     let (mut child, link) = dashboard(&home);
     for p in ["runners", "settings", "repos"] {
         b.goto(&format!("{link}&p={p}"));
