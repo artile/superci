@@ -2052,6 +2052,14 @@ fn a_ci_with_nothing_yet_moves_to_another_control_plane_from_the_browser_and_the
     let health: serde_json::Value = ureq::get(&format!("{}/health", served.url)).call().unwrap().body_mut().read_json().unwrap();
     assert_eq!(health["moved_to"].as_str(), Some(new.url.as_str()), "{health}");
     assert!(!served.aws.settings("testplane0002").iter().any(|(k, _)| k == "GITHUB_APP" || k == "NAME"), "nothing it did not have");
+    // The page after: the new one in use, the old one listed as moved away (a place to move back to).
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Control plane")));
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, _) = post(&mut b, "/plane/move", &[("plane", PLANE)]);
+    assert!(got < 500, "{got}");
+    b.goto(&format!("{link}&p=planes"));
+    b.wait("document.querySelector('main') !== null");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
