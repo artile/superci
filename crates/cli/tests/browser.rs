@@ -841,3 +841,42 @@ fn another_control_plane_s_row_says_what_can_be_done_with_it_as_it_stands() {
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+fn everything_a_ci_has_comes_along_when_it_moves_to_another_control_plane_from_the_browser() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The one in use with all it can carry: GitHub and GitLab, a name, labels, Cloudflare's location and image, its
+    // own networks in AWS, a secret for runs from a computer. Another in the same account, reading its settings there.
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let plane = PLANE;
+    for (k, v) in [("NAME", "AcmeCI"), ("LABELS", r#"["acmeci","acmeci-big"]"#), ("CF_LOCATION", "weur"), ("CF_IMAGE", "https://images.example.com/full:1"),
+        ("AWS_NETWORKS", r#"{"us-east-1":{"subnets":["subnet-0123456789abcdef0"],"security_groups":["sg-0123456789abcdef0"]}}"#), ("CONTAINERS", "off")] {
+        served.aws.put(&format!("/superci/{plane}/{k}"), v);
+    }
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let home = signed_in(&served);
+    let o = common::command(&home).args(["secrets", "create", "NPM_TOKEN", "--value-env=THE_VALUE"]).env("THE_VALUE", "npm-token-for-tests").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&page_shows("Overview"));
+    b.click(".side a", "Control plane");
+    b.wait(&shows(&new.url));
+    b.click("main button", "Move here");
+    b.wait("document.querySelector('dialog[open]') !== null");
+    b.click("dialog[open] button.primary", "");
+    // The new one, in use, has it all.
+    let has = |k: &str| served.aws.settings("testplane0002").into_iter().find(|(n, _)| n == k).map(|(_, v)| v);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "moved: {:?}; page {}", served.aws.settings("testplane0002").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), b.eval("document.querySelector('main').innerText.slice(0, 600)")); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    for k in ["GITHUB_APP", "GITLAB", "NAME", "LABELS", "CF_LOCATION", "CF_IMAGE", "AWS_NETWORKS"] { assert!(has(k).is_some(), "{k}: {:?}", served.aws.settings("testplane0002")) }
+    assert_eq!(has("NAME").as_deref(), Some("AcmeCI"));
+    assert!(served.aws.settings("testplane0002").iter().any(|(k, _)| k.starts_with("SECRET_")), "the secret came along");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
