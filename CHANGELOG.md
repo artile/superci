@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.18
+- A change's note in the dashboard ("Removed Cloudflare. Left: …") is shown once its page has loaded. A page still loading took it, and it was not shown.
+
 ## 0.19.17 — 2026-10-18
 - `superci planes create cloudflare` after the Cloudflare sign-in ended says it ended (it said to sign in), and a Modal token given in SUPERCI_MODAL_TOKEN_ID that Modal refuses is said as Modal refused it (it was dropped, and the command said to sign in).
 - A cloud that does not answer at all (Modal or Cloudflare down, say) is a note on each dashboard page, which shows what the other clouds have and keeps working: every page said "Could not reach your cloud", even with the control plane in AWS. `superci planes list` notes it too, and a command that needs that cloud says it did not answer (it said to sign in).
