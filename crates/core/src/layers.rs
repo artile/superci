@@ -118,10 +118,11 @@ pub const PLAN_MS: u64 = 7 * 86_400_000;
 /// (a pull of them is mostly asking the registry), and the store's switch at the machine's start would be waited for.
 pub const PLAN_BYTES: u64 = 256 << 20;
 
-/// What a machine of a job gets, from what the job's last run had and pulled (`Images`): the store set up at its start,
-/// on a disk of its own, only when that run used `PLAN_BYTES` of images; else Docker exactly as it comes (nothing to
-/// wait for, nothing to pay for). (Kept in memory instead, a layer that did not fit was pulled as usual after its
-/// fetch had begun: slower than no store.)
+/// What a machine of a job gets, from what the job's last run had and pulled (`Images`), or else the last of its
+/// repository's jobs that used images (`repo_images_key`: a new job, a new workflow, has the layers its repository's
+/// other jobs kept): the store set up at its start, on a disk of its own, only when that run used `PLAN_BYTES` of
+/// images; else Docker exactly as it comes (nothing to wait for, nothing to pay for). (Kept in memory instead, a layer
+/// that did not fit was pulled as usual after its fetch had begun: slower than no store.)
 pub fn plan(last: Option<&Images>, now: u64) -> bool {
     last.filter(|l| now.saturating_sub(l.at) < PLAN_MS).is_some_and(|l| l.served_bytes + l.pulled_bytes >= PLAN_BYTES)
 }
@@ -131,6 +132,11 @@ pub fn plan(last: Option<&Images>, now: u64) -> bool {
 pub fn images_key(repo: &str, workflow: &str, name: &str) -> String {
     format!("limg:{}:{}", repo.to_ascii_lowercase(), &crate::crypto::sha256_hex(format!("{workflow}\n{name}").as_bytes())[..16])
 }
+
+/// Where the last word of a repository's job that used images (`plan`'s bytes) is kept: for a job of it with none of
+/// its own. (What its layers are, fetched ahead at a machine's start, is the job's own only: another job's would fill a
+/// machine with layers its job may not use.)
+pub fn repo_images_key(repo: &str) -> String { format!("limg:{}:repo", repo.to_ascii_lowercase()) }
 
 /// An upload link given to a machine: for which layer, of which repository, to where.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -417,7 +423,10 @@ impl ControlPlane<'_> {
         let Some(mut job) = self.job_of_machine(machine).await? else { return Ok(Response::text(404, "no job of this machine")) };
         said.used.retain(|d| is_digest(d));
         said.used.truncate(500);
-        if !job.repo.is_empty() { self.store.put_until(&images_key(&job.repo, &job.workflow, &job.name), serde_json::to_string(&said).map_err(|e| e.to_string())?, now + PLAN_MS).await?; }
+        if !job.repo.is_empty() {
+            self.store.put_until(&images_key(&job.repo, &job.workflow, &job.name), serde_json::to_string(&said).map_err(|e| e.to_string())?, now + PLAN_MS).await?;
+            if plan(Some(&said), now) { self.store.put_until(&repo_images_key(&job.repo), serde_json::to_string(&Images { used: vec![], ..said.clone() }).map_err(|e| e.to_string())?, now + PLAN_MS).await?; }
+        }
         job.images = Some(Images { used: vec![], ..said });
         self.keep_job(&job).await?;
         Ok(Response::json(&json!({})))
