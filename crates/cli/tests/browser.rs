@@ -602,6 +602,26 @@ fn a_secret_for_runs_from_a_computer_is_added_in_settings_listed_without_its_val
     b.click("nav a", "Settings");
     b.wait(&page_shows("DEPLOY_KEY"));
 
+    // The same one again: kept already, nothing changed. A new value for one not kept: refused; for this one: taken.
+    let (got, text) = post(&mut b, "/secrets/add", &[("name", "DEPLOY_KEY"), ("value", "again"), ("repo", "acme/app"), ("branch", "release/*")]);
+    assert!(got == 409 && text.contains("kept for") && text.contains("already"), "{got} {text}");
+    let cli = |args: &[&str]| { let o = common::command(&home).args(args).env("THE_VALUE", "deploy-value-0002").output().unwrap(); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (ok, said) = cli(&["secrets", "update", "NOT_KEPT", "--value-env=THE_VALUE"]);
+    assert!(!ok && said.contains("is not kept"), "{said}");
+    let (ok, said) = cli(&["secrets", "update", "DEPLOY_KEY", "--repo=acme/app", "--branch=release/*", "--value-env=THE_VALUE"]);
+    assert!(ok, "{said}");
+    assert!(kept()[0].1.contains("deploy-value-0002"), "{:?}", kept());
+    // A hundred kept: no more.
+    for n in 0..99 {
+        let stored = superci_core::secrets::Stored { name: format!("S{n}"), value: "v".into(), scope: Default::default(), updated_ms: 1 };
+        served.aws.put(&format!("/superci/{PLANE}/{}", superci_core::secrets::setting(&format!("S{n}"), &Default::default())), &serde_json::to_string(&stored).unwrap());
+    }
+    let (got, text) = post(&mut b, "/secrets/add", &[("name", "ONE_MORE"), ("value", "v")]);
+    assert!(got == 409 && text.contains("100 secrets at most"), "{got} {text}");
+    served.aws.params.lock().unwrap().retain(|k, _| !k.contains("/SECRET_S"));
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&page_shows("DEPLOY_KEY"));
+
     // Removed.
     b.eval("window.confirm = () => true");
     b.click(r#"form[action="/secrets/remove"] button"#, "Remove");
@@ -2697,6 +2717,7 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
     let budget = superci_testkit::ec2_error("UnauthorizedOperation", &format!("You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane-testplane0001/superci is not authorized to perform: ec2:RunInstances with an explicit deny in an identity-based policy: arn:aws:iam::111111111111:policy/{}", superci_core::aws::stop_policy_name(PLANE)));
     let singles: Vec<(&str, u16, String)> = vec![("its subnet gone", 400, superci_testkit::ec2_error("InvalidSubnetID.NotFound", "The subnet ID 'subnet-00000000000000001' does not exist")),
         ("its security group gone", 400, superci_testkit::ec2_error("InvalidGroup.NotFound", "The security group 'sg-00000000000000001' does not exist")),
+        ("its security group id malformed", 400, superci_testkit::ec2_error("InvalidSecurityGroupID.Malformed", "Invalid id: \"sg-x\"")),
         ("its image gone", 400, superci_testkit::ec2_error("InvalidAMIID.NotFound", "The image id '[ami-00000000000000001]' does not exist")),
         ("too many requests", 503, superci_testkit::ec2_error("RequestLimitExceeded", "Request limit exceeded.")),
         ("spot refused by the organization", 403, scp), ("stopped by AWS's budget", 403, budget)];
@@ -7269,7 +7290,7 @@ fn a_job_nothing_can_run_is_failed_by_a_small_runner_wherever_one_starts_and_its
     let cases: Vec<(&str, bool, Vec<(&str, &str)>, bool, bool)> = vec![
         ("on AWS", true, vec![("CONTAINERS", "off")], true, true),
         ("AWS refusing, on-demand off", true, vec![("CONTAINERS", "off"), ("ROUTING", r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand","off":true}]}"#)], false, false),
-        ("through a Modal launcher", false, vec![("CONTAINERS", "off"), ("LAUNCHERS", modal)], true, false),
+        ("through a Modal launcher", false, vec![("CONTAINERS", "off"), ("LAUNCHERS", modal)], true, true),
         ("nowhere", false, vec![("CONTAINERS", "off")], true, false),
     ];
     for (what, with_aws, settings, aws_starts, fails_fast) in cases {
@@ -7335,6 +7356,141 @@ fn jobs_github_never_told_of_are_found_by_asking_and_started_and_their_pages_say
         b.goto(&format!("{link}&p=job&id={id}"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
     }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Jobs through launchers in Cloudflare (with GitHub's full image) and Modal (one with a GPU), each started as the
+/// launcher answered and stopped once over; a GitLab job Modal cannot run; and both launchers refusing what a job
+/// asks, which fails it at once. Each job's page says where it ran, or why not.
+#[test]
+fn jobs_through_cloudflare_and_modal_launchers_start_stop_and_are_refused_as_each_launcher_answered() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let launchers = r#"[{"cloud":"cloudflare","url":"https://superci-runners.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#;
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    for (k, v) in [("CONTAINERS", "off"), ("LAUNCHERS", launchers), ("CF_IMAGE", "https://images.example.com/full:1")] { served.aws.put(&format!("/superci/{PLANE}/{k}"), v) }
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let job = |label: &str| { let (id, q) = served.github.queue(label, label, served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let on_cf = job("superci");
+    let on_modal = job("superci/provider=modal/gpu=t4");
+    for (id, cloud) in [(on_cf, "cloudflare"), (on_modal, "modal")] { assert!(state(id)["state"] == "launched" && state(id)["cloud"] == cloud, "{cloud}: {}", state(id)) }
+    let image_sent = served.github.asked.lock().unwrap().iter().any(|a| a.contains("workers.dev/launch"));
+    assert!(image_sent, "{:?}", served.github.asked.lock().unwrap());
+    for id in [on_cf, on_modal] {
+        assert!(served.webhook(served.github.start(id)) < 300);
+        assert!(served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms())) < 300);
+    }
+    // A GitLab job: not on Modal (it runs no Docker); on Cloudflare.
+    let (gl, p) = served.gitlab.pending("gitlab", &["superci/provider=modal"], served.now_ms());
+    assert!(served.gitlab_webhook(p) < 300);
+    // Both launchers refusing what the job asks: it fails at once, saying each.
+    served.github.fail("POST", "/launch", 400, "no such size");
+    let refused = job("superci/cpu=2");
+    served.github.fail_none();
+    assert_eq!(state(refused)["state"], "failed", "{}", state(refused));
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let _ = gl;
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// How AWS's spot machines stand for each job: paused after AWS took two back (on-demand), not allowed for the role
+/// lately, none now with on-demand at its limit (waits), kept off spot with on-demand at its limit (back on spot),
+/// stopped by AWS's budget everywhere; a machine family with its own disk, memory alone asked, Windows with its
+/// files in memory or behind no public address, a wait under the spot limit over, a job from before labels were
+/// kept, Docker's images kept from the start. Each job's page says how it stands.
+#[test]
+fn each_way_aws_spot_machines_stand_decides_how_a_job_starts_and_its_page_says_so() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let fresh = || { served.aws.fail_none(); served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:") && !k.starts_with("spot:")); served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string()); };
+    let job = |label: &str| { let (id, q) = served.github.queue(label, label, served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let no_room = superci_testkit::ec2_error("InsufficientInstanceCapacity", "no");
+    let at_limit = superci_testkit::ec2_error("VcpuLimitExceeded", "You have requested more vCPU capacity than your current vCPU limit");
+    let budget = superci_testkit::ec2_error("UnauthorizedOperation", &format!("You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane-testplane0001/superci is not authorized to perform: ec2:RunInstances with an explicit deny in an identity-based policy: arn:aws:iam::111111111111:policy/{}", superci_core::aws::stop_policy_name(PLANE)));
+    let mut ids = vec![];
+    // Paused after AWS took two spot machines back a moment ago: on-demand.
+    fresh();
+    for n in 0..2 { served.store.0.lock().unwrap().insert(format!("spot:interrupted:{}:{n}", served.now_ms() - 60_000 - n), (served.now_ms() - 60_000).to_string()); }
+    served.aws.fail("RunInstances", 200, &started, None);
+    let paused = job("superci");
+    assert_eq!(state(paused)["on_demand"], true, "{}", state(paused));
+    ids.push(paused);
+    // Spot not allowed for the role lately: on-demand straight away.
+    fresh();
+    served.store.0.lock().unwrap().insert("aws:spot-not-allowed".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let not_allowed = job("superci");
+    assert_eq!(state(not_allowed)["on_demand"], true, "{}", state(not_allowed));
+    ids.push(not_allowed);
+    // No spot machine now, on-demand at the account's limit: it waits for a spot one.
+    fresh();
+    served.aws.fail("RunInstances|MarketType", 400, &no_room, None);
+    served.aws.fail("RunInstances", 400, &at_limit, None);
+    let waits = job("superci");
+    // (Its other spot pools asked round by round first.)
+    for _ in 0..10 { if !state(waits)["error"].as_str().unwrap_or_default().contains("other spot pools") { break } served.later(25_000); served.upkeep(); }
+    assert!(state(waits)["error"].as_str().unwrap_or_default().starts_with("waiting: AWS has no spot machine for it now, and your AWS account's on-demand limit"), "{}", state(waits));
+    ids.push(waits);
+    // Kept off spot (paused), on-demand at its limit: a spot machine is asked for after all.
+    fresh();
+    for n in 0..2 { served.store.0.lock().unwrap().insert(format!("spot:interrupted:{}:{n}", served.now_ms() - 60_000 - n), (served.now_ms() - 60_000).to_string()); }
+    served.aws.fail("RunInstances|MarketType", 200, &started, None);
+    served.aws.fail("RunInstances", 400, &at_limit, None);
+    let back = job("superci");
+    for _ in 0..10 { if !state(back)["error"].as_str().unwrap_or_default().contains("other spot pools") && state(back)["state"] != "waiting" { break } served.later(25_000); served.upkeep(); }
+    ids.push(back);
+    // AWS's budget stopping every new machine: said, and not tried again and again.
+    fresh();
+    served.aws.fail("RunInstances", 403, &budget, None);
+    let stopped = job("superci");
+    ids.push(stopped);
+    // A family with its own disk (as AWS gave one), memory alone asked, Windows in memory and Windows with no public
+    // address for its cache, Docker's images kept from the start on Ubuntu 26.04 (its files in memory too).
+    fresh();
+    served.aws.fail("RunInstances", 200, &started.replace("c8a.xlarge", "m6id.xlarge"), None);
+    let local = job("superci/family=m6id");
+    assert_eq!(state(local)["local_disk"], true, "{}", state(local));
+    served.aws.fail_none();
+    served.aws.fail("RunInstances", 200, &started, None);
+    for label in ["superci/ram=16", "superci/os=windows/scratch=ramdisk", "superci/os=windows", "superci/image=ubuntu26/docker-cache=true", "superci/image=ubuntu26/docker-cache=true/scratch=ramdisk"] { ids.push(job(label)) }
+    // Waiting under the spot limit for longer than it waits: asked again now; a waiting job with no label kept.
+    let (limit_wait, q) = served.github.queue("waited under the spot limit", "superci", served.now_ms());
+    served.aws.fail_none();
+    served.aws.fail("RunInstances", 400, &no_room, None);
+    assert!(served.webhook(q) < 300);
+    let (no_label, q) = served.github.queue("no label kept", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let long_ago = served.now_ms() - 5 * 60_000;
+    edit(limit_wait, &|j| { j["state"] = "waiting".into(); j["spot_limit_wait"] = long_ago.into(); });
+    edit(no_label, &|j| { j["state"] = "waiting".into(); j["label"] = "".into(); });
+    fresh();
+    served.aws.fail("RunInstances", 200, &started, None);
+    served.later(30_000);
+    served.upkeep();
+    assert_eq!(state(limit_wait)["state"], "launched", "{}", state(limit_wait));
+    ids.extend([limit_wait, no_label]);
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    seen_in_browser(&served);
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -8246,6 +8402,25 @@ fn finished_jobs_logs_are_read_whole_kept_for_the_next_opens_and_raw_ones_go_to_
     assert!(status < 500, "{status}");
     let (status, _) = get(&mut b, "/job/view?id=1&gl=Bad!");
     assert_eq!(status, 400);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn two_gitlabs_are_each_listed_on_the_permissions_card_and_repositories() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gsecond"), r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gsecond"}"#);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (p, said) in [("planes", "Permissions"), ("repos", "GitLab")] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", reads(said)));
+    }
+    b.goto(&format!("{link}&p=gitlab&g=gsecond"));
+    b.wait(&shows("GitLab"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

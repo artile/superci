@@ -432,10 +432,29 @@ impl Http for GitHub {
         self.asked.lock().unwrap().push(format!("{} {}", r.method, r.url));
         let failed = self.hub.lock().unwrap().failing.iter().find(|(m, part, ..)| *m == r.method && r.url.contains(part.as_str())).map(|(_, _, s, a)| (*s, a.clone()));
         if let Some((status, answer)) = failed { return Ok(Response::new(status, "application/json", answer)) }
+        if let Some(answer) = launcher(&r, self.asked.lock().unwrap().len()) { return Ok(answer) }
         Ok(self.answer(&r).unwrap_or_else(|| {
             self.unanswered.lock().unwrap().push(format!("{} {}", r.method, r.url));
             Response::new(404, "text/plain", format!("not here: {} {}", r.method, r.url))
         }))
+    }
+}
+
+/// A launcher in Modal (`*.modal.run`) or Cloudflare (`*.workers.dev`), as it answers a control plane: a sandbox or
+/// container started for a job (Modal runs no Docker for a GitLab job), one stopped.
+fn launcher(r: &Request, n: usize) -> Option<Response> {
+    let url = url::Url::parse(&r.url).ok()?;
+    let host = url.host_str()?;
+    let modal = host.ends_with(".modal.run");
+    if !(modal || host.ends_with(".workers.dev")) || r.method != "POST" { return None }
+    let body: Value = serde_json::from_slice(&r.body).unwrap_or_default();
+    let ok = |v: Value| Some(Response::new(200, "application/json", v.to_string()));
+    match url.path() {
+        "/launch" if modal && body["gitlab"].is_object() => Some(Response::new(400, "application/json", json!({ "detail": "Modal runs no Docker for GitLab jobs" }).to_string())),
+        "/launch" if modal => ok(json!({ "id": format!("sb-{n:022}"), "kind": "sandbox" })),
+        "/launch" => ok(json!({ "id": format!("{n:064x}"), "kind": "standard-2" })),
+        "/stop" => ok(json!({ "stopped": true })),
+        _ => None,
     }
 }
 
