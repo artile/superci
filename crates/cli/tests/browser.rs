@@ -3232,7 +3232,7 @@ mod github_in_browser {
             (serde_json::json!({ "state": "failed", "cloud": "cloudflare", "error": "the container cannot be kept running" }), "Cloudflare could not keep its container running"),
             (serde_json::json!({ "state": "failed", "cloud": "", "error": format!("waiting: {}", "x".repeat(130)) }), &"…"),
             (serde_json::json!({ "state": "swept", "cloud": "aws", "error": null }), "Its machine never started the job"),
-            (serde_json::json!({ "state": "orphan", "cloud": "aws", "error": null }), "Its machine was lost"),
+            (serde_json::json!({ "state": "orphan", "cloud": "aws", "error": null }), "Cancelled"),
             // Kept off on-demand before its cloud is said; a RAM disk at more than AWS's own speed; spot again, but on
             // an on-demand machine after all, or on Cloudflare (neither said to be on spot again).
             (serde_json::json!({ "state": "launching", "cloud": "", "spot_again": true }), "On a spot machine again"),
@@ -6676,6 +6676,56 @@ fn the_sweep_places_a_cut_off_start_again_settles_what_a_machine_sent_and_takes_
     let (mut child, link) = dashboard(&home);
     for (id, said) in [(cut, "Status"), (thrice, "three times"), (ran, "Passed"), (gone, "Status")] {
         b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        assert!(page.contains(said), "job {id}: no {said:?} ({}):\n{page}", state(id));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitLab's jobs on AWS: one whose spot machine AWS takes back, retried at GitLab and run again off spot machines; an
+/// event delivered twice; one taken by another job's runner; one cancelled while its machine starts. Each job's page
+/// says how it went.
+#[test]
+fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_said_on_their_pages() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.connect_gitlab();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let state = |id: u64| served.store.under(&format!("job:gl{id}"))[0].1.clone();
+    let agent = ureq::Agent::new_with_defaults();
+    let say = |q: &str| agent.post(&format!("{}/{q}", served.url)).send("").map(|r| r.status().as_u16()).unwrap_or_else(|e| match e { ureq::Error::StatusCode(c) => c, _ => 0 });
+    // Taken back: its machine says so, GitLab fails the job, and SuperCI asks GitLab to run it again.
+    let (back, p) = served.gitlab.pending("e2e", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(p.clone()) < 300);
+    assert!(served.gitlab_webhook(p) < 300, "the same event again: known");
+    let notice = state(back)["notice"].as_str().expect("its machine's link to say AWS takes it back").to_string();
+    served.gitlab_webhook(served.gitlab.running(back, served.now_ms()));
+    assert_eq!(say(&format!("interrupted?gl={back}&t={notice}")), 200);
+    served.gitlab_webhook(served.gitlab.finish(back, "failed", "ERROR: Job failed: the runner was stopped", served.now_ms()));
+    assert!(served.gitlab.asked.lock().unwrap().iter().any(|a| a.contains(&format!("/jobs/{back}/retry"))), "GitLab asked to run it again");
+    // Taken by another job's runner: its own machine's job then runs as the other job.
+    let (x, p) = served.gitlab.pending("lint", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    let (y, p) = served.gitlab.pending("build", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    let ry = state(y)["runner_id"].as_u64().expect("its runner");
+    served.gitlab_webhook(served.gitlab.running_on(x, ry, served.now_ms()));
+    // Cancelled while its machine starts.
+    let (z, p) = served.gitlab.pending("deploy", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    served.gitlab_webhook(served.gitlab.finish(z, "canceled", "", served.now_ms()));
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (id, said) in [(back, "AWS took back its spot machine"), (x, "Status"), (y, "Status"), (z, "Cancelled")] {
+        b.goto(&format!("{link}&p=job&id={id}&gl="));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
         let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
         assert!(page.contains(said), "job {id}: no {said:?} ({}):\n{page}", state(id));

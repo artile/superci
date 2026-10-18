@@ -309,7 +309,7 @@ fn given_key() -> Option<(String, String)> {
 /// What a command that looks reads: the control plane, and the key it is read with. With a key given by name: that
 /// control plane, with no sign-in. Else the one in use, with this machine's key.
 /// A job that failed: its runner ran it and it failed, or it never ran.
-fn failed_job(j: &Value) -> bool { j["conclusion"] == "failure" || ["failed", "swept", "orphan"].contains(&j["state"].as_str().unwrap_or_default()) }
+fn failed_job(j: &Value) -> bool { j["conclusion"] == "failure" || ["failed", "swept"].contains(&j["state"].as_str().unwrap_or_default()) }
 
 /// What a job's whole log says of its tests (`test_results`), and where its artifacts are: a run from a computer's
 /// by name (`superci artifacts retrieve`), a code host's at its run's page.

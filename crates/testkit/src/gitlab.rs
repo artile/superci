@@ -83,6 +83,16 @@ impl GitLab {
         self.event(id)
     }
 
+    /// Taken by this runner (any made here), as GitLab gives a job to any runner with its tags: its event.
+    pub fn running_on(&self, id: u64, runner: u64, now_ms: u64) -> Vec<u8> {
+        {
+            let mut lab = self.lab.lock().unwrap();
+            let j = lab.jobs.get_mut(&id).unwrap();
+            for (k, v) in [("status", json!("running")), ("started_at", json!(iso(now_ms))), ("queued_duration", json!(1.2)), ("runner", json!({ "id": runner, "description": format!("runner {runner}"), "active": true, "paused": false, "is_shared": false, "runner_type": "project_type", "name": "gitlab-runner", "online": true, "status": "online" }))] { j[k] = v }
+        }
+        self.event(id)
+    }
+
     /// It ended (`success`, `failed`), with its log.
     pub fn finish(&self, id: u64, status: &str, log: &str, now_ms: u64) -> Vec<u8> {
         {

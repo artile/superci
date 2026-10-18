@@ -441,8 +441,9 @@ fn job_ended(j: &serde_json::Value) -> (&'static str, &'static str) {
         ("done", Some("cancelled")) => ("", "Cancelled"),
         ("done", Some("skipped" | "neutral")) => ("", "Skipped"),
         ("done", _) => ("good", "Done"),
-        ("failed" | "orphan" | "swept", _) => ("bad", "Failed"),
-        ("cancelled", _) => ("", "Cancelled"),
+        ("failed" | "swept", _) => ("bad", "Failed"),
+        // (An orphan is a job cancelled while its machine came up: that machine is ended unless it takes another job.)
+        ("cancelled" | "orphan", _) => ("", "Cancelled"),
         ("running", _) => ("accent", "Running"),
         ("waiting", _) => ("open", "Waiting"),
         _ => ("open", "Starting"),
@@ -452,7 +453,7 @@ fn job_ended(j: &serde_json::Value) -> (&'static str, &'static str) {
 /// A job as commands say it: how it stands, what it is (its name, repository and workflow), the runner it got, how
 /// long it ran, what it cost, and why (when it failed or waits): the words the Jobs page has.
 pub fn job_words(j: &serde_json::Value) -> serde_json::Value {
-    let state = match j["state"].as_str().unwrap_or_default() { "done" => "done", "failed" | "orphan" | "swept" => "failed", "cancelled" => "cancelled", "running" => "running", "waiting" => "waiting", _ => "starting" };
+    let state = match j["state"].as_str().unwrap_or_default() { "done" => "done", "failed" | "swept" => "failed", "cancelled" | "orphan" => "cancelled", "running" => "running", "waiting" => "waiting", _ => "starting" };
     let (title, sub) = job_names(j);
     let why = if ["failed", "waiting"].contains(&state) { plain_reason(j) } else { off_spot(j).map(|(why, _)| why).unwrap_or_default() };
     // (How the job itself ended, where a machine ran it to its end: `passed`, `failed`, …; apart from `state`.)
@@ -1071,7 +1072,7 @@ fn plain_reason(j: &serde_json::Value) -> String {
     let Some(e) = j["error"].as_str() else {
         return match state {
             "swept" => "Its machine never started the job".into(),
-            "orphan" => "Its machine was lost".into(),
+            "orphan" => "Cancelled while its machine came up; the machine is ended unless it takes another job".into(),
             "waiting" => "Waiting for a free runner".into(),
             // It ran: its steps say how it went (a failed one in its log).
             "done" | "running" => String::new(),
@@ -6199,7 +6200,7 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
     let now = now_ms();
     let day: Vec<&serde_json::Value> = jobs.iter().filter(|j| now.saturating_sub(j["at_ms"].as_u64().unwrap_or_default()) < 86_400_000).collect();
     let state = |j: &serde_json::Value| j["state"].as_str().unwrap_or_default().to_string();
-    let failed: Vec<&&serde_json::Value> = day.iter().filter(|j| ["failed", "orphan", "swept"].contains(&state(j).as_str())).collect();
+    let failed: Vec<&&serde_json::Value> = day.iter().filter(|j| ["failed", "swept"].contains(&state(j).as_str())).collect();
     let waiting: Vec<&&serde_json::Value> = day.iter().filter(|j| state(j) == "waiting").collect();
     let running = day.iter().filter(|j| ["launching", "launched", "running"].contains(&state(j).as_str())).count();
     let ran = day.iter().filter(|j| j["started_ms"].as_u64().is_some()).count();
@@ -6234,7 +6235,7 @@ fn overview_cards(v: &PlaneView, jobs: &[serde_json::Value], period: &str) -> St
     let mut hours = [(0u32, 0u32); 24];
     for j in &day {
         let hour = &mut hours[slot(j)];
-        if ["failed", "orphan", "swept"].contains(&state(j).as_str()) { hour.1 += 1 } else { hour.0 += 1 }
+        if ["failed", "swept"].contains(&state(j).as_str()) { hour.1 += 1 } else { hour.0 += 1 }
     }
     let jobs_spark = spark(&hours.iter().enumerate().map(|(i, (ok, bad))| (*ok as f64, *bad as f64, format!("{}: {ok} ran{}", hour_name(i), if *bad > 0 { format!(", {bad} did not") } else { String::new() }))).collect::<Vec<_>>());
     let jobs_kpi = kpi(day.len().to_string(), if day.len() == 1 { "job" } else { "jobs" }, jobs_spark,

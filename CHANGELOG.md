@@ -5,6 +5,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 ## 0.19.18
 - A change's note in the dashboard ("Removed Cloudflare. Left: …") is shown once its page has loaded. A page still loading took it, and it was not shown.
 - A job with nowhere to run names the operating systems as they are written: "Nowhere to run Windows: Cloudflare runs Linux only" (it said "windows" and "linux").
+- A job cancelled while its machine came up shows as Cancelled, saying its machine is ended unless it takes another job. It showed as Failed ("Its machine was lost") and counted among the failures.
 
 ## 0.19.17 — 2026-10-18
 - `superci planes create cloudflare` after the Cloudflare sign-in ended says it ended (it said to sign in), and a Modal token given in SUPERCI_MODAL_TOKEN_ID that Modal refuses is said as Modal refused it (it was dropped, and the command said to sign in).
