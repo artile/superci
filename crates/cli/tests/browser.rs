@@ -7011,7 +7011,8 @@ fn a_control_plane_is_updated_from_its_page_its_launchers_with_it_or_said_as_not
     let cases: Vec<Case> = vec![
         ("from before the new names", None, false, false, "Updated to"),
         ("with launchers in Cloudflare and Modal, both signed in", Some(r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners-testplane0001.modal.run"}]"#), true, false, "Updated to"),
-        ("with a launcher in Cloudflare, not signed in", Some(r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#), false, false, "Its Cloudflare launcher was not updated"),
+        ("with a launcher in Cloudflare, not signed in", Some(r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#), false, false, "Cloudflare is not signed in to here"),
+        ("with a launcher in Cloudflare, its sign-in ended", Some(r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#), false, false, "the Cloudflare sign-in has expired"),
         ("AWS refusing its new code", None, false, true, "Rate exceeded"),
     ];
     for (what, launchers, clouds, refuse, said) in cases {
@@ -7029,6 +7030,12 @@ fn a_control_plane_is_updated_from_its_page_its_launchers_with_it_or_said_as_not
             for host in [format!("superci-runners-{PLANE}.acme.workers.dev"), format!("acmeorg--superci-runners-{PLANE}.modal.run")] { w.insert(host, served.url.clone()); }
         } else {
             served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+        }
+        if what.contains("sign-in ended") {
+            let file = home.join("workspaces/default/sign-ins.json");
+            let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            kept["cloudflare_ended"] = true.into();
+            std::fs::write(&file, kept.to_string()).unwrap();
         }
         if refuse { served.aws.fail(&format!("functions/superci-plane-{PLANE}/code"), 429, &superci_testkit::json_error("TooManyRequestsException", "Rate exceeded"), None) }
         // A control plane from before 0.19.13, with its settings under their old names: the page offers the update.
@@ -8630,6 +8637,11 @@ fn an_update_waits_for_the_jobs_running_on_cloudflare_saying_how_many() {
     b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
     let (got, text) = post(&mut b, "/plane/update", &[]);
     assert!(got == 409 && text.contains("2 jobs are running on Cloudflare"), "{got} {text}");
+    // One of them over: the other said alone.
+    let first = served.store.under("job:").into_iter().filter_map(|(_, j)| j["job_id"].as_u64()).min().unwrap();
+    served.webhook(served.github.finish(first, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    let (got, text) = post(&mut b, "/plane/update", &[]);
+    assert!(got == 409 && text.contains("1 job is running on Cloudflare"), "{got} {text}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
