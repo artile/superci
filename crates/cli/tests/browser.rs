@@ -7043,3 +7043,95 @@ fn a_finished_cloudflare_jobs_cost_is_settled_at_what_cloudflare_measured() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Control planes of each kind deployed, given runners, moved and deleted from the dashboard, as Cloudflare and Modal
+/// answered a real account: a Cloudflare one with its containers and a Modal launcher, everything moved to a Modal
+/// one, Cloudflare's launcher taken out there, both deleted. Each step read on its page.
+#[test]
+fn control_planes_of_each_kind_are_deployed_moved_and_deleted_from_the_dashboard_as_their_clouds_answered() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00002", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00002/CONTAINERS");
+    let aws = served.aws.clone();
+    let md = superci_testkit::serve_as("mdplane00002", move |c| {
+        let settings = aws.modal_plane_settings();
+        c.read_settings(&settings);
+        c.own_cloud = "modal".into();
+        c.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+    });
+    md.aws.params.lock().unwrap().remove("/superci/mdplane00002/CONTAINERS");
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00002.modal.run".into(), md.url.clone());
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-runners-cfplane00002.modal.run".into(), md.url.clone());
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let step = |name: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/move/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    // A dashboard for each step (a deploy names its new control plane as it starts), its form posted from its page.
+    let open = |b: &mut Browser, id: &str| { let (child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", id), ("SUPERCI_VIEWS_S", "0")]); b.goto(&link); b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap())); (child, link) };
+    let until_page = |b: &mut Browser, link: &str, page: &str, text: &str| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            b.goto(&format!("{link}&{page}"));
+            b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+            let t = b.eval("document.body.innerText").as_str().unwrap_or_default().to_string();
+            if t.contains(text) { return }
+            assert!(std::time::Instant::now() < end, "{page}: no {text:?}:\n{t}");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    };
+    // Deployed: a Cloudflare one in its account, then a Modal one.
+    step("01-deploy-cf");
+    let (child, link) = open(&mut b, "cfplane00002");
+    let (got, text) = post(&mut b, "/plane/cloudflare", &[("account", "1111111111111111111111111111111a")]);
+    assert!(got < 400, "{got} {text}");
+    until_page(&mut b, &link, "p=planes", "superci.acme.workers.dev");
+    drop(child);
+    step("02-deploy-modal");
+    let (child, link) = open(&mut b, "mdplane00002");
+    let (got, text) = post(&mut b, "/plane/modal", &[]);
+    assert!(got < 400, "{got} {text}");
+    until_page(&mut b, &link, "p=planes", "acmeorg--superci-plane-mdplane00002");
+    drop(child);
+    // The Cloudflare one: its own containers, and Modal's sandboxes through a launcher deployed in Modal.
+    step("03-cf-containers");
+    let (child, link) = open(&mut b, "");
+    let (got, text) = post(&mut b, "/runners/cloudflare?c=cfplane00002", &[]);
+    assert!(got < 400, "{got} {text}");
+    step("04-cf-modal-agent");
+    let (got, text) = post(&mut b, "/runners/modal?c=cfplane00002", &[]);
+    assert!(got < 400, "{got} {text}");
+    until_page(&mut b, &link, "c=cfplane00002&p=runners", "Modal");
+    drop(child);
+    // Everything moved to the Modal one; the Cloudflare one says where it went.
+    step("06-dashboard");
+    step("07-move");
+    let (child, link) = open(&mut b, "");
+    let (got, text) = post(&mut b, "/plane/move?c=cfplane00002", &[("plane", "mdplane00002")]);
+    assert!(got < 400, "{got} {text}");
+    until("moved", || cf.store.under("moved_to").len() == 1);
+    step("08-after-move");
+    until_page(&mut b, &link, "c=mdplane00002&p=runners", "Cloudflare");
+    drop(child);
+    // Cloudflare's launcher taken out of the Modal one; then both deleted.
+    step("09-md-remove-cf");
+    let (child, link) = open(&mut b, "");
+    let (got, text) = post(&mut b, "/runners/remove?c=mdplane00002", &[("cloud", "cloudflare")]);
+    assert!(got < 400, "{got} {text}");
+    step("10-delete-cf");
+    let (got, text) = post(&mut b, "/plane/delete?c=mdplane00002", &[("plane", "cfplane00002")]);
+    assert!(got < 400, "{got} {text}");
+    until_page(&mut b, &link, "c=mdplane00002&p=planes", "Deleted");
+    drop(child);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
