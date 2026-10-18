@@ -9733,7 +9733,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["connections", "create", "gitlab"], vec!["connections", "create", "gitlab", "--token-env=GITLAB_TOKEN_FOR_TESTS", "--dry-run"], vec!["connections", "list", "--json"],
         vec!["projects", "update", "--enabled=true", "--all", "--dry-run"], vec!["projects", "update", "--enabled=false", "--all"], vec!["projects", "update", "--enabled=true"], vec!["projects", "update", "250833", "--enabled=true", "--dry-run"],
         vec!["artifacts", "list"], vec!["artifacts", "list", "--run=abc"], vec!["artifacts", "retrieve", &by_run], vec!["artifacts", "list", &by_run], vec!["artifacts", "retrieve", "report", &by_run],
-        vec!["caches", "update"], vec!["limits", "update", "--max-hours=3"], vec!["limits", "update", "--daily-usd=5"], vec!["machine", "update", "--cpu=3", "--ram=1"], vec!["machine", "update", "--disk=1"],
+        vec!["caches", "update"], vec!["limits", "update", "--max-hours=3"], vec!["limits", "update", "--daily-usd=5"], vec!["machine", "update", "--cpu=3", "--ram=1"], vec!["machine", "update", "--disk=1"], vec!["machine", "update", "--os=windows", "--arch=arm64"], vec!["machine", "update", "--os=default", "--arch=default", "--dry-run"],
         vec!["secrets", "create", "LISTED", "--value-env=HOME"], vec!["secrets", "list"], vec!["secrets", "list", "--json"], vec!["secrets", "delete", "LISTED", "--confirm"],
         // Help, a resource alone, what is no command.
         vec!["help"], vec!["help", "runs"], vec!["runs"], vec!["runs", "--help"], vec!["nothing"], vec!["runs", "nothing"], vec!["--version"],
