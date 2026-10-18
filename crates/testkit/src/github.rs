@@ -24,6 +24,8 @@ struct Hub {
     refuse_puts: bool,
     /// Calls answered with an error (`fail`): the method and a part of the address, and the answer.
     failing: Vec<(String, String, u16, String)>,
+    /// Answers given as they are, with their headers, to a method on a URL with this part (see `answer_with`).
+    scripted: Vec<(String, String, u16, Vec<(String, String)>, String)>,
     jobs: BTreeMap<u64, Value>,
     logs: BTreeMap<u64, String>,
     /// Each run's logs, once it has ended (GitHub's zip: a folder for each job, a file for each step).
@@ -115,7 +117,13 @@ impl GitHub {
     /// A call (its method, and a part of its address) answered with this error from now on; `fail_none` clears them.
     pub fn fail(&self, method: &str, part: &str, status: u16, message: &str) { self.hub.lock().unwrap().failing.push((method.into(), part.into(), status, json!({ "message": message, "documentation_url": "https://docs.github.com/rest", "status": status.to_string() }).to_string())) }
 
-    pub fn fail_none(&self) { self.hub.lock().unwrap().failing.clear() }
+    pub fn fail_none(&self) { let mut h = self.hub.lock().unwrap(); h.failing.clear(); h.scripted.clear() }
+
+    /// What any address asked with `method` on a URL with `part` in it answers (a registry, say): this status, these
+    /// headers, this body. Taken back with `fail_none`.
+    pub fn answer_with(&self, method: &str, part: &str, status: u16, headers: &[(&str, &str)], body: &str) {
+        self.hub.lock().unwrap().scripted.push((method.into(), part.into(), status, headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), body.into()))
+    }
 
     /// How many times GitHub's key set for its jobs' tokens was asked for.
     pub fn jwks_asked(&self) -> u64 { self.hub.lock().unwrap().jwks_asked }
@@ -486,6 +494,12 @@ impl Http for GitHub {
         self.asked.lock().unwrap().push(format!("{} {}", r.method, r.url));
         let failed = self.hub.lock().unwrap().failing.iter().find(|(m, part, ..)| *m == r.method && r.url.contains(part.as_str())).map(|(_, _, s, a)| (*s, a.clone()));
         if let Some((status, answer)) = failed { return Ok(Response::new(status, "application/json", answer)) }
+        let scripted = self.hub.lock().unwrap().scripted.iter().find(|(m, part, ..)| *m == r.method && r.url.contains(part.as_str())).cloned();
+        if let Some((_, _, status, headers, body)) = scripted {
+            let mut res = Response::new(status, "application/json", body);
+            for (k, v) in &headers { res = res.with_header(k, v) }
+            return Ok(res)
+        }
         if let Some(answer) = launcher(&r, self.asked.lock().unwrap().len()) { return Ok(answer) }
         Ok(self.answer(&r).unwrap_or_else(|| {
             self.unanswered.lock().unwrap().push(format!("{} {}", r.method, r.url));

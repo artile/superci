@@ -9060,6 +9060,46 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         let (status, done) = call("layers-uploaded", serde_json::json!({ "id": a["id"] }));
         assert!(status == 200 && done["do"] == "granted", "{status} {done}");
     }
+    // Layers each registry gives anyone or not, asked as Docker asks with no sign-in: at once; after a token (its
+    // challenge quoted or not, the token as `token` or `access_token`); not after a token refused, empty, or from a
+    // realm that is not HTTPS; a challenge with no realm or none at all; refused; names no registry takes. Proposed
+    // again, those on their way are had.
+    let blob = |c: char| format!("/blobs/{}", digest(c));
+    let scripted: Vec<(String, u16, Vec<(&str, String)>, &str)> = vec![
+        (blob('1'), 206, vec![], ""),
+        (blob('2'), 401, vec![("www-authenticate", r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="x""#.into())], ""),
+        ("auth.docker.io/token".into(), 200, vec![], r#"{"token":"anonymous-pull-token"}"#),
+        (blob('3'), 401, vec![("www-authenticate", "Bearer realm=https://quay.io/v2/auth,service=quay.io".into())], ""),
+        ("quay.io/v2/auth".into(), 200, vec![], r#"{"access_token":""}"#),
+        (blob('4'), 401, vec![("www-authenticate", r#"Bearer realm="http://auth.example/token""#.into())], ""),
+        (blob('5'), 401, vec![("www-authenticate", r#"Bearer service="x""#.into())], ""),
+        (blob('6'), 401, vec![], ""),
+        (blob('7'), 429, vec![], ""),
+        (blob('8'), 401, vec![("www-authenticate", r#"Bearer realm="https://ghcr.io/token""#.into())], ""),
+        ("ghcr.io/token".into(), 403, vec![], "{}"),
+        (blob('9'), 401, vec![("www-authenticate", r#"Basic realm="registry""#.into())], ""),
+    ];
+    for (part, status, headers, body) in &scripted {
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        served.github.answer_with("GET", part, *status, &headers, body);
+    }
+    let source = |registry: &str, repository: &str| serde_json::json!({ "registry": registry, "repository": repository });
+    let (status, said) = call("layers-propose", serde_json::json!({ "layers": [
+        { "digest": digest('1'), "size": 500, "sources": [source("ghcr.io", "acme/app")] },
+        { "digest": digest('2'), "size": 500, "sources": [source("docker.io", "library/node")] },
+        { "digest": digest('3'), "size": 500, "sources": [source("quay.io", "acme/tool")] },
+        { "digest": digest('4'), "size": 500, "sources": [source("public.ecr.aws", "acme/x")] },
+        { "digest": digest('5'), "size": 500, "sources": [source("registry.k8s.io", "pause")] },
+        { "digest": digest('6'), "size": 500, "sources": [source("mcr.microsoft.com", "dotnet/sdk")] },
+        { "digest": digest('7'), "size": 500, "sources": [source("gcr.io", "acme/x")] },
+        { "digest": digest('8'), "size": 500, "sources": [source("ghcr.io", "acme/private")] },
+        { "digest": digest('9'), "size": 500, "sources": [source("registry.gitlab.com", "acme/x")] },
+        { "digest": digest('0'), "size": 500, "sources": [source("x.gcr.io", "Upper/case"), source("-x.gcr.io", "a"), source(".gcr.io", "a"), source("europe-docker.pkg.dev", "/root"), source("index.docker.io", "a/../b"), source("registry-1.docker.io", &"a".repeat(256))] },
+        { "digest": digest('e'), "size": 500, "sources": [source("UPPER.gcr.io", "a"), source("", "a"), source("europe-docker.pkg.dev", "p/r/i"), source("evil.example", "x")] }] }));
+    assert_eq!(status, 200, "{said}");
+    let (status, again) = call("layers-propose", serde_json::json!({ "layers": [{ "digest": digest('1'), "size": 500 }, { "digest": digest('2'), "size": 500 }, { "digest": digest('3'), "size": 500 }] }));
+    assert_eq!(status, 200, "{again}");
+    served.github.fail_none();
     // Links to what the store has of them (nothing yet), what was kept as the job ended and after it.
     assert_eq!(call("layers-links", serde_json::json!({ "digests": [digest('a'), "nope"] })).0, 200);
     for body in [serde_json::json!({ "keeping": true, "pulled": 2, "pulled_bytes": 2000 }), serde_json::json!({ "pulled": 2, "pulled_bytes": 2000, "uploaded": 1, "uploaded_bytes": 1000, "served_digests": [digest('a')], "used": [digest('a'), "nope"] }), serde_json::json!("not what was kept")] {
@@ -9067,6 +9107,21 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         assert!(status < 500, "{status}");
     }
     assert!(call("tool-get", serde_json::json!({ "tool": "turbo", "hash": "abc" })).0 < 500);
+    // What the converter made of each layer under way, read at the sweep: a layer; one it refused; one of another
+    // digest; one S3 would not give (asked again), then none heard of in time.
+    let converting: Vec<String> = served.store.under("lconv:").into_iter().map(|(k, _)| k).collect();
+    assert!(!converting.is_empty(), "conversions under way");
+    let done_key = |k: &str| { let hex = k.rsplit_once(":sha256:").unwrap().1.to_string(); (format!("{bucket}/layers/done/{hex}.json"), hex) };
+    for (i, k) in converting.iter().enumerate() {
+        let (key, hex) = done_key(k);
+        let file = |ext: &str| serde_json::json!({ "key": format!("layers/{hex}.{ext}"), "size": 500, "digest": format!("sha256:{hex}") });
+        match i % 4 {
+            0 => served.github.put_object(&key, serde_json::json!({ "digest": format!("sha256:{hex}"), "diff_id": format!("sha256:{hex}"), "erofs": file("erofs"), "blob": file("blob") }).to_string().as_bytes()),
+            1 => served.github.put_object(&key, br#"{"error":"not a layer: gzip: invalid header"}"#),
+            2 => served.github.put_object(&key, serde_json::json!({ "digest": digest('f'), "erofs": file("erofs"), "blob": file("blob") }).to_string().as_bytes()),
+            _ => served.github.fail("GET", &format!("layers/done/{hex}"), 500, "failed"),
+        }
+    }
     // An hour on: the store's upkeep at the sweep.
     served.later(3_700_000);
     served.upkeep();
@@ -9085,6 +9140,23 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         b.goto(&format!("{link}&p=job&id={id}"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
     }
+    served.github.fail_none();
+    served.later(superci_core::layers::CONVERT_MS + 60_000);
+    served.upkeep();
+    // A week on: public layers asked of their registry again (one still given, one no longer); then, unused past the
+    // cache's days, taken out with their files.
+    served.github.answer_with("GET", &blob('1'), 206, &[], "");
+    served.github.answer_with("GET", "/blobs/", 404, &[], "");
+    let made = served.store.under("layer:").len();
+    served.later(superci_core::layers::PUBLIC_MS + 3_600_000);
+    served.upkeep();
+    served.github.fail_none();
+    served.later(40 * 86_400_000);
+    served.upkeep();
+    assert!(served.store.under("layer:").len() <= made, "layers taken out");
+    // (A job no longer kept: its page says so.)
+    b.goto(&format!("{link}&p=job&id=1"));
+    b.wait(&shows("Not among the latest jobs"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
