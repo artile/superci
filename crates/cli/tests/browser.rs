@@ -2474,3 +2474,43 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Jobs with each kind of label on AWS: each job's page says the machine it got, as AWS answered Test.
+#[test]
+fn each_kind_of_label_gets_its_aws_machine_and_its_page_says_which() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let labels = ["superci", "superci/cpu=8", "superci/cpu=2/ram=16", "superci/arch=arm64", "superci/os=windows", "superci/scratch=ramdisk", "superci/scratch=localdisk", "superci/family=c8id",
+        "superci/family=m7gd/scratch=localdisk", "superci/disk=200/disk-speed=500", "superci/disk-iops=6000", "superci/gpu=any", "superci/image=ubuntu26", "superci/image=ubuntu26/docker-cache=true",
+        "superci/image=ubuntu26/docker-cache=false", "superci/image=ubuntu24", "superci/spot=false/cpu=16", "superci/cpu=64/family=m8a+r8a"];
+    let mut jobs = vec![];
+    for label in labels {
+        served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:") && !k.starts_with("aws:no-fleet"));
+        let (id, q) = served.github.queue(label, label, served.now_ms());
+        assert!(served.webhook(q) < 300, "{label}");
+        jobs.push((id, label));
+    }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (id, label) in &jobs {
+        let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        match job["machine_type"].as_str() {
+            // Its machine, and its start (where its time went, what AWS was asked).
+            Some(kind) => assert!(page.contains(kind) && page.contains("Its start"), "{label}: {kind} not on its page:\n{page}"),
+            // Or why it has none.
+            None => { let why = job["error"].as_str().unwrap_or_default().trim_start_matches("waiting: ").split(" (").next().unwrap_or_default().to_lowercase(); assert!(page.to_lowercase().contains(&why), "{label}: {why:?} not on its page:\n{page}") }
+        }
+    }
+    let launched = jobs.iter().filter(|(id, _)| served.store.under(&format!("job:{id}"))[0].1["machine_type"].is_string()).count();
+    assert!(launched >= labels.len() - 2, "most get a machine: {launched} of {}", labels.len());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
