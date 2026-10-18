@@ -7186,6 +7186,47 @@ fn jobs_aws_took_back_are_run_again_once_their_runs_end_or_say_why_not_for_each_
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A job whose label nothing here can run is failed by a small runner where one starts: on AWS (no containers of its
+/// own); not at all when AWS refuses it with on-demand turned off (tried again later); through a Modal launcher; and
+/// nowhere when nothing is connected. Each job's page says why it failed.
+#[test]
+fn a_job_nothing_can_run_is_failed_by_a_small_runner_wherever_one_starts_and_its_page_says_why() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    // Each setup: AWS connected, its settings, what AWS answers a machine, and whether the small runner started.
+    let modal = r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#;
+    let cases: Vec<(&str, bool, Vec<(&str, &str)>, bool, bool)> = vec![
+        ("on AWS", true, vec![("CONTAINERS", "off")], true, true),
+        ("AWS refusing, on-demand off", true, vec![("CONTAINERS", "off"), ("ROUTING", r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand","off":true}]}"#)], false, false),
+        ("through a Modal launcher", false, vec![("CONTAINERS", "off"), ("LAUNCHERS", modal)], true, false),
+        ("nowhere", false, vec![("CONTAINERS", "off")], true, false),
+    ];
+    for (what, with_aws, settings, aws_starts, fails_fast) in cases {
+        let served = serve(move |c| {
+            if with_aws { (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX })); }
+        });
+        served.connect_github();
+        for (k, v) in &settings { served.aws.put(&format!("/superci/{PLANE}/{k}"), v) }
+        served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+        if aws_starts { served.aws.fail("RunInstances", 200, &started, None) } else { served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("InsufficientInstanceCapacity", "no"), None) }
+        let (id, q) = served.github.queue(what, "superci/cpus=8", served.now_ms());
+        assert!(served.webhook(q) < 300, "{what}");
+        let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+        assert_eq!(job["failed_fast"] == true, fails_fast, "{what}: {job}");
+        if with_aws && !fails_fast { assert!(job["fail_pending"].is_string(), "{what}: tried again later: {job}") }
+        served.aws.fail_none();
+        let home = signed_in(&served);
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        assert!(page.contains("cpus"), "{what}: {page}");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
 /// GitLab's jobs on AWS: one whose spot machine AWS takes back, retried at GitLab and run again off spot machines; an
 /// event delivered twice; one taken by another job's runner; one cancelled while its machine starts. Each job's page
 /// says how it went.
