@@ -9700,7 +9700,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     served.webhook(served.github.finish(id, "failure", "2026-10-15T10:00:01.0000000Z ##[error]Process completed with exit code 1.", served.now_ms()));
     let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
     let home = signed_in(&served);
-    let cli = |args: &[&str]| { let o = common::command(&home).args(args).output().unwrap(); (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let cli = |args: &[&str]| { let o = common::command(&home).args(args).env("GITLAB_TOKEN_FOR_TESTS", "gitlab-token-for-tests").output().unwrap(); (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
     let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
     let table: Vec<Vec<&str>> = vec![
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
@@ -9728,6 +9728,10 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["workspaces", "create"], vec!["workspaces", "create", "Globex", "--dry-run"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "list"], vec!["status", "--workspace=globex"],
         vec!["workspaces", "update", "globex", "--id=initech", "--dry-run"], vec!["workspaces", "update", "globex", "--id=initech"], vec!["workspaces", "update", "initech", "--plane=testplane0001", "--dry-run"], vec!["workspaces", "update"],
         vec!["workspaces", "delete", "initech"], vec!["workspaces", "delete", "initech", "--confirm", "--dry-run"], vec!["workspaces", "delete", "initech", "--confirm"], vec!["workspaces", "delete", "nosuch", "--confirm"],
+        vec!["public_repos", "create"], vec!["public_repos", "create", "acme/app", "--dry-run"], vec!["public_repos", "delete", "acme/app", "--dry-run"],
+        vec!["connections", "delete", "github"], vec!["connections", "delete", "github", "acme", "--confirm"], vec!["connections", "delete", "github", "nobody", "--confirm"], vec!["connections", "delete"],
+        vec!["connections", "create", "gitlab"], vec!["connections", "create", "gitlab", "--token-env=GITLAB_TOKEN_FOR_TESTS", "--dry-run"], vec!["connections", "list", "--json"],
+        vec!["projects", "update", "--enabled=true", "--all", "--dry-run"], vec!["projects", "update", "--enabled=false", "--all"], vec!["projects", "update", "--enabled=true"], vec!["projects", "update", "250833", "--enabled=true", "--dry-run"],
         vec!["artifacts", "list"], vec!["artifacts", "list", "--run=abc"], vec!["artifacts", "retrieve", &by_run], vec!["artifacts", "list", &by_run], vec!["artifacts", "retrieve", "report", &by_run],
         vec!["caches", "update"], vec!["limits", "update", "--max-hours=3"], vec!["limits", "update", "--daily-usd=5"], vec!["machine", "update", "--cpu=3", "--ram=1"], vec!["machine", "update", "--disk=1"],
         vec!["secrets", "create", "LISTED", "--value-env=HOME"], vec!["secrets", "list"], vec!["secrets", "list", "--json"], vec!["secrets", "delete", "LISTED", "--confirm"],
