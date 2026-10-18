@@ -9302,6 +9302,60 @@ fn a_queued_event_delivered_twice_after_a_stuck_start_or_for_a_job_run_again_is_
 }
 
 #[test]
+fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_shows_what_changed() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(id));
+    served.webhook(served.github.finish(id, "failure", "2026-10-15T10:00:01.0000000Z ##[error]Process completed with exit code 1.", served.now_ms()));
+    let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
+    let home = signed_in(&served);
+    let cli = |args: &[&str]| { let o = common::command(&home).args(args).output().unwrap(); (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
+    let table: Vec<Vec<&str>> = vec![
+        // Jobs and runs: by run, by id, with their tests, and what is not an id.
+        vec!["jobs", "list", &by_run], vec!["jobs", "list", "--run=abc"], vec!["jobs", "retrieve"], vec!["jobs", "retrieve", "abc"], vec!["jobs", "retrieve", &id_s, "--bytes=200"], vec!["jobs", "retrieve", &id_s, "--tests"],
+        vec!["runs", "retrieve"], vec!["runs", "retrieve", "abc"], vec!["runs", "retrieve", &run], vec!["runs", "retrieve", &run, "--tests"], vec!["runs", "retrieve", "123456"], vec!["runs", "cancel"], vec!["runs", "cancel", "abc"],
+        vec!["usage", "retrieve", "--period=month"], vec!["usage", "retrieve", "--period=year"],
+        // Runners: each setting, those a provider does not have, and what is no provider.
+        vec!["runners", "update", "cloudflare", "--regions=us-east-1"], vec!["runners", "update", "aws", "--regions=us-east-1,us-east-2", "--dry-run"], vec!["runners", "update", "cloudflare", "--location=weur"],
+        vec!["runners", "update", "cloudflare", "--image=none"], vec!["runners", "update", "cloudflare", "--image=https://images.example.com/full:1"], vec!["runners", "update", "aws", "--networks="],
+        vec!["runners", "update", "aws", "--enabled=false", "--dry-run"], vec!["runners", "update", "nowhere"], vec!["runners", "update"], vec!["runners", "delete", "cloudflare", "--only-here", "--stop-jobs", "--dry-run"],
+        vec!["runners", "delete", "nowhere", "--confirm"], vec!["runners", "delete", "cloudflare"], vec!["runners", "create", "nowhere"], vec!["runners", "create"],
+        // Labels, its name, the default machine, limits: nothing given, defaults, what does not hold.
+        vec!["labels", "create"], vec!["labels", "create", "acmeci-big"], vec!["labels", "list"], vec!["labels", "delete", "acmeci-big", "--confirm"], vec!["labels", "delete"],
+        vec!["name", "update"], vec!["name", "update", "Acme CI", "--dry-run"], vec!["machine", "update"], vec!["machine", "update", "--cpu=default", "--ram=default"], vec!["machine", "update", "--cpu=0"],
+        vec!["limits", "update"], vec!["limits", "update", "--max-cpu=16"], vec!["limits", "update", "--monthly-usd=inf"],
+        vec!["accounts", "update", "aws"], vec!["accounts", "update", "aws", "--monthly-usd=100", "--budget=emails", "--email=ops@example.com", "--dry-run"], vec!["accounts", "retrieve", "aws", "--account=222222222222"],
+        // Code hosts' connections, projects, control planes, images.
+        vec!["connections", "list"], vec!["connections", "create"], vec!["connections", "create", "github", "--dry-run"], vec!["connections", "create", "gitlab", "--dry-run"], vec!["connections", "delete", "gitlab", "--dry-run"],
+        vec!["projects", "list"], vec!["projects", "update"], vec!["projects", "update", "acme/app", "--enabled=false", "--dry-run"],
+        vec!["planes", "allow"], vec!["planes", "allow", "acme/app", "--dry-run"], vec!["planes", "delete"], vec!["planes", "delete", "nosuchplane1", "--confirm"], vec!["planes", "update", "--dry-run"], vec!["planes", "create"], vec!["planes", "create", "nowhere"],
+        vec!["images", "create"], vec!["images", "create", "ca-central-1", "--dry-run"], vec!["images", "update", "ca-central-1", "--dry-run"], vec!["images", "delete", "ca-central-1"], vec!["images", "delete", "mars-1", "--confirm"],
+        // Keys and workspaces: what is not there, what is there already, and dry runs.
+        vec!["keys", "delete"], vec!["keys", "delete", "nosuchkey"], vec!["keys", "create", "dry", "--dry-run"],
+        vec!["workspaces", "create"], vec!["workspaces", "create", "Globex", "--dry-run"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "list"], vec!["status", "--workspace=globex"],
+        vec!["workspaces", "update", "globex", "--id=initech", "--dry-run"], vec!["workspaces", "update", "globex", "--id=initech"], vec!["workspaces", "update", "initech", "--plane=testplane0001", "--dry-run"], vec!["workspaces", "update"],
+        vec!["workspaces", "delete", "initech"], vec!["workspaces", "delete", "initech", "--confirm", "--dry-run"], vec!["workspaces", "delete", "initech", "--confirm"], vec!["workspaces", "delete", "nosuch", "--confirm"],
+        // Help, a resource alone, what is no command.
+        vec!["help"], vec!["help", "runs"], vec!["runs"], vec!["runs", "--help"], vec!["nothing"], vec!["runs", "nothing"], vec!["--version"],
+    ];
+    for args in &table {
+        let (code, said) = cli(args);
+        assert!((0..=3).contains(&code) && !said.contains("panicked"), "{args:?}: {code} {said}");
+    }
+    let (mut child, link) = dashboard(&home);
+    for p in ["runners", "settings", "repos"] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
