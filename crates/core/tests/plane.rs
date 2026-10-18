@@ -1687,6 +1687,14 @@ fn a_gitlab_job_whose_spot_machine_is_taken_back_is_run_again_on_demand() {
     run(gitlab_event_on(1977, "running", secret, Some(55)));
     assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/interrupted?gl=1977&t=wrong-wrong-wrong-wrong"))).status, 404);
     assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/interrupted?gl=1977&t={token}"))).status, 200);
+    // Said again (its watch may say it twice): one record. An id that is no GitLab job's, or none: nothing here.
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/interrupted?gl=1977&t={token}"))).status, 200);
+    assert_eq!(store.0.borrow().keys().filter(|k| k.starts_with("spot:interrupted:")).count(), 1);
+    for gl in ["", "19%2077", "AB"] { assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/interrupted?gl={gl}&t={token}"))).status, 404, "{gl}") }
+    // Its machine says how its start went by its own job's id likewise.
+    let hello = job(1977)["hello"].as_str().unwrap().to_string();
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/hello?gl=1977&t={hello}&ready=1789999999000"))).status, 200);
+    for gl in ["", "AB"] { assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/hello?gl={gl}&t={hello}"))).status, 404, "{gl}") }
     // The job fails: GitLab is asked to run it again at once, and the new job gets an on-demand machine.
     run(gitlab_event_on(1977, "failed", secret, Some(55)));
     assert!(clouds.0.calls.borrow().iter().any(|c| c.0 == "POST" && c.1.ends_with("/projects/380/jobs/1977/retry")));
@@ -2723,6 +2731,11 @@ fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself()
     let worker = format!("[2026-10-15 10:00:02Z INFO Worker] Waiting to receive the job message from the channel.\n[2026-10-15 10:00:02Z INFO Worker] Job message:\n {message}\n[2026-10-15 10:00:02Z INFO Worker] Starting the job {{\n");
     let sent = |t: &str| run(Request::new("POST", &format!("{PLANE_URL}/hello?runner=superci-{PLANE_ID}-7&t={t}&worker=1")).with_body(worker.clone())).status;
     assert_eq!((sent("wrong-wrong-wrong-wrong"), sent(&token)), (404, 200));
+    // A start of a log with no job message in it: taken, and nothing made of it. A page with nothing in it, or
+    // named as no page is, is no page: nothing kept.
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/hello?runner=superci-{PLANE_ID}-7&t={token}&worker=1")).with_body("[2026-10-15 10:00:02Z INFO Worker] Waiting\n")).status, 200);
+    assert_eq!(page(&token, "aaaa_3333_1.log", 0, ""), 200);
+    assert_eq!(page(&token, &format!("{}.log", "a".repeat(120)), 0, "x"), 200);
     let got = json(&run(Request::new("GET", &format!("{PLANE_URL}/job/log?id=7&steps=1")).with_header("authorization", "Bearer dashboard-session-key-1")));
     let shape = got["shape"].as_array().unwrap_or_else(|| panic!("{got}"));
     assert_eq!((shape.len(), &shape[0]["id"], &shape[0]["bg"], &shape[11]["control"], &shape[11]["group"]), (14, &serde_json::json!("server"), &serde_json::json!(true), &serde_json::json!("wait"), &serde_json::json!("__parallel_0")));
