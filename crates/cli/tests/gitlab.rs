@@ -318,3 +318,29 @@ fn gitlab_is_connected_from_the_cli_and_its_projects_switched() {
     assert_eq!(served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "GITLAB").map(|(_, v)| v).as_deref(), Some("off"));
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn gitlab_jobs_whose_events_were_lost_are_settled_by_the_upkeep_as_gitlab_has_them() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    // One its machine's runner took, then finished; one cancelled before any runner took it; one still waiting.
+    let (ran, p) = served.gitlab.pending("ran", &["superci"], served.now_ms());
+    served.gitlab_webhook(p);
+    let _ = served.gitlab.running(ran, served.now_ms());
+    let (gone, p) = served.gitlab.pending("gone", &["superci"], served.now_ms());
+    served.gitlab_webhook(p);
+    let _ = served.gitlab.finish(gone, "canceled", "", served.now_ms());
+    let (waits, p) = served.gitlab.pending("waits", &["superci"], served.now_ms());
+    served.gitlab_webhook(p);
+    let state = |id: u64| served.store.under(&format!("job:gl{id}"))[0].1.clone();
+    // None of their events came. A minute on, the one its runner took is running (GitLab is asked once its machine
+    // has had time to come up); the cancelled one is given the time a machine may take.
+    served.later(61_000);
+    served.upkeep();
+    assert_eq!((state(ran)["state"].as_str(), state(gone)["state"].as_str()), (Some("running"), Some("launched")));
+    // Past that: the one GitLab no longer has waiting is ended.
+    served.later(3 * 60_000);
+    served.upkeep();
+    assert!(["swept", "cancelled", "done"].contains(&state(gone)["state"].as_str().unwrap()), "{}", state(gone));
+    assert_ne!(state(waits)["state"], "running", "{}", state(waits));
+}
