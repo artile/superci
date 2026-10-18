@@ -6413,3 +6413,51 @@ mod commands_dashboard_in_browser {
         super::seen_in_browser(&served);
     }
 }
+
+/// Settings: a secret added in its dialog (and what it refuses), taken out again; another device's key and an
+/// agent's read key taken out.
+#[test]
+fn secrets_are_added_and_taken_out_and_keys_removed_from_settings() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    // Another device that looks after this CI, beside this one.
+    served.aws.put(&format!("/superci/{PLANE}/DEVICE_KEY_4102444800_LAPTOP"), "another-devices-key-for-tests-0001");
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let settings = |b: &mut Browser| { b.goto(&format!("{link}&p=settings")); b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Secrets"))); };
+    settings(&mut b);
+    // Added in its dialog, for one repository: listed by name and where it may be used, never by its value.
+    b.eval("document.querySelector('button[onclick*=add-secret]').click()");
+    b.wait("document.getElementById('add-secret').open");
+    b.eval("(() => { const d = document.getElementById('add-secret'); d.querySelector('[name=name]').value = 'NPM_TOKEN'; d.querySelector('[name=value]').value = 'npm-secret-value-for-tests'; d.querySelector('details').open = true; d.querySelector('[name=repo]').value = 'acme/app'; d.querySelector('button.primary').click(); })()");
+    b.wait(&format!("{} && {}", shows("NPM_TOKEN"), shows("acme/app")));
+    assert!(!b.eval("document.body.innerText").as_str().unwrap_or_default().contains("npm-secret-value-for-tests"));
+    assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k.starts_with("SECRET_") && v.contains("npm-secret-value-for-tests")));
+    // Refused: the same again, a name no secret may have, a scope that is none; nothing changes.
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    for (fields, said) in [(&[("name", "NPM_TOKEN"), ("value", "x"), ("repo", "acme/app")][..], "is kept for"), (&[("name", "1BAD"), ("value", "x")], "That secret was not added"),
+        (&[("name", "OK_NAME"), ("value", "x"), ("repo", "not a repository")], "That cannot be its scope"), (&[("name", "GONE"), ("repo", "acme/app")], "That secret was not taken out")] {
+        let path = if fields.iter().any(|(k, _)| *k == "value") { "/secrets/add" } else { "/secrets/remove" };
+        let (got, text) = post(&mut b, path, fields);
+        assert!(got >= 400 && text.contains(said), "{fields:?}: {got} {text}");
+    }
+    assert_eq!(served.aws.settings(PLANE).iter().filter(|(k, _)| k.starts_with("SECRET_")).count(), 1);
+    // Taken out by its button.
+    settings(&mut b);
+    b.eval("window.confirm = () => true");
+    b.eval("[...document.querySelectorAll('form[action=\"/secrets/remove\"] button')][0].click()");
+    until("the secret taken out", || !served.aws.settings(PLANE).iter().any(|(k, _)| k.starts_with("SECRET_")));
+    settings(&mut b);
+    // The other device's key, and the agent's read key, removed.
+    b.eval("window.confirm = () => true");
+    b.eval("[...document.querySelectorAll('form[action=\"/keys/remove\"]')].find(f => f.querySelector('[name=name]') && f.querySelector('[name=name]').value.includes('LAPTOP')).querySelector('button').click()");
+    until("the other device's key removed", || !served.aws.settings(PLANE).iter().any(|(k, _)| k.contains("LAPTOP")));
+    settings(&mut b);
+    let reads = || served.aws.settings(PLANE).iter().filter(|(k, _)| k.starts_with("READ_KEY_")).count();
+    let before = reads();
+    b.eval("[...document.querySelectorAll('form[action=\"/keys/remove\"]')].find(f => f.querySelector('[name=read]')).querySelector('button').click()");
+    until("the read key removed", || reads() < before);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
