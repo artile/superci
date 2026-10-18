@@ -2624,6 +2624,15 @@ fn the_debug_commands_answer_as_the_clouds_answered_and_the_pages_stay() {
         let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
         assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked"), "{args:?}: {said}");
     }
+    // Recorded as a recording is made (for the test kit): each exchange written to the file named.
+    let record = home.join("recorded.jsonl");
+    let o = common::command(&home).args(["debug", "ec2", "us-east-1", "DescribeRegions"]).env("SUPERCI_RECORD", &record).env("SUPERCI_RECORD_SIGN_INS", "1").output().unwrap();
+    assert!(o.status.code().is_some_and(|c| c <= 3), "{}", String::from_utf8_lossy(&o.stderr));
+    // AWS answering that the sign-in's token expired: said as a sign-in to make again.
+    served.aws.fail("DescribeRegions", 400, &superci_testkit::ec2_error("ExpiredToken", "The security token included in the request is expired"), None);
+    let o = common::command(&home).args(["debug", "ec2", "us-east-1", "DescribeRegions"]).output().unwrap();
+    assert!(o.status.code().is_some_and(|c| c <= 3));
+    served.aws.fail_none();
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
     b.wait("document.querySelector('main') !== null");
