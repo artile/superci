@@ -608,6 +608,15 @@ fn a_secret_for_runs_from_a_computer_is_added_in_settings_listed_without_its_val
     b.click("nav a", "Settings");
     b.wait(&page_shows("DEPLOY_KEY"));
 
+    // What a secret may not be: a name too long, one starting with a digit, a value empty or over 4 KB, a scope's
+    // repository that is no owner/name.
+    for (fields, said) in [(vec![("name", "A".repeat(101)), ("value", "v".to_string())], "100 characters at most"), (vec![("name", "9LIVES".to_string()), ("value", "v".to_string())], "does not start with a digit"),
+        (vec![("name", "BAD-NAME".to_string()), ("value", "v".to_string())], "only letters, digits and _"), (vec![("name", "EMPTY".to_string()), ("value", String::new())], "empty"),
+        (vec![("name", "HUGE".to_string()), ("value", "x".repeat(5000))], "4 KB at most"), (vec![("name", "SCOPED".to_string()), ("value", "v".to_string()), ("repo", "not-a-repo".to_string())], "owner/name")] {
+        let refs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let (got, text) = post(&mut b, "/secrets/add", &refs);
+        assert!(got >= 400 && text.contains(said), "{fields:?}: {got} {text}");
+    }
     // The same one again: kept already, nothing changed. A new value for one not kept: refused; for this one: taken.
     let (got, text) = post(&mut b, "/secrets/add", &[("name", "DEPLOY_KEY"), ("value", "again"), ("repo", "acme/app"), ("branch", "release/*")]);
     assert!(got == 409 && text.contains("kept for") && text.contains("already"), "{got} {text}");
@@ -5418,6 +5427,40 @@ mod runs_suite_in_browser {
         assert_eq!(compile.handed(&served)["variables"]["TOKEN"]["value"], "any-value");
         compile.take();
         compile.finish("succeeded");
+        let _ = std::fs::remove_dir_all(&dir);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
+    fn a_runs_secrets_are_those_whose_scope_holds_for_its_branch_and_workflow_and_that_it_names() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.ANY }} ${{ secrets['BY_BRANCH'] }} ${{ secrets[\"BY_CLASS\"] }} ${{ secrets . BY_ONE }} ${{ secrets.BY_WORKFLOW }} ${{ secrets.BY_PATH }} ${{ secrets.NOT_HERE }} ${{ github.secrets_x }} ${{ secrets.OTHER_REPO }} ${{ secrets.TAGS }}\n")]);
+        let branch = String::from_utf8(Command::new("git").current_dir(&dir).args(["branch", "--show-current"]).output().unwrap().stdout).unwrap().trim().to_string();
+        let keep = |name: &str, value: &str, scope: superci_core::secrets::Scope, at: u64| {
+            let stored = superci_core::secrets::Stored { name: name.into(), value: value.into(), scope: scope.clone(), updated_ms: at };
+            served.aws.put(&format!("/superci/{}/{}", superci_testkit::PLANE, superci_core::secrets::setting(name, &scope)), &serde_json::to_string(&stored).unwrap());
+        };
+        let scope = |branch: Option<&str>, workflow: Option<&str>, repo: Option<&str>| superci_core::secrets::Scope { branch: branch.map(str::to_string), workflow: workflow.map(str::to_string), repo: repo.map(str::to_string), ..Default::default() };
+        let first = &branch[..1];
+        keep("ANY", "any", scope(None, None, None), 1);
+        keep("ANY", "any, by its branch", scope(Some("**"), None, None), 2);
+        keep("BY_BRANCH", "by branch", scope(Some(&format!("{first}*")), None, None), 1);
+        keep("BY_CLASS", "by class", scope(Some(&format!("[{first}-{first}]{}", &branch[1..])), None, None), 1);
+        keep("BY_ONE", "by one", scope(Some(&format!("?{}", &branch[1..])), None, None), 1);
+        keep("BY_WORKFLOW", "by workflow", scope(None, Some("ci.yml"), None), 1);
+        keep("BY_PATH", "by path", scope(None, Some(".github/workflows/*.yml"), None), 1);
+        keep("NOT_HERE", "not here", scope(Some("release/*"), None, None), 1);
+        keep("OTHER_REPO", "other", scope(None, None, Some("acme/other")), 1);
+        keep("TAGS", "tags", scope(Some("[v"), None, None), 1);
+        keep("UNNAMED", "unnamed", scope(None, None, None), 1);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let vars = runner_of(&served, &run, "build").handed(&served)["variables"].clone();
+        let value = |n: &str| vars[n]["value"].as_str().map(str::to_string);
+        assert_eq!(value("ANY").as_deref(), Some("any, by its branch"), "{vars}");
+        for n in ["BY_BRANCH", "BY_CLASS", "BY_ONE", "BY_WORKFLOW", "BY_PATH"] { assert!(value(n).is_some(), "{n}: {vars}") }
+        for n in ["NOT_HERE", "OTHER_REPO", "TAGS", "UNNAMED"] { assert!(value(n).is_none(), "{n}: {vars}") }
         let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
     }
