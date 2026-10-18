@@ -9904,6 +9904,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         assert!(o.status.code().is_some_and(|c| c <= 3) && said.contains("subtracts"), "{args:?}: {said}{}", String::from_utf8_lossy(&o.stderr));
     }
     let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
+    let (long_x, long_l) = ("x".repeat(80), "l".repeat(80));
     let table: Vec<Vec<&str>> = vec![
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
         vec!["jobs", "list", &by_run], vec!["jobs", "list", "--run=abc"], vec!["jobs", "retrieve"], vec!["jobs", "retrieve", "abc"], vec!["jobs", "retrieve", &id_s, "--bytes=200"], vec!["jobs", "retrieve", &id_s, "--tests"],
@@ -9916,8 +9917,8 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["runners", "delete", "nowhere", "--confirm"], vec!["runners", "delete", "cloudflare"], vec!["runners", "create", "nowhere"], vec!["runners", "create"],
         // Labels, its name, the default machine, limits: nothing given, defaults, what does not hold.
         vec!["labels", "create"], vec!["labels", "create", "acmeci-big"], vec!["labels", "list"], vec!["labels", "delete", "acmeci-big", "--confirm"], vec!["labels", "delete"],
-        vec!["name", "update"], vec!["name", "update", "Acme CI", "--dry-run"], vec!["name", "update", "a<b>"], vec!["name", "update", &"x".repeat(80)], vec!["name", "update", " "],
-        vec!["labels", "create", "Bad Label"], vec!["labels", "create", "superci/cpu=4"], vec!["labels", "create", &"l".repeat(80)], vec!["labels", "create", "-dash"], vec!["machine", "update"], vec!["machine", "update", "--cpu=default", "--ram=default"], vec!["machine", "update", "--cpu=0"],
+        vec!["name", "update"], vec!["name", "update", "Acme CI", "--dry-run"], vec!["name", "update", "a<b>"], vec!["name", "update", &long_x], vec!["name", "update", " "],
+        vec!["labels", "create", "Bad Label"], vec!["labels", "create", "superci/cpu=4"], vec!["labels", "create", &long_l], vec!["labels", "create", "-dash"], vec!["machine", "update"], vec!["machine", "update", "--cpu=default", "--ram=default"], vec!["machine", "update", "--cpu=0"],
         vec!["limits", "update"], vec!["limits", "update", "--max-cpu=16"], vec!["limits", "update", "--monthly-usd=inf"],
         vec!["accounts", "update", "aws"], vec!["accounts", "update", "aws", "--monthly-usd=100", "--budget=emails", "--email=ops@example.com", "--dry-run"], vec!["accounts", "retrieve", "aws", "--account=222222222222"],
         // Code hosts' connections, projects, control planes, images.
