@@ -26,6 +26,10 @@ pub struct Spec {
     /// Whether it may run on a spot machine (one its cloud can take back): unset or `true`, it may; `false`, never
     /// (`spot=false`: a deploy, a job that must not be run twice). A label's `spot=true` undoes a default of `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub spot: Option<bool>,
+    /// Docker's images from the cache (Ubuntu 26.04 machines): unset, as its job's last run, or its repository's
+    /// jobs', used them (see `layers::plan`); `false`, Docker as it comes, nothing kept after it (`docker-cache=false`:
+    /// to time a job cold, or a job the cache does not suit); `true`, from its start whatever its last run used.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub docker_cache: Option<bool>,
     /// Its disk's speed on AWS, when not left to the machine's size (see `disk_speed`): MiB a second, and IOPS.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_mibs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub disk_iops: Option<u32>,
@@ -39,7 +43,7 @@ pub struct Spec {
 }
 
 /// What a label can say: its keys, in the order they are written when a label is made from a machine.
-pub const KEYS: [&str; 13] = ["cpu", "ram", "disk", "disk-speed", "disk-iops", "arch", "os", "image", "gpu", "family", "scratch", "provider", "spot"];
+pub const KEYS: [&str; 14] = ["cpu", "ram", "disk", "disk-speed", "disk-iops", "arch", "os", "image", "gpu", "family", "scratch", "provider", "spot", "docker-cache"];
 
 /// The Ubuntu images a Linux machine can run.
 pub const UBUNTUS: [&str; 2] = ["ubuntu26", "ubuntu24"];
@@ -49,7 +53,7 @@ pub const UBUNTUS: [&str; 2] = ["ubuntu26", "ubuntu24"];
 pub const UBUNTU_26_FROM_MS: u64 = 1_795_046_400_000;
 
 /// How a label is written, for a job whose label is not understood.
-const HOW: &str = "A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, image, gpu, family, scratch, provider, spot";
+const HOW: &str = "A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, image, gpu, family, scratch, provider, spot, docker-cache";
 
 /// The AWS machine families a label may name: what a job's CPUs come from (compute, general, memory), AMD and arm64,
 /// and those with a local NVMe disk. Each with its memory for each CPU (GB).
@@ -151,6 +155,7 @@ impl Spec {
             "scratch" => self.scratch = Some(one_of(&["ramdisk", "localdisk"])?),
             "provider" => self.cloud = Some(one_of(&CLOUDS)?),
             "spot" => self.spot = Some(one_of(&["true", "false"])? == "true"),
+            "docker-cache" => self.docker_cache = Some(one_of(&["true", "false"])? == "true"),
             _ => return Err(format!("“{key}” is not a key a label has. {HOW}")),
         }
         Ok(())
@@ -162,6 +167,7 @@ impl Spec {
         if let (Some(a), Some(b)) = (self.families.iter().find(|f| arm(f)), self.families.iter().find(|f| !arm(f))) { return Err(format!("{a} machines are arm64 and {b} machines are x64: a job runs on one or the other")) }
         if let (Some(f), Some(arch)) = (self.families.first(), self.arch.as_deref()) { if arm(f) != (arch == "arm64") { return Err(format!("{f} machines are {}, and the label says arch={arch}", if arm(f) { "arm64" } else { "x64" })) } }
         if let (Some(i), true) = (&self.image, self.os() != "linux") { return Err(format!("image={i} is an Ubuntu for Linux machines, and the label says os={}", self.os())) }
+        if self.docker_cache.is_some() && (self.os() != "linux" || self.image.as_deref() == Some("ubuntu24")) { return Err(format!("the Docker image cache is on Ubuntu 26.04 machines (image=ubuntu26), and the label says {}", if self.os() != "linux" { format!("os={}", self.os()) } else { "image=ubuntu24".into() })) }
         if !self.families.is_empty() && self.gpu.is_some() { return Err("a GPU's machine family follows the GPU: say gpu or family, not both".into()) }
         if self.scratch.as_deref() == Some("localdisk") { if let Some(f) = self.families.iter().find(|f| !local(f)) { return Err(format!("{f} machines have no local disk: name a family that has one (m8id, c8id, r8id; m8gd on arm64), or leave family out")) } }
         Ok(())
@@ -178,7 +184,7 @@ impl Spec {
     pub fn pairs(&self) -> Vec<(&'static str, String)> {
         let n = |v: Option<u32>| v.map(|n| n.to_string());
         [("cpu", n(self.cpu)), ("ram", n(self.ram_gb)), ("disk", n(self.disk_gb)), ("disk-speed", n(self.disk_mibs)), ("disk-iops", n(self.disk_iops)), ("arch", self.arch.clone()), ("os", self.os.clone()),
-            ("image", self.image.clone()), ("gpu", self.gpu.clone()), ("family", Some(self.families.join("+")).filter(|f| !f.is_empty())), ("scratch", self.scratch.clone()), ("provider", self.cloud.clone()), ("spot", self.spot.map(|s| s.to_string()))]
+            ("image", self.image.clone()), ("gpu", self.gpu.clone()), ("family", Some(self.families.join("+")).filter(|f| !f.is_empty())), ("scratch", self.scratch.clone()), ("provider", self.cloud.clone()), ("spot", self.spot.map(|s| s.to_string())), ("docker-cache", self.docker_cache.map(|s| s.to_string()))]
             .into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
     }
 
@@ -194,7 +200,7 @@ impl Spec {
             // (Not the default's Ubuntu for a label that names another system.)
             image: self.image.clone().or_else(|| default.image.clone().filter(|_| self.os.as_deref().is_none_or(|o| o == "linux"))),
             gpu: self.gpu.clone().or_else(|| default.gpu.clone()),
-            cloud: self.cloud.clone().or_else(|| default.cloud.clone()), spot: self.spot.or(default.spot),
+            cloud: self.cloud.clone().or_else(|| default.cloud.clone()), spot: self.spot.or(default.spot), docker_cache: self.docker_cache.or(default.docker_cache),
             disk_mibs: self.disk_mibs.or(default.disk_mibs), disk_iops: self.disk_iops.or(default.disk_iops),
             scratch: self.scratch.clone().or_else(|| default.scratch.clone()),
             families: if self.families.is_empty() { default.families.clone() } else { self.families.clone() },
@@ -226,6 +232,7 @@ impl Spec {
         match self.image.as_deref() { Some("ubuntu26") => parts.push("Ubuntu 26.04".into()), Some("ubuntu24") => parts.push("Ubuntu 24.04".into()), _ => {} }
         match self.gpu.as_deref() { Some("any") => parts.push("a GPU".into()), Some(g) => parts.push(format!("{} GPU", g.to_uppercase())), None => {} }
         if self.on_demand() { parts.push("no spot machines".into()) }
+        match self.docker_cache { Some(false) => parts.push("no Docker image cache".into()), Some(true) => parts.push("Docker image cache from the start".into()), None => {} }
         match self.disk_mibs { Some(DISK_MIBS_INCLUDED) => parts.push("standard disk speed".into()), Some(m) => parts.push(format!("{m} MiB/s disk")), None => {} }
         if let Some(i) = self.disk_iops { parts.push(format!("{i} IOPS")) }
         if self.ramdisk() { parts.push("RAM disk".into()) }
@@ -403,6 +410,14 @@ mod tests {
         assert_eq!(parse("superci/image=ubuntu26/cpu=8").unwrap().label("superci"), "superci/cpu=8/image=ubuntu26");
         assert_eq!(parse("superci/image=ubuntu22").unwrap_err(), "image is ubuntu26 or ubuntu24, not “ubuntu22” (runs-on: superci/image=ubuntu22)");
         assert!(parse("superci/os=windows/image=ubuntu26").unwrap_err().contains("an Ubuntu for Linux machines"));
+        // The Docker image cache: off, or on from the start, for a job; Ubuntu 26.04 only.
+        let s = parse("superci/docker-cache=false/image=ubuntu26").unwrap();
+        assert_eq!((s.docker_cache, s.label("superci"), s.describe().contains("no Docker image cache")), (Some(false), "superci/image=ubuntu26/docker-cache=false".to_string(), true));
+        assert_eq!(parse("superci/docker-cache=true").unwrap().or(&Spec { docker_cache: Some(false), ..Default::default() }).docker_cache, Some(true));
+        assert_eq!(parse("superci/cpu=8").unwrap().or(&Spec { docker_cache: Some(false), ..Default::default() }).docker_cache, Some(false));
+        assert!(parse("superci/docker-cache=off").unwrap_err().contains("docker-cache is true or false"));
+        assert!(parse("superci/docker-cache=true/image=ubuntu24").unwrap_err().contains("the Docker image cache is on Ubuntu 26.04 machines"));
+        assert!(parse("superci/docker-cache=false/os=windows").unwrap_err().contains("os=windows"));
         // The default machine's Ubuntu comes along, unless the label names another system.
         let default = Spec { image: Some("ubuntu24".into()), ..Default::default() };
         assert_eq!((parse("superci/cpu=4").unwrap().or(&default).image.as_deref(), parse("superci/os=windows").unwrap().or(&default).image.as_deref()), (Some("ubuntu24"), None));
@@ -427,7 +442,7 @@ mod tests {
         // What is not understood says so, with how a label is written: a key that is none, a value out of range or
         // not one of its words, a pair with no "=", a key said twice.
         let err = |label: &str| Spec::parse(label, "superci").unwrap().unwrap_err();
-        assert!(err("superci/cores=8").starts_with("“cores” is not a key a label has. A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, image, gpu, family, scratch, provider, spot"), "{}", err("superci/cores=8"));
+        assert!(err("superci/cores=8").starts_with("“cores” is not a key a label has. A label says a machine as key=value pairs after its name, like superci/cpu=8/ram=32. The keys: cpu, ram, disk, disk-speed, disk-iops, arch, os, image, gpu, family, scratch, provider, spot, docker-cache"), "{}", err("superci/cores=8"));
         assert_eq!(err("superci/cpu=500"), "cpu is a number of CPUs from 1 to 192, not “500” (runs-on: superci/cpu=500)");
         assert_eq!(err("superci/arch=arm"), "arch is x64 or arm64, not “arm” (runs-on: superci/arch=arm)");
         assert!(err("superci/cpu=8/ondemand").starts_with("“ondemand” in runs-on: superci/cpu=8/ondemand is not a key=value."));

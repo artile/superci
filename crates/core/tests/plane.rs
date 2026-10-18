@@ -4056,13 +4056,14 @@ fn ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has
     assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/cache/someone-elses-link-here/layers.json"))).status, 404);
     // A job never run before (a new workflow's): the store from its start too, as its repository's jobs used images;
     // once its own run used none, Docker as it comes for it. Another repository's new job: Docker as it comes.
-    let named = |job_id: u64, repo: &str, workflow: &str, name: &str| -> (String, Vec<(String, String)>) {
-        let payload = serde_json::json!({ "action": "queued", "workflow_job": { "id": job_id, "run_id": 3, "labels": ["superci/image=ubuntu26"], "name": name, "workflow_name": workflow }, "repository": { "full_name": repo, "private": true }, "installation": { "id": 42 } }).to_string();
+    let labelled_named = |job_id: u64, repo: &str, workflow: &str, name: &str, label: &str| -> (String, Vec<(String, String)>) {
+        let payload = serde_json::json!({ "action": "queued", "workflow_job": { "id": job_id, "run_id": 3, "labels": [label], "name": name, "workflow_name": workflow }, "repository": { "full_name": repo, "private": true }, "installation": { "id": 42 } }).to_string();
         let sig = format!("sha256={}", hex(&hmac_sha256(b"whsec", payload.as_bytes())));
         run(Request::new("POST", &format!("{PLANE_URL}/webhook")).with_header("x-github-event", "workflow_job").with_header("x-hub-signature-256", &sig).with_body(payload));
         let launch = launches(&http.clouds).pop().expect("a machine");
         (String::from_utf8(STANDARD.decode(field(&launch, "UserData")).unwrap()).unwrap(), launch)
     };
+    let named = |job_id: u64, repo: &str, workflow: &str, name: &str| labelled_named(job_id, repo, workflow, name, "superci/image=ubuntu26");
     let (script, _) = named(5, "acme/app", "End to end", "e2e");
     assert!(script.contains("/layers|bash"), "{script}");
     assert_eq!(job(&store, 5)["layers"], true);
@@ -4073,6 +4074,12 @@ fn ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has
     assert!(script.contains("/layers|bash"), "a job using none leaves its repository's word as it was: {script}");
     let (script, _) = named(8, "acme/other", "End to end", "e2e");
     assert!(!script.contains("/layers|bash"), "{script}");
+    // A label's `docker-cache`: false, Docker as it comes and nothing kept, whatever was used before; true, the store
+    // from the start, whatever was.
+    let (script, launch) = machine(9, "superci/image=ubuntu26/docker-cache=false");
+    assert!(!script.contains("/layers|bash") && !script.contains("$f keep") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty(), "{script}");
+    let (script, _) = labelled_named(10, "acme/other", "End to end", "e2e", "superci/image=ubuntu26/docker-cache=true");
+    assert!(script.contains("/layers|bash") && script.contains("$f keep"), "{script}");
     // Ubuntu 24.04 (Docker 28): as before, nothing of the store's.
     let (script, launch) = machine(4, "superci/image=ubuntu24");
     assert!(!script.contains("/layers|bash") && !script.contains("$f keep") && field(&launch, "BlockDeviceMapping.2.DeviceName").is_empty());

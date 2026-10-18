@@ -2916,10 +2916,11 @@ impl<'a> ControlPlane<'a> {
                             // Docker's images from the cache: on the Ubuntu whose Docker keeps them in containerd. Set up at
                             // the start, on a disk of its own, only for a job whose last run used images, or, a job with
                             // no last run, whose repository's jobs did (see `layers::plan`); kept after every job.
-                            let images = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26";
+                            // (`docker-cache=false`: Docker as it comes, nothing kept; `true`: the store from the start.)
+                            let images = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26" && spec.docker_cache != Some(false);
                             let used = if images { get_json::<crate::layers::Images>(self.store, &crate::layers::images_key(&job.repo, &job.workflow, &job.name)).await.ok().flatten() } else { None };
                             // (A job whose own last run said nothing, or is gone: its repository's other jobs.)
-                            let setup = crate::layers::plan(used.as_ref(), now) || (images && used.as_ref().is_none_or(|u| now.saturating_sub(u.at) >= crate::layers::PLAN_MS)
+                            let setup = (images && spec.docker_cache == Some(true)) || crate::layers::plan(used.as_ref(), now) || (images && used.as_ref().is_none_or(|u| now.saturating_sub(u.at) >= crate::layers::PLAN_MS)
                                 && crate::layers::plan(get_json::<crate::layers::Images>(self.store, &crate::layers::repo_images_key(&job.repo)).await.ok().flatten().as_ref(), now));
                             // A job whose files are in memory or on its machine's own disk keeps the layers there
                             // too (the store's folder is bound there with Docker's): no disk of their own, which

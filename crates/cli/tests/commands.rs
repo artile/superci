@@ -104,6 +104,11 @@ fn changes_are_written_where_the_control_plane_reads_them_and_it_answers_with_th
     assert_eq!(json(&home, &["machine", "retrieve"]).1["machine"], serde_json::json!({ "cpu": 8 }));
     ok(&["machine", "update", "--cpu=default"]);
     assert_eq!(json(&home, &["machine", "retrieve"]).1["machine"], serde_json::json!({}));
+    // No Docker image cache for any job unless its label says so.
+    ok(&["machine", "update", "--docker-cache=false"]);
+    assert_eq!(json(&home, &["machine", "retrieve"]).1["machine"], serde_json::json!({ "docker_cache": false }));
+    ok(&["machine", "update", "--docker-cache=default"]);
+    assert_eq!(json(&home, &["machine", "retrieve"]).1["machine"], serde_json::json!({}));
     // With --dry-run, what it would do, and nothing done.
     let before = served.aws.asked.lock().unwrap().len();
     let (code, would) = json(&home, &["name", "update", "Other", "--dry-run"]);

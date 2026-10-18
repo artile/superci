@@ -5988,6 +5988,7 @@ fn machines_card(v: &PlaneView) -> (String, String) {
     // (What only a command sets for every job: where its files are kept, its machine families, its provider.)
     if let Some(scratch) = m.scratch.as_deref() { parts.push(if scratch == "ramdisk" { "RAM disk".into() } else { "local disk".into() }) }
     if !m.families.is_empty() { parts.push(m.families.join(", ")) }
+    match m.docker_cache { Some(false) => parts.push("no Docker image cache".into()), Some(true) => parts.push("Docker image cache from the start".into()), None => {} }
     if let Some(provider) = &m.cloud { parts.push(format!("only {}", cloud_name(provider))) }
     let dialog = format!(r#"<dialog class="dlg" id="default-machine" onclick="if(event.target===this)this.close()"><form method="post" action="/machine" class="dlg-body picker" data-mode="default" data-default="{}" oninput="superciPick(this)" onchange="superciPick(this)"><div class="dlg-head"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span><strong>Default machine</strong><small>For <code>runs-on: {base}</code>, and any part a label leaves out.</small></span><button type="button" class="icon-btn" aria-label="Close" onclick="this.closest('dialog').close()"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div><div class="picker-fields">{}{}{}{}{}{}</div>{}<label class="check"><input type="checkbox" name="nospot"{}> No spot machines</label><div class="fits"><span class="note">Runs on</span>{}</div><div class="dlg-foot"><button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button><button class="button primary sm">Save</button></div></form></dialog>"#,
         esc(&default.to_string()),
@@ -5997,7 +5998,7 @@ fn machines_card(v: &PlaneView) -> (String, String) {
         // (Beside the system: which Ubuntu, unset as GitHub's `ubuntu-latest` is.)
         format!("{}{}", choice("os", "System", "", &[("linux", "Linux"), ("windows", "Windows")], Some(m.os())), choice("image", "Ubuntu", "As ubuntu-latest", &UBUNTU_CHOICES, m.image.as_deref())),
         // (What the dialog does not show is kept as it is.)
-        m.pairs().iter().filter(|(key, _)| ["disk-iops", "gpu", "family", "scratch", "provider"].contains(key)).map(|(key, value)| format!(r#"<input type="hidden" name="{key}" value="{}">"#, esc(value))).collect::<String>(),
+        m.pairs().iter().filter(|(key, _)| ["disk-iops", "gpu", "family", "scratch", "provider", "docker-cache"].contains(key)).map(|(key, value)| format!(r#"<input type="hidden" name="{key}" value="{}">"#, esc(value))).collect::<String>(),
         if m.on_demand() { " checked" } else { "" }, pools());
     let default_row = format!(r#"<div class="default-machine"><span class="logo" style="width:36px;height:36px;background:var(--accent-soft);color:var(--accent)">{ICON_CHIP}</span><span class="dm-main"><strong>Default machine</strong><small>What <code>{base}</code> runs on, and anything a label leaves out.</small></span><span class="dm-spec">{}</span><button type="button" class="button secondary sm" onclick="document.getElementById('default-machine').showModal()">Change</button></div>"#,
         parts.iter().map(|p| format!(r#"<span class="lim">{}</span>"#, esc(p))).collect::<String>());
