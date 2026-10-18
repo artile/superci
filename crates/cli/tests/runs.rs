@@ -1518,3 +1518,38 @@ fn a_run_the_control_plane_cannot_run_is_refused_with_why_and_starts_nothing() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn a_gpu_job_on_an_account_with_no_gpu_quota_fails_saying_which_quota_and_a_type_a_zone_lacks_is_said_as_aws_answered() {
+    let own = |c: &mut superci_core::plane::Config| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    };
+    let job_of = |served: &superci_testkit::Served| loop {
+        if let Some((_, j)) = served.store.under("job:").into_iter().next().filter(|(_, j)| j["machine_id"].is_string() || ["failed", "waiting"].contains(&j["state"].as_str().unwrap_or_default())) { break j }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    // A GPU machine on-demand, on an account AWS allows none (its quota for them is 0), as AWS answered Test.
+    let served = serve(own);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/gpu-on-demand.jsonl"), &[]);
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  train:\n    runs-on: superci/gpu=any/spot=false\n    steps:\n      - run: make train\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let job = job_of(&served);
+    assert_eq!(job["state"], "failed", "{job}");
+    assert!(job["error"].as_str().unwrap().starts_with("AWS lets this account run no GPU machines yet: ask AWS for more in Service Quotas, “Running On-Demand G and VT instances”"), "{job}");
+    let _ = std::fs::remove_dir_all(&dir);
+    // A type the zone asked does not offer, as AWS answered Test for us-east-1e (here for every zone): each zone's
+    // refusal is kept with the job's start, and the job goes to the next in the order, Cloudflare.
+    let served = serve(own);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/unsupported.jsonl"), &[]);
+    let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2/spot=false\n    steps:\n      - run: make test\n")]);
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let job = job_of(&served);
+    let asks = job["asks"].as_array().cloned().unwrap_or_default();
+    assert!(job["cloud"] == "cloudflare" && asks.len() == 6 && asks.iter().all(|a| a["said"] == "Unsupported" && a["spot"] == false), "{job}");
+    assert!(served.store.under("aws:unoffered:us-east-1:").len() >= 6, "a type a zone lacks is not asked there again: {:?}", served.store.under("aws:"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
