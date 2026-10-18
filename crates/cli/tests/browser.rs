@@ -6213,12 +6213,28 @@ fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_p
         ("nothing to run Windows", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws","off":true},{"cloud":"aws-on-demand","off":true}]}"#, false, vec![("superci/os=windows", "Nowhere to run Windows: Cloudflare runs Linux only")]),
         ("macOS, which SuperCI does not run", r#"{"order":[{"cloud":"aws"}]}"#, false, vec![("superci/os=macos", "macOS")]),
     ];
+    // And with settings beside the routing ("-aws": AWS not connected).
+    let launcher = r#"[{"cloud":"cloudflare","url":"https://superci-runners.acme.workers.dev"}]"#;
+    let more: Vec<(&'static str, &'static str, bool, Vec<(&'static str, &'static str)>, Vec<(&str, &str)>)> = vec![
+        ("the AWS account past its month's limit", r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare","off":true}],"account_usd":{"aws":1.0}}"#, true, vec![("superci", "the AWS account reached its $1 a month")], vec![]),
+        ("the AWS account past its day's limit", r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare","off":true}],"account_daily_usd":{"aws":1.0}}"#, true, vec![("superci", "the AWS account reached its $1 a day")], vec![]),
+        ("a default and no order", r#"{"default":"aws"}"#, false, vec![("superci", "c8a.xlarge")], vec![]),
+        ("a default not added here", r#"{"default":"modal"}"#, false, vec![("superci", "Modal is not connected")], vec![]),
+        ("a rule naming a provider not added here", r#"{"rules":[{"repo":"acme/*","cloud":"modal"}]}"#, false, vec![("superci", "Modal is not connected")], vec![]),
+        ("a label naming a provider not added here", r#"{"order":[{"cloud":"aws"}]}"#, false, vec![("superci/provider=modal", "Its label needs Modal runners")], vec![]),
+        ("nothing connected", r#"{}"#, false, vec![("superci", "No cloud connected for jobs")], vec![("CONTAINERS", "off"), ("-aws", "")]),
+        ("Cloudflare through a launcher", r#"{}"#, false, vec![("superci", "Status")], vec![("CONTAINERS", "off"), ("LAUNCHERS", launcher), ("-aws", "")]),
+        ("Cloudflare's own containers and a launcher beside", r#"{}"#, false, vec![("superci", "Status")], vec![("LAUNCHERS", launcher), ("-aws", "")]),
+    ];
+    let cases: Vec<(&str, &str, bool, Vec<(&str, &str)>, Vec<(&str, &str)>)> = cases.into_iter().map(|(a, b, c, d)| (a, b, c, d, vec![])).chain(more).collect();
     let mut wrong = vec![];
-    for (what, routing, with_spend, jobs) in cases {
-        let served = serve(|c| {
-            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    for (what, routing, with_spend, jobs, settings) in cases {
+        let with_aws = !settings.iter().any(|(k, _)| *k == "-aws");
+        let served = serve(move |c| {
+            if with_aws { (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX })); }
         });
         served.connect_github();
+        for (k, v) in &settings { if *k != "-aws" { served.aws.put(&format!("/superci/{PLANE}/{k}"), v) } }
         served.aws.put(&format!("/superci/{PLANE}/ROUTING"), routing);
         served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
         served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
