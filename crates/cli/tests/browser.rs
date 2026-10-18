@@ -5967,8 +5967,18 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     // How its start went: booted, its script began, its runner ready and listening.
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&boot=6.61&script={}&read={}&ready={}", now - 9000, now - 8000, now - 7000), ""), 200);
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&listening={}&gh=12", now - 3000), ""), 200);
-    // Without its link: nothing.
+    // Without its link: nothing. Times far from now, and a wait for GitHub out of range, are not taken.
     assert_eq!(say(&format!("hello?runner={runner}&t=not-its-link-at-all-xx&ready={now}"), ""), 404);
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&read={}&gh=999", now - 86_400_000), ""), 200);
+    // By a GitLab job's id that is none, or no id at all: nothing.
+    for q in ["hello?gl=&t=x", "hello?gl=NOT-AN-ID&t=x", "hello?t=x", "interrupted?gl=NOT-AN-ID&t=x", "interrupted?t=x"] { assert_eq!(say(q, ""), 404, "{q}") }
+    // The start of its runner's own log, with the job message in it: its steps' shape; one without: nothing made of it.
+    let message = include_str!("../../core/tests/fixtures/runner/parallel.github.json");
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&worker=1"), &format!("[2026-10-15 10:00:02Z INFO Worker] Job message:\n {message}\n[2026-10-15 10:00:02Z INFO Worker] Starting the job {{\n")), 200);
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&worker=1"), "[2026-10-15 10:00:02Z INFO Worker] Waiting\n"), 200);
+    // A page with nothing in it, or named as no page is: nothing kept.
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live=aaaa_3333_1.log&at=0"), ""), 200);
+    assert_eq!(say(&format!("hello?runner={runner}&t={hello}&live={}.log&at=0", "a".repeat(120)), "x"), 200);
     // Its runner's own log, while it waits for GitHub.
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&log=runner"), "[2026-10-13 22:56:41Z WARN GitHubActionsService] Attempt 1 of POST request failed (Socket Error: TryAgain).\n"), 200);
     // The job taken; a step's lines as they are written, before GitHub has any.
@@ -5986,6 +5996,9 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     // AWS takes it back: said by its machine (with its own link), the job then failed by GitHub.
     assert_eq!(say(&format!("interrupted?runner={runner}&t=not-its-link-at-all-xx"), ""), 404);
     assert_eq!(say(&format!("interrupted?runner={runner}&t={notice}"), ""), 200);
+    // Said again (its watch may say it twice): one record.
+    assert_eq!(say(&format!("interrupted?runner={runner}&t={notice}"), ""), 200);
+    assert_eq!(served.store.under("spot:interrupted:").len(), 1);
     assert!(served.webhook(served.github.finish(id, "failure", "2026-10-15T10:00:07.0000000Z The runner has received a shutdown signal.", served.now_ms())) < 300);
     b.goto(&format!("{link}&p=job&id={id}"));
     b.wait(&shows("Status"));
