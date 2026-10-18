@@ -440,6 +440,9 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
     runners(&mut b);
     b.click(r#"button[aria-label="AWS account 111111111111 settings"]"#, "");
     b.wait("[...document.querySelectorAll('dialog')].some(d => d.open && d.querySelector('textarea[name=networks]'))");
+    // None given while none is kept: nothing written.
+    let (status, _, _) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "")]);
+    assert!(status < 400 && setting("AWS_NETWORKS").is_none(), "{:?}", setting("AWS_NETWORKS"));
     b.eval("(() => { const d = [...document.querySelectorAll('dialog')].find(d => d.open); d.querySelector('textarea[name=networks]').value = 'us-east-1 not-a-subnet'; d.querySelector('button.primary').click(); })()");
     b.wait("document.body.innerText.includes('Check your networks')");
     assert_eq!(setting("AWS_NETWORKS"), None);
@@ -465,6 +468,18 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
     for _ in 0..2 {
         let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "")]);
         assert!(status < 400 && setting("AWS_NETWORKS").as_deref() == Some("{}"), "{status} {} {:?}", common::words(&said), setting("AWS_NETWORKS"));
+    }
+    // Cloudflare's location as it is already: nothing written. A limit that is no amount (not finite, below zero): none.
+    let (status, _, _) = common::post(&link, "/routing", &[("action", "pool"), ("cloud", "cloudflare"), ("location", "weur")]);
+    assert!(status < 400 && setting("CF_LOCATION").as_deref() == Some("weur"), "{:?}", setting("CF_LOCATION"));
+    let (status, _, _) = common::post(&link, "/routing", &[("action", "pool"), ("cloud", "cloudflare"), ("location", "weur")]);
+    assert!(status < 400 && setting("CF_LOCATION").as_deref() == Some("weur"));
+    for usd in ["inf", "-5", "NaN"] {
+        let (status, _, _) = common::post(&link, "/routing", &[("action", "pool"), ("cloud", "cloudflare"), ("usd", usd), ("max", "1000")]);
+        assert!(status < 400, "{usd}");
+        let routing: serde_json::Value = serde_json::from_str(&setting("ROUTING").unwrap_or_default()).unwrap_or_default();
+        let pool = routing["order"].as_array().into_iter().flatten().find(|p| p["cloud"] == "cloudflare").cloned().unwrap_or_default();
+        assert!(pool["monthly_usd"].is_null() && pool["max_jobs"].is_null(), "{usd}: {pool}");
     }
 
     // A new order: each provider once, and only ones it has (as a page made up would say).
