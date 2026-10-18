@@ -684,6 +684,21 @@ fn a_jobs_page_says_each_step_of_its_start_and_its_runner_as_its_machine_said() 
     b.click("main a", "tests");
     b.wait(&shows("Its start"));
     let page = b.eval("location.href").as_str().unwrap().to_string();
+    let asks = || serde_json::json!([
+        { "at": 1, "ms": 300, "kind": "m8a.2xlarge", "spot": true, "said": "InsufficientInstanceCapacity", "zone": "us-east-1a", "usd": 0.135 },
+        { "at": 1, "ms": 300, "kind": "m8a.2xlarge", "spot": true, "said": "InsufficientInstanceCapacity", "zone": "us-east-1b" },
+        { "at": 1, "ms": 300, "kind": "m7a.2xlarge", "spot": true, "said": "MaxSpotInstanceCountExceeded" },
+        { "at": 1, "ms": 300, "kind": "c7a.2xlarge", "spot": true, "said": "RequestLimitExceeded" },
+        { "at": 1, "ms": 300, "kind": "c6a.2xlarge", "spot": true, "said": "Unsupported" },
+        { "at": 1, "ms": 300, "kind": "r8a.2xlarge", "spot": true, "said": "InsufficientInstanceCapacity", "pools": 14 },
+        { "at": 1, "ms": 300, "kind": "r7a.2xlarge", "spot": true, "said": "VcpuLimitExceeded", "pools": 3 },
+        { "at": 1, "ms": 300, "kind": "r6a.2xlarge", "spot": true, "said": "Unsupported", "pools": 2 },
+        { "at": 1, "ms": 300, "kind": "m8a.2xlarge", "spot": false, "said": "InsufficientInstanceCapacity" },
+        { "at": 1, "ms": 300, "kind": "m6a.large", "spot": false, "said": "started", "zone": "us-east-1c" },
+        { "at": 1, "ms": 300, "kind": "m6a.2xlarge", "spot": true, "said": "started", "zone": "us-east-1d", "pools": 5 },
+    ]);
+    let asked = || "AWS gave a machine (no spot m8a.2xlarge in 2 zones; your account's limit refused spot m7a.2xlarge; AWS took no more requests for spot c7a.2xlarge; Unsupported spot c6a.2xlarge; \
+        no spot machine in 14 other pools; your account's limit refused 3 other pools; Unsupported for 2 other pools; no on-demand m8a.2xlarge; on-demand m6a.large in us-east-1c; m6a.2xlarge in us-east-1d, AWS's choice of 5 pools)".to_string();
     let aws = |more: serde_json::Value| { let mut m = serde_json::json!({ "cloud": "aws", "machine_id": "i-0a1b2c3d4e5f60718", "launched_ms": t + 3_000 }); for (k, v) in more.as_object().unwrap() { m[k] = v.clone() } m };
     for (more, said) in [
         // From GitHub, after a wait under the spot limit, every step its machine timed, and what its runner logged.
@@ -708,6 +723,8 @@ fn a_jobs_page_says_each_step_of_its_start_and_its_runner_as_its_machine_said() 
         (serde_json::json!({ "provider": "github", "queued_ms": t - 2_000 }), vec!["GitHub told SuperCI of the job"]),
         // From before computers were set aside.
         (serde_json::json!({ "cloud": "machine" }), vec!["Your computer"]),
+        // What AWS answered each ask, said in a few words beside its step.
+        (aws(serde_json::json!({ "machine_type": "m6a.2xlarge", "started_ms": t + 30_000, "asks": asks() })), vec![&*asked()]),
     ] {
         let mut j = first.clone();
         for k in ["machine", "started_ms", "queued_ms", "launched_ms", "machine_id", "spot_waited_ms", "machine_type", "cpu", "disk_gb", "disk_mibs"] { j.as_object_mut().unwrap().remove(k); }
@@ -724,6 +741,9 @@ fn a_jobs_page_says_each_step_of_its_start_and_its_runner_as_its_machine_said() 
         let main = b.text("main");
         for s in said { assert!(main.contains(s), "{s}: {main}") }
     }
+    // Not its first choice, on the jobs list: the types AWS had no spot machine of, where and at what price.
+    b.click("a.chip", "Jobs");
+    b.wait(&shows("Not the first choice: AWS had no spot m8a.2xlarge in us-east-1a ($0.135 an hour) or r8a.2xlarge"));
     served.store.0.lock().unwrap().insert(key.clone(), first.to_string());
     seen_in_browser(&served);
     let _ = child.kill();
