@@ -2565,6 +2565,9 @@ fn each_kind_of_label_gets_its_aws_machine_and_its_page_says_which() {
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     served.connect_github();
+    served.connect_gitlab();
+    // (Behind its public address: its machines get their own links, Linux's and Windows'.)
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let labels = ["superci", "superci/cpu=8", "superci/cpu=2/ram=16", "superci/arch=arm64", "superci/os=windows", "superci/scratch=ramdisk", "superci/scratch=localdisk", "superci/family=c8id",
@@ -2576,6 +2579,14 @@ fn each_kind_of_label_gets_its_aws_machine_and_its_page_says_which() {
         let (id, q) = served.github.queue(label, label, served.now_ms());
         assert!(served.webhook(q) < 300, "{label}");
         jobs.push((id, label));
+    }
+    // GitLab's jobs with a few of them, as their tags.
+    let mut gl = vec![];
+    for label in ["superci", "superci/os=windows", "superci/image=ubuntu26/docker-cache=true", "superci/spot=false"] {
+        served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:") && !k.starts_with("aws:no-fleet"));
+        let (id, p) = served.gitlab.pending(label, &[label], served.now_ms());
+        assert!(served.gitlab_webhook(p) < 300, "{label}");
+        gl.push((id, label));
     }
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
@@ -2590,6 +2601,13 @@ fn each_kind_of_label_gets_its_aws_machine_and_its_page_says_which() {
             // Or why it has none.
             None => { let why = job["error"].as_str().unwrap_or_default().trim_start_matches("waiting: ").split(" (").next().unwrap_or_default().to_lowercase(); assert!(page.to_lowercase().contains(&why), "{label}: {why:?} not on its page:\n{page}") }
         }
+    }
+    for (id, label) in &gl {
+        let job = served.store.under(&format!("job:gl{id}"))[0].1.clone();
+        b.goto(&format!("{link}&p=job&id={id}&gl="));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        if let Some(kind) = job["machine_type"].as_str() { assert!(page.contains(kind), "GitLab {label}: {kind} not on its page:\n{page}") }
     }
     let launched = jobs.iter().filter(|(id, _)| served.store.under(&format!("job:{id}"))[0].1["machine_type"].is_string()).count();
     assert!(launched >= labels.len() - 2, "most get a machine: {launched} of {}", labels.len());
