@@ -3,7 +3,7 @@
 //! kit's stand-in for AWS (where the dashboard writes the control plane's settings, and the control plane reads them).
 //! Skipped where no Chrome is installed.
 mod common;
-use common::{dashboard, home, played, played_steps, signed_in};
+use common::{words, dashboard, home, played, played_steps, signed_in};
 use superci_testkit::{serve, Browser, PLANE};
 
 /// Waits up to 15 seconds for `holds`, else fails saying `what`.
@@ -639,4 +639,31 @@ fn a_control_plane_from_before_the_keys_new_name_says_why_with_a_key_alone_and_i
     b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Update to ')", shows(env!("CARGO_PKG_VERSION"))));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
+}
+
+
+#[test]
+fn a_cloudflare_sign_in_cloudflare_no_longer_takes_is_said_on_every_page_as_cloudflare_answered() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Its token refused (Cloudflare's 9109), and one due whose renewal Cloudflare refuses (invalid_grant): both over.
+    for due in [false, true] {
+        let served = serve(|_| {});
+        let home = signed_in(&served);
+        served.aws.replaying(include_str!("../fixtures/cloudflare/sign-in/ended.jsonl"), &[]);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["cloudflare"] = serde_json::json!({ "access": "example-access_token-ended", "expires_at_ms": if due { 0u64 } else { 4102444800000u64 }, "refresh": "example-refresh_token-ended" });
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let (mut child, link) = dashboard(&home);
+        b.goto(&link);
+        b.wait(&shows("Your Cloudflare sign-in has expired"));
+        // The rest of the page as it is: the control plane in AWS is read, and a page of its own says it too.
+        b.wait(&shows("Set up"));
+        b.click(".side a", "Control plane");
+        b.wait(&format!("{} && {}", shows("Your Cloudflare sign-in has expired"), shows("AWS · 111111111111")));
+        assert!(b.eval("[...document.querySelectorAll('main a, main button')].some(e => e.innerText.includes('Sign in with Cloudflare'))") == true, "due {due}");
+        assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
