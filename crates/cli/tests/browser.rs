@@ -7135,3 +7135,73 @@ fn control_planes_of_each_kind_are_deployed_moved_and_deleted_from_the_dashboard
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A Cloudflare control plane's containers set from the Runners form (where they start, GitHub's full image, how many
+/// at once), then it and a Modal one updated from the dashboard, as Cloudflare and Modal answered a real account.
+#[test]
+fn cloudflare_containers_are_set_and_cloudflare_and_modal_control_planes_updated_from_the_dashboard() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00003/CONTAINERS");
+    let aws = served.aws.clone();
+    let md = superci_testkit::serve_as("mdplane00003", move |c| { c.read_settings(&aws.modal_plane_settings()); c.own_cloud = "modal".into(); c.containers = false; });
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00003.modal.run".into(), md.url.clone());
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let step = |name: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/update/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    let open = |b: &mut Browser, id: &str| { let (child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", id), ("SUPERCI_VIEWS_S", "0")]); b.goto(&link); b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap())); (child, link) };
+    let until_page = |b: &mut Browser, link: &str, page: &str, text: &str| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            b.goto(&format!("{link}&{page}"));
+            b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+            let t = b.eval("document.body.innerText").as_str().unwrap_or_default().to_string();
+            if t.contains(text) { return }
+            assert!(std::time::Instant::now() < end, "{page}: no {text:?}:\n{t}");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    };
+    step("01-deploy-cf");
+    let (child, link) = open(&mut b, "cfplane00003");
+    assert!(post(&mut b, "/plane/cloudflare", &[("account", "1111111111111111111111111111111a")]).0 < 400);
+    until_page(&mut b, &link, "p=planes", "superci.acme.workers.dev");
+    drop(child);
+    step("02-deploy-modal");
+    let (child, link) = open(&mut b, "mdplane00003");
+    assert!(post(&mut b, "/plane/modal", &[]).0 < 400);
+    until_page(&mut b, &link, "p=planes", "acmeorg--superci-plane-mdplane00003");
+    drop(child);
+    step("03-cf-containers");
+    let (child, link) = open(&mut b, "");
+    assert!(post(&mut b, "/runners/cloudflare?c=cfplane00003", &[]).0 < 400);
+    // Its containers: where they start, GitHub's full image, how many at once (each a secret of its Worker).
+    step("04-cf-settings");
+    let (got, text) = post(&mut b, "/routing?c=cfplane00003", &[("action", "pool"), ("cloud", "cloudflare"), ("location", "weur"), ("image", "https://images.example.com/full"), ("max", "3")]);
+    assert!(got < 400, "{got} {text}");
+    let secret = |n: &str| served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == n).map(|(_, v)| v).unwrap_or_default();
+    until("its containers' settings", || secret("CF_LOCATION") == "weur" && secret("CF_IMAGE") == "https://images.example.com/full");
+    until_page(&mut b, &link, "c=cfplane00003&p=runners", "3 at once");
+    // Each updated to this version: the Worker uploaded again; Modal's app deployed again.
+    step("05-update-cf");
+    assert!(post(&mut b, "/plane/update?c=cfplane00003", &[("plane", "cfplane00003")]).0 < 400);
+    until_page(&mut b, &link, "c=cfplane00003&p=planes", "Updated to");
+    drop(child);
+    step("06-update-md");
+    let (child, link) = open(&mut b, "");
+    assert!(post(&mut b, "/plane/update?c=mdplane00003", &[("plane", "mdplane00003")]).0 < 400);
+    until_page(&mut b, &link, "c=mdplane00003&p=planes", "Updated to");
+    drop(child);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
