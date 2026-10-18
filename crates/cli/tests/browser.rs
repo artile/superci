@@ -10175,6 +10175,8 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
         vec!["jobs", "list", &by_run], vec!["jobs", "list", "--run=abc"], vec!["jobs", "retrieve"], vec!["jobs", "retrieve", "abc"], vec!["jobs", "retrieve", &id_s, "--bytes=200"], vec!["jobs", "retrieve", &id_s, "--tests"],
         vec!["runs", "retrieve"], vec!["runs", "retrieve", "abc"], vec!["runs", "retrieve", &run], vec!["runs", "retrieve", &run, "--tests"], vec!["runs", "retrieve", "123456"], vec!["runs", "cancel"], vec!["runs", "cancel", "abc"],
+        vec!["runs", "wait"], vec!["runs", "wait", "abc"], vec!["runs", "wait", "999"], vec!["artifacts", "list", "--run="], vec!["artifacts", "list", "--run=abc"], vec!["artifacts", "retrieve", "--run=999"],
+        vec!["artifacts", "retrieve", "x", "--run=abc"], vec!["artifacts", "retrieve", "x", "--run=999"],
         vec!["usage", "retrieve", "--period=month"], vec!["usage", "retrieve", "--period=year"],
         // Runners: each setting, those a provider does not have, and what is no provider.
         vec!["runners", "update", "cloudflare", "--regions=us-east-1"], vec!["runners", "update", "aws", "--regions=us-east-1,us-east-2", "--dry-run"], vec!["runners", "update", "cloudflare", "--location=weur"],
