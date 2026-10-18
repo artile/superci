@@ -7028,6 +7028,75 @@ fn a_runner_taking_another_jobs_work_swaps_machines_for_each_way_the_two_jobs_st
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A job's end as GitHub says it, for each way its record stands: its machine keeping its images a while; cancelled
+/// while it waited for room, while its machine was asked for, before any runner took it (taken back, or already over);
+/// ended on another job's runner; its record holding another job's machine; a conclusion said again differently; and
+/// one ended before this control plane knew of it. Each job's page says how it stands.
+#[test]
+fn a_jobs_end_is_settled_for_each_way_its_record_stands_and_said_on_its_page() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let job = |name: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let gone = |id: u64| served.store.0.lock().unwrap().contains_key(&format!("gone:{id}"));
+    let now = served.now_ms();
+    // Its machine keeps its job's images: ended later, if it has not gone by itself.
+    let keeps = job("keeps its images");
+    assert!(served.webhook(served.github.start(keeps)) < 300);
+    edit(keeps, &|j| { j["keeps"] = true.into(); });
+    assert!(served.webhook(served.github.finish(keeps, "success", "ok", now)) < 300);
+    assert!(served.store.0.lock().unwrap().contains_key(&format!("keeping:{keeps}")), "{}", state(keeps));
+    // Cancelled while it waited for room, and while its machine was being asked for.
+    let (waiting, launching) = (job("waiting"), job("launching"));
+    edit(waiting, &|j| { j["state"] = "waiting".into(); for k in ["machine_id", "runner", "runner_id"] { j.as_object_mut().unwrap().remove(k); } });
+    edit(launching, &|j| { j["state"] = "launching".into(); });
+    for id in [waiting, launching] { assert!(served.webhook(served.github.cancel(id, now)) < 300) }
+    assert!(state(waiting)["state"] == "cancelled" && gone(waiting), "{}", state(waiting));
+    assert!(gone(launching), "{}", state(launching));
+    // Cancelled before any runner took it: its runner taken back (its machine ended), or already over.
+    let (taken_back, over) = (job("taken back"), job("already over"));
+    edit(over, &|j| { j["over"] = true.into(); });
+    for id in [taken_back, over] { assert!(served.webhook(served.github.cancel(id, now)) < 300) }
+    assert!(state(taken_back)["began"] == true && state(over)["over"] == true, "{} {}", state(taken_back), state(over));
+    // Ended on another job's runner (that job still queued): its own machine is for that one now.
+    let (ran_on, runner_of) = (job("ran on another's runner"), job("whose runner it ran on"));
+    let runner = state(runner_of)["runner"].as_str().unwrap().to_string();
+    let _ = served.github.start_on(ran_on, &runner);
+    assert!(served.webhook(served.github.finish(ran_on, "success", "ok", now)) < 300);
+    assert!(state(ran_on)["over"] == true && state(ran_on)["for_job"].as_u64() == Some(runner_of), "{}", state(ran_on));
+    // Its record holding a machine busy with another job's work; and one whose conclusion is said again differently.
+    let (holding, again) = (job("holding another's machine"), job("said again"));
+    edit(holding, &|j| { j["state"] = "running".into(); j["seen_in_progress"] = true.into(); j["began"] = false.into(); j["runner"] = "superci-elsewhere".into(); });
+    edit(again, &|j| { j["state"] = "done".into(); j["seen_in_progress"] = true.into(); j["began"] = true.into(); j["conclusion"] = "failure".into(); j["runner"] = "superci-elsewhere".into(); });
+    for id in [holding, again] { assert!(served.webhook(served.github.cancel(id, now)) < 300) }
+    assert!(state(holding)["began"] == true && state(again)["conclusion"] == "cancelled", "{} {}", state(holding), state(again));
+    // Ended before this control plane knew of it: its queued event, behind, starts nothing.
+    let (unknown, queued) = served.github.queue("unknown", "superci", now);
+    assert!(served.webhook(served.github.cancel(unknown, now)) < 300);
+    assert!(gone(unknown));
+    assert!(served.webhook(queued) < 300);
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for id in [keeps, waiting, launching, taken_back, over, ran_on, holding, again] {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// GitLab's jobs on AWS: one whose spot machine AWS takes back, retried at GitLab and run again off spot machines; an
 /// event delivered twice; one taken by another job's runner; one cancelled while its machine starts. Each job's page
 /// says how it went.
