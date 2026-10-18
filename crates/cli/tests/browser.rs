@@ -1736,3 +1736,30 @@ fn sign_ins_made_elsewhere_while_the_dashboard_runs_are_taken_in_on_the_next_pag
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn signing_out_from_settings_ends_each_sign_in_and_hands_back_this_computers_key() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "example-access_token-1", "expires_at_ms": 4102444800000u64, "refresh": "example-refresh_token-2" });
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    // (Cloudflare asked to end it, as it answered; its usage and Modal's billing read meanwhile.)
+    served.aws.replaying(&[include_str!("../fixtures/cloudflare/01-look.jsonl"), include_str!("../fixtures/cloudflare/sign-in/usage.jsonl"), include_str!("../fixtures/modal/05-dashboard.jsonl"), include_str!("../fixtures/cloudflare/sign-in/sign-out.jsonl")].concat(), &[]);
+    let keys = || served.aws.settings(PLANE).into_iter().filter(|(k, _)| k.starts_with("DEVICE_KEY_")).count();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&shows("This device"));
+    let before = keys();
+    let (got, text) = post(&mut b, "/signout", &[]);
+    assert!(got < 400, "{got} {text}");
+    // Nothing kept on this computer, and the control plane no longer takes its key.
+    until("signed out", || !file.exists());
+    assert!(keys() < before, "its key handed back");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("dash.cloudflare.com/oauth2/revoke"))), "Cloudflare asked to end it");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
