@@ -7352,3 +7352,37 @@ fn an_update_waits_for_the_jobs_running_on_cloudflare_saying_how_many() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A change in the dashboard that needs a cloud whose sign-in is over: said as that, with what to do. Noted as ended
+/// before, refused by the cloud as the change is made (as Cloudflare and Modal answered ended ones), or the cloud not
+/// answering. Nothing changes.
+#[test]
+fn a_change_needing_a_cloud_whose_sign_in_is_over_says_so() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let cf = serde_json::json!({ "access": "example-access_token-ended", "expires_at_ms": 4102444800000u64, "refresh": "example-refresh_token-ended" });
+    let modal = serde_json::json!({ "token_id": "ak-superciendedrecording00", "token_secret": "as-superciendedrecording00", "workspace": "acmeci" });
+    type Case = (&'static str, Vec<(&'static str, serde_json::Value)>, &'static str, &'static str, Vec<(&'static str, &'static str)>, &'static str);
+    let cases: Vec<Case> = vec![
+        ("Cloudflare noted as ended", vec![("cloudflare_ended", true.into())], "", "/plane/cloudflare", vec![("account", "1111111111111111111111111111111a")], "Cloudflare sign-in has expired"),
+        ("Modal noted as ended", vec![("modal_ended", true.into())], "", "/plane/modal", vec![], "Modal no longer accepts"),
+        ("Cloudflare refusing it", vec![("cloudflare", cf.clone())], include_str!("../fixtures/cloudflare/sign-in/ended.jsonl"), "/plane/cloudflare", vec![("account", "1111111111111111111111111111111a")], "Cloudflare sign-in has expired"),
+        ("Modal refusing it", vec![("modal", modal.clone())], include_str!("../fixtures/modal/sign-in/ended.jsonl"), "/plane/modal", vec![], "Modal no longer accepts"),
+        ("Modal not answering", vec![("modal", serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" }))], "", "/runners/modal", vec![], "Modal"),
+    ];
+    for (what, kept_extra, recording, path, fields, said) in cases {
+        let served = serve(|_| {});
+        let home = signed_in(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        for (k, v) in kept_extra { kept[k] = v }
+        std::fs::write(&file, kept.to_string()).unwrap();
+        if !recording.is_empty() { served.aws.replaying(recording, &[]) }
+        let (mut child, link) = dashboard(&home);
+        b.goto(&link);
+        b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+        let (got, text) = post(&mut b, path, &fields);
+        assert!(got >= 400 && text.contains(said), "{what}: {got} {text}");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
