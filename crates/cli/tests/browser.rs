@@ -8468,6 +8468,20 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         ids.push(id);
     }
     assert!(served.store.under("job:").iter().any(|(_, j)| j["layers"] == true), "Docker's images kept from the start for one: {:?}", served.store.under("job:").iter().map(|(_, j)| (j["label"].clone(), j["layers"].clone(), j["keeps"].clone())).collect::<Vec<_>>());
+    // That machine's own link: the layer store's script, program and index, and what it asks of the store.
+    let script_now = script();
+    let link = script_now.split("plane.acme.test/cache/").nth(1).unwrap().split(|c: char| c == '\'' || c == '"' || c == '/' || c.is_whitespace()).next().unwrap().to_string();
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    for what in ["layers", "layers-program", "layers.json", "cache", "program"] {
+        let status = agent.get(&format!("{}/cache/{link}/{what}", served.url)).call().map(|r| r.status().as_u16()).unwrap_or(0);
+        assert!(status < 500, "{what}: {status}");
+        if what == "cache" { assert_eq!(status, 200, "its link is its machine's") }
+    }
+    for (what, body) in [("layers-links", r#"{"layers":["sha256:aaaa"]}"#), ("layers-propose", r#"{"layers":[{"digest":"sha256:aaaa","size":10}]}"#), ("layers-uploaded", r#"{"layers":["sha256:aaaa"]}"#),
+        ("layers-kept", r#"{"served":1,"served_bytes":10,"pulled":0,"pulled_bytes":0,"uploaded":0,"uploaded_bytes":0}"#), ("tool-get", r#"{"tool":"turbo","hash":"abc"}"#)] {
+        let status = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body).map(|r| r.status().as_u16()).unwrap_or(0);
+        assert!(status < 500, "{what}: {status}");
+    }
     // Docker's images not kept: the cache still there.
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{order},"cache":{{"images_off":true}}}}"#));
     ids.push(job("superci"));
