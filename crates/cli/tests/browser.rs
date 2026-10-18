@@ -917,6 +917,10 @@ fn another_control_plane_in_the_account_is_deleted_from_its_menu_and_the_one_in_
     let home = signed_in(&served);
     served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
     for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    // (A budget in AWS made for it, and its network that AWS will not delete yet: each said as left.)
+    other.aws.put("/superci/testplane0002/ROUTING", r#"{"aws_budget":{"stop":false},"account_usd":{"aws":100.0}}"#);
+    served.aws.put("/superci/testplane0002/ROUTING", r#"{"aws_budget":{"stop":false},"account_usd":{"aws":100.0}}"#);
+    served.aws.fail("DeleteVpc", 400, &superci_testkit::ec2_error("DependencyViolation", "The vpc 'vpc-00000000000000001' has dependencies and cannot be deleted."), None);
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
     b.wait(&shows("Set up"));
@@ -931,6 +935,8 @@ fn another_control_plane_in_the_account_is_deleted_from_its_menu_and_the_one_in_
     // Gone from the page and from AWS; the one in use keeps everything.
     b.wait(&format!("!document.querySelector('main').innerText.includes({:?})", other.url));
     until("its settings deleted", || served.aws.settings("testplane0002").is_empty());
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows("Control plane"));
     assert!(!served.aws.settings(superci_testkit::PLANE).is_empty());
     let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
     assert!(asked.iter().any(|a| a == "DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0002"), "{asked:?}");
