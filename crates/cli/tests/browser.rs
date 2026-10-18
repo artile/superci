@@ -2737,6 +2737,45 @@ fn a_first_control_plane_made_from_the_cli_is_followed_to_its_end_and_shown_on_t
 }
 
 #[test]
+fn each_test_runners_failures_are_read_from_a_jobs_log_by_the_cli_and_the_job_page_shows_it() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let t = |lines: &[&str]| lines.iter().enumerate().map(|(i, l)| format!("2026-10-15T10:00:{:02}.0000000Z {l}\n", i % 60)).collect::<String>();
+    let logs: Vec<(&str, String)> = vec![
+        ("vitest", t(&[" FAIL  src/math.test.ts > math > adds", "AssertionError: expected 3 to be 4", "- Expected", "+ Received", "⎯⎯⎯⎯⎯⎯", " Test Files  1 failed (1)", "      Tests  1 failed | 3 passed (4)"])),
+        ("jest", t(&["  ● Cart › totals the items", "", "    expect(received).toBe(expected)", "    Expected: 30", "    Received: 20", "  ● Console", "Test Suites: 1 failed, 1 total", "Tests:       1 failed, 2 passed, 3 total"])),
+        ("playwright", t(&["Running 4 tests using 2 workers", "  ✓  1 [chromium] › e2e/a.spec.ts:4:3 › logs in (2.1s)", "  ✘  2 [chromium] › e2e/a.spec.ts:9:3 › logs out (1.0s)", "  ✓  3 [chromium] › e2e/a.spec.ts:9:3 › logs out (retry #1) (1.2s)",
+            "  ✘  4 [chromium] › e2e/b.spec.ts:2:3 › pays (3.0s)", "  1) [chromium] › e2e/b.spec.ts:2:3 › pays ───", "    Error: expect(locator).toBeVisible() failed", "    TimeoutError: waited", "  1 failed", "  1 flaky", "  2 passed (5.0s)"])),
+        ("pytest", t(&["FAILED tests/test_app.py::test_login - AssertionError: no", "ERROR tests/test_db.py::test_conn - ConnectionError", "===== 1 failed, 1 error, 7 passed in 1.20s ====="])),
+        ("cargo", t(&["test store::reads ... ok", "test store::writes ... FAILED", "failures:", "---- store::writes stdout ----", "thread 'store::writes' panicked at src/store.rs:40:9:", "assertion failed", "failures:", "test result: FAILED. 1 passed; 1 failed; 0 ignored"])),
+        ("go", t(&["=== RUN   TestAdd", "--- FAIL: TestAdd (0.01s)", "    add_test.go:10: got 3, want 4", "--- PASS: TestSub (0.00s)", "--- SKIP: TestMul (0.00s)", "FAIL"])),
+        ("marked", t(&["[slot 1] test a::one ... ok", "[slot 2] test b::two ... FAILED", "[slot 2] ---- b::two stdout ----", "[slot 2] boom", "[slot 1] test result: ok. 1 passed; 0 failed", "[slot 2] test result: FAILED. 0 passed; 1 failed", "[a-very-long-mark-that-is-no-process-at-all] x", "[a[b]] y"])),
+        ("none matched", t(&["No tests found, exiting with code 1", "No test files found, exiting with code 1", "##[error]Process completed with exit code 1."])),
+        ("none matched 2", t(&["Error: No tests found", "No test suite found in file src/a.test.ts", "ERROR: not found: tests/test_x.py::nothing", "======= no tests ran in 0.01s ======="])),
+        ("nothing read", t(&["make: *** [Makefile:3: lint] Error 2", "##[error]Process completed with exit code 2."])),
+    ];
+    let mut ids = vec![];
+    for (name, log) in &logs {
+        let (id, q) = served.github.queue(name, "superci", served.now_ms()); served.webhook(q);
+        served.webhook(served.github.start(id));
+        served.webhook(served.github.finish(id, "failure", log, served.now_ms()));
+        ids.push((id, *name));
+    }
+    let home = signed_in(&served);
+    for (id, name) in &ids {
+        let o = common::command(&home).args(["jobs", "retrieve", &id.to_string(), "--tests", "--json"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string();
+        assert!(o.status.code().is_some_and(|c| c <= 3) && !String::from_utf8_lossy(&o.stderr).contains("panicked"), "{name}: {said}{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
