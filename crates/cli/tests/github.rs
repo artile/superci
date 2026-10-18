@@ -3,7 +3,7 @@
 //! connected; the job is then followed in the CLI and in the dashboard, in Chrome where it is installed.
 mod common;
 use common::{dashboard, json, part, signed_in, superci, words};
-use superci_testkit::{serve, Browser, Served};
+use superci_testkit::{serve, Served};
 
 /// GitHub's log of a job, as it keeps it (each line timed; a step's lines in a group).
 fn github_log() -> String {
@@ -58,48 +58,6 @@ fn a_github_job_runs_on_its_machine_and_is_read_with_its_log_in_the_cli() {
     let connections = json(&home, &["connections", "list"]).1;
     assert_eq!(connections["github"][0]["owner"].as_str().or(connections["installations"][0]["account"].as_str()), Some("acme"), "{connections}");
     assert!(unanswered(&served).is_empty(), "{:?}", unanswered(&served));
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[test]
-fn a_github_jobs_page_shows_its_log_in_steps_and_leads_to_github() {
-    let served = serve(|_| {});
-    served.connect_github();
-    let home = signed_in(&served);
-    let id = ran(&served, "failure");
-    let (mut child, link) = dashboard(&home);
-    // Its page as the dashboard's page fetches it, and its log in steps.
-    let (_, page) = part(&link, &format!("/?p=job&id={id}&fragment=1"));
-    let shown = words(&page);
-    assert!(shown.contains("app · Build and Test") && shown.contains("Status Failed") && !shown.contains("It did not start"), "{shown}");
-    assert!(page.contains(&format!("/actions/runs/")) && page.contains("On GitHub"), "{shown}");
-    let (_, view) = part(&link, &format!("/job/view?id={id}"));
-    let view: serde_json::Value = serde_json::from_str(&view).unwrap();
-    let steps: Vec<&str> = view["steps"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
-    assert!(steps.contains(&"Set up job") && steps.contains(&"Run make test"), "{view}");
-    // Its raw log is GitHub's own link.
-    let (status, _) = part(&link, &format!("/job/raw?id={id}"));
-    assert_eq!(status, 302);
-    // Repositories: the App connected in acme, its repository.
-    let (_, repos) = part(&link, "/?p=repos&fragment=1");
-    assert!(words(&repos).contains("acme"), "{}", words(&repos));
-
-    // In Chrome: from Jobs to the job, its failed step open with its lines.
-    if let Some(mut b) = Browser::open(1300, 900) {
-        b.goto(&link);
-        b.wait("document.querySelector('main') && document.querySelector('main').innerText.includes('Usage')");
-        b.click("nav a", "Runs");
-        b.wait("document.querySelector('main').innerText.includes('Recent runs')");
-        b.click(".tabs a", "Jobs");
-        b.wait("document.querySelector('main').innerText.includes('Recent jobs')");
-        b.click("main a", "test");
-        b.wait("document.querySelector('details.lstep')");
-        b.wait("[...document.querySelectorAll('details.lstep')].some(d => d.innerText.includes('Run make test'))");
-        let on_github = b.eval("document.querySelector('a[href^=\"https://github.com/acme/app/actions/runs/\"]').innerText");
-        assert!(on_github.as_str().unwrap_or_default().contains("On GitHub"), "{on_github}");
-    }
-    assert!(unanswered(&served).is_empty(), "{:?}", unanswered(&served));
-    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -234,52 +192,6 @@ fn github_is_connected_from_repositories_and_its_jobs_then_run() {
     // Its jobs run.
     ran(&served, "success");
     assert!(unanswered(&served).is_empty(), "{:?}", unanswered(&served));
-    let _ = child.kill();
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[test]
-fn a_finished_jobs_page_shows_its_whole_log_however_large() {
-    let served = serve(|_| {});
-    served.connect_github();
-    let home = signed_in(&served);
-    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
-    served.webhook(queued);
-    served.webhook(served.github.start(id));
-    // 2.4 MB: more than the last part a running job's page reads.
-    // (Its lines in the second its steps began, as GitHub says of them.)
-    let at = served.github.job(id)["started_at"].as_str().unwrap().trim_end_matches('Z').to_string();
-    let mut log = vec![format!("{at}.1000000Z ##[group]Set up job"), format!("{at}.2000000Z ##[endgroup]"), format!("{at}.3000000Z ##[group]Run make test")];
-    log.extend((1..=40_000).map(|n| format!("{at}.4000000Z test {n} of the suite passed in good time")));
-    let log = log.join("\n");
-    assert!(log.len() > 2_000_000);
-    served.webhook(served.github.finish(id, "success", &log, served.now_ms()));
-    let (mut child, link) = dashboard(&home);
-    let (_, view) = part(&link, &format!("/job/view?id={id}"));
-    let view: serde_json::Value = serde_json::from_str(&view).unwrap();
-    assert_eq!(view["truncated"], false);
-    let step = view["steps"].as_array().unwrap().iter().find(|s| s["name"] == "Run make test").unwrap();
-    let lines = step["lines"].as_array().unwrap();
-    assert_eq!((lines.len(), lines[1][2].as_str(), lines[40_000][2].as_str()), (40_001, Some("test 1 of the suite passed in good time"), Some("test 40000 of the suite passed in good time")));
-    // In Chrome: nothing of it drawn until a step is opened, then its first 2,000 lines and a way to more; search
-    // finds a line far down without drawing the step whole.
-    if let Some(mut b) = Browser::open(1300, 900) {
-        b.goto(&format!("{link}&p=job&id={id}"));
-        b.wait("document.querySelector('details.lstep')");
-        assert_eq!(b.eval("document.querySelectorAll('.ll').length"), 0);
-        b.click("details.lstep summary", "Run make test");
-        b.wait("document.querySelectorAll('.ll').length === 2000");
-        assert_eq!(b.text(".ll-more"), "Show 4,000 more of 38,001 lines");
-        b.click(".ll-more", "");
-        b.wait("document.querySelectorAll('.ll').length === 6000");
-        assert_eq!(b.eval("document.querySelectorAll('.ll')[5999].querySelector('.ln').textContent"), "6000", "each line its number");
-        b.fill("[data-log-search]", "test 39999 of");
-        b.wait("document.querySelectorAll('.ll.hit').length === 1");
-        assert_eq!((b.text(".ll.hit .lx"), b.eval("document.querySelectorAll('.ll').length")), ("test 39999 of the suite passed in good time".to_string(), serde_json::json!(1)));
-        // Cleared: the step as it was opened (6,000 lines shown).
-        b.fill("[data-log-search]", "");
-        b.wait("document.querySelectorAll('.ll').length === 6000");
-    }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

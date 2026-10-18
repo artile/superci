@@ -3,7 +3,7 @@
 //! runner dropped as it went, from the step's whole log), and how the run ended.
 mod common;
 use std::process::{Command, Stdio};
-use superci_testkit::{serve, Browser, Runner};
+use superci_testkit::{serve, Runner};
 
 fn checkout() -> std::path::PathBuf {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -723,67 +723,6 @@ fn a_job_that_may_fail_lets_the_run_go_on_and_one_past_its_timeout_is_ended() {
 }
 
 #[test]
-fn a_run_from_a_computer_is_followed_in_the_dashboard_from_runs_to_its_jobs_log() {
-    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
-    let served = serve(|_| {});
-    let dir = checkout();
-    let started = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
-    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
-    let run = run_of(&served);
-    play(&served, &run, &["compiling".to_string(), "test 1 passed".to_string()], "succeeded");
-    let home = common::signed_in(&served);
-    let (mut child, link) = common::dashboard(&home);
-    let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
-    b.goto(&link);
-    b.wait(&shows("Usage"));
-    // Runs: the run, by its workflow; its page: its job; the job's page: its steps, and their lines.
-    b.click("nav a", "Runs");
-    b.wait(r#"document.querySelector('main a[href*="p=run&"]') !== null"#);
-    b.eval(r#"document.querySelector('main a[href*="p=run&"]').click()"#);
-    b.wait(&shows("tests"));
-    b.wait(r#"document.querySelector('main a[href*="p=job&"]') !== null"#);
-    b.eval(r#"document.querySelector('main a[href*="p=job&"]').click()"#);
-    b.wait("document.querySelector('details.lstep') !== null");
-    b.click("details.lstep summary", "Run make test");
-    b.wait("[...document.querySelectorAll('.ll .lx')].some(l => l.textContent === 'test 1 passed')");
-    let _ = child.kill();
-    let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn overviews_period_and_the_runs_and_jobs_tabs_switch_in_the_browser() {
-    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
-    let served = serve(|_| {});
-    let dir = checkout();
-    let started = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
-    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
-    play(&served, &run_of(&served), &["ok".to_string()], "succeeded");
-    let home = common::signed_in(&served);
-    let (mut child, link) = common::dashboard(&home);
-    let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
-    let on = |period: &str| format!(r#"document.querySelector('nav.seg-links a[aria-current="true"]') && document.querySelector('nav.seg-links a[aria-current="true"]').textContent === {}"#, serde_json::json!(period));
-    b.goto(&link);
-    b.wait(&shows("Usage"));
-    // The period: 24 hours unless chosen; 7 days, then 30, each marked and kept in the address.
-    b.wait(&on("24 hours"));
-    b.click("nav.seg-links a", "7 days");
-    b.wait(&format!("{} && new URLSearchParams(location.search).get('usage') === 'week'", on("7 days")));
-    b.click("nav.seg-links a", "30 days");
-    b.wait(&format!("{} && new URLSearchParams(location.search).get('usage') === 'month'", on("30 days")));
-    // Runs and Jobs: one tab each, the run there and its job here.
-    b.click("nav a", "Runs");
-    b.wait(r#"document.querySelector('a.tab[aria-selected="true"]') && document.querySelector('a.tab[aria-selected="true"]').textContent === 'Runs'"#);
-    b.wait(&shows("ci.yml"));
-    b.click("a.tab", "Jobs");
-    b.wait(r#"document.querySelector('a.tab[aria-selected="true"]') && document.querySelector('a.tab[aria-selected="true"]').textContent === 'Jobs'"#);
-    b.wait(&shows("tests"));
-    let _ = child.kill();
-    let _ = std::fs::remove_dir_all(&home);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn a_job_whose_spot_machine_aws_took_back_is_started_again_off_spot_and_the_run_goes_on() {
     let served = serve(|_| {});
     let dir = checkout();
@@ -905,42 +844,6 @@ fn a_run_cancelled_before_its_machine_began_its_job_ends_that_machine_at_once() 
     assert_eq!((job["state"].as_str(), job["ended_ms"].is_u64()), (Some("cancelled"), true), "{job}");
     let jobs = served.store.under(&format!("run:{run}"))[0].1["jobs"].clone();
     assert_eq!((jobs[0]["state"].as_str(), jobs[0]["result"].as_str()), (Some("done"), Some("cancelled")), "{jobs}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_running_run_is_cancelled_from_its_page_in_the_browser() {
-    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
-    let served = serve(|_| {});
-    let dir = checkout();
-    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let run = run_of(&served);
-    let runner = runner_of(&served, &run, "tests");
-    runner.take();
-    runner.steps(&[("abababab-0000-0000-0000-000000000007", "Run make", 1, "inProgress", None, None)]);
-    let home = common::signed_in(&served);
-    let (mut child, link) = common::dashboard(&home);
-    let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
-    b.goto(&link);
-    b.wait(&shows("Usage"));
-    b.click("nav a", "Runs");
-    b.wait(r#"document.querySelector('main a[href*="p=run&"]') !== null"#);
-    b.eval(r#"document.querySelector('main a[href*="p=run&"]').click()"#);
-    // Running: its Cancel; clicked, its runner is told to stop, as GitHub tells one.
-    b.wait(r#"[...document.querySelectorAll('main button')].some(x => x.textContent === 'Cancel run')"#);
-    b.eval(r#"[...document.querySelectorAll('main button')].find(x => x.textContent === 'Cancel run').click()"#);
-    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let told = loop {
-        let (status, m) = runner.message();
-        if status == 200 { break m }
-        assert!(std::time::Instant::now() < end, "its runner was not told");
-    };
-    assert_eq!(told["messageType"], "JobCancellation", "{told}");
-    runner.finish("canceled");
-    b.wait(&shows("Cancelled"));
-    let _ = child.kill();
-    let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

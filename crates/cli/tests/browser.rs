@@ -2374,7 +2374,7 @@ fn a_page_whose_dashboard_stopped_keeps_what_it_showed_marked_stale_and_says_whe
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
     let home = signed_in(&served);
-    let (mut child, link) = dashboard(&home);
+    let (child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=runners"));
     b.wait(&format!("{} && !document.body.classList.contains('busy')", shows("Clouds")));
     // Stopped: the page keeps what it showed, dimmed, with a bar saying so (its next look finds nothing).
@@ -2514,3 +2514,350 @@ fn each_kind_of_label_gets_its_aws_machine_and_its_page_says_which() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Browser tests of runs: what a person sees of them in the dashboard.
+mod runs_in_browser {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use superci_testkit::Runner;
+
+    fn checkout() -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!("superci-e2e-{}-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst), superci_core_free_id()));
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make\n      - run: make test\n").unwrap();
+        std::fs::write(dir.join("Makefile"), "test:\n\techo ok\n").unwrap();
+        for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] {
+            assert!(Command::new("git").current_dir(&dir).args(args).status().unwrap().success());
+        }
+        dir
+    }
+    fn superci_core_free_id() -> u128 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() }
+
+    #[test]
+    fn a_run_from_a_computer_prints_every_line_once_in_order_and_ends_with_how_each_step_went() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let home = dir.join(".home");
+        let cli = Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml"])
+            .env("SUPERCI_HOME", &home).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        // The machine started; its runner (played here) takes the job.
+        let run = loop {
+            if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let line = |n: u64| format!("build line {n}");
+        let (a, b) = ("aaaaaaaa-0000-0000-0000-000000000001", "bbbbbbbb-0000-0000-0000-000000000002");
+        runner.take();
+        assert_eq!(runner.steps(&[(a, "Run make", 1, "inProgress", None, None), (b, "Run make test", 2, "pending", None, None)]), 200);
+        // Lines 1-3 as they come, then 7-8: the runner dropped 4-6 (it holds 1,024 at most).
+        assert_eq!(runner.lines(a, 1, &(1..=3).map(line).collect::<Vec<_>>()), 200);
+        std::thread::sleep(std::time::Duration::from_millis(1800));
+        assert_eq!(runner.lines(a, 7, &(7..=8).map(line).collect::<Vec<_>>()), 200);
+        std::thread::sleep(std::time::Duration::from_millis(1800));
+        // The step ends: its whole log; then the next step, and the job.
+        assert_eq!(runner.log(1, &(1..=8).map(|n| format!("2026-10-15T10:00:0{}.0000000Z {}", n % 10, line(n))).collect::<Vec<_>>().join("\n")), 200);
+        assert_eq!(runner.steps(&[(a, "Run make", 1, "completed", Some("succeeded"), Some(1)), (b, "Run make test", 2, "inProgress", None, None)]), 200);
+        assert_eq!(runner.lines(b, 1, &["ok".to_string()]), 200);
+        assert_eq!(runner.log(2, "2026-10-15T10:00:09.0000000Z ok"), 200);
+        assert_eq!(runner.steps(&[(a, "Run make", 1, "completed", Some("succeeded"), Some(1)), (b, "Run make test", 2, "completed", Some("succeeded"), Some(2))]), 200);
+        assert_eq!(runner.finish("succeeded"), 200);
+        let out = cli.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{said}");
+        // Every line once, in the order printed: 1-3 as they came, 7-8, then 4-6 once the step ended, said as late.
+        let printed: Vec<&str> = said.lines().map(str::trim).collect();
+        let at = |s: &str| printed.iter().position(|l| l.ends_with(s)).unwrap_or_else(|| panic!("no {s:?} in:\n{said}"));
+        for n in 1..=8 { assert_eq!(printed.iter().filter(|l| l.ends_with(&line(n))).count(), 1, "{n} once:\n{said}") }
+        assert!(at(&line(3)) < at(&line(7)) && at(&line(8)) < at("lines 4–6 of this step, which came late:") && at("which came late:") < at(&line(4)) && !said.contains("when it ends"), "{said}");
+        // How it ended: each step, then the run.
+        let has = |s: &str| printed.iter().position(|l| l.contains(s)).unwrap_or_else(|| panic!("no {s:?} in:\n{said}"));
+        assert!(has("✓ Run make 7 s") < has("✓ Run make test 7 s") && said.contains("The run ended: success"), "{said}");
+        // (Its log has no tests: no line of them.)
+        assert!(!said.contains("Tests:"), "{said}");
+        // Once it ran, how its start went (where the time from sending it to its first step went).
+        assert!(has("Running (started in ") < has(&line(1)) && said.contains("its machine was asked for "), "{said}");
+        // Its end said after its lines, the late ones too.
+        assert!(at(&line(4)) < has("Ended: success"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    fn play(served: &superci_testkit::Served, run: &str, lines: &[String], result: &str) {
+        let runner = loop { if let Some(r) = Runner::of_run(served, run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let a = "cccccccc-0000-0000-0000-000000000003";
+        runner.take();
+        runner.steps(&[(a, "Run make test", 1, "inProgress", None, None)]);
+        runner.lines(a, 1, lines);
+        runner.log(1, &lines.iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n"));
+        runner.steps(&[(a, "Run make test", 1, "completed", Some(if result == "succeeded" { "succeeded" } else { "failed" }), Some(1))]);
+        runner.finish(result);
+    }
+    fn run_of(served: &superci_testkit::Served) -> String {
+        loop {
+            if let Some((k, _)) = served.store.under("run:").into_iter().next() { return k.trim_start_matches("run:").to_string() }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    fn superci(served: &superci_testkit::Served, dir: &std::path::Path, args: &[&str]) -> Command {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_superci"));
+        // (A run over waits 3 seconds at most for steps' logs here, where a minute would only slow the tests.)
+        c.current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_LOGS_WAIT_S", "3").stdout(Stdio::piped()).stderr(Stdio::piped());
+        c
+    }
+    /// The runner of the job shown as `name`, once it is started.
+    fn runner_of(served: &superci_testkit::Served, run: &str, name: &str) -> Runner {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(r) = Runner::of_job(served, run, name) { return r }
+            let names: Vec<String> = served.store.under(&format!("run:{run}")).into_iter().next().map(|(_, r)| r["jobs"].as_array().into_iter().flatten().map(|j| format!("{}:{}", j["name"], j["state"])).collect()).unwrap_or_default();
+            assert!(std::time::Instant::now() < end, "no job {name} started: {names:?}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    #[test]
+    fn a_run_from_a_computer_is_followed_in_the_dashboard_from_runs_to_its_jobs_log() {
+        let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+        let served = serve(|_| {});
+        let dir = checkout();
+        let started = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+        let run = run_of(&served);
+        play(&served, &run, &["compiling".to_string(), "test 1 passed".to_string()], "succeeded");
+        let home = common::signed_in(&served);
+        let (mut child, link) = common::dashboard(&home);
+        let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
+        b.goto(&link);
+        b.wait(&shows("Usage"));
+        // Runs: the run, by its workflow; its page: its job; the job's page: its steps, and their lines.
+        b.click("nav a", "Runs");
+        b.wait(r#"document.querySelector('main a[href*="p=run&"]') !== null"#);
+        b.eval(r#"document.querySelector('main a[href*="p=run&"]').click()"#);
+        b.wait(&shows("tests"));
+        b.wait(r#"document.querySelector('main a[href*="p=job&"]') !== null"#);
+        b.eval(r#"document.querySelector('main a[href*="p=job&"]').click()"#);
+        b.wait("document.querySelector('details.lstep') !== null");
+        b.click("details.lstep summary", "Run make test");
+        b.wait("[...document.querySelectorAll('.ll .lx')].some(l => l.textContent === 'test 1 passed')");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn overviews_period_and_the_runs_and_jobs_tabs_switch_in_the_browser() {
+        let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+        let served = serve(|_| {});
+        let dir = checkout();
+        let started = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+        play(&served, &run_of(&served), &["ok".to_string()], "succeeded");
+        let home = common::signed_in(&served);
+        let (mut child, link) = common::dashboard(&home);
+        let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
+        let on = |period: &str| format!(r#"document.querySelector('nav.seg-links a[aria-current="true"]') && document.querySelector('nav.seg-links a[aria-current="true"]').textContent === {}"#, serde_json::json!(period));
+        b.goto(&link);
+        b.wait(&shows("Usage"));
+        // The period: 24 hours unless chosen; 7 days, then 30, each marked and kept in the address.
+        b.wait(&on("24 hours"));
+        b.click("nav.seg-links a", "7 days");
+        b.wait(&format!("{} && new URLSearchParams(location.search).get('usage') === 'week'", on("7 days")));
+        b.click("nav.seg-links a", "30 days");
+        b.wait(&format!("{} && new URLSearchParams(location.search).get('usage') === 'month'", on("30 days")));
+        // Runs and Jobs: one tab each, the run there and its job here.
+        b.click("nav a", "Runs");
+        b.wait(r#"document.querySelector('a.tab[aria-selected="true"]') && document.querySelector('a.tab[aria-selected="true"]').textContent === 'Runs'"#);
+        b.wait(&shows("ci.yml"));
+        b.click("a.tab", "Jobs");
+        b.wait(r#"document.querySelector('a.tab[aria-selected="true"]') && document.querySelector('a.tab[aria-selected="true"]').textContent === 'Jobs'"#);
+        b.wait(&shows("tests"));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_running_run_is_cancelled_from_its_page_in_the_browser() {
+        let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+        let served = serve(|_| {});
+        let dir = checkout();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let runner = runner_of(&served, &run, "tests");
+        runner.take();
+        runner.steps(&[("abababab-0000-0000-0000-000000000007", "Run make", 1, "inProgress", None, None)]);
+        let home = common::signed_in(&served);
+        let (mut child, link) = common::dashboard(&home);
+        let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
+        b.goto(&link);
+        b.wait(&shows("Usage"));
+        b.click("nav a", "Runs");
+        b.wait(r#"document.querySelector('main a[href*="p=run&"]') !== null"#);
+        b.eval(r#"document.querySelector('main a[href*="p=run&"]').click()"#);
+        // Running: its Cancel; clicked, its runner is told to stop, as GitHub tells one.
+        b.wait(r#"[...document.querySelectorAll('main button')].some(x => x.textContent === 'Cancel run')"#);
+        b.eval(r#"[...document.querySelectorAll('main button')].find(x => x.textContent === 'Cancel run').click()"#);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let told = loop {
+            let (status, m) = runner.message();
+            if status == 200 { break m }
+            assert!(std::time::Instant::now() < end, "its runner was not told");
+        };
+        assert_eq!(told["messageType"], "JobCancellation", "{told}");
+        runner.finish("canceled");
+        b.wait(&shows("Cancelled"));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Browser tests of github: what a person sees of them in the dashboard.
+mod github_in_browser {
+    use super::*;
+    use common::{part, words};
+    use superci_testkit::Served;
+
+    fn unanswered(served: &Served) -> Vec<String> { served.github.unanswered.lock().unwrap().iter().filter(|u| u.contains("github")).cloned().collect() }
+
+    /// A job of `acme/app` labelled `superci`, from queued to ended as GitHub tells it: its number.
+    fn ran(served: &Served, conclusion: &str) -> u64 {
+        let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+        assert_eq!(served.webhook(queued), 202);
+        // A machine for it, its runner registered with GitHub for exactly this job.
+        assert_eq!(served.machines.0.lock().unwrap().len(), 1, "its machine");
+        let job = served.store.under(&format!("job:{id}")).into_iter().next().expect("the job kept").1;
+        assert_eq!((job["state"].as_str(), job["repo"].as_str()), (Some("launched"), Some("acme/app")), "{job}");
+        assert_eq!(served.webhook(served.github.start(id)), 202);
+        assert_eq!(served.store.under(&format!("job:{id}"))[0].1["state"], "running");
+        assert_eq!(served.webhook(served.github.finish(id, conclusion, &github_log(), served.now_ms())), 202);
+        id
+    }
+    /// GitHub's log of a job, as it keeps it (each line timed; a step's lines in a group).
+    fn github_log() -> String {
+        ["2026-10-15T10:00:00.1000000Z ##[group]Set up job", "2026-10-15T10:00:00.2000000Z Current runner version: '2.329.0'", "2026-10-15T10:00:00.3000000Z ##[endgroup]",
+            "2026-10-15T10:00:01.0000000Z ##[group]Run make test", "2026-10-15T10:00:01.1000000Z \u{1b}[36;1mmake test\u{1b}[0m", "2026-10-15T10:00:01.2000000Z ##[endgroup]",
+            "2026-10-15T10:00:02.0000000Z test 1 passed", "2026-10-15T10:00:03.0000000Z \u{1b}[32mall 2 passed\u{1b}[0m", "2026-10-15T10:00:04.0000000Z Cleaning up orphan processes"].join("\n")
+    }
+    #[test]
+    fn a_github_jobs_page_shows_its_log_in_steps_and_leads_to_github() {
+        let served = serve(|_| {});
+        served.connect_github();
+        let home = signed_in(&served);
+        let id = ran(&served, "failure");
+        let (mut child, link) = dashboard(&home);
+        // Its page as the dashboard's page fetches it, and its log in steps.
+        let (_, page) = part(&link, &format!("/?p=job&id={id}&fragment=1"));
+        let shown = words(&page);
+        assert!(shown.contains("app · Build and Test") && shown.contains("Status Failed") && !shown.contains("It did not start"), "{shown}");
+        assert!(page.contains(&format!("/actions/runs/")) && page.contains("On GitHub"), "{shown}");
+        let (_, view) = part(&link, &format!("/job/view?id={id}"));
+        let view: serde_json::Value = serde_json::from_str(&view).unwrap();
+        let steps: Vec<&str> = view["steps"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
+        assert!(steps.contains(&"Set up job") && steps.contains(&"Run make test"), "{view}");
+        // Its raw log is GitHub's own link.
+        let (status, _) = part(&link, &format!("/job/raw?id={id}"));
+        assert_eq!(status, 302);
+        // Repositories: the App connected in acme, its repository.
+        let (_, repos) = part(&link, "/?p=repos&fragment=1");
+        assert!(words(&repos).contains("acme"), "{}", words(&repos));
+
+        // In Chrome: from Jobs to the job, its failed step open with its lines.
+        if let Some(mut b) = Browser::open(1300, 900) {
+            b.goto(&link);
+            b.wait("document.querySelector('main') && document.querySelector('main').innerText.includes('Usage')");
+            b.click("nav a", "Runs");
+            b.wait("document.querySelector('main').innerText.includes('Recent runs')");
+            b.click(".tabs a", "Jobs");
+            b.wait("document.querySelector('main').innerText.includes('Recent jobs')");
+            b.click("main a", "test");
+            b.wait("document.querySelector('details.lstep')");
+            b.wait("[...document.querySelectorAll('details.lstep')].some(d => d.innerText.includes('Run make test'))");
+            let on_github = b.eval("document.querySelector('a[href^=\"https://github.com/acme/app/actions/runs/\"]').innerText");
+            assert!(on_github.as_str().unwrap_or_default().contains("On GitHub"), "{on_github}");
+        }
+        assert!(unanswered(&served).is_empty(), "{:?}", unanswered(&served));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+    #[test]
+    fn a_finished_jobs_page_shows_its_whole_log_however_large() {
+        let served = serve(|_| {});
+        served.connect_github();
+        let home = signed_in(&served);
+        let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+        served.webhook(queued);
+        served.webhook(served.github.start(id));
+        // 2.4 MB: more than the last part a running job's page reads.
+        // (Its lines in the second its steps began, as GitHub says of them.)
+        let at = served.github.job(id)["started_at"].as_str().unwrap().trim_end_matches('Z').to_string();
+        let mut log = vec![format!("{at}.1000000Z ##[group]Set up job"), format!("{at}.2000000Z ##[endgroup]"), format!("{at}.3000000Z ##[group]Run make test")];
+        log.extend((1..=40_000).map(|n| format!("{at}.4000000Z test {n} of the suite passed in good time")));
+        let log = log.join("\n");
+        assert!(log.len() > 2_000_000);
+        served.webhook(served.github.finish(id, "success", &log, served.now_ms()));
+        let (mut child, link) = dashboard(&home);
+        let (_, view) = part(&link, &format!("/job/view?id={id}"));
+        let view: serde_json::Value = serde_json::from_str(&view).unwrap();
+        assert_eq!(view["truncated"], false);
+        let step = view["steps"].as_array().unwrap().iter().find(|s| s["name"] == "Run make test").unwrap();
+        let lines = step["lines"].as_array().unwrap();
+        assert_eq!((lines.len(), lines[1][2].as_str(), lines[40_000][2].as_str()), (40_001, Some("test 1 of the suite passed in good time"), Some("test 40000 of the suite passed in good time")));
+        // In Chrome: nothing of it drawn until a step is opened, then its first 2,000 lines and a way to more; search
+        // finds a line far down without drawing the step whole.
+        if let Some(mut b) = Browser::open(1300, 900) {
+            b.goto(&format!("{link}&p=job&id={id}"));
+            b.wait("document.querySelector('details.lstep')");
+            assert_eq!(b.eval("document.querySelectorAll('.ll').length"), 0);
+            b.click("details.lstep summary", "Run make test");
+            b.wait("document.querySelectorAll('.ll').length === 2000");
+            assert_eq!(b.text(".ll-more"), "Show 4,000 more of 38,001 lines");
+            b.click(".ll-more", "");
+            b.wait("document.querySelectorAll('.ll').length === 6000");
+            assert_eq!(b.eval("document.querySelectorAll('.ll')[5999].querySelector('.ln').textContent"), "6000", "each line its number");
+            b.fill("[data-log-search]", "test 39999 of");
+            b.wait("document.querySelectorAll('.ll.hit').length === 1");
+            assert_eq!((b.text(".ll.hit .lx"), b.eval("document.querySelectorAll('.ll').length")), ("test 39999 of the suite passed in good time".to_string(), serde_json::json!(1)));
+            // Cleared: the step as it was opened (6,000 lines shown).
+            b.fill("[data-log-search]", "");
+            b.wait("document.querySelectorAll('.ll').length === 6000");
+        }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// Browser tests of gitlab: what a person sees of them in the dashboard.
+mod gitlab_in_browser {
+    use super::*;
+    use common::json;
+    use superci_testkit::gitlab;
+
+    #[test]
+    fn gitlab_is_connected_and_a_project_switched_on_and_off_in_the_browser() {
+        let Some(mut b) = superci_testkit::Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+        let served = serve(|_| {});
+        let home = signed_in(&served);
+        let (mut child, link) = dashboard(&home);
+        let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
+        let enabled = || json(&home, &["projects", "list"]).1["projects"][0]["enabled"].as_bool();
+        b.goto(&link);
+        b.wait(&shows("Usage"));
+        // Repositories: GitLab's Connect, its token pasted in the dialog (GitLab.com).
+        b.click("nav a", "Repositories");
+        b.wait(r#"[...document.querySelectorAll('main button')].some(x => x.textContent === 'Connect' && (x.getAttribute('onclick') || '').includes('gl-add'))"#);
+        b.eval(r#"[...document.querySelectorAll('main button')].find(x => x.textContent === 'Connect' && (x.getAttribute('onclick') || '').includes('gl-add')).click()"#);
+        b.wait("document.getElementById('gl-add').open");
+        b.fill("#gl-add input[name=token]", gitlab::TOKEN);
+        b.eval("document.querySelector('#gl-add input[name=token]').form.requestSubmit()");
+        // Its page: its projects, each off until turned on (a webhook for its job events), and off again.
+        b.wait(&shows("acme/app"));
+        b.wait(r#"[...document.querySelectorAll('main form[action="/gitlab/project"] button')].some(x => x.textContent === 'Turn on')"#);
+        b.eval(r#"[...document.querySelectorAll('main form[action="/gitlab/project"] button')].find(x => x.textContent === 'Turn on').click()"#);
+        let until = |what: &str, holds: &dyn Fn() -> bool| { let end = std::time::Instant::now() + std::time::Duration::from_secs(15); while !holds() { assert!(std::time::Instant::now() < end, "{what}"); std::thread::sleep(std::time::Duration::from_millis(200)) } };
+        until("the project on", &|| enabled() == Some(true));
+        assert!(served.gitlab.asked.lock().unwrap().iter().any(|a| a == &format!("POST https://gitlab.com/api/v4/projects/{}/hooks", gitlab::PROJECT)));
+        b.wait(r#"[...document.querySelectorAll('main form[action="/gitlab/project"] button')].some(x => x.textContent === 'Turn off') && !document.body.classList.contains('busy')"#);
+        b.eval(r#"[...document.querySelectorAll('main form[action="/gitlab/project"] button')].find(x => x.textContent === 'Turn off').click()"#);
+        until("the project off", &|| enabled() == Some(false));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

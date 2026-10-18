@@ -102,37 +102,6 @@ fn a_job_with_other_tags_is_left_alone_and_an_event_without_the_secret_refused()
 }
 
 #[test]
-fn gitlab_is_connected_and_a_project_switched_on_and_off_in_the_browser() {
-    let Some(mut b) = superci_testkit::Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
-    let served = serve(|_| {});
-    let home = signed_in(&served);
-    let (mut child, link) = dashboard(&home);
-    let shows = |words: &str| format!("document.querySelector('main') && document.querySelector('main').innerText.includes({})", serde_json::json!(words));
-    let enabled = || json(&home, &["projects", "list"]).1["projects"][0]["enabled"].as_bool();
-    b.goto(&link);
-    b.wait(&shows("Usage"));
-    // Repositories: GitLab's Connect, its token pasted in the dialog (GitLab.com).
-    b.click("nav a", "Repositories");
-    b.wait(r#"[...document.querySelectorAll('main button')].some(x => x.textContent === 'Connect' && (x.getAttribute('onclick') || '').includes('gl-add'))"#);
-    b.eval(r#"[...document.querySelectorAll('main button')].find(x => x.textContent === 'Connect' && (x.getAttribute('onclick') || '').includes('gl-add')).click()"#);
-    b.wait("document.getElementById('gl-add').open");
-    b.fill("#gl-add input[name=token]", gitlab::TOKEN);
-    b.eval("document.querySelector('#gl-add input[name=token]').form.requestSubmit()");
-    // Its page: its projects, each off until turned on (a webhook for its job events), and off again.
-    b.wait(&shows("acme/app"));
-    b.wait(r#"[...document.querySelectorAll('main form[action="/gitlab/project"] button')].some(x => x.textContent === 'Turn on')"#);
-    b.eval(r#"[...document.querySelectorAll('main form[action="/gitlab/project"] button')].find(x => x.textContent === 'Turn on').click()"#);
-    let until = |what: &str, holds: &dyn Fn() -> bool| { let end = std::time::Instant::now() + std::time::Duration::from_secs(15); while !holds() { assert!(std::time::Instant::now() < end, "{what}"); std::thread::sleep(std::time::Duration::from_millis(200)) } };
-    until("the project on", &|| enabled() == Some(true));
-    assert!(served.gitlab.asked.lock().unwrap().iter().any(|a| a == &format!("POST https://gitlab.com/api/v4/projects/{}/hooks", gitlab::PROJECT)));
-    b.wait(r#"[...document.querySelectorAll('main form[action="/gitlab/project"] button')].some(x => x.textContent === 'Turn off') && !document.body.classList.contains('busy')"#);
-    b.eval(r#"[...document.querySelectorAll('main form[action="/gitlab/project"] button')].find(x => x.textContent === 'Turn off').click()"#);
-    until("the project off", &|| enabled() == Some(false));
-    let _ = child.kill();
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[test]
 fn a_gitlab_job_asking_for_windows_or_only_modal_is_said_to_have_nowhere_to_run() {
     // Modal's sandboxes beside Cloudflare's containers: neither runs Docker for GitLab on Windows, and Modal runs none.
     let served = serve(|c| { c.containers = true; c.launchers = vec![superci_core::plane::Launcher { cloud: "modal".into(), url: "https://acme--superci-runners.modal.run".into() }]; });
