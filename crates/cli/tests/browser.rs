@@ -422,6 +422,15 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
         assert!(status == 400 && common::words(&said).contains(why), "{text}: {status} {}", common::words(&said));
     }
     assert!(setting("AWS_NETWORKS").unwrap().contains("subnet-00000000000000002"));
+    // The same again: nothing asked of AWS. Then none: back to SuperCI's network; none again changes nothing.
+    let asked = served.aws.asked.lock().unwrap().len();
+    let kept = setting("AWS_NETWORKS").unwrap();
+    let (status, _, _) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1: subnet-00000000000000001, subnet-00000000000000002, sg-00000000000000001, private")]);
+    assert!(status < 400 && setting("AWS_NETWORKS").as_deref() == Some(kept.as_str()) && !served.aws.asked.lock().unwrap()[asked..].iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("DescribeSubnets")));
+    for _ in 0..2 {
+        let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "")]);
+        assert!(status < 400 && setting("AWS_NETWORKS").as_deref() == Some("{}"), "{status} {} {:?}", common::words(&said), setting("AWS_NETWORKS"));
+    }
 
     // A new order: each provider once, and only ones it has (as a page made up would say).
     for fields in [&[("action", "order"), ("cloud_0", "aws"), ("cloud_1", "aws")][..], &[("action", "order"), ("cloud_0", "nowhere")],
