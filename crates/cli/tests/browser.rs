@@ -1019,3 +1019,71 @@ fn a_day_of_github_and_gitlab_jobs_is_summed_up_on_overview_for_a_day_a_week_and
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn control_planes_are_set_up_in_cloudflare_and_modal_from_the_browser_and_deleted_from_their_menus_as_both_answered() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The CI's control plane in AWS, signed in to Cloudflare and Modal too; the Worker and Modal's app, once deployed,
+    // served here, reading the secrets they were given.
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00003/CONTAINERS");
+    let aws = served.aws.clone();
+    let md = superci_testkit::serve_as("mdplane00003", move |c| { c.read_settings(&aws.modal_plane_settings()); c.own_cloud = "modal".into(); c.containers = false; });
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00003.modal.run".into(), md.url.clone());
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let fixture = |name: &str| std::fs::read_to_string(format!("{}/fixtures/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    served.aws.replaying(&[fixture("cloudflare/sign-in/usage"), fixture("modal/05-dashboard")].concat(), &[]);
+    // In Cloudflare: its row's Set up, its progress, then it is listed.
+    served.aws.replaying(&fixture("update/01-deploy-cf"), &[]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", "cfplane00003")]);
+    b.goto(&link);
+    b.wait(&page_shows("Overview"));
+    b.click(".side a", "Control plane");
+    b.wait(&shows("Set up"));
+    b.click("form[action=\"/plane/cloudflare\"] button", "Set up");
+    // (Deployed: its row, with what can be done with it.)
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("superci.acme.workers.dev Move here") { assert!(std::time::Instant::now() < end, "Cloudflare's: {}", b.eval("document.querySelector('main').innerText.slice(0, 500)")); std::thread::sleep(std::time::Duration::from_millis(500)) }
+    let _ = child.kill();
+    // In Modal likewise.
+    served.aws.replaying(&fixture("update/02-deploy-modal"), &[]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", "mdplane00003")]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows("superci.acme.workers.dev"));
+    b.click("form[action=\"/plane/modal\"] button", "Set up");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("modal.run Move here") { assert!(std::time::Instant::now() < end, "Modal's: {}", common::words(&common::part(&link, "/?p=planes&fragment=1").1).chars().take(800).collect::<String>()); std::thread::sleep(std::time::Duration::from_millis(500)) }
+    // Each one's own pages: opened by its id.
+    for id in ["cfplane00003", "mdplane00003"] {
+        b.goto(&format!("{link}&c={id}&p=add-runners"));
+        b.wait(&page_shows("Add a provider"));
+    }
+    // Each deleted from its menu: gone from the list, and from its cloud.
+    for (step, row) in [("update/07-delete-cf", "superci.acme.workers.dev"), ("update/08-delete-md", "modal.run")] {
+        served.aws.replaying(&fixture(step), &[]);
+        b.goto(&format!("{link}&p=planes"));
+        b.wait(&shows(row));
+        b.eval(&format!("[...document.querySelectorAll('details.menu')].find(m => m.closest('.pick, .row, li, div') && m.parentElement.closest('div').innerText.includes({row:?}) && m.querySelector('.menu-pop').textContent.includes('Delete')).querySelector('summary').click(); true"));
+        b.click("details.menu[open] .menu-pop button", "Delete…");
+        b.wait("document.querySelector('dialog[open]') !== null");
+        b.click("dialog[open] button.danger", "");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&format!("{row} Move here")) { assert!(std::time::Instant::now() < end, "{row} deleted"); std::thread::sleep(std::time::Duration::from_millis(500)) }
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
