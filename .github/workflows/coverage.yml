@@ -45,13 +45,13 @@ jobs:
           # (superci-layers' end-to-end suite in a privileged container, measured with the rest.)
           SUPERCI_LAYERS_E2E: "1"
           IMAGES: mirror.gcr.io/library
-        run: npx -y supercov@4.18.0 -- cargo test --workspace
+        run: npx -y supercov@4.19.0 -- cargo test --workspace
       - name: What the tests reach
         if: always()
         run: |
-          npx -y supercov@4.18.0 runs latest
-          npx -y supercov@4.18.0 runs latest gaps
-          npx -y supercov@4.18.0 runs latest file crates/cli/src/dashboard.rs --group decision --sort missing --limit 80
+          npx -y supercov@4.19.0 runs latest
+          npx -y supercov@4.19.0 runs latest gaps
+          npx -y supercov@4.19.0 runs latest file crates/cli/src/dashboard.rs --group decision --sort missing --limit 80
       - uses: actions/upload-artifact@v4
         if: always()
         with:
