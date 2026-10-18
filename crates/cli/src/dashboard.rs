@@ -4192,19 +4192,20 @@ mark();load()})();</script>"#;
         let jobs = v.jobs();
         let (setup, waiting) = self.setup_card(v);
         // Still reading it: the page's own loading shape (the same as before the first answer), looked at again.
-        if v.status.is_none() && v.online && setup.is_empty() { return (skeleton("overview", "Overview"), true) }
-        let jobs_card = if v.status.is_none() && v.online { overview_skeleton_cards() } else { overview_cards(v, &jobs, &usage_shown()) };
+        if v.status.is_none() && setup.is_empty() { return (skeleton("overview", "Overview"), true) }
+        let jobs_card = if v.status.is_none() { overview_skeleton_cards() } else { overview_cards(v, &jobs, &usage_shown()) };
         (format!(r#"<div class="bar"><h1 class="page-title">Overview</h1></div><div class="cards">{setup}{jobs_card}</div>"#), waiting)
     }
 
     /// Setting up after the control plane: numbered steps; each says what it does, shows its one action, and stays locked
     /// until the step before is done. Gone when everything is ready. Also whether the page should refresh by itself.
+    /// Only for a control plane that answers (Overview says one that does not as such, without this card).
     fn setup_card(&self, v: &PlaneView) -> (String, bool) {
         if v.ready() { return (String::new(), false) }
         let (step, locked) = (setup_step, setup_locked);
 
         // 1. The control plane.
-        let plane = step(1, if v.online { "done" } else { "" }, format!("<h3>Control plane {}</h3>", if v.online { pill("good", "running") } else { pill("open", "starting") }),
+        let plane = step(1, "done", format!("<h3>Control plane {}</h3>", pill("good", "running")),
             format!("<p>{} · <code>{}</code></p>", esc(&v.plane.place()), esc(v.plane.url().trim_start_matches("https://"))));
 
         // Each step says where it stands in a line and has one button, to the page where it is done: nothing is done
@@ -4212,9 +4213,7 @@ mark();load()})();</script>"#;
         // 2. Where jobs come from: GitHub or GitLab (or both), on Repositories.
         let gh_done = v.github && v.installed;
         let connected: Vec<String> = [v.app_owner().filter(|_| gh_done).map(|o| format!("GitHub · {o}")), v.gitlab_url().map(|u| format!("GitLab · {}", u.trim_start_matches("https://")))].into_iter().flatten().collect();
-        let github = if !v.online {
-            step(2, "locked", "<h3>Connect GitHub or GitLab</h3>".into(), format!("<p>Where your jobs come from.</p>{}", locked("the control plane")))
-        } else if gh_done || v.gitlab {
+        let github = if gh_done || v.gitlab {
             step(2, "done", format!("<h3>GitHub or GitLab {}</h3>", pill("good", "connected")), format!("<p>{}</p>", esc(&connected.join(", "))))
         } else if self.github_expected.is_some_and(|until| now_ms() < until) {
             // Just back from GitHub: the control plane has not said it yet. The page looks again by itself.
@@ -4230,16 +4229,14 @@ mark();load()})();</script>"#;
         let logos = format!(r#"<span class="logos">{}{}{}</span>"#, logo("cloudflare", 22), logo("aws", 22), logo("modal", 22));
         let runners = if v.runners {
             step(3, "done", format!("<h3>Runners {}</h3>", pill("good", "added")), format!("<p>{}</p>", esc(&v.clouds().iter().map(|c| cloud_name(c)).collect::<Vec<_>>().join(", "))))
-        } else if v.online {
-            step(3, "", format!("<h3>Add runners {logos}</h3>"), r#"<p>Where jobs run: containers in Cloudflare, spot machines in AWS, sandboxes in Modal. Add one or more; the control plane decides per job.</p><div class="do"><a class="button primary" href="/?p=add-runners">Add runners</a></div>"#.to_string())
         } else {
-            step(3, "locked", format!("<h3>Add runners {logos}</h3>"), format!("<p>Where jobs run: containers in Cloudflare, spot machines in AWS, sandboxes in Modal.</p>{}", locked("the control plane")))
+            step(3, "", format!("<h3>Add runners {logos}</h3>"), r#"<p>Where jobs run: containers in Cloudflare, spot machines in AWS, sandboxes in Modal. Add one or more; the control plane decides per job.</p><div class="do"><a class="button primary" href="/?p=add-runners">Add runners</a></div>"#.to_string())
         };
         // 4. The one line a workflow needs, on Workflows.
         let label = esc(&v.label());
         // (Locked: once the steps before it are done the card is gone, and Overview's jobs card says the line.)
         let workflow = step(4, "locked", "<h3>Use it in a workflow</h3>".into(), format!("<p>Set <code>runs-on: {label}</code> in a workflow; nothing else changes.</p>{}", locked("GitHub or GitLab, and runners")));
-        let waiting = !v.online || (v.github && !v.installed);
+        let waiting = v.github && !v.installed;
         (format!(r#"<section class="card" id="setup"><div class="card-head"><h2>Set up</h2>{}</div><div class="steps">{plane}{github}{runners}{workflow}</div></section>"#, pill("open", "4 steps")), waiting)
     }
 
