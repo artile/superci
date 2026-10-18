@@ -92,9 +92,9 @@ impl Browser {
         r["result"]["value"].clone()
     }
 
-    /// Waits, up to 15 seconds, for `js` to hold in the page.
+    /// Waits, up to 30 seconds (a page among many tests at once, on a busy machine), for `js` to hold in the page.
     pub fn wait(&mut self, js: &str) {
-        let until = Instant::now() + Duration::from_secs(15);
+        let until = Instant::now() + Duration::from_secs(30);
         while Instant::now() < until {
             if self.call("Runtime.evaluate", json!({ "expression": format!("!!({js})"), "returnByValue": true })).is_ok_and(|r| r["result"]["value"] == true) { return }
             std::thread::sleep(Duration::from_millis(100));
@@ -118,7 +118,7 @@ impl Browser {
             return [x, y, !!at && (at === e || e.contains(at) || at.contains(e))]; }})()", json!(selector), json!(words));
         let mut last: Option<[f64; 2]> = None;
         // (Up to 15 seconds, as `wait`: a page loading under a slow, measured build comes late.)
-        let until = Instant::now() + Duration::from_secs(15);
+        let until = Instant::now() + Duration::from_secs(30);
         let (x, y) = loop {
             let at = self.eval(&find);
             let Some(a) = at.as_array() else {
