@@ -1154,3 +1154,26 @@ fn a_command_needing_a_sign_in_that_ended_says_so() {
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+/// A key for a coding agent: a name that cannot be one refused; a control plane too old for keys, or for keys that
+/// start runs, refused with what to do. Nothing is kept.
+#[test]
+fn a_key_that_cannot_be_made_is_refused_saying_why() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let keys = || served.aws.settings(superci_testkit::PLANE).into_iter().filter(|(k, _)| k.starts_with("READ_KEY_")).count();
+    let before = keys();
+    let refused = |args: &[&str], said: &str| {
+        let o = superci(&home, args);
+        let e = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+        assert!(!o.status.success() && e.contains(said), "{args:?}: {e}");
+    };
+    refused(&["keys", "create", "not-a-name"], "A key's name is letters and digits, 24 at most");
+    refused(&["keys", "create", "abcdefghijklmnopqrstuvwxy"], "A key's name is letters and digits, 24 at most");
+    *served.aws.old_version.lock().unwrap() = Some("0.10.0".into());
+    refused(&["keys", "create", "agent"], "read keys need control plane 0.11.0 or newer");
+    *served.aws.old_version.lock().unwrap() = Some("0.17.0".into());
+    refused(&["keys", "create", "builder", "--runs"], "keys that start runs need control plane 0.18.0 or newer");
+    assert_eq!(keys(), before, "nothing kept");
+    let _ = std::fs::remove_dir_all(&home);
+}

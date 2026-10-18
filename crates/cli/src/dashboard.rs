@@ -1423,10 +1423,12 @@ impl Dashboard {
         if !(1..=366).contains(&days) { return Err("A key lasts from 1 to 366 days.".into()) }
         let seen = view::plane_view(&plane, Some(&self.status_key));
         if view::older(seen.version.as_deref(), "0.11.0") { return Err("Update the control plane first: read keys need control plane 0.11.0 or newer (`superci planes update`).".into()) }
-        let status = seen.status.or_else(|| status_soon(plane.url(), &self.status_key)).ok_or("The control plane did not answer: try again in a few seconds")?;
-        if read_keys(&status).iter().any(|(n, _)| *n == name) { return Err(format!("There is a key named {} already: `superci keys delete {}` first.", name.to_lowercase(), name.to_lowercase())) }
         // (A key that may also start runs from a computer says so after its hash.)
         if runs && view::older(seen.version.as_deref(), "0.18.0") { return Err("Update the control plane first: keys that start runs need control plane 0.18.0 or newer (`superci planes update`).".into()) }
+        // (One that answers and does not take this computer's key: why, rather than "did not answer".)
+        let refused = self.key_refused(&seen);
+        let status = seen.status.clone().or_else(|| status_soon(plane.url(), &self.status_key)).ok_or_else(|| refused.unwrap_or_else(|| "The control plane did not answer: try again in a few seconds".to_string()))?;
+        if read_keys(&status).iter().any(|(n, _)| *n == name) { return Err(format!("There is a key named {} already: `superci keys delete {}` first.", name.to_lowercase(), name.to_lowercase())) }
         let (key, until) = (format!("superci_{}_{}", if runs { "run" } else { "read" }, random_token(32)), now_ms() / 1000 + days * 86_400);
         let hash = superci_core::crypto::sha256_hex(key.as_bytes());
         let value = if runs { format!("{hash}:runs") } else { hash };

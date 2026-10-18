@@ -1791,3 +1791,33 @@ fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there(
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn the_default_machine_and_keys_forms_take_only_what_they_may_and_the_machine_is_shown_as_set() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=workflows"));
+    b.wait(&shows("Default machine"));
+    let machine = || served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "MACHINE").map(|(_, v)| v);
+    // Refused: a value that is no value, parts that do not go together.
+    for (fields, said) in [(&[("cpu", "lots")][..], "That machine is not understood"), (&[("os", "windows"), ("arch", "arm64")], "Windows machines are x64"), (&[("family", "m8g+m8a")], "That machine does not go together")] {
+        let (got, text) = post(&mut b, "/machine", fields);
+        assert!(got >= 400 && text.contains(said), "{fields:?}: {got} {text}");
+    }
+    // What is the standard anyway (x64, spot, left to the provider) is not kept; what is set is shown.
+    post(&mut b, "/machine", &[("cpu", "default"), ("arch", "x64"), ("spot", "true"), ("os", "linux")]);
+    until("nothing kept", || machine().is_none_or(|m| m == "{}"));
+    let (got, text) = post(&mut b, "/machine", &[("cpu", "8"), ("ram", "32"), ("scratch", "ramdisk"), ("family", "m8a"), ("provider", "aws"), ("disk-speed", "500")]);
+    assert!(got < 400, "{got} {text}");
+    b.goto(&format!("{link}&p=workflows"));
+    b.wait(&format!("{} && {} && {}", reads("8 CPU"), reads("RAM disk"), reads("m8a")));
+    // A key to take out that is no device key's name: refused, nothing changed.
+    let (got, text) = post(&mut b, "/keys/remove", &[("name", "DEVICE_KEY_not-one")]);
+    assert!(got == 409 && text.contains("That is not a device key"), "{got} {text}");
+    let (got, text) = post(&mut b, "/keys/remove", &[("name", "READER")]);
+    assert!(got == 409 && text.contains("That is not a device key"), "{got} {text}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
