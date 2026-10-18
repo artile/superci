@@ -43,6 +43,12 @@ fn seen_in_browser(served: &superci_testkit::Served) {
         // (A waiting job's reason is said as it is; a failed one's in plain words, a cancelled one's not at all.)
         let why = if j["state"] == "waiting" { j["error"].as_str().unwrap_or_default().trim_start_matches("waiting: ").split(" (").next().unwrap_or_default().chars().take(40).collect::<String>().to_lowercase() } else { String::new() };
         assert!(page.contains("status") && (why.is_empty() || page.contains(&why)), "job {id} ({}): {why:?} not on its page:\n{page}", j["state"]);
+        // Its log, as its page reads it, and as it is (the page's Raw log).
+        let gl_q = if gl { format!("&gl={}", j["gitlab"].as_str().unwrap_or_default()) } else { String::new() };
+        for what in ["view", "raw"] {
+            let got = b.eval(&format!("fetch('/job/{what}?id={id}{gl_q}', {{credentials: 'same-origin', redirect: 'manual'}}).then(r => r.status)"));
+            assert!(got.as_u64().is_none_or(|s| s < 500), "job {id}'s {what}: {got}");
+        }
     }
     b.goto(&format!("{link}&p=runs"));
     b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
@@ -1638,16 +1644,29 @@ fn a_first_control_plane_is_set_up_in_aws_from_the_browser_started_over_once_and
         account.replaying(look, &[]);
         // (Looked at again, as its Refresh does; the page shows that account before anything is asked of it.)
         post(&mut b, "/aws/look", &[("next", "?p=plane")]);
-        b.goto(&format!("{link}&p=plane"));
-        b.wait(&reads(marker));
+        // (Looked at in the background: read again until the page has the new look, under load a while.)
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            b.goto(&format!("{link}&p=plane"));
+            b.wait("document.querySelector('main') !== null");
+            if b.eval(&reads(marker)).as_bool() == Some(true) { break }
+            assert!(std::time::Instant::now() < end, "{marker}: {}", b.text("main"));
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         let (got, text) = post(&mut b, "/plane/aws", &[("region", region), ("account", "111111111111")]);
         assert!(got == 409 && text.contains(said), "{region}: {got} {text}");
     }
     // (Back to the classic account, where N. Virginia is allowed.)
     account.replaying(include_str!("../fixtures/aws/classic/look.jsonl"), &[]);
     post(&mut b, "/aws/look", &[("next", "?p=plane")]);
-    b.goto(&format!("{link}&p=plane"));
-    b.wait(&reads("Not in Canada"));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        b.goto(&format!("{link}&p=plane"));
+        b.wait("document.querySelector('main') !== null");
+        if b.eval(&reads("Not in Canada")).as_bool() == Some(true) { break }
+        assert!(std::time::Instant::now() < end, "{}", b.text("main"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
     // With nothing answered by AWS it stops, and says so; started over, what it made is removed.
     let (got, text) = post(&mut b, "/plane/aws", &[("region", "us-east-1"), ("account", "111111111111")]);
     assert!(got < 400, "{got} {text}");
