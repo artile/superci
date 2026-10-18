@@ -2879,8 +2879,10 @@ impl<'a> ControlPlane<'a> {
                         }
                         let creds = self.aws_creds(plane_url, &a).await?;
                         let tags = vec![("Name".to_string(), machine_name_in_aws(self.config.name(), &job.repo, job.job_id)), ("superci-plane".into(), self.config.plane_id.clone()), ("superci-job".into(), job.job_id.to_string()), ("superci-repo".into(), job.repo.clone())];
-                        // The standard machine keeps the configured types; a sized one gets the types that fit it.
-                        let types = if spec.cpu.is_none() && spec.ram_gb.is_none() && spec.arch() == "x64" && spec.gpu.is_none() { self.config.instance_types.clone() } else { aws_instance_types(&spec) };
+                        // The standard machine keeps the configured types; a sized one, or one that names its
+                        // families or asks for a disk of its own, gets the types that fit it.
+                        let standard = spec.cpu.is_none() && spec.ram_gb.is_none() && spec.arch() == "x64" && spec.gpu.is_none() && spec.families.is_empty() && !spec.localdisk();
+                        let types = if standard { self.config.instance_types.clone() } else { aws_instance_types(&spec) };
                         let mut disk_gb = spec.disk_gb.unwrap_or(60);
                         let (mut disk_mibs, mut disk_iops) = (DISK_MIBS_INCLUDED, DISK_IOPS_INCLUDED);
                         job.cpu = Some(Capacity::aws().fit(&spec).map(|s| s.cpu).unwrap_or(4));

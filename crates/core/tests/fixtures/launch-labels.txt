@@ -1,0 +1,17 @@
+superci => launched c8a.xlarge spot cpu 4 disk 60 | ramdisk null local null layers null | asked c8a.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/cpu=8 => launched m8a.2xlarge spot cpu 8 disk 60 | ramdisk null local null layers null | asked m8a.2xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/cpu=2/ram=16 => launched r8a.large spot cpu 2 disk 60 | ramdisk null local null layers null | asked r8a.large | disks /dev/sda1 60 GB | script hello notice layers
+superci/arch=arm64 => launched c8g.xlarge spot cpu 4 disk 60 | ramdisk null local null layers null | asked c8g.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/os=windows => launched c8a.xlarge spot cpu 4 disk 100 | ramdisk null local null layers null | asked c8a.xlarge | disks /dev/sda1 100 GB | script hello notice
+superci/scratch=ramdisk => launched c8a.xlarge spot cpu 4 disk 60 | ramdisk true local null layers null | asked c8a.xlarge | disks /dev/sda1 60 GB | script ramdisk hello notice layers
+superci/scratch=localdisk => launched c8id.xlarge spot cpu 4 disk 60 | ramdisk null local true layers null | asked c8id.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/family=c8id => launched c8id.xlarge spot cpu 4 disk 60 | ramdisk null local true layers null | asked c8id.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/family=m7gd/scratch=localdisk => launched m7gd.xlarge spot cpu 4 disk 60 | ramdisk null local true layers null | asked m7gd.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/disk=200 => launched c8a.xlarge spot cpu 4 disk 200 | ramdisk null local null layers null | asked c8a.xlarge | disks /dev/sda1 200 GB | script hello notice layers
+superci/gpu=any => launched g4dn.xlarge spot cpu 4 disk 60 | ramdisk null local null layers null | asked g4dn.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/image=ubuntu26 => launched c8a.xlarge spot cpu 4 disk 60 | ramdisk null local null layers null | asked c8a.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/image=ubuntu26/docker-cache=true => launched c8a.xlarge spot cpu 4 disk 60 | ramdisk null local null layers null | asked c8a.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/image=ubuntu26/docker-cache=false => launched c8a.xlarge spot cpu 4 disk 60 | ramdisk null local null layers null | asked c8a.xlarge | disks /dev/sda1 60 GB | script hello notice layers
+superci/image=ubuntu26/scratch=ramdisk/docker-cache=true => launched c8a.xlarge spot cpu 4 disk 60 | ramdisk true local null layers null | asked c8a.xlarge | disks /dev/sda1 60 GB | script ramdisk hello notice layers
+superci/image=ubuntu26/docker-cache=true/disk=300 => launched c8a.xlarge spot cpu 4 disk 300 | ramdisk null local null layers null | asked c8a.xlarge | disks /dev/sda1 300 GB | script hello notice layers
+superci/spot=false/cpu=16 => launched m8a.4xlarge on-demand cpu 16 disk 60 | ramdisk null local null layers null | asked m8a.4xlarge | disks /dev/sda1 60 GB | script hello layers

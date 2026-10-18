@@ -4846,3 +4846,42 @@ fn every_pair_of_aws_refusals_ends_each_kind_of_job_as_the_table_says() {
     for (w, g) in want.lines().zip(got.lines()) { assert_eq!(w, g) }
     assert_eq!(want.lines().count(), got.lines().count());
 }
+
+/// What a job's label asks of its AWS machine, for each kind of label: the machine it got and what it was asked with
+/// (its types, disks, start script's parts). Kept in `fixtures/launch-labels.txt`, so a change shows as a change there.
+/// (`SUPERCI_WRITE_FIXTURES=1` writes it anew.)
+#[test]
+fn each_kind_of_label_asks_aws_for_the_machine_the_table_says() {
+    let labels = ["superci", "superci/cpu=8", "superci/cpu=2/ram=16", "superci/arch=arm64", "superci/os=windows", "superci/scratch=ramdisk", "superci/scratch=localdisk",
+        "superci/family=c8id", "superci/family=m7gd/scratch=localdisk", "superci/disk=200", "superci/gpu=any", "superci/image=ubuntu26", "superci/image=ubuntu26/docker-cache=true",
+        "superci/image=ubuntu26/docker-cache=false", "superci/image=ubuntu26/scratch=ramdisk/docker-cache=true", "superci/image=ubuntu26/docker-cache=true/disk=300", "superci/spot=false/cpu=16"];
+    let got: String = std::thread::scope(|s| labels.map(|label| s.spawn(move || {
+        let clouds = Kinds { clouds: FakeClouds::default(), no_gpus: false };
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(labelled("queued", 9, "acme/app", None, label)));
+        let j = job(&store, 9);
+        let asked = launches(&clouds.clouds).last().cloned();
+        let (types, disks, script) = match &asked {
+            Some(l) => {
+                let types: Vec<String> = (1..=20).filter_map(|i| { let t = field(l, &format!("InstanceType.{i}")); (!t.is_empty()).then_some(t) }).chain([field(l, "InstanceType")]).filter(|t| !t.is_empty()).collect();
+                let disks: Vec<String> = (1..=4).filter_map(|i| { let gb = field(l, &format!("BlockDeviceMapping.{i}.Ebs.VolumeSize")); (!gb.is_empty()).then(|| format!("{} {gb} GB", field(l, &format!("BlockDeviceMapping.{i}.DeviceName")))) }).collect();
+                let script = user_data_of(l);
+                let parts: Vec<&str> = [("ramdisk", "tmpfs"), ("nvme", "nvme"), ("hello", "/hello?"), ("notice", "/interrupted?"), ("layers", "superci-layers")].into_iter().filter(|(_, m)| script.contains(m)).map(|(n, _)| n).collect();
+                (types.join(","), disks.join(", "), parts.join(" "))
+            }
+            None => Default::default(),
+        };
+        format!("{label} => {} {} {} cpu {} disk {} | ramdisk {} local {} layers {} | asked {types} | disks {disks} | script {script}{}\n", j["state"].as_str().unwrap_or_default(), j["machine_type"].as_str().unwrap_or("-"),
+            asked.as_deref().map(|l| field(l, "InstanceMarketOptions.MarketType")).filter(|m| !m.is_empty()).unwrap_or_else(|| "on-demand".into()), j["cpu"], j["disk_gb"], j["ramdisk"], j["local_disk"], j["layers"],
+            j["error"].as_str().map(|e| format!(" | {e}")).unwrap_or_default())
+    })).into_iter().map(|h| h.join().unwrap()).collect());
+    let at = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/launch-labels.txt");
+    if std::env::var_os("SUPERCI_WRITE_FIXTURES").is_some() { std::fs::write(at, &got).unwrap() }
+    let want = std::fs::read_to_string(at).unwrap_or_default();
+    for (w, g) in want.lines().zip(got.lines()) { assert_eq!(w, g) }
+    assert_eq!(want.lines().count(), got.lines().count());
+}
