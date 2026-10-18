@@ -6758,6 +6758,8 @@ fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_p
         ("a default not added here", r#"{"default":"modal"}"#, false, vec![("superci", "Modal is not connected")], vec![]),
         ("a rule naming a provider not added here", r#"{"rules":[{"repo":"acme/*","cloud":"modal"}]}"#, false, vec![("superci", "Modal is not connected")], vec![]),
         ("a label naming a provider not added here", r#"{"order":[{"cloud":"aws"}]}"#, false, vec![("superci/provider=modal", "Its label needs Modal runners")], vec![]),
+        ("a label naming AWS, which the order leaves out", r#"{"order":[{"cloud":"cloudflare"}]}"#, false, vec![("superci/provider=aws", "c8a.xlarge")], vec![]),
+        ("a rule naming AWS, which the order leaves out", r#"{"order":[{"cloud":"cloudflare"}],"rules":[{"repo":"acme/*","cloud":"aws"}]}"#, false, vec![("superci", "c8a.xlarge")], vec![]),
         ("nothing connected", r#"{}"#, false, vec![("superci", "No cloud connected for jobs")], vec![("CONTAINERS", "off"), ("-aws", "")]),
         ("Cloudflare through a launcher", r#"{}"#, false, vec![("superci", "Status")], vec![("CONTAINERS", "off"), ("LAUNCHERS", launcher), ("-aws", "")]),
         ("Cloudflare's own containers and a launcher beside", r#"{}"#, false, vec![("superci", "Status")], vec![("LAUNCHERS", launcher), ("-aws", "")]),
@@ -7999,6 +8001,18 @@ fn jobs_github_never_told_of_are_found_by_asking_and_started_and_their_pages_say
     served.later(5 * 60_000);
     served.upkeep();
     assert!(known(quiet), "found in a quieter repository too");
+    // One waiting with a label of another runner's: not this control plane's to start. A repository not heard of
+    // for two weeks: no longer asked.
+    let (not_ours, _) = served.github.queue("on GitHub's runners", "ubuntu-latest", served.now_ms());
+    served.later(5 * 60_000);
+    served.upkeep();
+    assert!(!known(not_ours));
+    let weeks = served.now_ms() - 15 * 86_400_000;
+    { let mut m = served.store.0.lock().unwrap(); for (k, v) in m.clone().into_iter().filter(|(k, _)| k.starts_with("repo:")) { let mut j: serde_json::Value = serde_json::from_str(&v).unwrap(); j["at_ms"] = weeks.into(); m.insert(k, j.to_string()); } }
+    let (forgotten, _) = served.github.queue("after two weeks", "superci", served.now_ms());
+    served.later(5 * 60_000);
+    served.upkeep();
+    let _ = forgotten;
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
     for id in [lost, quiet] {
