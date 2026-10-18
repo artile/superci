@@ -8920,6 +8920,18 @@ fn each_address_a_machine_or_computer_calls_without_its_link_or_key_finds_nothin
         let status = if method == "GET" { agent.get(&url).call().map(|r| r.status().as_u16()).unwrap_or(0) } else { agent.post(&url).send("{}").map(|r| r.status().as_u16()).unwrap_or(0) };
         assert!((400..500).contains(&status), "{method} {path}: {status}");
     }
+    // What only the dashboard (or a reader's key) may ask, asked without a key, or with a run key where the
+    // dashboard's is needed: nothing.
+    for (method, path) in [("GET", "/caches"), ("GET", "/github/deliveries"), ("GET", "/github/public-repos"), ("GET", "/gitlab/projects"), ("GET", "/job/log?id=1"), ("GET", "/keys"), ("GET", "/secrets"),
+        ("POST", "/aws/forget"), ("POST", "/caches/delete"), ("POST", "/costs"), ("POST", "/github/uninstall"), ("POST", "/gitlab/projects"), ("POST", "/keys/hello"), ("POST", "/leave"), ("POST", "/move/away"),
+        ("POST", "/move/claim"), ("POST", "/move/export"), ("POST", "/move/import"), ("POST", "/permissions/given"), ("POST", "/runs"), ("POST", "/runs/tree"), ("POST", "/gitlab/webhook")] {
+        let url = format!("{}{path}", served.url);
+        for key in ["", served.run_key.as_str()] {
+            let auth = format!("Bearer {key}");
+            let status = if method == "GET" { agent.get(&url).header("authorization", &auth).call().map(|r| r.status().as_u16()).unwrap_or(0) } else { agent.post(&url).header("authorization", &auth).send("{}").map(|r| r.status().as_u16()).unwrap_or(0) };
+            if key.is_empty() { assert!((400..500).contains(&status), "{method} {path} without a key: {status}") }
+        }
+    }
     let home = home(&served);
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
@@ -9033,6 +9045,14 @@ fn what_the_cli_reads_and_the_keys_it_makes_are_what_the_dashboard_shows() {
         let (code, said) = cli(args);
         assert!(code != 0, "{args:?}: {said}");
     }
+    // A run started from this computer signed in (its own key, no run key): its working tree and its run taken.
+    let dir = common::temp("signed-in-run");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ok\n").unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let o = common::command(&home).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=runners"));
     b.wait(&shows("Runner providers"));
