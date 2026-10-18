@@ -8,6 +8,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A job no provider could start says AWS's refusal for want of GPU quota once: "AWS lets this account run no GPU machines yet…" (it said "AWS: AWS lets…").
 - A label that names an x64 family (`superci/family=c8id`) or asks for a disk of the machine's own (`superci/scratch=localdisk`) gets such a machine on AWS. Without a size in the label it got the standard machine (c8a, no disk of its own). Update your control plane for it.
 - "Sign in again", after AWS refused a sign-in's last step (the account changed on its page midway), signs in again with several workspaces on the computer. It said "Which workspace?", since its link named none.
+- A dashboard page whose dashboard stopped keeps what it showed, dimmed, with a bar saying when that was and to run `superci dashboard` again; once a new one runs, the bar says to open the link it printed. The page was emptied to one line. After a short break (the computer asleep), it picks up by itself.
 - Overview says "1 job · 1 did not run" (it said "1 jobs").
 - Overview's machine time over 6,000 minutes is labelled machine hours (it said "120 h machine minutes").
 - `superci keys create --runs` on a control plane too old for run keys says to update it, and one that does not take this computer's key says why (both said it had not answered).

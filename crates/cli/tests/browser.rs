@@ -2368,3 +2368,33 @@ fn the_aws_account_card_says_what_each_kind_of_account_allows_and_whose_rule_a_r
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+fn a_page_whose_dashboard_stopped_keeps_what_it_showed_marked_stale_and_says_when_a_new_one_runs() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&format!("{} && !document.body.classList.contains('busy')", shows("Clouds")));
+    // Stopped: the page keeps what it showed, dimmed, with a bar saying so (its next look finds nothing).
+    drop(child);
+    b.eval("document.querySelector('.side .nav a[href*=\"p=overview\"]').click()");
+    b.wait("document.body.classList.contains('stale') && document.getElementById('stale-bar')");
+    let bar = b.eval("document.getElementById('stale-bar').innerText").as_str().unwrap_or_default().to_string();
+    // (Its address and the sidebar stay on the page it shows, not the one that could not open.)
+    assert!(b.eval("location.search.includes('p=runners') && document.querySelector('.side .nav a[aria-current=true]').href.includes('p=runners')").as_bool() == Some(true));
+    if let Some(at) = std::env::var_os("SUPERCI_SHOTS") { std::thread::sleep(std::time::Duration::from_millis(500)); b.screenshot(&std::path::Path::new(&at).join("stale-stopped.png")) }
+    assert!(bar.contains("The dashboard stopped.") && bar.contains("Run superci dashboard again."), "{bar}");
+    assert!(b.eval("document.querySelector('main').innerText.includes('Clouds')").as_bool() == Some(true), "what it showed is kept");
+    assert_eq!(b.eval("getComputedStyle(document.querySelector('main > .cards, main > section, main > div:not(.stale-bar)')).pointerEvents").as_str(), Some("none"), "nothing on it can be pressed");
+    // A new one on the same address: it does not take this tab's old key, which is said; nothing else changes.
+    let port = link.split(':').nth(2).and_then(|p| p.split('/').next()).unwrap().to_string();
+    let (mut child, _) = common::dashboard_with(&home, &[("SUPERCI_PORT", &port)]);
+    b.wait("document.getElementById('stale-bar') && document.getElementById('stale-bar').innerText.includes('A new dashboard is running.')");
+    if let Some(at) = std::env::var_os("SUPERCI_SHOTS") { b.screenshot(&std::path::Path::new(&at).join("stale-new.png")) }
+    assert!(b.eval("document.querySelector('main').innerText.includes('Clouds')").as_bool() == Some(true));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
