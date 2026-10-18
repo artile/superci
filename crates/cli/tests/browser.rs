@@ -5553,6 +5553,14 @@ mod runs_suite_in_browser {
         let kept = served.store.under(&format!("run:{run}"))[0].1.clone();
         let (_, hit) = cache(link, "lookup", serde_json::json!({ "token": token, "key": "test-times-2", "restore_keys": ["test-times-"], "version": version }));
         assert_eq!((hit["hit"].as_bool(), hit["key"].as_str()), (Some(true), Some("test-times-1")), "{hit}\nrun cache: {} ref {} repository {}", kept["cache"], kept["ref"], kept["repository"]);
+        // Its runner fetches its checkout, and the working tree's part it points at; a token no runner has: nothing.
+        let rtoken = served.store.under(&format!("run:{run}"))[0].1["jobs"][0]["token"].as_str().unwrap_or_default().to_string();
+        let (status, _, body) = http("GET", &format!("{}/runner/{rtoken}/superci/checkout.tar.gz", served.url), b"");
+        assert!(status == 200 && !body.is_empty(), "{status}");
+        let (status, _, _) = http("GET", &format!("{}/runner/{rtoken}/superci/tree?part=0", served.url), b"");
+        assert!(status < 500, "{status}");
+        assert_eq!(http("GET", &format!("{}/runner/short/superci/checkout.tar.gz", served.url), b"").0, 404);
+        assert_eq!(http("GET", &format!("{}/runner/no-runner-has-this-token-000/superci/checkout.tar.gz", served.url), b"").0, 404);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
