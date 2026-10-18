@@ -4763,3 +4763,28 @@ fn a_runner_name_github_has_already_gets_a_name_of_its_own() {
     assert!(j["state"] == "launched" && runner.starts_with(&format!("{taken}-r")), "{j}");
     assert_eq!(clouds.calls.borrow().iter().filter(|c| c.1.ends_with("/generate-jitconfig")).count(), 3, "the earlier one, the refused one, its own");
 }
+
+/// What a job is told when AWS refuses its machine, by what AWS said: no spot room with on-demand at the account's
+/// limit (it waits for spot), on-demand alone at the limit, a GPU machine with no quota at all, and no room anywhere.
+#[test]
+fn a_job_whose_machine_aws_refuses_is_told_why_by_what_aws_said() {
+    let cases: [(&str, &str, &str, &str); 4] = [
+        ("superci", "InsufficientInstanceCapacity", "VcpuLimitExceeded", "waiting: AWS has no spot machine for it now, and your AWS account's on-demand limit does not let an on-demand one start ("),
+        ("superci/spot=false", "InsufficientInstanceCapacity", "VcpuLimitExceeded", "Your AWS account's limits do not let this machine start: it asks for 4 CPUs (us-east-1 on-demand: VcpuLimitExceeded; us-east-2 on-demand: VcpuLimitExceeded)"),
+        ("superci/gpu=any", "MaxSpotInstanceCountExceeded", "VcpuLimitExceeded", "AWS lets this account run no GPU machines yet: ask AWS for more in Service Quotas, "),
+        ("superci", "InsufficientInstanceCapacity", "InsufficientInstanceCapacity", "AWS had no room for it: "),
+    ];
+    for (label, spot, on_demand, said) in cases {
+        let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| body.contains("Action=RunInstances").then(|| aws_refuses(if body.contains("MarketType=spot") { spot } else { on_demand })));
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(labelled("queued", 1, "acme/app", None, label)));
+        let j = job(&store, 1);
+        let e = j["error"].as_str().unwrap_or_default();
+        assert!(e.contains(said), "{label} ({spot}, {on_demand}): {e}");
+    }
+}
