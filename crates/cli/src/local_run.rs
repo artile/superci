@@ -375,7 +375,11 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
         if st["over"] == true && over_at.is_none() { over_at = Some(std::time::Instant::now()) }
         // (And for each step's result, which its runner may send after the job has ended too.)
         let results_missing = jobs.iter().any(|j| j["result"].is_string() && !["skipped", "cancelled"].contains(&j["result"].as_str().unwrap_or_default()) && j["steps"].as_array().is_some_and(|ss| ss.iter().any(|s| s["result"].is_null() && s["start"].is_string())));
-        if st["over"] == true && (logs.iter().any(|l| !l.complete()) || results_missing) && over_at.is_some_and(|t| t.elapsed().as_secs() <= logs_wait_s()) {
+        // (And for what a machine that keeps Docker's images had from the cache, which it says as its job ends: 10
+        // seconds at most.)
+        let images_missing = jobs.iter().any(|j| j["result"].is_string() && j["start"]["keeps"] == true && j["start"]["images"].is_null());
+        let waited = over_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        if st["over"] == true && (((logs.iter().any(|l| !l.complete()) || results_missing) && waited <= logs_wait_s()) || (images_missing && waited <= logs_wait_s().min(10))) {
             if !told_waiting && over_at.is_some_and(|t| t.elapsed().as_secs() >= 2) { say("The run is over; its summary comes once its runner has sent the steps' logs (a minute at most)."); told_waiting = true }
             continue
         }
@@ -389,6 +393,12 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                     j["took_ms"].as_u64().map(|ms| format!(", {}", span(ms / 1000))).unwrap_or_default(), j["usd"].as_f64().map(|u| format!(", ${u:.3}")).unwrap_or_default(),
                     match (j["result"].as_str().unwrap_or("?"), j["error"].as_str().filter(|e| !e.is_empty())) { (r, Some(e)) => format!("{r} ({e})"), (r, None) => r.to_string() }));
                 // Started again: said, with its first attempt (its artifacts are kept anew by this one).
+                // What it had from the cache's Docker images and pulled (what was kept, once its machine has: `jobs retrieve`).
+                match crate::dashboard::images_said(&j["start"]) {
+                    Some(i) => say(&format!("{}  Docker images: {i}.", crate::commands::JOB_LINE)),
+                    None if j["start"]["keeps"] == true && j["start"]["images"].is_null() => if let Some(id) = j["job_id"].as_str() { say(&format!("{}  Docker images: not said yet by its machine (`superci jobs retrieve {id}` says them once it has).", crate::commands::JOB_LINE)) },
+                    None => {}
+                }
                 if let Some(first) = j["restarted"]["job_id"].as_str() { say(&format!("{}  Started again on an on-demand machine: {} (its first attempt was job {first}).", crate::commands::JOB_LINE, j["restarted"]["why"].as_str().unwrap_or("its machine ended"))) }
                 let mut steps: Vec<&Value> = j["steps"].as_array().into_iter().flatten().collect();
                 steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));

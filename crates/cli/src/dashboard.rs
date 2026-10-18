@@ -895,6 +895,8 @@ pub fn images_said(j: &serde_json::Value) -> Option<String> {
     let from = (n("served") > 0).then(|| format!("{} from the cache ({})", layers(n("served")), size_words(n("served_bytes"))));
     // (What the next job has from it: what was uploaded, and what the cache had already. Pulled and neither: said.)
     let kept = match (n("uploaded") + n("had"), n("pulled")) {
+        // (Said as the job ended: its machine is keeping them.)
+        _ if i["keeping"] == true => "being kept for the next job".to_string(),
         (0, _) => "none kept for the next job".to_string(),
         (k, all) if k >= all => "kept for the next job".to_string(),
         (k, _) => format!("{k} of them kept for the next job ({})", size_words(n("uploaded_bytes") + n("had_bytes"))),

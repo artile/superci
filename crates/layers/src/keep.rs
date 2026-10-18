@@ -118,6 +118,12 @@ pub fn keep(o: &Options) -> i32 {
         if blob_path(&o.content, &l.digest).and_then(|p| std::fs::metadata(p).ok()).is_some_and(|m| m.len() == l.size) { offered.push(l) } else { done.missing += 1; done.missing_bytes += l.size }
     }
     let sizes: std::collections::HashMap<String, u64> = offered.iter().map(|l| (l.digest.clone(), l.size)).collect();
+    // Something to upload: what it had and pulled said first (the run's summary is printed as the job ends; the
+    // uploads may take minutes).
+    if !offered.is_empty() {
+        let first = json!({ "served": done.served, "served_bytes": done.served_bytes, "pulled": done.pulled, "pulled_bytes": done.pulled_bytes, "off": done.off, "keeping": true });
+        if let Err(e) = post(&agent, &format!("{}/layers-kept", o.link), &first) { eprintln!("superci-layers keep: saying what it had: {e}") }
+    }
     let said = offer(&agent, &o.link, &o.content, offered, began + o.most);
     let (uploaded, bytes, had) = (said.uploaded, said.bytes, said.had);
     (done.uploaded, done.uploaded_bytes, done.refused, done.failed, done.note) = (uploaded, bytes, said.refused, said.failed, said.note);

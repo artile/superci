@@ -2,6 +2,10 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.17
+- `superci runs create` and `runs wait` end with each job's Docker images, `--quiet` too: what came from the cache and what was pulled, as `superci jobs retrieve` says them. A machine says this as its job ends, before it uploads what it pulled for the next job (that may take minutes); what was kept, and why not, follows in `jobs retrieve`. Update your control plane for it.
+- A machine whose cache for Docker images could not be switched in always gets Docker back. systemd starts Docker three times a minute at most, and a machine's start, the switch and putting Docker back are three already: one more left Docker off for the job.
+
 ## 0.19.16 — 2026-10-18
 - Docker images are kept and served on machines whose files are in memory (`superci/scratch=ramdisk`). The cache was never switched in there: the kernel mounts no EROFS file from memory's filesystem, so its setup turned it off, while each job still said its layers came from the cache (it counted what the cache's index listed). The layers' files now go on a disk in memory, with no disk of their own beside it (and none in the price). A job says layers came from the cache only when they did, and says why the cache was off when it was. On a 16-CPU machine with files in memory, a local Supabase starts in 27 s instead of 32 s, with 6.2 GB of memory used instead of 11.6 (the images are no longer held both compressed and unpacked).
 - A machine gets every layer's link with the cache's index at its start, and fetches the layers its job's last run used right away, before Docker asks for them (106 layers, 3 GB, in 3.3 s): its pull then finds them there. It asked for links layer by layer as Docker pulled, and a burst of those waited seconds on the control plane. Layers a job used are kept in the cache as long as jobs use them, as before.

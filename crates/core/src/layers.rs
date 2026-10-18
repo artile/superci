@@ -102,6 +102,9 @@ pub struct Images { #[serde(default)] pub served: u64, #[serde(default)] pub ser
     /// machine's start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub used: Vec<String>,
     #[serde(default)] pub at: u64,
+    /// Said as the job ended, before its machine kept what it pulled: what it had from the store and pulled (kept or
+    /// not, and why, comes once it has).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub keeping: bool,
     /// Why nothing could be said (containerd out of reach).
     #[serde(default, skip_serializing_if = "Option::is_none")] pub error: Option<String> }
 
@@ -394,6 +397,15 @@ impl ControlPlane<'_> {
     pub(crate) async fn layers_kept(&self, machine: &cache::Machine, body: &[u8], now: u64) -> Result<Response> {
         let Ok(mut said) = serde_json::from_slice::<Images>(body) else { return Ok(Response::text(400, "not what was kept")) };
         said.at = now;
+        // Said as the job ended, before keeping: on the job's record, for the run's summary, unless what was kept has
+        // been said already (the rest is said with that).
+        if said.keeping {
+            let Some(mut job) = self.job_of_machine(machine).await? else { return Ok(Response::text(404, "no job of this machine")) };
+            if job.images.as_ref().is_some_and(|i| !i.keeping) { return Ok(Response::json(&json!({}))) }
+            job.images = Some(Images { used: vec![], ..said });
+            self.keep_job(&job).await?;
+            return Ok(Response::json(&json!({})))
+        }
         // The layers it had from the store: used (once a day at most), so that they stay while jobs use them (their
         // links came with the index: nothing else says so).
         let served: Vec<String> = serde_json::from_slice::<Value>(body).ok().and_then(|b| b["served_digests"].as_array().map(|d| d.iter().filter_map(|x| x.as_str().filter(|d| is_digest(d)).map(str::to_string)).take(500).collect())).unwrap_or_default();

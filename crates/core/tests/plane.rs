@@ -4021,9 +4021,16 @@ fn ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has
     let first = link_of(&script);
     let kept = |link: &str, served: u64, pulled_bytes: u64| run(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/layers-kept"))
         .with_body(serde_json::json!({ "served": served, "served_bytes": served * 1000, "pulled": 5, "pulled_bytes": pulled_bytes, "uploaded": 5, "uploaded_bytes": pulled_bytes, "seconds": 3.1 }).to_string()));
+    // As the job ended, before keeping: what it pulled, on the job's record (for the run's summary); then what was kept,
+    // which a late first word does not take back.
+    let early = || run(Request::new("POST", &format!("{PLANE_URL}/cache/{first}/layers-kept")).with_body(serde_json::json!({ "served": 0, "pulled": 5, "pulled_bytes": 300 << 20, "keeping": true }).to_string()));
+    assert_eq!(early().status, 200);
+    assert_eq!((job(&store, 1)["images"]["keeping"].clone(), job(&store, 1)["images"]["pulled"].clone()), (serde_json::json!(true), serde_json::json!(5)));
     // (After its job: the runner's own record has gone by then; the machine's link knows its job.)
     assert_eq!(kept(&first, 0, 300 << 20).status, 200);
     assert_eq!(job(&store, 1)["images"]["pulled_bytes"], 300u64 << 20);
+    assert_eq!(early().status, 200);
+    assert_eq!((job(&store, 1)["images"]["keeping"].clone(), job(&store, 1)["images"]["uploaded"].clone()), (serde_json::Value::Null, serde_json::json!(5)));
     assert_eq!(kept("someone-elses-link-here", 0, 1).status, 404);
     // The next: the store from its start, on a disk of its own, in its price.
     let (script, _) = machine(2, "superci/image=ubuntu26");

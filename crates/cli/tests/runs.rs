@@ -144,6 +144,38 @@ fn quiet_a_failed_run_says_how_each_step_went_and_the_end_of_the_one_that_failed
 }
 
 #[test]
+fn a_runs_summary_quiet_too_says_what_each_job_had_from_the_caches_docker_images() {
+    // A job whose machine keeps Docker's images: what it had and pulled, as its machine said when the job ended (before
+    // keeping them); one whose machine has said nothing yet: where to read it once it has.
+    for (images, line) in [(Some(serde_json::json!({ "served": 103, "served_bytes": 2_700_000_000u64, "pulled": 12, "pulled_bytes": 300_000_000u64, "keeping": true, "at": 1 })),
+            "Docker images: 103 layers from the cache (2.7 GB); 12 layers pulled (300 MB), being kept for the next job."), (None, "Docker images: not said yet by its machine (`superci jobs retrieve ")] {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+        let run = run_of(&served);
+        let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let a = "cccccccc-0000-0000-0000-000000000003";
+        runner.take();
+        {
+            let mut store = served.store.0.lock().unwrap();
+            let key = store.keys().find(|k| k.starts_with("job:")).unwrap().clone();
+            let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+            j["keeps"] = true.into();
+            if let Some(i) = &images { j["images"] = i.clone() }
+            store.insert(key, j.to_string());
+        }
+        runner.steps(&[(a, "Run make test", 1, "inProgress", None, None)]);
+        runner.log(1, "2026-10-15T10:00:01.0000000Z ok");
+        runner.steps(&[(a, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+        runner.finish("succeeded");
+        let out = cli.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && said.contains(line), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
 fn a_dry_run_checks_the_workflow_its_job_and_the_tree_and_starts_nothing() {
     let served = serve(|_| {});
     let dir = checkout();

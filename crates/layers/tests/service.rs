@@ -165,7 +165,7 @@ async fn its_snapshots_are_containerds_overlay() {
 /// taken only with the SHA-256 they say), their word (`POST /uploaded`) and what was kept (`POST /layers-kept`).
 /// What it was asked, kept.
 #[derive(Default)]
-struct Plane { files: HashMap<String, Vec<u8>>, asked: Vec<String>, uploaded: HashMap<String, Vec<u8>>, kept: Option<serde_json::Value> }
+struct Plane { files: HashMap<String, Vec<u8>>, asked: Vec<String>, uploaded: HashMap<String, Vec<u8>>, kept: Option<serde_json::Value>, first: Option<serde_json::Value> }
 
 fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -221,7 +221,7 @@ fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
                     if ok { p.lock().unwrap().uploaded.insert(u[4..].to_string(), body); send(&mut out, 200, "", b"") } else { send(&mut out, 400, "", b"BadDigest") }
                 }
                 ("POST", "/uploaded") => send(&mut out, 200, "", br#"{"do": "converting"}"#),
-                ("POST", "/layers-kept") => { p.lock().unwrap().kept = Some(json); send(&mut out, 200, "", b"{}") }
+                ("POST", "/layers-kept") => { let mut p = p.lock().unwrap(); if json["keeping"] == true { p.first = Some(json) } else { p.kept = Some(json) } send(&mut out, 200, "", b"{}") }
                 _ => send(&mut out, 404, "", b""),
             }
         });
@@ -277,6 +277,9 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_
     assert!(p.lock().unwrap().asked.iter().any(|a| a == "POST /uploaded"));
     let said = p.lock().unwrap().kept.clone().unwrap();
     assert_eq!((said["served"].as_u64(), said["pulled"].as_u64(), said["pulled_bytes"].as_u64(), said["uploaded"].as_u64()), (Some(1), Some(1), Some(blob.len() as u64), Some(1)), "{said}");
+    // (And before the uploads, what it had and pulled: said first, for the run's summary.)
+    let first = p.lock().unwrap().first.take().expect("said before the uploads");
+    assert_eq!((first["served"].as_u64(), first["pulled"].as_u64(), first["uploaded"].as_u64()), (Some(1), Some(1), None), "{first}");
     // The image's own blobs (there at the machine's start) are not offered; containerd out of reach is said as such.
     std::fs::write(s.dir.join("boot"), format!("{}\n", &lacked[7..])).unwrap();
     p.lock().unwrap().uploaded.clear();
@@ -285,6 +288,7 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_
     assert!(again.status.success());
     let said = p.lock().unwrap().kept.clone().unwrap();
     assert_eq!((said["pulled"].as_u64(), said["uploaded"].as_u64()), (Some(0), Some(0)), "{said}");
+    assert!(p.lock().unwrap().first.is_none(), "nothing to upload: said once");
     // Not switched in on its machine (its setup said why): nothing came from the store, and why is said.
     std::fs::write(&state, "off: the kernel does not mount an EROFS file: Block device required (os error 15)").unwrap();
     let off = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", s.socket.display()),
