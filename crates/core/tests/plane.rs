@@ -4885,3 +4885,95 @@ fn each_kind_of_label_asks_aws_for_the_machine_the_table_says() {
     for (w, g) in want.lines().zip(got.lines()) { assert_eq!(w, g) }
     assert_eq!(want.lines().count(), got.lines().count());
 }
+
+/// A job no spot or on-demand pool has a machine for, among many (as AWS answered a fleet of them): asked again
+/// twice, a minute apart, then failed with what AWS said; its start keeps the last two dozen requests. A type AWS does not offer in a zone is not asked
+/// there again.
+#[test]
+fn a_job_no_pool_has_room_for_is_asked_three_times_then_fails_and_a_type_a_zone_lacks_is_not_asked_there_again() {
+    let none: &'static str = Box::leak(FLEET_NONE.replace("g6.xlarge", "c8a.16xlarge").replace("g5.xlarge", "m8a.16xlarge").into_boxed_str());
+    let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+        let xml = |s: String| Some(Response::new(200, "text/xml", s));
+        if body.contains("Action=DescribeVpcs") { return xml("<vpcSet><item><vpcId>vpc-1</vpcId></item></vpcSet>".into()) }
+        if body.contains("Action=DescribeSubnets") { return xml(format!("<subnetSet>{}</subnetSet>", ["a", "b", "c", "d", "e", "f"].map(|z| format!("<item><subnetId>subnet-{z}</subnetId><availabilityZone>us-east-1{z}</availabilityZone></item>")).concat())) }
+        if body.contains("Action=DescribeSecurityGroups") { return xml("<securityGroupInfo><item><groupId>sg-1</groupId></item></securityGroupInfo>".into()) }
+        if body.contains("Action=DescribeSpotPriceHistory") && !body.contains("AvailabilityZone=") { return xml("<spotPriceHistorySet/>".into()) }
+        if body.contains("Action=RunInstances") { return Some(aws_refuses("InsufficientInstanceCapacity")) }
+        if body.contains("Action=CreateLaunchTemplate") { return xml(FLEET_TEMPLATE.into()) }
+        if body.contains("Action=CreateFleet") { return xml(none.into()) }
+        if body.contains("Action=DeleteLaunchTemplate") { return xml(FLEET_TEMPLATE_REMOVED.into()) }
+        None
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.max_cpu = Some(64);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/cpu=64/family=c8a+m8a+r8a+c7a+m7a+r7a")));
+    // Tried again twice, a minute apart, then failed.
+    let mut said = vec![];
+    for _ in 0..3 {
+        let e = job(&store, 7)["error"].as_str().unwrap_or_default().to_string();
+        said.push(e.split(" (").next().unwrap_or_default().to_string());
+        clock.0.set(clock.0.get() + 61_000);
+        block_on(plane.alarm()).unwrap();
+    }
+    let again = "waiting: starting its machine failed, trying again".to_string();
+    assert_eq!(said, [again.clone(), again, "AWS had no room for it: us-east-1: InsufficientInstanceCapacity; us-east-1 on-demand: InsufficientInstanceCapacity".to_string()]);
+    let j = job(&store, 7);
+    assert_eq!((j["state"].as_str(), j["asks"].as_array().map(|a| a.len())), (Some("failed"), Some(24)), "the last two dozen requests: {j}");
+    assert!(j["error"].as_str().unwrap().starts_with("AWS had no room for it: us-east-1: InsufficientInstanceCapacity; us-east-1 on-demand: InsufficientInstanceCapacity"), "{j}");
+    // The zone that does not have the types: noted, and left out of the next job's requests.
+    assert!(store.0.borrow().contains_key("aws:unoffered:us-east-1:c8a.16xlarge:us-east-1e") && store.0.borrow().contains_key("aws:unoffered:us-east-1:m8a.16xlarge:us-east-1e"));
+    let before = clouds.0.calls.borrow().len();
+    let asked_in = |from: usize, to: usize| clouds.0.calls.borrow()[from..to].iter().any(|c| {
+        let f: Vec<(String, String)> = url::form_urlencoded::parse(c.2.as_bytes()).into_owned().collect();
+        let at = |prefix: &str| (field(&f, &format!("{prefix}InstanceType")), field(&f, &format!("{prefix}SubnetId")));
+        let mut pools = vec![at(""), at("NetworkInterface.1.")];
+        for n in 1..=40 { pools.push(at(&format!("LaunchTemplateConfigs.1.Overrides.{n}."))) }
+        pools.iter().any(|(t, s)| t == "c8a.16xlarge" && s == "subnet-e")
+    });
+    assert!(asked_in(0, before), "the first job asked it there");
+    block_on(plane.handle(labelled("queued", 8, "acme/app", None, "superci/cpu=64/family=c8a+m8a+r8a+c7a+m7a+r7a")));
+    let after = clouds.0.calls.borrow().len();
+    assert!(!asked_in(before, after), "c8a.16xlarge asked in us-east-1e again");
+}
+
+/// A request for many spot pools refused for something else than room (here its template gone, as AWS words that):
+/// no answer about the pools, so the job goes on with them in rounds, before it is tried again.
+#[test]
+fn a_fleet_refused_for_something_else_than_room_goes_on_with_the_pools_in_rounds() {
+    let refused: &'static str = Box::leak(FLEET_NONE.replace("g6.xlarge", "c8a.16xlarge").replace("g5.xlarge", "m8a.16xlarge").replace("<errorCode>InvalidFleetConfiguration</errorCode>", "<errorCode>InvalidLaunchTemplateId.NotFound</errorCode>").into_boxed_str());
+    let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+        let xml = |s: String| Some(Response::new(200, "text/xml", s));
+        if body.contains("Action=DescribeVpcs") { return xml("<vpcSet><item><vpcId>vpc-1</vpcId></item></vpcSet>".into()) }
+        if body.contains("Action=DescribeSubnets") { return xml(format!("<subnetSet>{}</subnetSet>", ["a", "b", "c", "d", "e", "f"].map(|z| format!("<item><subnetId>subnet-{z}</subnetId><availabilityZone>us-east-1{z}</availabilityZone></item>")).concat())) }
+        if body.contains("Action=DescribeSecurityGroups") { return xml("<securityGroupInfo><item><groupId>sg-1</groupId></item></securityGroupInfo>".into()) }
+        if body.contains("Action=DescribeSpotPriceHistory") && !body.contains("AvailabilityZone=") { return xml("<spotPriceHistorySet/>".into()) }
+        if body.contains("Action=RunInstances") { return Some(aws_refuses("InsufficientInstanceCapacity")) }
+        if body.contains("Action=CreateLaunchTemplate") { return xml(FLEET_TEMPLATE.into()) }
+        if body.contains("Action=CreateFleet") { return xml(refused.into()) }
+        if body.contains("Action=DeleteLaunchTemplate") { return xml(FLEET_TEMPLATE_REMOVED.into()) }
+        None
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.max_cpu = Some(64);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/cpu=64/family=c8a+m8a+r8a+c7a+m7a+r7a")));
+    let mut said = vec![];
+    for _ in 0..5 {
+        said.push(job(&store, 7)["error"].as_str().unwrap_or_default().split(" (").next().unwrap_or_default().to_string());
+        clock.0.set(clock.0.get() + 61_000);
+        block_on(plane.alarm()).unwrap();
+    }
+    let (more, again) = ("waiting: asking AWS's other spot pools for a machine".to_string(), "waiting: starting its machine failed, trying again".to_string());
+    assert_eq!(said[..3], [more.clone(), more, again]);
+    assert_eq!(job(&store, 7)["state"].as_str(), Some("failed"));
+}
+
