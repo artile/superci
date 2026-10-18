@@ -6305,7 +6305,7 @@ fn usage_figures(u: &serde_json::Value, period: &str, jobs: &[serde_json::Value]
     let jobs_kpi = if u["runs"].is_u64() && n("runs") > 0 {
         let runs_spark = spark((0..count).map(|i| (s(i, "runs"), 0.0, format!("{}: {} {}", step_name(i), s(i, "runs"), if s(i, "runs") == 1.0 { "run" } else { "runs" }))).collect());
         kpi(n("runs").to_string(), if n("runs") == 1 { "run" } else { "runs" }, runs_spark,
-            if n("not_ran") == 0 { format!("{} {}", n("jobs"), if n("jobs") == 1 { "job" } else { "jobs" }) } else { format!(r#"{} jobs<span class="sep">·</span><span class="bad-text">{} did not run</span>"#, n("jobs"), n("not_ran")) })
+            if n("not_ran") == 0 { format!("{} {}", n("jobs"), if n("jobs") == 1 { "job" } else { "jobs" }) } else { format!(r#"{} {}<span class="sep">·</span><span class="bad-text">{} did not run</span>"#, n("jobs"), if n("jobs") == 1 { "job" } else { "jobs" }, n("not_ran")) })
     } else { jobs_kpi };
     // Minutes: what the machines ran, and what the code host bills (each job rounded up to a minute).
     let minutes = |m: f64| if m >= 6000.0 { format!("{:.0} h", m / 60.0) } else if m >= 100.0 { format!("{:.0} min", m) } else { format!("{:.1} min", m) };

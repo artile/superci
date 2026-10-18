@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.17
+- Overview says "1 job · 1 did not run" (it said "1 jobs").
 - Overview's machine time over 6,000 minutes is labelled machine hours (it said "120 h machine minutes").
 - `superci keys create --runs` on a control plane too old for run keys says to update it, and one that does not take this computer's key says why (both said it had not answered).
 - A sign-in made elsewhere while the dashboard runs (another terminal's `superci login`) shows on the next page; it showed one page later.

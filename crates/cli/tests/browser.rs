@@ -1946,3 +1946,26 @@ fn a_cloud_that_does_not_answer_while_control_planes_are_looked_for_and_an_aws_s
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn a_job_whose_machine_could_not_start_is_counted_as_one_that_did_not_run_and_listed_as_failed() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A job for AWS, which does not give its machine.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    let (_, q) = served.github.queue("build", "superci/provider=aws", served.now_ms());
+    served.webhook(q);
+    for _ in 0..3 { served.later(600_000); served.upkeep(); }
+    let home = home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&reads("1 job · 1 did not run"));
+    b.click("nav a", "Runs");
+    b.click(".tabs a", "Jobs");
+    b.wait(&reads("Failed"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
