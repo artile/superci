@@ -662,6 +662,75 @@ fn a_jobs_page_says_what_it_had_from_the_caches_docker_images() {
 }
 
 #[test]
+fn a_jobs_page_says_each_step_of_its_start_and_its_runner_as_its_machine_said() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = home(&served);
+    played(&served, &home.join("checkout"));
+    let (key, first) = {
+        let store = served.store.0.lock().unwrap();
+        let key = store.keys().find(|k| k.starts_with("job:")).cloned().unwrap();
+        let j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+        (key, j)
+    };
+    let t = first["at_ms"].as_u64().unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runs");
+    b.wait(&shows("Recent runs"));
+    b.click(".tabs a", "Jobs");
+    b.wait(&shows("Recent jobs"));
+    b.click("main a", "tests");
+    b.wait(&shows("Its start"));
+    let page = b.eval("location.href").as_str().unwrap().to_string();
+    let aws = |more: serde_json::Value| { let mut m = serde_json::json!({ "cloud": "aws", "machine_id": "i-0a1b2c3d4e5f60718", "launched_ms": t + 3_000 }); for (k, v) in more.as_object().unwrap() { m[k] = v.clone() } m };
+    for (more, said) in [
+        // From GitHub, after a wait under the spot limit, every step its machine timed, and what its runner logged.
+        (aws(serde_json::json!({ "provider": "github", "queued_ms": t - 2_000, "spot_waited_ms": 1_000, "started_ms": t + 41_000, "cpu": 8, "machine_type": "m8a.2xlarge", "disk_gb": 60, "disk_mibs": 500, "ramdisk": true, "on_demand": true,
+            "machine": { "script_ms": t + 20_000, "boot_s": 5.0, "read_ms": t + 22_000, "ready_ms": t + 25_000, "listening_ms": t + 40_000, "github_wait_s": 12, "log": "[RUNNER] waiting ... 30 s ..." } })),
+            vec!["GitHub told SuperCI of the job", "waited for room under your AWS spot limit", "AWS gave a machine", "the machine was made and switched on", "it booted", "its disk and Docker were set up",
+                "the runner's files were read from the image (GitHub refused the first connection; reachable after 12 s)", "the runner started and reached GitHub", "GitHub gave it the job",
+                "What its runner logged while it was slow to reach GitHub", "[RUNNER] waiting ... 30 s ...", "8 CPU · m8a.2xlarge · 500 MiB/s disk · RAM disk · on-demand"]),
+        // A run from a computer's: no read of the image timed; the control plane gave it the job.
+        (aws(serde_json::json!({ "started_ms": t + 30_000, "machine_type": "c8a.xlarge", "disk_gb": 100, "disk_mibs": 300, "local_disk": true,
+            "machine": { "script_ms": t + 20_000, "boot_s": 5.0, "ready_ms": t + 25_000, "listening_ms": t + 28_000, "log": "[RUNNER] retrying" } })),
+            vec!["its start-up script ran", "the runner started and reached the control plane", "the control plane gave it the job", "slow to reach the control plane", "c8a.xlarge · 100 GB disk at 300 MiB/s · local disk"]),
+        // Its runner listening, no job taken yet.
+        (aws(serde_json::json!({ "machine_type": "c8a.xlarge", "disk_gb": 200, "machine": { "script_ms": t + 20_000, "boot_s": 5.0, "ready_ms": t + 25_000, "listening_ms": t + 28_000 } })),
+            vec!["the runner started and reached the control plane", "c8a.xlarge · 200 GB disk"]),
+        (aws(serde_json::json!({ "provider": "github", "machine": { "script_ms": t + 20_000, "boot_s": 5.0, "ready_ms": t + 25_000, "listening_ms": t + 28_000 } })),
+            vec!["the runner started and reached GitHub"]),
+        // The job taken with no time of its runner listening.
+        (aws(serde_json::json!({ "started_ms": t + 30_000, "machine": { "script_ms": t + 20_000, "boot_s": 5.0, "ready_ms": t + 25_000 } })),
+            vec!["the runner started and took the job"]),
+        // No machine given yet: only GitHub's word.
+        (serde_json::json!({ "provider": "github", "queued_ms": t - 2_000 }), vec!["GitHub told SuperCI of the job"]),
+        // From before computers were set aside.
+        (serde_json::json!({ "cloud": "machine" }), vec!["Your computer"]),
+    ] {
+        let mut j = first.clone();
+        for k in ["machine", "started_ms", "queued_ms", "launched_ms", "machine_id", "spot_waited_ms", "machine_type", "cpu", "disk_gb", "disk_mibs"] { j.as_object_mut().unwrap().remove(k); }
+        for (k, v) in more.as_object().unwrap() { j[k] = v.clone() }
+        // (What its machine said is kept apart from its record: see `MachineStart`.)
+        let hello = format!("hello:{}", key.trim_start_matches("job:"));
+        {
+            let mut store = served.store.0.lock().unwrap();
+            match j.as_object_mut().unwrap().remove("machine") { Some(m) => { store.insert(hello, m.to_string()); } None => { store.remove(&hello); } }
+            store.insert(key.clone(), j.to_string());
+        }
+        b.goto(&page);
+        b.wait(&shows("Status"));
+        let main = b.text("main");
+        for s in said { assert!(main.contains(s), "{s}: {main}") }
+    }
+    served.store.0.lock().unwrap().insert(key.clone(), first.to_string());
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn keeping_docker_images_is_turned_off_and_on_in_settings() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|c| {
