@@ -2569,6 +2569,44 @@ fn what_each_kind_of_aws_account_allows_is_said_by_the_cli_as_aws_answered_and_o
 }
 
 #[test]
+fn the_debug_commands_answer_as_the_clouds_answered_and_the_pages_stay() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.aws.fail("RunInstances", 200, &started, None);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.fail("/client/v4/accounts", 200, r#"{"result":[{"id":"1111111111111111111111111111111a","name":"Acme"}],"success":true,"errors":[],"messages":[]}"#, None);
+    let body = home.join("body.json");
+    std::fs::write(&body, r#"{"query":"query{viewer{accounts{g:containersUsageAdaptiveGroups(limit:1){sum{cpuTimeSec}}}}}","variables":{}}"#).unwrap();
+    let body = body.to_string_lossy().to_string();
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    let s3 = format!("https://{bucket}.s3.us-east-1.amazonaws.com/x");
+    let table: Vec<Vec<&str>> = vec![
+        vec!["debug", "networks"], vec!["debug", "networks", "us-east-1"], vec!["debug", "budget"], vec!["debug", "budget", "set", "100", "ops@example.com", "stop"], vec!["debug", "budget", "lift"], vec!["debug", "budget", "remove"],
+        vec!["debug", "launch", "us-east-1", "spot", "c8a.large"], vec!["debug", "launch", "us-east-1", "on-demand"], vec!["debug", "presign", "GET", "us-east-1", &bucket, "trees/x", "2"], vec!["debug", "presign", "GET", "us-east-1", &bucket, "x", "many"],
+        vec!["debug", "rest", "us-east-1", "s3", "GET", &s3], vec!["debug", "cloudflare", "GET", "/accounts"], vec!["debug", "cloudflare", "POST", "/graphql", &body],
+        vec!["debug", "ec2", "us-east-1", "DescribeRegions"], vec!["debug", "iam", "GetRole", "RoleName=superci-plane-testplane0001"], vec!["debug", "json", "us-east-1", "ssm", "AmazonSSM.GetParameter", r#"{"Name":"/superci/x"}"#],
+        vec!["debug", "abandon", "us-east-1", "testplane0009"],
+    ];
+    for args in &table {
+        let o = common::command(&home).args(args).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked"), "{args:?}: {said}");
+    }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
