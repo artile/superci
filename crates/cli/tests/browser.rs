@@ -7386,3 +7386,45 @@ fn a_change_needing_a_cloud_whose_sign_in_is_over_says_so() {
     }
 }
 
+/// A control plane asked for in AWS where it could not run: a region the account's organization closes, one without
+/// the image jobs run on (both said before anything is made); then one that AWS stops, asked for again meanwhile,
+/// and started over, what it made removed (or said as left).
+#[test]
+fn a_control_plane_asked_for_where_it_cannot_run_is_refused_and_one_stopped_is_started_over() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    // Ireland closed by the organization's policy (as AWS words it); Canada and Stockholm without the image.
+    served.aws.fail("DescribeVpcs|ec2.eu-west-1.", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-example001/service_control_policy/p-example1"), None);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=add-runners"));
+    b.wait("document.getElementById('aws-account') && !document.body.innerText.includes('Asking AWS')");
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/plane/aws", &[("region", "eu-west-1"), ("account", "111111111111")]);
+    assert!(got == 409 && text.contains("cannot use Ireland") && text.contains("organization"), "{got} {text}");
+    let (got, text) = post(&mut b, "/plane/aws", &[("region", "ca-central-1"), ("account", "111111111111")]);
+    assert!(got == 409 && text.contains("No job could start in Canada"), "{got} {text}");
+    // One AWS stops (it answers nothing more), asked for again while it runs; then started over.
+    served.aws.fail_none();
+    served.aws.fail("CreateRole", 503, &superci_testkit::ec2_error("ServiceUnavailable", "Service is unavailable."), None);
+    let (got, text) = post(&mut b, "/plane/aws", &[("region", "us-east-2"), ("account", "111111111111")]);
+    assert!(got < 400, "{got} {text}");
+    let (got, _) = post(&mut b, "/plane/aws", &[("region", "us-east-2"), ("account", "111111111111")]);
+    assert!(got < 400, "a second while one runs: back to its page");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        b.goto(&format!("{link}&p=plane"));
+        b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+        if b.eval("document.body.innerText").as_str().unwrap_or_default().contains("Try again") { break }
+        assert!(std::time::Instant::now() < end, "it stopped: {}", b.eval("document.body.innerText"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/plane/start-over", &[]);
+    assert!(got < 400, "{got} {text}");
+    b.goto(&format!("{link}&p=plane"));
+    b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
