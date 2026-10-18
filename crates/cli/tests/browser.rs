@@ -7064,6 +7064,181 @@ fn the_sweep_finds_out_what_became_of_jobs_whose_events_were_lost_and_says_it_on
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The sweep, more of what it finds: a start under way a moment ago, a job past its longest time (90 minutes) with a
+/// reason said already, one running that never said so, a cancelled job's machine meant for another, its runner kept
+/// by GitHub, GitHub failing to say whether a runner is busy, one whose own job began elsewhere, one handed on late,
+/// a template AWS would not remove, runs and notes kept and gone, machines keeping images, and a move a moment ago.
+#[test]
+fn the_sweep_finds_more_states_of_jobs_runs_and_notes_and_says_them_on_their_pages() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}],"max_minutes":90}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let labelled = |name: &str, label: &str| { let (id, q) = served.github.queue(name, label, served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let job = |name: &str| labelled(name, "superci");
+    let now = served.now_ms();
+    let (just, past, never_said, meant, kept_by_github, unsure, begun) = (job("started a moment ago"), job("past its longest time"), job("running, never said"), job("meant for another"), job("its runner kept"), job("GitHub unsure"), job("begun elsewhere"));
+    edit(just, &|j| { j["state"] = "launching".into(); j["launched_ms"] = (now - 30_000).into(); j["seen_in_progress"] = true.into(); });
+    edit(past, &|j| { j["state"] = "running".into(); j["seen_in_progress"] = true.into(); j["launched_ms"] = (now - 100 * 60_000).into(); j["error"] = "said before".into(); });
+    edit(never_said, &|j| { j["state"] = "running".into(); j["launched_ms"] = (now - 11 * 60_000).into(); });
+    let other = job("the other");
+    edit(meant, &|j| { j["for_job"] = other.into(); j["launched_ms"] = (now - 2 * 60_000).into(); });
+    served.store.0.lock().unwrap().insert(format!("gone:{meant}"), now.to_string());
+    served.store.0.lock().unwrap().insert(format!("gone:{kept_by_github}"), now.to_string());
+    let runner_of = |id: u64| state(id)["runner_id"].as_u64().unwrap();
+    served.github.fail("DELETE", &format!("/runners/{}", runner_of(kept_by_github)), 422, "Bad request - Runner is still running a job");
+    served.github.ended_untold(unsure);
+    edit(unsure, &|j| { j["launched_ms"] = (now - 2 * 60_000).into(); });
+    served.github.fail("GET", &format!("/runners/{}", runner_of(unsure)), 502, "Server Error");
+    served.github.ended_untold(begun);
+    edit(begun, &|j| { j["launched_ms"] = (now - 9 * 60_000).into(); j["began"] = true.into(); });
+    // Handed on late: its own job ended, another still waiting with no machine coming, nine minutes on.
+    let handing = |name: &str| labelled(name, "superci/cpu=2");
+    let (late, waiting_one) = (handing("handed late"), handing("waiting with none coming"));
+    served.github.ended_untold(late);
+    edit(late, &|j| { j["launched_ms"] = (now - 9 * 60_000).into(); });
+    edit(waiting_one, &|j| { j["state"] = "done".into(); j["seen_in_progress"] = true.into(); });
+    // Not waited for here: a failed one's failing runner pending, one to be run again.
+    let (pending_fail, to_rerun) = (job("failing runner pending"), job("to run again"));
+    edit(pending_fail, &|j| { j["fail_pending"] = "why".into(); j["state"] = "done".into(); j["ended_ms"] = now.into(); });
+    edit(to_rerun, &|j| { j["rerun"] = serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/app", "name": "x", "state": "asked", "at_ms": now }); j["state"] = "done".into(); });
+    // An ended AWS machine whose sending is counted already, and one ended days ago.
+    let (counted, days) = (job("counted"), job("days ago"));
+    edit(counted, &|j| { j["state"] = "done".into(); j["ended_ms"] = (now - 20 * 60_000).into(); j["cost_from"] = "list".into(); j["sent_gb"] = 1.0.into(); });
+    edit(days, &|j| { j["state"] = "done".into(); j["ended_ms"] = (now - 3 * 86_400_000).into(); j["cost_from"] = "list".into(); });
+    {
+        let mut m = served.store.0.lock().unwrap();
+        // A template AWS will not remove yet (an hour old): kept for the next sweep.
+        m.insert("aws:template:us-east-1:superci-fleet-9".into(), (now - 3_600_000).to_string());
+        // A run whose key is no number, one kept a day with a log in a bucket no longer there, a tree a moment ago.
+        m.insert("run:abc".into(), serde_json::json!({ "jobs": [{ "state": "running" }] }).to_string());
+        m.insert("run:5".into(), serde_json::json!({ "at_ms": now - 2 * 86_400_000, "jobs": [{ "state": "done", "token": "tok0000000000000000001" }] }).to_string());
+        m.insert("rlog:tok0000000000000000001:1:001".into(), "\"s3:us-east-1\"".into());
+        m.insert("rtree-at:fresh".into(), now.to_string());
+        // A machine keeping images till later, and one for a job no longer kept.
+        m.insert(format!("keeping:{counted}"), (now + 600_000).to_string());
+        m.insert("keeping:4242".into(), (now - 1).to_string());
+        // A move here a moment ago.
+        m.insert("claimed_at".into(), now.to_string());
+    }
+    served.aws.fail("DeleteLaunchTemplate", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation."), None);
+    served.upkeep();
+    let st = |id: u64| state(id)["state"].as_str().unwrap_or_default().to_string();
+    assert_eq!(st(just), "launching");
+    assert_eq!((st(past), state(past)["error"].as_str().unwrap_or_default().to_string()), ("swept".into(), "said before".into()));
+    assert_eq!(st(never_said), "swept", "{}", state(never_said));
+    {
+        let m = served.store.0.lock().unwrap();
+        for k in ["aws:template:us-east-1:superci-fleet-9", "rtree-at:fresh", &format!("keeping:{counted}")] { assert!(m.contains_key(k), "{k} gone") }
+        assert!(!m.contains_key("keeping:4242"));
+    }
+    served.github.fail_none();
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    b.goto(&format!("{link}&p=job&id={past}"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A failing runner taking a job that waits for room (failed for the first one's reason, the first given a failing
+/// runner again), and one taking a job already over (left as it is). Each page says how it stands.
+#[test]
+fn a_failing_runner_taking_a_waiting_job_or_one_over_settles_each_and_their_pages_say_so() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let job = |name: &str, label: &str| { let (id, q) = served.github.queue(name, label, served.now_ms()); assert!(served.webhook(q) < 300); id };
+    // A label no machine has, its failing runner started; its record nameless (from before names were kept).
+    let first = job("first", "superci/cpus=8");
+    edit(first, &|j| { j["name"] = "".into(); });
+    let waiting = job("waiting", "superci");
+    edit(waiting, &|j| { j["state"] = "waiting".into(); });
+    let failing = format!("superci-{PLANE}-{first}-x");
+    served.webhook(served.github.start_on(waiting, &failing));
+    served.webhook(served.github.finish(waiting, "failure", "2026-10-15T10:00:01.0000000Z Error: the label is not understood", served.now_ms()));
+    assert!(state(waiting)["state"] == "failed" && state(waiting)["error"].as_str().unwrap_or_default().contains("another job"), "{}", state(waiting));
+    assert!(state(first)["fail_pending"].is_string(), "{}", state(first));
+    // Another such label; its failing runner takes a job already over: left as it is.
+    let second = job("second", "superci/cpus=4");
+    let over = job("over", "superci");
+    edit(over, &|j| { j["state"] = "done".into(); j["seen_in_progress"] = true.into(); });
+    let failing = format!("superci-{PLANE}-{second}-x");
+    served.webhook(served.github.start_on(over, &failing));
+    served.webhook(served.github.finish(over, "failure", "2026-10-15T10:00:01.0000000Z Error", served.now_ms()));
+    assert!(state(over)["failed_fast"] != true, "{}", state(over));
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for id in [first, waiting, over] {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitLab's jobs on AWS whose events never came, found at the sweep as GitLab has them: running on their runners,
+/// passed, cancelled (GitLab refusing to remove its runner), and still pending (its machine tried again).
+#[test]
+fn the_sweep_settles_gitlab_jobs_whose_events_never_came_as_gitlab_has_them() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.connect_gitlab();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let state = |id: u64| served.store.under(&format!("job:gl{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:gl{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let mut ids = vec![];
+    for (name, ends) in [("running", ""), ("passed", "success"), ("cancelled", "canceled"), ("pending", "-")] {
+        let (id, p) = served.gitlab.pending(name, &["superci"], served.now_ms());
+        assert!(served.gitlab_webhook(p) < 300);
+        let runner = state(id)["runner_id"].as_u64().unwrap();
+        if ends != "-" { let _ = served.gitlab.running_on(id, runner, served.now_ms()); }
+        if !ends.is_empty() && ends != "-" { let _ = served.gitlab.finish(id, ends, "ok", served.now_ms()); }
+        ids.push((id, name));
+    }
+    let nine = served.now_ms() - 9 * 60_000;
+    for (id, _) in &ids { edit(*id, &|j| { j["launched_ms"] = nine.into(); }) }
+    served.gitlab.fail("DELETE", "/runners/", 500);
+    served.upkeep();
+    served.gitlab.fail_none();
+    let st = |id: u64| state(id)["state"].as_str().unwrap_or_default().to_string();
+    assert_eq!(st(ids[0].0), "running", "{}", state(ids[0].0));
+    assert_eq!(st(ids[1].0), "done", "{}", state(ids[1].0));
+    assert_eq!(st(ids[2].0), "cancelled", "{}", state(ids[2].0));
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (id, _) in &ids {
+        b.goto(&format!("{link}&p=job&id={id}&gl="));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A runner taking another job than its own, for each way its own job and that other job stand: the other job with no
 /// machine coming gets this one (its own machine ended, failed, or never had), the runner's own job then needing none
 /// (cancelled, failed by a failing runner, over, its machine meant for that other job) or a new one; the other job
@@ -8421,6 +8596,49 @@ fn two_gitlabs_are_each_listed_on_the_permissions_card_and_repositories() {
     }
     b.goto(&format!("{link}&p=gitlab&g=gsecond"));
     b.wait(&shows("GitLab"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn signing_out_with_cloudflare_and_modal_signed_in_says_what_became_of_each_sign_in() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&page_shows("Usage"));
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/signout", &[]);
+    assert!(got < 400, "{got} {text}");
+    assert!(!file.exists(), "its sign-ins removed");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn each_address_a_machine_or_computer_calls_without_its_link_or_key_finds_nothing_and_the_pages_stay() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let token = "not-a-machines-link-000000";
+    for (method, path) in [("POST", "/runs/12/cancel"), ("GET", "/runs/12/artifacts"), ("GET", "/runs/12/log"), ("GET", "/runs/12"), ("GET", "/runs/12/artifact"),
+        ("GET", &*format!("/cache/{token}/program")), ("GET", &format!("/cache/{token}/cache")), ("GET", &format!("/cache/{token}/layers")), ("GET", &format!("/cache/{token}/layers-program")),
+        ("GET", &format!("/cache/{token}/layers.json")), ("GET", &format!("/cache/{token}/other")), ("POST", &format!("/cache/{token}/layers-links")), ("POST", &format!("/cache/{token}/layers-propose")),
+        ("POST", &format!("/cache/{token}/layers-uploaded")), ("POST", &format!("/cache/{token}/layers-kept")), ("POST", &format!("/cache/{token}/tool-get")), ("POST", &format!("/cache/{token}/other"))] {
+        let url = format!("{}{path}", served.url);
+        let status = if method == "GET" { agent.get(&url).call().map(|r| r.status().as_u16()).unwrap_or(0) } else { agent.post(&url).send("{}").map(|r| r.status().as_u16()).unwrap_or(0) };
+        assert!((400..500).contains(&status), "{method} {path}: {status}");
+    }
+    let home = home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
