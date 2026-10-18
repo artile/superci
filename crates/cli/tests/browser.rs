@@ -5992,3 +5992,56 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Where a job goes, by the order, its limits and rules and what the job asks, on a control plane with its own
+/// Cloudflare containers and an AWS account: each job's page says where it runs, or why it waits or failed.
+#[test]
+fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_page() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    // A month's spend on AWS before (two hours at $2 an hour), for the limits.
+    let spent = |served: &superci_testkit::Served| { let now = served.now_ms(); served.store.0.lock().unwrap().insert("job:50".into(), serde_json::json!({ "job_id": 50, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": now - 7_200_000, "ended_ms": now - 60_000,
+        "installation_id": 42, "cloud": "aws", "usd_per_hour": 2.0, "seen_in_progress": true }).to_string()); };
+    // Each case: the routing, what was spent before, the jobs (their labels), and what each one's page says.
+    type Case = (&'static str, &'static str, bool, Vec<(&'static str, &'static str)>);
+    let cases: Vec<Case> = vec![
+        ("Cloudflare one job at a time", r#"{"order":[{"cloud":"cloudflare","max_jobs":1},{"cloud":"aws","off":true},{"cloud":"aws-on-demand","off":true}]}"#, false,
+            vec![("superci", "Starting"), ("superci", "Cloudflare runs 1 at once")]),
+        ("a job too large for Cloudflare goes to AWS", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws"}]}"#, false, vec![("superci/cpu=8", "8 CPU · m8a.2xlarge"), ("superci", "4 CPU · 12 GB")]),
+        ("a job only Cloudflare may run, too large for it", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws"}]}"#, false, vec![("superci/provider=cloudflare/cpu=16", "Cloudflare")]),
+        ("a rule sends the repository to Cloudflare", r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare"}],"rules":[{"repo":"acme/*","cloud":"cloudflare"}]}"#, false, vec![("superci", "4 CPU · 12 GB")]),
+        ("AWS spot past its month's limit: on-demand", r#"{"order":[{"cloud":"aws","monthly_usd":1.0},{"cloud":"cloudflare","off":true}]}"#, true, vec![("superci", "c8a.xlarge · on-demand")]),
+        ("past its limit with on-demand off: nowhere", r#"{"order":[{"cloud":"aws","monthly_usd":1.0},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]}"#, true, vec![("superci", "Nowhere to run the default machine: AWS reached its $1 a month")]),
+        ("the whole CI past its month's limit", r#"{"order":[{"cloud":"aws"}],"monthly_usd":1.0}"#, true, vec![("superci", "reached its limit")]),
+        ("the whole CI past its day's limit", r#"{"order":[{"cloud":"aws"}],"daily_usd":1.0}"#, true, vec![("superci", "a day")]),
+        ("larger than the largest machine allowed", r#"{"order":[{"cloud":"aws"}],"max_cpu":8}"#, false, vec![("superci/cpu=16", "16")]),
+        ("a label that is not understood", r#"{"order":[{"cloud":"aws"}]}"#, false, vec![("superci/cpus=8", "cpus")]),
+        ("nothing to run Windows", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws","off":true},{"cloud":"aws-on-demand","off":true}]}"#, false, vec![("superci/os=windows", "Nowhere to run Windows: Cloudflare runs Linux only")]),
+    ];
+    let mut wrong = vec![];
+    for (what, routing, with_spend, jobs) in cases {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        served.connect_github();
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), routing);
+        served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+        served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+        served.aws.fail("RunInstances", 200, &started, None);
+        if with_spend { spent(&served) }
+        let ids: Vec<(u64, &str, &str)> = jobs.iter().map(|(label, said)| { let (id, q) = served.github.queue(label, label, served.now_ms()); assert!(served.webhook(q) < 300, "{what}"); (id, *label, *said) }).collect();
+        let home = signed_in(&served);
+        let (mut child, link) = dashboard(&home);
+        for (id, label, said) in ids {
+            b.goto(&format!("{link}&p=job&id={id}"));
+            b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+            let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+            let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+            if !page.contains(said) { wrong.push(format!("{what}: {label}: no {said:?} ({} {}): {}", job["state"], job["error"], page.chars().take(400).collect::<String>())) }
+        }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+

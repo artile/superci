@@ -950,7 +950,7 @@ fn the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it() 
     // Nothing here runs macOS; a part that is not understood: each fails with why, nothing started.
     run(labelled("queued", 5, "acme/app", None, "superci/os=macos"));
     assert_eq!(job(&store, 5)["state"], "failed");
-    assert!(job(&store, 5)["error"].as_str().unwrap().starts_with("nowhere to run macos"), "{}", job(&store, 5)["error"]);
+    assert!(job(&store, 5)["error"].as_str().unwrap().starts_with("nowhere to run macOS"), "{}", job(&store, 5)["error"]);
     run(labelled("queued", 6, "acme/app", None, "superci/cores=8"));
     assert!(job(&store, 6)["error"].as_str().unwrap().contains("“cores” is not a key a label has"));
     assert_eq!(launches(&clouds).len(), 3);

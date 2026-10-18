@@ -228,7 +228,7 @@ impl Spec {
         if let Some(r) = self.ram_gb { parts.push(format!("{r} GB")) }
         if let Some(d) = self.disk_gb { parts.push(format!("{d} GB disk")) }
         if self.arch.is_some() { parts.push(self.arch().to_string()) }
-        if self.os.is_some() { parts.push(self.os().to_string()) }
+        if self.os.is_some() { parts.push(os_name(self.os()).to_string()) }
         match self.image.as_deref() { Some("ubuntu26") => parts.push("Ubuntu 26.04".into()), Some("ubuntu24") => parts.push("Ubuntu 24.04".into()), _ => {} }
         match self.gpu.as_deref() { Some("any") => parts.push("a GPU".into()), Some(g) => parts.push(format!("{} GPU", g.to_uppercase())), None => {} }
         if self.on_demand() { parts.push("no spot machines".into()) }
@@ -282,7 +282,7 @@ impl Capacity {
         if ram > self.max_ram_gb { return Err(format!("at most {} GB memory", self.max_ram_gb)) }
         if disk > self.max_disk_gb { return Err(format!("at most {} GB disk", self.max_disk_gb)) }
         if !self.arch.iter().any(|a| a == s.arch()) { return Err(format!("{} only", self.arch.join(", "))) }
-        if !self.os.iter().any(|o| o == s.os()) { return Err(format!("{} only", self.os.join(", "))) }
+        if !self.os.iter().any(|o| o == s.os()) { return Err(format!("{} only", self.os.iter().map(|o| os_name(o)).collect::<Vec<_>>().join(", "))) }
         if let Some(i) = s.image.as_deref().filter(|i| !self.images.iter().any(|x| x == i)) { return Err(format!("no {i} image (only {})", self.images.join(", "))) }
         if s.on_demand() && !self.on_demand { return Err("spot machines only".into()) }
         if !s.families.is_empty() && !self.scratch { return Err("no AWS machine families".into()) }
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(Capacity::aws().refuses(&spec("superci/arch=arm64/gpu=any")), Some("GPUs on x64 only".into()));
         // Windows: AWS only, x64, no GPUs.
         assert_eq!(Capacity::aws().refuses(&spec("superci/os=windows")), None);
-        assert!(Capacity::cloudflare().refuses(&spec("superci/os=windows")).unwrap().contains("linux only"));
+        assert!(Capacity::cloudflare().refuses(&spec("superci/os=windows")).unwrap().contains("Linux only"));
         assert!(Capacity::modal().refuses(&spec("superci/os=windows")).is_some());
         assert_eq!(Capacity::aws().refuses(&spec("superci/arch=arm64/os=windows")), Some("Windows on x64 only".into()));
         assert_eq!(Capacity::aws().refuses(&spec("superci/os=windows/gpu=any")), Some("no Windows machines with GPUs".into()));
@@ -577,3 +577,6 @@ mod tests {
         assert!(t.contains(&"m7a.4xlarge".to_string()));
     }
 }
+
+/// An operating system as people write it: Linux, Windows, macOS.
+pub fn os_name(os: &str) -> &str { match os { "linux" => "Linux", "windows" => "Windows", "macos" => "macOS", o => o } }
