@@ -23,6 +23,8 @@ struct Lab {
     runners: BTreeMap<u64, (Vec<String>, bool)>,
     hooks: BTreeMap<u64, Value>,
     next: u64,
+    /// Calls answered with an error (`fail`): the method, a part of the address, the status.
+    failing: Vec<(String, String, u16)>,
 }
 
 #[derive(Clone, Default)]
@@ -37,6 +39,11 @@ fn iso(ms: u64) -> String { format!("{}.{:03}Z", crate::github::iso(ms).trim_end
 impl GitLab {
     /// The connection as the dashboard keeps it in the control plane's settings (`GITLAB`).
     pub fn connection() -> Value { json!({ "url": URL, "token": TOKEN, "hook_secret": HOOK_SECRET }) }
+
+    /// A call (its method, and a part of its address) answered with this status from now on; `fail_none` clears them.
+    pub fn fail(&self, method: &str, part: &str, status: u16) { self.lab.lock().unwrap().failing.push((method.into(), part.into(), status)) }
+
+    pub fn fail_none(&self) { self.lab.lock().unwrap().failing.clear() }
 
     pub fn job(&self, id: u64) -> Value { self.lab.lock().unwrap().jobs.get(&id).cloned().unwrap_or_default() }
 
@@ -117,6 +124,9 @@ impl GitLab {
         let segs: Vec<&str> = path.split('/').collect();
         let project = PROJECT.to_string();
         let mut lab = self.lab.lock().unwrap();
+        if let Some((_, _, status)) = lab.failing.iter().find(|(m, part, _)| *m == r.method && r.url.contains(part.as_str())) {
+            return Some(Response::new(*status, "application/json", json!({ "message": format!("{status} refused") }).to_string()))
+        }
         match (r.method.as_str(), segs.as_slice()) {
             // Who the token is, and what it may do (docs.gitlab.com/api/users, /api/personal_access_tokens).
             ("GET", ["user"]) => ok(200, json!({ "id": 1, "username": "mona", "name": "Mona Lisa", "state": "active", "locked": false, "avatar_url": "https://www.gravatar.com/avatar/00000000000000000000000000000000?s=80&d=identicon",

@@ -7350,7 +7350,7 @@ fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_sa
     });
     *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
     served.connect_gitlab();
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
@@ -7401,6 +7401,47 @@ fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_sa
         assert_eq!(state(id)["state"], after, "{name}: {}", state(id));
         cancelled.push(id);
     }
+    // Taken back with GitLab refusing to run it again and to remove its runner: said; its end said again finds it
+    // already settled.
+    let (refused, p) = served.gitlab.pending("refused again", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(p) < 300);
+    let notice = state(refused)["notice"].as_str().unwrap().to_string();
+    served.gitlab_webhook(served.gitlab.running(refused, served.now_ms()));
+    assert_eq!(say(&format!("interrupted?gl={refused}&t={notice}")), 200);
+    served.gitlab.fail("POST", &format!("/jobs/{refused}/retry"), 403);
+    served.gitlab.fail("DELETE", "/runners/", 500);
+    let ended = served.gitlab.finish(refused, "failed", "ERROR: Job failed", served.now_ms());
+    served.gitlab_webhook(ended.clone());
+    assert!(state(refused)["error"].as_str().unwrap_or_default().contains("not run again"), "{}", state(refused));
+    served.gitlab_webhook(ended);
+    served.gitlab.fail_none();
+    // Taken back as it passed: done, not run again. (The takings back before forgotten: spot is not paused for it.)
+    served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("spot:interrupted:"));
+    let (passed, p) = served.gitlab.pending("passed anyway", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(p) < 300);
+    let notice = state(passed)["notice"].as_str().unwrap().to_string();
+    served.gitlab_webhook(served.gitlab.running(passed, served.now_ms()));
+    assert_eq!(say(&format!("interrupted?gl={passed}&t={notice}")), 200);
+    served.gitlab_webhook(served.gitlab.finish(passed, "success", "ok", served.now_ms()));
+    assert_eq!(state(passed)["state"], "done", "{}", state(passed));
+    // Run on another job's runner while its own record is over, or its own machine already running it.
+    let (host, p) = served.gitlab.pending("its runner", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    let host_runner = state(host)["runner_id"].as_u64().unwrap();
+    let (over_own, p) = served.gitlab.pending("over already", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    edit(over_own, &|j| { j["state"] = "cancelled".into(); });
+    served.gitlab_webhook(served.gitlab.running_on(over_own, host_runner, served.now_ms()));
+    let (host2, p) = served.gitlab.pending("its runner too", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    let host2_runner = state(host2)["runner_id"].as_u64().unwrap();
+    let (seen_own, p) = served.gitlab.pending("seen already", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    edit(seen_own, &|j| { j["seen_in_progress"] = true.into(); });
+    served.gitlab_webhook(served.gitlab.running_on(seen_own, host2_runner, served.now_ms()));
+    // Ended with no runner as other than cancelled (its machine left idle), and cancelled once its machine was seen.
+    let (no_runner, p) = served.gitlab.pending("passed elsewhere", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    served.gitlab_webhook(served.gitlab.finish(no_runner, "success", "ok", served.now_ms()));
+    assert_eq!(state(no_runner)["state"], "orphan", "{}", state(no_runner));
+    let (seen, p) = served.gitlab.pending("seen, then cancelled", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    edit(seen, &|j| { j["seen_in_progress"] = true.into(); });
+    served.gitlab_webhook(served.gitlab.finish(seen, "canceled", "", served.now_ms()));
     served.aws.fail_none();
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
