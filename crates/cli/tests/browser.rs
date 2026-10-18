@@ -9050,6 +9050,46 @@ fn sign_ins_in_each_state_are_read_and_kept_as_they_stand_and_the_pages_say_so()
 }
 
 #[test]
+fn control_planes_are_found_again_as_the_clouds_have_them_one_gone_none_found_or_a_second_accounts_sign_in_ended() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let open = |b: &mut Browser, link: &str| { b.goto(&format!("{link}&p=planes")); b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')"); b.text("main") };
+    // The kept control plane deleted from its account meanwhile: gone from the page; the one there offered.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let change = |file: &std::path::Path, f: &dyn Fn(&mut serde_json::Value)| { let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap(); f(&mut kept); std::fs::write(file, kept.to_string()).unwrap(); };
+    change(&file, &|k| { k["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": "http://127.0.0.1:9", "plane_id": "goneplane001", "label": "" } }]); });
+    let (mut child, link) = dashboard(&home);
+    let text = open(&mut b, &link);
+    assert!(!text.contains("127.0.0.1:9"), "{text}");
+    let _ = child.kill();
+    // A second AWS account whose sign-in has ended: forgotten, the first's control plane read as before.
+    change(&file, &|k| {
+        let mut other = k["aws"].clone();
+        other["account_id"] = "222222222222".into();
+        other["creds"]["expires_at_ms"] = 0.into();
+        other["refresh_token"] = "refresh-token-ended".into();
+        k["aws_more"] = serde_json::json!([other]);
+    });
+    let (mut child, link) = dashboard(&home);
+    let _ = open(&mut b, &link);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // No control plane kept, and AWS not answering: said as the page.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    change(&file, &|k| { for f in ["plane", "planes_more", "key"] { k.as_object_mut().unwrap().remove(f); } });
+    served.aws.fail("ListFunctions", 500, &superci_testkit::json_error("ServiceException", "We encountered an internal error. Please try again."), None);
+    served.aws.fail("lambda.", 500, &superci_testkit::json_error("ServiceException", "We encountered an internal error. Please try again."), None);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') && document.querySelector('main').innerText.length > 0");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
