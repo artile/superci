@@ -2442,8 +2442,15 @@ fn removing_a_cloudflare_or_modal_launcher_needs_its_sign_in_or_is_from_superci_
         b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
         let (got, text) = post(&mut b, "/runners/remove", &[("cloud", cloud), ("only", "on")]);
         assert!(got < 400, "{cloud}: {got} {text}");
-        b.goto(&format!("{link}&p=runners"));
-        b.wait(&page_shows(&left));
+        // (Under load the removal may still be going on when the page is first read: read again until it says.)
+        let mut said = false;
+        for _ in 0..30 {
+            b.goto(&format!("{link}&p=runners"));
+            b.wait(&shows("Add provider"));
+            if b.text("body").contains(&left) { said = true; break }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        assert!(said, "{cloud}: {}", b.text("body"));
     }
     assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k == "LAUNCHERS" && v == "[]"));
     let _ = child.kill();
