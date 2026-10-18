@@ -965,12 +965,18 @@ fn removing_a_runner_provider_is_refused_while_it_runs_jobs_or_its_cloud_is_not_
         let (got, text) = post(&mut b, "/runners/remove", fields);
         assert!(got == status && text.contains(said), "{fields:?}: {got} {text}");
     }
+    // Its update likewise: not without the sign-in where it runs.
+    let (got, text) = post(&mut b, "/plane/update", &[]);
+    assert!(got == 403 && text.contains("Sign in with AWS to update it"), "{got} {text}");
     // Signed in, AWS from SuperCI only: forgotten here, and what is left in the account said.
     let _ = child.kill();
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
     b.wait(&shows("Usage"));
+    // Signed in, its update waits for the job running on Cloudflare (a new setup would stop it).
+    let (got, text) = post(&mut b, "/plane/update", &[]);
+    assert!(got == 409 && text.contains("1 job is running on Cloudflare"), "{got} {text}");
     let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "aws"), ("only", "on")]);
     assert!(got < 400, "{got} {text}");
     until("AWS forgotten", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_RUNNERS" && v == "off"));
@@ -1016,6 +1022,17 @@ fn a_day_of_github_and_gitlab_jobs_is_summed_up_on_overview_for_a_day_a_week_and
     b.wait(&format!("{} && {}", shows("Pipeline"), shows("Failed")));
     b.click(".tabs a", "Jobs");
     b.wait(&format!("{} && {} && {}", shows("gl-test"), shows("Starting"), shows("116m")));
+    // A GitLab job's page: its log, read from GitLab, in steps.
+    b.click("main a", "gl-test");
+    b.wait("document.querySelector('details.lstep')");
+    b.click("details.lstep summary", "");
+    b.wait("[...document.querySelectorAll('.ll .lx')].some(l => l.textContent.includes('ok'))");
+    // A GitHub job's: read from GitHub once it ended.
+    b.click("nav a", "Runs");
+    b.click(".tabs a", "Jobs");
+    b.wait(&shows("lint"));
+    b.click("main a", "lint");
+    b.wait("document.querySelector('details.lstep')");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -1071,6 +1088,17 @@ fn control_planes_are_set_up_in_cloudflare_and_modal_from_the_browser_and_delete
     for id in ["cfplane00003", "mdplane00003"] {
         b.goto(&format!("{link}&c={id}&p=add-runners"));
         b.wait(&page_shows("Add a provider"));
+    }
+    // Each updated (to this version again), as both clouds answered: the Worker uploaded again, Modal's app deployed again.
+    for (step, id) in [("update/05-update-cf", "cfplane00003"), ("update/06-update-md", "mdplane00003")] {
+        served.aws.replaying(&fixture(step), &[]);
+        b.goto(&format!("{link}&p=planes"));
+        b.wait(&shows("Move here"));
+        let (got, text) = post(&mut b, "/plane/update", &[("plane", id)]);
+        assert!(got < 400, "{id}: {got} {text}");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Updating") { assert!(std::time::Instant::now() < end, "{id} updated"); std::thread::sleep(std::time::Duration::from_millis(500)) }
+        assert!(!common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("The update stopped"), "{}", common::words(&common::part(&link, "/?p=planes&fragment=1").1));
     }
     // Each deleted from its menu: gone from the list, and from its cloud.
     for (step, row) in [("update/07-delete-cf", "superci.acme.workers.dev"), ("update/08-delete-md", "modal.run")] {
