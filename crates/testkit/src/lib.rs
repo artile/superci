@@ -413,7 +413,7 @@ impl Aws {
                         _ => {}
                     }
                 }
-                let (status, said, answer) = a.replay(&method, &url, "", &asked).unwrap_or_else(|| {
+                let (status, said, answer) = a.failed(&url, "", &asked).or_else(|| a.replay(&method, &url, "", &asked)).unwrap_or_else(|| {
                     a.unanswered.lock().unwrap().push(format!("{method} {url}"));
                     (404, vec![], json!({ "success": false, "errors": [{ "code": 0, "message": format!("the test kit's Cloudflare has no answer for {method} {url}") }] }).to_string())
                 });
@@ -484,6 +484,18 @@ impl Aws {
     /// A Worker's secrets, as a control plane there reads them (its settings).
     pub fn worker_settings(&self, script: &str) -> Vec<(String, String)> { self.worker_secrets.lock().unwrap().get(script).map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default() }
 
+    /// The answer `fail` set for this call, if one was (counted once more).
+    fn failed(&self, url: &str, target: &str, asked: &str) -> Option<(u16, Vec<(String, String)>, String)> {
+        let mut f = self.failing.lock().unwrap();
+        let doing = action(target, asked);
+        // (`Action|part of the address`: that action there only, `RunInstances|ec2.eu-west-1`; `DryRun=true` and the
+        // like match what was asked.)
+        let i = f.iter().position(|(a, ..)| a.split('|').all(|p| p == doing || url.contains(p) || asked.contains(p)))?;
+        let got = (f[i].1, vec![], f[i].2.clone());
+        match &mut f[i].3 { Some(1) => { f.remove(i); } Some(n) => *n -= 1, None => {} }
+        Some(got)
+    }
+
     /// `action` answered with this error from now on: `times` times, or every time.
     pub fn fail(&self, action: &str, status: u16, answer: &str, times: Option<u32>) { self.failing.lock().unwrap().push((action.to_string(), status, answer.to_string(), times)) }
 
@@ -509,19 +521,7 @@ impl Aws {
     /// The same, with the answer's headers.
     pub fn handle_full(&self, method: &str, url: &str, target: &str, asked: &str) -> (u16, Vec<(String, String)>, String) {
         // (AWS's own public parameters, `/aws/service/…`, are not the account's: as a recording has them.)
-        let failed = {
-            let mut f = self.failing.lock().unwrap();
-            let doing = action(target, asked);
-            // (`Action|part of the address`: that action there only, `RunInstances|ec2.eu-west-1`; `DryRun=true` and
-            // the like match what was asked.)
-            let i = f.iter().position(|(a, ..)| a.split('|').all(|p| p == doing || url.contains(p) || asked.contains(p)));
-            i.map(|i| {
-                let got = (f[i].1, vec![], f[i].2.clone());
-                match &mut f[i].3 { Some(1) => { f.remove(i); } Some(n) => *n -= 1, None => {} }
-                got
-            })
-        };
-        if let Some((status, headers, answer)) = failed {
+        if let Some((status, headers, answer)) = self.failed(url, target, asked) {
             self.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": target, "asked": asked, "status": status, "answer": answer }));
             return (status, headers, answer)
         }

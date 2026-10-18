@@ -7009,3 +7009,37 @@ fn aws_runners_are_connected_once_by_the_stacks_report_and_runners_shows_them() 
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A finished Cloudflare job's cost as Cloudflare measured it (its usage figures, as its GraphQL API answers them):
+/// read by the dashboard once Cloudflare has them, handed to the control plane, and the job settled at that.
+#[test]
+fn a_finished_cloudflare_jobs_cost_is_settled_at_what_cloudflare_measured() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    // A job that ran a minute on Cloudflare's containers and ended five minutes ago.
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(id));
+    served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    let container = "a".repeat(64);
+    { let now = served.now_ms(); let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
+      j["machine_id"] = container.clone().into(); j["started_ms"] = (now - 360_000).into(); j["ended_ms"] = (now - 300_000).into(); m.insert(k, j.to_string()); }
+    // Signed in to Cloudflare: its account, no control plane of SuperCI's there, and its usage figures for the job.
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.fail("/client/v4/accounts?", 200, r#"{"result":[{"id":"1111111111111111111111111111111a","name":"Acme"}],"success":true,"errors":[],"messages":[]}"#, None);
+    served.aws.fail("/workers/scripts", 200, r#"{"result":[],"success":true,"errors":[],"messages":[]}"#, None);
+    served.aws.fail("/workers/subdomain", 200, r#"{"result":{"subdomain":"acme"},"success":true,"errors":[],"messages":[]}"#, None);
+    served.aws.fail("/graphql", 200, &serde_json::json!({ "data": { "viewer": { "accounts": [{ "g": [{ "dimensions": { "instanceId": container }, "sum": { "cpuTimeSec": 45.0, "allocatedMemory": 1.0e12, "allocatedDisk": 2.0e12, "txBytes": 1.0e8 } }] }] } }, "errors": null }).to_string(), None);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=overview"));
+    b.wait(&shows("Usage"));
+    until("its cost settled at what Cloudflare measured", || served.store.under(&format!("job:{id}"))[0].1["cost_from"] == "measured");
+    b.goto(&format!("{link}&p=job&id={id}"));
+    b.wait(&format!("{} && {}", shows("Status"), shows("Passed")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
