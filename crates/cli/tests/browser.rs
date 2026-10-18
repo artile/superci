@@ -10449,3 +10449,77 @@ fn spot_machines_asked_of_a_fleet_are_started_or_refused_as_ec2_answers_each_way
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The AWS account's own budget, each step by itself (`superci debug budget`), as AWS Budgets and IAM answer in
+/// each way the documentation gives: no budget; one with its spending; a fault; made with emails and the action
+/// (its rule and role there already, the new role not yet known to Budgets once); raised after it stopped (the rule
+/// taken off, AWS asked to judge anew, while it was still undoing); the action removed when it was gone already, or
+/// with IAM refusing; no address to write to; removed with nothing left, or Budgets failing. The limits card still
+/// reads.
+#[test]
+fn the_aws_accounts_budget_is_made_raised_lifted_and_removed_as_budgets_and_iam_answer_each_way() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let not_found = r#"{"__type":"NotFoundException","Message":"Unable to get budget: superci - the budget doesn't exist."}"#;
+    let fault = r#"{"__type":"InternalErrorException","Message":"An error on the server occurred during the processing of your request. Try again later."}"#;
+    let denied = r#"{"__type":"AccessDeniedException","Message":"Budgets could not assume the role: not authorized to perform sts:AssumeRole"}"#;
+    let invalid = r#"{"__type":"InvalidParameterException","Message":"The action's subscribers are not valid."}"#;
+    let iam_error = |code: &str| format!(r#"<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><Error><Type>Sender</Type><Code>{code}</Code><Message>{code}</Message></Error><RequestId>1</RequestId></ErrorResponse>"#);
+    let iam_ok = r#"<Response xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></Response>"#;
+    let budget = |usd: &str| format!(r#"{{"Budget":{{"BudgetName":"superci","BudgetLimit":{{"Amount":"{usd}","Unit":"USD"}},"CalculatedSpend":{{"ActualSpend":{{"Amount":"12.5","Unit":"USD"}}}}}}}}"#);
+    let actions = |status: &str| format!(r#"{{"Actions":[{{"ActionId":"00000000-0000-4000-8000-000000000001","Status":"{status}"}}]}}"#);
+    let (exists, no_such, refused) = (iam_error("EntityAlreadyExists"), iam_error("NoSuchEntity"), iam_error("AccessDenied"));
+    let ok_iam = ["CreatePolicy", "CreateRole", "PutRolePolicy", "DetachRolePolicy", "DeleteRolePolicy", "DeleteRole", "DeletePolicy"];
+    let steps: Vec<(Vec<&str>, Vec<(&str, u16, String, Option<u32>)>, &str)> = vec![
+        (vec!["found"], vec![("DescribeBudget", 400, not_found.into(), None)], "None"),
+        (vec!["found"], vec![("DescribeBudget", 200, budget("100.0"), None), ("DescribeBudgetActionsForBudget", 400, not_found.into(), None)], "amount: 100.0"),
+        (vec!["found"], vec![("DescribeBudget", 500, fault.into(), None)], "InternalErrorException"),
+        (vec!["set", "12.5", "ops@example.com", "stop"], vec![("DescribeBudget", 400, not_found.into(), None), ("CreateBudget", 200, "{}".into(), None), ("CreatePolicy", 409, exists.clone(), Some(1)),
+            ("CreateBudgetAction", 400, denied.into(), Some(1)), ("CreateBudgetAction", 200, r#"{"ActionId":"00000000-0000-4000-8000-000000000001"}"#.into(), None)], "set"),
+        (vec!["set", "150", "", "stop"], vec![("DescribeBudget", 200, budget("100"), None), ("DescribeBudgetActionsForBudget", 200, actions("EXECUTION_SUCCESS"), Some(2)),
+            ("DescribeBudgetActionsForBudget", 200, actions("REVERSE_IN_PROGRESS"), Some(1)), ("DescribeBudgetActionsForBudget", 200, actions("REVERSE_SUCCESS"), None),
+            ("UpdateBudget", 200, "{}".into(), None), ("ExecuteBudgetAction", 200, "{}".into(), None), ("DetachRolePolicy", 404, no_such.clone(), None)], "set"),
+        (vec!["set", "100", "", ""], vec![("DescribeBudget", 200, budget("100"), None), ("DescribeBudgetActionsForBudget", 200, actions("STANDBY"), None), ("DeleteBudgetAction", 400, not_found.into(), None),
+            ("DetachRolePolicy", 403, refused.clone(), None)], "AccessDenied"),
+        (vec!["set", "100", "", ""], vec![("DescribeBudget", 200, budget("100"), None), ("DescribeBudgetActionsForBudget", 200, actions("EXECUTION_SUCCESS"), None), ("ExecuteBudgetAction", 200, "{}".into(), None),
+            ("DeleteBudgetAction", 500, fault.into(), None)], "InternalErrorException"),
+        (vec!["set", "100", "", ""], vec![("DescribeBudget", 200, budget("100"), None), ("DescribeBudgetActionsForBudget", 200, actions("STANDBY"), None), ("DeleteBudgetAction", 200, "{}".into(), None),
+            ("DeleteRolePolicy", 403, refused.clone(), None)], "AccessDenied"),
+        (vec!["set", "100", "", "stop"], vec![("DescribeBudget", 200, budget("100"), None), ("DescribeBudgetActionsForBudget", 400, not_found.into(), None),
+            ("DescribeNotificationsForBudget", 200, r#"{"Notifications":[{"NotificationType":"ACTUAL","ComparisonOperator":"GREATER_THAN","Threshold":80}]}"#.into(), None),
+            ("DescribeSubscribersForNotification", 200, r#"{"Subscribers":[{"SubscriptionType":"SNS","Address":"arn:aws:sns:us-east-1:111111111111:x"}]}"#.into(), None)], "An address"),
+        (vec!["set", "100", "", "stop"], vec![("DescribeBudget", 200, budget("100"), None), ("DescribeBudgetActionsForBudget", 400, not_found.into(), None),
+            ("DescribeNotificationsForBudget", 200, r#"{"Notifications":[{"NotificationType":"ACTUAL","ComparisonOperator":"GREATER_THAN","Threshold":80}]}"#.into(), None),
+            ("DescribeSubscribersForNotification", 200, r#"{"Subscribers":[{"SubscriptionType":"EMAIL","Address":"ops@example.com"}]}"#.into(), None), ("CreateRole", 403, refused.clone(), None)], "AccessDenied"),
+        (vec!["set", "100", "ops@example.com", "stop"], vec![("DescribeBudget", 200, budget("100"), None), ("DescribeBudgetActionsForBudget", 400, not_found.into(), None),
+            ("CreateBudgetAction", 400, r#"{"__type":"ValidationException","Message":"1 validation error detected"}"#.into(), None)], "ValidationException"),
+        (vec!["set", "100", "ops@example.com", "stop"], vec![("DescribeBudget", 200, budget("100"), None), ("DescribeBudgetActionsForBudget", 400, not_found.into(), None),
+            ("CreateBudgetAction", 400, invalid.into(), Some(1)), ("CreateBudgetAction", 200, "{}".into(), None)], "set"),
+        (vec!["lift"], vec![("DescribeBudgetActionsForBudget", 200, actions("REVERSE_SUCCESS"), None)], "lifted"),
+        (vec!["lift", "again"], vec![("DescribeBudgetActionsForBudget", 200, actions("REVERSE_SUCCESS"), None), ("ExecuteBudgetAction", 200, "{}".into(), None)], "lifted"),
+        (vec!["remove"], vec![("DescribeBudgetActionsForBudget", 400, not_found.into(), None), ("DetachRolePolicy", 404, no_such.clone(), None), ("DeleteRolePolicy", 404, no_such.clone(), None),
+            ("DeleteBudget", 400, not_found.into(), None)], "removed"),
+        (vec!["remove"], vec![("DescribeBudgetActionsForBudget", 400, not_found.into(), None), ("DeleteBudget", 500, fault.into(), None)], "InternalErrorException"),
+        (vec!["remove"], vec![("DescribeBudgetActionsForBudget", 500, fault.into(), None)], "InternalErrorException"),
+    ];
+    for (args, answers, said) in &steps {
+        served.aws.fail_none();
+        for (action, status, answer, times) in answers {
+            let action = if !ok_iam.contains(action) { format!("AWSBudgetServiceGateway.{action}") } else { action.to_string() };
+            served.aws.fail(&action, *status, answer, *times)
+        }
+        for a in ok_iam { served.aws.fail(a, 200, iam_ok, None) }
+        let mut all = vec!["debug", "budget"];
+        all.extend(args.iter());
+        let o = common::command(&home).args(&all).output().unwrap();
+        let out = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(out.contains(said), "{args:?}: {out}");
+    }
+    served.aws.fail_none();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
