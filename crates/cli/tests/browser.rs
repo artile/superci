@@ -7508,6 +7508,64 @@ fn a_gitlab_jobs_cache_is_kept_as_its_projects_once_its_job_began_and_settings_l
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Each kind of machine's start script with the cache in it, its region's bucket ready: Linux (and Docker's images kept
+/// when the store's program is there too), arm64, Windows; none with the cache turned off, and no images kept with
+/// them turned off. Each job's page then says how it stands.
+#[test]
+fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_off() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    let order = r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#;
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!("{order}}}"));
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    for arch in ["x86_64", "aarch64", "x86_64-windows"] { served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key(arch)), b"program") }
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::layers_key("x86_64")), b"program");
+    // The start script AWS was last given.
+    let script = || {
+        let asked = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()).unwrap();
+        let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+        use base64::Engine;
+        String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(data).unwrap()).to_string()
+    };
+    let job = |label: &str| { let (id, q) = served.github.queue(label, label, served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let mut ids = vec![];
+    let runs = || served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).count();
+    for label in ["superci", "superci/arch=arm64", "superci/os=windows"] {
+        let before = runs();
+        let id = job(label);
+        assert!(runs() > before, "{label}: no machine asked for: {}", served.store.under(&format!("job:{id}"))[0].1);
+        let s = script();
+        assert!(s.contains("plane.acme.test/cache/"), "{label}: {}", s.lines().filter(|l| l.contains("cache")).collect::<Vec<_>>().join("\n"));
+        ids.push(id);
+    }
+    // Docker's images not kept: the cache still there.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{order},"cache":{{"images_off":true}}}}"#));
+    ids.push(job("superci"));
+    assert!(script().contains("plane.acme.test/cache/"));
+    // The cache turned off: none in its script.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{order},"cache":{{"off":true}}}}"#));
+    ids.push(job("superci"));
+    assert!(!script().contains("plane.acme.test/cache/"), "turned off");
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for id in ids {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// AWS's runners connected to a control plane outside AWS, as the stack the dashboard opens reports back: a forged
 /// report, one for another role, account or region refused; the right one taken once. Runners then shows AWS.
 #[test]
