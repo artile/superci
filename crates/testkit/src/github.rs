@@ -36,6 +36,8 @@ struct Hub {
     nowhere: bool,
     /// An App made before it asked for Actions: its permissions and its installations' without `actions`.
     older_app: bool,
+    /// Its installation has not accepted the App's newest permissions (the App asks for them).
+    older_install: bool,
     /// How many times GitHub's key set for its jobs' tokens was asked for.
     jwks_asked: u64,
     /// The App was uninstalled.
@@ -84,6 +86,9 @@ impl GitHub {
 
     /// The App as one made before it asked for Actions (write): it asks for less, and its installations accepted less.
     pub fn set_older_app(&self, older: bool) { self.hub.lock().unwrap().older_app = older }
+
+    /// Its installation has not accepted the App's newest permissions: the App asks for them, the installation lacks them.
+    pub fn set_older_install(&self, older: bool) { self.hub.lock().unwrap().older_install = older }
 
     /// An object put in a bucket (`bucket/key`), as the control plane's deploy leaves its program there.
     pub fn put_object(&self, key: &str, bytes: &[u8]) { self.hub.lock().unwrap().objects.insert(key.to_string(), bytes.to_vec()); }
@@ -300,6 +305,7 @@ impl GitHub {
         }
         if url.host_str() != Some("api.github.com") { return None }
         let permissions = if self.hub.lock().unwrap().older_app { json!({ "metadata": "read", "organization_self_hosted_runners": "write" }) } else { json!({ "actions": "write", "metadata": "read", "organization_self_hosted_runners": "write" }) };
+        let installed = if self.hub.lock().unwrap().older_install { json!({ "metadata": "read", "organization_self_hosted_runners": "write" }) } else { permissions.clone() };
         let account = json!({ "login": OWNER, "id": 9_919, "type": "Organization", "avatar_url": "https://avatars.githubusercontent.com/u/9919?v=4", "html_url": format!("https://github.com/{OWNER}") });
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut h = self.hub.lock().unwrap();
@@ -311,7 +317,7 @@ impl GitHub {
             ("GET", ["app", "installations"]) if h.nowhere => ok(200, json!([])),
             ("GET", ["app", "installations"]) => ok(200, json!([{ "id": INSTALLATION, "account": account, "repository_selection": if h.selected { "selected" } else { "all" }, "access_tokens_url": format!("https://api.github.com/app/installations/{INSTALLATION}/access_tokens"),
                 "repositories_url": "https://api.github.com/installation/repositories", "html_url": format!("https://github.com/organizations/{OWNER}/settings/installations/{INSTALLATION}"),
-                "app_id": APP_ID, "app_slug": "superci-acme", "target_id": 9_919, "target_type": "Organization", "permissions": permissions, "events": ["workflow_job"],
+                "app_id": APP_ID, "app_slug": "superci-acme", "target_id": 9_919, "target_type": "Organization", "permissions": installed, "events": ["workflow_job"],
                 "created_at": "2026-10-01T10:00:00Z", "updated_at": "2026-10-01T10:00:00Z", "single_file_name": null, "suspended_at": null }])),
             ("POST", ["app", "installations", id, "access_tokens"]) if *id == INSTALLATION.to_string() => ok(201, json!({ "token": "ghs_16C7e42F292c6912E7710c838347Ae178B4a", "expires_at": "2099-01-01T00:00:00Z",
                 "permissions": permissions, "repository_selection": "all" })),

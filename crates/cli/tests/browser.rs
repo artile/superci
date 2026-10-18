@@ -6830,3 +6830,31 @@ fn control_planes_found_in_aws_are_listed_apart_seen_or_dropped_when_deleted_the
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The Permissions card: what AWS refused the control plane (noted by it) while this computer is not signed in to that
+/// account, and a GitHub installation that has not accepted the App's newer permissions, each with what to do.
+#[test]
+fn the_permissions_card_says_what_aws_refused_and_what_an_installation_has_not_accepted() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.github.set_older_install(true);
+    // AWS refused the control plane one of its permissions (as it noted, with what AWS said).
+    served.store.0.lock().unwrap().insert("denied:aws:AskSpotPoolsAtOnce".into(), serde_json::json!({ "at_ms": served.now_ms(), "said": "UnauthorizedOperation: You are not authorized to perform: ec2:CreateLaunchTemplate" }).to_string());
+    // This computer has the control plane's key only: no AWS sign-in.
+    let home = common::home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && {}", shows("Permissions"), shows("AWS refused 1 permission")));
+    b.wait(&shows("has 1 permission to accept"));
+    // Each opens what to do: sign in with AWS, coming back to allow it; accept it on GitHub.
+    b.eval("document.querySelector('button[onclick*=\"perm-aws\"]').click()");
+    b.wait("document.getElementById('perm-aws').open && document.getElementById('perm-aws').innerText.includes('Sign in with AWS')");
+    b.eval("document.getElementById('perm-aws').close()");
+    b.eval("document.querySelector('button[onclick*=\"perm-gh-\"]').click()");
+    b.wait("[...document.querySelectorAll('dialog')].some(d => d.open && d.innerText.includes('Review request'))");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
