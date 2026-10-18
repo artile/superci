@@ -2168,3 +2168,25 @@ fn a_control_plane_with_a_modal_launcher_and_modal_not_signed_in_says_its_runner
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn a_modal_sign_in_started_from_the_dashboard_waits_for_its_approval_on_the_pages_that_need_it() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A Modal launcher, Modal not signed in; its sign-in started here (Modal's token flow, as it answered).
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#);
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("Optional: its runners work without it"));
+    // (To Modal's page, in its own tab.)
+    let (got, _) = post(&mut b, "/modal/signin", &[("next", "?p=planes")]);
+    assert!(got < 400);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("Approve it in Modal's tab, then close the tab Waiting"));
+    for p in ["overview", "add-runners", "runners"] { b.goto(&format!("{link}&p={p}")); b.wait(&format!("!document.querySelector('main').innerText.includes('Reading your control plane') && {}", page_shows("Modal"))); }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
