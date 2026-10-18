@@ -6872,6 +6872,91 @@ fn the_sweep_places_a_cut_off_start_again_settles_what_a_machine_sent_and_takes_
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The sweep finding jobs in each state their events left them (some events lost): a failing runner GitHub still has
+/// queued, or no longer; machines whose jobs were taken elsewhere, failed or ended, one GitHub has on its very runner,
+/// one whose runner is busy with another job, one handed to another job still waiting; and notes past their time.
+#[test]
+fn the_sweep_finds_out_what_became_of_jobs_whose_events_were_lost_and_says_it_on_their_pages() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let labelled = |name: &str, label: &str| { let (id, q) = served.github.queue(name, label, served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let job = |name: &str| labelled(name, "superci");
+    let now = served.now_ms();
+    // A failing runner not started yet: GitHub still has its job queued (its failing runner asked for again); no
+    // longer queued; tried for over half an hour.
+    let (pending, no_longer, too_long) = (job("fail pending"), job("fail pending, ended"), job("fail pending, long ago"));
+    for id in [pending, no_longer, too_long] { edit(id, &|j| { j["state"] = "failed".into(); j["fail_pending"] = "the workflow asks for no runner SuperCI has".into(); j["ended_ms"] = now.into(); j["began"] = true.into(); }) }
+    edit(too_long, &|j| { j["ended_ms"] = (now - 31 * 60_000).into(); });
+    served.github.ended_untold(no_longer);
+    // Machines that came up and began nothing, nine minutes on: its job failed at once meanwhile, over, its own job
+    // ended elsewhere untold.
+    let (failed_fast, over, elsewhere) = (job("failed fast"), job("over"), job("elsewhere"));
+    let old = now - 9 * 60_000;
+    for id in [failed_fast, over, elsewhere] { edit(id, &|j| { j["launched_ms"] = old.into(); }) }
+    edit(failed_fast, &|j| { j["failed_fast"] = true.into(); });
+    edit(over, &|j| { j["over"] = true.into(); });
+    served.github.ended_untold(elsewhere);
+    // Two minutes on: one GitHub has on its very runner, the event never came; one whose job ended elsewhere and whose
+    // runner is busy with another job; one whose job ended elsewhere while another job still waits with no machine
+    // coming for it, and one whose job ended while the job it would go to has ended too.
+    // (Those handed on with a label of their own: no other machine here is handed to them.)
+    let handing = |name: &str| labelled(name, "superci/cpu=2");
+    let (on_its_runner, busy, handed, waits, handed_late, waited) = (job("on its runner"), job("busy"), handing("handed on"), handing("still waits"), handing("handed late"), handing("waited"));
+    let two = now - 2 * 60_000;
+    for id in [on_its_runner, busy, handed, handed_late] { edit(id, &|j| { j["launched_ms"] = two.into(); }) }
+    let runner = |id: u64| state(id)["runner"].as_str().unwrap().to_string();
+    let _ = served.github.start_on(on_its_runner, &runner(on_its_runner));
+    served.github.ended_untold(busy);
+    let other = job("on the busy runner");
+    let _ = served.github.start_on(other, &runner(busy));
+    // (Its machine was handed to another: it waits with none coming, as far as the control plane knows.)
+    for id in [waits, waited] { edit(id, &|j| { j["state"] = "done".into(); j["seen_in_progress"] = true.into(); }) }
+    served.github.ended_untold(handed);
+    served.github.ended_untold(waited);
+    // Notes past their time, a launch template left behind a day ago, a machine kept for its images past its time.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for k in ["spot:interrupted:1", "rerun:2", "rerun-asked:3", "gone:4"] { m.insert(k.into(), (now - 8 * 86_400_000).to_string()); }
+        m.insert("aws:template:us-east-1:superci-fleet-1".into(), (now - 2 * 86_400_000).to_string());
+        m.insert("aws:template:us-east-1:superci-fleet-2".into(), now.to_string());
+        m.insert(format!("keeping:{over}"), (now - 1).to_string());
+    }
+    served.upkeep();
+    let st = |id: u64| state(id)["state"].as_str().unwrap_or_default().to_string();
+    assert!(state(pending)["failed_fast"] == true, "its failing runner asked for again: {}", state(pending));
+    assert!(state(no_longer)["fail_pending"].is_null() && state(too_long)["fail_pending"].is_null(), "{} {}", state(no_longer), state(too_long));
+    assert_eq!((st(failed_fast), st(over), st(elsewhere)), ("swept".into(), "done".into(), "swept".into()));
+    assert_eq!(st(on_its_runner), "running", "{}", state(on_its_runner));
+    assert_eq!(st(busy), "running", "{}", state(busy));
+    assert_eq!(state(handed)["for_job"].as_u64(), Some(waits), "{}", state(handed));
+    {
+        let m = served.store.0.lock().unwrap();
+        for k in ["spot:interrupted:1", "rerun:2", "rerun-asked:3", "gone:4", "aws:template:us-east-1:superci-fleet-1", &format!("keeping:{over}")] { assert!(!m.contains_key(k), "{k} kept") }
+        assert!(m.contains_key("aws:template:us-east-1:superci-fleet-2"), "a template of a moment ago is left for its removal");
+    }
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for id in [pending, no_longer, too_long, failed_fast, over, elsewhere, on_its_runner, busy, handed, handed_late] {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// GitLab's jobs on AWS: one whose spot machine AWS takes back, retried at GitLab and run again off spot machines; an
 /// event delivered twice; one taken by another job's runner; one cancelled while its machine starts. Each job's page
 /// says how it went.
