@@ -7272,3 +7272,19 @@ fn a_modal_control_plane_is_deployed_given_sandboxes_and_deleted_from_the_dashbo
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Pages opened by the addresses older links have: a control plane chosen by its place in the list (one that is
+/// there, one that is not), and the set-up shown or not; each opens a page.
+#[test]
+fn pages_open_by_older_links_a_control_plane_by_its_place_and_set_up_shown_or_not() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (q, said) in [("p=planes&plane=0", "Control plane"), ("p=planes&plane=7", "Control plane"), ("p=overview&new=1", "Set up"), ("p=overview&new=0", "Usage")] {
+        b.goto(&format!("{link}&{q}"));
+        b.wait(&format!("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane') && {}", page_shows(said)));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
