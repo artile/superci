@@ -1132,3 +1132,25 @@ fn a_limit_an_older_control_plane_does_not_keep_is_refused_saying_to_update_it()
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A command that needs a cloud whose sign-in ended (noted by an earlier run) says so, with what to do, and changes
+/// nothing: AWS's, Cloudflare's and Modal's.
+#[test]
+fn a_command_needing_a_sign_in_that_ended_says_so() {
+    let served = serve(|_| {});
+    for (flag, args, said) in [
+        ("aws_ended", &["limits", "update", "--max-cpu=8"][..], "SuperCI's AWS sign-in has ended"),
+        ("cloudflare_ended", &["runners", "create", "cloudflare"], "Cloudflare sign-in has expired"),
+        ("modal_ended", &["runners", "create", "modal"], "Modal no longer accepts SuperCI's sign-in"),
+    ] {
+        let home = common::home(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept[flag] = true.into();
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let o = superci(&home, args);
+        let e = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+        assert!(!o.status.success() && e.contains(said), "{flag}: {e}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
