@@ -2712,6 +2712,31 @@ fn a_control_plane_updated_from_the_cli_is_followed_to_its_end_and_its_page_says
 }
 
 #[test]
+fn a_first_control_plane_made_from_the_cli_is_followed_to_its_end_and_shown_on_the_dashboard() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let account = superci_testkit::Aws::serve();
+    let new = superci_testkit::serve_as("deployplane1", |_| {});
+    let home = common::temp("cli-first-home");
+    let ws = home.join("workspaces/default");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("sign-ins.json"), serde_json::json!({ "aws": { "region": "us-east-1", "account_id": "111111111111", "who": "arn:aws:sts::111111111111:assumed-role/Admin/someone",
+        "creds": { "access_key_id": "ASIAEXAMPLE", "secret_access_key": "example", "session_token": "example", "expires_at_ms": 4102444800000u64 }, "refresh_token": "", "dpop": { "private_b64": "", "kid": "" } } }).to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    account.replaying(include_str!("../fixtures/aws/classic/look.jsonl"), &[]);
+    account.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", "deployplane1"), ("http://new-plane.test", &new.url)]);
+    for args in [&["planes", "create", "aws", "--region=mars-1"][..], &["planes", "create", "aws", "--region=us-east-1", "--dry-run"], &["planes", "create", "aws", "--region=us-east-1"]] {
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "deployplane1").output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked"), "{args:?}: {said}");
+    }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
