@@ -6616,3 +6616,58 @@ fn a_control_plane_is_updated_from_its_page_its_launchers_with_it_or_said_as_not
     }
 }
 
+/// What the sweep does as time passes, each said on the job's page: a start cut off midway placed again (three times,
+/// then failed), what an AWS machine sent to the internet added to its job's cost once CloudWatch has counted it (as
+/// AWS documents its answer), and a machine whose job was cancelled before it began taken back.
+#[test]
+fn the_sweep_places_a_cut_off_start_again_settles_what_a_machine_sent_and_takes_back_a_cancelled_jobs_machine() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    // (What CloudWatch counted a machine sent: 2 GB, as its GetMetricStatistics answers.)
+    served.aws.fail("GetMetricStatistics", 200, "<GetMetricStatisticsResponse xmlns=\"http://monitoring.amazonaws.com/doc/2010-08-01/\"><GetMetricStatisticsResult><Datapoints><member><Sum>1500000000</Sum><Unit>Bytes</Unit></member><member><Sum>500000000</Sum><Unit>Bytes</Unit></member></Datapoints><Label>NetworkOut</Label></GetMetricStatisticsResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ResponseMetadata></GetMetricStatisticsResponse>", None);
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    // One whose start was cut off midway (the runtime stopped while AWS was asked), and one cut off for the third time.
+    let (cut, q) = served.github.queue("cut off", "superci", served.now_ms()); served.webhook(q);
+    let (thrice, q) = served.github.queue("cut off thrice", "superci", served.now_ms()); served.webhook(q);
+    let old = served.now_ms() - 5 * 60_000;
+    edit(cut, &|j| { j["state"] = "launching".into(); j["launched_ms"] = old.into(); });
+    edit(thrice, &|j| { j["state"] = "launching".into(); j["launched_ms"] = old.into(); j["retries"] = 2.into(); });
+    // One that ran and ended on its AWS machine.
+    let (ran, q) = served.github.queue("ran", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(ran));
+    served.webhook(served.github.finish(ran, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    // One cancelled before any runner took it, the note of that missed by its start.
+    let (gone, q) = served.github.queue("gone", "superci", served.now_ms()); served.webhook(q);
+    served.store.0.lock().unwrap().insert(format!("gone:{gone}"), served.now_ms().to_string());
+    served.github.ended_untold(gone);
+    served.upkeep();
+    assert_eq!((state(cut)["state"].as_str(), state(cut)["retries"].as_u64()), (Some("launched"), Some(1)), "{}", state(cut));
+    assert_eq!(state(thrice)["state"], "failed", "{}", state(thrice));
+    // A quarter of an hour on: what its machine sent, counted.
+    served.later(15 * 60_000);
+    served.upkeep();
+    let sent = state(ran)["sent_gb"].as_f64();
+    assert!(sent.is_some_and(|g| (g - 2.0).abs() < 0.01), "{}", state(ran));
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (id, said) in [(cut, "Status"), (thrice, "three times"), (ran, "Passed"), (gone, "Status")] {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        assert!(page.contains(said), "job {id}: no {said:?} ({}):\n{page}", state(id));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
