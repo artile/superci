@@ -1921,6 +1921,19 @@ fn a_second_control_plane_given_a_code_host_of_its_own_makes_two_cis_listed_and_
     b.wait(&shows("Serves a code host of its own"));
     b.goto(&format!("{link}&c=cfplane00003&p=overview"));
     b.wait(&page_shows("Overview"));
+    // The other CI is no place to move to, nor to delete as a spare: refused, saying why.
+    let (got, text) = post(&mut b, &format!("/plane/move?c={PLANE}"), &[("plane", "cfplane00003")]);
+    assert!(got == 409 && text.contains("That control plane serves a code host of its own"), "{got} {text}");
+    let (got, text) = post(&mut b, &format!("/plane/delete?c={PLANE}"), &[("plane", "cfplane00003")]);
+    assert!(got == 409 && text.contains("This control plane serves a code host"), "{got} {text}");
+    // SuperCI stopped for the GitLab one, named: GitLab let go of and it deleted (as Cloudflare answered); the other CI
+    // left as it is.
+    served.aws.replaying(&fixture("update/07-delete-cf"), &[]);
+    let (got, text) = post(&mut b, "/plane/leave?c=cfplane00003", &[("plane", "cfplane00003"), ("confirm", "superci")]);
+    assert!(got < 400, "{got} {text}");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while common::words(&common::part(&link, &format!("/?c={PLANE}&p=planes&fragment=1")).1).contains("superci.acme.workers.dev") { assert!(std::time::Instant::now() < end, "the GitLab one deleted"); std::thread::sleep(std::time::Duration::from_millis(500)) }
+    assert!(served.aws.settings(PLANE).iter().any(|(k, _)| k == "GITHUB_APP"), "the other CI as it was");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
