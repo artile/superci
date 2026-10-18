@@ -1434,3 +1434,32 @@ fn a_cloudflare_token_given_and_refused_is_said_as_that_token_not_as_a_sign_in_t
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn a_control_plane_that_does_not_answer_is_said_on_its_pages_instead_of_a_guess_at_what_it_has() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Its address answering nothing (down, or its cloud's network).
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = "http://127.0.0.1:9".into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "1")]);
+    b.goto(&link);
+    b.wait(&shows("Your control plane is not answering"));
+    // Not "no runners yet", "connect GitHub" or "sign in": that it does not answer.
+    for p in ["runners", "repos", "workflows", "runs", "jobs"] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait(&shows("Your control plane is not answering"));
+        assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("No runners yet"), "{p}");
+    }
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("http://127.0.0.1:9 Not answering In use"));
+    // Settings: the workspace's own, which need no control plane.
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&shows("Workspace"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

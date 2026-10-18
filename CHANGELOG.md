@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.17
+- A control plane that does not answer is said on Runners, Repositories, Workflows, Runs and Jobs, as on Overview. They guessed at what it had: no runners yet, GitHub to connect, jobs out of reach for want of a sign-in.
 - A Cloudflare token given in SUPERCI_CLOUDFLARE_TOKEN that Cloudflare refuses is said as that token (the dashboard said the Cloudflare sign-in had ended, and offered to sign in).
 - A change in the dashboard that needs a sign-in that ended says so, as commands do (it said to sign in, or that something went wrong).
 - Adding a label on a control plane too old for more labels says to update it (it said the control plane had not answered yet).

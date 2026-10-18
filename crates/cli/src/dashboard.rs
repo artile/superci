@@ -3948,9 +3948,16 @@ mark();load()})();</script>"#;
                 pick(cloud, &format!("Approve in {name} sign-in", name = provider_name(cloud)), false), esc(v.plane.url().trim_start_matches("https://")), name = provider_name(cloud))
         }
         // One not heard from yet (it may be taking this session's key): loading, for half a minute.
-        if let Some(v) = current.filter(|v| !v.online && !self.answered.contains(v.plane.plane_id()) && now_ms() < self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(0) + 30_000) {
+        if let Some(v) = current.filter(|v| !v.online && !self.answered.contains(v.plane.plane_id()) && now_ms() < self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(0) + key_wait_ms()) {
             let _ = v;
             return format!(r#"<div data-refresh="2"></div>{}"#, skeleton(section, section_title(section)));
+        }
+        // One that does not answer (after the wait above): its pages say so, as Overview does, rather than guess at
+        // what it has (no runners, nothing connected); the page looks again by itself. (Control plane lists it as such;
+        // Settings keeps the workspace's own, which need no control plane.)
+        if let Some(v) = current.filter(|v| !v.online && !matches!(v.plane, Plane::Seen { .. })).filter(|_| !["plane", "planes", "overview", "changes", "all", "settings"].contains(&section)) {
+            return format!(r#"<div data-refresh="5"></div><div class="bar"><h1 class="page-title">{}</h1></div><div class="cards"><section class="card">{}</section></div>"#, section_title(section),
+                empty_state(&logo(v.plane.cloud(), 40), "Your control plane is not answering", &format!("{} did not answer just now. Jobs wait until it does; this page looks again by itself.", esc(v.plane.url().trim_start_matches("https://"))), r#"<a class="button secondary sm" href="/?p=planes">Control plane</a>"#))
         }
         let (html, waiting) = match section {
             "plane" if !views.is_empty() => (self.planes_page(views), self.deploy_running()),
@@ -5477,7 +5484,7 @@ fn section_name(section: &str) -> &str {
     }
 }
 
-/// How long pages wait for a control plane to take this computer's key before saying why it does not.
+/// How long pages wait for a control plane (to answer at all, to take this computer's key) before saying why not.
 const KEY_WAIT_MS: u64 = 30_000;
 fn key_wait_ms() -> u64 {
     #[cfg(debug_assertions)]
