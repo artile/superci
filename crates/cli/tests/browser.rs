@@ -6957,6 +6957,77 @@ fn the_sweep_finds_out_what_became_of_jobs_whose_events_were_lost_and_says_it_on
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A runner taking another job than its own, for each way its own job and that other job stand: the other job with no
+/// machine coming gets this one (its own machine ended, failed, or never had), the runner's own job then needing none
+/// (cancelled, failed by a failing runner, over, its machine meant for that other job) or a new one; the other job
+/// with a machine still coming has that one handed to this runner's job. Each job's page says how it stands.
+#[test]
+fn a_runner_taking_another_jobs_work_swaps_machines_for_each_way_the_two_jobs_stand() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let job = |name: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let now = served.now_ms();
+    let owns: [(&str, &dyn Fn(&mut serde_json::Value, u64)); 5] = [
+        ("its own", &|_, _| {}),
+        ("orphan", &|j, _| { j["state"] = "orphan".into(); }),
+        ("failed fast", &|j, _| { j["failed_fast"] = true.into(); }),
+        ("over", &|j, _| { j["over"] = true.into(); }),
+        ("for the other", &|j, other| { j["for_job"] = other.into(); }),
+    ];
+    let others: [(&str, &dyn Fn(&mut serde_json::Value)); 5] = [
+        ("its machine ended", &|j| { j["state"] = "swept".into(); j["ended_ms"] = now.into(); }),
+        ("no machine", &|j| { j["state"] = "failed".into(); j.as_object_mut().unwrap().remove("machine_id"); }),
+        ("its machine coming", &|_| {}),
+        ("running, not begun", &|j| { j["state"] = "running".into(); j["seen_in_progress"] = true.into(); j["began"] = false.into(); }),
+        ("running, begun", &|j| { j["state"] = "running".into(); j["seen_in_progress"] = true.into(); j["began"] = true.into(); }),
+    ];
+    let mut pairs = vec![];
+    for (own_is, own_edit) in &owns {
+        for (other_is, other_edit) in &others {
+            let (a, o) = (job(&format!("{own_is} / {other_is}")), job(&format!("other: {own_is} / {other_is}")));
+            edit(a, &|j| own_edit(j, o));
+            edit(o, &|j| other_edit(j));
+            let runner = state(a)["runner"].as_str().unwrap_or_else(|| panic!("{own_is} / {other_is}: {}", state(a))).to_string();
+            assert!(served.webhook(served.github.start_on(o, &runner)) < 300);
+            pairs.push((a, o, *own_is, *other_is));
+        }
+    }
+    for (a, o, own_is, other_is) in &pairs {
+        let (sa, so) = (state(*a), state(*o));
+        let (a_state, o_state) = (sa["state"].as_str().unwrap_or_default(), so["state"].as_str().unwrap_or_default());
+        let swapped = ["its machine ended", "no machine"].contains(other_is);
+        if swapped {
+            assert_eq!(o_state, "running", "{own_is} / {other_is}: {so}");
+            let want = match *own_is { "orphan" => "cancelled", "failed fast" => "failed", "over" | "for the other" => "done", _ => "launched" };
+            assert_eq!(a_state, want, "{own_is} / {other_is}: {sa}");
+        } else {
+            assert_eq!(sa["ran"].as_u64(), Some(*o), "{own_is} / {other_is}: {sa}");
+            assert!(so["began"] == true, "{own_is} / {other_is}: {so}");
+            if *other_is == "its machine coming" { assert!(so["for_job"].as_u64().is_some(), "{own_is} / {other_is}: {so}") }
+        }
+    }
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    // (Each of the latest jobs' pages: see `seen_in_browser`.)
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// GitLab's jobs on AWS: one whose spot machine AWS takes back, retried at GitLab and run again off spot machines; an
 /// event delivered twice; one taken by another job's runner; one cancelled while its machine starts. Each job's page
 /// says how it went.
