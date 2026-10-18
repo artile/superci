@@ -7543,7 +7543,8 @@ fn the_sweep_settles_gitlab_jobs_whose_events_never_came_as_gitlab_has_them() {
     }
     let nine = served.now_ms() - 9 * 60_000;
     for (id, _) in &ids { edit(*id, &|j| { j["launched_ms"] = nine.into(); }) }
-    served.gitlab.fail("DELETE", "/runners/", 500);
+    // (GitLab refusing to remove the cancelled one's runner only: the others' go.)
+    served.gitlab.fail("DELETE", &format!("/runners/{}", state(ids[2].0)["runner_id"]), 500);
     served.upkeep();
     served.gitlab.fail_none();
     let st = |id: u64| state(id)["state"].as_str().unwrap_or_default().to_string();
