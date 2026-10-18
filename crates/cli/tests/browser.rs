@@ -7689,6 +7689,27 @@ fn a_jobs_end_is_settled_for_each_way_its_record_stands_and_said_on_its_page() {
     assert!(served.webhook(served.github.cancel(unknown, now)) < 300);
     assert!(gone(unknown));
     assert!(served.webhook(queued) < 300);
+    // Ending on another job's runner while waiting, and while its machine was asked for.
+    let host = job("host runner");
+    let host_runner = state(host)["runner"].as_str().unwrap().to_string();
+    let (w2, l2) = (job("waiting, on another's runner"), job("launching, on another's runner"));
+    edit(w2, &|j| { j["state"] = "waiting".into(); for k in ["machine_id", "runner", "runner_id"] { j.as_object_mut().unwrap().remove(k); } });
+    edit(l2, &|j| { j["state"] = "launching".into(); });
+    for id in [w2, l2] { let _ = served.github.start_on(id, &host_runner); assert!(served.webhook(served.github.finish(id, "success", "ok", now)) < 300); }
+    // Seen running, then cancelled with no runner; its runner kept by GitHub (taken back refused): left idle.
+    let (seen, kept_runner) = (job("seen, cancelled"), job("runner kept"));
+    edit(seen, &|j| { j["seen_in_progress"] = true.into(); });
+    served.github.fail("DELETE", &format!("/runners/{}", state(kept_runner)["runner_id"]), 422, "Runner is still running a job");
+    for id in [seen, kept_runner] { assert!(served.webhook(served.github.cancel(id, now)) < 300) }
+    served.github.fail_none();
+    assert_eq!(state(kept_runner)["state"], "orphan", "{}", state(kept_runner));
+    // The same end said twice: nothing more.
+    assert!(served.webhook(served.github.cancel(again, now)) < 300);
+    // A job not known here ended on a runner of ours.
+    let (stranger, _) = served.github.queue("stranger", "superci", now);
+    let other_host = job("other host");
+    let _ = served.github.start_on(stranger, &state(other_host)["runner"].as_str().unwrap().to_string());
+    assert!(served.webhook(served.github.finish(stranger, "success", "ok", now)) < 300);
     served.aws.fail_none();
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
