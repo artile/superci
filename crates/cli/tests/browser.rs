@@ -2624,6 +2624,15 @@ fn the_debug_commands_answer_as_the_clouds_answered_and_the_pages_stay() {
         let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
         assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked"), "{args:?}: {said}");
     }
+    // What a deploy that stopped partway made, removed: as AWS answered a real deletion, and with AWS refusing all of
+    // it (a region the account may not use: nothing was made there).
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[]);
+    let o = common::command(&home).args(["debug", "abandon", "us-east-1", "testplane0002"]).output().unwrap();
+    assert!(o.status.code().is_some_and(|c| c <= 3), "{}", String::from_utf8_lossy(&o.stderr));
+    served.aws.fail("amazonaws.com", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. with an explicit deny in a service control policy"), None);
+    let o = common::command(&home).args(["debug", "abandon", "eu-west-3", "testplane0002"]).output().unwrap();
+    assert!(o.status.code().is_some_and(|c| c <= 3), "{}", String::from_utf8_lossy(&o.stderr));
+    served.aws.fail_none();
     // Recorded as a recording is made (for the test kit): each exchange written to the file named.
     let record = home.join("recorded.jsonl");
     let o = common::command(&home).args(["debug", "ec2", "us-east-1", "DescribeRegions"]).env("SUPERCI_RECORD", &record).env("SUPERCI_RECORD_SIGN_INS", "1").output().unwrap();
