@@ -17,6 +17,8 @@ on:
 
 permissions:
   contents: read
+  # (Whether the Test workflow passed for this commit already: its tests are not run twice.)
+  actions: read
 
 concurrency:
   group: publish
@@ -61,17 +63,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
+      # What was compiled before (dependencies above all), kept between releases: the same release build, sooner.
+      # (A run from a tag reads what one from main saved.)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
           package-manager-cache: false
-      - name: The build's tools (zig, cargo-zigbuild, worker-build)
-        run: |
-          brew install zig
-          cargo install --locked cargo-zigbuild worker-build
+      - name: The build's tools (zig)
+        run: brew install zig
+      # (Built programs, not compiled here each time.)
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild,worker-build
       - name: Build everything and pack the npm packages
         run: ./scripts/npm-pack.sh
+      - name: Whether this commit's tests passed already (the Test workflow)
+        id: tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow=test.yml --commit "$GITHUB_SHA" --status success --json databaseId --jq length 2>/dev/null || echo 0)
+          echo "passed=$([ "${n:-0}" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: The tests
+        if: steps.tested.outputs.passed != 'true'
         run: cargo test --workspace
       - name: Try what was packed, through npx
         env:
