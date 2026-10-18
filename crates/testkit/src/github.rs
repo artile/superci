@@ -50,6 +50,10 @@ struct Hub {
     attempts: Vec<u64>,
     /// S3's objects, by bucket and key (`bucket/key`), as the control plane's buckets keep them.
     objects: BTreeMap<String, Vec<u8>>,
+    /// Each object's headers S3 keeps with it (`x-amz-meta-*`, its checksum), given back on a HEAD.
+    meta: BTreeMap<String, Vec<(String, String)>>,
+    /// The buckets made (`PUT` on a bucket's root).
+    buckets: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Default)]
@@ -94,6 +98,16 @@ impl GitHub {
 
     /// An object put in a bucket (`bucket/key`), as the control plane's deploy leaves its program there.
     pub fn put_object(&self, key: &str, bytes: &[u8]) { self.hub.lock().unwrap().objects.insert(key.to_string(), bytes.to_vec()); }
+
+    /// An object put at a link as a machine puts it: at the link's bucket and key, with the headers S3 keeps.
+    pub fn put_at(&self, link: &str, bytes: &[u8], headers: &[(&str, &str)]) {
+        let url = url::Url::parse(link).unwrap();
+        let bucket = url.host_str().unwrap().split_once(".s3.").unwrap().0;
+        let key = format!("{bucket}/{}", url.path().trim_start_matches('/'));
+        let mut h = self.hub.lock().unwrap();
+        h.objects.insert(key.clone(), bytes.to_vec());
+        h.meta.insert(key, headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())).collect());
+    }
 
     /// From now on S3 refuses what is put in a bucket (`false`: takes it again).
     pub fn refuse_puts(&self, refuse: bool) { self.hub.lock().unwrap().refuse_puts = refuse }
@@ -277,6 +291,29 @@ impl GitHub {
             let key = format!("{bucket}/{}", path.trim_start_matches('/'));
             let mut h = self.hub.lock().unwrap();
             let missing = || Response::new(404, "application/xml", format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message><Key>{}</Key></Error>", path.trim_start_matches('/')));
+            let root = path.trim_start_matches('/').is_empty();
+            // (Its keys, as ListObjectsV2 answers: those under `prefix`.)
+            // (Its rules, as `?lifecycle` sets them: taken.)
+            if root && url.query_pairs().any(|(k, _)| k == "lifecycle") { return Some(Response::new(200, "application/xml", "")) }
+            let made = h.buckets.contains(&bucket) || h.objects.keys().any(|k| k.starts_with(&format!("{bucket}/")));
+            if root && !made && r.method != "PUT" { return Some(Response::new(404, "application/xml", format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message><BucketName>{bucket}</BucketName></Error>"))) }
+            if root && r.method == "HEAD" { return Some(Response::new(200, "application/xml", "")) }
+            if root && r.method == "GET" {
+                let prefix = url.query_pairs().find(|(k, _)| k == "prefix").map(|(_, v)| v.into_owned()).unwrap_or_default();
+                let keys: Vec<String> = h.objects.keys().filter_map(|k| k.strip_prefix(&format!("{bucket}/"))).filter(|k| k.starts_with(&prefix) && !k.is_empty()).map(str::to_string).collect();
+                let contents: String = keys.iter().map(|k| format!("<Contents><Key>{k}</Key><Size>{}</Size><LastModified>2026-10-15T10:00:00.000Z</LastModified></Contents>", h.objects[&format!("{bucket}/{k}")].len())).collect();
+                return Some(Response::new(200, "application/xml", format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult><Name>{bucket}</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>", keys.len())))
+            }
+            // (A bucket made: once; again, as S3 says to its owner.)
+            if root && r.method == "PUT" {
+                if !h.buckets.insert(bucket.clone()) { return Some(Response::new(409, "application/xml", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>BucketAlreadyOwnedByYou</Code><Message>Your previous request to create the named bucket succeeded and you already own it.</Message></Error>")) }
+                return Some(Response::new(200, "application/xml", ""))
+            }
+            if root && r.method == "DELETE" { h.buckets.remove(&bucket); return Some(Response::new(204, "application/xml", "")) }
+            if !root && r.method == "PUT" && r.header("x-amz-copy-source").is_none() && !h.refuse_puts {
+                let kept: Vec<(String, String)> = r.headers.iter().filter(|(k, _)| { let k = k.to_ascii_lowercase(); k.starts_with("x-amz-meta-") || k == "x-amz-checksum-sha256" }).map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect();
+                h.meta.insert(key.clone(), kept);
+            }
             return Some(match r.method.as_str() {
                 "PUT" if h.refuse_puts => Response::new(403, "application/xml", "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Request has expired</Message></Error>"),
                 // (A copy within S3: `x-amz-copy-source: /bucket/key`.)
@@ -287,7 +324,14 @@ impl GitHub {
                     },
                     None => { h.objects.insert(key, r.body.clone()); Response::new(200, "application/xml", "") }
                 },
-                "HEAD" => if h.objects.contains_key(&key) { Response::new(200, "application/octet-stream", "") } else { Response::new(404, "application/xml", "") },
+                "HEAD" => match h.objects.get(&key) {
+                    Some(b) => {
+                        let mut res = Response::new(200, "application/octet-stream", "").with_header("content-length", &b.len().to_string());
+                        for (k, v) in h.meta.get(&key).cloned().unwrap_or_default() { res = res.with_header(&k, &v) }
+                        res
+                    }
+                    None => Response::new(404, "application/xml", ""),
+                },
                 // (A range of it, as S3 answers one: 206 with those bytes.)
                 "GET" => match (h.objects.get(&key), r.header("range").and_then(|v| v.strip_prefix("bytes=")).and_then(|v| v.split_once('-'))) {
                     (Some(b), Some((from, to))) => {

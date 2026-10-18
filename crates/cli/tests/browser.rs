@@ -9039,6 +9039,27 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         let (status, _) = call("layers-uploaded", serde_json::json!({ "id": id }));
         assert!(status <= at_most || given.is_empty(), "{id}: {status}");
     }
+    // Then put there: not that layer (another size; S3 told to remove it), then as the link said (converted, or
+    // queued); the other layer's, once its layer is on its way (granted).
+    let uploads: Vec<(String, serde_json::Value)> = said["layers"].as_object().unwrap().iter().filter(|(_, a)| a["do"] == "upload").map(|(d, a)| (d.clone(), a.clone())).collect();
+    let (_, first) = &uploads[0];
+    let sum = first["headers"]["x-amz-checksum-sha256"].as_str().unwrap();
+    served.github.put_at(first["url"].as_str().unwrap(), &[0u8; 999], &[("x-amz-checksum-sha256", sum)]);
+    let (status, _) = call("layers-uploaded", serde_json::json!({ "id": first["id"] }));
+    assert_eq!(status, 409);
+    served.github.put_at(first["url"].as_str().unwrap(), &[0u8; 1000], &[("x-amz-checksum-sha256", "c3VtIG9mIGFub3RoZXI=")]);
+    assert_eq!(call("layers-uploaded", serde_json::json!({ "id": first["id"] })).0, 409);
+    served.github.put_at(first["url"].as_str().unwrap(), &[0u8; 1000], &[("x-amz-checksum-sha256", sum)]);
+    let (status, done) = call("layers-uploaded", serde_json::json!({ "id": first["id"] }));
+    assert!(status == 200 && (done["do"] == "converting" || done["do"] == "granted"), "{status} {done}");
+    assert_eq!(call("layers-uploaded", serde_json::json!({ "id": first["id"] })).0, 404, "said once");
+    let (status, again) = call("layers-propose", serde_json::json!({ "layers": [{ "digest": uploads[0].0, "size": 1000 }] }));
+    assert_eq!(status, 200);
+    if let Some(a) = again["layers"][&uploads[0].0].as_object().filter(|a| a["do"] == "upload") {
+        served.github.put_at(a["url"].as_str().unwrap(), &[0u8; 1000], &[("x-amz-checksum-sha256", a["headers"]["x-amz-checksum-sha256"].as_str().unwrap())]);
+        let (status, done) = call("layers-uploaded", serde_json::json!({ "id": a["id"] }));
+        assert!(status == 200 && done["do"] == "granted", "{status} {done}");
+    }
     // Links to what the store has of them (nothing yet), what was kept as the job ended and after it.
     assert_eq!(call("layers-links", serde_json::json!({ "digests": [digest('a'), "nope"] })).0, 200);
     for body in [serde_json::json!({ "keeping": true, "pulled": 2, "pulled_bytes": 2000 }), serde_json::json!({ "pulled": 2, "pulled_bytes": 2000, "uploaded": 1, "uploaded_bytes": 1000, "served_digests": [digest('a')], "used": [digest('a'), "nope"] }), serde_json::json!("not what was kept")] {
@@ -10159,3 +10180,75 @@ fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+
+#[test]
+fn each_regions_cache_bucket_is_made_filled_once_and_removed_as_s3_answers_and_as_it_refuses() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    // (Its network as AWS answered; its bucket is S3's stand-in's.)
+    let network: String = include_str!("../fixtures/aws/regions/add.jsonl").lines().filter(|l| !l.contains(".s3.")).map(|l| format!("{l}\n")).collect();
+    served.aws.replaying(&network, &[("mixplane0001", PLANE)]);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let bucket = superci_core::cache::bucket(PLANE, "eu-north-1");
+    let root = format!("https://{bucket}.s3.eu-north-1.amazonaws.com/");
+    let program = superci_core::cache::program_key("x86_64");
+    let has = |key: &str| served.github.objects().iter().any(|(k, _)| k == &format!("{bucket}/{key}"));
+    let connect = |b: &mut Browser| {
+        let _ = post(b, "/routing", &[("action", "pool"), ("cloud", "aws"), ("region_0", "us-east-1")]);
+        let (got, text) = post(b, "/routing", &[("action", "pool"), ("cloud", "aws"), ("region_0", "us-east-1"), ("region_1", "eu-north-1")]);
+                assert!(got < 500, "{got} {text}");
+    };
+    // Made, with this version's programs in it; again, as it is (nothing put twice).
+    connect(&mut b);
+    assert!(has(&program), "{:?} {:?}", served.github.objects(), served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {} {}", a["url"], a["status"], a["answer"].as_str().unwrap_or_default().chars().take(150).collect::<String>())).collect::<Vec<_>>());
+    served.github.remove_object(&format!("{bucket}/{}", superci_core::cache::program_key("aarch64")));
+    connect(&mut b);
+    assert!(has(&superci_core::cache::program_key("aarch64")));
+    // S3 saying it is not there, then that it is ours already (made meanwhile); refusing to make it, its rules or a
+    // program; not letting it be read, or failing.
+    let refusals: Vec<Vec<(&str, &str, u16)>> = vec![
+        vec![("HEAD", root.as_str(), 404)],
+        vec![("HEAD", root.as_str(), 404), ("PUT", root.as_str(), 403)],
+        vec![("HEAD", root.as_str(), 403)],
+        vec![("HEAD", root.as_str(), 500)],
+        vec![("PUT", "?lifecycle", 400)],
+        vec![("PUT", "/superci/cache-", 500)],
+    ];
+    for fails in &refusals {
+        served.github.remove_object(&format!("{bucket}/{program}"));
+        for (m, part, status) in fails { served.github.fail(m, part, *status, "refused") }
+        connect(&mut b);
+        served.github.fail_none();
+    }
+    // Removed with all it keeps: S3 refusing the list, a key, the bucket itself; then gone, and gone again.
+    // (Its network there: none left, as EC2 answers that.)
+    let remove = || { served.aws.fail("ec2.eu-north-1", 200, "<DescribeResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId></DescribeResponse>", None); let o = common::command(&home).args(["debug", "networks", "eu-north-1"]).output().unwrap(); served.aws.fail_none(); String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr) };
+    served.github.fail("GET", "?list-type=2", 403, "refused");
+    let said = remove();
+    assert!(said.contains("cache bucket"), "{said}");
+    served.github.fail_none();
+    served.github.fail("DELETE", &format!("{root}superci/"), 500, "failed");
+    assert!(remove().contains("cache bucket"));
+    served.github.fail_none();
+    for (k, _) in served.github.objects() { if k.starts_with(&format!("{bucket}/")) { served.github.remove_object(&k) } }
+    connect(&mut b);
+    for (k, _) in served.github.objects() { if k.starts_with(&format!("{bucket}/")) { served.github.remove_object(&k) } }
+    served.github.fail("DELETE", &root, 500, "failed");
+    let said = remove();
+    served.github.fail_none();
+    assert!(said.contains("cache bucket"), "{said}");
+    connect(&mut b);
+    let said = remove();
+    assert!(said.contains("deleted in eu-north-1") && !has(&program), "{said}");
+    let said = remove();
+    assert!(said.contains("deleted in eu-north-1"), "{said}");
+    b.goto(&format!("{link}&p=runners"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
