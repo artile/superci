@@ -5642,6 +5642,34 @@ mod runs_suite_in_browser {
     }
 
     #[test]
+    fn a_runs_expressions_of_each_kind_are_read_and_its_runner_s_own_calls_are_answered() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "env:\n  _UNDER: one\njobs:\n  t:\n    runs-on: superci\n    env:\n      QUOTED: ${{ 'it''s' }}\n      EXP: ${{ 1e-3 + 2E+2 }}\n      NEG: ${{ -4 }}\n      BIG: ${{ 1e20 }}\n      STAR: ${{ toJSON(fromJSON('[{\"a\":1},{\"a\":2}]').*.a) }}\n      NOTFALSE: ${{ !false }}\n      UNDER: ${{ env._UNDER }}\n      NUMBOOL: ${{ 0.5 && 'yes' }}\n    steps:\n      - if: ${{ success() && true }}\n        run: echo ${{ format('{0}-{1}', 'a', 2) }}\n      - if: ${{ failure() || cancelled() }}\n        run: echo never\n      - run: echo ${{ contains('abc', 'b') }} ${{ startsWith('abc', 'a') }} ${{ endsWith('abc', 'c') }} ${{ join(fromJSON('[1,2]'), '-') }}\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let r = runner_of(&served, &run, "t");
+        let handed = r.handed(&served);
+        assert!(handed["variables"].is_object() || handed["contextData"].is_object(), "{handed}");
+        // Its runner's own calls, as GitHub's runner makes them: its connection, its session, the job request, the
+        // feed, actions to download, lines as they are written, a log's pieces.
+        let token = served.store.under(&format!("run:{run}"))[0].1["jobs"][0]["token"].as_str().unwrap_or_default().to_string();
+        let base = format!("{}/runner/{token}", served.url);
+        for (method, path, body) in [("GET", "/_apis/connectionData?connectOptions=1", ""), ("POST", "/_apis/oauth2/auth/token", ""), ("POST", "/_apis/distributedtask/pools/1/sessions/AgentSession/x", "{}"),
+            ("DELETE", "/_apis/distributedtask/pools/1/sessions/AgentSession/x", ""), ("GET", "/_apis/distributedtask/pools/1/messages/AgentRequest/1", ""), ("GET", "/_apis/distributedtask/feedstream/1", ""),
+            ("POST", "/_apis/distributedtask/hubs/Actions/plans/p/ActionDownloadInfo/1", r#"{"actions":[{"nameWithOwner":"actions/checkout","ref":"v4"},{"nameWithOwner":"actions/setup-node","ref":"v4"}]}"#),
+            ("POST", "/_apis/distributedtask/hubs/Actions/plans/p/timelines/t/records/r/TimeLineWebConsoleLog/1", r#"{"value":["line one","line two"],"stepId":"s"}"#),
+            ("POST", "/_apis/distributedtask/hubs/Actions/plans/p/logs/Logfiles/notanumber", "x"), ("DELETE", "/_apis/distributedtask/other/1", "")] {
+            let (status, _, _) = http(method, &format!("{base}{path}"), body.as_bytes());
+            assert!(status < 500, "{method} {path}: {status}");
+        }
+        r.take();
+        r.finish("succeeded");
+        let _ = std::fs::remove_dir_all(&dir);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
     fn a_matrix_made_by_an_expression_is_read_once_the_job_it_needs_has_ended() {
         let served = serve(|_| {});
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  setup:\n    runs-on: superci\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo 'shards=[1,2,3]' >> $GITHUB_OUTPUT\n  test:\n    needs: setup\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.setup.outputs.shards) }}\n        os: [linux]\n    steps:\n      - run: echo shard ${{ matrix.shard }}\n")]);
