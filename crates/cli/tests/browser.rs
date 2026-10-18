@@ -1941,7 +1941,7 @@ fn a_second_control_plane_given_a_code_host_of_its_own_makes_two_cis_listed_and_
     std::fs::write(&file, kept.to_string()).unwrap();
     let fixture = |name: &str| std::fs::read_to_string(format!("{}/fixtures/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap();
     served.aws.replaying(&[fixture("cloudflare/sign-in/usage"), fixture("update/01-deploy-cf")].concat(), &[]);
-    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", "cfplane00003")]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", "cfplane00003"), ("SUPERCI_LAST_GOOD_S", "1"), ("SUPERCI_VIEWS_S", "0")]);
     b.goto(&format!("{link}&p=planes"));
     b.wait(&shows("Set up"));
     b.click("form[action=\"/plane/cloudflare\"] button", "Set up");
@@ -1956,6 +1956,17 @@ fn a_second_control_plane_given_a_code_host_of_its_own_makes_two_cis_listed_and_
     // The dashboard, naming neither: the list of them, to open one.
     b.goto(&link);
     b.wait(&format!("{} && {} && {}", shows("Control planes"), reads("GitHub: acme · AWS · 111111111111"), reads("GitLab: gitlab.com · Cloudflare · Acme")));
+    // The GitLab one stops answering: no longer a live CI, the dashboard opens the other; the list (asked for) says
+    // which does not answer. Answering again, as before.
+    cf.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.goto(&format!("{link}&p=all"));
+    b.wait(&reads("Not answering"));
+    cf.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    b.goto(&link);
+    b.wait(&format!("{} && {}", shows("Control planes"), reads("GitLab: gitlab.com · Cloudflare · Acme")));
     // A change that names neither: refused, nothing changed.
     let (got, text) = post(&mut b, "/labels", &[("label", "acmeci")]);
     assert!(got == 409 && text.contains("Which control plane?"), "{got} {text}");
