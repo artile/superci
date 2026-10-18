@@ -175,6 +175,72 @@ fn a_runs_summary_quiet_too_says_what_each_job_had_from_the_caches_docker_images
     }
 }
 
+/// A way to the control plane that can be cut (every connection dropped, new ones refused) and put back, as when
+/// this computer's network or DNS drops for a while.
+struct Cut { url: String, down: std::sync::Arc<std::sync::atomic::AtomicBool>, open: std::sync::Arc<std::sync::Mutex<Vec<std::net::TcpStream>>> }
+impl Cut {
+    fn to(target: &str) -> Cut {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let target = target.trim_start_matches("http://").trim_end_matches('/').to_string();
+        let (down, open) = (std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::net::TcpStream>::new())));
+        let (d, o) = (down.clone(), open.clone());
+        std::thread::spawn(move || for client in listener.incoming().flatten() {
+            if d.load(std::sync::atomic::Ordering::SeqCst) { drop(client); continue }
+            let Ok(server) = std::net::TcpStream::connect(&target) else { continue };
+            o.lock().unwrap().extend([client.try_clone().unwrap(), server.try_clone().unwrap()]);
+            for (mut from, mut to) in [(client.try_clone().unwrap(), server.try_clone().unwrap()), (server, client)] {
+                std::thread::spawn(move || { let _ = std::io::copy(&mut from, &mut to); let _ = to.shutdown(std::net::Shutdown::Both); });
+            }
+        });
+        Cut { url, down, open }
+    }
+    fn set(&self, down: bool) {
+        self.down.store(down, std::sync::atomic::Ordering::SeqCst);
+        if down { for s in self.open.lock().unwrap().drain(..) { let _ = s.shutdown(std::net::Shutdown::Both); } }
+    }
+}
+
+#[test]
+fn a_run_followed_through_a_network_that_drops_for_a_while_is_followed_to_its_end() {
+    let served = serve(|_| {});
+    let dir = checkout();
+    let cut = Cut::to(&served.url);
+    let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).env("SUPERCI_PLANE", &cut.url).spawn().unwrap();
+    let run = run_of(&served);
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let a = "cccccccc-0000-0000-0000-000000000003";
+    runner.take();
+    runner.steps(&[(a, "Run make test", 1, "inProgress", None, None)]);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Out of touch for a while; the run ends meanwhile.
+    cut.set(true);
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    runner.log(1, "2026-10-15T10:00:01.0000000Z ok");
+    runner.steps(&[(a, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+    runner.finish("succeeded");
+    cut.set(false);
+    let out = cli.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && said.contains("Out of touch with the control plane (") && said.contains("In touch with the control plane again after ") && said.contains("The run ended: success"), "{said}");
+    assert_eq!(said.matches("Out of touch").count(), 1, "said once: {said}");
+    // Out of touch for longer than it waits: given up, saying how to follow it again (the run goes on).
+    let dir2 = checkout();
+    let served2 = serve(|_| {});
+    let cut2 = Cut::to(&served2.url);
+    let cli = superci(&served2, &dir2, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).env("SUPERCI_PLANE", &cut2.url).env("SUPERCI_LOST_S", "4").spawn().unwrap();
+    let run2 = run_of(&served2);
+    let runner2 = loop { if let Some(r) = Runner::of_run(&served2, &run2) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    runner2.take();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    cut2.set(true);
+    let out = cli.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success() && said.contains(&format!("`superci runs wait {run2}` follows it again")), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
 #[test]
 fn a_dry_run_checks_the_workflow_its_job_and_the_tree_and_starts_nothing() {
     let served = serve(|_| {});

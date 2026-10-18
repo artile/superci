@@ -450,15 +450,17 @@ fn steps_run_side_by_side_are_shown_nested_with_what_they_are_as_github_shows_th
     b.wait(&shows("Recent jobs"));
     b.click("main a", "tests");
     b.wait("document.querySelectorAll('details.lstep').length === 7");
+    // Every step closed at first, the group too: its steps hidden; opened, shown; closed, hidden again.
+    assert_eq!(b.eval("[...document.querySelectorAll('details.lstep')].filter(d => d.open).length"), 0);
+    b.wait("document.querySelectorAll('details.lchild.lhid').length === 2");
+    b.click("details.lgroup summary", "");
+    b.wait("document.querySelectorAll('details.lchild.lhid').length === 0");
     // The group's row before its steps, which are under it; each says what it is.
     let rows = b.eval("[...document.querySelectorAll('details.lstep')].map(d => (d.classList.contains('lchild') ? '  ' : '') + d.querySelector('.lsn').innerText + ' ' + d.querySelector('.lsb').innerText.replace(/\\s+/g, ' ').trim())");
     assert_eq!(rows, serde_json::json!(["Boot the stack BACKGROUND", "Run npm ci ", "Parallel group BACKGROUND PARALLEL · 2 steps", "  Lint BACKGROUND", "  Unit tests BACKGROUND", "Wait for the stack WAIT Boot the stack", "Run npm run e2e "]));
     if let Ok(dir) = std::env::var("SUPERCI_PREVIEW_DIR") { b.eval("window.scrollTo(0, document.querySelector('.log-card').offsetTop - 20)"); b.wait("new Promise(r => setTimeout(() => r(true), 400))"); b.screenshot(&std::path::Path::new(&dir).join("parallel-steps.png")) }
-    // The group folded: its steps hidden; unfolded: shown again.
     b.click("details.lgroup summary", "");
     b.wait("document.querySelectorAll('details.lchild.lhid').length === 2");
-    b.click("details.lgroup summary", "");
-    b.wait("document.querySelectorAll('details.lchild.lhid').length === 0");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

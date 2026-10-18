@@ -103,6 +103,13 @@ const MOST_LAYERS: usize = 8;
 
 /// How long a run that is over is waited for, at most, for each step's own log (seconds): a minute, or in a test what
 /// `SUPERCI_LOGS_WAIT_S` says (a debug build).
+/// How long a run is followed with no answer from its control plane before giving up (it goes on there).
+fn lost_s() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("SUPERCI_LOST_S").ok().and_then(|v| v.parse().ok()) { return s }
+    600
+}
+
 fn logs_wait_s() -> u64 {
     #[cfg(debug_assertions)]
     if let Some(s) = std::env::var("SUPERCI_LOGS_WAIT_S").ok().and_then(|v| v.parse().ok()) { return s }
@@ -302,13 +309,16 @@ pub fn wait(plane: &str, key: &str, run: &str, how: Follow, say: &mut dyn FnMut(
 
 fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Instant, sent_here: bool, say: &mut dyn FnMut(&str)) -> Result<Done> {
     let http = crate::aws::Blocking::new();
-    let call = |method: &str, at: &str| -> Result<Value> {
+    // (An error that may pass: no answer at all, as when this computer's network or DNS drops, or the control plane
+    // busy or restarting. The run goes on meanwhile.)
+    let call = |method: &str, at: &str| -> std::result::Result<Value, (bool, String)> {
         let r = Request::new(method, &format!("{plane}{at}")).with_header("authorization", &format!("Bearer {key}"));
-        let res = block_on(http.send(r))?;
-        if res.status == 404 { return Err(format!("No run {run} among this control plane's runs from a computer (they are kept a day).")) }
-        if res.status >= 300 { return Err(format!("the control plane said {}: {}", res.status, res.body_text().trim())) }
-        serde_json::from_slice(&res.body).map_err(|e| format!("the control plane's answer: {e}"))
+        let res = block_on(http.send(r)).map_err(|e| (true, e.to_string()))?;
+        if res.status == 404 { return Err((false, format!("No run {run} among this control plane's runs from a computer (they are kept a day)."))) }
+        if res.status >= 300 { return Err((res.status >= 500 || res.status == 429, format!("the control plane said {}: {}", res.status, res.body_text().trim()))) }
+        serde_json::from_slice(&res.body).map_err(|e| (false, format!("the control plane's answer: {e}")))
     };
+    let mut lost: Option<std::time::Instant> = None;
     let (mut after, mut last): (Vec<u64>, Vec<String>) = (vec![], vec![]);
     let mut logs: Vec<Lines> = vec![];
     let mut ended_at: Vec<Option<std::time::Instant>> = vec![];
@@ -318,7 +328,17 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
     loop {
         std::thread::sleep(std::time::Duration::from_millis(1500));
         let cursor = after.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-        let st = call("GET", &format!("/runs/{run}?after={cursor}"))?;
+        // Out of touch with the control plane: asked again, a few seconds apart, for ten minutes at most.
+        let st = match call("GET", &format!("/runs/{run}?after={cursor}")) {
+            Ok(st) => { if let Some(t) = lost.take() { say(&format!("In touch with the control plane again after {}.", span(t.elapsed().as_secs()))) } st }
+            Err((true, e)) => {
+                let since = *lost.get_or_insert_with(|| { say(&format!("Out of touch with the control plane ({e}); asking again. The run goes on meanwhile.")); std::time::Instant::now() });
+                if since.elapsed().as_secs() >= lost_s() { return Err(format!("Out of touch with the control plane for {} ({e}). The run goes on there: `superci runs wait {run}` follows it again.", span(since.elapsed().as_secs()))) }
+                std::thread::sleep(std::time::Duration::from_millis(3500));
+                continue
+            }
+            Err((false, e)) => return Err(e),
+        };
         let jobs = st["jobs"].as_array().cloned().unwrap_or_default();
         after.resize(jobs.len(), 0);
         last.resize(jobs.len(), String::new());
