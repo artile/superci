@@ -1115,3 +1115,38 @@ fn control_planes_are_set_up_in_cloudflare_and_modal_from_the_browser_and_delete
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn the_aws_accounts_own_budget_set_raised_made_to_stop_lifted_and_removed_shows_on_the_limits_card() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    // Each step as a real account answered it (`fixtures/aws/budget`).
+    let step = |file: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/aws/budget/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[("abcdefghijkl", superci_testkit::PLANE)]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runners");
+    b.wait(&shows("Limits"));
+    let account = |usd: &str, budget: &str| -> Vec<(String, String)> { let mut f = vec![("action".to_string(), "account_usd".to_string()), ("account".into(), "aws".into()), ("usd".into(), usd.into())]; if !budget.is_empty() { f.push(("budget".into(), budget.into())) } f };
+    for (file, fields, card, gone) in [
+        ("02-emails.jsonl", { let mut f = account("100", "emails"); f.push(("email".into(), "someone@example.com".into())); f }, "$0.00 of $100.00 AWS emails", ""),
+        ("04-raise.jsonl", account("120", ""), "$0.00 of $120.00 AWS emails", ""),
+        ("06-stop.jsonl", account("120", "stops"), "AWS stops at the limit", ""),
+        ("08-lift.jsonl", account("120", "lift"), "AWS stops at the limit", ""),
+        ("09-remove.jsonl", account("120", "none"), "$0.00 of $120.00", "AWS emails"),
+    ] {
+        step(file);
+        let (got, text) = post(&mut b, "/routing", &fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        assert!(got < 400, "{file}: {got} {text}");
+        b.goto(&format!("{link}&p=runners"));
+        b.wait(&reads(card));
+        if !gone.is_empty() { assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().replace('\n', " ").contains(gone), "{file}") }
+    }
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
