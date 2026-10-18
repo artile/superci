@@ -4809,14 +4809,17 @@ fn a_job_whose_machine_aws_refuses_is_told_why_by_what_aws_said() {
 fn every_pair_of_aws_refusals_ends_each_kind_of_job_as_the_table_says() {
     let answers = ["", "InsufficientInstanceCapacity", "VcpuLimitExceeded", "MaxSpotInstanceCountExceeded", "Unsupported", "InvalidParameterValue", "UnauthorizedOperation", "500"];
     // (Each kind of job in a thread of its own: 144 control planes in all.)
-    let kinds = ["superci", "superci/spot=false", "superci/gpu=any", "superci/gpu=any/spot=false"];
-    let got: String = std::thread::scope(|s| kinds.map(|label| s.spawn(move || {
+    // (The last: a control plane in two regions, the second with no room for anything.)
+    let kinds = ["superci", "superci/spot=false", "superci/gpu=any", "superci/gpu=any/spot=false", "superci in us-east-1 and us-east-2"];
+    let got: String = std::thread::scope(|s| kinds.map(|kind| s.spawn(move || {
+        let (label, two) = match kind.split_once(" in ") { Some((l, _)) => (l, true), None => (kind, false) };
         let mut got = String::new();
         for spot in answers {
             for od in answers {
                 if label.contains("spot=false") && !spot.is_empty() { continue }
-                let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+                let clouds = With(FakeClouds::default(), move |r: &Request, body: &str| {
                     if !body.contains("Action=RunInstances") { return None }
+                    if r.url.contains("us-east-2") { return Some(aws_refuses("InsufficientInstanceCapacity")) }
                     match if body.contains("MarketType=spot") { spot } else { od } {
                         "" => None,
                         "500" => Some(Response::new(500, "text/xml", "<Response><Errors><Error><Code>InternalError</Code><Message>An internal error has occurred</Message></Error></Errors></Response>")),
@@ -4827,11 +4830,12 @@ fn every_pair_of_aws_refusals_ends_each_kind_of_job_as_the_table_says() {
                 let mut config = Config::new(PLANE_ID.into());
                 config.app = Some(app());
                 (config.aws_own, config.aws_own_creds) = own_aws();
+                if two { config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()] }
                 let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
                 block_on(plane.handle(labelled("queued", 9, "acme/app", None, label)));
                 let j = job(&store, 9);
-                got.push_str(&format!("{label} | spot {} | on-demand {} => {}{}\n", if spot.is_empty() { "started" } else { spot }, if od.is_empty() { "started" } else { od }, j["state"].as_str().unwrap_or_default(),
-                    j["error"].as_str().map(|e| format!(": {e}")).unwrap_or_default()));
+                got.push_str(&format!("{kind} | spot {} | on-demand {} => {}{}\n", if spot.is_empty() { "started" } else { spot }, if od.is_empty() { "started" } else { od }, j["state"].as_str().unwrap_or_default(),
+                    j["error"].as_str().map(|e| format!(" | {e}")).unwrap_or_default()));
             }
         }
         got
