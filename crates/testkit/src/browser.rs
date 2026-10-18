@@ -92,9 +92,10 @@ impl Browser {
         r["result"]["value"].clone()
     }
 
-    /// Waits, up to 30 seconds (a page among many tests at once, on a busy machine), for `js` to hold in the page.
+    /// Waits, up to 30 seconds (a page among many tests at once, on a busy machine; `SUPERCI_BROWSER_WAIT_S` for
+    /// longer, as under a coverage run), for `js` to hold in the page.
     pub fn wait(&mut self, js: &str) {
-        let until = Instant::now() + Duration::from_secs(30);
+        let until = Instant::now() + Duration::from_secs(std::env::var("SUPERCI_BROWSER_WAIT_S").ok().and_then(|s| s.parse().ok()).unwrap_or(30));
         while Instant::now() < until {
             if self.call("Runtime.evaluate", json!({ "expression": format!("!!({js})"), "returnByValue": true })).is_ok_and(|r| r["result"]["value"] == true) { return }
             std::thread::sleep(Duration::from_millis(100));
