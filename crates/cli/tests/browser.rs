@@ -8106,38 +8106,59 @@ fn a_control_plane_asked_for_where_it_cannot_run_is_refused_and_one_stopped_is_s
 #[test]
 fn the_overview_after_a_busy_hour_on_aws_says_its_runs_jobs_waits_and_what_github_would_have_charged() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
-    // From a control plane that counts runs, and one from before that does not (0.19.5).
-    for old in [None, Some("0.19.5")] {
+    // From a control plane that counts runs, one from before that does not (0.19.5), and one from before runs were
+    // kept with jobs (0.18.1).
+    for old in [None, Some("0.19.5"), Some("0.18.1")] {
         let served = serve(|c| {
             (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
         });
         if let Some(v) = old { *served.aws.old_version.lock().unwrap() = Some(v.into()) }
         served.connect_github();
-        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#);
         served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
         let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
         served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
         served.aws.fail("RunInstances", 200, &started, None);
-        // Three runs, each waiting a minute and a half for its machine and running a few minutes.
-        for name in ["build", "test", "lint"] {
-            let (id, q) = served.github.queue(name, "superci", served.now_ms());
+        // Three runs on AWS and one on Cloudflare, each waiting a minute and a half for its machine and running a few
+        // minutes; and one that never ran (a label nothing has).
+        let mut ids = vec![];
+        for (name, label) in [("build", "superci"), ("test", "superci"), ("lint", "superci"), ("docs", "superci/provider=cloudflare")] {
+            let (id, q) = served.github.queue(name, label, served.now_ms());
             assert!(served.webhook(q) < 300);
             served.later(90_000);
             assert!(served.webhook(served.github.start(id)) < 300);
             served.later(4 * 60_000);
             assert!(served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms())) < 300);
+            ids.push(id);
         }
+        let (never, q) = served.github.queue("never", "superci/cpus=8", served.now_ms());
+        assert!(served.webhook(q) < 300);
+        ids.push(never);
         served.aws.fail_none();
         // (Its runs counted at a sweep.)
         served.upkeep();
+        // From before runs were kept with jobs: none of them in a run.
+        if old == Some("0.18.1") {
+            for id in &ids { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); j["run_id"] = 0.into(); m.insert(k, j.to_string()); }
+        }
         let home = signed_in(&served);
         let (mut child, link) = dashboard(&home);
         b.goto(&format!("{link}&p=overview"));
-        b.wait(&format!("{} && {}", reads("3 jobs"), shows("Usage")));
+        b.wait(&format!("{} && {}", reads("did not"), reads("Latest")));
         let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
-        assert!(page.contains("min") && !page.contains("did not"), "{old:?}: {page}");
-        if old.is_none() { assert!(page.contains("3 runs"), "{page}") }
+        assert!(page.contains("Where they ran") && page.contains("min"), "{old:?}: {page}");
+        if old.is_none() { assert!(page.contains("5 runs"), "{page}") }
+        if old == Some("0.18.1") {
+            assert!(page.contains("All jobs"), "{page}");
+            // Two days on: no jobs in the last day.
+            let _ = child.kill();
+            served.later(2 * 86_400_000);
+            let (c, link) = dashboard(&home);
+            child = c;
+            b.goto(&format!("{link}&p=overview"));
+            b.wait(&reads("No jobs in the last 24 hours"));
+        }
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
     }
