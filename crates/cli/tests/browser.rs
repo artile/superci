@@ -3,7 +3,7 @@
 //! kit's stand-in for AWS (where the dashboard writes the control plane's settings, and the control plane reads them).
 //! Skipped where no Chrome is installed.
 mod common;
-use common::{words, dashboard, home, played, played_steps, signed_in};
+use common::{dashboard, home, played, played_steps, signed_in};
 use superci_testkit::{serve, Browser, PLANE};
 
 /// Waits up to 15 seconds for `holds`, else fails saying `what`.
@@ -2249,3 +2249,34 @@ fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn removing_a_cloudflare_or_modal_launcher_needs_its_sign_in_or_is_from_superci_only_saying_what_is_left_there() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Launchers in Cloudflare and Modal, neither signed in.
+    let served = serve(|_| {});
+    let launchers = r#"[{"cloud":"modal","url":"https://acme--superci-runners.modal.run"},{"cloud":"cloudflare","url":"https://superci-runners.acme.workers.dev"}]"#;
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), launchers);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&shows("Runner providers"));
+    for (cloud, said) in [("modal", "Sign in with Modal first"), ("cloudflare", "Sign in with Cloudflare first")] {
+        let (got, text) = post(&mut b, "/runners/remove", &[("cloud", cloud)]);
+        assert!(got == 403 && text.contains(said), "{cloud}: {got} {text}");
+    }
+    // From SuperCI only: forgotten, and each one's launcher said as left there. (Asked from a page that does not
+    // look again by itself: what it says once done is left for the next page.)
+    for (cloud, left) in [("cloudflare", format!("Left: the Cloudflare launcher superci-runners-{PLANE}")), ("modal", format!("Left: the Modal app superci-runners-{PLANE} in your workspace"))] {
+        b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+        let (got, text) = post(&mut b, "/runners/remove", &[("cloud", cloud), ("only", "on")]);
+        assert!(got < 400, "{cloud}: {got} {text}");
+        b.goto(&format!("{link}&p=runners"));
+        b.wait(&page_shows(&left));
+    }
+    assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k == "LAUNCHERS" && v == "[]"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+

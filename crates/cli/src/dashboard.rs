@@ -2492,9 +2492,9 @@ impl Dashboard {
                 // A finished job's page shows its whole log, whatever its size (GitHub's from GitHub, a run from a
                 // computer's from the bucket): the control plane says its steps, the log comes whole. While it runs,
                 // the last of it, as it comes.
-                let ended = job.as_ref().is_some_and(|j| !["launching", "launched", "running", "waiting"].contains(&j["state"].as_str().unwrap_or_default()));
-                if req.path == "/job/view" && ended {
-                    if let Some(j) = job.as_ref() {
+                let ended = job.as_ref().filter(|j| !["launching", "launched", "running", "waiting"].contains(&j["state"].as_str().unwrap_or_default()));
+                if req.path == "/job/view" {
+                    if let Some(j) = ended {
                         // (A finished job's view, kept for its next opens: its log can be many MB, read from GitHub.)
                         let kept_as = format!("{}|{id}|{gl}", v.plane.url());
                         if let Some((_, kept)) = lock(&LOG_VIEWS).iter().find(|(k, _)| *k == kept_as) { return Ok(Response::new(200, "application/json", kept.clone())) }
