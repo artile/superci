@@ -1134,7 +1134,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                     let account = match (args.get("account"), accounts) {
                         (Some(a), _) => a.to_string(),
                         (None, [(only, _)]) => only.clone(),
-                        (None, []) => return Err("Sign in with Cloudflare first.".into()),
+                        (None, []) => return Err(d.ended_said("Sign in with Cloudflare first.".into()).into()),
                         (None, several) => return usage(format!("Say which account: --account=ID. Yours: {}.", several.iter().map(|(id, name)| format!("{id} ({name})")).collect::<Vec<_>>().join(", "))),
                     };
                     (vec![field("account", account.clone())], format!("Cloudflare, in account {account}"))

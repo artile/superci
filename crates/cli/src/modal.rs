@@ -97,9 +97,11 @@ impl Session {
     pub fn from_env() -> Option<Session> {
         let var = |n: &str| std::env::var(n).ok().filter(|v| !v.trim().is_empty());
         let (token_id, token_secret) = (var("SUPERCI_MODAL_TOKEN_ID")?, var("SUPERCI_MODAL_TOKEN_SECRET")?);
+        // (Its workspace's name, as Modal says it. A token Modal refuses is given all the same: what Modal says of it
+        // then reaches whoever gave it, rather than "sign in", which would not replace it.)
         let mut c = Client::new(Some(Session { token_id: token_id.clone(), token_secret: token_secret.clone(), workspace: String::new() })).ok()?;
-        let w: pb::WorkspaceNameLookupResponse = c.unary("WorkspaceNameLookup", pb::Empty {}).ok()?;
-        Some(Session { token_id, token_secret, workspace: w.username })
+        let workspace = c.unary::<_, pb::WorkspaceNameLookupResponse>("WorkspaceNameLookup", pb::Empty {}).map(|w| w.username).unwrap_or_default();
+        Some(Session { token_id, token_secret, workspace })
     }
 }
 

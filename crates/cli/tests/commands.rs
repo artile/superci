@@ -1177,3 +1177,41 @@ fn a_key_that_cannot_be_made_is_refused_saying_why() {
     assert_eq!(keys(), before, "nothing kept");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// What a command says when a cloud's sign-in is over: one noted as ended (it asks to sign in there), one the cloud
+/// refuses as the command goes (Cloudflare's 9109, Modal's Unauthenticated, as each answered): said as ended, with what to
+/// do. A token given by name for the run, refused, is said as the cloud said it (signing in would not replace it).
+#[test]
+fn a_command_whose_cloud_sign_in_is_over_or_refused_says_which_and_what_to_do() {
+    let served = serve(|_| {});
+    let run = |kept_extra: &[(&str, serde_json::Value)], env: &[(&str, &str)], recording: &str, args: &[&str]| -> (bool, String) {
+        let home = common::signed_in(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        for (k, v) in kept_extra { kept[*k] = v.clone() }
+        std::fs::write(&file, kept.to_string()).unwrap();
+        if !recording.is_empty() { served.aws.replaying(recording, &[]) }
+        let o = common::command(&home).args(args).envs(env.iter().copied()).output().unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        (o.status.success(), String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout))
+    };
+    let cf = serde_json::json!({ "access": "example-access_token-ended", "expires_at_ms": 4102444800000u64, "refresh": "example-refresh_token-ended" });
+    let modal = serde_json::json!({ "token_id": "ak-superciendedrecording00", "token_secret": "as-superciendedrecording00", "workspace": "acmeci" });
+    let cf_ended = include_str!("../fixtures/cloudflare/sign-in/ended.jsonl");
+    let modal_ended = include_str!("../fixtures/modal/sign-in/ended.jsonl");
+    // Noted as ended, and the command needs that cloud: said as ended.
+    let (ok, said) = run(&[("cloudflare_ended", true.into())], &[], "", &["planes", "create", "cloudflare"]);
+    assert!(!ok && said.contains("Cloudflare sign-in has expired"), "{said}");
+    let (ok, said) = run(&[("modal_ended", true.into())], &[], "", &["planes", "create", "modal"]);
+    assert!(!ok && said.contains("Modal no longer accepts"), "{said}");
+    // Refused by the cloud as the command goes: said as ended.
+    let (ok, said) = run(&[("cloudflare", cf.clone())], &[], cf_ended, &["planes", "create", "cloudflare"]);
+    assert!(!ok && said.contains("Cloudflare sign-in has expired"), "{said}");
+    let (ok, said) = run(&[("modal", modal.clone())], &[], modal_ended, &["planes", "create", "modal"]);
+    assert!(!ok && said.contains("Modal no longer accepts"), "{said}");
+    // A token given for the run, refused: as the cloud said it, not as a sign-in that ended.
+    let (ok, said) = run(&[], &[("SUPERCI_CLOUDFLARE_TOKEN", "a-token-cloudflare-refuses")], cf_ended, &["planes", "create", "cloudflare"]);
+    assert!(!ok && !said.contains("sign-in has expired") && (said.contains("9109") || said.contains("Invalid access token")), "{said}");
+    let (ok, said) = run(&[], &[("SUPERCI_MODAL_TOKEN_ID", "ak-superciendedrecording00"), ("SUPERCI_MODAL_TOKEN_SECRET", "as-superciendedrecording00")], modal_ended, &["planes", "create", "modal"]);
+    assert!(!ok && said.contains("Token not found"), "{said}");
+}

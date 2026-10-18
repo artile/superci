@@ -1257,7 +1257,7 @@ impl Dashboard {
 
     /// The same of Modal's.
     /// A change that needs a cloud, after that cloud ended the sign-in kept here: said as that (else as it was said).
-    fn ended_said(&self, e: String) -> String {
+    pub(crate) fn ended_said(&self, e: String) -> String {
         let (cf, modal) = (self.cf_ended && self.cf.is_none(), self.modal_ended && self.modal.is_none());
         if self.aws_ended && e.contains("Sign in with AWS") { AWS_ENDED.to_string() } else if (cf && e.contains("Sign in with Cloudflare")) || (!self.cf_given && cloudflare::over(&e)) { CF_ENDED.to_string() }
             else if (modal && e.contains("Sign in with Modal")) || (!self.modal_given && e.contains(modal::ENDED)) { MODAL_ENDED.to_string() } else { e }
