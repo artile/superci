@@ -6492,3 +6492,73 @@ fn signing_out_with_every_cloud_signed_in_says_what_happened_to_each() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The Runners page's settings, sent as its forms send them: limits a control plane too old for them refuses, an
+/// order that would leave none and one with a provider it did not list, the last provider kept in, public
+/// repositories chosen, an account's limit without its sign-in, a region added with its network as AWS answered.
+#[test]
+fn the_runners_settings_refuse_what_cannot_be_and_add_a_region_with_its_network() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let own = |c: &mut superci_core::plane::Config| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    };
+    let routing = |served: &superci_testkit::Served| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").and_then(|(_, v)| serde_json::from_str::<serde_json::Value>(&v).ok()).unwrap_or_default();
+    // Too old for a limit for the whole CI (before 0.15.0), then for a day's limit and AWS's budget (before 0.16.0).
+    for (version, fields, said) in [("0.14.0", &[("action", "monthly_usd"), ("usd", "100")][..], "Update the control plane first"),
+        ("0.15.0", &[("action", "monthly_usd"), ("usd", "100"), ("daily", "10")], "A limit for a day"), ("0.15.0", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails")], "A limit for a day")] {
+        let served = serve(own);
+        *served.aws.old_version.lock().unwrap() = Some(version.into());
+        let home = signed_in(&served);
+        let (mut child, link) = dashboard(&home);
+        b.goto(&link);
+        b.goto(&link);
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+        let (got, text) = post(&mut b, "/routing", fields);
+        assert!(got == 409 && text.contains(said), "{version} {fields:?}: {got} {text}");
+        assert!(routing(&served).get("monthly_usd").is_none());
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+    let served = serve(own);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    // An order with every provider taken out, and the last one taken out: refused.
+    let (got, text) = post(&mut b, "/routing", &[("action", "order"), ("out_0", "aws"), ("out_1", "aws-on-demand"), ("out_2", "cloudflare")]);
+    assert!(got == 400 && text.contains("Keep one provider in the order"), "{got} {text}");
+    for cloud in ["aws", "aws-on-demand"] { let (got, text) = post(&mut b, "/routing", &[("action", "take_out"), ("cloud", cloud), ("current", "aws,aws-on-demand,cloudflare")]); assert!(got < 400, "{cloud}: {got} {text}") }
+    let (got, text) = post(&mut b, "/routing", &[("action", "take_out"), ("cloud", "cloudflare"), ("current", "cloudflare")]);
+    assert!(got == 400 && text.contains("Keep one provider in the order"), "{got} {text}");
+    // An order naming one provider: the others stay, after it.
+    let (got, text) = post(&mut b, "/routing", &[("action", "order"), ("cloud_0", "cloudflare")]);
+    assert!(got < 400, "{got} {text}");
+    let order: Vec<String> = routing(&served)["order"].as_array().unwrap().iter().map(|p| p["cloud"].as_str().unwrap().to_string()).collect();
+    assert_eq!(order[0], "cloudflare", "{order:?}");
+    // Public repositories chosen: only owner/name; patterns kept.
+    let (got, text) = post(&mut b, "/routing", &[("action", "public_set"), ("repo", "not-a-repository")]);
+    assert!(got == 400 && text.contains("A repository is owner/name"), "{got} {text}");
+    let (got, text) = post(&mut b, "/routing", &[("action", "public_set"), ("repo", "acme/site"), ("repo", "acme/site")]);
+    assert!(got < 400, "{got} {text}");
+    assert_eq!(routing(&served)["public_repos"], serde_json::json!(["acme/site"]));
+    // A region added to AWS's spot machines: its network made first in the account signed in to, as AWS answered.
+    served.aws.replaying(include_str!("../fixtures/aws/regions/add.jsonl"), &[("mixplane0001", PLANE)]);
+    let (got, text) = post(&mut b, "/routing", &[("action", "pool"), ("cloud", "aws"), ("region_0", "us-east-1"), ("region_1", "eu-north-1")]);
+    assert!(got < 400, "{got} {text}");
+    until("the region kept", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_REGIONS" && v.contains("eu-north-1")));
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().unwrap_or_default().contains("ec2.eu-north-1") && a["asked"].as_str().unwrap_or_default().contains("Action=CreateVpc")), "its network made");
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&format!("{} && {}", shows("Runner providers"), shows("Stockholm")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // Not signed in to the AWS account whose limit it is: refused, saying so.
+    let served = serve(own);
+    let home = common::home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails"), ("email", "ops@example.com")]);
+    assert!(got == 403 && text.contains("Sign in with AWS first"), "{got} {text}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
