@@ -5461,6 +5461,14 @@ mod runs_suite_in_browser {
         assert_eq!(value("ANY").as_deref(), Some("any, by its branch"), "{vars}");
         for n in ["BY_BRANCH", "BY_CLASS", "BY_ONE", "BY_WORKFLOW", "BY_PATH"] { assert!(value(n).is_some(), "{n}: {vars}") }
         for n in ["NOT_HERE", "OTHER_REPO", "TAGS", "UNNAMED"] { assert!(value(n).is_none(), "{n}: {vars}") }
+        // A workflow that reads them all (toJSON(secrets)): given every one whose scope holds.
+        std::fs::write(dir.join(".github/workflows/all.yml"), "jobs:\n  all:\n    runs-on: superci\n    steps:\n      - run: echo '${{ toJSON(secrets) }}'\n").unwrap();
+        for args in [&["add", "-A"][..], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "all"]] { assert!(Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/all.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let second = served.store.under("run:").into_iter().map(|(k, _)| k.trim_start_matches("run:").to_string()).find(|k| *k != run).unwrap();
+        let vars = runner_of(&served, &second, "all").handed(&served)["variables"].clone();
+        assert!(vars["UNNAMED"]["value"].is_string(), "{vars}");
         let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
     }
