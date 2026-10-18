@@ -1399,3 +1399,38 @@ fn with_several_workspaces_each_page_and_change_says_which_and_one_is_renamed_an
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn sign_ins_that_ended_before_are_said_when_the_dashboard_opens_and_the_ci_is_still_read_with_its_key() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Its last run noted each cloud's sign-in as ended; this computer's key still reaches the control plane.
+    for (flag, said) in [("aws_ended", "AWS sign-in has ended"), ("cloudflare_ended", "Cloudflare sign-in has expired"), ("modal_ended", "Modal no longer accepts")] {
+        let served = serve(|_| {});
+        let home = home(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept[flag] = true.into();
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let (mut child, link) = dashboard(&home);
+        b.goto(&link);
+        b.wait(&format!("{} && {}", page_shows(said), shows("Usage")));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+
+#[test]
+fn a_cloudflare_token_given_and_refused_is_said_as_that_token_not_as_a_sign_in_that_ended() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    // (Cloudflare's answer to a token it does not take.)
+    served.aws.replaying(include_str!("../fixtures/cloudflare/sign-in/ended.jsonl"), &[]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_CLOUDFLARE_TOKEN", "a-token-cloudflare-refuses")]);
+    b.goto(&link);
+    b.wait(&shows("Cloudflare refuses the token in SUPERCI_CLOUDFLARE_TOKEN"));
+    assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("sign-in has ended"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

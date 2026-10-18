@@ -3702,6 +3702,11 @@ mark();load()})();</script>"#;
             if let Err(e) = d.discover() {
                 // A sign-in that ran out (Cloudflare's lasts an hour): forget it and ask again, where the user is.
                 if e.contains("(9109)") || e.contains("Invalid access token") || e.contains("sign-in expired") {
+                    // (A token given in SUPERCI_CLOUDFLARE_TOKEN is no sign-in: signing in would not replace it.)
+                    if d.cf_given {
+                        return format!(r#"<div class="bar"><h1 class="page-title">Cloudflare refuses its token</h1></div><div class="cards"><section class="card">{}</section></div>"#,
+                            empty_state(&logo("cloudflare", 40), "Cloudflare refuses the token in SUPERCI_CLOUDFLARE_TOKEN", "Give one it takes, or leave SUPERCI_CLOUDFLARE_TOKEN out and sign in with Cloudflare. Your runners keep working meanwhile.", ""))
+                    }
                     d.cf = None;
                     d.looked_cf = false;
                     return format!(r#"<div class="bar"><h1 class="page-title">Sign in again</h1></div><div class="cards"><section class="card">{}</section></div>"#,
