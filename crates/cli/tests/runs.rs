@@ -1488,3 +1488,33 @@ fn a_step_whose_result_never_came_is_judged_by_its_own_lines_and_its_failed_test
     assert!(quiet.contains("The run is over; its summary comes once its runner has sent the steps' logs"), "{quiet}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_run_the_control_plane_cannot_run_is_refused_with_why_and_starts_nothing() {
+    let served = serve(|_| {});
+    let w = ".github/workflows/";
+    let called = "on: workflow_call\njobs:\n  inner:\n    runs-on: superci\n    steps:\n      - run: true\n";
+    let calls_on = "on: workflow_call\njobs:\n  inner:\n    uses: ./.github/workflows/called.yml\n";
+    let matrix65 = format!("jobs:\n  t:\n    runs-on: superci\n    strategy:\n      matrix:\n        n: [{}]\n    steps:\n      - run: true\n", (0..65).map(|n| n.to_string()).collect::<Vec<_>>().join(", "));
+    let cases: Vec<(&str, String, &[&str], &str)> = vec![
+        ("ci.yml", "on: push\njobs: {}\n".into(), &[], "has no jobs"),
+        ("ci.yml", "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: true\n".into(), &["--job=nope"], "has no job named nope: a"),
+        ("ci.yml", "jobs:\n  a:\n    runs-on: superci\n    needs: gone\n    steps:\n      - run: true\n".into(), &[], "the job a needs gone, which"),
+        ("ci.yml", "jobs:\n  a:\n    uses: octo/repo/.github/workflows/x.yml@v1\n".into(), &[], "a workflow of another repository is not run from a computer yet"),
+        ("ci.yml", "jobs:\n  a:\n    uses: ./.github/workflows/push.yml\n".into(), &[], "which is not a workflow that may be called (on: workflow_call)"),
+        ("ci.yml", "jobs:\n  a:\n    strategy:\n      matrix:\n        n: [1, 2]\n    uses: ./.github/workflows/called.yml\n".into(), &[], "calls a workflow with a matrix: not run from a computer yet"),
+        ("ci.yml", "jobs:\n  a:\n    uses: ./.github/workflows/calls.yml\n".into(), &[], "calls a workflow in turn: not run from a computer yet"),
+        ("ci.yml", matrix65, &[], "65 jobs: a run from a computer runs 64 at most"),
+    ];
+    for (name, text, extra, refused) in cases {
+        let path = format!("{w}{name}");
+        let dir = checkout_with(&[(path.as_str(), text.as_str()), (".github/workflows/called.yml", called), (".github/workflows/calls.yml", calls_on), (".github/workflows/push.yml", "on: push\njobs:\n  p:\n    runs-on: superci\n    steps:\n      - run: true\n")]);
+        let mut args = vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"];
+        args.extend_from_slice(extra);
+        let o = superci(&served, &dir, &args).output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(!o.status.success() && err.contains(refused), "{refused}: {err}{}", String::from_utf8_lossy(&o.stdout));
+        assert!(served.store.under("run:").is_empty() && served.machines.0.lock().unwrap().is_empty(), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
