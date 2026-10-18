@@ -8104,6 +8104,46 @@ fn a_control_plane_asked_for_where_it_cannot_run_is_refused_and_one_stopped_is_s
 /// The Overview after one job, one run, its machine had in seconds: said in the singular, every job having run, the
 /// wait under a minute.
 #[test]
+fn the_overview_after_a_busy_hour_on_aws_says_its_runs_jobs_waits_and_what_github_would_have_charged() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    // From a control plane that counts runs, and one from before that does not (0.19.5).
+    for old in [None, Some("0.19.5")] {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        if let Some(v) = old { *served.aws.old_version.lock().unwrap() = Some(v.into()) }
+        served.connect_github();
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+        served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+        let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+        served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+        served.aws.fail("RunInstances", 200, &started, None);
+        // Three runs, each waiting a minute and a half for its machine and running a few minutes.
+        for name in ["build", "test", "lint"] {
+            let (id, q) = served.github.queue(name, "superci", served.now_ms());
+            assert!(served.webhook(q) < 300);
+            served.later(90_000);
+            assert!(served.webhook(served.github.start(id)) < 300);
+            served.later(4 * 60_000);
+            assert!(served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms())) < 300);
+        }
+        served.aws.fail_none();
+        // (Its runs counted at a sweep.)
+        served.upkeep();
+        let home = signed_in(&served);
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=overview"));
+        b.wait(&format!("{} && {}", reads("3 jobs"), shows("Usage")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        assert!(page.contains("min") && !page.contains("did not"), "{old:?}: {page}");
+        if old.is_none() { assert!(page.contains("3 runs"), "{page}") }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
