@@ -2112,3 +2112,20 @@ fn repositories_on_a_control_plane_too_old_for_more_organizations_or_gitlabs_say
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn providers_in_the_order_that_this_control_plane_has_not_added_are_said_and_rules_from_before_shown() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Cloudflare's containers added; the order (as after a move) names Modal too, then AWS's on-demand machines.
+    let served = serve(|_| {});
+    let home = home(&served);
+    for (order, said) in [(r#"[{"cloud":"cloudflare"},{"cloud":"modal"}]"#, "Modal is not added to this control plane yet · Add it"),
+        (r#"[{"cloud":"cloudflare"},{"cloud":"modal"},{"cloud":"aws-on-demand"}]"#, "are not added to this control plane yet · Add them")] {
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"default":null,"rules":[{{"repo":"acme/*","cloud":"cloudflare"}}],"order":{order}}}"#));
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=runners"));
+        b.wait(&format!("{} && {}", reads(said), reads("acme/* only uses")));
+        let _ = child.kill();
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
