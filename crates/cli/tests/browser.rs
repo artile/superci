@@ -2446,6 +2446,9 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
     };
     // (A machine started last: what AWS refused is tried while none of this kind's are running.)
     let answers = ["InsufficientInstanceCapacity", "VcpuLimitExceeded", "MaxSpotInstanceCountExceeded", "Unsupported", "UnauthorizedOperation", "500", ""];
+    // A machine started, as AWS answered Test's request for one.
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
     let home = signed_in(&served);
     // (Each page read anew: the jobs come between them.)
     let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
@@ -2458,8 +2461,13 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
                 served.aws.fail_none();
                 // (Each case as if first: the pools AWS had no machine in a moment ago are not remembered.)
                 served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:") && !k.starts_with("aws:unoffered:") && !k.starts_with("aws:no-fleet") && !k.starts_with("spot:"));
-                if !spot.is_empty() { let (s, a) = refusal(spot); served.aws.fail("RunInstances|MarketType", s, &a, None); served.aws.fail("CreateFleet", s, &a, None) }
-                if !od.is_empty() { let (s, a) = refusal(od); served.aws.fail("RunInstances", s, &a, None) }
+                // (Pools asked one by one, as when a role may not ask for many at once: each refusal is AWS's word
+                // for that pool.)
+                served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+                let (s, a) = if spot.is_empty() { (200, started.clone()) } else { refusal(spot) };
+                served.aws.fail("RunInstances|MarketType", s, &a, None);
+                let (s, a) = if od.is_empty() { (200, started.clone()) } else { refusal(od) };
+                served.aws.fail("RunInstances", s, &a, None);
                 let (id, q) = served.github.queue(&format!("{label} {spot} {od}"), label, served.now_ms());
                 assert!(served.webhook(q) < 300);
                 jobs.push((id, spot, od));
@@ -2489,12 +2497,47 @@ fn jobs_aws_refuses_say_on_their_pages_what_became_of_them_for_every_pair_of_ref
         }
     }
     // Every kind of end the table has, among them.
+    // And single refusals that steer a start elsewhere, on a spot machine with on-demand starting: its network or
+    // image gone, AWS's limit on requests, spot refused by the account's organization, AWS's budget stopping it.
+    let scp = superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane-testplane0001/superci is not authorized to perform: ec2:RunInstances on resource: arn:aws:ec2:us-east-1:111111111111:spot-instances-request/* with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-example001/service_control_policy/p-example1");
+    let budget = superci_testkit::ec2_error("UnauthorizedOperation", &format!("You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane-testplane0001/superci is not authorized to perform: ec2:RunInstances with an explicit deny in an identity-based policy: arn:aws:iam::111111111111:policy/{}", superci_core::aws::stop_policy_name(PLANE)));
+    let singles: Vec<(&str, u16, String)> = vec![("its subnet gone", 400, superci_testkit::ec2_error("InvalidSubnetID.NotFound", "The subnet ID 'subnet-00000000000000001' does not exist")),
+        ("its security group gone", 400, superci_testkit::ec2_error("InvalidGroup.NotFound", "The security group 'sg-00000000000000001' does not exist")),
+        ("its image gone", 400, superci_testkit::ec2_error("InvalidAMIID.NotFound", "The image id '[ami-00000000000000001]' does not exist")),
+        ("too many requests", 503, superci_testkit::ec2_error("RequestLimitExceeded", "Request limit exceeded.")),
+        ("spot refused by the organization", 403, scp), ("stopped by AWS's budget", 403, budget)];
+    let mut singled = vec![];
+    for (what, status, answer) in &singles {
+        served.aws.fail_none();
+        served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:"));
+        served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+        served.aws.fail("RunInstances|MarketType", *status, answer, None);
+        served.aws.fail("RunInstances", 200, &started, None);
+        let (id, q) = served.github.queue(what, "superci", served.now_ms());
+        assert!(served.webhook(q) < 300);
+        singled.push((id, *what));
+    }
+    served.aws.fail_none();
+    for (id, what) in &singled {
+        let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        let why = job["error"].as_str().unwrap_or_default().trim_start_matches("waiting: ").split(" (").next().unwrap_or_default().chars().take(40).collect::<String>();
+        assert!(why.is_empty() || page.to_lowercase().contains(&why.to_lowercase()), "{what}: {why:?} not on its page:\n{page}");
+        *said.entry(format!("{what}: {} {}", job["state"].as_str().unwrap_or_default(), job["error"].as_str().unwrap_or_default().chars().take(100).collect::<String>())).or_default() += 1;
+    }
     // Every kind of end, among them: at once, and once asked again.
     for kind in ["launched", "AWS lets this account run no GPU machines yet", "asking AWS's other spot pools", "Your AWS account's limits do not let this machine start", "no provider could start its machine",
         "AWS had no room for it", "InternalError", "UnauthorizedOperation"] {
         assert!(said.keys().any(|k| k.contains(kind)), "no job ended as {kind:?}: {said:#?}");
     }
     for kind in ["launched", "failed: "] { assert!(later.keys().any(|k| k.contains(kind)), "none {kind:?} later: {later:#?}") }
+    // Each of those got its machine on-demand, its spot refusal noted with it.
+    for (id, what) in &singled {
+        let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+        assert!(job["state"] == "launched" && job["on_demand"] == true, "{what}: {job}");
+    }
     b.goto(&format!("{link}&p=jobs"));
     b.wait(&shows("Recent jobs"));
     let _ = child.kill();
