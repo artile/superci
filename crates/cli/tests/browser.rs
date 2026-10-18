@@ -735,7 +735,7 @@ fn a_modal_sign_in_modal_no_longer_takes_is_said_on_every_page_as_modal_answered
 /// A form posted from the page itself (as a person who edited its fields could): the answer's status and words.
 fn post(b: &mut Browser, path: &str, fields: &[(&str, &str)]) -> (u16, String) {
     let body = fields.iter().map(|(k, v)| format!("{}={}", k, v.replace('%', "%25").replace('&', "%26").replace('=', "%3D").replace(' ', "%20").replace('+', "%2B").replace('@', "%40"))).collect::<Vec<_>>().join("&");
-    let got = b.eval(&format!("fetch({path:?}, {{method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: {{'content-type': 'application/x-www-form-urlencoded'}}, body: {body:?}}}).then(async r => [r.status, r.type === 'opaqueredirect' ? 'redirected' : (await r.text()).replace(/<(style|script)[^>]*>[\\s\\S]*?<\\/\\1>/g, ' ').replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ')])"));
+    let got = b.eval(&format!("fetch({path:?}, {{method: 'POST', credentials: 'same-origin', redirect: 'manual', headers: {{'content-type': 'application/x-www-form-urlencoded'}}, body: {body:?}}}).then(async r => [r.status, r.type === 'opaqueredirect' ? 'redirected' : (await r.text()).replace(/<(style|script)[^>]*>[\\s\\S]*?<\\/\\1>/g, ' ').replace(/<[^>]*>/g, ' ').replace(/&#39;/g, '\\x27').replace(/&quot;/g, '\\x22').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\\s+/g, ' ')])"));
     (got[0].as_u64().unwrap_or(0) as u16, got[1].as_str().unwrap_or_default().to_string())
 }
 
@@ -1460,6 +1460,39 @@ fn a_control_plane_that_does_not_answer_is_said_on_its_pages_instead_of_a_guess_
     // Settings: the workspace's own, which need no control plane.
     b.goto(&format!("{link}&p=settings"));
     b.wait(&shows("Workspace"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn gitlabs_are_connected_one_and_another_and_again_from_the_browser_and_what_is_not_one_is_refused() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let token = superci_testkit::gitlab::GitLab::connection()["token"].as_str().unwrap().to_string();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=repos"));
+    b.wait(&shows("Where jobs come from"));
+    let gitlabs = || served.aws.settings(PLANE).into_iter().filter(|(k, _)| k.starts_with("GITLAB")).map(|(k, _)| k).collect::<Vec<_>>();
+    // Refused, nothing kept: an address that is not one, a token GitLab does not take, a GitLab not connected here.
+    for (fields, said) in [
+        (vec![("url", "gitlab.com"), ("token", token.as_str()), ("which", "new")], "GitLab's address starts with https://"),
+        (vec![("url", "https://gitlab.com"), ("token", "glpat-not-a-token"), ("which", "new")], "GitLab did not accept the token"),
+        (vec![("url", "https://gitlab.com"), ("token", token.as_str()), ("which", "gnothere")], "That GitLab is not connected here"),
+    ] {
+        let (got, text) = post(&mut b, "/gitlab/connect", &fields);
+        assert!(got == 400 && text.contains(said), "{fields:?}: {got} {text}");
+        assert!(gitlabs().is_empty());
+    }
+    // The first, another beside it, and the first again (its webhooks given the new secret).
+    for which in ["new", "new", ""] {
+        let (got, text) = post(&mut b, "/gitlab/connect", &[("url", "https://gitlab.com"), ("token", &token), ("which", which)]);
+        assert!(got < 400, "{which}: {got} {text}");
+    }
+    assert_eq!(gitlabs().len(), 2, "{:?}", gitlabs());
+    // Repositories lists them both.
+    b.goto(&format!("{link}&p=repos"));
+    b.wait(&reads("GitLab"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
