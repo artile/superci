@@ -2129,3 +2129,20 @@ fn providers_in_the_order_that_this_control_plane_has_not_added_are_said_and_rul
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn the_limits_card_on_control_planes_from_before_its_limits_says_what_they_lack() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Before account limits (0.14): said in their place. Before a day's (0.15): the month's only.
+    for (version, said) in [("0.14.0", "A limit for everything, and for a cloud account, needs a newer control plane"), ("0.15.3", "this month")] {
+        let served = serve(|_| {});
+        *served.aws.old_version.lock().unwrap() = Some(version.into());
+        let home = signed_in(&served);
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=runners"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", reads(said)));
+        if version == "0.15.3" { assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("today"), "no day's limit") }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
