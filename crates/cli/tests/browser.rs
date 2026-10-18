@@ -7754,6 +7754,21 @@ fn a_runner_taking_another_jobs_work_swaps_machines_for_each_way_the_two_jobs_st
             if *other_is == "its machine coming" { assert!(so["for_job"].as_u64().is_some(), "{own_is} / {other_is}: {so}") }
         }
     }
+    // Its own start told twice; a machine left idle by a cancel taking its own job after all; a job begun on a runner
+    // none of ours told again.
+    let twice = job("started twice");
+    let (q1, q2) = (served.github.start(twice), served.github.start(twice));
+    assert!(served.webhook(q1) < 300 && served.webhook(q2) < 300);
+    assert_eq!(state(twice)["state"], "running");
+    let idle = job("left idle");
+    edit(idle, &|j| { j["state"] = "orphan".into(); });
+    assert!(served.webhook(served.github.start(idle)) < 300);
+    assert_eq!(state(idle)["state"], "running", "{}", state(idle));
+    let elsewhere = job("begun elsewhere");
+    edit(elsewhere, &|j| { j["began"] = true.into(); });
+    let mut ev = served.github.start(elsewhere);
+    ev.0 = String::from_utf8(ev.0).unwrap().replace(state(elsewhere)["runner"].as_str().unwrap(), "someone-elses-runner").into_bytes();
+    let _ = served.webhook(ev);
     served.aws.fail_none();
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
