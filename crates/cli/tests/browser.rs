@@ -6032,6 +6032,7 @@ fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_p
         ("larger than the largest machine allowed", r#"{"order":[{"cloud":"aws"}],"max_cpu":8}"#, false, vec![("superci/cpu=16", "16")]),
         ("a label that is not understood", r#"{"order":[{"cloud":"aws"}]}"#, false, vec![("superci/cpus=8", "cpus")]),
         ("nothing to run Windows", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws","off":true},{"cloud":"aws-on-demand","off":true}]}"#, false, vec![("superci/os=windows", "Nowhere to run Windows: Cloudflare runs Linux only")]),
+        ("macOS, which SuperCI does not run", r#"{"order":[{"cloud":"aws"}]}"#, false, vec![("superci/os=macos", "macOS")]),
     ];
     let mut wrong = vec![];
     for (what, routing, with_spend, jobs) in cases {
@@ -6726,6 +6727,38 @@ fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_sa
     let (mut child, link) = dashboard(&home);
     for (id, said) in [(back, "AWS took back its spot machine"), (x, "Status"), (y, "Status"), (z, "Cancelled")] {
         b.goto(&format!("{link}&p=job&id={id}&gl="));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        assert!(page.contains(said), "job {id}: no {said:?} ({}):\n{page}", state(id));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A failing runner (started to fail a job whose label is not understood) that GitHub hands another job instead: that
+/// job is said to have been failed by it, keeps its machine, and its machine then takes the first. Each page says so.
+#[test]
+fn a_failing_runner_that_takes_another_job_is_said_on_its_page_and_that_jobs_machine_takes_the_first() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    // A label no machine has: failed at once, with a runner started to say so on GitHub.
+    let (first, q) = served.github.queue("first", "superci/cpus=8", served.now_ms()); served.webhook(q);
+    let failing = format!("superci-{PLANE}-{first}-x");
+    assert!(served.store.0.lock().unwrap().contains_key(&format!("runner:{failing}")), "{:?}", served.store.0.lock().unwrap().keys().filter(|k| k.starts_with("runner:")).collect::<Vec<_>>());
+    // Another job with a label of SuperCI's: its machine; the failing runner takes it first, and fails it.
+    let (second, q) = served.github.queue("second", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start_on(second, &failing));
+    served.webhook(served.github.finish(second, "failure", "2026-10-15T10:00:01.0000000Z Error: the label is not understood", served.now_ms()));
+    assert!(state(second)["error"].as_str().unwrap_or_default().starts_with("failed by the runner started to fail first"), "{}", state(second));
+    // Its machine then takes the first job, still queued at GitHub.
+    let runner = state(second)["runner"].as_str().unwrap().to_string();
+    served.webhook(served.github.start_on(first, &runner));
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (id, said) in [(first, "Running"), (second, "Failed")] {
+        b.goto(&format!("{link}&p=job&id={id}"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
         let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
         assert!(page.contains(said), "job {id}: no {said:?} ({}):\n{page}", state(id));
