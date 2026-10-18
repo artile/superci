@@ -6384,6 +6384,14 @@ mod commands_dashboard_in_browser {
         assert!(!new.store.under(&format!("job:{id}")).is_empty(), "the job it ran came along");
         let health: serde_json::Value = ureq::get(&format!("{}/health", served.url)).call().unwrap().body_mut().read_json().unwrap();
         assert_eq!(health["moved_to"].as_str(), Some(new.url.as_str()), "{health}");
+        // A job GitHub still sends to the old one: passed on to the new one, signed as it came; an event signed by no
+        // App is not passed on.
+        let (later, queued) = served.github.queue("after the move", "superci", served.now_ms());
+        let status = served.webhook(queued);
+        assert!(status < 300, "{status} {:?}", served.github.redelivered());
+        assert!((0..60).any(|_| { std::thread::sleep(std::time::Duration::from_millis(100)); !new.store.under(&format!("job:{later}")).is_empty() }), "passed on to the new one");
+        let (_, (body, _)) = served.github.queue("forged", "superci", served.now_ms());
+        assert_eq!(served.webhook((body, format!("sha256={}", "0".repeat(64)))), 401);
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
         super::seen_in_browser(&served);

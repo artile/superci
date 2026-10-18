@@ -420,10 +420,30 @@ impl GitHub {
 impl Http for GitHub {
     async fn send(&self, r: Request) -> io::Result<Response> {
         if let Some(answer) = self.gitlab.answer(&r) { return Ok(answer) }
+        // Another control plane served on this computer (one moved to): asked as it is, as a deployed one would be.
+        if r.url.starts_with("http://127.0.0.1:") { return Ok(local(&r)) }
         self.asked.lock().unwrap().push(format!("{} {}", r.method, r.url));
         Ok(self.answer(&r).unwrap_or_else(|| {
             self.unanswered.lock().unwrap().push(format!("{} {}", r.method, r.url));
             Response::new(404, "text/plain", format!("not here: {} {}", r.method, r.url))
         }))
     }
+}
+
+/// A request to a server on this computer, made as it is (its method, headers and body), and its answer.
+fn local(r: &Request) -> Response {
+    use std::io::{Read, Write};
+    let url = url::Url::parse(&r.url).unwrap();
+    let host = format!("{}:{}", url.host_str().unwrap_or("127.0.0.1"), url.port().unwrap_or(80));
+    let Ok(mut s) = std::net::TcpStream::connect(&host) else { return Response::new(502, "text/plain", "nothing answers there") };
+    let path = format!("{}{}", url.path(), url.query().map(|q| format!("?{q}")).unwrap_or_default());
+    let mut head = format!("{} {path} HTTP/1.1\r\nhost: {host}\r\ncontent-length: {}\r\nconnection: close\r\n", r.method, r.body.len());
+    for (k, v) in &r.headers { head.push_str(&format!("{k}: {v}\r\n")) }
+    head.push_str("\r\n");
+    let _ = s.write_all(head.as_bytes()).and_then(|_| s.write_all(&r.body));
+    let mut out = vec![];
+    let _ = s.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out).to_string();
+    let status = text.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(502);
+    Response::new(status, "text/plain", text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
 }
