@@ -1694,17 +1694,30 @@ fn cloudflare_jobs_estimated_costs_are_replaced_by_what_cloudflare_measured_once
     // Three jobs on Cloudflare's containers, ended ten minutes ago; Cloudflare's usage for their containers as it answered.
     let served = serve(|_| {});
     served.connect_github();
-    for n in 1..=3 { let (id, q) = served.github.queue(&format!("job{n}"), "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(id)); served.later(60_000); served.webhook(served.github.finish(id, "success", "ok", served.now_ms())); }
+    served.connect_gitlab();
+    // (And a GitLab job, the third container; and three more that are not measured: one measured already, one whose
+    // container is no Cloudflare one, one ended a moment ago.)
+    let (gid, p) = served.gitlab.pending("gl-test", &["superci"], served.now_ms());
+    served.gitlab_webhook(p);
+    served.gitlab_webhook(served.gitlab.running(gid, served.now_ms()));
+    served.gitlab_webhook(served.gitlab.finish(gid, "success", "ok", served.now_ms()));
+    for n in 1..=5 { let (id, q) = served.github.queue(&format!("job{n}"), "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(id)); served.later(60_000); served.webhook(served.github.finish(id, "success", "ok", served.now_ms())); }
     // Each one's container as Cloudflare named it, ended ten minutes ago.
     {
         let mut store = served.store.0.lock().unwrap();
         let keys: Vec<String> = store.keys().filter(|k| k.starts_with("job:")).cloned().collect();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut keys = keys;
+        keys.sort_by_key(|k| (!k.starts_with("job:gl"), k.clone()));
         for (i, k) in keys.iter().enumerate() {
             let mut j: serde_json::Value = serde_json::from_str(&store[k]).unwrap();
-            j["machine_id"] = format!("{:064x}", i + 1).into();
+            // The GitLab job the third container, the first two GitHub jobs the others; then the three left out.
+            let n = if i == 0 { 3 } else { i };
+            j["machine_id"] = if i == 4 { "not-a-cloudflare-container".to_string() } else { format!("{n:064x}") }.into();
             j["machine_type"] = "4cpu-12gb".into();
-            j["started_ms"] = (now - 603_000).into(); j["ended_ms"] = (now - 600_000).into(); j["launched_ms"] = (now - 670_000).into();
+            let ended = if i == 5 { now - 60_000 } else { now - 600_000 };
+            j["started_ms"] = (ended - 3_000).into(); j["ended_ms"] = ended.into(); j["launched_ms"] = (ended - 10_000).into();
+            if i == 3 { j["cost_from"] = "measured".into(); j["usd"] = 0.001.into() }
             store.insert(k.clone(), j.to_string());
         }
     }
@@ -1717,8 +1730,8 @@ fn cloudflare_jobs_estimated_costs_are_replaced_by_what_cloudflare_measured_once
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=jobs"));
     b.wait(&reads("3s $0.0006 Passed"));
-    assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("≈"), "measured, not estimated");
-    until("kept as measured", || served.store.under("job:").iter().all(|(_, j)| j["cost_from"] == "measured"));
+    until("kept as measured", || served.store.under("job:").iter().filter(|(_, j)| j["cost_from"] == "measured").count() >= 4);
+    assert!(served.store.under("job:").iter().any(|(k, j)| k.starts_with("job:gl") && j["cost_from"] == "measured"), "the GitLab job measured too");
     // Runners: Cloudflare's month as it bills it (what its Workers Paid plan includes, and what is billed after).
     b.goto(&format!("{link}&p=runners"));
     b.wait(&reads("this month ·"));
