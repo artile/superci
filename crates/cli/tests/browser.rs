@@ -2201,3 +2201,51 @@ fn a_modal_sign_in_started_from_the_dashboard_waits_for_its_approval_on_the_page
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
+    let served = serve(|_| {});
+    served.connect_github();
+    let (_, q) = served.github.queue("never-taken", "superci", served.now_ms()); served.webhook(q);
+    let (b2, q) = served.github.queue("never-ends", "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(b2));
+    let (c, q) = served.github.queue("ended", "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(c)); served.webhook(served.github.finish(c, "success", "ok", served.now_ms()));
+    for ms in [11 * 60_000, 6 * 3_600_000, 25 * 3_600_000, 3 * 86_400_000] { served.later(ms); served.upkeep(); }
+    let home = home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runs");
+    b.click(".tabs a", "Jobs");
+    // Past its longest time; never started, three times: each said; the one that ended as it ended.
+    b.wait(&format!("{} && {} && {}", reads("ran past its longest time (6 hours)"), reads("did not start a machine for it, three times"), reads("ended")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+
+#[test]
+fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare","max_jobs":1}]}"#);
+    let (a, q) = served.github.queue("first", "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(a));
+    let (_, q) = served.github.queue("waits", "superci", served.now_ms()); served.webhook(q);
+    let (_, p) = served.gitlab.pending("gl-waits", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    let home = home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&reads("Cloudflare runs 1 at once — Waiting"));
+    let _ = child.kill();
+    // Hours on: the first swept, the next started in its place; a day on, the GitLab one given up.
+    for ms in [30 * 60_000, 7 * 3_600_000, 25 * 3_600_000] { served.later(ms); served.upkeep(); }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&format!("{} && {}", reads("Waited a day for room — Failed"), reads("ran past its longest time")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
