@@ -1690,6 +1690,9 @@ fn cloudflare_jobs_estimated_costs_are_replaced_by_what_cloudflare_measured_once
     b.wait(&reads("3s $0.0006 Passed"));
     assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("≈"), "measured, not estimated");
     until("kept as measured", || served.store.under("job:").iter().all(|(_, j)| j["cost_from"] == "measured"));
+    // Runners: Cloudflare's month as it bills it (what its Workers Paid plan includes, and what is billed after).
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&reads("this month ·"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
