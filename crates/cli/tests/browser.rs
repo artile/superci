@@ -1349,6 +1349,18 @@ fn the_aws_accounts_own_budget_set_raised_made_to_stop_lifted_and_removed_shows_
         if !gone.is_empty() { assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().replace('\n', " ").contains(gone), "{file}") }
     }
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    // What a budget in AWS must not be: no email address, an answer that is none of AWS's, a lift with nothing to
+    // lift, a budget with no monthly limit. Each refused, nothing changed.
+    for (fields, said) in [
+        ({ let mut f = account("120", "emails"); f.push(("email".into(), "not an address".into())); f }, "That is no email address"),
+        ({ let mut f = account("130", "emails"); f.push(("email".into(), "nobody-at-example.com".into())); f }, "That is no email address"),
+        (account("120", "sometimes"), "none, emails or stops"),
+        (account("120", "lift"), "There is no budget in AWS to lift"),
+        (account("", "emails"), "A budget in AWS needs the monthly limit"),
+    ] {
+        let (got, text) = post(&mut b, "/routing", &fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
+        assert!(got == 400 && text.contains(said), "{fields:?}: {got} {text}");
+    }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -2332,6 +2344,21 @@ fn the_limits_card_on_control_planes_from_before_its_limits_says_what_they_lack(
         b.goto(&format!("{link}&p=runners"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", reads(said)));
         if version == "0.15.3" { assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("today"), "no day's limit") }
+        // What it cannot keep is refused, saying to update it; what it can is set.
+        let refused: Vec<Vec<(&str, &str)>> = if version == "0.14.0" { vec![vec![("action", "monthly_usd"), ("usd", "100")], vec![("action", "account_usd"), ("account", "aws"), ("usd", "100")]] }
+            else { vec![vec![("action", "monthly_usd"), ("usd", "100"), ("daily", "10")], vec![("action", "account_usd"), ("account", "aws"), ("usd", "100"), ("budget", "emails")]] };
+        for fields in refused {
+            let (got, text) = post(&mut b, "/routing", &fields);
+            assert!(got == 409 && text.contains("Update the control plane first"), "{version} {fields:?}: {got} {text}");
+        }
+        if version == "0.15.3" {
+            for fields in [vec![("action", "monthly_usd"), ("usd", "100")], vec![("action", "account_usd"), ("account", "aws"), ("usd", "50")]] {
+                let (got, text) = post(&mut b, "/routing", &fields);
+                assert!(got < 400, "{fields:?}: {got} {text}");
+            }
+            b.goto(&format!("{link}&p=runners"));
+            b.wait(&reads("$100.00"));
+        }
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
     }
