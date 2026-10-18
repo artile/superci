@@ -407,6 +407,49 @@ pub fn callable(workflow: &Node) -> bool {
     }
 }
 
+/// A workflow's `on.workflow_dispatch` inputs as GitHub gives them to a manual start with `given` (NAME, VALUE): typed
+/// for `inputs` (a boolean true or false, a number a number), and as text for `github.event.inputs`. Each one not
+/// given takes its default. A workflow not started by hand, an input it does not have, one required and not given, a
+/// boolean not true or false, a number not a number, a choice not among its options: refused.
+pub fn dispatch_inputs(workflow: &Node, given: &[(String, String)]) -> Result<(serde_json::Value, serde_json::Value)> {
+    let on = workflow.get("on").or_else(|| workflow.get("true"));
+    let started = match on {
+        Some(Node::Scalar { text, .. }) => text == "workflow_dispatch",
+        Some(Node::Seq { items, .. }) => items.iter().any(|i| i.text() == Some("workflow_dispatch")),
+        Some(m @ Node::Map { .. }) => m.get("workflow_dispatch").is_some(),
+        None => false,
+    };
+    if !started { return Err("the workflow has no `on: workflow_dispatch`: GitHub would not start it by hand".into()) }
+    let defs = on.and_then(|o| o.get("workflow_dispatch")).and_then(|d| d.get("inputs"));
+    let names: Vec<String> = defs.map(|d| d.pairs().iter().filter_map(|(k, _)| k.text().map(str::to_string)).collect()).unwrap_or_default();
+    if let Some((n, _)) = given.iter().find(|(n, _)| !names.contains(n)) { return Err(format!("the workflow has no input {n} ({})", if names.is_empty() { "it has none".to_string() } else { format!("its inputs: {}", names.join(", ")) })) }
+    let (mut typed, mut text) = (serde_json::Map::new(), serde_json::Map::new());
+    for name in &names {
+        let d = defs.and_then(|d| d.get(name));
+        let field = |k: &str| d.and_then(|d| d.get(k)).and_then(|v| v.text()).map(str::to_string);
+        let kind = field("type").unwrap_or_else(|| "string".into());
+        let value = match given.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone()).or_else(|| field("default")) {
+            Some(v) => v,
+            None if field("required").as_deref() == Some("true") => return Err(format!("the workflow's input {name} is required: --input={name}=VALUE")),
+            None if kind == "boolean" => "false".into(),
+            None => String::new(),
+        };
+        let t = match kind.as_str() {
+            "boolean" => match value.as_str() { "true" => true.into(), "false" => false.into(), _ => return Err(format!("the input {name} is true or false, not “{value}”")) },
+            "number" => match value.trim().parse::<f64>() { Ok(f) => serde_json::json!(f), Err(_) if value.is_empty() => value.clone().into(), Err(_) => return Err(format!("the input {name} is a number, not “{value}”")) },
+            "choice" => {
+                let options: Vec<String> = d.and_then(|d| d.get("options")).map(|o| o.items().iter().filter_map(|i| i.text().map(str::to_string)).collect()).unwrap_or_default();
+                if !value.is_empty() && !options.contains(&value) { return Err(format!("the input {name} is one of {}, not “{value}”", options.join(", "))) }
+                value.clone().into()
+            }
+            _ => value.clone().into(),
+        };
+        typed.insert(name.clone(), t);
+        text.insert(name.clone(), value.into());
+    }
+    Ok((typed.into(), text.into()))
+}
+
 /// A called workflow's `on.workflow_call` part (its inputs, secrets and outputs), when written as a mapping.
 pub fn call_part(workflow: &Node) -> Option<&Node> { workflow.get("on").or_else(|| workflow.get("true")).and_then(|o| o.get("workflow_call")) }
 
@@ -500,5 +543,23 @@ mod tests {
         assert_eq!((c("always()"), c("${{ failure() || true }}"), c("github.ref == 'refs/heads/main'")), ("always()".to_string(), "failure() || true".to_string(), "success() && (github.ref == 'refs/heads/main')".to_string()));
         // (A name that only ends like one of them is no such question.)
         assert_eq!(c("steps.x.outputs.success == 'yes'"), "success() && (steps.x.outputs.success == 'yes')");
+    }
+
+    #[test]
+    fn a_manual_starts_inputs_are_its_defaults_and_what_is_given_typed_as_their_kinds() {
+        let wf = parse("on:\n  workflow_dispatch:\n    inputs:\n      record:\n        type: boolean\n        default: false\n      shards:\n        type: number\n        default: 2\n      browser:\n        type: choice\n        options: [chromium, webkit]\n        default: chromium\n      note:\n        required: true\njobs:\n  t:\n    runs-on: x\n    steps: [{run: x}]\n").unwrap();
+        let given = |p: &[(&str, &str)]| p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let (typed, text) = dispatch_inputs(&wf, &given(&[("note", "hi"), ("record", "true")])).unwrap();
+        assert_eq!(typed, serde_json::json!({ "record": true, "shards": 2.0, "browser": "chromium", "note": "hi" }));
+        assert_eq!(text, serde_json::json!({ "record": "true", "shards": "2", "browser": "chromium", "note": "hi" }));
+        assert!(dispatch_inputs(&wf, &[]).unwrap_err().contains("input note is required: --input=note=VALUE"));
+        assert!(dispatch_inputs(&wf, &given(&[("note", "x"), ("record", "yes")])).unwrap_err().contains("true or false, not “yes”"));
+        assert!(dispatch_inputs(&wf, &given(&[("note", "x"), ("shards", "many")])).unwrap_err().contains("a number, not “many”"));
+        assert!(dispatch_inputs(&wf, &given(&[("note", "x"), ("browser", "edge")])).unwrap_err().contains("one of chromium, webkit, not “edge”"));
+        assert!(dispatch_inputs(&wf, &given(&[("nope", "x")])).unwrap_err().contains("no input nope (its inputs: record, shards, browser, note)"));
+        let push = parse("on: push\njobs:\n  t:\n    runs-on: x\n    steps: [{run: x}]\n").unwrap();
+        assert!(dispatch_inputs(&push, &[]).unwrap_err().contains("no `on: workflow_dispatch`"));
+        let bare = parse("on: [push, workflow_dispatch]\njobs:\n  t:\n    runs-on: x\n    steps: [{run: x}]\n").unwrap();
+        assert_eq!(dispatch_inputs(&bare, &[]).unwrap(), (serde_json::json!({}), serde_json::json!({})));
     }
 }

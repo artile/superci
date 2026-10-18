@@ -999,6 +999,19 @@ fn needs_said(jobs: &[serde_json::Value], needed: &[String], call: Option<&str>,
     Ok((needs, status, all_good))
 }
 
+/// A run from a computer's event payload and inputs, at most (bytes).
+pub const RUN_EVENT_BYTES: usize = 64 * 1024;
+
+/// A run from a computer's event, in its `github` context: its payload (`github.event`), and for a pull request its
+/// branches (`head_ref`, `base_ref`), as GitHub gives them.
+fn run_event(github: &mut serde_json::Value, run: &serde_json::Value) {
+    if run["event"].is_object() { github["event"] = run["event"].clone() }
+    if run["event_name"] == "pull_request" {
+        github["head_ref"] = run["event"]["pull_request"]["head"]["ref"].as_str().unwrap_or_default().into();
+        github["base_ref"] = run["event"]["pull_request"]["base"]["ref"].as_str().unwrap_or_default().into();
+    }
+}
+
 /// A called workflow's inputs: each one's default, then what the caller gives (`with:`), read with the caller's
 /// contexts, as the input's type says (boolean, number, string). One required and not given is refused.
 fn call_inputs(part: Option<&crate::workflow::Node>, with: Option<&crate::workflow::Node>, c: &crate::expression::Contexts) -> std::result::Result<serde_json::Value, String> {
@@ -3800,8 +3813,14 @@ impl<'a> ControlPlane<'a> {
             #[serde(default)] sha: String, #[serde(default)] actor: String, #[serde(default)] event_name: String, #[serde(default)] secrets: Vec<(String, String)>,
             #[serde(default)] vars: Vec<(String, String)>, #[serde(default)] tree: Option<String>, #[serde(default)] parts: u32, #[serde(default)] layered: bool,
             /// The workflows its jobs call (`uses: ./.github/workflows/x.yml`), by path, as the working tree has them.
-            #[serde(default)] called: std::collections::BTreeMap<String, String> }
+            #[serde(default)] called: std::collections::BTreeMap<String, String>,
+            /// Its event's payload, as GitHub would send it (`github.event`), and a manual start's inputs, typed
+            /// (`inputs`): made by the command from the working tree and what it was given.
+            #[serde(default)] event: serde_json::Value, #[serde(default)] inputs: serde_json::Value }
         let r: NewRun = match serde_json::from_slice(&req.body) { Ok(r) => r, Err(e) => return Ok(Response::text(400, &format!("not a run: {e}"))) };
+        // (Kept with the run: a few KB, as GitHub's.)
+        let event_bytes = r.event.to_string().len() + r.inputs.to_string().len();
+        if event_bytes > RUN_EVENT_BYTES { return Ok(Response::text(400, &format!("its event's payload is {} KB; a run takes {} KB at most", event_bytes.div_ceil(1024), RUN_EVENT_BYTES / 1024))) }
         let wf = match crate::workflow::parse(&r.workflow) { Ok(w) => w, Err(e) => return Ok(Response::text(400, &e)) };
         let jobs = wf.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default();
         let names: Vec<String> = jobs.iter().filter_map(|(k, _)| k.text().map(str::to_string)).collect();
@@ -3884,7 +3903,7 @@ impl<'a> ControlPlane<'a> {
         // (Its name, for the cache's list: a repository GitHub does not know here has no other.)
         if ns.starts_with("local-") && !r.repository.is_empty() { let _ = self.store.put_if_absent(&format!("cachename:{ns}"), r.repository.clone()).await; }
         let run = serde_json::json!({ "at_ms": now, "workflow": r.workflow, "path": r.path, "repository": r.repository, "ref": r.reference, "sha": r.sha, "actor": r.actor,
-            "event_name": r.event_name, "secrets": r.secrets, "stored": stored, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances, "called": r.called,
+            "event_name": r.event_name, "event": if r.event.is_object() { r.event } else { serde_json::json!({}) }, "inputs": if r.inputs.is_object() { r.inputs } else { serde_json::json!({}) }, "secrets": r.secrets, "stored": stored, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances, "called": r.called,
             "cache": { "ns": ns, "default_branch": default_branch } });
         put_json(self.store, &format!("run:{run_id}"), &run).await?;
         if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
@@ -4072,9 +4091,12 @@ impl<'a> ControlPlane<'a> {
         let vars: serde_json::Map<String, serde_json::Value> = serde_json::from_value::<Vec<(String, String)>>(run["vars"].clone()).unwrap_or_default().into_iter().map(|(k, v)| (k, v.into())).collect();
         let reference = run["ref"].as_str().filter(|r| !r.is_empty()).unwrap_or("refs/heads/main");
         let mut c = serde_json::Map::new();
-        c.insert("github".into(), serde_json::json!({ "event_name": run["event_name"].as_str().filter(|e| !e.is_empty()).unwrap_or("push"), "repository": run["repository"], "ref": reference, "sha": run["sha"], "actor": run["actor"] }));
+        let mut github = serde_json::json!({ "event_name": run["event_name"].as_str().filter(|e| !e.is_empty()).unwrap_or("push"), "repository": run["repository"], "ref": reference, "sha": run["sha"], "actor": run["actor"] });
+        run_event(&mut github, run);
+        c.insert("github".into(), github);
         c.insert("vars".into(), vars.into());
-        c.insert("inputs".into(), if job["inputs"].is_object() { job["inputs"].clone() } else { serde_json::json!({}) });
+        // (A called workflow's job: what its caller gives; else a manual start's.)
+        c.insert("inputs".into(), if job["inputs"].is_object() { job["inputs"].clone() } else if run["inputs"].is_object() { run["inputs"].clone() } else { serde_json::json!({}) });
         c.insert("matrix".into(), job["matrix"].clone());
         c.insert("strategy".into(), serde_json::json!({ "fail-fast": true, "job-index": job["index"], "job-total": job["total"], "max-parallel": job["total"] }));
         c.insert("needs".into(), serde_json::Value::Object(needs.clone()));
@@ -4170,11 +4192,12 @@ impl<'a> ControlPlane<'a> {
         let reference = run["ref"].as_str().filter(|r| !r.is_empty()).unwrap_or("refs/heads/main").to_string();
         let actor = run["actor"].as_str().unwrap_or_default();
         let path = source.map(str::to_string).unwrap_or_else(|| run["path"].as_str().unwrap_or_default().to_string());
-        let github = serde_json::json!({ "event_name": run["event_name"].as_str().filter(|e| !e.is_empty()).unwrap_or("push"), "event": {}, "repository": repository,
+        let mut github = serde_json::json!({ "event_name": run["event_name"].as_str().filter(|e| !e.is_empty()).unwrap_or("push"), "event": {}, "repository": repository,
             "repository_owner": repository.split('/').next().unwrap_or_default(), "ref": reference, "ref_name": reference.rsplit('/').next().unwrap_or_default(),
             "ref_type": if reference.starts_with("refs/tags/") { "tag" } else { "branch" }, "sha": run["sha"], "actor": actor, "triggering_actor": actor,
             "workflow": wf.get("name").and_then(|n| n.text()).unwrap_or(&path), "run_id": run_id.to_string(), "run_number": "1", "run_attempt": "1",
             "server_url": "https://github.com", "api_url": "https://api.github.com", "graphql_url": "https://api.github.com/graphql", "job": key_name, "retention_days": "1" });
+        run_event(&mut github, run);
         let service = format!("{plane_url}/runner/{token}/");
         let vars: Vec<(String, String)> = serde_json::from_value(run["vars"].clone()).unwrap_or_default();
         let display = inst["name"].as_str().map(str::to_string);
@@ -4186,7 +4209,7 @@ impl<'a> ControlPlane<'a> {
         let access_token = self.identity().await?.signing.jwt(&claims)?;
         let given = crate::runner_service::Given { workflow: &own_text, path: &path, job: key_name, secrets, vars: &vars, github, service: &service,
             access_token: &access_token, ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
-            strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone(), inputs: inst["inputs"].clone() };
+            strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone(), inputs: if inst["inputs"].is_object() { inst["inputs"].clone() } else { run["inputs"].clone() } };
         let message = crate::runner_service::job_message(&given)?;
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, layered: run["layered"] == true, at_ms: now, job_id, ..Default::default() }).await?;
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),

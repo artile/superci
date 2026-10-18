@@ -158,18 +158,32 @@ fn equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// One value of an object (by its key, in any case) or an array (by its place).
+fn index(on: &Value, i: &Value) -> Value {
+    match on {
+        Value::Object(m) => { let k = text(i); m.get(&k).or_else(|| m.iter().find(|(x, _)| x.eq_ignore_ascii_case(&k)).map(|(_, v)| v)).cloned().unwrap_or(Value::Null) }
+        Value::Array(a) => a.get(number(i) as usize).cloned().unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+/// Whether an expression is a filter's items (`x.*`, and what is read of each after it).
+fn filtered(e: &Expr) -> bool { match e { Expr::Filter(_) => true, Expr::Index(on, _) => filtered(on), _ => false } }
+
 fn eval(e: &Expr, c: &Contexts) -> Result<Value> {
     Ok(match e {
         Expr::Lit(v) => v.clone(),
         Expr::Ctx(name) => c.values.get(&name.to_ascii_lowercase()).or_else(|| c.values.get(name)).cloned().unwrap_or(Value::Null),
+        // After a filter (`labels.*.name`): each item's, those that have it.
+        Expr::Index(on, i) if filtered(on) => {
+            let (on, i) = (eval(on, c)?, eval(i, c)?);
+            Value::Array(on.as_array().into_iter().flatten().map(|item| index(item, &i)).filter(|v| !v.is_null()).collect())
+        }
         Expr::Index(on, i) => {
             let (on, i) = (eval(on, c)?, eval(i, c)?);
-            match (&on, &i) {
-                (Value::Object(m), _) => { let k = text(&i); m.get(&k).or_else(|| m.iter().find(|(x, _)| x.eq_ignore_ascii_case(&k)).map(|(_, v)| v)).cloned().unwrap_or(Value::Null) }
-                (Value::Array(a), _) => a.get(number(&i) as usize).cloned().unwrap_or(Value::Null),
-                _ => Value::Null,
-            }
+            index(&on, &i)
         }
+        Expr::Filter(on) if filtered(on) => Value::Array(eval(on, c)?.as_array().into_iter().flatten().flat_map(|v| match v { Value::Object(m) => m.values().cloned().collect(), Value::Array(a) => a.clone(), _ => vec![] }).collect()),
         Expr::Filter(on) => match eval(on, c)? { Value::Object(m) => Value::Array(m.into_values().collect()), Value::Array(a) => Value::Array(a), _ => json!([]) },
         Expr::Not(x) => json!(!truthy(&eval(x, c)?)),
         Expr::Bin("&&", a, b) => { let a = eval(a, c)?; if truthy(&a) { eval(b, c)? } else { a } }
@@ -273,6 +287,11 @@ mod tests {
         assert_eq!(e("fromJSON(needs.build.outputs.list)[1]"), json!("b"));
         assert_eq!(e("join(fromJSON(needs.build.outputs.list), '+')"), json!("a+b"));
         assert_eq!(e("contains(fromJSON('[1, 2]'), 2) && 3 >= 2.5 && 'b' > 'A'"), json!(true));
+        // A pull request's labels, as label conditions read them.
+        let labelled = json!({ "github": { "event": { "pull_request": { "labels": [{ "name": "wip" }, { "name": "e2e-recordings" }] } } }, "inputs": {} }).as_object().unwrap().clone();
+        let lc = Contexts { values: &labelled, status: Status::Success };
+        assert_eq!(evaluate("github.event.pull_request.labels.*.name", &lc).unwrap(), json!(["wip", "e2e-recordings"]));
+        assert!(holds("contains(github.event.pull_request.labels.*.name, 'e2e-recordings') || inputs.record", &lc).unwrap());
         assert_eq!(e("needs.missing.result"), Value::Null);
         assert_eq!(e("'it''s'"), json!("it's"));
         assert!(evaluate("nope(1)", &c).is_err() && evaluate("1 2", &c).is_err());

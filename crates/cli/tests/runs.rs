@@ -242,6 +242,56 @@ fn a_run_followed_through_a_network_that_drops_for_a_while_is_followed_to_its_en
 }
 
 #[test]
+fn a_run_is_started_as_a_labelled_pull_request_or_a_manual_start_with_its_inputs_as_github_would_send_them() {
+    let workflow = "on:\n  pull_request:\n  workflow_dispatch:\n    inputs:\n      record:\n        type: boolean\n        default: false\njobs:\n  tests:\n    if: contains(github.event.pull_request.labels.*.name, 'e2e-recordings') || inputs.record\n    runs-on: superci\n    steps:\n      - run: make test\n";
+    let started = |args: &[&str], runs: bool| {
+        let served = serve(|_| {});
+        let dir = checkout();
+        std::fs::write(dir.join(".github/workflows/ci.yml"), workflow).unwrap();
+        let mut all = vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"];
+        all.extend(args);
+        let cli = superci(&served, &dir, &all).spawn().unwrap();
+        let run = run_of(&served);
+        let ran = (0..60).find_map(|_| { std::thread::sleep(std::time::Duration::from_millis(100)); Runner::of_run(&served, &run) });
+        assert_eq!(ran.is_some(), runs, "{args:?} {}", served.store.under(&format!("run:{run}"))[0].1);
+        // (The job its runner takes: with the payload in its `github` context.)
+        let taken = ran.map(|r| { let (_, m) = r.message(); r.finish("succeeded"); m.to_string() }).unwrap_or_default();
+        let out = cli.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        // (Kept with the run: the payload as GitHub sends it.)
+        let kept = served.store.under(&format!("run:{run}"))[0].1.clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        (said, kept, taken)
+    };
+    // A pull request with the label: its job runs, the payload labelled; without it, skipped.
+    let (_, kept, taken) = started(&["--event=pull_request", "--label=wip", "--label=e2e-recordings"], true);
+    assert!(taken.contains("e2e-recordings") && taken.contains("head_ref"), "{taken}");
+    assert_eq!((kept["event"]["action"].as_str(), kept["event"]["label"]["name"].as_str(), kept["event"]["pull_request"]["labels"][1]["name"].as_str(), kept["event"]["pull_request"]["head"]["ref"].is_string()), (Some("labeled"), Some("e2e-recordings"), Some("e2e-recordings"), true), "{kept}");
+    let (said, _, _) = started(&["--event=pull_request"], false);
+    assert!(said.contains("skipped"), "{said}");
+    // Started by hand with the input: its job runs, the input typed; its defaults otherwise.
+    let (_, kept, taken) = started(&["--event=workflow_dispatch", "--input=record=true"], true);
+    assert!(taken.contains("record"), "{taken}");
+    assert_eq!((kept["inputs"]["record"].clone(), kept["event"]["inputs"]["record"].clone()), (serde_json::json!(true), serde_json::json!("true")), "{kept}");
+    // What does not go together: refused before anything is sent.
+    let served = serve(|_| {});
+    let dir = checkout();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), workflow).unwrap();
+    std::fs::write(dir.join("event.json"), r#"{"pull_request": {"draft": true}}"#).unwrap();
+    for (args, refused) in [(&["--label=x"][..], "--label is a pull request's label"), (&["--event=workflow_dispatch", "--input=nope=1"], "The workflow has no input nope (its inputs: record)"),
+        (&["--event=workflow_dispatch", "--input=record=yes"], "true or false, not “yes”"), (&["--event=release"], "--event is push, pull_request or workflow_dispatch"), (&["--event=pull_request", "--input=record=true"], "--input is a manual start's input")] {
+        let mut all = vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--dry-run"];
+        all.extend(args);
+        let o = superci(&served, &dir, &all).output().unwrap();
+        assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(refused), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--dry-run", "--event=pull_request", "--event-payload=event.json"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(served.store.under("run:").is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_dry_run_checks_the_workflow_its_job_and_the_tree_and_starts_nothing() {
     let served = serve(|_| {});
     let dir = checkout();

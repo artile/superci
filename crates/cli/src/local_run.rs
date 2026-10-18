@@ -150,12 +150,64 @@ fn repository(root: &Path) -> String {
 #[derive(Clone, Copy, Default)]
 pub struct Follow { pub quiet: bool, pub detach: bool, pub dry_run: bool }
 
-pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: &str, secrets: &[(String, String)], vars: &[(String, String)], how: Follow, say: &mut dyn FnMut(&str)) -> Result<Done> {
+/// The event a run from a computer is started as: `push`, `pull_request` (with its labels) or `workflow_dispatch`
+/// (with its inputs), and a file of JSON put over the payload made for it.
+#[derive(Clone, Default)]
+pub struct Event { pub name: String, pub labels: Vec<String>, pub inputs: Vec<(String, String)>, pub payload: Option<String> }
+
+/// The event's payload as GitHub would send it (`github.event`), from the working tree and what was given, and a
+/// manual start's inputs, typed (`inputs`). What does not go together is refused, before anything is sent.
+fn event_payload(root: &Path, text: &str, e: &Event, reference: &str, sha: &str, actor: &str) -> Result<(Value, Value)> {
+    if !["push", "pull_request", "workflow_dispatch"].contains(&e.name.as_str()) { return Err(format!("--event is push, pull_request or workflow_dispatch, not “{}”.", e.name)) }
+    if !e.labels.is_empty() && e.name != "pull_request" { return Err("--label is a pull request's label: --event=pull_request --label=NAME.".into()) }
+    if !e.inputs.is_empty() && e.name != "workflow_dispatch" { return Err("--input is a manual start's input: --event=workflow_dispatch --input=NAME=VALUE.".into()) }
+    let repo = repository(root);
+    let (owner, name) = repo.split_once('/').unwrap_or(("local", repo.as_str()));
+    // (The default branch: origin's, else main.)
+    let default_branch = git(root, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).ok().and_then(|b| b.strip_prefix("origin/").map(str::to_string)).unwrap_or_else(|| "main".into());
+    let branch = reference.strip_prefix("refs/heads/").unwrap_or(reference).to_string();
+    let subject = git(root, &["log", "-1", "--format=%s"]).unwrap_or_default();
+    let mut payload = json!({ "repository": { "full_name": repo, "name": name, "owner": { "login": owner }, "default_branch": default_branch }, "sender": { "login": actor } });
+    let mut inputs = json!({});
+    match e.name.as_str() {
+        "push" => { payload["ref"] = reference.into(); payload["before"] = "0".repeat(40).into(); payload["after"] = sha.into(); payload["head_commit"] = json!({ "id": sha, "message": git(root, &["log", "-1", "--format=%B"]).unwrap_or_default() }); payload["pusher"] = json!({ "name": actor }) }
+        "pull_request" => {
+            // (Labelled: as GitHub sends a label's adding, the last one the label added.)
+            payload["action"] = if e.labels.is_empty() { "synchronize" } else { "labeled" }.into();
+            payload["number"] = 1.into();
+            payload["pull_request"] = json!({ "number": 1, "title": subject, "state": "open", "draft": false, "user": { "login": actor }, "head": { "ref": branch, "sha": sha }, "base": { "ref": default_branch },
+                "labels": e.labels.iter().map(|l| json!({ "name": l })).collect::<Vec<_>>() });
+            if let Some(l) = e.labels.last() { payload["label"] = json!({ "name": l }) }
+        }
+        _ => {
+            let wf = superci_core::workflow::parse(text).map_err(|err| err.to_string())?;
+            let (typed, as_text) = superci_core::workflow::dispatch_inputs(&wf, &e.inputs).map_err(|err| format!("{}{}.", &err[..1].to_uppercase(), &err[1..]))?;
+            payload["ref"] = reference.into();
+            payload["inputs"] = as_text;
+            inputs = typed;
+        }
+    }
+    // A file's JSON over it: objects merged, anything else replaced.
+    if let Some(file) = &e.payload {
+        let given: Value = serde_json::from_slice(&std::fs::read(file).map_err(|err| format!("{file}: {err}"))?).map_err(|err| format!("{file} is not JSON: {err}"))?;
+        if !given.is_object() { return Err(format!("{file} is a JSON object: the payload's fields, as GitHub's event has them.")) }
+        fn over(a: &mut Value, b: Value) { match (a, b) { (Value::Object(a), Value::Object(b)) => for (k, v) in b { over(a.entry(k).or_insert(Value::Null), v) }, (a, b) => *a = b } }
+        over(&mut payload, given);
+    }
+    let bytes = payload.to_string().len() + inputs.to_string().len();
+    if bytes > superci_core::plane::RUN_EVENT_BYTES { return Err(format!("The event's payload is {} KB; a run takes {} KB at most.", bytes.div_ceil(1024), superci_core::plane::RUN_EVENT_BYTES / 1024)) }
+    Ok((payload, inputs))
+}
+
+pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: &Event, secrets: &[(String, String)], vars: &[(String, String)], how: Follow, say: &mut dyn FnMut(&str)) -> Result<Done> {
     let here = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = std::path::PathBuf::from(git(&here, &["rev-parse", "--show-toplevel"]).map_err(|_| "Run it in a git checkout: the run takes its working tree.".to_string())?);
     let file = here.join(workflow);
     let text = std::fs::read_to_string(&file).map_err(|e| format!("{workflow}: {e}"))?;
     let path = file.canonicalize().ok().and_then(|f| f.strip_prefix(root.canonicalize().ok()?).ok().map(|p| p.to_string_lossy().replace('\\', "/"))).unwrap_or_else(|| workflow.to_string());
+    let reference = git(&root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_else(|_| "refs/heads/main".into());
+    let (sha, actor) = (git(&root, &["rev-parse", "HEAD"]).unwrap_or_default(), git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()));
+    let (payload, inputs) = event_payload(&root, &text, event, &reference, &sha, &actor)?;
     new_enough(crate::cloudflare::health(plane).as_ref().and_then(|h| h["version"].as_str()))?;
     if how.dry_run { return dry_run(&root, &path, &text, job) }
     let http = crate::aws::Blocking::new();
@@ -237,7 +289,6 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     };
     // (A layer sent at once: kept now.)
     if layer.is_some() && pending.is_none() { keep_base(&name, &now) }
-    let reference = git(&root, &["symbolic-ref", "-q", "HEAD"]).unwrap_or_else(|_| "refs/heads/main".into());
     // The workflows its jobs call (`uses: ./.github/workflows/x.yml`), from the working tree as it is.
     let mut called = serde_json::Map::new();
     if let Ok(wf) = superci_core::workflow::parse(&text) {
@@ -249,8 +300,8 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
             called.insert(p.to_string(), t.into());
         }
     }
-    let body = json!({ "workflow": text, "path": path, "job": job, "repository": repository(&root), "ref": reference, "sha": git(&root, &["rev-parse", "HEAD"]).unwrap_or_default(),
-        "actor": git(&root, &["config", "user.name"]).unwrap_or_else(|_| "superci".into()), "event_name": event, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts, "layered": layered, "called": called });
+    let body = json!({ "workflow": text, "path": path, "job": job, "repository": repository(&root), "ref": reference, "sha": sha,
+        "actor": actor, "event_name": event.name, "event": payload, "inputs": inputs, "secrets": secrets, "vars": vars, "tree": tree, "parts": parts, "layered": layered, "called": called });
     let made = call("POST", "/runs", body.to_string().into_bytes())?;
     let run = made["run_id"].as_str().unwrap_or_default().to_string();
     // Secrets its workflows name that this CI does not keep for it and that were not given: empty, as on GitHub.
