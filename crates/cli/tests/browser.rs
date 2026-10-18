@@ -620,6 +620,43 @@ fn a_jobs_page_says_what_it_had_from_the_caches_docker_images() {
     b.click("main a", "tests");
     b.wait(&shows("Docker images"));
     assert!(b.text("main").contains("103 layers from the cache (2.7 GB)"), "{}", b.text("main"));
+    // Every other shape its machine may say, each read again on the same page.
+    let page = b.eval("location.href").as_str().unwrap().to_string();
+    for (images, said) in [
+        (serde_json::json!({ "error": "the bucket was gone" }), "not kept (the bucket was gone)"),
+        (serde_json::json!({ "served": 1, "served_bytes": 1_000_000 }), "1 layer from the cache (1.0 MB)"),
+        (serde_json::json!({ "pulled": 4, "pulled_bytes": 40_000_000, "uploaded": 3, "had": 1 }), "4 layers pulled (40 MB), kept for the next job"),
+        (serde_json::json!({ "pulled": 2, "pulled_bytes": 20_000_000, "keeping": true }), "2 layers pulled (20 MB), being kept for the next job"),
+        (serde_json::json!({ "pulled": 1, "pulled_bytes": 5_000_000 }), "1 layer pulled (5.0 MB), none kept for the next job"),
+        (serde_json::json!({ "pulled": 9, "pulled_bytes": 90_000_000, "uploaded": 2, "uploaded_bytes": 20_000_000, "missing": 1, "missing_bytes": 10_000_000, "refused": 3, "failed": 3, "note": "the bucket said 503" }),
+            "2 of them kept for the next job (20 MB): 1 layer with no whole file on the machine (10 MB), 3 layers the cache would not take, 3 layers not uploaded (the bucket said 503)"),
+        (serde_json::json!({ "pulled": 2, "pulled_bytes": 2_000_000, "failed": 2 }), "2 layers not uploaded (failed)"),
+        (serde_json::json!({ "off": "no FUSE on it" }), "the cache was not set up on its machine (no FUSE on it)"),
+        (serde_json::json!({ "served": 5, "served_bytes": 5_000_000, "pulled": 1, "pulled_bytes": 1_000_000, "off": "no FUSE on it" }), "5 layers from the cache (5.0 MB); 1 layer pulled (1.0 MB), none kept for the next job; the cache was not set up"),
+    ] {
+        {
+            let mut store = served.store.0.lock().unwrap();
+            let key = store.keys().find(|k| k.starts_with("job:")).cloned().unwrap();
+            let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+            j["images"] = images;
+            store.insert(key, j.to_string());
+        }
+        b.goto(&page);
+        b.wait(&shows("Docker images"));
+        assert!(b.text("main").contains(said), "{said}: {}", b.text("main"));
+    }
+    // Nothing used: no line said.
+    {
+        let mut store = served.store.0.lock().unwrap();
+        let key = store.keys().find(|k| k.starts_with("job:")).cloned().unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&store[&key]).unwrap();
+        j["images"] = serde_json::json!({});
+        store.insert(key, j.to_string());
+    }
+    b.goto(&page);
+    b.wait(&shows("Status"));
+    assert!(!b.text("main").contains("Docker images"), "{}", b.text("main"));
+    seen_in_browser(&served);
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
