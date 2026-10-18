@@ -4992,6 +4992,41 @@ mod runs_suite_in_browser {
     }
 
     #[test]
+    fn a_job_past_its_timeout_fails_the_call_after_it_is_skipped_a_matrix_of_nothing_fails_and_a_cancel_not_heeded_ends_its_machine() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[
+            (".github/workflows/ci.yml", "jobs:\n  first:\n    runs-on: superci\n    timeout-minutes: 1\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo 'shards=[]' >> $GITHUB_OUTPUT\n  call:\n    needs: first\n    uses: ./.github/workflows/build.yml\n  shards:\n    needs: first\n    if: always()\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.first.outputs.shards || '[]') }}\n    steps:\n      - run: echo ${{ matrix.shard }}\n"),
+            (".github/workflows/build.yml", "on:\n  workflow_call:\njobs:\n  compile:\n    runs-on: superci\n    steps:\n      - run: echo compile\n"),
+        ]);
+        // Past its timeout-minutes, its runner still going: its machine ended, it fails; the call after it is
+        // skipped; the matrix read from it has nothing in it, and fails as GitHub fails it.
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let first = runner_of(&served, &run, "first");
+        first.take();
+        served.later(2 * 60_000);
+        served.upkeep();
+        let kept = served.store.under(&format!("run:{run}"))[0].1.clone();
+        let names: Vec<String> = kept["jobs"].as_array().unwrap().iter().map(|j| format!("{} {} {}", j["name"].as_str().or(j["key"].as_str()).unwrap_or_default(), j["state"], j["result"])).collect();
+        assert!(names.iter().any(|n| n.contains("call / compile") && n.contains("skipped")), "{names:?}");
+        // Another run, cancelled while its first job runs and its runner does not stop it: ended after the grace time.
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success());
+        let second = served.store.under("run:").into_iter().map(|(k, _)| k.trim_start_matches("run:").to_string()).find(|k| *k != run).unwrap();
+        let r = runner_of(&served, &second, "first");
+        r.take();
+        let o = superci(&served, &dir, &["runs", "cancel", &second]).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        served.later(10 * 60_000);
+        served.upkeep();
+        let kept = served.store.under(&format!("run:{second}"))[0].1.clone();
+        assert!(kept["jobs"].as_array().unwrap().iter().all(|j| j["state"] == "done"), "{kept}");
+        let _ = std::fs::remove_dir_all(&dir);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
     fn a_matrix_made_by_an_expression_is_read_once_the_job_it_needs_has_ended() {
         let served = serve(|_| {});
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  setup:\n    runs-on: superci\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo 'shards=[1,2,3]' >> $GITHUB_OUTPUT\n  test:\n    needs: setup\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.setup.outputs.shards) }}\n        os: [linux]\n    steps:\n      - run: echo shard ${{ matrix.shard }}\n")]);
