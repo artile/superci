@@ -9701,6 +9701,16 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
     let home = signed_in(&served);
     let cli = |args: &[&str]| { let o = common::command(&home).args(args).output().unwrap(); (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    // (A second workspace looking after the same CI, as a copy of the first: listed as its twin.)
+    let twin = home.join("workspaces/twin");
+    std::fs::create_dir_all(&twin).unwrap();
+    std::fs::copy(home.join("workspaces/default/sign-ins.json"), twin.join("sign-ins.json")).unwrap();
+    // (And a computer with none yet.)
+    let empty = common::temp("no-workspaces");
+    std::fs::create_dir_all(&empty).unwrap();
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).args(["workspaces", "list"]).env("SUPERCI_HOME", &empty).output().unwrap();
+    assert!(String::from_utf8_lossy(&o.stdout).contains("None yet") || o.status.code().is_some_and(|c| c <= 3));
+    let _ = std::fs::remove_dir_all(&empty);
     let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
     let table: Vec<Vec<&str>> = vec![
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
@@ -9724,6 +9734,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["images", "create"], vec!["images", "create", "ca-central-1", "--dry-run"], vec!["images", "update", "ca-central-1", "--dry-run"], vec!["images", "delete", "ca-central-1"], vec!["images", "delete", "mars-1", "--confirm"],
         // Keys and workspaces: what is not there, what is there already, and dry runs.
         vec!["keys", "delete"], vec!["keys", "delete", "nosuchkey"], vec!["keys", "create", "dry", "--dry-run"],
+        vec!["workspaces", "update", "--plane=testplane0001"], vec!["workspaces", "update", "--id=other"], vec!["workspaces", "delete", "--confirm"], vec!["workspaces", "list"],
         vec!["workspaces", "create"], vec!["workspaces", "create", "Globex", "--dry-run"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "list"], vec!["status", "--workspace=globex"],
         vec!["workspaces", "update", "globex", "--id=initech", "--dry-run"], vec!["workspaces", "update", "globex", "--id=initech"], vec!["workspaces", "update", "initech", "--plane=testplane0001", "--dry-run"], vec!["workspaces", "update"],
         vec!["workspaces", "delete", "initech"], vec!["workspaces", "delete", "initech", "--confirm", "--dry-run"], vec!["workspaces", "delete", "initech", "--confirm"], vec!["workspaces", "delete", "nosuch", "--confirm"],
