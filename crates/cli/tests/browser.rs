@@ -3609,6 +3609,57 @@ mod github_in_browser {
     }
 
     #[test]
+    fn a_logs_odd_lines_and_a_run_logs_zip_with_odd_files_are_read_as_far_as_they_hold() {
+        let served = serve(|_| {});
+        served.connect_github();
+        let home = signed_in(&served);
+        // A log with what a job's log can hold: a January time, colours (one never closed), a tab and a carriage
+        // return, an escape that is no colour, a line with no time, an erase-line code.
+        let log = "2026-01-15T10:00:00.0000000Z ##[group]Run make\n2026-01-15T10:00:01.0000000Z \u{1b}[1;31mred\u{1b}[0m plain \u{1b}[32mstill open\n2026-01-15T10:00:02.0000000Z tab\there\r\n2026-01-15T10:00:03.0000000Z esc\u{1b}X not a colour\nshort\n2026-01-15T10:00:04.0000000Z \u{1b}[2Kerased\n2026-01-15T10:00:05.0000000Z ##[endgroup]\n";
+        let (id, q) = served.github.queue("odd log", "superci", served.now_ms()); served.webhook(q);
+        served.webhook(served.github.start(id));
+        served.webhook(served.github.finish(id, "success", log, served.now_ms()));
+        let (mut child, link) = dashboard(&home);
+        let (status, view) = part(&link, &format!("/job/view?id={id}"));
+        assert!(status == 200 && view.contains("still open"), "{status} {view}");
+        // Steps run side by side, with its run's logs zipped: files named as no step is, and one zip whose directory is
+        // damaged (its steps' lines as they came, then).
+        fn zip_of(files: &[(&str, &[u8])], damaged: bool) -> Vec<u8> {
+            let (mut out, mut dir) = (vec![], vec![]);
+            for (name, data) in files {
+                let at = out.len() as u32;
+                let (n, size) = (name.len() as u16, data.len() as u32);
+                out.extend([0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                out.extend(size.to_le_bytes()); out.extend(size.to_le_bytes()); out.extend(n.to_le_bytes()); out.extend(0u16.to_le_bytes());
+                out.extend(name.as_bytes()); out.extend(*data);
+                dir.extend([0x50, 0x4b, if damaged { 0x09 } else { 0x01 }, 0x02, 20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                dir.extend(size.to_le_bytes()); dir.extend(size.to_le_bytes()); dir.extend(n.to_le_bytes());
+                dir.extend([0u8; 12]); dir.extend(at.to_le_bytes()); dir.extend(name.as_bytes());
+            }
+            let (cd_at, cd_len, count) = (out.len() as u32, dir.len() as u32, files.len() as u16);
+            out.extend(dir);
+            out.extend([0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]);
+            out.extend(count.to_le_bytes()); out.extend(count.to_le_bytes()); out.extend(cd_len.to_le_bytes()); out.extend(cd_at.to_le_bytes()); out.extend([0, 0]);
+            out
+        }
+        for damaged in [false, true] {
+            let (id, q) = served.github.queue("test", "superci", served.now_ms()); served.webhook(q);
+            served.webhook(served.github.start(id));
+            served.webhook(served.github.finish(id, "success", &github_log(), served.now_ms()));
+            served.github.set_steps(id, serde_json::from_str(include_str!("../fixtures/github/parallel-steps.json")).unwrap());
+            let job = served.github.job(id)["name"].as_str().unwrap_or("tests").to_string();
+            let files: Vec<(String, Vec<u8>)> = vec![(format!("{job}/1_Set up job.txt"), b"2026-10-15T10:00:00.0000000Z set up\n".to_vec()), (format!("{job}/notastep.txt"), b"x".to_vec()),
+                (format!("{job}/x_named.txt"), b"x".to_vec()), (format!("{job}/_nothing.txt"), b"x".to_vec()), ("another job/1_Set up job.txt".to_string(), b"x".to_vec())];
+            let refs: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+            served.github.run_ended(id, zip_of(&refs, damaged));
+            let (status, _) = part(&link, &format!("/job/view?id={id}"));
+            assert_eq!(status, 200);
+        }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_jobs_steps_run_side_by_side_show_their_own_lines_once_its_run_has_ended() {
         let served = serve(|_| {});
         served.connect_github();
