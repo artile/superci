@@ -2518,6 +2518,14 @@ fn a_modal_sign_in_started_before_any_other_waits_on_every_page_and_all_control_
         b.goto(&format!("{link}&p={p}"));
         b.wait("document.querySelector('main') !== null && document.querySelector('main').innerText.length > 0");
     }
+    // Approved in Modal (as its token flow answered, after a while): kept, wherever the page was.
+    let file = home.join("workspaces/default/sign-ins.json");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while !std::fs::read_to_string(&file).unwrap_or_default().contains("token_id") {
+        assert!(std::time::Instant::now() < end, "not approved: {}", b.text("body"));
+        b.goto(&format!("{link}&p=overview"));
+        b.wait("document.querySelector('main') !== null");
+    }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
     // Every control plane, listed (the one in use marked).
