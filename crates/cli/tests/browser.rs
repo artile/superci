@@ -8324,7 +8324,9 @@ fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_sa
     let notice = state(passed)["notice"].as_str().unwrap().to_string();
     served.gitlab_webhook(served.gitlab.running(passed, served.now_ms()));
     assert_eq!(say(&format!("interrupted?gl={passed}&t={notice}")), 200);
-    served.gitlab_webhook(served.gitlab.finish(passed, "success", "ok", served.now_ms()));
+    // (Its trace as GitLab writes one: sections, one without a heading, erase-line codes and carriage returns.)
+    let trace = "\u{1b}[0KRunning with gitlab-runner 17.5.0\nsection_start:1760000000:prepare_executor\r\u{1b}[0K\u{1b}[0K\u{1b}[36;1mPreparing the executor\u{1b}[0;m\nUsing Docker\nsection_end:1760000001:prepare_executor\r\u{1b}[0K\nsection_start:1760000001:step_script\r\u{1b}[0K\n$ make test\nok\nsection_end:1760000002:step_script\r\u{1b}[0K\n\u{1b}[32;1mJob succeeded\u{1b}[0;m\n";
+    served.gitlab_webhook(served.gitlab.finish(passed, "success", trace, served.now_ms()));
     assert_eq!(state(passed)["state"], "done", "{}", state(passed));
     // Run on another job's runner while its own record is over, or its own machine already running it.
     let (host, p) = served.gitlab.pending("its runner", &["superci"], served.now_ms()); served.gitlab_webhook(p);
