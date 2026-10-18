@@ -699,3 +699,26 @@ fn another_control_plane_in_the_account_is_deleted_from_its_menu_and_the_one_in_
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_modal_sign_in_modal_no_longer_takes_is_said_on_every_page_as_modal_answered() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    // (Modal's answer to a token it does not know: Unauthenticated, "Token not found".)
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/ended.jsonl"), &[]);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-superciendedrecording00", "token_secret": "as-superciendedrecording00", "workspace": "acmeci" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Modal no longer accepts your sign-in"));
+    // The control plane in AWS is read all the same, and its page says it too.
+    b.wait(&shows("Set up"));
+    b.click(".side a", "Control plane");
+    b.wait(&format!("{} && {}", shows("Modal no longer accepts your sign-in"), shows("AWS · 111111111111")));
+    assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
