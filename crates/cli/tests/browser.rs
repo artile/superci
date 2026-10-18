@@ -9995,7 +9995,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         assert!(o.status.code().is_some_and(|c| c <= 3) && said.contains("subtracts"), "{args:?}: {said}{}", String::from_utf8_lossy(&o.stderr));
     }
     let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
-    let (long_x, long_l) = ("x".repeat(80), "l".repeat(80));
+    let (long_x, long_l, long_id) = ("x".repeat(80), "l".repeat(80), format!("--id={}", "a".repeat(40)));
     let table: Vec<Vec<&str>> = vec![
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
         vec!["jobs", "list", &by_run], vec!["jobs", "list", "--run=abc"], vec!["jobs", "retrieve"], vec!["jobs", "retrieve", "abc"], vec!["jobs", "retrieve", &id_s, "--bytes=200"], vec!["jobs", "retrieve", &id_s, "--tests"],
@@ -10019,6 +10019,8 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["images", "create"], vec!["images", "create", "ca-central-1", "--dry-run"], vec!["images", "update", "ca-central-1", "--dry-run"], vec!["images", "delete", "ca-central-1"], vec!["images", "delete", "mars-1", "--confirm"],
         // Keys and workspaces: what is not there, what is there already, and dry runs.
         vec!["keys", "delete"], vec!["keys", "delete", "nosuchkey"], vec!["keys", "create", "dry", "--dry-run"],
+        vec!["workspaces", "update", "default", "--id=Bad!"], vec!["workspaces", "update", "default", "--id="], vec!["workspaces", "update", "default", &long_id], vec!["workspaces", "update", "default", "--id=-dash"],
+        vec!["workspaces", "update", "nosuch", "--id=other"], vec!["workspaces", "create", "!!!"], vec!["workspaces", "create", "Ünïcode CI", "--dry-run"], vec!["workspaces", "create", "default"],
         vec!["workspaces", "update", "--plane=testplane0001"], vec!["workspaces", "update", "--id=other"], vec!["workspaces", "delete", "--confirm"], vec!["workspaces", "list"],
         vec!["workspaces", "create"], vec!["workspaces", "create", "Globex", "--dry-run"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "create", "Globex"], vec!["workspaces", "list"], vec!["status", "--workspace=globex"],
         vec!["workspaces", "update", "globex", "--id=initech", "--dry-run"], vec!["workspaces", "update", "globex", "--id=initech"], vec!["workspaces", "update", "initech", "--plane=testplane0001", "--dry-run"], vec!["workspaces", "update"],
