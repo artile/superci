@@ -6045,3 +6045,45 @@ fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_p
     assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
 }
 
+/// Jobs on each other's runners, as GitHub hands a job to any runner with its label, and a machine that never begins
+/// its job: each job's page says where it ran and how it ended, the sweep's tries and end too.
+#[test]
+fn jobs_on_each_others_runners_and_a_machine_that_never_begins_are_said_on_their_pages() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let runner_of = |id: u64| state(id)["runner"].as_str().unwrap().to_string();
+    // Two jobs, each its machine; the second's runner takes the first, and the first's machine then the second.
+    let (a, q) = served.github.queue("first", "superci", served.now_ms()); served.webhook(q);
+    let (c, q) = served.github.queue("second", "superci", served.now_ms()); served.webhook(q);
+    let (ra, rc) = (runner_of(a), runner_of(c));
+    served.webhook(served.github.start_on(a, &rc));
+    served.webhook(served.github.start_on(c, &ra));
+    served.webhook(served.github.finish(a, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    served.webhook(served.github.finish(c, "failure", "2026-10-15T10:00:01.0000000Z not ok", served.now_ms()));
+    // A third whose machine was given its job, then the job went to another runner after its machine failed.
+    let (d, q) = served.github.queue("third", "superci", served.now_ms()); served.webhook(q);
+    let (e, q) = served.github.queue("fourth", "superci", served.now_ms()); served.webhook(q);
+    { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{d}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); j["state"] = "failed".into(); m.insert(k, j.to_string()); }
+    served.webhook(served.github.start_on(d, &runner_of(e)));
+    // A fifth whose machine never begins it: tried again by the sweep, twice, then failed with why.
+    let (f, q) = served.github.queue("fifth", "superci", served.now_ms()); served.webhook(q);
+    for _ in 0..4 { served.later(4 * 60_000); served.upkeep(); }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (id, said) in [(a, "Passed"), (c, "Failed"), (d, "Running"), (f, "Failed")] {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        assert!(page.contains(said), "job {id}: no {said:?} ({}):\n{page}", state(id));
+    }
+    // The fifth's page says why it ended.
+    let why = state(f)["error"].as_str().unwrap_or_default().chars().take(30).collect::<String>();
+    b.goto(&format!("{link}&p=job&id={f}"));
+    b.wait(&shows(&why[..1].to_uppercase()));
+    assert!(b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().to_lowercase().contains(&why.to_lowercase()), "{}", state(f));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
