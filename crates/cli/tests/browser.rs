@@ -6507,6 +6507,9 @@ fn a_machines_own_word_its_start_its_runners_log_its_lines_and_aws_taking_it_bac
     let agent = ureq::Agent::new_with_defaults();
     let say = |q: &str, body: &str| agent.post(&format!("{}/{q}", served.url)).send(body.to_string()).map(|r| r.status().as_u16()).unwrap_or_else(|e| match e { ureq::Error::StatusCode(c) => c, _ => 0 });
     let now = served.now_ms();
+    // (Its region's bucket ready: what its runner writes as it goes is kept there, and read back from there.)
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
     // How its start went: booted, its script began, its runner ready and listening.
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&boot=6.61&script={}&read={}&ready={}", now - 9000, now - 8000, now - 7000), ""), 200);
     assert_eq!(say(&format!("hello?runner={runner}&t={hello}&listening={}&gh=12", now - 3000), ""), 200);
