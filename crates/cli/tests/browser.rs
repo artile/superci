@@ -7428,3 +7428,23 @@ fn a_control_plane_asked_for_where_it_cannot_run_is_refused_and_one_stopped_is_s
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The Overview after one job, one run, its machine had in seconds: said in the singular, every job having run, the
+/// wait under a minute.
+#[test]
+fn the_overview_after_one_quick_job_says_it_in_the_singular() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(id));
+    served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=overview"));
+    b.wait(&format!("{} && {}", reads("1 job"), shows("Usage")));
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+    assert!(!page.contains("1 jobs") && !page.contains("did not run"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
