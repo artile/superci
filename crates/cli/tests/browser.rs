@@ -1642,3 +1642,38 @@ fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_de
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+fn cloudflare_jobs_estimated_costs_are_replaced_by_what_cloudflare_measured_once_it_has() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Three jobs on Cloudflare's containers, ended ten minutes ago; Cloudflare's usage for their containers as it answered.
+    let served = serve(|_| {});
+    served.connect_github();
+    for n in 1..=3 { let (id, q) = served.github.queue(&format!("job{n}"), "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(id)); served.later(60_000); served.webhook(served.github.finish(id, "success", "ok", served.now_ms())); }
+    // Each one's container as Cloudflare named it, ended ten minutes ago.
+    {
+        let mut store = served.store.0.lock().unwrap();
+        let keys: Vec<String> = store.keys().filter(|k| k.starts_with("job:")).cloned().collect();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        for (i, k) in keys.iter().enumerate() {
+            let mut j: serde_json::Value = serde_json::from_str(&store[k]).unwrap();
+            j["machine_id"] = format!("{:064x}", i + 1).into();
+            j["machine_type"] = "4cpu-12gb".into();
+            j["started_ms"] = (now - 603_000).into(); j["ended_ms"] = (now - 600_000).into(); j["launched_ms"] = (now - 670_000).into();
+            store.insert(k.clone(), j.to_string());
+        }
+    }
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(&[include_str!("../fixtures/cloudflare/01-look.jsonl"), include_str!("../fixtures/cloudflare/sign-in/usage.jsonl")].concat(), &[]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&reads("3s $0.0006 Passed"));
+    assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("≈"), "measured, not estimated");
+    until("kept as measured", || served.store.under("job:").iter().all(|(_, j)| j["cost_from"] == "measured"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
