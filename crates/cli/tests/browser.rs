@@ -609,7 +609,8 @@ fn a_control_plane_from_before_the_keys_new_name_says_why_with_a_key_alone_and_i
     let served = serve(|_| {});
     let plane = served.plane.clone();
     // Its settings under their old names, as such a control plane keeps them.
-    served.aws.put(&format!("/superci/{plane}/AGENTS"), "[]");
+    // (With a launcher in Cloudflare, which this workspace is not signed in to.)
+    served.aws.put(&format!("/superci/{plane}/AGENTS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#);
     *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
     // With this computer's key alone (no sign-in to hand it under the old name): its pages say why they do not load.
     let home = home(&served);
@@ -639,6 +640,9 @@ fn a_control_plane_from_before_the_keys_new_name_says_why_with_a_key_alone_and_i
     let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while names().iter().any(|k| k == "AGENTS" || k.starts_with("DASHBOARD_KEY_")) { assert!(std::time::Instant::now() < end, "the update did not end: {:?}; {}", names(), b.eval("document.querySelector('#side-update').innerText")); std::thread::sleep(std::time::Duration::from_millis(300)) }
     assert!(served.aws.old_version.lock().unwrap().is_none() && names().iter().any(|k| k.starts_with("DEVICE_KEY_")), "{:?}", names());
+    // Its launcher in Cloudflare was not updated with it, and that is said.
+    assert!(names().iter().any(|k| k == "LAUNCHERS"), "its launchers under the new name: {:?}", names());
+    b.wait(&page_shows("Its Cloudflare launcher was not updated"));
     b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Update to ')", shows(env!("CARGO_PKG_VERSION"))));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
