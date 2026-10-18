@@ -7205,3 +7205,70 @@ fn cloudflare_containers_are_set_and_cloudflare_and_modal_control_planes_updated
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A Modal control plane deployed from the dashboard, given its own sandboxes, read, its sandboxes taken out and the
+/// control plane deleted, as Modal answered a real workspace. Each step read on its page.
+#[test]
+fn a_modal_control_plane_is_deployed_given_sandboxes_and_deleted_from_the_dashboard_as_modal_answered() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let modal = superci_testkit::serve_as("mdplane00001", move |c| {
+        let settings = aws.modal_plane_settings();
+        c.read_settings(&settings);
+        c.own_cloud = "modal".into();
+        c.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+    });
+    modal.aws.params.lock().unwrap().remove("/superci/mdplane00001/CONTAINERS");
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00001.modal.run".into(), modal.url.clone());
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let step = |name: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/modal/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", "mdplane00001"), ("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&link);
+    let quiet = |b: &mut Browser| b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let until_page = |b: &mut Browser, page: &str, text: &str| {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            b.goto(&format!("{link}&{page}"));
+            b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+            let t = b.eval("document.body.innerText").as_str().unwrap_or_default().to_string();
+            if t.contains(text) { return }
+            assert!(std::time::Instant::now() < end, "{page}: no {text:?}:\n{t}");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    };
+    // Deployed: its images built in the workspace, `modal deploy` run in a sandbox, answering.
+    step("02-deploy");
+    quiet(&mut b);
+    assert!(post(&mut b, "/plane/modal", &[]).0 < 400);
+    until_page(&mut b, "p=planes", "acmeorg--superci-plane-mdplane00001");
+    step("03-use");
+    until_page(&mut b, "c=mdplane00001&p=planes", "Modal · acmeorg");
+    // Its own sandboxes, switched on.
+    step("04-sandboxes");
+    quiet(&mut b);
+    assert!(post(&mut b, "/runners/modal-own?c=mdplane00001", &[]).0 < 400);
+    step("05-dashboard");
+    until_page(&mut b, "c=mdplane00001&p=runners", "Sandboxes");
+    // Taken out, then deleted (its app stopped and its Dicts deleted, by Modal's own client in a sandbox).
+    step("06-remove");
+    quiet(&mut b);
+    let (got, text) = post(&mut b, "/runners/remove?c=mdplane00001", &[("cloud", "modal")]);
+    assert!(got < 400, "{got} {text}");
+    step("07-delete");
+    let _ = child.kill();
+    let (child2, link2) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&link2);
+    b.goto(&format!("{}/job/view?id=0", link2.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/plane/delete", &[("plane", "mdplane00001")]);
+    assert!(got < 400, "{got} {text}");
+    b.goto(&format!("{link2}&p=planes"));
+    b.wait(&page_shows("Deleted Modal · acmeorg"));
+    drop(child2);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
