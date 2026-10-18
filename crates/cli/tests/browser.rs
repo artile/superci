@@ -1308,3 +1308,47 @@ fn moves_deletions_and_labels_a_control_plane_cannot_take_are_refused_and_change
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_first_control_plane_is_set_up_in_aws_from_the_browser_started_over_once_and_made_as_aws_answered() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A workspace signed in to an AWS account with no control plane yet.
+    let account = superci_testkit::Aws::serve();
+    let new = superci_testkit::serve_as("deployplane1", |_| {});
+    let home = common::temp("first-home");
+    let ws = home.join("workspaces/default");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("sign-ins.json"), serde_json::json!({ "aws": { "region": "us-east-1", "account_id": "111111111111", "who": "arn:aws:sts::111111111111:assumed-role/Admin/someone",
+        "creds": { "access_key_id": "ASIAEXAMPLE", "secret_access_key": "example", "session_token": "example", "expires_at_ms": 4102444800000u64 }, "refresh_token": "", "dpop": { "private_b64": "", "kid": "" } } }).to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", "deployplane1")]);
+    b.goto(&link);
+    b.wait(&page_shows("Overview"));
+    b.goto(&format!("{link}&p=plane"));
+    b.wait(&shows("Set up"));
+    // Refused: a region not listed, an account not signed in to.
+    for (fields, status, said) in [(&[("region", "mars-north-1")][..], 400, "Choose a region from the list"), (&[("region", "us-east-1"), ("account", "222222222222")], 403, "Sign in with AWS first")] {
+        let (got, text) = post(&mut b, "/plane/aws", fields);
+        assert!(got == status && text.contains(said), "{fields:?}: {got} {text}");
+    }
+    // With nothing answered by AWS it stops, and says so; started over, what it made is removed.
+    let (got, text) = post(&mut b, "/plane/aws", &[("region", "us-east-1"), ("account", "111111111111")]);
+    assert!(got < 400, "{got} {text}");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Try again") { assert!(std::time::Instant::now() < end, "{}", common::words(&common::part(&link, "/?p=plane&fragment=1").1)); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    let (got, text) = post(&mut b, "/plane/start-over", &[]);
+    assert!(got < 400, "{got} {text}");
+    // As AWS answered a real one: made, and the overview leads on to connecting GitHub or GitLab.
+    account.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", "deployplane1"), ("http://new-plane.test", &new.url)]);
+    let (got, text) = post(&mut b, "/plane/aws", &[("region", "us-east-1"), ("account", "111111111111")]);
+    assert!(got < 400, "{got} {text}");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let page = common::words(&common::part(&link, "/?p=overview&fragment=1").1);
+        if page.contains("Connect GitHub or GitLab") && page.contains("Running") { break }
+        assert!(std::time::Instant::now() < end, "{page}");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
