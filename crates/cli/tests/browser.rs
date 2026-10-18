@@ -7334,3 +7334,21 @@ fn another_control_plane_is_deleted_from_the_dashboard_and_what_was_left_elsewhe
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// An update asked for while jobs run on Cloudflare's containers (a new setup would stop them): refused, saying how
+/// many, for two as for one.
+#[test]
+fn an_update_waits_for_the_jobs_running_on_cloudflare_saying_how_many() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    for name in ["one", "two"] { let (id, q) = served.github.queue(name, "superci/provider=cloudflare", served.now_ms()); served.webhook(q); served.webhook(served.github.start(id)); }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/plane/update", &[]);
+    assert!(got == 409 && text.contains("2 jobs are running on Cloudflare"), "{got} {text}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
