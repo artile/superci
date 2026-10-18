@@ -1184,3 +1184,26 @@ fn the_runner_image_is_copied_into_another_region_from_the_aws_accounts_section_
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn what_an_aws_account_allows_is_said_in_its_section_as_real_accounts_answered() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // A project of AWS's new sign-up (paid, and newly activated), and a classic account: as each answered.
+    for (look, said) in [
+        (include_str!("../fixtures/aws/project-paid/look.jsonl"), "AWS keeps it to Stockholm and allows it no spot machines"),
+        (include_str!("../fixtures/aws/project-activated/look.jsonl"), "The other 11 are refused. By its AWS organization"),
+        (include_str!("../fixtures/aws/classic/look.jsonl"), "All 12 SuperCI works in"),
+    ] {
+        let served = serve(|_| {});
+        served.aws.replaying(look, &[]);
+        let home = signed_in(&served);
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=planes"));
+        b.wait(&reads(said));
+        // And where machines are added, the same.
+        b.goto(&format!("{link}&p=add-runners"));
+        b.wait(&page_shows("Add a provider"));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
