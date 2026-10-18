@@ -73,8 +73,10 @@ jobs:
           npx -y supercov@4.19.0 runs latest file crates/cli/src/dashboard.rs --group decision --sort missing --limit 80
           # Each file's conditions still to show, by decision, kept with the run (to read without measuring again).
           mkdir -p gaps
-          for f in crates/cli/src/dashboard.rs crates/core/src/plane.rs crates/cli/src/commands.rs crates/cli/src/view.rs crates/cli/src/log_view.rs; do
-            npx -y supercov@4.19.0 runs latest file "$f" --group decision --sort missing --limit 3000 > "gaps/$(basename "$f" .rs).txt" || true
+          # (Every source file's, named by its path: crates/core/src/aws.rs is core-aws.txt.)
+          for f in crates/cli/src/*.rs crates/core/src/*.rs; do
+            n=$(echo "$f" | sed -e 's|^crates/||' -e 's|/src/|-|' -e 's|\.rs$||')
+            npx -y supercov@4.19.0 runs latest file "$f" --group decision --sort missing --limit 3000 > "gaps/$n.txt" || true
           done
           npx -y supercov@4.19.0 runs latest files --limit 0 > gaps/files.txt || true
       - uses: actions/upload-artifact@v4
