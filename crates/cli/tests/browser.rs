@@ -7298,3 +7298,39 @@ fn pages_open_by_older_links_a_control_plane_by_its_place_and_set_up_shown_or_no
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Another control plane in the same AWS account deleted from the dashboard, as AWS answered a real deletion: the one
+/// in use is not (that is stopping SuperCI); the other goes, and what was made for it elsewhere is said as left where
+/// it could not be deleted: its launchers in Cloudflare and Modal (not signed in to), its budget in AWS.
+#[test]
+fn another_control_plane_is_deleted_from_the_dashboard_and_what_was_left_elsewhere_is_said() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    // (The other reads its settings where the dashboard writes them: its key, its launchers, its routing.)
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    // The other one's launchers in Cloudflare and Modal, and a budget in AWS for its limit.
+    let launchers = r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0002.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners-testplane0002.modal.run"}]"#;
+    served.aws.put("/superci/testplane0002/LAUNCHERS", launchers);
+    served.aws.put("/superci/testplane0002/ROUTING", r#"{"aws_budget":{"stop":false},"order":[{"cloud":"aws"}]}"#);
+    served.aws.fail("budgets.amazonaws.com", 400, &superci_testkit::json_error("AccessDeniedException", "User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: budgets:ViewBudget"), None);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && {}", shows("Control plane"), shows(&other.url)));
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    // The one in use: refused.
+    let (got, text) = post(&mut b, "/plane/delete", &[("plane", PLANE)]);
+    assert!(got == 409 && text.contains("in use"), "{got} {text}");
+    // The other: deleted, with what is left said.
+    let (got, text) = post(&mut b, "/plane/delete", &[("plane", "testplane0002")]);
+    assert!(got < 400, "{got} {text}");
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && {} && {}", page_shows("Deleted"), page_shows("Its Cloudflare launcher (sign in with Cloudflare to remove it)"), page_shows("Its Modal launcher (sign in with Modal to remove it)")));
+    assert!(b.eval("document.body.innerText").as_str().unwrap_or_default().contains("Its budget in AWS"), "{}", b.eval("document.body.innerText"));
+    assert!(served.aws.settings("testplane0002").is_empty(), "its settings gone: {:?}", served.aws.settings("testplane0002"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
