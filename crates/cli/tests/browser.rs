@@ -6925,3 +6925,53 @@ fn a_working_trees_parts_are_taken_or_refused_and_no_run_comes_of_them() {
     assert!(served.store.under("run:").is_empty());
 }
 
+/// A GitLab job's cache on AWS: its machine keeps GitLab's cache through SuperCI's, refused until its job began (which
+/// job a runner takes is GitLab's to say), then kept as its project's by its branch; Settings lists it by the project.
+#[test]
+fn a_gitlab_jobs_cache_is_kept_as_its_projects_once_its_job_began_and_settings_lists_it() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_gitlab();
+    // (Behind its public address: machines reach the cache at it.)
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    // Its bucket ready (its cache program there).
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    let (id, p) = served.gitlab.pending("test", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(p) < 300);
+    // Its machine's start script: GitLab's runner keeps its cache at superci-cache, with a link of its own.
+    let asked = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()).unwrap();
+    let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+    use base64::Engine;
+    let script = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(data).unwrap()).unwrap();
+    assert!(script.contains("CACHE_TYPE=s3"), "GitLab's runner keeps its cache with SuperCI's: {}", script.lines().filter(|l| l.to_lowercase().contains("cache")).collect::<Vec<_>>().join("\n"));
+    let link = script.split("/cache/").nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let call = |what: &str, body: serde_json::Value| { let mut r = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body.to_string()).unwrap(); (r.status().as_u16(), serde_json::from_str::<serde_json::Value>(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default()) };
+    let key = "gl/project/250833/default-non_protected/cache.zip";
+    assert_eq!(call("tool-begin", serde_json::json!({ "tool": "gitlab", "hash": key })).0, 403, "before its job began");
+    served.gitlab_webhook(served.gitlab.running(id, served.now_ms()));
+    let (status, begun) = call("tool-begin", serde_json::json!({ "tool": "gitlab", "hash": key }));
+    assert_eq!(status, 200, "{begun}");
+    assert_eq!(call("tool-sign", serde_json::json!({ "tool": "gitlab", "hash": key, "names": ["p00001"] })).0, 200);
+    assert_eq!(call("tool-finish", serde_json::json!({ "tool": "gitlab", "hash": key, "pieces": [["p00000", 64], ["p00001", 6]] })).1["size"], 70);
+    assert_eq!(call("tool-get", serde_json::json!({ "tool": "gitlab", "hash": key })).1["pieces"].as_array().map(Vec::len), Some(2));
+    // A link that is no machine's: nothing.
+    let (status, _) = { let mut r = agent.post(&format!("{}/cache/not-a-machines-link/tool-get", served.url)).send("{}").unwrap(); (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()) };
+    assert!(status >= 400, "{status}");
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&format!("{} && {}", shows("Cache"), shows("acme/app")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
