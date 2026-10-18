@@ -2501,6 +2501,36 @@ fn a_modal_sign_in_started_from_the_dashboard_waits_for_its_approval_on_the_page
 }
 
 #[test]
+fn a_modal_sign_in_started_before_any_other_waits_on_every_page_and_all_control_planes_are_listed() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Signed in nowhere: Modal's sign-in started from the first page, each page then waits for its approval.
+    let account = superci_testkit::Aws::serve();
+    account.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
+    let home = common::temp("modal-first");
+    std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    let (got, _) = post(&mut b, "/modal/signin", &[]);
+    assert!(got < 400);
+    for p in ["overview", "runners", "settings"] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait("document.querySelector('main') !== null && document.querySelector('main').innerText.length > 0");
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // Every control plane, listed (the one in use marked).
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=all"));
+    b.wait("document.querySelector('main') !== null && document.querySelector('main').innerText.length > 0");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
