@@ -1365,6 +1365,23 @@ fn a_first_control_plane_is_set_up_in_aws_from_the_browser_started_over_once_and
         let (got, text) = post(&mut b, "/plane/aws", fields);
         assert!(got == status && text.contains(said), "{fields:?}: {got} {text}");
     }
+    // As a classic account answered: a region where the image jobs run on is not yet, refused. As a project of AWS's
+    // new sign-up: a region its organization refuses, refused, saying whose rule it is.
+    for (look, region, marker, said) in [(include_str!("../fixtures/aws/classic/look.jsonl"), "ca-central-1", "Not in Canada", "No job could start in Canada"),
+        (include_str!("../fixtures/aws/project-activated/look.jsonl"), "us-east-1", "The other 11 are refused", "AWS account 111111111111 cannot use N. Virginia")] {
+        account.replaying(look, &[]);
+        // (Looked at again, as its Refresh does; the page shows that account before anything is asked of it.)
+        post(&mut b, "/aws/look", &[("next", "?p=plane")]);
+        b.goto(&format!("{link}&p=plane"));
+        b.wait(&reads(marker));
+        let (got, text) = post(&mut b, "/plane/aws", &[("region", region), ("account", "111111111111")]);
+        assert!(got == 409 && text.contains(said), "{region}: {got} {text}");
+    }
+    // (Back to the classic account, where N. Virginia is allowed.)
+    account.replaying(include_str!("../fixtures/aws/classic/look.jsonl"), &[]);
+    post(&mut b, "/aws/look", &[("next", "?p=plane")]);
+    b.goto(&format!("{link}&p=plane"));
+    b.wait(&reads("Not in Canada"));
     // With nothing answered by AWS it stops, and says so; started over, what it made is removed.
     let (got, text) = post(&mut b, "/plane/aws", &[("region", "us-east-1"), ("account", "111111111111")]);
     assert!(got < 400, "{got} {text}");
