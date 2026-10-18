@@ -9701,16 +9701,6 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
     let home = signed_in(&served);
     let cli = |args: &[&str]| { let o = common::command(&home).args(args).output().unwrap(); (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
-    // (A second workspace looking after the same CI, as a copy of the first: listed as its twin.)
-    let twin = home.join("workspaces/twin");
-    std::fs::create_dir_all(&twin).unwrap();
-    std::fs::copy(home.join("workspaces/default/sign-ins.json"), twin.join("sign-ins.json")).unwrap();
-    // (And a computer with none yet.)
-    let empty = common::temp("no-workspaces");
-    std::fs::create_dir_all(&empty).unwrap();
-    let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).args(["workspaces", "list"]).env("SUPERCI_HOME", &empty).output().unwrap();
-    assert!(String::from_utf8_lossy(&o.stdout).contains("None yet") || o.status.code().is_some_and(|c| c <= 3));
-    let _ = std::fs::remove_dir_all(&empty);
     let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
     let table: Vec<Vec<&str>> = vec![
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
@@ -9747,6 +9737,19 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         let (code, said) = cli(args);
         assert!((0..=3).contains(&code) && !said.contains("panicked"), "{args:?}: {code} {said}");
     }
+    // (A second workspace looking after the same CI, as a copy of the first: listed as its twin.)
+    let twin = home.join("workspaces/twin");
+    std::fs::create_dir_all(&twin).unwrap();
+    std::fs::copy(home.join("workspaces/default/sign-ins.json"), twin.join("sign-ins.json")).unwrap();
+    // (And a computer with none yet.)
+    let empty = common::temp("no-workspaces");
+    std::fs::create_dir_all(&empty).unwrap();
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).args(["workspaces", "list"]).env("SUPERCI_HOME", &empty).output().unwrap();
+    assert!(String::from_utf8_lossy(&o.stdout).contains("None yet") || o.status.code().is_some_and(|c| c <= 3));
+    let _ = std::fs::remove_dir_all(&empty);
+    let (code, said) = cli(&["workspaces", "list"]);
+    assert!(code <= 3 && said.contains("twin"), "{said}");
+    let _ = std::fs::remove_dir_all(&twin);
     // The control plane named by its id, by its address, and by what is neither; and how long each part took.
     for plane in [PLANE.to_string(), served.url.clone(), format!("{}/", served.url), "nosuchplane1".to_string()] {
         let (code, said) = cli(&["status", &format!("--plane={plane}")]);
