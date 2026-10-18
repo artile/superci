@@ -25,6 +25,8 @@ struct Lab {
     next: u64,
     /// Calls answered with an error (`fail`): the method, a part of the address, the status.
     failing: Vec<(String, String, u16)>,
+    /// The token's scopes as GitLab says them, when not every one SuperCI asks for (`scopes`).
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Clone, Default)]
@@ -44,6 +46,9 @@ impl GitLab {
     pub fn fail(&self, method: &str, part: &str, status: u16) { self.lab.lock().unwrap().failing.push((method.into(), part.into(), status)) }
 
     pub fn fail_none(&self) { self.lab.lock().unwrap().failing.clear() }
+
+    /// The token's scopes as GitLab says them from now on (a token made with fewer than SuperCI asks for).
+    pub fn scopes(&self, scopes: &[&str]) { self.lab.lock().unwrap().scopes = Some(scopes.iter().map(|s| s.to_string()).collect()) }
 
     pub fn job(&self, id: u64) -> Value { self.lab.lock().unwrap().jobs.get(&id).cloned().unwrap_or_default() }
 
@@ -132,7 +137,7 @@ impl GitLab {
             ("GET", ["user"]) => ok(200, json!({ "id": 1, "username": "mona", "name": "Mona Lisa", "state": "active", "locked": false, "avatar_url": "https://www.gravatar.com/avatar/00000000000000000000000000000000?s=80&d=identicon",
                 "web_url": format!("{URL}/mona"), "created_at": "2026-01-01T00:00:00.000Z", "bot": false, "public_email": null, "email": "mona@example.com", "is_admin": false })),
             ("GET", ["personal_access_tokens", "self"]) => ok(200, json!({ "id": 4, "name": "SuperCI", "revoked": false, "created_at": "2026-10-01T10:00:00.000Z", "description": "",
-                "scopes": ["api", "create_runner", "manage_runner"], "user_id": 1, "last_used_at": "2026-10-15T10:00:00.000Z", "active": true, "expires_at": "2027-10-01" })),
+                "scopes": lab.scopes.clone().unwrap_or_else(|| vec!["api".into(), "create_runner".into(), "manage_runner".into()]), "user_id": 1, "last_used_at": "2026-10-15T10:00:00.000Z", "active": true, "expires_at": "2027-10-01" })),
             ("GET", ["projects"]) => {
                 let p = fixture("project");
                 ok(200, json!([{ "id": PROJECT, "description": p["description"], "name": "app", "name_with_namespace": "Acme / app", "path": "app", "path_with_namespace": PATH,

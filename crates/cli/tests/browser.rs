@@ -8922,6 +8922,15 @@ fn two_gitlabs_are_each_listed_on_the_permissions_card_and_repositories() {
         b.goto(&format!("{link}&p={p}"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", reads(said)));
     }
+    // Their tokens made with fewer scopes than SuperCI asks for: each said with what it lacks.
+    served.gitlab.scopes(&["read_api"]);
+    // (Read again once the control plane's ten minutes with the last answer are over.)
+    served.later(11 * 60_000);
+    let _ = child.kill();
+    let (c, link) = dashboard(&home);
+    child = c;
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", reads("Its token lacks")));
     b.goto(&format!("{link}&p=gitlab&g=gsecond"));
     b.wait(&shows("GitLab"));
     let _ = child.kill();
