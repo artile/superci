@@ -4214,12 +4214,8 @@ mark();load()})();</script>"#;
         };
         // 4. The one line a workflow needs, on Workflows.
         let label = esc(&v.label());
-        let ready_before = v.online && ((v.github && v.installed) || v.gitlab) && v.runners;
-        let workflow = if ready_before {
-            step(4, "", "<h3>Use it in a workflow</h3>".into(), format!(r#"<p>Set <code>runs-on: {label}</code> in a workflow; nothing else changes.</p><div class="do"><a class="button primary" href="/?p=workflows">Open Workflows</a></div>"#))
-        } else {
-            step(4, "locked", "<h3>Use it in a workflow</h3>".into(), format!("<p>Set <code>runs-on: {label}</code> in a workflow; nothing else changes.</p>{}", locked("GitHub or GitLab, and runners")))
-        };
+        // (Locked: once the steps before it are done the card is gone, and Overview's jobs card says the line.)
+        let workflow = step(4, "locked", "<h3>Use it in a workflow</h3>".into(), format!("<p>Set <code>runs-on: {label}</code> in a workflow; nothing else changes.</p>{}", locked("GitHub or GitLab, and runners")));
         let waiting = !v.online || (v.github && !v.installed);
         (format!(r#"<section class="card" id="setup"><div class="card-head"><h2>Set up</h2>{}</div><div class="steps">{plane}{github}{runners}{workflow}</div></section>"#, pill("open", "4 steps")), waiting)
     }
