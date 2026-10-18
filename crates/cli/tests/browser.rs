@@ -667,3 +667,35 @@ fn a_cloudflare_sign_in_cloudflare_no_longer_takes_is_said_on_every_page_as_clou
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+
+#[test]
+fn another_control_plane_in_the_account_is_deleted_from_its_menu_and_the_one_in_use_stays() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The one in use, and another beside it in the same account, AWS answering as it did a real account.
+    let served = serve(|_| {});
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Set up"));
+    b.click(".side a", "Control plane");
+    b.wait(&shows(&other.url));
+    // Its menu (the one in use has no Delete in its own), then its dialog.
+    b.eval("[...document.querySelectorAll('details.menu')].find(m => m.querySelector('.menu-pop').textContent.includes('Delete')).querySelector('summary').click(); true");
+    b.click("details.menu[open] .menu-pop button", "Delete…");
+    b.wait("document.querySelector('dialog[open]') !== null");
+    assert!(b.eval("document.querySelector('dialog[open]').innerText").as_str().unwrap().contains("its function, table, schedule, parameters and role"));
+    b.click("dialog[open] button.danger", "");
+    // Gone from the page and from AWS; the one in use keeps everything.
+    b.wait(&format!("!document.querySelector('main').innerText.includes({:?})", other.url));
+    until("its settings deleted", || served.aws.settings("testplane0002").is_empty());
+    assert!(!served.aws.settings(superci_testkit::PLANE).is_empty());
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
+    assert!(asked.iter().any(|a| a == "DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-testplane0002"), "{asked:?}");
+    assert!(!asked.iter().any(|a| a.contains("functions/superci-plane-testplane0001") && a.starts_with("DELETE")), "{asked:?}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
