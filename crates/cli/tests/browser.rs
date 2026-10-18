@@ -2097,3 +2097,18 @@ fn a_second_organizations_app_is_listed_beside_the_first_and_removed_from_reposi
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn repositories_on_a_control_plane_too_old_for_more_organizations_or_gitlabs_says_to_update_it() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    *served.aws.old_version.lock().unwrap() = Some("0.9.30".into());
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=repos"));
+    b.wait(&format!("{} && {}", reads("several organizations need 0.9.31 or newer"), reads("0.9.37")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
