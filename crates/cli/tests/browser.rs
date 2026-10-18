@@ -6461,3 +6461,34 @@ fn secrets_are_added_and_taken_out_and_keys_removed_from_settings() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Signing out with AWS, Cloudflare and Modal signed in, from Settings: each said, the workspace's sign-ins gone,
+/// and the first screen of a new SuperCI after.
+#[test]
+fn signing_out_with_every_cloud_signed_in_says_what_happened_to_each() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&shows("Sign out"));
+    // This computer's key was in the control plane; signing out takes it out there too.
+    let keys = || served.aws.settings(PLANE).into_iter().filter(|(k, _)| k.starts_with("DEVICE_KEY_")).count();
+    let before = keys();
+    b.eval("window.confirm = () => true");
+    b.eval("[...document.querySelectorAll('form[action=\"/signout\"] button')][0].click()");
+    b.wait(&page_shows("Signed out."));
+    until("its sign-ins removed", || !file.exists());
+    assert!(keys() <= before, "{before} → {}", keys());
+    // Afterwards: the first screen, nothing of the workspace's.
+    b.goto(&link);
+    b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+    assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().contains("AWS · 111111111111"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
