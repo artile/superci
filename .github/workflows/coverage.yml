@@ -1,7 +1,15 @@
 name: Coverage
 
-# The tests, measured by supercov: lines, branches and MC/DC, each test's own. Run by hand (Actions → Coverage).
-on: workflow_dispatch
+# The tests, measured by supercov: lines, branches and MC/DC, each test's own. Run by hand (Actions → Coverage):
+# every test, or the browser suite alone (what the dashboard and control plane are covered by end to end, in Chrome).
+on:
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: Every test, or the browser suite alone
+        type: choice
+        options: [all, browser]
+        default: all
 
 permissions:
   contents: read
@@ -39,6 +47,7 @@ jobs:
           grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
           sudo modprobe erofs && grep erofs /proc/filesystems
       - name: The tests, measured
+        if: inputs.tests != 'browser'
         # (In supercov's own copy of the repository: what ./build.sh built is found in this one.)
         env:
           SUPERCI_BUILT: ${{ github.workspace }}
@@ -46,15 +55,36 @@ jobs:
           SUPERCI_LAYERS_E2E: "1"
           IMAGES: mirror.gcr.io/library
         run: npx -y supercov@4.19.0 -- cargo test --workspace
+      - name: The browser suite, measured
+        if: inputs.tests == 'browser'
+        env:
+          SUPERCI_BUILT: ${{ github.workspace }}
+          # (A page waits longer under a coverage run, a few at a time.)
+          SUPERCI_BROWSER_WAIT_S: "120"
+        run: |
+          # (Its tests skip themselves where there is no Chrome: a measure of skipped tests would say nothing.)
+          google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
+          npx -y supercov@4.19.0 -- cargo test -p superci --no-fail-fast --test browser -- --test-threads=4
       - name: What the tests reach
         if: always()
         run: |
           npx -y supercov@4.19.0 runs latest
           npx -y supercov@4.19.0 runs latest gaps
           npx -y supercov@4.19.0 runs latest file crates/cli/src/dashboard.rs --group decision --sort missing --limit 80
+          # Each file's conditions still to show, by decision, kept with the run (to read without measuring again).
+          mkdir -p gaps
+          for f in crates/cli/src/dashboard.rs crates/core/src/plane.rs crates/cli/src/commands.rs crates/cli/src/view.rs crates/cli/src/log_view.rs; do
+            npx -y supercov@4.19.0 runs latest file "$f" --group decision --sort missing --limit 3000 > "gaps/$(basename "$f" .rs).txt" || true
+          done
+          npx -y supercov@4.19.0 runs latest files --limit 0 > gaps/files.txt || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage
           path: .supercov/runs
           include-hidden-files: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gaps
+          path: gaps
