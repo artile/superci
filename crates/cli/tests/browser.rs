@@ -4977,6 +4977,21 @@ mod runs_suite_in_browser {
     }
 
     #[test]
+    fn one_job_asked_for_brings_the_jobs_it_needs_a_matrix_with_nothing_in_it_runs_nothing_and_a_secret_not_kept_is_said() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.NOT_KEPT }}\n  none:\n    needs: build\n    runs-on: superci\n    strategy:\n      matrix:\n        include: []\n    steps:\n      - run: echo none\n  test:\n    needs: [build, none]\n    runs-on: superci\n    steps:\n      - run: echo test\n  other:\n    runs-on: superci\n    steps:\n      - run: echo other\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--job=test", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success(), "{said}");
+        let run = run_of(&served);
+        let kept = served.store.under(&format!("run:{run}"))[0].1.clone();
+        let keys: Vec<&str> = kept["jobs"].as_array().unwrap().iter().filter_map(|j| j["key"].as_str()).collect();
+        assert!(keys.contains(&"build") && keys.contains(&"test") && !keys.contains(&"other") && !keys.contains(&"none"), "{keys:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
     fn a_matrix_made_by_an_expression_is_read_once_the_job_it_needs_has_ended() {
         let served = serve(|_| {});
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  setup:\n    runs-on: superci\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo 'shards=[1,2,3]' >> $GITHUB_OUTPUT\n  test:\n    needs: setup\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.setup.outputs.shards) }}\n        os: [linux]\n    steps:\n      - run: echo shard ${{ matrix.shard }}\n")]);
