@@ -80,6 +80,9 @@ pub struct Served { pub plane: String, pub url: String, pub store: Shared, pub m
 
 impl Served {
     /// Moves the control plane's time on by `ms`.
+    /// Time passing, for a hook (`Aws::during`): each call moves this control plane's clock on by `ms`.
+    pub fn ticker(&self) -> impl Fn(u64) + Send + Sync + 'static { let c = self.clock.0.clone(); move |ms| { c.fetch_add(ms, std::sync::atomic::Ordering::SeqCst); } }
+
     pub fn later(&self, ms: u64) { self.clock.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst); }
 
     /// The control plane's time now.
@@ -305,6 +308,8 @@ pub struct Aws {
     /// its status and answer, and how many more times (none: every time). Written as AWS documents its errors, for what
     /// a test cannot have a real account answer (throttling, a fault of AWS's, an organization's policy).
     pub failing: Arc<Mutex<Vec<(String, u16, String, Option<u32>)>>>,
+    /// What happens as an action is asked (`during`): time passing while AWS answers, a job's end arriving meanwhile.
+    pub during: Arc<Mutex<Vec<(String, Arc<dyn Fn() + Send + Sync>)>>>,
 }
 
 /// EC2's error answer (and IAM's, STS's: the query APIs'), as AWS documents it.
@@ -502,6 +507,9 @@ impl Aws {
     /// `action` answered with this error from now on: `times` times, or every time.
     pub fn fail(&self, action: &str, status: u16, answer: &str, times: Option<u32>) { self.failing.lock().unwrap().push((action.to_string(), status, answer.to_string(), times)) }
 
+    /// `f` run each time `action` is asked (as `fail` matches it), before it is answered.
+    pub fn during(&self, action: &str, f: impl Fn() + Send + Sync + 'static) { self.during.lock().unwrap().push((action.to_string(), Arc::new(f))) }
+
     /// No call answered with an error any more (each answered as before `fail`).
     pub fn fail_none(&self) { self.failing.lock().unwrap().clear() }
 
@@ -523,6 +531,9 @@ impl Aws {
 
     /// The same, with the answer's headers.
     pub fn handle_full(&self, method: &str, url: &str, target: &str, asked: &str) -> (u16, Vec<(String, String)>, String) {
+        let doing = action(target, asked);
+        let hooks: Vec<Arc<dyn Fn() + Send + Sync>> = self.during.lock().unwrap().iter().filter(|(a, _)| a.split('|').all(|p| p == doing || url.contains(p) || asked.contains(p))).map(|(_, f)| f.clone()).collect();
+        for f in hooks { f() }
         // (AWS's own public parameters, `/aws/service/…`, are not the account's: as a recording has them.)
         if let Some((status, headers, answer)) = self.failed(url, target, asked) {
             self.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": target, "asked": asked, "status": status, "answer": answer }));

@@ -7801,6 +7801,94 @@ fn each_way_aws_spot_machines_stand_decides_how_a_job_starts_and_its_page_says_s
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Starts as AWS takes its time and as jobs end meanwhile: spot pools asked until the start's time is up (the next
+/// try below spot machines), a job cancelled while its machine was asked for (the machine ended at once), one whose
+/// record ended meanwhile, a machine family with its own disk SuperCI does not know. Each job's page says how it stands.
+#[test]
+fn starts_that_take_aws_long_or_whose_jobs_end_meanwhile_settle_each_job_and_its_page_says_so() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let fresh = || { served.aws.fail_none(); served.aws.during.lock().unwrap().clear(); served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:") && !k.starts_with("spot:")); served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string()); };
+    let no_room = superci_testkit::ec2_error("InsufficientInstanceCapacity", "no");
+    let mut ids = vec![];
+    // Every spot pool full, AWS taking six seconds a request: out of time, the next try below spot machines.
+    fresh();
+    served.aws.fail("RunInstances|MarketType", 400, &no_room, None);
+    served.aws.fail("RunInstances", 200, &started, None);
+    let tick = served.ticker();
+    served.aws.during("RunInstances", move || tick(6_000));
+    let (slow, q) = served.github.queue("slow", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    for _ in 0..10 { if state(slow)["state"] != "waiting" { break } served.later(25_000); served.upkeep(); }
+    assert!(state(slow)["no_spot"] == true || state(slow)["on_demand"] == true || state(slow)["error"].as_str().unwrap_or_default().contains("out of time"), "{}", state(slow));
+    ids.push(slow);
+    // Cancelled while its machine was asked for: the machine it is given is ended at once, the job cancelled.
+    fresh();
+    served.aws.fail("RunInstances", 200, &started, None);
+    let (gone, q) = served.github.queue("gone meanwhile", "superci", served.now_ms());
+    let store = served.store.0.clone();
+    let now = served.now_ms();
+    served.aws.during("RunInstances", move || { store.lock().unwrap().insert(format!("gone:{gone}"), now.to_string()); });
+    assert!(served.webhook(q) < 300);
+    assert_eq!(state(gone)["state"], "cancelled", "{}", state(gone));
+    ids.push(gone);
+    // Its record ended meanwhile (cancelled by its event as the machine was asked for).
+    fresh();
+    served.aws.fail("RunInstances", 200, &started, None);
+    let (ended, q) = served.github.queue("ended meanwhile", "superci", served.now_ms());
+    let store = served.store.0.clone();
+    served.aws.during("DescribeImages", move || {
+        let mut m = store.lock().unwrap();
+        let k = format!("job:{ended}");
+        if let Some(v) = m.get(&k).cloned() { let mut j: serde_json::Value = serde_json::from_str(&v).unwrap(); j["state"] = "cancelled".into(); j["ended_ms"] = now.into(); j["rev"] = (j["rev"].as_u64().unwrap_or(0) + 1).into(); m.insert(k, j.to_string()); }
+    });
+    assert!(served.webhook(q) < 300);
+    ids.push(ended);
+    // A family with its own disk SuperCI does not know (as AWS gave it): its files on the standard disk.
+    fresh();
+    served.aws.fail("RunInstances", 200, &started.replace("c8a.xlarge", "m5d.xlarge"), None);
+    let (odd, q) = served.github.queue("odd family", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    assert!(state(odd)["local_disk"] != true, "{}", state(odd));
+    ids.push(odd);
+    fresh();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane whose own containers are Modal's: a job started there, sized for it, and stopped once over.
+#[test]
+fn a_control_plane_whose_own_containers_are_modals_starts_and_stops_a_job_there() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| { c.own_cloud = "modal".into(); });
+    served.connect_github();
+    let (id, q) = served.github.queue("on modal", "superci/cpu=2", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert_eq!(job["state"], "launched", "{job}");
+    served.webhook(served.github.start(id));
+    served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=job&id={id}"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// GitLab's jobs on AWS: one whose spot machine AWS takes back, retried at GitLab and run again off spot machines; an
 /// event delivered twice; one taken by another job's runner; one cancelled while its machine starts. Each job's page
 /// says how it went.
@@ -8149,7 +8237,7 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
     let job = |label: &str| { let (id, q) = served.github.queue(label, label, served.now_ms()); assert!(served.webhook(q) < 300); id };
     let mut ids = vec![];
     let runs = || served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).count();
-    for label in ["superci", "superci/arch=arm64", "superci/os=windows"] {
+    for label in ["superci", "superci/arch=arm64", "superci/os=windows", "superci/image=ubuntu26/docker-cache=true", "superci/image=ubuntu26/docker-cache=true/scratch=ramdisk"] {
         let before = runs();
         let id = job(label);
         assert!(runs() > before, "{label}: no machine asked for: {}", served.store.under(&format!("job:{id}"))[0].1);
@@ -8157,6 +8245,7 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         assert!(s.contains("plane.acme.test/cache/"), "{label}: {}", s.lines().filter(|l| l.contains("cache")).collect::<Vec<_>>().join("\n"));
         ids.push(id);
     }
+    assert!(served.store.under("job:").iter().any(|(_, j)| j["layers"] == true), "Docker's images kept from the start for one: {:?}", served.store.under("job:").iter().map(|(_, j)| (j["label"].clone(), j["layers"].clone(), j["keeps"].clone())).collect::<Vec<_>>());
     // Docker's images not kept: the cache still there.
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{order},"cache":{{"images_off":true}}}}"#));
     ids.push(job("superci"));
