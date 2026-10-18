@@ -6796,3 +6796,37 @@ fn a_failing_runner_that_takes_another_job_is_said_on_its_page_and_that_jobs_mac
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// What the dashboard finds in the AWS account it is signed in to, by the roles SuperCI made there (as IAM lists them):
+/// another CI's control plane, listed apart; a control plane elsewhere whose machines run here, only seen; and the
+/// workspace's own one deleted in AWS meanwhile, dropped from the workspace.
+#[test]
+fn control_planes_found_in_aws_are_listed_apart_seen_or_dropped_when_deleted_there() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let role = |name: &str, description: &str| format!("<member><Path>/</Path><RoleName>{name}</RoleName><RoleId>AROAEXAMPLE{:09}</RoleId><Arn>arn:aws:iam::111111111111:role/{name}</Arn><CreateDate>2026-10-18T10:00:00Z</CreateDate><Description>{description}</Description><MaxSessionDuration>3600</MaxSessionDuration></member>", name.len());
+    let roles = |members: &[String]| format!("<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{}</Roles></ListRolesResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ResponseMetadata></ListRolesResponse>", members.concat());
+    // Its own, another CI's beside it, and the role a control plane on Cloudflare runs its AWS machines with.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.fail("ListRoles", 200, &roles(&[role(&format!("superci-plane-{PLANE}"), &format!("Runs the SuperCI control plane {} (Lambda, us-east-1, runs-on superci).", served.url)),
+        role("superci-plane-otherci000001", "Runs the SuperCI control plane https://otherci.example (Lambda, us-east-1, runs-on otherci)."),
+        role("superci-plane-elsewhere0001", "Assumed by the SuperCI control plane https://superci.acme.workers.dev (OpenID Connect) to run GitHub Actions jobs.")]), None);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Control plane")));
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+    assert!(page.contains("AWS · 111111111111") && page.contains("otherci000001"), "{page}");
+    let _ = child.kill();
+    // Deleted in AWS meanwhile: no role of its any more. Dropped from the workspace; the page starts anew.
+    served.aws.fail_none();
+    served.aws.fail("ListRoles", 200, &roles(&[]), None);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+    let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+    assert!(!page.contains("AWS · 111111111111 · us-east-1"), "{page}");
+    let kept = std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap_or_default();
+    assert!(!kept.contains("\"plane\":{\"Aws\""), "dropped from the workspace: {kept}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
