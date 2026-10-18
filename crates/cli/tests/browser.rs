@@ -8165,6 +8165,45 @@ fn the_overview_after_a_busy_hour_on_aws_says_its_runs_jobs_waits_and_what_githu
 }
 
 #[test]
+fn finished_jobs_logs_are_read_whole_kept_for_the_next_opens_and_raw_ones_go_to_github() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let mut ids = vec![];
+    for n in 0..6 {
+        let (id, q) = served.github.queue(&format!("job {n}"), "superci", served.now_ms());
+        served.webhook(q);
+        served.webhook(served.github.start(id));
+        served.webhook(served.github.finish(id, "success", &format!("2026-10-15T10:00:01.0000000Z job {n} says ok\n"), served.now_ms()));
+        ids.push(id);
+    }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let get = |b: &mut Browser, path: &str| -> (u16, String) {
+        let got = b.eval(&format!("fetch({path:?}, {{credentials: 'same-origin', redirect: 'manual'}}).then(async r => [r.status, await r.text()])"));
+        (got[0].as_u64().unwrap_or(0) as u16, got[1].as_str().unwrap_or_default().to_string())
+    };
+    // Each finished job's log, whole; more than are kept for the next opens, then the first again.
+    for (n, id) in ids.iter().enumerate().chain(std::iter::once((0, &ids[0]))) {
+        let (status, text) = get(&mut b, &format!("/job/view?id={id}"));
+        assert!(status == 200 && text.contains(&format!("job {n} says ok")), "{id}: {status} {text}");
+    }
+    // Its raw log: from GitHub's own link.
+    let (status, _) = get(&mut b, &format!("/job/raw?id={}", ids[1]));
+    assert!(status == 200 || status == 0 || (300..400).contains(&status), "{status}");
+    // A GitLab job's address that is no job here, and one with a letter no id has.
+    let (status, _) = get(&mut b, "/job/view?id=17000000099&gl=gl-2nd");
+    assert!(status < 500, "{status}");
+    let (status, _) = get(&mut b, "/job/view?id=1&gl=Bad!");
+    assert_eq!(status, 400);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
