@@ -861,7 +861,9 @@ fn everything_a_ci_has_comes_along_when_it_moves_to_another_control_plane_from_t
     served.connect_gitlab();
     let plane = PLANE;
     for (k, v) in [("NAME", "AcmeCI"), ("LABELS", r#"["acmeci","acmeci-big"]"#), ("CF_LOCATION", "weur"), ("CF_IMAGE", "https://images.example.com/full:1"),
-        ("AWS_NETWORKS", r#"{"us-east-1":{"subnets":["subnet-0123456789abcdef0"],"security_groups":["sg-0123456789abcdef0"]}}"#), ("CONTAINERS", "off")] {
+        ("AWS_NETWORKS", r#"{"us-east-1":{"subnets":["subnet-0123456789abcdef0"],"security_groups":["sg-0123456789abcdef0"]}}"#), ("CONTAINERS", "off"),
+        // (A second GitLab, under its own id.)
+        ("GITLAB_gsecond", r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gsecond"}"#)] {
         served.aws.put(&format!("/superci/{plane}/{k}"), v);
     }
     let aws = served.aws.clone();
@@ -883,7 +885,7 @@ fn everything_a_ci_has_comes_along_when_it_moves_to_another_control_plane_from_t
     let has = |k: &str| served.aws.settings("testplane0002").into_iter().find(|(n, _)| n == k).map(|(_, v)| v);
     let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
     while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "moved: {:?}; page {}", served.aws.settings("testplane0002").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), b.eval("document.querySelector('main').innerText.slice(0, 600)")); std::thread::sleep(std::time::Duration::from_millis(300)) }
-    for k in ["GITHUB_APP", "GITLAB", "NAME", "LABELS", "CF_LOCATION", "CF_IMAGE", "AWS_NETWORKS"] { assert!(has(k).is_some(), "{k}: {:?}", served.aws.settings("testplane0002")) }
+    for k in ["GITHUB_APP", "GITLAB", "GITLAB_gsecond", "NAME", "LABELS", "CF_LOCATION", "CF_IMAGE", "AWS_NETWORKS"] { assert!(has(k).is_some(), "{k}: {:?}", served.aws.settings("testplane0002")) }
     assert_eq!(has("NAME").as_deref(), Some("AcmeCI"));
     assert!(served.aws.settings("testplane0002").iter().any(|(k, _)| k.starts_with("SECRET_")), "the secret came along");
     let _ = child.kill();
