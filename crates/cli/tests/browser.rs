@@ -4033,6 +4033,15 @@ mod github_in_browser {
             assert!(status >= 200, "{ac}");
             assert!(post("begin", serde_json::json!({ "token": t, "key": "deps-scoped", "version": version })).0 >= 400, "{ac}");
         }
+        // Tokens that are no job's: in two parts, claiming another algorithm or a key GitHub has not, not valid yet.
+        use base64::Engine;
+        let b64 = |v: serde_json::Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+        let claims = b64(serde_json::json!({ "repository_id": "197814629", "ac": "[]", "exp": exp }));
+        let later_on = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "197814629", "ac": "[]", "exp": exp, "nbf": exp - 10 }));
+        for t in [format!("{}.{claims}", b64(serde_json::json!({ "alg": "RS256" }))), format!("{}.{claims}.c2ln", b64(serde_json::json!({ "alg": "HS256", "kid": "x" }))),
+            format!("{}.{claims}.c2ln", b64(serde_json::json!({ "alg": "RS256", "kid": "no-such-key" }))), later_on] {
+            assert_eq!(post("lookup", serde_json::json!({ "token": t, "key": "deps-main", "version": version })).0, 403, "{t}");
+        }
         let empty_repo = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "", "ac": "[]", "exp": exp }));
         assert_eq!(post("lookup", serde_json::json!({ "token": empty_repo, "key": "deps-main", "version": version })).0, 403);
         // Keys GitHub's client would not send: empty, too long, with a comma or a control character.
@@ -9666,6 +9675,11 @@ fn each_address_a_machine_or_computer_calls_without_its_link_or_key_finds_nothin
         let url = format!("{}{path}", served.url);
         let status = if method == "GET" { agent.get(&url).call().map(|r| r.status().as_u16()).unwrap_or(0) } else { agent.post(&url).send("{}").map(|r| r.status().as_u16()).unwrap_or(0) };
         assert!((400..500).contains(&status), "{method} {path}: {status}");
+    }
+    // GitHub's webhook with a signature of the wrong length, or none.
+    for sig in ["sha256=short", "", "sha1=0000"] {
+        let status = agent.post(&format!("{}/webhook", served.url)).header("x-hub-signature-256", sig).header("x-github-event", "workflow_job").send("{}").map(|r| r.status().as_u16()).unwrap_or(0);
+        assert!((400..500).contains(&status), "{sig}: {status}");
     }
     // What only the dashboard (or a reader's key) may ask, asked without a key, or with a run key where the
     // dashboard's is needed: nothing.
