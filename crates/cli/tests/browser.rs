@@ -8994,6 +8994,50 @@ fn what_the_cli_reads_and_the_keys_it_makes_are_what_the_dashboard_shows() {
 }
 
 #[test]
+fn sign_ins_in_each_state_are_read_and_kept_as_they_stand_and_the_pages_say_so() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let pages = |b: &mut Browser, link: &str| for p in ["overview", "planes", "runners"] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait(&format!("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')"));
+    };
+    // An AWS sign-in due, whose renewal AWS refuses: ended, said, the rest of the pages as they are.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let change = |f: &dyn Fn(&mut serde_json::Value)| { let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap(); f(&mut kept); std::fs::write(&file, kept.to_string()).unwrap(); };
+    change(&|k| { k["aws"]["creds"]["expires_at_ms"] = 0.into(); k["aws"]["refresh_token"] = "refresh-token-aws-ended".into(); });
+    let (mut child, link) = dashboard(&home);
+    pages(&mut b, &link);
+    let _ = child.kill();
+    // Cloudflare signed in, with no account it may use; Modal's token given for this run, which Modal refuses; and
+    // what ended before (AWS's, Cloudflare's, Modal's) kept as ended.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    kept["modal_ended"] = true.into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.fail("api.cloudflare.com/client/v4/accounts", 200, &serde_json::json!({ "success": true, "errors": [], "messages": [], "result": [], "result_info": { "page": 1, "per_page": 50, "count": 0, "total_count": 0 } }).to_string(), None);
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/ended.jsonl"), &[]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_MODAL_TOKEN_ID", "ak-modal-given"), ("SUPERCI_MODAL_TOKEN_SECRET", "as-modal-given")]);
+    pages(&mut b, &link);
+    let _ = child.kill();
+    // Signed out of AWS since, its end noted, with Cloudflare's and Modal's: each said where a page needs it.
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for k in ["aws", "cloudflare"] { kept.as_object_mut().unwrap().remove(k); }
+    kept["aws_ended"] = true.into();
+    kept["cloudflare_ended"] = true.into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    pages(&mut b, &link);
+    let (got, _) = post(&mut b, "/runners/cloudflare", &[]);
+    assert!(got >= 400);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
