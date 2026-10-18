@@ -38,6 +38,8 @@ fn seen_in_browser(served: &superci_testkit::Served) {
         b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
         let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ").to_lowercase();
         if page.contains("not among the latest jobs") { continue }
+        // (Or the page says why it shows no job: the control plane moved, a sign-in to make.)
+        if !page.contains("status") && page.contains("control plane") && page.contains("sign in") { continue }
         // (A waiting job's reason is said as it is; a failed one's in plain words, a cancelled one's not at all.)
         let why = if j["state"] == "waiting" { j["error"].as_str().unwrap_or_default().trim_start_matches("waiting: ").split(" (").next().unwrap_or_default().chars().take(40).collect::<String>().to_lowercase() } else { String::new() };
         assert!(page.contains("status") && (why.is_empty() || page.contains(&why)), "job {id} ({}): {why:?} not on its page:\n{page}", j["state"]);
@@ -6087,3 +6089,327 @@ fn jobs_on_each_others_runners_and_a_machine_that_never_begins_are_said_on_their
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// What the dashboard does to the clouds (the order, stopping SuperCI, AWS removed and added again, a deploy, a move, an
+/// account looked at), as a real account answered, each scenario ending with what a person sees of it.
+mod commands_dashboard_in_browser {
+    use super::*;
+    use common::{json, superci};
+
+    #[test]
+    fn the_order_takes_providers_out_and_puts_them_back_and_each_of_awss_has_its_own_regions() {
+        // A control plane whose own AWS account runs jobs (its spot and on-demand machines), with Cloudflare's containers.
+        let served = serve(|c| {
+            c.containers = true;
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        let home = common::signed_in(&served);
+        let text = |args: &[&str]| { let o = superci(&home, args); String::from_utf8_lossy(&o.stdout).to_string() };
+        // The order: the providers named, in that order; the others taken out (kept, and put back by naming them).
+        let order = json(&home, &["runners", "order", "cloudflare"]).1;
+        assert_eq!((order["order"].clone(), order["taken_out"].clone()), (serde_json::json!(["cloudflare"]), serde_json::json!(["aws", "aws-on-demand"])), "{order}");
+        assert!(text(&["runners", "list"]).contains("Taken out of the order: aws, aws-on-demand"));
+        let order = json(&home, &["runners", "order", "aws", "cloudflare", "aws-on-demand"]).1;
+        assert_eq!((order["order"].clone(), order["taken_out"].clone()), (serde_json::json!(["aws", "cloudflare", "aws-on-demand"]), serde_json::json!([])), "{order}");
+        // AWS's on-demand machines in regions of their own (here: N. Virginia, where the control plane is set up already).
+        let listed = json(&home, &["runners", "update", "aws-on-demand", "--regions=us-east-1"]).1;
+        let on_demand = listed["order"].as_array().unwrap().iter().find(|p| p["cloud"] == "aws-on-demand").cloned().unwrap_or_default();
+        assert_eq!((on_demand["regions"].clone(), on_demand["taken_out"].as_bool()), (serde_json::json!(["us-east-1"]), Some(false)), "{listed}");
+        assert!(text(&["runners", "list"]).contains("aws-on-demand  in us-east-1"));
+        // Not one left in the order: refused (no job could start).
+        let (code, none) = json(&home, &["runners", "order", "nowhere"]);
+        assert_eq!(code, 2, "{none}");
+        // In the dashboard: its rows, AWS's two alike; each one's Take out, and Put back (to the end of the order).
+        let (mut child, link) = common::dashboard(&home);
+        let routing = || serde_json::from_str::<serde_json::Value>(&served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or("{}".into())).unwrap();
+        let (_, page) = common::part(&link, "/?p=runners&fragment=1");
+        assert!(page.contains("<strong>AWS spot</strong>") && page.contains("<strong>AWS on-demand</strong>") && page.contains("<h2>Clouds</h2>") && page.matches("data-regions").count() == 2, "{}", common::words(&page));
+        let current = "aws,cloudflare,aws-on-demand";
+        let (status, to, said) = common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "aws"), ("current", current)]);
+        assert!(status == 303 && to.contains("p=runners"), "{status} {said}");
+        assert_eq!(routing()["order"], serde_json::json!([{ "cloud": "cloudflare" }, { "cloud": "aws-on-demand", "regions": ["us-east-1"] }, { "cloud": "aws", "off": true, "regions": ["us-east-1"] }]), "(spot's regions kept as they were when on-demand's were set)");
+        let (_, page) = common::part(&link, "/?p=runners&fragment=1");
+        assert!(common::words(&page).contains("AWS spot Taken out of the order") && !page.contains(r#"data-cloud="aws""#), "{}", common::words(&page));
+        common::post(&link, "/routing", &[("action", "put_back"), ("cloud", "aws"), ("current", "cloudflare,aws-on-demand,aws")]);
+        assert_eq!(routing()["order"], serde_json::json!([{ "cloud": "cloudflare" }, { "cloud": "aws-on-demand", "regions": ["us-east-1"] }, { "cloud": "aws", "regions": ["us-east-1"] }]));
+        // The last one in the order is not taken out.
+        common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "aws"), ("current", "cloudflare,aws-on-demand,aws")]);
+        common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "aws-on-demand"), ("current", "cloudflare,aws-on-demand,aws")]);
+        let (status, _, said) = common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "cloudflare"), ("current", "cloudflare,aws-on-demand,aws")]);
+        assert!(status == 400 && said.contains("Keep one provider in the order"), "{status} {said}");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
+    fn superci_is_stopped_from_the_dashboard_github_and_gitlab_let_go_of_and_its_control_plane_deleted_as_aws_answered() {
+        let served = serve(|_| {});
+        served.connect_github();
+        served.connect_gitlab();
+        let home = common::signed_in(&served);
+        let (mut child, link) = common::dashboard(&home);
+        // A GitLab project sending its jobs here.
+        let project = superci_testkit::gitlab::PROJECT.to_string();
+        let (status, _, _) = common::post(&link, "/gitlab/project", &[("gitlab", ""), ("id", &project), ("enabled", "true")]);
+        assert!(status < 400);
+        // Not typed as asked: nothing is done.
+        let (status, _, said) = common::post(&link, "/plane/leave", &[("confirm", "yes")]);
+        assert!(status == 400 && common::words(&said).contains("Type superci to confirm"), "{status} {}", common::words(&said));
+        assert!(!served.github.uninstalled());
+        // Stopped: GitLab's webhook and GitHub's App let go of, then the control plane deleted (AWS answering as a real
+        // account answered a control plane's deletion, this one's id in it).
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+        let (status, _, said) = common::post(&link, "/plane/leave", &[("confirm", "superci")]);
+        let said = common::words(&said);
+        assert!(status == 200 && said.contains("SuperCI is stopped") && said.contains("Delete the GitHub App superci-acme on GitHub") && said.contains("Change runs-on: superci back"), "{status} {said}");
+        assert!(served.github.uninstalled(), "its App uninstalled");
+        assert!(served.gitlab.asked.lock().unwrap().iter().any(|a| a.starts_with(&format!("DELETE https://gitlab.com/api/v4/projects/{project}/hooks/"))), "{:?}", served.gitlab.asked.lock().unwrap());
+        assert!(served.aws.settings(superci_testkit::PLANE).is_empty(), "{:?}", served.aws.settings(superci_testkit::PLANE));
+        let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
+        assert!(asked.iter().any(|a| a == &format!("DELETE https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-{}", superci_testkit::PLANE)), "{asked:?}");
+        assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
+    fn awss_runners_are_removed_and_added_again_from_the_dashboard_their_role_and_networks_deleted_as_aws_answered() {
+        // A control plane in AWS whose own account runs jobs, with Cloudflare's containers beside (the test kit's).
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        let home = common::signed_in(&served);
+        let (mut child, link) = common::dashboard(&home);
+        let setting = |n: &str| served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+        let page = || common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+        // Refused: a provider that is not one; a dialog shown for another control plane.
+        let (status, _, said) = common::post(&link, "/runners/remove", &[("cloud", "gcp")]);
+        assert!(status == 400 && common::words(&said).contains("Unknown provider"), "{status}");
+        let (status, _, said) = common::post(&link, "/runners/remove", &[("cloud", "aws"), ("plane", "anotherplane1")]);
+        assert!(status == 409 && common::words(&said).contains("Another control plane is in use now"), "{status}");
+        // Removed from SuperCI only: forgotten here, what is left in AWS said.
+        let (status, _, _) = common::post(&link, "/runners/remove", &[("cloud", "aws"), ("only", "on")]);
+        assert_eq!(status, 303);
+        assert_eq!(setting("AWS_RUNNERS").as_deref(), Some("off"));
+        assert!(page().contains("Removed AWS. Left: in AWS account 111111111111: the role superci-plane-testplane0001's machines policy"), "{}", page());
+        // Added again: its role given the machines' policy again (as AWS answered a real deploy), and on.
+        served.aws.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+        let (status, to, said) = common::post(&link, "/runners/aws-own", &[]);
+        assert!(status == 303 && to.contains("p=runners"), "{status} {}", common::words(&said));
+        assert_eq!(setting("AWS_RUNNERS").as_deref(), Some("on"));
+        // Its role given the permissions it lacks (a newer version's), and told so; a control plane not known here refused.
+        let puts = || served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().starts_with("Action=PutRolePolicy")).count();
+        let before = puts();
+        let (status, to, _) = common::post(&link, "/permissions/aws", &[("plane", superci_testkit::PLANE)]);
+        assert!(status == 303 && to.contains("#permissions") && puts() > before, "{status} {to}");
+        let (status, _, said) = common::post(&link, "/permissions/aws", &[("plane", "nowhere00000")]);
+        assert!(status >= 400 && common::words(&said).contains("Which control plane?"), "{status}");
+        // Removed with its part in AWS: the machines' policy, then their network (as AWS answered a real deletion).
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+        let (status, _, _) = common::post(&link, "/runners/remove", &[("cloud", "aws")]);
+        assert_eq!(status, 303);
+        let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| a["asked"].as_str().unwrap_or_default().chars().take(60).collect()).collect();
+        for done in ["Action=PutRolePolicy", "Action=DeleteRolePolicy", "Action=DeleteVpc&"] { assert!(asked.iter().any(|a| a.starts_with(done)), "{done}: {asked:?}") }
+        assert!(page().contains("Removed AWS.") && !page().contains("Left:"), "{}", page());
+        // Cloudflare's containers, its own: switched off.
+        let (status, _, _) = common::post(&link, "/runners/remove", &[("cloud", "cloudflare")]);
+        assert_eq!(status, 303);
+        assert_eq!(setting("CONTAINERS").as_deref(), Some("off"));
+        assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
+    fn an_aws_accounts_look_is_said_by_the_cli_and_on_add_runners_as_aws_answered_each_kind_of_account() {
+        // Each kind as a real account answered (`fixtures/aws/…/look.jsonl`): what the CLI says, and what Add runners shows.
+        let cases = [
+            ("classic/look", include_str!("../fixtures/aws/classic/look.jsonl"), "Kind          open: nothing SuperCI does is refused",
+                &["Nothing SuperCI does there is refused", "64 on-demand · 96 spot", "Not in Canada, Stockholm, which this account may also use", "Copy into Canada"][..]),
+            ("project-activated/look", include_str!("../fixtures/aws/project-activated/look.jsonl"), "Kind          an AWS project (AWS's new sign-up): it works in eu-north-1 only, with spot machines",
+                &["A project of AWS's new sign-up: it works in Stockholm only", "The other 11 are refused. By its AWS organization (policy p-example1)", "16 on-demand · 32 spot", "Runner image In Stockholm", "Managed from account 222222222222"]),
+            ("project-paid/look", include_str!("../fixtures/aws/project-paid/look.jsonl"), "Kind          an AWS project (AWS's new sign-up): it works in eu-north-1 only, and spot machines are refused",
+                &["AWS keeps it to Stockholm and allows it no spot machines, so jobs run on on-demand machines", "Spot machines Not allowed By its AWS organization (policy p-example2)", "5 on-demand · 5 spot",
+                    "Not in Stockholm No job can start there until it is copied in", "Managed from account 222222222222"]),
+        ];
+        for (name, recording, said, shown) in cases {
+            let served = serve(|_| {});
+            let home = common::signed_in(&served);
+            served.aws.replaying(recording, &[]);
+            let o = superci(&home, &["accounts", "retrieve", "aws"]);
+            let text = String::from_utf8_lossy(&o.stdout);
+            assert!(o.status.success() && text.contains(said), "{name}: {text}{}", String::from_utf8_lossy(&o.stderr));
+            // The image jobs run on, by region: published there, or to copy in.
+            let (code, images) = json(&home, &["images", "list"]);
+            assert!(code == 0 && images["images"].as_array().is_some_and(|i| !i.is_empty()), "{name}: {images}");
+            let (mut child, link) = common::dashboard(&home);
+            // (Looked at in the background once signed in: shown when it is in.)
+            let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=add-runners&fragment=1").1) }).find(|p| p.contains("AWS account aws 111111111111") && !p.contains("Looking")).unwrap_or_default();
+            for want in shown { assert!(page.contains(want), "{name}: no {want:?} in {page}") }
+            // Looked at again when asked (on the page's next view).
+            let before = served.aws.asked.lock().unwrap().len();
+            let (status, _, _) = common::post(&link, "/aws/look", &[]);
+            assert!(status < 400, "{name}: {status}");
+            assert!((0..40).any(|_| { common::part(&link, "/?p=add-runners&fragment=1"); std::thread::sleep(std::time::Duration::from_millis(100)); served.aws.asked.lock().unwrap().len() > before }), "{name}: looked again");
+            let _ = child.kill();
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    #[test]
+    fn a_control_plane_is_deployed_to_aws_from_the_dashboard_as_aws_answered_a_real_account() {
+        // The workspace's control plane, and the new one the deploy brings up (its address, as AWS gave it).
+        let served = serve(|_| {});
+        let new = superci_testkit::serve_as("deployplane1", |_| {});
+        let home = common::signed_in(&served);
+        served.aws.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", "deployplane1"), ("http://new-plane.test", &new.url)]);
+        let (mut child, link) = common::dashboard(&home);
+        // A region not in the list is refused before anything is made.
+        let (status, _, said) = common::post(&link, "/plane/aws", &[("region", "mars-1")]);
+        assert!(status == 400 && common::words(&said).contains("Choose a region from the list"), "{status}");
+        // Deployed (the same id as the recording's, as a try after a stop reuses its first's).
+        let (status, _, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "deployplane1")]);
+        assert_eq!(status, 303);
+        let listed = (0..120).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let (_, page) = common::part(&link, "/?p=planes&fragment=1");
+            let w = common::words(&page);
+            (w.contains(&new.url) && w.contains("Move here")).then_some(w)
+        });
+        let (_, plane_page) = common::part(&link, "/?p=plane&fragment=1");
+        assert!(listed.is_some(), "{}", common::words(&plane_page));
+        let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap(), a["url"].as_str().unwrap())).collect();
+        assert!(asked.iter().any(|a| a == "POST https://lambda.us-east-1.amazonaws.com/2015-03-31/functions"), "{asked:?}");
+        assert!(asked.iter().any(|a| a == "GET https://lambda.us-east-1.amazonaws.com/2015-03-31/functions/superci-plane-deployplane1-convert/configuration"), "the layer store's converter made beside it: {asked:?}");
+        assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
+        // Its settings written for it (the key the dashboard reads it with among them).
+        let settings = served.aws.settings("deployplane1");
+        assert!(settings.iter().any(|(k, _)| k.starts_with("DEVICE_KEY_")), "{:?}", settings.iter().map(|(k, _)| k).collect::<Vec<_>>());
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
+    fn everything_moves_to_another_control_plane_from_the_dashboard_and_the_old_one_says_where() {
+        // The one in use, with GitHub's App and a job it ran; another in the same account (as a deploy leaves one),
+        // reading its settings where the dashboard writes them.
+        let served = serve(|_| {});
+        served.connect_github();
+        let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+        assert_eq!(served.webhook(queued), 202);
+        assert_eq!(served.webhook(served.github.start(id)), 202);
+        assert_eq!(served.webhook(served.github.finish(id, "success", "ok", served.now_ms())), 202);
+        let aws = served.aws.clone();
+        let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+        for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+        // (Its runners stay with it: nothing to bring along.)
+        served.aws.put(&format!("/superci/{}/CONTAINERS", superci_testkit::PLANE), "off");
+        let home = common::signed_in(&served);
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+        let (mut child, link) = common::dashboard(&home);
+        // (Found in the account, on Control planes.)
+        assert!((0..60).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&new.url) }), "the other one found");
+        let (status, _, said) = common::post(&link, "/plane/move", &[("plane", "nowhere00000")]);
+        assert!(status >= 400 && common::words(&said).contains("That control plane is not known here"), "{status}");
+        let (status, _, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+        assert_eq!(status, 303, "{}", common::words(&said));
+        // The old one passes on what still reaches it; the new one, in use, has GitHub's App and the history.
+        let moved = (0..120).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); served.store.under("moved_to").len() == 1 && new.store.under("standby").is_empty() && !new.store.under("claimed_at").is_empty() });
+        let (_, page) = common::part(&link, "/?p=planes&fragment=1");
+        assert!(moved, "{}", common::words(&page));
+        assert!(served.aws.settings("testplane0002").iter().any(|(k, _)| k == "GITHUB_APP"));
+        assert!(!new.store.under(&format!("job:{id}")).is_empty(), "the job it ran came along");
+        let health: serde_json::Value = ureq::get(&format!("{}/health", served.url)).call().unwrap().body_mut().read_json().unwrap();
+        assert_eq!(health["moved_to"].as_str(), Some(new.url.as_str()), "{health}");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
+    fn the_first_control_plane_deployed_in_a_named_workspace_is_called_what_the_workspace_is() {
+        // An account with no control plane yet (AWS answering as it did a real deploy), and a workspace named AcmeCI
+        // signed in to it.
+        let account = superci_testkit::Aws::serve();
+        let new = superci_testkit::serve_as("deployplane1", |_| {});
+        account.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", "deployplane1"), ("http://new-plane.test", &new.url)]);
+        let home = common::temp("named-home");
+        let ws = home.join("workspaces/default");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("sign-ins.json"), serde_json::json!({ "aws": { "region": "us-east-1", "account_id": "111111111111", "who": "arn:aws:sts::111111111111:assumed-role/Admin/someone",
+            "creds": { "access_key_id": "ASIAEXAMPLE", "secret_access_key": "example", "session_token": "example", "expires_at_ms": 4102444800000u64 }, "refresh_token": "", "dpop": { "private_b64": "", "kid": "" } } }).to_string()).unwrap();
+        std::fs::write(ws.join("workspace.json"), serde_json::json!({ "name": "AcmeCI" }).to_string()).unwrap();
+        std::fs::write(home.join("aws-at"), &account.url).unwrap();
+        let (_child, link) = common::dashboard(&home);
+        let (status, to, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "deployplane1")]);
+        assert!(status == 303 && to.contains("p=plane"), "{status} {to}");
+        // (Taken in when a page is shown next.)
+        let named = (0..120).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::part(&link, "/?p=plane&fragment=1"); account.settings("deployplane1").iter().any(|(k, v)| k == "NAME" && v == "AcmeCI") });
+        assert!(named, "{:?}", account.settings("deployplane1").iter().map(|(k, _)| k).collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn another_ci_in_the_same_account_is_listed_apart_and_a_workspace_of_its_own_picks_it() {
+        // Two control planes in the account, each serving GitHub (two CIs, side by side): the workspace looks after its own.
+        let served = serve(|_| {});
+        served.connect_github();
+        // (The other reads its settings in the account, where the dashboard writes them.)
+        let aws = served.aws.clone();
+        let other = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+        for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+        served.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+        served.aws.put("/superci/testplane0002/NAME", "GlobexCI");
+        served.aws.put("/superci/testplane0002/OWNERS", "github:globex");
+        let home = common::signed_in(&served);
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+        let keys = || served.aws.settings("testplane0002").iter().filter(|(k, _)| k.starts_with("DEVICE_KEY_")).count();
+        let keys_before = keys();
+        // Commands are for this workspace's CI, with nothing named; the other one is not this workspace's to name.
+        let (code, v) = json(&home, &["planes", "allow", "--dry-run"]);
+        assert!(code == 0 && v["would"].as_str().unwrap_or_default().contains(superci_testkit::PLANE), "{v}");
+        let (code, v) = json(&home, &["planes", "allow", "--dry-run", "--plane=testplane0002"]);
+        assert!(code != 0, "{v}");
+        assert_eq!(json(&home, &["jobs", "list"]).0, 0);
+        // Listed apart, with its name and whose jobs it runs (read from the account, before anything of this computer's
+        // is in it); its settings are not touched.
+        let (code, planes) = json(&home, &["planes", "list"]);
+        assert!(code == 0 && planes["control_planes"].as_array().unwrap().len() == 1 && planes["control_planes"][0]["in_use"] == true, "{planes}");
+        assert_eq!((planes["found"][0]["id"].as_str(), planes["found"][0]["name"].as_str(), planes["found"][0]["owners"].as_str()), (Some("testplane0002"), Some("GlobexCI"), Some("github:globex")), "{planes}");
+        let o = superci(&home, &["planes", "list"]);
+        let said = String::from_utf8_lossy(&o.stdout).to_string();
+        assert!(said.contains("Other CIs in your signed-in clouds, not this workspace's:") && said.contains("testplane0002") && said.contains("GlobexCI"), "{said}");
+        assert_eq!(keys(), keys_before, "no key of this computer's in another CI");
+        // A workspace of its own: made, signed in to the same account, and it picks that CI.
+        assert!(superci(&home, &["workspaces", "create", "Globex"]).status.success());
+        let mine = std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap();
+        let mut theirs: serde_json::Value = serde_json::from_str(&mine).unwrap();
+        for k in ["plane", "planes_more", "key", "cloudflare", "modal"] { theirs.as_object_mut().unwrap().remove(k); }
+        std::fs::write(home.join("workspaces/globex/sign-ins.json"), theirs.to_string()).unwrap();
+        let (code, v) = json(&home, &["planes", "list", "--workspace=globex"]);
+        assert!(code == 0 && v["control_planes"].as_array().unwrap().is_empty() && v["found"].as_array().unwrap().len() == 2, "found, none taken in: {v}");
+        let (code, v) = json(&home, &["workspaces", "update", "globex", "--plane=testplane0002"]);
+        assert!(code == 0 && v["plane"] == "testplane0002", "{v}");
+        let (_, v) = json(&home, &["planes", "list", "--workspace=globex"]);
+        assert_eq!((v["control_planes"][0]["id"].as_str(), v["found"][0]["id"].as_str()), (Some("testplane0002"), Some(superci_testkit::PLANE)), "{v}");
+        assert_eq!(keys(), keys_before + 1, "its key written in the CI it picked");
+        // One that looks after a CI already takes no second one.
+        let (code, v) = json(&home, &["workspaces", "update", "default", "--plane=testplane0002"]);
+        assert!(code != 0 && v["error"].as_str().unwrap_or_default().contains("looks after a CI already"), "{v}");
+        // The dashboard: the other CI is offered as the workspace that looks after it.
+        let (_child, link) = common::dashboard(&home);
+        assert!((0..40).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); let w = common::words(&common::part(&link, "/?p=planes&fragment=1").1); w.contains("Other CIs in your signed-in accounts") && w.contains("GlobexCI") && w.contains("Open Globex") }));
+        // Each CI in the account has a name of its own: this one is not renamed to the other's (whatever the case).
+        let (status, _, said) = common::post(&link, "/name?w=default", &[("name", "globexci")]);
+        assert!(status == 409 && common::words(&said).contains("testplane0002 in the same AWS account is called globexci"), "{status} {}", common::words(&said));
+        assert!(!served.aws.settings(superci_testkit::PLANE).iter().any(|(k, v)| k == "NAME" && v == "globexci"));
+        // The duplicate is said in the list of workspaces.
+        let o = superci(&home, &["workspaces", "list"]);
+        assert!(String::from_utf8_lossy(&o.stdout).lines().all(|l| !l.contains("same CI as")), "none yet: {}", String::from_utf8_lossy(&o.stdout));
+        let _ = std::fs::remove_dir_all(&home);
+        super::seen_in_browser(&served);
+    }
+}
