@@ -34,6 +34,8 @@ struct Hub {
     /// The App is installed on chosen repositories only (not all of the organization's), or nowhere yet.
     selected: bool,
     nowhere: bool,
+    /// An App made before it asked for Actions: its permissions and its installations' without `actions`.
+    older_app: bool,
     /// How many times GitHub's key set for its jobs' tokens was asked for.
     jwks_asked: u64,
     /// The App was uninstalled.
@@ -79,6 +81,9 @@ impl GitHub {
 
     /// The App installed on chosen repositories only, or (`nowhere`) not installed anywhere yet.
     pub fn set_installed(&self, selected: bool, nowhere: bool) { let mut h = self.hub.lock().unwrap(); (h.selected, h.nowhere) = (selected, nowhere) }
+
+    /// The App as one made before it asked for Actions (write): it asks for less, and its installations accepted less.
+    pub fn set_older_app(&self, older: bool) { self.hub.lock().unwrap().older_app = older }
 
     /// An object put in a bucket (`bucket/key`), as the control plane's deploy leaves its program there.
     pub fn put_object(&self, key: &str, bytes: &[u8]) { self.hub.lock().unwrap().objects.insert(key.to_string(), bytes.to_vec()); }
@@ -282,7 +287,7 @@ impl GitHub {
             return Some(res)
         }
         if url.host_str() != Some("api.github.com") { return None }
-        let permissions = json!({ "actions": "write", "metadata": "read", "organization_self_hosted_runners": "write" });
+        let permissions = if self.hub.lock().unwrap().older_app { json!({ "metadata": "read", "organization_self_hosted_runners": "write" }) } else { json!({ "actions": "write", "metadata": "read", "organization_self_hosted_runners": "write" }) };
         let account = json!({ "login": OWNER, "id": 9_919, "type": "Organization", "avatar_url": "https://avatars.githubusercontent.com/u/9919?v=4", "html_url": format!("https://github.com/{OWNER}") });
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
         let mut h = self.hub.lock().unwrap();

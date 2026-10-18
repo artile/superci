@@ -1207,3 +1207,32 @@ fn what_an_aws_account_allows_is_said_in_its_section_as_real_accounts_answered()
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+
+#[test]
+fn the_permissions_card_says_what_each_place_still_needs_and_with_which_sign_in() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    for (case, said) in [("older app", "1 permission to add in its App"), ("other account", "Signed in to account 222222222222; its role is in 111111111111"), ("key only", "Sign in to check its role")] {
+        let served = serve(|_| {});
+        served.connect_github();
+        // (An App made before it asked for Actions; a sign-in to another account than its role's; no sign-in.)
+        if case == "older app" { served.github.set_older_app(true) }
+        let home = if case == "key only" { home(&served) } else { signed_in(&served) };
+        if case == "other account" {
+            let file = home.join("workspaces/default/sign-ins.json");
+            let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            kept["aws"]["account_id"] = "222222222222".into();
+            std::fs::write(&file, kept.to_string()).unwrap();
+        }
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=planes"));
+        b.wait(&reads(said));
+        if case == "older app" {
+            // Its review: what to add, and why.
+            b.eval("[...document.querySelectorAll('main button')].find(x => x.innerText === 'Review').click(); true");
+            b.wait("document.querySelector('dialog[open]') && document.querySelector('dialog[open]').innerText.includes('Actions (write)')");
+        }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
