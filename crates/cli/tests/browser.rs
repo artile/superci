@@ -8794,6 +8794,69 @@ fn control_planes_in_clouds_not_signed_in_or_not_answering_are_listed_as_they_st
 }
 
 #[test]
+fn what_the_cli_reads_and_the_keys_it_makes_are_what_the_dashboard_shows() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(id));
+    served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    let home = signed_in(&served);
+    let cli = |args: &[&str]| { let o = common::command(&home).args(args).output().unwrap(); (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    // What it reads, each as the dashboard reads it.
+    for args in [&["status"][..], &["jobs", "list"], &["jobs", "retrieve", &id.to_string()], &["runs", "list"], &["usage", "retrieve"], &["usage", "retrieve", "--period=week"], &["planes", "list"], &["runners", "list"],
+        &["accounts", "list"], &["accounts", "retrieve", "aws"], &["limits", "retrieve"], &["labels", "list"], &["jobs", "retrieve", &id.to_string(), "--tests"], &["name", "retrieve"], &["machine", "retrieve"], &["caches", "retrieve"], &["caches", "list"], &["secrets", "list"], &["keys", "list"], &["images", "list"], &["workspaces", "list"],
+        &["status", "--json"], &["jobs", "list", "--json"]] {
+        let (code, said) = cli(args);
+        assert!(code == 0 || code == 1, "{args:?}: {code} {said}");
+        assert!(!said.contains("panicked"), "{args:?}: {said}");
+    }
+    // Keys: a read key, a run key; names and lengths that are not one, a name kept already.
+    let (code, said) = cli(&["keys", "create", "reader", "--days=7"]);
+    assert!(code == 0 && said.contains("superci_read_"), "{said}");
+    let (code, said) = cli(&["keys", "create", "ci2", "--runs"]);
+    assert!(code == 0 && said.contains("SUPERCI_KEY=superci_run_"), "{said}");
+    for (args, why) in [(&["keys", "create", "reader"][..], "a key named reader already"), (&["keys", "create", "not-a-name"], "letters and digits"), (&["keys", "create", "averyveryverylongnamethatgoeson"], "letters and digits"),
+        (&["keys", "create", "late", "--days=400"], "1 to 366 days"), (&["keys", "create", "late", "--days=0"], "1 to 366 days"), (&["keys", "create", "late", "--days=x"], "number of days"), (&["keys", "create", "capped", "--max-cpu=8"], "no limits of its own")] {
+        let (code, said) = cli(args);
+        assert!(code != 0 && said.contains(why), "{args:?}: {code} {said}");
+    }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&format!("{} && {}", page_shows("reader"), page_shows("ci2")));
+    let _ = child.kill();
+    // From control planes too old for them: said to update first.
+    for (version, args, why) in [("0.10.0", &["keys", "create", "old"][..], "0.11.0 or newer"), ("0.17.0", &["keys", "create", "old", "--runs"], "0.18.0 or newer")] {
+        *served.aws.old_version.lock().unwrap() = Some(version.into());
+        let (code, said) = cli(args);
+        assert!(code != 0 && said.contains(why), "{version}: {code} {said}");
+    }
+    *served.aws.old_version.lock().unwrap() = None;
+    // What it changes: each first as a dry run (nothing done), then done; and what is no change at all.
+    for args in [&["name", "update", "AcmeCI"][..], &["labels", "create", "acmeci"], &["labels", "delete", "acmeci", "--confirm"], &["machine", "update", "--cpu=8", "--ram=32"], &["machine", "update", "--arch=arm64"],
+        &["limits", "update", "--max-cpu=32", "--max-hours=3", "--monthly-usd=200", "--daily-usd=20"], &["limits", "update", "--monthly-usd=none", "--daily-usd=none"],
+        &["runners", "update", "cloudflare", "--max-jobs=3", "--monthly-usd=50"], &["runners", "update", "cloudflare", "--max-jobs=none", "--monthly-usd=none"],
+        &["caches", "update", "--size-gb=20", "--days=5", "--images=false"], &["caches", "update", "--enabled=false"], &["caches", "update", "--enabled=true", "--images=true"],
+        &["accounts", "update", "aws", "--monthly-usd=100", "--daily-usd=10"], &["accounts", "update", "aws", "--monthly-usd=none", "--daily-usd=none"]] {
+        let (code, said) = cli(&[args, &["--dry-run"]].concat());
+        assert!(code == 0 || code == 1, "{args:?} dry: {code} {said}");
+        let (code, said) = cli(args);
+        assert!(code == 0 || code == 1, "{args:?}: {code} {said}");
+        assert!(!said.contains("panicked"), "{args:?}: {said}");
+    }
+    for args in [&["machine", "update", "--cpu=lots"][..], &["limits", "update", "--monthly-usd=-1"], &["runners", "update", "nowhere", "--max-jobs=1"], &["caches", "update", "--size-gb=0"], &["labels", "delete", "superci"],
+        &["name", "update"], &["accounts", "update", "gcp", "--monthly-usd=1"], &["machine", "update", "--arch=sparc"]] {
+        let (code, said) = cli(args);
+        assert!(code != 0, "{args:?}: {said}");
+    }
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(&shows("Runner providers"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
