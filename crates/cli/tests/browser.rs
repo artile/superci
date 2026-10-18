@@ -6562,3 +6562,57 @@ fn the_runners_settings_refuse_what_cannot_be_and_add_a_region_with_its_network(
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A control plane updated from its page, as AWS answered a real update: its steps, then what it says when done: its
+/// settings under their new names, a launcher updated with it or said as not, a refusal with Try again.
+#[test]
+fn a_control_plane_is_updated_from_its_page_its_launchers_with_it_or_said_as_not() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    // Each case: its launchers, signed in to Cloudflare and Modal, what AWS refuses, and what its page says when done.
+    type Case = (&'static str, Option<&'static str>, bool, bool, &'static str);
+    let cases: Vec<Case> = vec![
+        ("from before the new names", None, false, false, "Updated to"),
+        ("with launchers in Cloudflare and Modal, both signed in", Some(r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners-testplane0001.modal.run"}]"#), true, false, "Updated to"),
+        ("with a launcher in Cloudflare, not signed in", Some(r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#), false, false, "Its Cloudflare launcher was not updated"),
+        ("AWS refusing its new code", None, false, true, "Rate exceeded"),
+    ];
+    for (what, launchers, clouds, refuse, said) in cases {
+        let served = serve(|_| {});
+        let home = signed_in(&served);
+        if let Some(l) = launchers { served.aws.put(&format!("/superci/{PLANE}/AGENTS"), l); served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off"); }
+        if clouds {
+            let file = home.join("workspaces/default/sign-ins.json");
+            let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+            kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+            std::fs::write(&file, kept.to_string()).unwrap();
+            served.aws.replaying(include_str!("../fixtures/aws/planes/update-with-launchers.jsonl"), &[("mixplane0001", PLANE), ("http://new-plane.test", &served.url)]);
+            let mut w = served.aws.workers.lock().unwrap();
+            for host in [format!("superci-runners-{PLANE}.acme.workers.dev"), format!("acmeorg--superci-runners-{PLANE}.modal.run")] { w.insert(host, served.url.clone()); }
+        } else {
+            served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+        }
+        if refuse { served.aws.fail(&format!("functions/superci-plane-{PLANE}/code"), 429, &superci_testkit::json_error("TooManyRequestsException", "Rate exceeded"), None) }
+        // A control plane from before 0.19.13, with its settings under their old names: the page offers the update.
+        served.aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &served.key);
+        *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=planes"));
+        b.wait(&format!("document.querySelector('form[action=\"/plane/update\"] button') && {}", shows("Control plane")));
+        b.eval("document.querySelector('form[action=\"/plane/update\"] button').click()");
+        b.wait(&format!("{} || {}", page_shows("Updating to"), page_shows(said)));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            b.goto(&format!("{link}&p=planes"));
+            b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+            let text = b.eval("document.body.innerText").as_str().unwrap_or_default().to_string();
+            if text.contains(said) { break }
+            assert!(std::time::Instant::now() < end, "{what}: no {said:?}:\n{text}");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        if refuse { assert!(b.eval("!!document.querySelector('form[action=\"/plane/update\"] button')").as_bool() == Some(true), "{what}: Try again offered") }
+        else { assert!(served.aws.settings(PLANE).iter().any(|(k, _)| k == "LAUNCHERS") || launchers.is_none(), "{what}: its launchers under the new name") }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
