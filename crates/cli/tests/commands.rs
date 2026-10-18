@@ -1113,3 +1113,22 @@ fn the_runner_image_is_copied_in_listed_and_removed_as_aws_answered_a_real_copy(
     assert!(said.contains("Removed your copy of the image from ca-central-1, with its storage."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A limit an older control plane does not keep is refused, saying to update it: a day's before 0.16.0, the whole CI's
+/// before 0.15.0. Nothing is written.
+#[test]
+fn a_limit_an_older_control_plane_does_not_keep_is_refused_saying_to_update_it() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let routing = || served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v);
+    let before = routing();
+    for (version, args, said) in [("0.15.3", &["limits", "update", "--monthly-usd=50", "--daily-usd=5"][..], "A limit for a day, and a budget in AWS itself, need a newer control plane"),
+        ("0.14.0", &["limits", "update", "--monthly-usd=50"], "A limit for the whole CI or for a cloud account needs a newer control plane")] {
+        *served.aws.old_version.lock().unwrap() = Some(version.into());
+        let o = superci(&home, args);
+        let e = String::from_utf8_lossy(&o.stderr).to_string() + &String::from_utf8_lossy(&o.stdout);
+        assert!(!o.status.success() && e.contains(said) && e.contains("superci planes update"), "{version}: {e}");
+        assert_eq!(routing(), before, "nothing written");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}

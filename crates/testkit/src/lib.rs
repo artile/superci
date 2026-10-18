@@ -212,7 +212,17 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<Strin
     let res = block_on(plane.handle(req));
     let body = match (old, target.split('?').next().unwrap_or_default(), serde_json::from_slice::<Value>(&res.body)) {
         (Some(version), "/health", Ok(mut v)) => { v["version"] = json!(version); v.to_string().into_bytes() }
-        (Some(_), "/status", Ok(mut v)) => { if let Some(o) = v.as_object_mut() { let l = o.remove("launchers").unwrap_or_default(); o.insert("agents".into(), l); } v.to_string().into_bytes() }
+        (Some(version), "/status", Ok(mut v)) => {
+            if let Some(o) = v.as_object_mut() {
+                let l = o.remove("launchers").unwrap_or_default();
+                o.insert("agents".into(), l);
+                // (What came after it, it does not say: limits for the whole CI and an account came in 0.15.0, a day's in 0.16.0.)
+                let older = |than: &str| { let n = |s: &str| s.split('.').map(|p| p.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>(); n(&version) < n(than) };
+                if older("0.15.0") { o.remove("account_limits"); }
+                if older("0.16.0") { o.remove("daily_limits"); }
+            }
+            v.to_string().into_bytes()
+        }
         _ => res.body,
     };
     write(stream, res.status, &res.headers, &body)
