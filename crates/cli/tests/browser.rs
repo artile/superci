@@ -1604,3 +1604,41 @@ fn every_provider_s_runners_on_an_aws_control_plane_and_then_a_move_to_cloudflar
     assert!(ok && said.contains("Deleted AWS"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    for (recording, label, said) in [(include_str!("../fixtures/aws/launch/spot.jsonl"), "superci/cpu=2", "AWS's choice of 4 pools"), (include_str!("../fixtures/aws/launch/on-demand.jsonl"), "superci/cpu=2/spot=false", "m7a.large")] {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        served.aws.replaying(recording, &[]);
+        let home = home(&served);
+        let dir = home.join("checkout");
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::write(dir.join(".github/workflows/ci.yml"), format!("jobs:\n  tests:\n    runs-on: {label}\n    steps:\n      - run: make test\n")).unwrap();
+        for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"])
+            .env("SUPERCI_HOME", dir.join(".cli")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let job = loop { if let Some((_, j)) = served.store.under("job:").into_iter().next().filter(|(_, j)| j["machine_id"].is_string()) { break j } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let id = job["job_id"].to_string();
+        // While it starts: its page says the machine and how it was had.
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && {}", shows("Its start"), shows(said)));
+        // Taken by its runner and ended: the same, with its steps.
+        let run = served.store.under("run:").into_iter().next().unwrap().0.trim_start_matches("run:").to_string();
+        let runner = loop { if let Some(r) = superci_testkit::Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        runner.take();
+        runner.steps(&[("eeeeeeee-0000-0000-0000-000000000001", "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+        runner.log(1, "2026-10-15T10:00:01.0000000Z ok");
+        runner.finish("succeeded");
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && {}", shows("Passed"), shows("Its start")));
+        b.goto(&format!("{link}&p=runs"));
+        b.wait(&shows("Passed"));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
