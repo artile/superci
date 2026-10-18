@@ -2031,3 +2031,35 @@ fn control_planes_that_stop_answering_after_they_did_are_said_so_and_come_back_w
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn a_second_organizations_app_is_listed_beside_the_first_and_removed_from_repositories() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // acme's App, and globex's added beside it (the test kit's GitHub answers both alike).
+    let served = serve(|_| {});
+    served.connect_github();
+    let mut second = superci_testkit::github::GitHub::app();
+    second["id"] = 2002.into(); second["owner"] = "globex".into(); second["slug"] = "superci-globex".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_2002"), &second.to_string());
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=repos"));
+    b.wait(&format!("{} && {}", reads("GitHub · acme"), reads("GitHub · globex")));
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && {}", reads("GitHub acme: App"), reads("GitHub globex: App")));
+    // Refused: an organization that is none, or not one added here (the first is not removed this way).
+    for app in ["acme", "1001", "9999"] {
+        let (got, _) = post(&mut b, "/github/remove", &[("app", app)]);
+        assert!(got >= 400, "{app}");
+    }
+    // globex removed: uninstalled, forgotten here; acme's as it was.
+    let (got, text) = post(&mut b, "/github/remove", &[("app", "2002")]);
+    assert!(got < 400, "{got} {text}");
+    until("forgotten", || !served.aws.settings(PLANE).iter().any(|(k, _)| k == "GITHUB_APP_2002"));
+    assert!(served.aws.settings(PLANE).iter().any(|(k, _)| k == "GITHUB_APP"));
+    b.goto(&format!("{link}&p=repos"));
+    b.wait(&format!("{} && {} && !document.querySelector('main').innerText.includes('GitHub · globex')", reads("Removed globex. Its App"), reads("Jobs from acme")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
