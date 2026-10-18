@@ -5551,6 +5551,49 @@ mod runs_suite_in_browser {
     }
 
     #[test]
+    fn a_run_asked_for_in_each_way_it_cannot_be_is_said_and_one_of_two_jobs_is_followed_without_its_logs_wait() {
+        let served = serve(|_| {});
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo a\n  b:\n    runs-on: superci\n    steps:\n      - run: echo b\n")]);
+        let said = |o: std::process::Output| (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr));
+        // Following a run: none named, one that is no id, one not kept.
+        for args in [&["runs", "wait"][..], &["runs", "wait", "abc"], &["runs", "wait", "99999"]] {
+            let (ok, text) = said(superci(&served, &dir, args).output().unwrap());
+            assert!(!ok && !text.contains("panicked"), "{args:?}: {text}");
+        }
+        // An event's payload that is not an object, and one larger than a run takes.
+        let small = dir.join("small.json");
+        std::fs::write(&small, "[1, 2]").unwrap();
+        let big = dir.join("big.json");
+        std::fs::write(&big, format!("{{\"padding\": \"{}\"}}", "x".repeat(200_000))).unwrap();
+        for file in [&small, &big] {
+            let (ok, text) = said(superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", &format!("--event-payload={}", file.display()), "--dry-run"]).output().unwrap());
+            assert!(!ok, "{}: {text}", file.display());
+        }
+        // A folder that is no git checkout.
+        let bare = std::env::temp_dir().join(format!("superci-e2e-bare-{}", std::process::id()));
+        std::fs::create_dir_all(bare.join(".github/workflows")).unwrap();
+        std::fs::write(bare.join(".github/workflows/ci.yml"), "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n").unwrap();
+        let (ok, text) = said(superci(&served, &bare, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--dry-run"]).output().unwrap());
+        assert!(!ok && !text.contains("panicked"), "{text}");
+        let _ = std::fs::remove_dir_all(&bare);
+        // A control plane too old for runs from a computer: said, with what to do.
+        *served.aws.old_version.lock().unwrap() = Some("0.17.0".into());
+        let (ok, text) = said(superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap());
+        assert!(!ok && !text.contains("panicked"), "{text}");
+        *served.aws.old_version.lock().unwrap() = None;
+        // Two jobs, followed with no logs wait set (its own, a minute): each job's start said.
+        let mut c = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]);
+        c.env_remove("SUPERCI_LOGS_WAIT_S");
+        let child = c.spawn().unwrap();
+        let run = loop { if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        for name in ["a", "b"] { let r = runner_of(&served, &run, name); r.take(); r.finish("succeeded"); }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+        super::seen_in_browser(&served);
+    }
+
+    #[test]
     fn a_matrix_made_by_an_expression_is_read_once_the_job_it_needs_has_ended() {
         let served = serve(|_| {});
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  setup:\n    runs-on: superci\n    outputs:\n      shards: ${{ steps.s.outputs.shards }}\n    steps:\n      - id: s\n        run: echo 'shards=[1,2,3]' >> $GITHUB_OUTPUT\n  test:\n    needs: setup\n    runs-on: superci\n    strategy:\n      matrix:\n        shard: ${{ fromJSON(needs.setup.outputs.shards) }}\n        os: [linux]\n    steps:\n      - run: echo shard ${{ matrix.shard }}\n")]);
