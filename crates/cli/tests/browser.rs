@@ -9243,6 +9243,36 @@ fn sign_ins_not_completed_at_aws_or_started_on_another_port_for_cloudflare_are_s
 }
 
 #[test]
+fn a_queued_event_delivered_twice_after_a_stuck_start_or_for_a_job_run_again_is_taken_as_it_should() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    // Delivered twice: claimed once.
+    let (id, q) = served.github.queue("twice", "superci", served.now_ms());
+    assert!(served.webhook(q.clone()) < 300);
+    let runner = state(id)["runner"].clone();
+    assert!(served.webhook(q.clone()) < 300);
+    assert_eq!(state(id)["runner"], runner, "the same claim");
+    // Its start stuck midway (the runtime stopped), delivered again two minutes on: taken over.
+    { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); j["state"] = "launching".into(); m.insert(k, j.to_string()); }
+    served.later(120_000);
+    assert!(served.webhook(q) < 300);
+    // A job of a run asked to run again after AWS took its spot machine back: not on a spot machine this time.
+    let (again, q) = served.github.queue("run again", "superci", served.now_ms());
+    let run = served.github.job(again)["run_id"].as_u64().unwrap();
+    served.store.0.lock().unwrap().insert(format!("rerun:acme/app:{run}:run again"), served.now_ms().to_string());
+    assert!(served.webhook(q) < 300);
+    assert!(state(again)["no_spot"] == true && state(again)["after_reclaim"] == true, "{}", state(again));
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn the_overview_after_one_quick_job_says_it_in_the_singular() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
