@@ -2531,6 +2531,24 @@ fn a_modal_sign_in_started_before_any_other_waits_on_every_page_and_all_control_
 }
 
 #[test]
+fn a_workspace_with_no_control_plane_yet_is_asked_which_ci_from_every_page_and_control_plane_lists_the_one_found() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for f in ["plane", "planes_more", "key"] { kept.as_object_mut().unwrap().remove(f); }
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    for (p, said) in [("runners", "Which CI?"), ("jobs", "Which CI?"), ("planes", "Or set up a new one")] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait(&format!("document.querySelector('main') && document.body.innerText.includes({said:?})"));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
