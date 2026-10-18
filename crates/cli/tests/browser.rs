@@ -10252,3 +10252,111 @@ fn each_regions_cache_bucket_is_made_filled_once_and_removed_as_s3_answers_and_a
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A control plane reached at an address a machine's script may not carry (brackets of an IPv6 address, plain HTTP
+/// elsewhere than this computer), or at this computer's own (as tests serve it): spot machines refused their notice
+/// link or given it, on-demand ones started without saying how their start went; and the dashboard still reads.
+#[test]
+fn machines_of_a_control_plane_at_an_address_their_script_cannot_carry_start_without_its_links() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let scripts = || -> Vec<String> {
+        use base64::Engine;
+        served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str().filter(|s| s.contains("Action=RunInstances")).map(str::to_string))
+            .filter_map(|asked| url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()))
+            .map(|d| String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(d).unwrap_or_default()).to_string()).collect()
+    };
+    for public in [Some("https://[::1]:8443"), Some("http://plane.acme.test"), None] {
+        *served.public.lock().unwrap() = public.map(str::to_string);
+        for label in ["superci", "superci/os=windows", "superci/spot=false", "superci/os=windows/spot=false"] {
+            let before = scripts().len();
+            let (id, q) = served.github.queue(label, label, served.now_ms());
+            assert!(served.webhook(q) < 300, "{public:?} {label}");
+            let now = scripts();
+            let record = served.store.under(&format!("job:{id}")).first().map(|(_, j)| j.to_string()).unwrap_or_default();
+            match (public, label.contains("spot=false")) {
+                // (Spot: a notice link only it may carry, or none started.)
+                (Some(_), false) => assert!(now.len() == before || now.last().is_some_and(|s| !s.contains("[::1]")), "{public:?} {label}: {record}"),
+                // (On demand: started, never with a link of that address.)
+                (Some(p), true) => assert!(now.len() > before && !now.last().unwrap().contains(&format!("{p}/hello")), "{public:?} {label}: {record}"),
+                (None, spot) => assert!(now.len() > before && (spot || now.last().unwrap().contains("/interrupted?")), "{public:?} {label}: {record}"),
+            }
+        }
+    }
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=overview"));
+    b.wait(&shows("Usage"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Spot machines asked of a fleet, as EC2 answers one: slowed down (asked again after a pause, then no more), a
+/// machine in a pool said only by its subnet, no room in some pools and the type not offered in others (the next
+/// group asked), the account's spot limit, something refused that is not about room, and an answer with no fleet.
+/// Each job's page says what was asked.
+#[test]
+fn spot_machines_asked_of_a_fleet_are_started_or_refused_as_ec2_answers_each_way() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let fleet = |inside: &str| format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CreateFleetResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId>{inside}</CreateFleetResponse>");
+    let error = |code: &str, message: &str, over: &str| format!("<item><errorCode>{code}</errorCode><errorMessage>{message}</errorMessage><launchTemplateAndOverrides><overrides>{over}</overrides></launchTemplateAndOverrides><lifecycle>spot</lifecycle></item>");
+    let by_subnet = fleet("<fleetId>fleet-1</fleetId><fleetInstanceSet><item><instanceIds><item>i-00000000000000001</item></instanceIds><instanceType>c8a.large</instanceType><subnetId>subnet-00000000000000001</subnetId></item></fleetInstanceSet><errorSet/>");
+    let no_room = fleet(&format!("<fleetId>fleet-2</fleetId><fleetInstanceSet/><errorSet>{}{}{}</errorSet>",
+        error("InsufficientInstanceCapacity", "There is no Spot capacity available that matches your request.", "<instanceType>c8a.large</instanceType><subnetId>subnet-00000000000000001</subnetId>"),
+        error("InvalidFleetConfiguration", "Your requested instance type (c8a.large) is not supported in your requested Availability Zone (us-east-1e).", "<instanceType>c8a.large</instanceType><availabilityZone>us-east-1e</availabilityZone>"),
+        error("UnfulfillableCapacity", "Unable to fulfill capacity due to your request configuration.", "<instanceType>c7a.large</instanceType>")));
+    let limit = fleet(&format!("<fleetId>fleet-3</fleetId><errorSet>{}</errorSet>", error("MaxSpotInstanceCountExceeded", "Max spot instance count exceeded", "<instanceType>c8a.large</instanceType>")));
+    let other = fleet(&format!("<fleetId>fleet-4</fleetId><errorSet>{}{}</errorSet>", error("InvalidFleetConfiguration", "The launch template is not valid.", ""), error("UnauthorizedOperation", "You are not authorized to perform this operation.", "")));
+    let none = fleet("<errorSet/>");
+    let slow = superci_testkit::ec2_error("RequestLimitExceeded", "Request limit exceeded.");
+    let cases: Vec<Vec<(u16, &str, Option<u32>)>> = vec![
+        vec![(503, &slow, Some(2)), (200, &by_subnet, Some(1))],
+        vec![(200, &no_room, Some(1)), (200, &by_subnet, Some(1))],
+        vec![(200, &no_room, Some(1)), (200, &limit, Some(1))],
+        vec![(200, &other, Some(1))],
+        vec![(200, &none, Some(1))],
+        vec![(503, &slow, None)],
+    ];
+    let mut ids = vec![];
+    for (i, answers) in cases.iter().enumerate() {
+        served.aws.fail_none();
+        served.store.0.lock().unwrap().remove("aws:no-fleet");
+        for (status, answer, times) in answers { served.aws.fail("CreateFleet", *status, answer, *times) }
+        // (The best pool first, by itself: no room there.)
+        served.aws.fail("RunInstances", 500, &superci_testkit::ec2_error("InsufficientInstanceCapacity", "We currently do not have sufficient c8a.2xlarge capacity in the Availability Zone you requested (us-east-1a)."), Some(1));
+        served.aws.fail("RunInstances", 200, &started, None);
+        let (id, q) = served.github.queue("superci/cpu=8", "superci", served.now_ms());
+        assert!(served.webhook(q) < 300, "case {i}");
+        ids.push(id);
+    }
+    served.aws.fail_none();
+    let asked = served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("Action=CreateFleet")).count();
+    assert!(asked >= 10, "fleets asked: {asked}");
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    let _ = &ids;
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
