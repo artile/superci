@@ -175,7 +175,10 @@ impl GitLab {
             ("DELETE", ["runners", rid]) => { lab.runners.remove(&rid.parse().ok()?); Some(Response::new(204, "text/plain", "")) }
             ("GET", ["runners", rid, "jobs"]) => {
                 let rid: u64 = rid.parse().ok()?;
-                ok(200, Value::Array(lab.jobs.values().filter(|j| j["runner"]["id"] == rid && j["status"] == "running").cloned().collect()))
+                // (As GitLab lists a runner's jobs: each with its project.)
+                let p = fixture("project");
+                ok(200, Value::Array(lab.jobs.values().filter(|j| j["runner"]["id"] == rid && j["status"] == "running").cloned()
+                    .map(|mut j| { j["project"] = json!({ "id": PROJECT, "name": "app", "path_with_namespace": PATH, "default_branch": p["default_branch"] }); j }).collect()))
             }
             _ => None,
         }

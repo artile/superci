@@ -8045,6 +8045,17 @@ fn a_gitlab_jobs_cache_is_kept_as_its_projects_once_its_job_began_and_settings_l
     assert_eq!(call("tool-sign", serde_json::json!({ "tool": "gitlab", "hash": key, "names": ["p00001"] })).0, 200);
     assert_eq!(call("tool-finish", serde_json::json!({ "tool": "gitlab", "hash": key, "pieces": [["p00000", 64], ["p00001", 6]] })).1["size"], 70);
     assert_eq!(call("tool-get", serde_json::json!({ "tool": "gitlab", "hash": key })).1["pieces"].as_array().map(Vec::len), Some(2));
+    // Another job whose running event never came: GitLab is asked which job its runner runs, and its cache is open.
+    let (id2, p) = served.gitlab.pending("test 2", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(p) < 300);
+    let asked = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()).unwrap();
+    let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+    let script2 = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(data).unwrap()).unwrap();
+    let link2 = script2.split("/cache/").nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let runner2 = served.store.under(&format!("job:gl{id2}"))[0].1["runner_id"].as_u64().unwrap();
+    let _ = served.gitlab.running_on(id2, runner2, served.now_ms());
+    let mut r = agent.post(&format!("{}/cache/{link2}/tool-begin", served.url)).send(serde_json::json!({ "tool": "gitlab", "hash": "gl/project/250833/other/cache.zip" }).to_string()).unwrap();
+    assert_eq!(r.status().as_u16(), 200, "{}", r.body_mut().read_to_string().unwrap_or_default());
     // A link that is no machine's: nothing.
     let (status, _) = { let mut r = agent.post(&format!("{}/cache/not-a-machines-link/tool-get", served.url)).send("{}").unwrap(); (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()) };
     assert!(status >= 400, "{status}");
