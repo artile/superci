@@ -31,6 +31,9 @@ struct Hub {
     next: u64,
     /// `acme/app` is public (anyone can open a pull request that runs code there).
     public: bool,
+    /// The App is installed on chosen repositories only (not all of the organization's), or nowhere yet.
+    selected: bool,
+    nowhere: bool,
     /// How many times GitHub's key set for its jobs' tokens was asked for.
     jwks_asked: u64,
     /// The App was uninstalled.
@@ -73,6 +76,9 @@ pub(crate) fn iso(ms: u64) -> String {
 impl GitHub {
     /// Makes `acme/app` public, or private again.
     pub fn set_public(&self, public: bool) { self.hub.lock().unwrap().public = public }
+
+    /// The App installed on chosen repositories only, or (`nowhere`) not installed anywhere yet.
+    pub fn set_installed(&self, selected: bool, nowhere: bool) { let mut h = self.hub.lock().unwrap(); (h.selected, h.nowhere) = (selected, nowhere) }
 
     /// An object put in a bucket (`bucket/key`), as the control plane's deploy leaves its program there.
     pub fn put_object(&self, key: &str, bytes: &[u8]) { self.hub.lock().unwrap().objects.insert(key.to_string(), bytes.to_vec()); }
@@ -285,7 +291,8 @@ impl GitHub {
             ("GET", ["app"]) => ok(200, json!({ "id": APP_ID, "slug": "superci-acme", "node_id": "A_kwDOAAAA", "owner": account, "name": "SuperCI acme", "description": "",
                 "external_url": "https://superci.dev", "html_url": "https://github.com/apps/superci-acme", "created_at": "2026-10-01T10:00:00Z", "updated_at": "2026-10-01T10:00:00Z",
                 "permissions": permissions, "events": ["workflow_job"], "installations_count": 1 })),
-            ("GET", ["app", "installations"]) => ok(200, json!([{ "id": INSTALLATION, "account": account, "repository_selection": "all", "access_tokens_url": format!("https://api.github.com/app/installations/{INSTALLATION}/access_tokens"),
+            ("GET", ["app", "installations"]) if h.nowhere => ok(200, json!([])),
+            ("GET", ["app", "installations"]) => ok(200, json!([{ "id": INSTALLATION, "account": account, "repository_selection": if h.selected { "selected" } else { "all" }, "access_tokens_url": format!("https://api.github.com/app/installations/{INSTALLATION}/access_tokens"),
                 "repositories_url": "https://api.github.com/installation/repositories", "html_url": format!("https://github.com/organizations/{OWNER}/settings/installations/{INSTALLATION}"),
                 "app_id": APP_ID, "app_slug": "superci-acme", "target_id": 9_919, "target_type": "Organization", "permissions": permissions, "events": ["workflow_job"],
                 "created_at": "2026-10-01T10:00:00Z", "updated_at": "2026-10-01T10:00:00Z", "single_file_name": null, "suspended_at": null }])),
@@ -317,7 +324,7 @@ impl GitHub {
             ("PATCH", ["app", "hook", "config"]) => ok(200, json!({ "content_type": "json", "insecure_ssl": "0", "url": serde_json::from_slice::<Value>(&r.body).ok()?["url"] })),
             // A repository by its id (docs.github.com/rest/repos/repos#get-a-repository, as `/repositories/{id}`).
             ("GET", ["repositories", id]) => { drop(h); let r = self.repo(); if r["id"].to_string() == *id { ok(200, r) } else { ok(404, json!({ "message": "Not Found", "documentation_url": "https://docs.github.com/rest/repos/repos#get-a-repository", "status": "404" })) } }
-            ("GET", ["installation", "repositories"]) => { drop(h); ok(200, json!({ "total_count": 1, "repository_selection": "all", "repositories": [self.repo()] })) }
+            ("GET", ["installation", "repositories"]) => { let selection = if h.selected { "selected" } else { "all" }; drop(h); ok(200, json!({ "total_count": 1, "repository_selection": selection, "repositories": [self.repo()] })) }
             // A runner for one job (docs.github.com/rest/actions/self-hosted-runners).
             // (A personal account's App registers its runners in each repository: the same, there.)
             ("POST", ["orgs", OWNER, "actions", "runners", "generate-jitconfig"] | ["repos", OWNER, "app", "actions", "runners", "generate-jitconfig"]) => {

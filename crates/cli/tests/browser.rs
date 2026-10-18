@@ -912,3 +912,23 @@ fn an_address_edited_by_hand_is_read_only_as_far_as_it_holds_what_it_may() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn the_github_app_installed_everywhere_on_some_repositories_or_nowhere_yet_is_said_as_it_is() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    for (selected, nowhere, said) in [(false, false, "Jobs from acme (all repositories)"), (true, false, "Jobs from acme (selected repositories)"), (false, true, "install it where your runners should take jobs")] {
+        let served = serve(|_| {});
+        served.connect_github();
+        served.github.set_installed(selected, nowhere);
+        let home = home(&served);
+        let (mut child, link) = dashboard(&home);
+        b.goto(&link);
+        // (Not installed: Overview's step for it says so, its button to Repositories.)
+        if nowhere { b.wait(&shows("it still has to be installed where your runners should take jobs")) } else { b.wait(&shows("Usage")) }
+        b.click("nav a", "Repositories");
+        b.wait(&shows(said));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
