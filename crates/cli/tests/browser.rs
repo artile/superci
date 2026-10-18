@@ -1112,6 +1112,18 @@ fn everything_a_ci_has_comes_along_when_it_moves_to_another_control_plane_from_t
     let aws = served.aws.clone();
     let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
     for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    // Its history: a finished GitHub job, a finished GitLab job with its runner's record; one of them kept at the new
+    // one already (taken once).
+    let now = served.now_ms();
+    let done = |id: &str, provider: &str| serde_json::json!({ "job_id": id.trim_start_matches("gl").parse::<u64>().unwrap(), "run_id": 3, "repo": "acme/app", "state": "done", "at_ms": now - 60_000, "started_ms": now - 50_000, "ended_ms": now - 10_000,
+        "cloud": "cloudflare", "provider": provider, "seen_in_progress": true, "began": true, "conclusion": "success" }).to_string();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("job:900".into(), done("900", ""));
+        m.insert("job:gl17000000901".into(), done("gl17000000901", "gitlab"));
+        m.insert("glrunner:999".into(), serde_json::json!({ "id": 999, "job": 17000000901u64 }).to_string());
+    }
+    new.store.0.lock().unwrap().insert("job:900".into(), done("900", ""));
     let home = signed_in(&served);
     let o = common::command(&home).args(["secrets", "create", "NPM_TOKEN", "--value-env=THE_VALUE"]).env("THE_VALUE", "npm-token-for-tests").output().unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -1130,6 +1142,7 @@ fn everything_a_ci_has_comes_along_when_it_moves_to_another_control_plane_from_t
     while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "moved: {:?}; page {}", served.aws.settings("testplane0002").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), b.eval("document.querySelector('main').innerText.slice(0, 600)")); std::thread::sleep(std::time::Duration::from_millis(300)) }
     for k in ["GITHUB_APP", "GITHUB_APP_2002", "GITLAB", "GITLAB_gsecond", "NAME", "LABELS", "CF_LOCATION", "CF_IMAGE", "AWS_NETWORKS"] { assert!(has(k).is_some(), "{k}: {:?}", served.aws.settings("testplane0002")) }
     assert_eq!(has("NAME").as_deref(), Some("AcmeCI"));
+    assert!(new.store.0.lock().unwrap().contains_key("glrunner:999"), "its GitLab runner's record came along");
     assert!(served.aws.settings("testplane0002").iter().any(|(k, _)| k.starts_with("SECRET_")), "the secret came along");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
