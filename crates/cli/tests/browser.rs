@@ -8140,6 +8140,15 @@ fn gitlab_jobs_on_aws_taken_back_retried_on_anothers_runner_and_cancelled_are_sa
     let (y, p) = served.gitlab.pending("build", &["superci"], served.now_ms()); served.gitlab_webhook(p);
     let ry = state(y)["runner_id"].as_u64().expect("its runner");
     served.gitlab_webhook(served.gitlab.running_on(x, ry, served.now_ms()));
+    // It ends there: that runner's machine is done; its own machine is for the other job now.
+    served.gitlab_webhook(served.gitlab.finish(x, "success", "ok", served.now_ms()));
+    // One cancelled once it was on another's runner, its own record still starting.
+    let (z2, p) = served.gitlab.pending("deploy 2", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    let (h2, p) = served.gitlab.pending("its host", &["superci"], served.now_ms()); served.gitlab_webhook(p);
+    let rh2 = state(h2)["runner_id"].as_u64().expect("its runner");
+    { let mut m = served.store.0.lock().unwrap(); let k = format!("job:gl{z2}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); j["state"] = "launching".into(); m.insert(k, j.to_string()); }
+    let _ = served.gitlab.running_on(z2, rh2, served.now_ms());
+    served.gitlab_webhook(served.gitlab.finish(z2, "canceled", "", served.now_ms()));
     // Cancelled while its machine starts.
     let (z, p) = served.gitlab.pending("deploy", &["superci"], served.now_ms()); served.gitlab_webhook(p);
     served.gitlab_webhook(served.gitlab.finish(z, "canceled", "", served.now_ms()));
