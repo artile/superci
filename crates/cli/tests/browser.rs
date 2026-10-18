@@ -7113,6 +7113,79 @@ fn a_jobs_end_is_settled_for_each_way_its_record_stands_and_said_on_its_page() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Jobs whose spot machines AWS took back, run again once their runs have finished, for each way GitHub answers: run
+/// again alone, two of one run together, a run still going (asked later), a run gone, six hours on, the App not
+/// allowed, GitHub refusing, GitHub failing (asked later). Each job's page says what became of it.
+#[test]
+fn jobs_aws_took_back_are_run_again_once_their_runs_end_or_say_why_not_for_each_way_github_answers() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    // Each taken back as it ran, its runner ending the job as failed.
+    let taken_back = |name: &str| {
+        let (id, q) = served.github.queue(name, "superci", served.now_ms());
+        assert!(served.webhook(q) < 300);
+        assert!(served.webhook(served.github.start(id)) < 300);
+        edit(id, &|j| { j["interrupted"] = true.into(); });
+        assert!(served.webhook(served.github.finish(id, "failure", "2026-10-15T10:00:01.0000000Z The runner has received a shutdown signal.", served.now_ms())) < 300);
+        assert_eq!(state(id)["rerun"]["state"], "pending", "{name}: {}", state(id));
+        id
+    };
+    let alone = taken_back("alone");
+    let (first, second) = (taken_back("first of two"), taken_back("second of two"));
+    let run_of = |id: u64| state(id)["run_id"].as_u64().unwrap();
+    let first_run = run_of(first);
+    edit(second, &|j| { j["rerun"]["run_id"] = first_run.into(); j["run_id"] = first_run.into(); });
+    let going = taken_back("its run still going");
+    let (still, q) = served.github.queue("still running", "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(still));
+    let still_run = run_of(still);
+    edit(going, &|j| { j["rerun"]["run_id"] = still_run.into(); });
+    let gone = taken_back("its run gone");
+    edit(gone, &|j| { j["rerun"]["run_id"] = 39_999_999_999u64.into(); });
+    let late = taken_back("six hours on");
+    let long_ago = served.now_ms() - 7 * 3_600_000;
+    edit(late, &|j| { j["rerun"]["at_ms"] = long_ago.into(); });
+    let (not_allowed, refused, failing) = (taken_back("the App may not"), taken_back("GitHub refuses"), taken_back("GitHub fails"));
+    served.github.fail("POST", &format!("/actions/jobs/{not_allowed}/rerun"), 403, "Resource not accessible by integration");
+    served.github.fail("POST", &format!("/actions/jobs/{refused}/rerun"), 422, "This job cannot be re-run");
+    served.github.fail("POST", &format!("/actions/jobs/{failing}/rerun"), 502, "Server Error");
+    served.upkeep();
+    let rerun = |id: u64| state(id)["rerun"]["state"].as_str().unwrap_or_default().to_string();
+    assert_eq!(rerun(alone), "asked", "{}", state(alone));
+    assert_eq!((rerun(first), rerun(second)), ("asked".into(), "asked".into()), "{} {}", state(first), state(second));
+    assert!(served.github.asked.lock().unwrap().iter().any(|a| a.contains(&format!("/actions/runs/{first_run}/rerun-failed-jobs"))), "the two asked for together");
+    assert_eq!(rerun(going), "pending");
+    assert!(rerun(gone).contains("its run is gone"), "{}", state(gone));
+    assert!(rerun(late).contains("six hours later"), "{}", state(late));
+    assert!(rerun(not_allowed).contains("GitHub's App may not"), "{}", state(not_allowed));
+    assert!(rerun(refused).starts_with("not run again: "), "{}", state(refused));
+    assert_eq!(rerun(failing), "pending", "{}", state(failing));
+    assert!(!served.store.0.lock().unwrap().contains_key(&format!("rerun-asked:{failing}")), "asked again later");
+    served.github.fail_none();
+    served.aws.fail_none();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for (id, said) in [(alone, "ran the job again by itself"), (going, "SuperCI runs the job again by itself"), (gone, "its run is gone"), (late, "six hours later"), (not_allowed, "GitHub's App may not")] {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+        let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");
+        assert!(page.contains(said), "{id}: no {said:?}:\n{page}");
+    }
+    seen_in_browser(&served);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// GitLab's jobs on AWS: one whose spot machine AWS takes back, retried at GitLab and run again off spot machines; an
 /// event delivered twice; one taken by another job's runner; one cancelled while its machine starts. Each job's page
 /// says how it went.

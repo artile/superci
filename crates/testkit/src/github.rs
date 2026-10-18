@@ -22,6 +22,8 @@ const LOGS_AT: &str = "https://productionresultssa0.blob.core.windows.net/action
 struct Hub {
     /// S3 refuses what is put (as it refuses a link that ended).
     refuse_puts: bool,
+    /// Calls answered with an error (`fail`): the method and a part of the address, and the answer.
+    failing: Vec<(String, String, u16, String)>,
     jobs: BTreeMap<u64, Value>,
     logs: BTreeMap<u64, String>,
     /// Each run's logs, once it has ended (GitHub's zip: a folder for each job, a file for each step).
@@ -95,6 +97,11 @@ impl GitHub {
 
     /// From now on S3 refuses what is put in a bucket (`false`: takes it again).
     pub fn refuse_puts(&self, refuse: bool) { self.hub.lock().unwrap().refuse_puts = refuse }
+
+    /// A call (its method, and a part of its address) answered with this error from now on; `fail_none` clears them.
+    pub fn fail(&self, method: &str, part: &str, status: u16, message: &str) { self.hub.lock().unwrap().failing.push((method.into(), part.into(), status, json!({ "message": message, "documentation_url": "https://docs.github.com/rest", "status": status.to_string() }).to_string())) }
+
+    pub fn fail_none(&self) { self.hub.lock().unwrap().failing.clear() }
 
     /// How many times GitHub's key set for its jobs' tokens was asked for.
     pub fn jwks_asked(&self) -> u64 { self.hub.lock().unwrap().jwks_asked }
@@ -423,6 +430,8 @@ impl Http for GitHub {
         // Another control plane served on this computer (one moved to): asked as it is, as a deployed one would be.
         if r.url.starts_with("http://127.0.0.1:") { return Ok(local(&r)) }
         self.asked.lock().unwrap().push(format!("{} {}", r.method, r.url));
+        let failed = self.hub.lock().unwrap().failing.iter().find(|(m, part, ..)| *m == r.method && r.url.contains(part.as_str())).map(|(_, _, s, a)| (*s, a.clone()));
+        if let Some((status, answer)) = failed { return Ok(Response::new(status, "application/json", answer)) }
         Ok(self.answer(&r).unwrap_or_else(|| {
             self.unanswered.lock().unwrap().push(format!("{} {}", r.method, r.url));
             Response::new(404, "text/plain", format!("not here: {} {}", r.method, r.url))
