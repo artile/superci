@@ -330,3 +330,51 @@ fn the_dashboard_listens_where_it_can_and_says_where_and_why_not() {
     assert!(!o.status.success() && e.contains(&format!("Cloudflare's sign-in comes back to port {port} only")), "{e}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Who the dashboard answers: this computer's own address only, changes only from its own pages (by Sec-Fetch-Site, or
+/// else by Origin), and only a tab its link connected (by its cookie); a sign-in's way back passes without the cookie.
+#[test]
+fn only_this_computers_own_address_its_own_pages_and_a_connected_tab_are_answered() {
+    use std::io::{Read, Write};
+    let served = serve(|_| {});
+    let home = home(&served);
+    let (_child, link) = dashboard(&home);
+    let (base, key) = link.split_once("/?k=").unwrap();
+    let port = base.rsplit(':').next().unwrap().to_string();
+    let ask = |method: &str, path: &str, headers: &[(&str, &str)]| -> (u16, String) {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+        let mut req = format!("{method} {path} HTTP/1.1\r\nconnection: close\r\ncontent-length: 0\r\n");
+        for (k, v) in headers { req.push_str(&format!("{k}: {v}\r\n")) }
+        req.push_str("\r\n");
+        s.write_all(req.as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        (out.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0), words(&out))
+    };
+    let cookie = format!("superci_local={key}");
+    let here = format!("localhost:{port}");
+    // Another name pointing here, or no port, or one that is no number: not this computer's address.
+    for host in ["evil.example:8976".to_string(), "localhost:".to_string(), "localhost:abc".to_string()] {
+        let (status, said) = ask("GET", "/", &[("host", &host), ("cookie", &cookie)]);
+        assert!(status == 403 && said.contains("Not this computer's address"), "{host}: {status}");
+    }
+    // A change from another site: by Sec-Fetch-Site, or by its Origin where that is not said.
+    for headers in [vec![("sec-fetch-site", "cross-site")], vec![("origin", "http://evil.example")]] {
+        let mut h = vec![("host", here.as_str()), ("cookie", cookie.as_str())];
+        h.extend(headers.iter().copied());
+        let (status, said) = ask("POST", "/labels", &h);
+        assert!(status == 403 && said.contains("Not from your dashboard"), "{headers:?}: {status} {said}");
+    }
+    // From its own page (an Origin of null, as its no-referrer forms send, or its own): let through.
+    let own = format!("http://{here}");
+    for origin in ["null", own.as_str()] {
+        let (status, said) = ask("POST", "/routing", &[("host", &here), ("cookie", &cookie), ("origin", origin)]);
+        assert!(!said.contains("Not from your dashboard"), "{origin}: {status}");
+    }
+    // A tab its link did not connect: said so; a sign-in's way back passes on to be checked by its state.
+    let (status, said) = ask("GET", "/?p=overview", &[("host", &here)]);
+    assert!(status == 403 && said.contains("This tab is not connected to your dashboard"), "{status}");
+    let (_, said) = ask("GET", "/oauth/callback?code=x&state=y", &[("host", &here)]);
+    assert!(!said.contains("This tab is not connected"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
