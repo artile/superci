@@ -2549,6 +2549,26 @@ fn a_workspace_with_no_control_plane_yet_is_asked_which_ci_from_every_page_and_c
 }
 
 #[test]
+fn what_each_kind_of_aws_account_allows_is_said_by_the_cli_as_aws_answered_and_on_its_page() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    for look in [include_str!("../fixtures/aws/classic/look.jsonl"), include_str!("../fixtures/aws/project-activated/look.jsonl"), include_str!("../fixtures/aws/project-paid/look.jsonl")] {
+        let served = serve(|_| {});
+        served.aws.replaying(look, &[]);
+        let home = signed_in(&served);
+        for args in [&["accounts", "retrieve", "aws"][..], &["accounts", "retrieve", "aws", "--json"], &["images", "list"], &["status"]] {
+            let o = common::command(&home).args(args).output().unwrap();
+            let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked"), "{args:?}: {said}");
+        }
+        let (mut child, link) = dashboard(&home);
+        b.goto(&format!("{link}&p=planes"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("AWS account")));
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // One whose machine never takes it, one that runs and never ends, one that ended; then hours and days pass.
