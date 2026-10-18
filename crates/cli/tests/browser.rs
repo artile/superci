@@ -8205,6 +8205,16 @@ fn a_working_trees_parts_are_taken_or_refused_and_no_run_comes_of_them() {
     assert!(status == 200 && said.contains("\"base\":false"), "a base the bucket no longer has: {status} {said}");
     let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&base=bgone0123456789"), vec![]);
     assert!(status == 200 && said.contains("\"base\":false"), "{status} {said}");
+    // A chain with a name that is none; a layer named as none (taken as no layer); bases all there: the layer's link.
+    assert_eq!(send(&served, &format!("id={tree}&part=0&link=1&layer=l0123456789abcdef&base=b0123456789abcdef,no!"), vec![]).0, 400);
+    let (status, _) = send(&served, &format!("id={tree}&part=0&link=1&layer=short&base=b0123456789abcdef"), vec![]);
+    assert!(status < 500, "{status}");
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    for name in ["b0123456789abcdef", "l1111111111111111"] { served.github.put_object(&format!("{bucket}/bases/{name}.tar.gz"), b"tree") }
+    let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&layer=l2222222222222222&base=b0123456789abcdef,l1111111111111111"), vec![]);
+    assert!(status == 200 && said.contains("\"base\":true") && said.contains("\"parts\":3"), "{status} {said}");
+    let (status, said) = send(&served, &format!("id={tree}&part=0&link=1&base=b0123456789abcdef"), vec![]);
+    assert!(status == 200 && said.contains("\"parts\":2"), "{status} {said}");
     assert!(served.store.under("run:").is_empty());
 }
 
