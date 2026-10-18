@@ -598,3 +598,45 @@ fn keeping_docker_images_is_turned_off_and_on_in_settings() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+
+#[test]
+fn a_control_plane_from_before_the_keys_new_name_says_why_with_a_key_alone_and_is_updated_in_the_browser_once_signed_in() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let plane = served.plane.clone();
+    // Its settings under their old names, as such a control plane keeps them.
+    served.aws.put(&format!("/superci/{plane}/AGENTS"), "[]");
+    *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    // With this computer's key alone (no sign-in to hand it under the old name): its pages say why they do not load.
+    let home = home(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "1")]);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runs");
+    b.wait(&shows("reads this computer's key under its old name"));
+    assert!(b.eval("document.querySelector('main').innerText").as_str().unwrap().contains("superci planes update"));
+    let _ = child.kill();
+    // Signed in where it runs: the key handed under its old name, its pages read; updated from its page, it runs this
+    // version, its settings under the new names.
+    let home = signed_in(&served);
+    // (AWS's answers to an update, as recorded.)
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&shows("Usage"));
+    b.click("nav a", "Runs");
+    b.wait(&shows("No runs yet"));
+    b.click(".side a", "Control plane");
+    b.wait(&shows("Update to "));
+    b.click("main button, main a", &format!("Update to {}", env!("CARGO_PKG_VERSION")));
+    b.wait(&shows("Updating…"));
+    // (Its new code uploaded and started, the converter beside it, the old names taken out: a while.)
+    let names = || served.aws.settings(&plane).into_iter().map(|(k, _)| k).collect::<Vec<String>>();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while names().iter().any(|k| k == "AGENTS" || k.starts_with("DASHBOARD_KEY_")) { assert!(std::time::Instant::now() < end, "the update did not end: {:?}; {}", names(), b.eval("document.querySelector('#side-update').innerText")); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    assert!(served.aws.old_version.lock().unwrap().is_none() && names().iter().any(|k| k.starts_with("DEVICE_KEY_")), "{:?}", names());
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Update to ')", shows(env!("CARGO_PKG_VERSION"))));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

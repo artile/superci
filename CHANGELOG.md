@@ -3,6 +3,7 @@
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
 ## 0.19.17
+- A dashboard page whose control plane does not take this computer's key says why after half a minute (a control plane from before 0.19.13 reads the key under its old name; a key that expired; a newer control plane), with what to do. It kept saying "Reading your control plane…".
 - `superci runs create` starts a run as GitHub's events would: its job conditions and `github.event` see the payload GitHub sends, made from the working tree (the branch, the commit, a pull request's head and base). `--label=NAME` gives the pull request labels (its action `labeled`), `--event=workflow_dispatch` with `--input=NAME=VALUE` starts it by hand (other inputs take their defaults, typed as the workflow says, a required one or a wrong value refused), and `--event-payload=FILE` puts JSON over the payload. `github.event` was empty, so a job that read it, a label's say, was always skipped. Update your control plane for it.
 - A job's condition reads every item's field after `*`: `contains(github.event.pull_request.labels.*.name, 'x')` read the first label whole, and was false.
 - `superci runs create` and `runs wait` keep following a run when this computer loses the control plane for a while (its network or DNS drops, or the control plane is restarting): they say so once, ask again every few seconds, and go on where they were. They ended with an error, though the run went on. After ten minutes with no answer they end, saying how to follow the run again.

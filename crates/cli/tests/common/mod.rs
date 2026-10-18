@@ -109,14 +109,20 @@ impl Dashboard { pub fn kill(&mut self) -> std::io::Result<()> { self.0.kill() }
 impl Drop for Dashboard { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
 
 /// A dashboard on this computer for `home`'s workspace, and its link (with the key that opens it).
-pub fn dashboard(home: &std::path::Path) -> (Dashboard, String) {
+pub fn dashboard(home: &std::path::Path) -> (Dashboard, String) { dashboard_with(home, &[]) }
+
+/// The same, with these settings of its own.
+pub fn dashboard_with(home: &std::path::Path, envs: &[(&str, &str)]) -> (Dashboard, String) {
     let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-    let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
+    let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string()).envs(envs.iter().copied())
         .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
     let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
-    // (What it prints later is read too: a closed pipe would end it.)
+    // (What it prints later is read too: a closed pipe would end it, a full one stop it. What it says of itself is
+    // passed on, for a test that fails.)
     std::thread::spawn(move || lines.for_each(drop));
+    let errors = BufReader::new(child.stderr.take().unwrap()).lines().map_while(Result::ok);
+    std::thread::spawn(move || errors.for_each(|l| eprintln!("dashboard: {l}")));
     (Dashboard(child), link)
 }
 

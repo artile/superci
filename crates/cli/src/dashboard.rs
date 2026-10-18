@@ -3918,6 +3918,12 @@ mark();load()})();</script>"#;
         // Overview does not: its public state is enough, and its numbers and jobs fill in when the key is read.
         if settling && !["plane", "overview"].contains(&section) {
             let title = section_title(section);
+            // Half a minute on, one that still does not take the key will not by itself (it is from before the key's
+            // name, or the key expired): why, and what to do, said; looked at again now and then.
+            let waited = current.is_some_and(|v| now_ms() >= self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(u64::MAX - KEY_WAIT_MS) + key_wait_ms());
+            if let Some(why) = current.filter(|_| waited).and_then(|v| self.key_refused(v)) {
+                return format!(r#"<div data-refresh="5"></div><div class="bar"><h1 class="page-title">{}</h1></div><div class="cards"><section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section></div>"#, esc(title), esc(&why))
+            }
             return format!(r#"<div data-refresh="2"></div>{}"#, skeleton(section, title));
         }
         // The control plane in use is in a cloud this session is not signed in to: its pages need that sign-in, asked
@@ -5461,6 +5467,14 @@ fn section_name(section: &str) -> &str {
         s if ["plane", "planes", "all", "changes", "runners", "add-runners", "workflows", "settings", "jobs", "job", "runs", "run", "repos", "gitlab"].contains(&s) => s,
         _ => "overview",
     }
+}
+
+/// How long pages wait for a control plane to take this computer's key before saying why it does not.
+const KEY_WAIT_MS: u64 = 30_000;
+fn key_wait_ms() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("SUPERCI_KEY_WAIT_S").ok().and_then(|v| v.parse::<u64>().ok()) { return s * 1000 }
+    KEY_WAIT_MS
 }
 
 fn section_title(section: &str) -> &'static str {
