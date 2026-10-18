@@ -4000,6 +4000,28 @@ mod github_in_browser {
             let (status, said) = post("lookup", serde_json::json!({ "token": t, "key": "deps-main", "version": version }));
             assert_eq!((status, said["why"].as_str()), (403, Some(why)), "{said}");
         }
+        // Tokens that let it do nothing, whose scope is no ref, whose repository is empty: nothing found, nothing saved.
+        for ac in [serde_json::json!([{ "Scope": "refs/heads/main", "Permission": 0 }]), serde_json::json!([{ "Scope": "refs/heads/a:b", "Permission": 3 }]), serde_json::json!([{ "Scope": "refs/heads/\u{7}", "Permission": 3 }]), serde_json::json!([{ "Scope": "", "Permission": 3 }])] {
+            let t = token(197814629, ac.clone());
+            let (status, _) = post("lookup", serde_json::json!({ "token": t, "key": "deps-main", "version": version }));
+            assert!(status >= 200, "{ac}");
+            assert!(post("begin", serde_json::json!({ "token": t, "key": "deps-scoped", "version": version })).0 >= 400, "{ac}");
+        }
+        let empty_repo = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "", "ac": "[]", "exp": exp }));
+        assert_eq!(post("lookup", serde_json::json!({ "token": empty_repo, "key": "deps-main", "version": version })).0, 403);
+        // Keys GitHub's client would not send: empty, too long, with a comma or a control character.
+        for key in ["".to_string(), "k".repeat(513), "a,b".to_string(), "a\u{7}b".to_string()] {
+            assert_eq!(post("begin", serde_json::json!({ "token": main, "key": key, "version": version })).0, 400, "{key:?}");
+            assert!(post("lookup", serde_json::json!({ "token": main, "key": key, "version": version, "restore_keys": [key] })).0 >= 200);
+        }
+        // A save begun and left (its machine gone): taken over once it has stalled a while; a hit last used hours ago.
+        assert_eq!(post("begin", serde_json::json!({ "token": main, "key": "deps-left", "version": version })).1["ok"], true);
+        served.later(3 * 3_600_000);
+        assert_eq!(post("begin", serde_json::json!({ "token": main, "key": "deps-left", "version": version })).1["ok"], true, "taken over");
+        assert_eq!(found(&main, "deps-main")["hit"], true);
+        // A machine's link with a letter no link has.
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        assert!(agent.post(&format!("{}/cache/a-link-with-a-bad-letter!/lookup", served.url)).send("{}").unwrap().status().as_u16() >= 400);
         // Versions GitHub's client would not send, a token whose repository is no number, a save finished with no
         // pieces, a machine's link too short: refused.
         for v in ["".to_string(), "a-b".to_string(), "c".repeat(129)] {
@@ -4011,8 +4033,8 @@ mod github_in_browser {
         assert!(post("finish", serde_json::json!({ "token": main, "key": "deps-empty", "version": version, "pieces": [] })).0 >= 400);
         let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
         assert_eq!(agent.post(&format!("{}/cache/short/lookup", served.url)).send("{}").unwrap().status().as_u16(), 404);
-        // GitHub's keys were asked for once, and kept.
-        assert_eq!(served.github.jwks_asked(), 1);
+        // GitHub's keys were asked for once, and kept (and once more after the hours that passed above).
+        assert_eq!(served.github.jwks_asked(), 2);
         // The cache's list: the repository by its name, as GitHub has it; its entries by scope; a branch's taken out.
         let home = signed_in(&served);
         let (_, listed) = json(&home, &["caches", "list"]);
