@@ -8833,11 +8833,34 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         assert!(status < 500, "{what}: {status}");
         if what == "cache" { assert_eq!(status, 200, "its link is its machine's") }
     }
-    for (what, body) in [("layers-links", r#"{"layers":["sha256:aaaa"]}"#), ("layers-propose", r#"{"layers":[{"digest":"sha256:aaaa","size":10}]}"#), ("layers-uploaded", r#"{"layers":["sha256:aaaa"]}"#),
-        ("layers-kept", r#"{"served":1,"served_bytes":10,"pulled":0,"pulled_bytes":0,"uploaded":0,"uploaded_bytes":0}"#), ("tool-get", r#"{"tool":"turbo","hash":"abc"}"#)] {
-        let status = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body).map(|r| r.status().as_u16()).unwrap_or(0);
-        assert!(status < 500, "{what}: {status}");
+    let call = |what: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body.to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    // Layers its Docker pulled, proposed to the store: of each size and registry, one named as no digest is.
+    let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    let (status, said) = call("layers-propose", serde_json::json!({ "layers": [
+        { "digest": digest('a'), "size": 1000, "sources": [{ "registry": "docker.io", "repository": "library/node" }] },
+        { "digest": digest('b'), "size": 1000, "sources": [{ "registry": "ghcr.io", "repository": "acme/app" }, { "registry": "evil.example", "repository": "x" }, { "registry": "eu.gcr.io", "repository": "p/i" }, { "registry": "us-docker.pkg.dev", "repository": "../up" }] },
+        { "digest": digest('c'), "size": 0 }, { "digest": digest('d'), "size": 999_999_999_999u64 }, { "digest": "sha256:short", "size": 10 }] }));
+    assert!(status == 200 && said["layers"].is_object(), "{status} {said}");
+    // Its uploads said done: one with no id, one no upload has, and one it was given (nothing put there).
+    let given = said["layers"].as_object().unwrap().values().find_map(|a| a["id"].as_str().map(str::to_string)).unwrap_or_default();
+    assert!(!given.is_empty(), "an upload link for one of them: {said}");
+    for (id, at_most) in [("", 400), ("no-upload-has-this-id-0001", 404), (given.as_str(), 409)] {
+        let (status, _) = call("layers-uploaded", serde_json::json!({ "id": id }));
+        assert!(status <= at_most || given.is_empty(), "{id}: {status}");
     }
+    // Links to what the store has of them (nothing yet), what was kept as the job ended and after it.
+    assert_eq!(call("layers-links", serde_json::json!({ "digests": [digest('a'), "nope"] })).0, 200);
+    for body in [serde_json::json!({ "keeping": true, "pulled": 2, "pulled_bytes": 2000 }), serde_json::json!({ "pulled": 2, "pulled_bytes": 2000, "uploaded": 1, "uploaded_bytes": 1000, "served_digests": [digest('a')], "used": [digest('a'), "nope"] }), serde_json::json!("not what was kept")] {
+        let (status, _) = call("layers-kept", body);
+        assert!(status < 500, "{status}");
+    }
+    assert!(call("tool-get", serde_json::json!({ "tool": "turbo", "hash": "abc" })).0 < 500);
+    // An hour on: the store's upkeep at the sweep.
+    served.later(3_700_000);
+    served.upkeep();
     // Docker's images not kept: the cache still there.
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{order},"cache":{{"images_off":true}}}}"#));
     ids.push(job("superci"));
