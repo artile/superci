@@ -1275,6 +1275,10 @@ fn a_day_of_github_and_gitlab_jobs_is_summed_up_on_overview_for_a_day_a_week_and
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // A day's jobs: from GitHub a short pass, a failure, a two-hour pass and one still starting; from GitLab a pass.
     let served = serve(|_| {});
+    // (Its jobs run over two hours of the day: begun at six in the morning (UTC), so that none of it falls in the next.)
+    let day = 86_400_000;
+    let at = served.now_ms() % day;
+    served.later((day + 6 * 3_600_000 - at) % day);
     served.connect_github();
     served.connect_gitlab();
     let gh = |name: &str, end: Option<&str>, ms: u64| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); served.webhook(q); if let Some(e) = end { served.webhook(served.github.start(id)); served.later(ms); served.webhook(served.github.finish(id, e, "log", served.now_ms())); } };
@@ -7135,6 +7139,9 @@ fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_p
         let served = serve(move |c| {
             if with_aws { (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX })); }
         });
+        // (Its spending a day counts from midnight (UTC): begun in the morning, so that none of it falls in the day before.)
+        let day = 86_400_000;
+        served.later((day + 6 * 3_600_000 - served.now_ms() % day) % day);
         served.connect_github();
         for (k, v) in &settings { if *k != "-aws" { served.aws.put(&format!("/superci/{PLANE}/{k}"), v) } }
         served.aws.put(&format!("/superci/{PLANE}/ROUTING"), routing);
