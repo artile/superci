@@ -1865,3 +1865,51 @@ fn overview_sums_up_a_single_gitlab_job_and_a_day_of_long_ones() {
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+#[test]
+fn a_second_control_plane_given_a_code_host_of_its_own_makes_two_cis_listed_and_acted_on_one_at_a_time() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The CI in use (GitHub); a control plane set up in Cloudflare beside it, as this workspace sets one up to move to.
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00003/CONTAINERS");
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let fixture = |name: &str| std::fs::read_to_string(format!("{}/fixtures/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    served.aws.replaying(&[fixture("cloudflare/sign-in/usage"), fixture("update/01-deploy-cf")].concat(), &[]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", "cfplane00003")]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows("Set up"));
+    b.click("form[action=\"/plane/cloudflare\"] button", "Set up");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("superci.acme.workers.dev Move here") { assert!(std::time::Instant::now() < end, "set up"); std::thread::sleep(std::time::Duration::from_millis(500)) }
+    // GitLab connected to the Cloudflare one directly, from its own page, rather than moving: two CIs live here.
+    let token = superci_testkit::gitlab::GitLab::connection()["token"].as_str().unwrap().to_string();
+    b.goto(&format!("{link}&c=cfplane00003&p=repos"));
+    b.wait(&page_shows("Repositories"));
+    let (got, text) = post(&mut b, "/gitlab/connect?c=cfplane00003", &[("url", "https://gitlab.com"), ("token", &token), ("which", "new")]);
+    assert!(got < 400, "{got} {text}");
+    // The dashboard, naming neither: the list of them, to open one.
+    b.goto(&link);
+    b.wait(&format!("{} && {} && {}", shows("Control planes"), reads("GitHub: acme · AWS · 111111111111"), reads("GitLab: gitlab.com · Cloudflare · Acme")));
+    // A change that names neither: refused, nothing changed.
+    let (got, text) = post(&mut b, "/labels", &[("label", "acmeci")]);
+    assert!(got == 409 && text.contains("Which control plane?"), "{got} {text}");
+    // One opened: its pages; Control plane lists the other as a CI of its own, to open.
+    b.goto(&format!("{link}&c={PLANE}&p=planes"));
+    b.wait(&shows("Serves a code host of its own"));
+    b.goto(&format!("{link}&c=cfplane00003&p=overview"));
+    b.wait(&page_shows("Overview"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
