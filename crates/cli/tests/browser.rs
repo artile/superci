@@ -2324,6 +2324,193 @@ fn signing_out_from_settings_ends_each_sign_in_and_hands_back_this_computers_key
 }
 
 #[test]
+fn what_a_form_asks_that_changes_nothing_or_cannot_be_is_said_and_the_control_plane_keeps_what_it_had() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"account_usd":{"aws":100.0},"aws_budget":{"stop":false},"order":[{"cloud":"aws"},{"cloud":"cloudflare"}]}"#);
+    // A further GitLab, beside none first.
+    let mut further = superci_testkit::GitLab::connection();
+    further["id"] = "gabc12".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gabc12"), &further.to_string());
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    let words = |s: &str| common::words(s);
+    // AWS's runners in a region that is none.
+    let (status, _, said) = common::post(&link, "/aws/connect", &[("region", "mars-1")]);
+    assert!(status == 400 && words(&said).contains("Choose a region from the list"), "{status} {}", words(&said));
+    // The label it answers to already, added: first, as it was (no other rule for it).
+    let (status, to, _) = common::post(&link, "/labels", &[("label", "superci")]);
+    assert!(status == 303 && to.contains("p=settings"), "{status} {to}");
+    assert_eq!(setting("LABELS").as_deref(), Some(r#"["superci"]"#));
+    // AWS's limit set to what it is, its budget in AWS as it is: AWS is not asked, the limit and budget kept.
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "100")]);
+    assert!(status == 303, "{status} {}", words(&said));
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("budgets"))), "AWS asked about its budget");
+    let routing: serde_json::Value = serde_json::from_str(&setting("ROUTING").unwrap()).unwrap();
+    assert!(routing["account_usd"]["aws"] == 100.0 && routing["aws_budget"].is_object(), "{routing}");
+    // No networks of its own, as it had none: nothing written.
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "")]);
+    assert!(status == 303, "{status} {}", words(&said));
+    assert_eq!(setting("AWS_NETWORKS"), None);
+    // Signing in again after AWS's "400 Bad Request": by way of AWS's sign-out.
+    let (status, to, _) = common::post(&link, "/aws/signin", &[("fresh", "on")]);
+    assert!(status == 303 && to.starts_with("https://signin.aws.amazon.com/oauth?Action=logout&redirect_uri="), "{status} {to}");
+    // The further GitLab let go of: its connection gone, the first (none) left as it is.
+    let (status, to, _) = common::post(&link, "/gitlab/disconnect", &[("gitlab", "gabc12")]);
+    assert!(status == 303 && to.contains("p=repos"), "{status} {to}");
+    assert_eq!(setting("GITLAB_gabc12"), None);
+    // One cache key's entries taken out, of one branch.
+    let (status, to, _) = common::post(&link, "/caches/delete", &[("repo", "acme/app"), ("key", "node-modules"), ("scope", "refs/heads/main")]);
+    assert!(status == 303 && to.contains("p=settings"), "{status} {to}");
+    // A run cancelled that names none.
+    let (status, _, said) = common::post(&link, "/run/cancel", &[("id", "")]);
+    assert!(status == 400 && words(&said).contains("Which run?"), "{status}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_workspace_not_signed_in_to_aws_is_asked_to_sign_in_before_its_aws_is_looked_at_or_changed() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    // Refresh, with no AWS account in hand: back to the page, nothing looked at.
+    let (status, to, _) = common::post(&link, "/aws/look", &[("next", "?p=planes")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to}");
+    // Review → Allow needs the account's sign-in.
+    let (status, _, said) = common::post(&link, "/permissions/aws", &[("plane", "testplane0001")]);
+    assert!(status == 403 && common::words(&said).contains("Sign in with AWS first"), "{status} {}", common::words(&said));
+    // Adding runners: AWS's for its own account is a sign-in first.
+    let page = common::part(&link, "/?p=add-runners&fragment=1").1;
+    assert!(page.contains(r#"action="/aws/signin""#) && !page.contains(r#"action="/runners/aws-own""#), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_runs_page_and_a_jobs_page_show_their_own_among_other_repositories_and_attempts_of_the_same_run() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    let job: serde_json::Value = served.store.under(&format!("job:{id}"))[0].1.clone();
+    let run = job["run_id"].as_u64().unwrap();
+    // Its run tried again (a job of attempt 2, later), and a run of another repository with the same number.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (n, repo, attempt) in [(1, "acme/app", 2), (2, "acme/other", 1)] {
+            let mut j = job.clone();
+            (j["job_id"], j["repo"], j["attempt"], j["at_ms"]) = ((id + n).into(), repo.into(), attempt.into(), (job["at_ms"].as_u64().unwrap() + n * 1000).into());
+            m.insert(format!("job:{}", id + n), j.to_string());
+        }
+    }
+    let (mut child, link) = common::dashboard(&home);
+    let page = |q: &str| common::words(&common::part(&link, &format!("/?{q}&fragment=1")).1);
+    // Attempt 1's page: its one job, not the other attempt's nor the other repository's.
+    let first = page(&format!("p=run&repo=acme%2Fapp&id={run}&attempt=1"));
+    assert!(first.contains("Jobs here 1"), "{first}");
+    // An attempt there was none of.
+    let none = page(&format!("p=run&repo=acme%2Fapp&id={run}&attempt=7"));
+    assert!(none.contains("Not among the latest runs"), "{none}");
+    // The job's page names its own run (attempt 1), the later attempt listed first notwithstanding.
+    let (_, html) = common::part(&link, &format!("/?p=job&id={id}&fragment=1"));
+    assert!(html.contains(&format!("/?p=run&amp;repo=acme%2Fapp&amp;id={run}&amp;attempt=1")), "{}", common::words(&html));
+    // The same number asked for as a GitLab's job: not this one.
+    assert!(page(&format!("p=job&id={id}&gl=gother")).contains("Not among the latest jobs"));
+    // Cancelling it, and GitHub refusing: said, nothing else done.
+    served.github.fail("POST", &format!("/actions/runs/{run}/cancel"), 409, "Cannot cancel a workflow run that is completed.");
+    let (status, _, said) = common::post(&link, "/run/cancel", &[("id", &run.to_string()), ("repo", "acme/app")]);
+    assert!(status == 400 && common::words(&said).contains("The run was not cancelled"), "{status} {}", common::words(&said));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_image_jobs_run_on_is_copied_anew_when_the_accounts_copy_is_of_an_older_build_before_anything_was_looked_at() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    // As AWS answered: a copy in Canada there already, here of a build older than the newest published.
+    account.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[]);
+    account.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000")]);
+    let (mut child, link) = common::dashboard(&home);
+    let copied = || account.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage")) && a["url"].as_str().is_some_and(|u| u.contains("ca-central-1"))).count();
+    // Asked for the newer build (the account not looked at yet): copied in beside the old one.
+    let (status, to, said) = common::post(&link, "/aws/image", &[("region", "ca-central-1"), ("newer", "1")]);
+    assert!(status == 303 && to == "/?p=planes#aws-account", "{status} {to} {}", common::words(&said));
+    assert_eq!(copied(), 1, "copied in");
+    // Asked for a copy where one is on its way: none more; the set-up page looks again until it is there.
+    account.replaying(include_str!("../fixtures/aws/images/03-list-pending.jsonl"), &[]);
+    let (status, to, said) = common::post(&link, "/aws/image", &[("region", "ca-central-1")]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to} {}", common::words(&said));
+    assert_eq!(copied(), 1, "no copy more");
+    let (_, page) = common::part(&link, "/?p=plane&fragment=1");
+    assert!(page.contains(r#"<div data-refresh="10"></div>"#) && common::words(&page).contains("Set up a control plane"), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_first_control_plane_in_aws_is_refused_where_the_sign_in_may_run_nothing_and_asked_again_while_it_deploys_starts_nothing_more() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    let (mut child, link) = common::dashboard(&home);
+    let page = |p: &str| common::words(&common::part(&link, &format!("/?p={p}&fragment=1")).1);
+    // As a project of AWS's new sign-up answered, its refusals the sign-in's own (not its organization's), and the one
+    // region it had refused too: nowhere to set up.
+    let not_allowed = superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: ec2:DescribeVpcs because no identity-based policy allows the ec2:DescribeVpcs action");
+    account.fail("DescribeVpcs|ec2.eu-north-1", 403, &not_allowed, None);
+    account.replaying(include_str!("../fixtures/aws/project-activated/look.jsonl"), &[("with an explicit deny in a service control policy", "because no identity-based policy allows the action")]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut seen = page("plane");
+    while !seen.contains("No region to set it up in") { assert!(std::time::Instant::now() < end, "{seen}"); std::thread::sleep(std::time::Duration::from_millis(300)); seen = page("plane") }
+    let (status, _, said) = common::post(&link, "/plane/aws", &[("region", "us-east-1")]);
+    let said = common::words(&said);
+    assert!(status == 409 && said.contains("The sign-in is not allowed there") && said.contains("It allows none of the regions SuperCI works in"), "{status} {said}");
+    // As a classic account answered (N. Virginia allowed), with AWS slow to answer: a deploy under way, and its id
+    // given as no id is (a new one made).
+    account.fail_none();
+    account.replaying(include_str!("../fixtures/aws/classic/look.jsonl"), &[]);
+    common::post(&link, "/aws/look", &[("next", "?p=plane")]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !page("plane").contains("Not in Canada") { assert!(std::time::Instant::now() < end, "{}", page("plane")); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    let slow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let s = slow.clone();
+    account.during("amazonaws.com", move || if s.load(std::sync::atomic::Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_secs(3)) });
+    let (status, to, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "NOTANIDHERE1")]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to}");
+    // Meanwhile: another deploy asked for, and starting over, change nothing; it goes on.
+    let (status, to, _) = common::post(&link, "/plane/cloudflare", &[("account", "acme")]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to}");
+    let (status, to, _) = common::post(&link, "/plane/start-over", &[]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to}");
+    assert!(page("plane").contains("Deploying to AWS"), "{}", page("plane"));
+    slow.store(false, std::sync::atomic::Ordering::SeqCst);
+    // (AWS answering nothing more: it stops, to be tried again with the id it made.)
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !page("plane").contains("Try again") { assert!(std::time::Instant::now() < end, "{}", page("plane")); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    let (_, html) = common::part(&link, "/?p=plane&fragment=1");
+    let id = html.split(r#"name="plane" value=""#).nth(1).and_then(|r| r.split('"').next()).unwrap_or_default().to_string();
+    assert!(id.len() == 12 && id != "NOTANIDHERE1" && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "{id}");
+    // Signed out of AWS elsewhere, then started over: let go of, nothing asked of AWS (no sign-in to remove it with).
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept.as_object_mut().unwrap().remove("aws");
+    std::fs::write(&file, kept.to_string()).unwrap();
+    page("overview");
+    let asked = account.asked.lock().unwrap().len();
+    let (status, to, _) = common::post(&link, "/plane/start-over", &[]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to}");
+    assert_eq!(account.asked.lock().unwrap().len(), asked, "AWS asked");
+    // A sign-in with AWS begun again and not back yet: the pages say what to do if AWS's page said "400 Bad Request".
+    let (status, _, _) = common::get(&link, "/connect/aws");
+    assert!(status < 400, "{status}");
+    assert!(page("overview").contains("Your AWS sign-in is not finished"), "{}", page("overview"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // A control plane whose own account runs jobs, with a budget in AWS for its limit; AWS answering nothing more.
