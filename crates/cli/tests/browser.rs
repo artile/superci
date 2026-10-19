@@ -11179,3 +11179,51 @@ fn a_moved_control_plane_passes_events_on_and_moving_out_takes_its_one_time_toke
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A dashboard started with several workspaces and none named: a page opens on the one shown last (else the first),
+/// its address given the name; a part of a page, a change and a sign-in coming back that say no workspace are
+/// answered as such; a workspace not kept here leads to the list. Then the one opened is the one it opens on.
+#[test]
+fn a_dashboard_with_several_workspaces_and_none_named_opens_on_the_last_shown_and_asks_which_for_the_rest() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let acme = home.join("workspaces/acme");
+    std::fs::create_dir_all(&acme).unwrap();
+    std::fs::copy(home.join("workspaces/default/sign-ins.json"), acme.join("sign-ins.json")).unwrap();
+    let start = || {
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut child = common::command(&home).args(["dashboard", "--no-browser"]).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        use std::io::BufRead;
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
+        let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
+        std::thread::spawn(move || lines.for_each(drop));
+        (child, link)
+    };
+    let (mut child, link) = start();
+    // A page with no workspace named: to the first, by name.
+    let (status, to, _) = common::get(&link, "/?p=overview");
+    assert!(status == 303 && (to.contains("w=acme") || to.contains("w=default")), "{status} {to}");
+    // A part of a page, a change and a sign-in coming back, none naming one; a workspace not kept here.
+    let (status, _) = common::part(&link, "/?p=overview&fragment=1");
+    assert!(status < 500, "{status}");
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "monthly_usd"), ("usd", "5")]);
+    assert!(status == 409 && common::words(&said).contains("Which workspace?"), "{status} {}", common::words(&said));
+    let (status, _, said) = common::get(&link, "/oauth/callback?code=x&state=y");
+    assert!(status < 500, "{status} {}", common::words(&said));
+    let (status, to, _) = common::get(&link, "/?w=ghost");
+    assert!(status == 303 && to == "/workspaces", "{status} {to}");
+    let (_, gone) = common::part(&link, "/?w=ghost&fragment=1");
+    assert!(common::words(&gone).contains("not kept on this computer"), "{}", common::words(&gone));
+    let (status, _, said) = common::post(&link, "/routing?w=ghost", &[("action", "monthly_usd"), ("usd", "5")]);
+    assert!(status == 409 && common::words(&said).contains("not kept"), "{status} {}", common::words(&said));
+    // acme opened in the browser: noted, and the next dashboard opens on it.
+    b.goto(&format!("{link}&w=acme&p=overview"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let (mut child, link) = start();
+    let (_, to, _) = common::get(&link, "/?p=overview");
+    assert!(to.contains("w=acme"), "the one shown last: {to}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
