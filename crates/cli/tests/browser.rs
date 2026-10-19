@@ -2628,6 +2628,12 @@ fn a_cloudflare_control_planes_aws_runners_in_another_account_are_set_without_as
     let (status, to, said) = common::post(&link, "/runners/cloudflare", &[]);
     assert!(status == 303 && to == "/?p=runners", "{status} {to} {}", common::words(&said));
     assert_eq!(secret("LAUNCHERS").as_deref(), Some("[]"));
+    // Its AWS runners removed from SuperCI only: forgotten (the control plane told), what is in AWS listed as left.
+    let (status, to, said) = common::post(&link, "/runners/remove", &[("cloud", "aws"), ("only", "on")]);
+    assert!(status == 303 && to == "/?p=runners", "{status} {to} {}", common::words(&said));
+    assert!(cf.store.under("aws").is_empty(), "forgotten");
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(page.contains("Left: in AWS account 111111111111: the role superci-plane-cfplane00005 and its identity provider"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -2965,6 +2971,75 @@ fn a_first_control_plane_set_up_goes_on_from_its_page_to_the_overview_once() {
     }
     let (_, page) = common::part(&link, "/?p=plane&fragment=1");
     assert!(!page.contains("data-go=") && common::words(&page).contains(&new.url), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_first_deploy_that_stopped_is_started_over_and_all_it_made_is_removed_as_aws_answered() {
+    // Signed in to an AWS account with no control plane yet; AWS stopping the deploy (its role refused).
+    let account = superci_testkit::Aws::serve();
+    account.fail("CreateRole", 503, &superci_testkit::ec2_error("ServiceUnavailable", "Service is unavailable."), None);
+    let home = common::aws_only(&account);
+    let (mut child, link) = common::dashboard(&home);
+    let (status, to, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "deployplane1")]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to}");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Try again") { assert!(std::time::Instant::now() < end, "{}", common::words(&common::part(&link, "/?p=plane&fragment=1").1)); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    // Started over, AWS removing what it made as it removed a real one's: nothing left, nothing to say; back to choosing.
+    account.fail_none();
+    account.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", "deployplane1")]);
+    let (status, to, said) = common::post(&link, "/plane/start-over", &[]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to} {}", common::words(&said));
+    assert!(account.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=DeleteRole&") && s.contains("superci-plane-deployplane1"))), "its role removed");
+    assert!(common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Set up a control plane"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_further_gitlab_is_connected_again_with_a_new_secret_and_a_further_organization_with_a_name_of_its_own_is_offered_for_removal() {
+    let served = serve(|_| {});
+    served.connect_github();
+    // A further GitLab, and a further organization whose name GitHub Enterprise allowed an underscore in.
+    let mut further = superci_testkit::GitLab::connection();
+    further["id"] = "gabc12".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gabc12"), &further.to_string());
+    let mut theirs = superci_testkit::GitHub::app();
+    (theirs["id"], theirs["slug"], theirs["owner"]) = (1002.into(), "superci-acme-ci".into(), "acme_ci".into());
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_1002"), &theirs.to_string());
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    // Connected again, by its name: the same connection, a new secret for its webhooks.
+    let token = superci_testkit::GitLab::connection()["token"].as_str().unwrap().to_string();
+    let (status, to, said) = common::post(&link, "/gitlab/connect", &[("url", "https://gitlab.com"), ("token", &token), ("which", "gabc12")]);
+    assert!(status == 303 && to == "/?p=gitlab&g=gabc12", "{status} {to} {}", common::words(&said));
+    let now: serde_json::Value = serde_json::from_str(&setting("GITLAB_gabc12").unwrap()).unwrap();
+    assert!(now["id"] == "gabc12" && now["hook_secret"] != further["hook_secret"], "{now}");
+    // Repositories: the further organization can be removed, its name said in plain letters.
+    let (_, page) = common::part(&link, "/?p=repos&fragment=1");
+    assert!(page.contains("return confirm('Remove acmeci? Its App is uninstalled there") && common::words(&page).contains("GitHub · acme_ci"), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_modal_control_planes_own_sandboxes_are_shown_added() {
+    // A control plane in Modal, starting sandboxes itself; Modal signed in to (it answers nothing more).
+    let account = superci_testkit::Aws::serve();
+    let md = superci_testkit::serve_as("mdplane00005", |c| { c.own_cloud = "modal".into(); c.containers = true; });
+    let home = common::temp("modal-plane");
+    std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), serde_json::json!({
+        "modal": { "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" },
+        "key": { "name": "DEVICE_KEY_4102444800_TEST", "value": md.key, "planes": ["mdplane00005"] },
+        "plane": { "Modal": { "workspace": "acmeorg", "url": md.url, "plane_id": "mdplane00005", "label": "superci" } },
+    }).to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    let page = common::words(&common::part(&link, "/?p=add-runners&fragment=1").1);
+    assert!(page.contains("Sandboxes, one per job, in your Modal workspace. The first add builds a small image. Added"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
