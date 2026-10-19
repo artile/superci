@@ -3531,6 +3531,72 @@ fn a_regions_network_is_made_and_deleted_as_aws_answers_each_step_and_the_shared
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// GitHub as the control plane and the dashboard find it: an App begun for a name GitHub has none of (refused) and
+/// on a GitHub of its own whose address has digits and dashes (asked, and said not to answer from here); the
+/// deliveries that failed, asked again only those of jobs not asked again already; a job taken elsewhere whose runner
+/// GitHub no longer knows (swept); runs of repositories named as GitHub names none (their cache their own); a
+/// hundred public repositories and more; the cache's entries of repositories by ids that are none.
+#[test]
+fn github_is_asked_only_what_it_can_answer_and_its_answers_of_deliveries_runners_and_repositories_are_read_as_it_writes_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let (status, _, said) = common::post(&link, "/github/start", &[("login", "-acme"), ("host", "")]);
+    assert!(status == 400 && said.contains("That is not a GitHub name"), "{status} {said}");
+    // (A GitHub of its own, asked from this computer: none answers here.)
+    let (status, _, said) = common::post(&link, "/github/start", &[("login", "acme"), ("host", "git-hub2.example.com")]);
+    assert!(status == 400 && said.contains("git-hub2.example.com did not answer from this computer"), "{status} {}", common::words(&said));
+    let _ = child.kill();
+    // Deliveries GitHub lists as failed: an installation's, one asked again already, a job's (asked again).
+    let at = superci_core::aws::amz_iso(served.now_ms() - 60_000);
+    let listed = serde_json::json!([{ "id": 1, "guid": "g-1", "event": "installation", "status_code": 500, "delivered_at": at, "redelivery": false },
+        { "id": 2, "guid": "g-2", "event": "workflow_job", "status_code": 0, "delivered_at": at, "redelivery": true },
+        { "id": 3, "guid": "g-3", "event": "workflow_job", "status_code": 502, "delivered_at": at, "redelivery": false }]);
+    served.github.answer_with("GET", "/app/hook/deliveries?per_page=100", 200, &[], &listed.to_string());
+    // (GitHub taking it with nothing more to say.)
+    served.github.answer_with("POST", "/attempts", 202, &[], "");
+    served.upkeep();
+    let asked: Vec<String> = served.store.under("redelivered:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(asked, ["redelivered:g-3"]);
+    assert!(served.github.asked.lock().unwrap().iter().any(|a| a.ends_with("/app/hook/deliveries/3/attempts")));
+    served.github.fail_none();
+    // A job another runner took and ended untold, whose runner GitHub no longer has: its machine began nothing.
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    served.webhook(queued);
+    served.github.ended_untold(id);
+    served.github.fail("GET", "/actions/runners/", 404, "Not Found");
+    served.later(90_000);
+    served.upkeep();
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(["swept", "done"].contains(&job["state"].as_str().unwrap()), "{job}");
+    served.github.fail_none();
+    // Runs asked for by the API of repositories GitHub's names cannot be: their cache is their own.
+    for repository in ["acme/app/x", "acme/a!"] {
+        let body = serde_json::json!({ "workflow": "jobs:\n  t:\n    if: false\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": repository, "ref": "refs/heads/main" });
+        let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
+        let said: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+        assert_eq!(said["cache_own"], true, "{repository}: {said}");
+    }
+    // The public repositories of an installation with more than a hundred: each page read.
+    let page = |from: usize, n: usize| serde_json::json!({ "total_count": 130, "repositories": (from..from + n).map(|i| serde_json::json!({ "full_name": format!("acme/public-{i}"), "private": false })).collect::<Vec<_>>() }).to_string();
+    served.github.answer_with("GET", "/installation/repositories?per_page=100&page=1", 200, &[], &page(0, 100));
+    served.github.answer_with("GET", "/installation/repositories?per_page=100&page=2", 200, &[], &page(100, 30));
+    let repos: serde_json::Value = ureq::get(&format!("{}/github/public-repos", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap();
+    assert_eq!(repos["repos"].as_array().map(Vec::len), Some(130), "{repos}");
+    served.github.fail_none();
+    // The cache's entries of repositories whose ids are none: listed by those, GitHub not asked their names.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let entry = serde_json::json!({ "id": "e1", "region": "us-east-1", "made": served.now_ms(), "used": served.now_ms(), "done": true, "size": 10, "pieces": [["p-1", 10]] }).to_string();
+        for ns in ["gh", "ghx"] { m.insert(format!("cache:{ns}:refs/heads/main:{}:deps", "c".repeat(64)), entry.clone()); }
+    }
+    let (_, listed) = common::json(&home, &["caches", "list"]);
+    assert!(listed["repos"].as_array().is_some_and(|r| r.len() >= 2), "{listed}");
+    assert!(!served.github.asked.lock().unwrap().iter().any(|a| a.contains("/repositories/x") || a.ends_with("/repositories/")), "no id to ask by");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
