@@ -2900,7 +2900,8 @@ fn labels_at_each_limit_and_in_each_combination_are_fitted_to_a_provider_or_refu
         "superci/family=c8g+c8g", "superci/family=c8g/arch=arm64", "superci/family=m8a/arch=arm64", "superci/docker-cache=true/os=windows", "superci/docker-cache=true/image=ubuntu26",
         "superci/docker-cache=true", "superci/family=m8a/gpu=t4", "superci/family=m8a+c8gd", "superci/os=windows", "superci/gpu=t4", "superci/arch=arm64", "superci/image=ubuntu26",
         "superci/spot=false/disk-iops=4000/family=c8a", "superci/provider=cloudflare/image=ubuntu26", "superci/provider=cloudflare/spot=false", "superci/provider=cloudflare/scratch=ramdisk",
-        "superci/scratch=localdisk/gpu=t4", "superci/provider=modal/gpu=any", "superci/gpu=l40s", "superci/gpu=any/cpu=64", "superci/provider=modal/gpu=l40s/cpu=4/ram=500", "superci/cpu=6/ram=1000"];
+        "superci/scratch=localdisk/gpu=t4", "superci/provider=modal/gpu=any", "superci/gpu=l40s", "superci/gpu=any/cpu=64", "superci/provider=modal/gpu=l40s/cpu=4/ram=500", "superci/cpu=6/ram=1000",
+        "superci/scratch=localdisk", "superci/scratch=localdisk/family=m8ad", "superci/scratch=localdisk/family=c8gd/arch=arm64", "superci/scratch=ramdisk", "superci/scratch=ramdisk/cpu=16"];
     for label in labels {
         let (id, q) = served.github.queue(label, label, served.now_ms());
         assert!(served.webhook(q) < 300, "{label}");
