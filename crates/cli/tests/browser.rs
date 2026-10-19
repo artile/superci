@@ -835,6 +835,86 @@ fn aws_sign_ins_to_more_accounts_are_kept_beside_each_other_taken_in_hand_by_nam
     }
 }
 
+/// The AWS account in hand found ended while another account's sign-in stands: the other is kept in its place and
+/// nothing is noted as ended, whether the clouds are looked in (a command) or the other account is asked for by name
+/// (copying the runner image into it).
+#[test]
+fn an_aws_account_found_ended_beside_another_leaves_the_other_in_hand_and_nothing_noted_as_ended() {
+    let ended_beside = |served: &superci_testkit::Served| {
+        let home = signed_in(served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let mut other = k["aws"].clone();
+        other["account_id"] = "222222222222".into();
+        (k["aws"]["creds"]["expires_at_ms"], k["aws"]["refresh_token"]) = (0.into(), "superci-ended-refresh-token-for-a-recording".into());
+        k["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+        k["aws_more"] = serde_json::json!([other]);
+        std::fs::write(&file, k.to_string()).unwrap();
+        home
+    };
+    let kept = |home: &std::path::Path| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap() };
+    let in_hand_alone = |k: &serde_json::Value| k["aws"]["account_id"] == "222222222222" && k["aws_more"].as_array().is_none_or(|m| m.is_empty()) && k["aws_ended"] != true;
+    // A command that looks in the clouds.
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/sign-in/ended.jsonl"), &[]);
+    let home = ended_beside(&served);
+    common::json(&home, &["planes", "list"]);
+    assert!(in_hand_alone(&kept(&home)), "{}", kept(&home));
+    let _ = std::fs::remove_dir_all(&home);
+    // The other account named on a page.
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/sign-in/ended.jsonl"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[]);
+    let home = ended_beside(&served);
+    let (child, link) = dashboard(&home);
+    let (status, _, said) = common::post(&link, "/aws/image", &[("account", "222222222222"), ("region", "ca-central-1"), ("next", "?p=planes")]);
+    assert!(status < 400, "{status} {}", common::words(&said));
+    drop(child);
+    assert!(in_hand_alone(&kept(&home)), "{}", kept(&home));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The AWS account looked at again from its section: AWS not answering leaves the look before as it was; AWS calling
+/// the credentials expired renews them, or finds the sign-in over and says so.
+#[test]
+fn an_aws_account_looked_at_again_keeps_the_look_before_when_aws_does_not_answer_and_says_a_sign_in_found_over() {
+    let unavailable = superci_testkit::ec2_error("Unavailable", "The service is unavailable. Please try again shortly.");
+    let expired = superci_testkit::ec2_error("RequestExpired", "Request has expired.");
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/sign-in/ended.jsonl"), &[]);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["aws"]["refresh_token"] = "superci-ended-refresh-token-for-a-recording".into();
+    k["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (_child, link) = dashboard(&home);
+    let page = || common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    until("the account looked at", || { let p = page(); p.contains("Nothing refused") && !p.contains("Asking AWS") });
+    // Not answering: the look before stands.
+    served.aws.fail("DescribeVpcs", 503, &unavailable, None);
+    common::post(&link, "/aws/look", &[("next", "?p=planes")]);
+    until("asked again", || { page(); served.aws.asked.lock().unwrap().iter().any(|a| a["status"] == 503) });
+    until("the look before kept", || { let p = page(); !p.contains("Asking AWS") && p.contains("Nothing refused") && !p.contains("Not known") });
+    // Its credentials called expired: renewed, which AWS refuses: the sign-in is over, and said.
+    served.aws.fail_none();
+    served.aws.fail("DescribeVpcs", 400, &expired, None);
+    common::post(&link, "/aws/look", &[("next", "?p=planes")]);
+    until("the sign-in said as over", || page().contains("Your AWS sign-in has ended"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A setting written that the control plane does not show within twenty seconds is said as that, never as done.
+#[test]
+fn a_setting_the_control_plane_does_not_show_in_time_is_said_as_not_taken() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.fail("AmazonSSM.PutParameter|/NAME", 200, r#"{"Tier":"Standard","Version":2}"#, None);
+    let (code, said) = common::json(&home, &["name", "update", "AcmeCI"]);
+    assert!(code != 0 && said["error"].as_str().unwrap_or_default().contains("the control plane did not show it within twenty seconds"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
