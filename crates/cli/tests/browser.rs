@@ -220,6 +220,35 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     b.click("#pool-remove-100 button[name=only]", "");
     b.wait(&shows("Removed Cloudflare"));
     until("the launcher forgotten", || setting("LAUNCHERS").is_none_or(|l| !l.contains("cloudflare")));
+    // Added back, and removed signed in with Cloudflare: its launcher and its containers' application deleted there,
+    // the running job stopped with them.
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}]}"#);
+    let _ = child.kill();
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let cf_ok = |result: &str| format!(r#"{{"result":{result},"success":true,"errors":[],"messages":[]}}"#);
+    served.aws.fail("/client/v4/accounts?", 200, &cf_ok(r#"[{"id":"1111111111111111111111111111111a","name":"Acme"}]"#), None);
+    served.aws.fail("/workers/scripts", 200, &cf_ok("[]"), None);
+    served.aws.fail("/graphql", 200, r#"{"data":{"viewer":{"accounts":[]}},"errors":null}"#, None);
+    served.aws.fail("/workers/subdomain", 200, &cf_ok(r#"{"subdomain":"acme"}"#), None);
+    served.aws.fail("/containers/applications/app-runners", 200, &cf_ok("null"), None);
+    served.aws.fail("/containers/applications", 200, &cf_ok(r#"[{"id":"app-runners","name":"superci-runners-testplane0001"}]"#), None);
+    served.aws.fail("/workers/scripts/superci-runners-testplane0001", 200, &cf_ok("null"), None);
+    let (c, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    child = c;
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(r#"document.querySelector('button[aria-label="Cloudflare account settings"]') !== null"#);
+    b.click(r#"button[aria-label="Cloudflare account settings"]"#, "");
+    b.wait("document.getElementById('pool-100').open");
+    b.click("#pool-100 button.danger", "Remove");
+    b.wait("document.getElementById('pool-remove-100').open");
+    b.click("#pool-remove-100 button.danger", "Stop 1 and remove");
+    b.wait(&shows("Removed Cloudflare"));
+    let asked = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap_or_default(), a["url"].as_str().unwrap_or_default())).collect::<Vec<_>>();
+    assert!(asked.iter().any(|a| a.starts_with("DELETE") && a.contains("/workers/scripts/superci-runners-testplane0001")) && asked.iter().any(|a| a.starts_with("DELETE") && a.contains("/containers/applications/app-runners")), "{asked:#?}");
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
