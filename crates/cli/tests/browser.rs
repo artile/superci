@@ -7640,6 +7640,22 @@ mod commands_dashboard_in_browser {
         // A region not in the list is refused before anything is made.
         let (status, _, said) = common::post(&link, "/plane/aws", &[("region", "mars-1")]);
         assert!(status == 400 && common::words(&said).contains("Choose a region from the list"), "{status}");
+        // A first try that stops (its function fails to start), let go of: what it made in AWS removed, and said
+        // where something is left (AWS refusing to remove its role); then nothing to let go of.
+        served.aws.fail("/configuration", 200, r#"{"State":"Failed","StateReason":"The function's code could not be read.","LastUpdateStatus":"Failed"}"#, None);
+        let (status, _, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "deployplane1")]);
+        assert_eq!(status, 303);
+        let stopped = (0..240).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("failed to start") });
+        assert!(stopped, "{}", common::words(&common::part(&link, "/?p=plane&fragment=1").1));
+        served.aws.fail_none();
+        served.aws.fail("DeleteRole", 403, r#"<ErrorResponse><Error><Type>Sender</Type><Code>AccessDenied</Code><Message>not allowed to delete the role</Message></Error><RequestId>1</RequestId></ErrorResponse>"#, None);
+        let (status, _, said) = common::post(&link, "/plane/start-over", &[]);
+        assert!(status < 500, "{status} {}", common::words(&said));
+        served.aws.fail_none();
+        let (status, _, _) = common::post(&link, "/plane/start-over", &[]);
+        assert_eq!(status, 303, "nothing stopped to let go of");
+        // (What removing it asked that the deploy's recording has no answer for is no concern of the deploy's.)
+        served.aws.unanswered.lock().unwrap().clear();
         // Deployed (the same id as the recording's, as a try after a stop reuses its first's).
         let (status, _, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "deployplane1")]);
         assert_eq!(status, 303);
