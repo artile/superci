@@ -5475,6 +5475,91 @@ fn runs_from_a_computer_cancelled_or_failed_on_their_machines_are_ended_by_the_u
 }
 
 
+/// GitHub's events and the upkeep, for jobs off the usual way: a runner of a job here begins one never told of (noted
+/// as what it ran); a runner started to fail one job that ends another already running elsewhere leaves that one be; a
+/// job whose spot machine AWS took back, run again already, ends as it ended. Jobs failed at once: one kept with no
+/// label (the control plane's own), one asking for macOS past the month's limit (said as the limit, in cents), a
+/// GitLab one whose connection is gone (nothing to cancel there). A machine whose job ended untold is taken back from
+/// GitHub (its runner's name not kept), a GitLab job's is not GitHub's to take back. Spot not paused for two machines
+/// taken back long ago.
+#[test]
+fn jobs_off_the_usual_way_are_noted_failed_at_once_or_taken_back_as_their_events_and_the_upkeep_find_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let now = served.now_ms();
+    // (Two machines AWS took back within minutes of each other, three quarters of an hour ago; one long before.)
+    for ago in [200, 50, 45] { let at = now - ago * 60_000; served.store.0.lock().unwrap().insert(format!("spot:interrupted:{at}:{ago}"), at.to_string()); }
+    let job = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
+    let (a, q) = served.github.queue("a", "superci", now);
+    assert!(served.webhook(q) < 300);
+    assert!(job(a)["state"] == "launched" && job(a)["no_spot"].is_null(), "{}", job(a));
+    let ra = job(a)["runner"].as_str().unwrap().to_string();
+    // Its runner begins a job never told of here.
+    let (untold, _) = served.github.queue("untold", "superci", now);
+    assert!(served.webhook(served.github.start_on(untold, &ra)) < 300);
+    assert!(job(a)["ran"] == untold && job(a)["state"] == "running" && job(untold).is_null(), "{}", job(a));
+
+    // macOS: a runner started to fail it; it ends another job, running on its own machine: that one is left be.
+    let (mac, q) = served.github.queue("mac", "superci/os=macos", now);
+    assert!(served.webhook(q) < 300);
+    assert!(job(mac)["failed_fast"] == true, "{}", job(mac));
+    let failing = served.store.under("runner:").into_iter().find(|(k, v)| k.ends_with("-x") && *v == serde_json::json!(mac)).map(|(k, _)| k.trim_start_matches("runner:").to_string()).expect("its failing runner");
+    let (y, q) = served.github.queue("y", "superci", now);
+    assert!(served.webhook(q) < 300);
+    assert!(served.webhook(served.github.start(y)) < 300);
+    let _ = served.github.start_on(y, &failing);
+    assert!(served.webhook(served.github.finish(y, "failure", "", now)) < 300);
+    assert!(job(y)["state"] == "running" && job(y)["error"].is_null() && served.store.under(&format!("runner:{failing}")).is_empty(), "{}", job(y));
+
+    // Taken back by AWS, already run again: it ends as it ended (not failed for the machine).
+    let (i, q) = served.github.queue("i", "superci", now);
+    assert!(served.webhook(q) < 300);
+    assert!(served.webhook(served.github.start(i)) < 300);
+    let mut taken = job(i);
+    taken["interrupted"] = true.into();
+    taken["rerun"] = serde_json::json!({ "job_id": i, "run_id": taken["run_id"], "repo": "acme/app", "name": "i", "state": "asked", "at_ms": now });
+    served.store.0.lock().unwrap().insert(format!("job:{i}"), taken.to_string());
+    assert!(served.webhook(served.github.finish(i, "failure", "", now)) < 300);
+    assert!(job(i)["state"] == "done" && job(i)["conclusion"] == "failure", "{}", job(i));
+
+    // Kept waiting: one with no label, nowhere to run it now (the containers off); a GitLab one of a connection gone.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare","off":true}]}"#);
+    let waiting = |id: u64, provider: &str, gitlab: &str, label: &str| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "waiting", "provider": provider, "gitlab": gitlab, "label": label,
+        "project_id": superci_testkit::gitlab::PROJECT, "at_ms": now, "installation_id": 42, "cloud": "", "seen_in_progress": false }).to_string();
+    // A machine whose GitHub job ended untold, its runner's name not kept; a GitLab job's, the same.
+    let launched = |id: u64, provider: &str| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "launched", "provider": provider, "gitlab": "", "label": "superci",
+        "project_id": superci_testkit::gitlab::PROJECT, "at_ms": now, "launched_ms": now, "installation_id": 42, "cloud": "cloudflare", "machine_id": format!("machine-{id}"), "runner_id": 7, "seen_in_progress": false }).to_string();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (k, v) in [("job:91", waiting(91, "", "", "")), ("job:glgother-92", waiting(92, "gitlab", "gother", "superci/os=macos")), ("job:93", launched(93, "")), ("job:gl94", launched(94, "gitlab"))] {
+            m.insert(k.into(), v);
+            m.insert(format!("live:{}", k.trim_start_matches("job:")), String::new());
+        }
+        m.insert("gone:93".into(), now.to_string());
+        m.insert("gone:gl94".into(), now.to_string());
+    }
+    served.upkeep();
+    assert!(job(91)["state"] == "failed" && job(91)["failed_fast"] == true && job(91)["error"].as_str().unwrap_or_default().contains("Cloudflare is turned off"), "{}", job(91));
+    let gl = served.store.under("job:glgother-92")[0].1.clone();
+    assert!(gl["state"] == "failed" && gl["error"].as_str().unwrap_or_default().starts_with("nowhere to run"), "{gl}");
+    assert!(job(93)["state"] == "cancelled", "{}", job(93));
+    let gl94 = served.store.under("job:gl94")[0].1.clone();
+    assert!(gl94["state"] == "launched" && !served.store.under("gone:gl94").is_empty(), "{gl94}");
+
+    // macOS past the month's limit ($12.50, $20 spent): said as the limit.
+    let limited = serve(|c| c.routing.monthly_usd = Some(12.5));
+    limited.connect_github();
+    // (Its days' totals read: indexed.)
+    limited.upkeep();
+    let now = limited.now_ms();
+    limited.store.0.lock().unwrap().insert(superci_core::plane::day_key(now / 86_400_000), serde_json::json!({ "hours": [], "spend": { "cloudflare": 20.0 } }).to_string());
+    let (m, q) = limited.github.queue("mac", "superci/os=macos", now);
+    assert!(limited.webhook(q) < 300);
+    let j = limited.store.under(&format!("job:{m}"))[0].1.clone();
+    assert!(j["error"].as_str().unwrap_or_default().contains("reached its limit of $12.50 a month") && j["failed_fast"] == true, "{j}");
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

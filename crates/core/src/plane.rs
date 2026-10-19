@@ -3501,7 +3501,8 @@ impl<'a> ControlPlane<'a> {
             // job now (or for whichever job this machine was for).
             if j.job_id != job_id {
                 if let Some(mut other) = get_json::<Job>(self.store, &format!("job:{job_id}")).await? {
-                    let coming = active(&other) && !other.seen_in_progress;
+                    // (Active: one that is not took this runner's machine above.)
+                    let coming = !other.seen_in_progress;
                     if coming { other.for_job = Some(j.for_job.unwrap_or(j.job_id)) }
                     if coming || !other.began {
                         other.began = true;
@@ -4514,6 +4515,7 @@ impl<'a> ControlPlane<'a> {
     async fn completed(&self, plane_url: &str, ev: &github::JobEvent) -> Result<()> {
         let (job_id, runner) = (ev.job_id, ev.runner_name.as_deref());
         if let Some(name) = runner.filter(|r| failing_runner(r)) { return self.failed_by_runner(name, job_id).await }
+        // (Only with a runner of this control plane's: with none, it is none below.)
         let mut on_anothers = None;
         if let Some(mut j) = self.by_runner(runner).await? {
             if j.job_id != job_id { on_anothers = Some(j.for_job.unwrap_or(j.job_id)) }
@@ -4551,7 +4553,7 @@ impl<'a> ControlPlane<'a> {
             // Cancelled while waiting for room: nothing was started. (Noted too, for a sweep that listed it a moment
             // ago as waiting and is about to start it from that: it stops there, see `gone_key`.)
             if own.state == "waiting" {
-                if runner.is_none() && on_anothers.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
+                if runner.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
                 own.state = "cancelled".into();
                 own.began = true;
                 own.ended_ms = Some(self.clock.now_ms());
@@ -4560,7 +4562,7 @@ impl<'a> ControlPlane<'a> {
             }
             // Ended before any runner took it (cancelled), with its machine still being asked for: noted for the start
             // that is under way, which stops there or ends the machine it has just been given (see `gone_key`).
-            if own.state == "launching" && runner.is_none() && on_anothers.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
+            if own.state == "launching" && runner.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
             if own.state == "launched" && !own.seen_in_progress {
                 // It ran on another job's runner: that job, still queued, is what its own machine is for now. It
                 // ran nowhere (cancelled before a runner took it): its machine is ended now if its runner can be
@@ -4582,7 +4584,7 @@ impl<'a> ControlPlane<'a> {
             } else if own.conclusion != said_before {
                 self.keep(&format!("job:{job_id}"), &own).await?;
             }
-        } else if runner.is_none() && on_anothers.is_none() {
+        } else if runner.is_none() {
             // Ended before this control plane knew of it: GitHub sends a job's events side by side, and the end of
             // one cancelled as it was queued (a newer push took its place) can arrive first. Noted, so that its
             // queued event, a moment behind, starts nothing (see `gone_key`).
