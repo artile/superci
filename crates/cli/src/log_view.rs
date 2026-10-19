@@ -216,10 +216,9 @@ fn gitlab(log: &str, going: bool, conclusion: &str) -> Vec<Step> {
     // A step that never ended: still going, or where the job failed.
     let failed = !going && conclusion == "failure";
     if failed {
-        if let Some(s) = steps.iter_mut().rev().find(|s| s.ms.is_some() || s.state == "running") { s.state = "failure".into() }
+        if let Some(s) = steps.iter_mut().rev().find(|s| s.ms.is_some()) { s.state = "failure".into() }
         if let Some(last) = steps.iter_mut().rev().find(|s| !s.lines.is_empty()) { last.state = "failure".into() }
     }
-    if !going { for s in steps.iter_mut().filter(|s| s.state == "running") { s.state = if failed { "failure".into() } else { "success".into() } } }
     steps.retain(|s| !s.lines.is_empty() || s.ms.is_some());
     steps
 }

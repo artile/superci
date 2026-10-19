@@ -1515,3 +1515,46 @@ fn a_run_of_two_jobs_is_followed_through_groups_lines_sent_again_and_steps_whose
     assert!(said.contains("  What its runner logged while it was slow to reach the control plane") && said.contains("    [RUNNER 2026-10-15 10:00:12Z INFO] Listening for Jobs"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A GitHub job's log in steps, as its page draws it: a line past the next step's second goes to it, a post step's
+/// lines that are not its cleanup's stay where they were, a step whose time GitHub gives cut short, a carriage return
+/// left out; the steps of a parallel group under its row, not all in the background; and a job named with slashes,
+/// its steps run side by side, looked for in its run's logs by its name made a folder's.
+#[test]
+fn a_github_jobs_log_is_put_in_its_steps_by_their_times_and_its_parallel_groups_and_one_named_with_slashes_found_in_its_runs_logs() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let ended = |name: &str, log: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(id)); served.webhook(served.github.finish(id, "success", log, served.now_ms())); id };
+    let log = ["2026-10-15T10:00:00.0000000Z Set up the runner", "2026-10-15T10:00:01.0000000Z ##[group]Run make", "2026-10-15T10:00:01.0000000Z making\rstill making",
+        "2026-10-15T10:00:03.0000000Z made later", "2026-10-15T10:00:05.0000000Z not the cleanup yet", "2026-10-15T10:00:06.0000000Z Cleaning up orphan processes"].join("\n");
+    let id = ended("tests", &log);
+    let step = |name: &str, n: u64, from: &str, to: &str| serde_json::json!({ "name": name, "number": n, "status": "completed", "conclusion": "success", "started_at": from, "completed_at": to });
+    served.github.set_steps(id, serde_json::json!([step("Set up job", 1, "2026-10-15T10:00:00Z", "2026-10-15T10:00:01Z"), step("Run make", 2, "2026-10-15T10:00:01Z", "2026-10-15T10:00:02Z"),
+        step("Run a", 3, "2026-10-15T10:00:02Z", "2026-10-15T10:00:04Z"), step("Run b", 4, "2026-10-15T10:00:02Z", "2026-10-15T10:00:04Z"), step("Parallel group", 5, "2026-10-15T10:00:02Z", "2026-10-15T10:00:04Z"),
+        step("Post Run make", 6, "2026-10-15T10:00:05Z", "2026-10-15T10:00:06Z"), step("Complete job", 7, "2026-10-15T10:00:06Z", "2026-10-15T10:00:06Z"), step("Odd", 8, "2026-10-15", "2026-10-15")]));
+    // (Its shape, as the control plane keeps a job's: a parallel group's two steps, one in the background, then its row.)
+    served.store.0.lock().unwrap().insert(format!("shape:{id}"), serde_json::json!([{ "id": "make" }, { "id": "a", "group": "g" }, { "id": "b", "group": "g", "bg": true }, { "id": "g", "group": "g", "control": "parallel" }]).to_string());
+    let (mut child, link) = common::dashboard(&home);
+    let (_, view) = common::part(&link, &format!("/job/view?id={id}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap_or_else(|_| panic!("{view}"));
+    let steps = view["steps"].as_array().cloned().unwrap_or_default();
+    let names: Vec<&str> = steps.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert_eq!(names, ["Set up job", "Run make", "Parallel group", "Run a", "Run b", "Post Run make", "Complete job", "Odd"], "{view}");
+    let lines = |name: &str| steps.iter().find(|s| s["name"] == name).map(|s| s["lines"].as_array().unwrap().iter().map(|l| l[2].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>()).unwrap_or_default();
+    // (The carriage return left out of what is shown.)
+    assert_eq!(lines("Run make"), ["Run make", "makingstill making"], "{view}");
+    assert_eq!((lines("Parallel group"), lines("Post Run make"), lines("Complete job")), (vec!["made later".to_string(), "not the cleanup yet".into()], vec![], vec!["Cleaning up orphan processes".to_string()]), "{view}");
+    let row = &steps[2];
+    assert!(row["group"] == 2 && row["bg"].is_null() && steps[4]["bg"] == true && steps[5]["child"].is_null() && steps[7]["ms"].is_null(), "{view}");
+    // Named with slashes, its steps side by side: its own lines looked for in its run's logs, by its folder's name.
+    let side = ended("build / linux\\x64", "2026-10-15T22:00:51.0000000Z mixed");
+    served.github.set_steps(side, serde_json::from_str(include_str!("../fixtures/github/parallel-steps.json")).unwrap());
+    served.github.run_ended(side, include_bytes!("../fixtures/github/run-logs.zip").to_vec());
+    let (_, view) = common::part(&link, &format!("/job/view?id={side}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap_or_else(|_| panic!("{view}"));
+    // (Its folder is not among those of the run's logs: its lines as they came, said as mixed.)
+    assert!(view["mixed"] == true && view["steps"][0]["lines"][0][2] == "mixed", "{view}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
