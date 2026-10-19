@@ -1227,10 +1227,8 @@ impl Dashboard {
         if self.signed_in_as().is_none() { return Err(self.nowhere().into()) }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
         if let Some(live) = view::several(&views).filter(|_| one) { return Err(view::name_one(&live)) }
-        if !views.is_empty() {
-            let id = views[view::in_use(&views)].plane.plane_id().to_string();
-            if let Some(i) = self.planes.iter().position(|p| p.plane_id() == id) { self.select(i) }
-        }
+        // (Each view is of the control plane at its own place in the list.)
+        if !views.is_empty() { self.select(view::in_use(&views)) }
         self.keep();
         Ok(())
     }
@@ -1255,9 +1253,9 @@ impl Dashboard {
     }
 
     /// The kept Cloudflare sign-in is over (Cloudflare said so): forgotten, and said from here on where Cloudflare
-    /// is needed. (One given by name for this run is not SuperCI's to forget: its error is said as it is.)
+    /// is needed. (One given by name for this run is not SuperCI's to forget: its error is said as it is, and this is
+    /// never asked of it.)
     fn cf_over(&mut self) {
-        if self.cf_given { return }
         (self.cf, self.cf_ended, self.views) = (None, true, None);
         self.cf_accounts.clear();
     }
@@ -1274,7 +1272,6 @@ impl Dashboard {
 
     /// The same of Modal's.
     fn modal_over(&mut self) {
-        if self.modal_given { return }
         (self.modal, self.modal_ended, self.views) = (None, true, None);
     }
 
@@ -1371,8 +1368,9 @@ impl Dashboard {
         if self.planes.is_empty() { return if self.signed_in_as().is_none() { Err(self.nowhere().into()) } else { Ok(None) } }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
         if let Some(live) = view::several(&views) { return Err(view::name_one(&live)) }
-        let p = views[view::in_use(&views)].plane.clone();
-        if let Some(i) = self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { self.select(i) }
+        let i = view::in_use(&views);
+        let p = views[i].plane.clone();
+        self.select(i);
         let mut v = view::plane_view(&p, Some(&self.status_key));
         // Just handed the key: its whole status, once it takes it (a few tries).
         for _ in 0..8 { if !v.online || v.status.is_some() || !self.keyed.contains(p.plane_id()) { break } std::thread::sleep(Duration::from_millis(1500)); v.status = cloudflare::status(p.url(), &self.status_key) }
@@ -1529,10 +1527,11 @@ impl Dashboard {
         self.drop_secret(&plane, &setting)?;
         for _ in 0..60 {
             let seen = cloudflare::plane_get(plane.url(), &self.status_key, "/secrets").unwrap_or_default();
-            if !seen["secrets"].as_array().into_iter().flatten().any(|s| s["setting"] == setting.as_str()) { break }
+            if !seen["secrets"].as_array().into_iter().flatten().any(|s| s["setting"] == setting.as_str()) { return Ok(name) }
             std::thread::sleep(Duration::from_millis(500));
         }
-        Ok(name)
+        // (Never said as done while the control plane still gives it to runs.)
+        Err(format!("{name} is taken out of the control plane's cloud; the control plane still has it. Look with `superci secrets list` in a moment."))
     }
 
     /// `superci logout`: what is kept on this machine is removed, after the clouds that can end a sign-in were asked
@@ -2182,13 +2181,13 @@ impl Dashboard {
             self.aws_others.retain(|s| !ended.contains(&s.account_id));
         }
         let modal = if self.looked_modal { None } else { self.modal.clone() };
-        let accounts = self.cf_accounts.clone();
+        // (Cloudflare is looked in again only after a sign-in changed, which forgets the accounts it reached: asked anew.)
         let (cf_found, aws_found, modal_found) = std::thread::scope(|s| {
-            let c = cf.as_ref().map(|cf| { let accounts = accounts.clone(); s.spawn(move || -> Result<(Vec<(String, String)>, Vec<Plane>)> {
-                let accounts = if accounts.is_empty() { timed("Cloudflare: accounts", || cf.accounts())? } else { accounts };
+            let c = cf.as_ref().map(|cf| s.spawn(move || -> Result<(Vec<(String, String)>, Vec<Plane>)> {
+                let accounts = timed("Cloudflare: accounts", || cf.accounts())?;
                 let planes = timed("Cloudflare: find control planes", || cf.find_planes(&accounts))?;
                 Ok((accounts, planes))
-            }) });
+            }));
             let a: Vec<_> = aws.iter().map(|(creds, _)| s.spawn(move || timed("AWS: find control planes", || aws::connected_planes(creds)))).collect();
             let m = modal.as_ref().map(|session| s.spawn(move || -> Result<Vec<Plane>> {
                 let found = timed("Modal: find control planes", || modal::find_planes(session))?;
@@ -2324,7 +2323,8 @@ impl Dashboard {
             let hs: Vec<_> = asked.iter().map(|p| { let creds = &creds; s.spawn(move || {
                 let health = cloudflare::health(p.url()).unwrap_or_default();
                 // (One not answering is taken as a CI: nothing of it is taken in by guess.)
-                let serves = health.is_null() || health["github"] == true || health["gitlab"] == true || health["moved_to"].is_string();
+                // (One standing by for a move is not in use yet, whatever it was given: a place, as `serves_its_own` has it.)
+                let serves = health.is_null() || (health["standby"] != true && (health["github"] == true || health["gitlab"] == true || health["moved_to"].is_string()));
                 let mut a = FoundAbout { label: health["label"].as_str().map(str::to_string), version: health["version"].as_str().map(str::to_string), serves, ..Default::default() };
                 if let Plane::Aws { account_id, region, plane_id, .. } = p {
                     if let Some((_, c)) = creds.iter().find(|(id, _)| id == account_id) { if let Ok((name, owners)) = aws_plane::about(c, region, plane_id) { (a.name, a.owners) = (name, owners) } }

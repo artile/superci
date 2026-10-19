@@ -1176,7 +1176,8 @@ impl<'a> ControlPlane<'a> {
                     .chars().filter(|c| !c.is_control()).take(64).collect();
                 let Some(name) = self.device_key_name(&req) else { return Ok(nothing_here()) };
                 self.note_key(&name, Some(device.trim())).await?;
-                Ok(Response::text(200, "ok"))
+                // (In JSON, as every change asked with a device's key is answered: what the dashboard reads.)
+                Ok(Response::json(&serde_json::json!({ "ok": true })))
             }
             ("GET", "/keys") if self.dashboard(&req) => self.keys().await,
             ("GET", "/secrets") if self.dashboard(&req) => self.secrets().await,
