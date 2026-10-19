@@ -674,6 +674,55 @@ fn commands_say_each_cloud_signed_in_to_one_noted_as_ended_and_change_a_control_
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The AWS account section, and the regions a control plane may be set up in, for more kinds of account: kept out of
+/// other regions by the sign-in's role rather than its organization; kept by its organization to a region the image
+/// is not in; N. Virginia itself refused (another region chosen); its spot CPUs not said by AWS; and the image in every
+/// region it may use.
+#[test]
+fn the_aws_account_section_and_its_regions_say_what_more_kinds_of_account_allow() {
+    let scp = |action: &str| superci_testkit::ec2_error("UnauthorizedOperation", &format!("You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: {action} with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-example001/service_control_policy/p-example1"));
+    let role = |action: &str| superci_testkit::ec2_error("UnauthorizedOperation", &format!("You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/ReadOnly/someone is not authorized to perform: {action} because no identity-based policy allows the {action} action"));
+    let others = |except: &str| -> Vec<String> { superci_core::page::REGIONS.iter().filter(|r| **r != except).map(|r| format!("DescribeVpcs|ec2.{r}.")).collect() };
+    let image: String = include_str!("../fixtures/aws/settings/dashboard.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["url"] == "https://ec2.us-east-1.amazonaws.com/" && v["asked"].as_str().unwrap_or_default().contains("Action=DescribeImages")).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let no_images = "<DescribeImagesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>00000000-0000-4000-8000-000000000001</requestId><imagesSet/></DescribeImagesResponse>".to_string();
+    type Fails = Vec<(String, u16, String)>;
+    let cases: Vec<(&str, Fails, &str, &[&str])> = vec![
+        ("kept out of other regions by its role", others("us-east-1").into_iter().map(|o| (o, 403, role("ec2:DescribeVpcs"))).collect(), "planes",
+            &["Restricted", "Some of what SuperCI does there is refused", "By the permissions of the role or user signed in as."]),
+        ("kept by its organization to a region without the image", others("us-east-1").into_iter().map(|o| (o, 403, scp("ec2:DescribeVpcs"))).chain([("DescribeImages".to_string(), 200, no_images.clone())]).collect(), "planes",
+            &["Restricted", "Not in N. Virginia", "No job can start there until it is copied in"]),
+        ("N. Virginia refused by the role", vec![("DescribeVpcs|ec2.us-east-1.".to_string(), 403, role("ec2:DescribeVpcs"))], "add-runners",
+            &["us-east-1 · not allowed for this sign-in", "Change region"]),
+        ("its spot CPUs not said", vec![("L-34B43A08".to_string(), 400, superci_testkit::json_error("NoSuchResourceException", "The request failed because the specified service does not exist."))], "planes",
+            &["on-demand · ? spot"]),
+        ("the image everywhere", ["ca-central-1", "eu-north-1"].iter().map(|r| (format!("DescribeImages|ec2.{r}."), 200, image.clone())).collect(), "planes",
+            &["Runner image In every region it may use"]),
+    ];
+    for (what, fails, page, says) in cases {
+        let served = serve(|_| {});
+        for (action, status, answer) in fails { served.aws.fail(&action, status, &answer, None) }
+        let home = signed_in(&served);
+        // (Runners in AWS are added to a control plane elsewhere, in a region of the account's: one in Cloudflare.)
+        if page == "add-runners" {
+            let file = home.join("workspaces/default/sign-ins.json");
+            let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            k["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "acc-plane", "account_name": "Plane Co", "script": "superci-plane", "url": served.url, "plane_id": PLANE, "label": "superci" } });
+            std::fs::write(&file, k.to_string()).unwrap();
+        }
+        let (_child, link) = dashboard(&home);
+        let mut words = String::new();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < end {
+            words = common::words(&common::part(&link, &format!("/?p={page}&fragment=1")).1);
+            if words.contains("AWS account") && !words.contains("Asking AWS") && says.iter().all(|s| words.contains(s)) { break }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        for said in says { assert!(words.contains(said), "{what}: no {said:?} in\n{words}") }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
