@@ -5241,6 +5241,8 @@ fn the_upkeep_forgets_what_is_past_waits_a_job_tried_again_for_room_and_says_why
         m.insert("rtree-at:tree0001".into(), (now - 2 * 86_400_000).to_string());
         m.insert("rtree:tree0001:00000".into(), "\"part\"".into());
         m.insert("rtree-at:tree0002".into(), (now - 60_000).to_string());
+        m.insert("job:85".into(), serde_json::json!({ "job_id": 85, "run_id": 1, "repo": "acme/app", "state": "orphan", "cloud": "aws", "machine_id": "i-0orphan", "region": "us-east-1", "at_ms": now - 60_000, "installation_id": 42, "seen_in_progress": false }).to_string());
+        m.insert("live:85".into(), String::new());
     }
     // A job running, and one whose machine never began it.
     let (a, q) = served.github.queue("first", "superci", now);
@@ -5259,10 +5261,13 @@ fn the_upkeep_forgets_what_is_past_waits_a_job_tried_again_for_room_and_says_why
     assert_eq!(templates, vec!["aws:template:us-east-1:superci-lt-new".to_string()]);
     assert!(served.store.under("rtree:tree0001").is_empty() && served.store.under("rtree-at:tree0001").is_empty() && !served.store.under("rtree-at:tree0002").is_empty());
     assert!(job(a)["state"] == "running", "{}", job(a));
+    assert_eq!(job(85)["state"], "swept", "an AWS machine, with no AWS account any more: forgotten");
     assert!(job(b)["state"] == "waiting" && job(b)["error"].as_str().unwrap_or_default().contains("runs 1 at once") && job(b)["retries"] == 1, "{}", job(b));
 
     // AWS connected by a role it will not let this control plane take: the cache's and layers' upkeep say so.
     let refused = serve(|_| {});
+    // (Its containers turned off.)
+    refused.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "");
     let now = refused.now_ms();
     {
         let mut m = refused.store.0.lock().unwrap();
@@ -5271,12 +5276,16 @@ fn the_upkeep_forgets_what_is_past_waits_a_job_tried_again_for_room_and_says_why
         m.insert("aws:template:us-east-1:superci-lt-old".into(), (now - 2 * 86_400_000).to_string());
         // (Just moved here: looked after every minute, for a while.)
         m.insert("claimed_at".into(), now.to_string());
+        let orphan = |id: u64, cloud: &str| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "orphan", "cloud": cloud, "machine_id": format!("m-{id}"), "region": "us-east-1", "at_ms": now - 60_000, "installation_id": 42, "seen_in_progress": false }).to_string();
+        for (id, cloud) in [(86u64, "aws"), (87, "cloudflare")] { m.insert(format!("job:{id}"), orphan(id, cloud)); m.insert(format!("live:{id}"), String::new()); }
     }
     refused.github.fail("GET", "sts.us-east-1.amazonaws.com", 403, "not authorized to perform sts:AssumeRoleWithWebIdentity");
     refused.upkeep();
     let said = |k: &str| refused.store.under(k).into_iter().next().map(|(_, v)| v.to_string()).unwrap_or_default();
     assert!(said("cache-sweep-error").contains("sts:AssumeRoleWithWebIdentity") && said("layers-sweep-error").contains("sts:AssumeRoleWithWebIdentity"), "{} {}", said("cache-sweep-error"), said("layers-sweep-error"));
     assert!(refused.store.under("aws:template:").is_empty(), "given up on after a day");
+    // Machines left by jobs over (orphans): AWS's, its sign-in refused; a container's, containers off since: forgotten all the same.
+    for id in [86u64, 87] { assert_eq!(refused.store.under(&format!("job:{id}"))[0].1["state"], "swept", "{id}") }
 }
 
 /// GitLab's jobs as the upkeep finds them when GitLab's events do not come: one its runner holds but has not begun
@@ -5625,6 +5634,54 @@ fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_
     served.store.0.lock().unwrap().insert(format!("job:{again}"), serde_json::json!({ "job_id": again, "run_id": 1, "repo": "acme/app", "state": "launching", "cloud": "", "at_ms": served.now_ms(), "installation_id": 42, "seen_in_progress": false }).to_string());
     assert!(served.webhook(q) < 300);
     assert!(state(again)["state"] == "launching" && state(again)["rev"].is_null(), "{}", state(again));
+}
+
+/// AWS's networks as the control plane's role may read them: refused to the role, the machine starts in the region's
+/// default network and the refusal is noted for the dashboard; refused by the account's organization, not noted (no
+/// permission of the role's would change it); a network of the account's own set wrong, the start fails saying so.
+/// What an ended machine sent, CloudWatch refusing to say: noted as not known, not asked again. A zone noted a day ago
+/// as not offering a type is asked again.
+#[test]
+fn aws_networks_refused_to_the_role_or_by_the_organization_and_traffic_refused_are_said_as_aws_refused_them() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws-on-demand"},{"cloud":"aws","off":true},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let state = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
+    let queue = |name: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let denied = || served.store.under("denied:aws:ReadNetwork");
+    // (A zone noted as lacking a type a day and more ago.)
+    served.store.0.lock().unwrap().insert("aws:unoffered:us-east-1:c8a.xlarge:us-east-1f".into(), (served.now_ms() - 2 * 86_400_000).to_string());
+    // Refused to the role.
+    served.aws.fail("RunInstances", 200, &started, None);
+    served.aws.fail("DescribeVpcs", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane/plane is not authorized to perform: ec2:DescribeVpcs because no identity-based policy allows the ec2:DescribeVpcs action"), None);
+    let role = queue("refused to the role");
+    assert!(state(role)["state"] == "launched" && denied().len() == 1, "{} {:?}", state(role), denied());
+    assert!(served.store.under("aws:unoffered:").is_empty(), "asked again");
+    // Refused by the organization (a while on: the default network is looked up again).
+    served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("denied:"));
+    served.aws.fail_none();
+    served.aws.fail("RunInstances", 200, &started, None);
+    served.aws.fail("DescribeVpcs", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane/plane is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy"), None);
+    served.later(130_000);
+    let org = queue("refused by the organization");
+    assert!(state(org)["state"] == "launched" && denied().is_empty(), "{} {:?}", state(org), denied());
+    // A network of its own with no subnet: said.
+    served.aws.put(&format!("/superci/{PLANE}/AWS_NETWORKS"), r#"{"us-east-1":{"subnets":[],"security_groups":[]}}"#);
+    let own = queue("its own network");
+    assert!(state(own)["error"].as_str().unwrap_or_default().contains("a network of your own needs a subnet and a security group"), "{}", state(own));
+    // What an ended machine sent: CloudWatch refuses to say.
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("job:97".into(), serde_json::json!({ "job_id": 97, "run_id": 1, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "aws", "machine_id": "i-0sent", "region": "us-east-1",
+        "at_ms": now - 3_600_000, "launched_ms": now - 3_600_000, "ended_ms": now - 13 * 60_000, "installation_id": 42, "seen_in_progress": true, "began": true, "cost_usd": 0.1, "cost_from": "prices" }).to_string());
+    served.store.0.lock().unwrap().insert("live:97".into(), String::new());
+    served.aws.fail("monitoring.us-east-1", 400, &superci_testkit::json_error("AccessDeniedException", "User is not authorized to perform: cloudwatch:GetMetricData"), None);
+    served.upkeep();
+    assert_eq!(state(97)["sent_gb"], -1.0, "{}", state(97));
 }
 
 #[test]
