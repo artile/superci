@@ -3594,6 +3594,19 @@ fn github_is_asked_only_what_it_can_answer_and_its_answers_of_deliveries_runners
     let (_, listed) = common::json(&home, &["caches", "list"]);
     assert!(listed["repos"].as_array().is_some_and(|r| r.len() >= 2), "{listed}");
     assert!(!served.github.asked.lock().unwrap().iter().any(|a| a.contains("/repositories/x") || a.ends_with("/repositories/")), "no id to ask by");
+    // An App on a GitHub Enterprise Server of its own, installed nowhere it says: installed from that server's own page.
+    let mut app = superci_testkit::GitHub::app();
+    app["host"] = "ghe.acme.test".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &app.to_string());
+    let (mut child, link) = dashboard(&home);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let (_, page) = common::part(&link, "/?p=repos&fragment=1");
+        if page.contains("https://ghe.acme.test/github-apps/") { break }
+        assert!(std::time::Instant::now() < end, "{}", common::words(&page));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
 
