@@ -10752,3 +10752,40 @@ fn jobs_not_this_cis_and_runs_from_outside_a_public_repository_are_left_or_refus
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A Cloudflare sign-in at its end, renewed as Cloudflare answers: refused (the grant or the token no longer good:
+/// the sign-in is over, and said so), not answering (kept as it is), renewed with no new refresh token (the one
+/// before kept), and one with nothing to renew it. The control planes page still reads.
+#[test]
+fn a_cloudflare_sign_in_at_its_end_is_renewed_or_said_over_as_cloudflare_answers() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    served.aws.replaying(include_str!("../fixtures/cloudflare/01-look.jsonl"), &[]);
+    let token = "dash.cloudflare.com/oauth2/token";
+    for (refresh, status, answer) in [
+        (Some("cloudflare-refresh-for-tests"), 400, r#"{"error":"invalid_grant","error_description":"The refresh token is invalid"}"#),
+        (Some("cloudflare-refresh-for-tests"), 401, r#"{"error":"invalid_token"}"#),
+        (Some("cloudflare-refresh-for-tests"), 503, "upstream unavailable"),
+        (Some("cloudflare-refresh-for-tests"), 200, r#"{"access_token":"cloudflare-access-renewed","expires_in":3600,"token_type":"bearer"}"#),
+        (None, 200, "{}"),
+    ] {
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 1, "refresh": refresh });
+        std::fs::write(&file, kept.to_string()).unwrap();
+        served.aws.fail(token, status, answer, None);
+        let o = common::command(&home).args(["planes", "list"]).output().unwrap();
+        served.aws.fail_none();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked"), "{status}: {said}");
+        let now: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        if status == 200 && refresh.is_some() { assert_eq!(now["cloudflare"]["refresh"], "cloudflare-refresh-for-tests", "the one before kept: {now}") }
+    }
+    assert!(served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().unwrap_or_default().contains(token)).count() >= 4, "renewals asked");
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
