@@ -2975,6 +2975,9 @@ fn connecting_github_takes_a_name_and_a_host_as_github_would_and_refuses_what_is
         let (got, _) = post(&mut b, "/github/start", &fields);
         assert!(got < 500, "{fields:?}: {got}");
     }
+    // Repositories while that App is on its way (made at GitHub, not installed yet), and after.
+    b.goto(&format!("{link}&p=repos"));
+    b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
     // Back from GitHub with a state that is not this one's: said, nothing made.
     let (status, page) = common::part(&link, "/github/callback?state=not-this-ones&code=x");
     assert!(status == 400 && page.contains("expired"), "{status}");
