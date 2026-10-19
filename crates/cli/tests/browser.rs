@@ -6321,6 +6321,14 @@ mod runs_suite_in_browser {
         let (_, signed) = cache("sign", serde_json::json!({ "token": token, "key": "deps-1", "version": version, "names": ["p00000"] }));
         assert_eq!(s3("PUT", signed["urls"][0].as_str().unwrap(), b"node_modules, packed").0, 200);
         assert_eq!(cache("finish", serde_json::json!({ "token": token, "key": "deps-1", "version": version, "pieces": [["p00000", 20]] })).1["size"], 20);
+        // One begun and left: its pieces as no client gives them refused; taken over once it is ten minutes old.
+        assert_eq!(cache("begin", serde_json::json!({ "token": token, "key": "left-1", "version": version })).1["ok"], true);
+        for pieces in [serde_json::json!([]), serde_json::json!([["bad/name", 1]]), serde_json::json!((0..2001).map(|n| serde_json::json!([format!("p{n}"), 1])).collect::<Vec<_>>())] {
+            assert!(cache("finish", serde_json::json!({ "token": token, "key": "left-1", "version": version, "pieces": pieces })).0 >= 400);
+        }
+        assert_eq!(cache("begin", serde_json::json!({ "token": token, "key": "left-1", "version": version })).0, 409);
+        served.later(superci_core::cache::TAKEOVER_MS + 1_000);
+        assert_eq!(cache("begin", serde_json::json!({ "token": token, "key": "left-1", "version": version })).1["ok"], true, "taken over");
         // Restored by its key's beginning, and read back.
         let (_, hit) = cache("lookup", serde_json::json!({ "token": token, "key": "deps-2", "restore_keys": ["deps-"], "version": version }));
         assert_eq!((hit["hit"].as_bool(), hit["key"].as_str()), (Some(true), Some("deps-1")), "{hit}");
