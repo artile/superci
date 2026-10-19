@@ -10856,6 +10856,7 @@ fn machines_of_a_control_plane_at_an_address_their_script_cannot_carry_start_wit
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
     });
     served.connect_github();
+    served.connect_gitlab();
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
     let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -10873,6 +10874,9 @@ fn machines_of_a_control_plane_at_an_address_their_script_cannot_carry_start_wit
     };
     for public in [Some("https://[::1]:8443"), Some("http://plane.acme.test"), None] {
         *served.public.lock().unwrap() = public.map(str::to_string);
+        // (And a GitLab job each time: its runner's script gets the same address.)
+        let (_, pending) = served.gitlab.pending("gitlab", &["superci"], served.now_ms());
+        assert!(served.gitlab_webhook(pending) < 300, "{public:?} gitlab");
         for label in ["superci", "superci/os=windows", "superci/spot=false", "superci/os=windows/spot=false"] {
             let before = scripts().len();
             let (id, q) = served.github.queue(label, label, served.now_ms());
