@@ -11060,6 +11060,18 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         assert!(o.status.success() == works, "{ended}: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let _ = std::fs::remove_dir_all(&alone);
     }
+    // A name set in the control plane as the standard one, or as what can be no name: each read as the standard name.
+    for name in ["SuperCI", "a<b>"] {
+        served.aws.put(&format!("/superci/{PLANE}/NAME"), name);
+        let (code, said) = cli(&["name", "retrieve", "--workspace=default"]);
+        assert!(code == 0 && said.contains("SuperCI"), "{name}: {code} {said}");
+    }
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/NAME"));
+    // Its status asked with other values beside: as asked plainly.
+    for q in ["light=0", "other=1"] {
+        let mut r = ureq::get(&format!("{}/status?{q}", served.url)).header("authorization", &format!("Bearer {}", served.key)).config().http_status_as_error(false).build().call().unwrap();
+        assert!(r.status().as_u16() == 200 && r.body_mut().read_to_string().unwrap_or_default().contains("\"installations\""), "{q}");
+    }
     // Its status, named: which workspace it is said, there being several.
     let (code, said) = cli(&["status", "--workspace=twin", "--json"]);
     assert!(code == 0 && said.contains("\"workspace\"") && said.contains("\"workspaces\""), "{code} {said}");
