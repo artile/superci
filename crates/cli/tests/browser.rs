@@ -4744,6 +4744,9 @@ mod github_in_browser {
         served.upkeep();
         let asked = served.github.redelivered();
         assert_eq!(asked.len(), failed + 2, "{asked:?} (job {other})");
+        // Listed again: the ones sent again are marked as that.
+        let o = superci(&home, &["deliveries", "list"]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         super::seen_in_browser(&served);
     }
 
@@ -10979,6 +10982,10 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         let said = String::from_utf8_lossy(&o.stdout).to_string();
         assert!(o.status.code().is_some_and(|c| c <= 3) && said.contains("subtracts"), "{args:?}: {said}{}", String::from_utf8_lossy(&o.stderr));
     }
+    // (A second organization's App, to be removed from the CLI.)
+    let mut second = superci_testkit::github::GitHub::app();
+    second["id"] = 2002.into(); second["owner"] = "globex".into(); second["slug"] = "superci-globex".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_2002"), &second.to_string());
     let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
     let (long_x, long_l, long_id) = ("x".repeat(80), "l".repeat(80), format!("--id={}", "a".repeat(40)));
     // (And one still running: its log so far, into a file.)
@@ -11075,7 +11082,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["caches", "list", "--repo=acme/nothing"], vec!["secrets", "create", "DRY", "--value-env=HOME", "--dry-run"], vec!["keys", "create", "agent", "--max-cpu=8"], vec!["keys", "create", "agent", "--daily-usd=5"],
         vec!["accounts", "retrieve", "gcp"], vec!["images", "create", "eu-west-1", "--from=nothing"], vec!["images", "create", "eu-west-1", "--from=us-east-1:ami-0123456789abcdef0", "--dry-run"],
         vec!["runners", "update", "cloudflare"], vec!["runners", "update", "aws", "--networks=subnet-0123456789abcdef0", "--dry-run"], vec!["public_repos", "list"], vec!["runs", "cancel", "999"],
-        vec!["login", "aws"], vec!["login"], vec!["login", "nowhere"], vec!["connections", "create", "github", "acme", "--dry-run"], vec!["jobs", "list", "-"], vec!["images", "delete", "eu-west-1", "--confirm"],
+        vec!["login", "aws"], vec!["login"], vec!["login", "nowhere"], vec!["connections", "create", "github", "acme", "--dry-run"], vec!["jobs", "list", "-"], vec!["images", "delete", "eu-west-1", "--confirm"], vec!["connections", "delete", "github", "globex", "--confirm"],
         // Help, a resource alone, what is no command.
         vec!["help"], vec!["help", "runs"], vec!["runs"], vec!["runs", "--help"], vec!["nothing"], vec!["runs", "nothing"], vec!["--version"],
     ];
