@@ -1116,6 +1116,8 @@ fn what_little_there_is_is_said_as_it_stands() {
     let alone = common::aws_only(&account);
     let (code, status) = json(&alone, &["status"]);
     assert_eq!((code, &status["control_plane"], status["signed_in"].as_str()), (0, &serde_json::Value::Null, Some("AWS account 111111111111")), "{status}");
+    let said = String::from_utf8_lossy(&superci(&alone, &["status"]).stdout).into_owned();
+    assert!(said.contains("Control plane none found in the clouds signed in to. Set one up: `superci planes create aws --region=us-east-1`"), "{said}");
     let served = serve(|_| {});
     served.connect_github();
     let home = home(&served);
@@ -1158,6 +1160,18 @@ fn what_little_there_is_is_said_as_it_stands() {
     // A copy of the image from a region with no image named: how to name one.
     let (code, v) = json(&common::signed_in(&served), &["images", "create", "ca-central-1", "--from=eu-west-1:not-an-image"]);
     assert_eq!((code, v["error"].as_str()), (2, Some("--from is a region and an image: --from=eu-west-1:ami-0123456789abcdef0.")), "{v}");
+    // A key the control plane does not take: its status not read, as the times asked say (SUPERCI_TIMING).
+    let stale = common::temp("stale-key");
+    std::fs::create_dir_all(stale.join("workspaces/default")).unwrap();
+    std::fs::write(stale.join("workspaces/default/sign-ins.json"), std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap().replace(&served.key, "a-key-no-control-plane-takes")).unwrap();
+    let o = common::command(&stale).env("SUPERCI_TIMING", "1").args(["status"]).output().unwrap();
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("ms status (not read)") && e.contains("The control plane does not take this computer's key"), "{e}");
+    let _ = std::fs::remove_dir_all(&stale);
+    // The control plane not answering: where it is, and its jobs not read.
+    served.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let said = String::from_utf8_lossy(&superci(&home, &["status"]).stdout).into_owned();
+    assert!(said.contains("Control plane AWS · 111111111111 · us-east-1 · not answering\n") && said.contains("Jobs can run  not yet:") && said.trim_end().ends_with("Its jobs could not be read just now (it did not answer with this machine's key yet). Try again in a moment."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&reader);
     let _ = std::fs::remove_dir_all(&alone);
@@ -1223,4 +1237,61 @@ fn the_accounts_copies_of_the_image_are_said_by_their_builds_and_an_older_one_is
     let look = said(&["accounts", "retrieve", "aws"]);
     assert!(look.contains("At once       spot 16 vCPUs · on-demand 16 vCPUs") && look.contains("16 vCPUs is 4 jobs of the default size at a time. Ask AWS for more: "), "{look}");
     let _ = std::fs::remove_dir_all(&alone);
+}
+
+/// Workspaces as they are kept: one looking after a CI it is signed out of, with its code hosts; one signed in to a
+/// further AWS account only; a name that makes an id with digits and runs of what is not a letter; the first one
+/// named before any is kept; one whose sign-ins cannot be removed, said; and what names no command or workspace.
+#[test]
+fn workspaces_kept_signed_out_or_in_another_account_only_are_listed_as_they_stand_and_what_names_none_is_said() {
+    let served = serve(|_| {});
+    let root = home(&served);
+    std::fs::write(root.join("workspaces/default/workspace.json"), serde_json::json!({ "name": "Acme", "hosts": [["github", "acme"], ["gitlab", "gitlab.example.com"]] }).to_string()).unwrap();
+    // (Signed in to a further AWS account, and to none as the first.)
+    let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(common::signed_in(&served).join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+    std::fs::create_dir_all(root.join("workspaces/other")).unwrap();
+    std::fs::write(root.join("workspaces/other/sign-ins.json"), serde_json::json!({ "aws_more": [kept["aws"]] }).to_string()).unwrap();
+    // A name with a dash between words and a digit: its id with one dash where the name has several marks between words.
+    let (code, made) = json(&root, &["workspaces", "create", "Build - Farm 2"]);
+    assert_eq!((code, made["workspace"].as_str()), (0, Some("build-farm-2")), "{made}");
+    let said = String::from_utf8_lossy(&superci(&root, &["workspaces", "list"]).stdout).into_owned();
+    let line = |id: &str| said.lines().find(|l| l.split_whitespace().next() == Some(id)).unwrap_or_else(|| panic!("{id}: {said}")).trim_end().to_string();
+    assert_eq!(line("default"), format!("{:<24} Acme · GitHub acme · GitLab gitlab.example.com · AWS · 111111111111 · us-east-1 · signed out", "default"));
+    assert_eq!((line("other").as_str(), line("build-farm-2").ends_with("Build - Farm 2 · nothing set up yet")), ("other", true), "{said}");
+    // The first workspace, named where none is kept yet: it is that one, with nothing signed in.
+    let empty = common::temp("no-workspaces");
+    let o = common::command(&empty).args(["status", "--workspace=default"]).output().unwrap();
+    assert!(o.status.code() == Some(3) && String::from_utf8_lossy(&o.stderr).contains("SuperCI is not signed in on this computer."), "{}", String::from_utf8_lossy(&o.stderr));
+    // A sign-in in a workspace not kept here; a command that is no word at all.
+    let o = superci(&root, &["login", "--workspace=nowhere"]);
+    assert!(o.status.code() == Some(1) && String::from_utf8_lossy(&o.stderr).contains("--workspace names the workspace nowhere, and none is called that on this machine (here: build-farm-2, default, other)."), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = superci(&root, &["", "--workspace=other"]);
+    assert!(o.status.code() == Some(2) && String::from_utf8_lossy(&o.stderr).starts_with("superci: \n\nSuperCI — GitHub Actions and GitLab CI jobs on your own clouds"), "{}", String::from_utf8_lossy(&o.stderr));
+    // Sign-ins kept where a folder is: not removed, said.
+    std::fs::create_dir_all(empty.join("workspaces/odd/sign-ins.json")).unwrap();
+    let o = common::command(&empty).args(["logout", "--workspace=odd"]).output().unwrap();
+    assert!(o.status.code() == Some(1) && String::from_utf8_lossy(&o.stderr).contains("workspaces/odd/sign-ins.json: Is a directory"), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// Where jobs come from and what runs them, as a CI that has little of either says it: GitHub's App installed
+/// nowhere yet, a second GitLab by its name beside the first, and no runner provider at all.
+#[test]
+fn a_ci_whose_app_is_installed_nowhere_with_two_gitlabs_and_no_runner_provider_says_so() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.github.set_installed(false, true);
+    served.connect_gitlab();
+    let mut other = superci_testkit::GitLab::connection();
+    other["id"] = "other".into();
+    other["url"] = "https://gitlab.example.com".into();
+    served.aws.put(&format!("/superci/{}/GITLAB_OTHER", served.plane), &other.to_string());
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{}/CONTAINERS", served.plane));
+    let home = home(&served);
+    let said = |args: &[&str]| { let o = superci(&home, args); (o.status.code(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    assert_eq!(said(&["connections", "list"]), (Some(0), "github  acme  its App is not installed yet\ngitlab  https://gitlab.com\ngitlab  https://gitlab.example.com  (other)\n".to_string()));
+    let (code, runners) = said(&["runners", "list"]);
+    assert!(code == Some(0) && runners.starts_with("No runner provider yet: `superci runners create aws` (or cloudflare, or modal).\n"), "{runners}");
+    let _ = std::fs::remove_dir_all(&home);
 }
