@@ -1162,3 +1162,65 @@ fn what_little_there_is_is_said_as_it_stands() {
     let _ = std::fs::remove_dir_all(&reader);
     let _ = std::fs::remove_dir_all(&alone);
 }
+
+/// The account's own copies of the runner image as AWS lists them: one of an older build than its maker's newest
+/// (said, its update checked with a dry run), one before it removed, ones whose names carry no build; a copy asked
+/// for where one is; where it would come from, by the maker's list as GitHub gives it or GitHub not giving it; and an
+/// account that may use no region.
+#[test]
+fn the_accounts_copies_of_the_image_are_said_by_their_builds_and_an_older_one_is_removed_as_aws_answered() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let image = |id: &str, name: &str| format!("<item><imageId>{id}</imageId><imageState>available</imageState><name>{name}</name><blockDeviceMapping><item><ebs><snapshotId>snap-{}</snapshotId></ebs></item></blockDeviceMapping></item>", &id[4..]);
+    let copies = |items: &[String]| format!("<DescribeImagesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><imagesSet>{}</imagesSet></DescribeImagesResponse>", items.concat());
+    let x64 = "runs-on-v2.2-ubuntu24-full-x64-";
+    served.aws.fail("DescribeImages|tag%3Asuperci|ec2.eu-west-2.", 200, &copies(&[image("ami-0a00000000000001", &format!("{x64}20261002111320")), image("ami-0a00000000000002", &format!("{x64}20260916102456")),
+        image("ami-0a00000000000003", &format!("{x64}custom")), image("ami-0a00000000000004", &format!("{x64}2026100208x320"))]), None);
+    served.aws.fail("DescribeImages|tag%3Asuperci|ec2.eu-west-1.", 200, &copies(&[image("ami-0b00000000000001", &format!("{x64}20261002111320"))]), None);
+    served.aws.fail("DeregisterImage", 200, "<DeregisterImageResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><return>true</return></DeregisterImageResponse>", None);
+    served.aws.fail("DeleteSnapshot", 200, "<DeleteSnapshotResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><return>true</return></DeleteSnapshotResponse>", None);
+    let said = |args: &[&str]| { let o = superci(&home, args); (o.status.code(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (code, listed) = said(&["images", "list"]);
+    let line = |region: &str| listed.lines().find(|l| l.starts_with(region)).unwrap_or_default().to_string();
+    assert_eq!(code, Some(0), "{listed}");
+    assert!(line("eu-west-2").contains("your copy ami-0a00000000000001 (runs-on-v2.2-ubuntu24-full-x64-20261002111320): the build of 2 October 2026; one of 6 October 2026 is out")
+        && line("eu-west-2").ends_with("(the copy before it is removed)"), "{listed}");
+    assert!(line("eu-west-1").contains("the build of 2 October 2026; one of 6 October 2026 is out") && !line("eu-west-1").contains("removed"), "{listed}");
+    // (Only the older build is removed, with its snapshot: not those whose names carry none.)
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str().filter(|s| s.contains("DeregisterImage") || s.contains("DeleteSnapshot")).map(str::to_string)).collect();
+    assert_eq!(asked, ["Action=DeregisterImage&Version=2016-11-15&ImageId=ami-0a00000000000002", "Action=DeleteSnapshot&Version=2016-11-15&SnapshotId=snap-0a00000000000002"]);
+    let (code, update) = said(&["images", "update", "eu-west-2", "--dry-run"]);
+    assert!(code == Some(0) && update.starts_with("Would copy the build of 6 October 2026 into eu-west-2, from eu-west-1 (") && update.contains("in place of your copy of 2 October 2026. Nothing was changed."), "{update}");
+    let (code, create) = said(&["images", "create", "eu-west-2"]);
+    assert!(code == Some(1) && create.contains("eu-west-2 has your copy of the image already: ami-0a00000000000001 (available)."), "{create}");
+
+    // Where a copy into a region with none would come from: the maker's newest build that lists this image, past
+    // builds that list none or whose names carry no build; then GitHub not answering for the list.
+    let table = "### `ubuntu24-full-x64`\n\n| Region | AMI |\n| --- | --- |\n| us-east-1 | `ami-0123456789abcdef0` |\n";
+    served.github.answer_with("GET", "runner-images-for-aws/releases", 200, &[("content-type", "application/json")], &serde_json::json!([
+        { "tag_name": "linux-20261012000000", "body": "### `ubuntu24-full-arm64`\n\n| us-east-1 | `ami-0123456789abcdef1` |\n" },
+        { "tag_name": "linux-2026", "body": table }, { "tag_name": "linux-2026101x000000", "body": table }, { "tag_name": "linux-20261011000000", "body": table }]).to_string());
+    let (code, create) = said(&["images", "create", "eu-north-1", "--dry-run"]);
+    assert!(code == Some(0) && create.contains("Would copy the image jobs run on into eu-north-1, from us-east-1 (ami-0123456789abcdef0)."), "{create}");
+    served.github.fail_none();
+    served.github.fail("GET", "runner-images-for-aws/releases", 503, "unavailable");
+    let (code, create) = said(&["images", "create", "eu-north-1", "--dry-run"]);
+    assert!(code == Some(1) && create.contains("The list of runner images could not be read from GitHub (it answered 503)."), "{create}");
+    let _ = std::fs::remove_dir_all(&home);
+
+    // An account AWS answers nothing of in any region: no region to use, its images nowhere, and nothing asked of
+    // spot or on-demand machines.
+    let account = superci_testkit::Aws::serve();
+    account.fail("DescribeVpcs", 500, &superci_testkit::ec2_error("InternalError", "We encountered an internal error."), None);
+    let alone = common::aws_only(&account);
+    let said = |args: &[&str]| String::from_utf8_lossy(&superci(&alone, args).stdout).into_owned();
+    assert_eq!(said(&["images", "list"]).trim(), "This account can use none of the regions SuperCI works in.");
+    let look = said(&["accounts", "retrieve", "aws"]);
+    assert!(look.contains("Regions       none allowed\n") && !look.contains("Spot ") && !look.contains("On-demand ") && !look.contains("At once"), "{look}");
+    // One that may run 16 vCPUs at once: four jobs of the default size, and where to ask for more.
+    account.fail_none();
+    account.fail("servicequotas.", 200, r#"{"Quota":{"QuotaCode":"L-34B43A08","ServiceCode":"ec2","Value":16.0}}"#, None);
+    let look = said(&["accounts", "retrieve", "aws"]);
+    assert!(look.contains("At once       spot 16 vCPUs · on-demand 16 vCPUs") && look.contains("16 vCPUs is 4 jobs of the default size at a time. Ask AWS for more: "), "{look}");
+    let _ = std::fs::remove_dir_all(&alone);
+}

@@ -392,7 +392,7 @@ impl Look {
     /// What AWS said in place of an answer, when it said of no region whether the account may work there (the
     /// sign-in was over, or AWS did not answer): nothing is known of the account then.
     pub fn unanswered(&self) -> Option<&str> {
-        if self.regions.is_empty() || self.regions.iter().any(|(_, a)| !matches!(a, Answer::Unknown(_))) { return None }
+        if self.regions.iter().any(|(_, a)| !matches!(a, Answer::Unknown(_))) { return None }
         self.regions.iter().find_map(|(_, a)| match a { Answer::Unknown(e) => Some(e.as_str()), _ => None })
     }
 
@@ -541,7 +541,7 @@ pub fn build_of(name: &str) -> &str { name.rsplit('-').next().filter(|s| s.len()
 /// and a copy stays what it was): the newest build among the copies.
 pub fn behind<'a>(copies: &'a [aws::CopiedImage], newest: &str) -> Option<&'a str> {
     let have = copies.iter().map(|c| build_of(&c.name)).filter(|b| !b.is_empty()).max()?;
-    (!newest.is_empty() && have < newest).then_some(have)
+    (have < newest).then_some(have)
 }
 
 /// A build's day, as people say it: 20261006080949 is 6 October 2026.
