@@ -2880,7 +2880,11 @@ fn labels_at_each_limit_and_in_each_combination_are_fitted_to_a_provider_or_refu
         "superci/arch=arm64/gpu=t4", "superci/os=windows/arch=arm64", "superci/os=windows/gpu=any", "superci/gpu=h100/cpu=2", "superci/gpu=b200", "superci/gpu=l4/ram=8", "superci/gpu=zz",
         "superci/scratch=localdisk/os=windows", "superci/scratch=nowhere", "superci/family=m8a+r8a", "superci/family=c8gd/arch=x64", "superci/family=c8g", "superci/family=nope",
         "superci/image=ubuntu24/os=windows", "superci/image=ubuntu99", "superci/provider=cloudflare/gpu=t4", "superci/provider=modal/cpu=64/ram=512", "superci/provider=modal/gpu=a100",
-        "superci/provider=cloudflare/cpu=8", "superci/provider=nowhere", "superci/spot=maybe", "superci/docker-cache=x", "superci/os=macos/arch=arm64", "superci/cpu=", "superci/=4", "superci/cpu=4/cpu=8"];
+        "superci/provider=cloudflare/cpu=8", "superci/provider=nowhere", "superci/spot=maybe", "superci/docker-cache=x", "superci/os=macos/arch=arm64", "superci/cpu=", "superci/=4", "superci/cpu=4/cpu=8",
+        "superci/family=c8g+c8g", "superci/family=c8g/arch=arm64", "superci/family=m8a/arch=arm64", "superci/docker-cache=true/os=windows", "superci/docker-cache=true/image=ubuntu26",
+        "superci/docker-cache=true", "superci/family=m8a/gpu=t4", "superci/family=m8a+c8gd", "superci/os=windows", "superci/gpu=t4", "superci/arch=arm64", "superci/image=ubuntu26",
+        "superci/spot=false/disk-iops=4000/family=c8a", "superci/provider=cloudflare/image=ubuntu26", "superci/provider=cloudflare/spot=false", "superci/provider=cloudflare/scratch=ramdisk",
+        "superci/scratch=localdisk/gpu=t4", "superci/provider=modal/gpu=any", "superci/gpu=l40s", "superci/gpu=any/cpu=64", "superci/provider=modal/gpu=l40s/cpu=4/ram=500", "superci/cpu=6/ram=1000"];
     for label in labels {
         let (id, q) = served.github.queue(label, label, served.now_ms());
         assert!(served.webhook(q) < 300, "{label}");
@@ -10306,6 +10310,9 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         // Labels, its name, the default machine, limits: nothing given, defaults, what does not hold.
         vec!["labels", "create"], vec!["labels", "create", "acmeci-big"], vec!["labels", "list"], vec!["labels", "delete", "acmeci-big", "--confirm"], vec!["labels", "delete"],
         vec!["name", "update"], vec!["name", "update", "Acme CI", "--dry-run"], vec!["name", "update", "a<b>"], vec!["name", "update", &long_x], vec!["name", "update", " "],
+        vec!["labels", "create", "ubuntu"], vec!["labels", "create", "a"], vec!["labels", "create", "9ab"], vec!["labels", "create", "ab_c"],
+        vec!["workspaces", "create", "Ab", "--dry-run"], vec!["workspaces", "create", "x"], vec!["workspaces", "create", "Ab  c"], vec!["workspaces", "create", "Ab-"], vec!["workspaces", "create", "9ab"],
+        vec!["workspaces", "create", "A_b"], vec!["workspaces", "create", "Build", "Farm", "--dry-run"], vec!["workspaces", "create", "---", "--dry-run"],
         vec!["labels", "create", "Bad Label"], vec!["labels", "create", "superci/cpu=4"], vec!["labels", "create", &long_l], vec!["labels", "create", "-dash"], vec!["machine", "update"], vec!["machine", "update", "--cpu=default", "--ram=default"], vec!["machine", "update", "--cpu=0"],
         vec!["limits", "update"], vec!["limits", "update", "--max-cpu=16"], vec!["limits", "update", "--monthly-usd=inf"],
         vec!["accounts", "update", "aws"], vec!["accounts", "update", "aws", "--monthly-usd=100", "--budget=emails", "--email=ops@example.com", "--dry-run"], vec!["accounts", "retrieve", "aws", "--account=222222222222"],
