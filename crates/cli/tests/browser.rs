@@ -10428,6 +10428,15 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let _ = std::fs::remove_dir_all(&empty);
     let (code, said) = cli(&["workspaces", "list"]);
     assert!(code <= 3 && said.contains("twin"), "{said}");
+    // Its id changed: to what it is, to one taken, to what is no id, as a dry run, then to a new one and back; one
+    // not kept here; the command with nothing to say which.
+    for (args, said_part) in [(vec!["workspaces", "update", "twin", "--id=twin"], "has the id twin"), (vec!["workspaces", "update", "twin", "--id=default"], "already"),
+        (vec!["workspaces", "update", "twin", "--id=Bad_Id"], "lowercase"), (vec!["workspaces", "update", "twin", "--id=x-"], "lowercase"), (vec!["workspaces", "update", "twin", "--id=twin-two", "--dry-run"], "twin-two"),
+        (vec!["workspaces", "update", "twin", "--id=twin-two"], "has the id twin-two"), (vec!["workspaces", "update", "twin-two", "--id=twin"], "has the id twin"),
+        (vec!["workspaces", "update", "nowhere", "--id=elsewhere"], ""), (vec!["workspaces", "update", "--id=x"], "Say which"), (vec!["workspaces", "update", "twin"], "Say its new id")] {
+        let (code, said) = cli(&args);
+        assert!(code <= 3 && said.contains(said_part), "{args:?}: {said}");
+    }
     let _ = std::fs::remove_dir_all(&twin);
     // The control plane named by its id, by its address, and by what is neither; and how long each part took.
     for plane in [PLANE.to_string(), served.url.clone(), format!("{}/", served.url), "nosuchplane1".to_string()] {
