@@ -11029,6 +11029,20 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let _ = std::fs::remove_dir_all(&empty);
     let (code, said) = cli(&["workspaces", "list"]);
     assert!(code <= 3 && said.contains("twin"), "{said}");
+    // Signed in nowhere now, a sign-in noted as ended (Cloudflare's, Modal's, AWS's): the control plane kept here is
+    // still read with this computer's key. With no key handed to it either: said to sign in.
+    for (ended, works) in [("cloudflare_ended", true), ("modal_ended", true), ("aws_ended", true), ("", false)] {
+        let alone = home.with_extension(format!("alone{ended}"));
+        std::fs::create_dir_all(alone.join("workspaces/default")).unwrap();
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+        for k in ["aws", "cloudflare", "modal", "aws_more"] { kept.as_object_mut().unwrap().remove(k); }
+        if ended.is_empty() { kept["key"]["planes"] = serde_json::json!([]) } else { kept[ended] = true.into() }
+        std::fs::write(alone.join("workspaces/default/sign-ins.json"), kept.to_string()).unwrap();
+        std::fs::copy(home.join("aws-at"), alone.join("aws-at")).unwrap();
+        let o = common::command(&alone).args(["jobs", "list"]).output().unwrap();
+        assert!(o.status.success() == works, "{ended}: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let _ = std::fs::remove_dir_all(&alone);
+    }
     // Its status, named: which workspace it is said, there being several.
     let (code, said) = cli(&["status", "--workspace=twin", "--json"]);
     assert!(code == 0 && said.contains("\"workspace\"") && said.contains("\"workspaces\""), "{code} {said}");
