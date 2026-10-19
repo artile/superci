@@ -3716,6 +3716,59 @@ fn a_ci_of_github_alone_with_two_jobs_on_cloudflare_an_app_short_of_a_read_permi
 }
 
 #[test]
+fn the_aws_accounts_budget_that_stopped_machines_days_ago_on_a_control_plane_from_before_a_days_limit_is_said_as_set() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    // AWS's own budget, made to stop machines; it last did two days ago. The control plane from before a day's limit.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"}],"account_usd":{"aws":100.0},"aws_budget":{"stop":true}}"#);
+    served.store.0.lock().unwrap().insert("aws:budget-stopped".into(), (served.now_ms() - 2 * 86_400_000).to_string());
+    served.aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &served.key);
+    *served.aws.old_version.lock().unwrap() = Some("0.15.3".into());
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    // Its rule not on the role now (nothing to lift), and no day's limit or budget to choose here.
+    assert!(page.contains("AWS account 111111111111") && page.contains("AWS stops at the limit") && !page.contains("Lift"), "{page}");
+    assert!(!page.contains("In AWS itself") && !page.contains("Daily limit"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_cache_turned_off_says_so_and_lists_a_repositorys_entries_still_kept() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"}],"cache":{"off":true}}"#);
+    // Two entries a repository saved before it was turned off.
+    for key in ["deps-a", "deps-b"] {
+        served.store.0.lock().unwrap().insert(format!("cache:gh123:refs/heads/main:v1:{key}"), serde_json::json!({ "id": key, "region": "us-east-1", "size": 1_000_000, "made": served.now_ms() - 3_600_000, "done": true }).to_string());
+    }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let page = common::words(&common::part(&link, "/?p=settings&fragment=1").1);
+    assert!(page.contains("Off. Jobs use GitHub's own cache.") && page.contains("Turn on") && !page.contains("Docker images"), "{page}");
+    assert!(page.contains("2 entries"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_overview_after_one_run_from_a_computer_of_one_job_says_both_in_the_singular() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    played(&served, &home.join("checkout"));
+    // (Its runs counted at a sweep.)
+    served.upkeep();
+    let (mut child, link) = dashboard(&home);
+    let page = common::words(&common::part(&link, "/?p=overview&fragment=1").1);
+    assert!(page.contains("1 run") && page.contains("1 job") && !page.contains("1 runs") && !page.contains("1 jobs") && !page.contains("did not run"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
