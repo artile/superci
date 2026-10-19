@@ -9314,6 +9314,20 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
     served.later(3_700_000);
     served.upkeep();
     assert!(served.store.under("lconv:").len() < converting.len() && !served.store.under("layer:").is_empty(), "what the converter made, read");
+    // What the store has now: linked, listed in the machine's index (those its job used fetched ahead), and a layer
+    // the converter refused not taken again; upload ids that are none.
+    let made: Vec<String> = served.store.under("layer:").into_iter().filter_map(|(k, _)| k.rsplit_once(":sha256:").map(|(_, h)| format!("sha256:{h}"))).collect();
+    let (status, links) = call("layers-links", serde_json::json!({ "digests": made }));
+    assert!(status == 200 && links["layers"].as_object().is_some_and(|l| !l.is_empty()), "{status} {links}");
+    assert!(call("layers-kept", serde_json::json!({ "pulled": 1, "pulled_bytes": 500, "served_digests": made, "used": made })).0 < 500);
+    let index = agent.get(&format!("{}/cache/{link}/layers.json", served.url)).call().map(|mut r| r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+    assert!(index.contains("\"ahead\""), "{index}");
+    for (k, _) in served.store.under("lmiss:") {
+        let d = format!("sha256:{}", k.rsplit_once(":sha256:").unwrap().1);
+        let (_, again) = call("layers-propose", serde_json::json!({ "layers": [{ "digest": d, "size": 500 }] }));
+        assert_eq!(again["layers"][&d]["do"], "no", "{again}");
+    }
+    for id in ["short", "abcdefghijklmnop!q"] { assert_eq!(call("layers-uploaded", serde_json::json!({ "id": id })).0, 400, "{id}") }
     // Docker's images not kept: the cache still there.
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{order},"cache":{{"images_off":true}}}}"#));
     ids.push(job("superci"));
@@ -9339,6 +9353,9 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
     let made = served.store.under("layer:").len();
     served.later(superci_core::layers::PUBLIC_MS + 3_600_000);
     served.upkeep();
+    // (Linked a week on: its use noted again.)
+    let had: Vec<String> = served.store.under("layer:").into_iter().filter_map(|(k, _)| k.rsplit_once(":sha256:").map(|(_, h)| format!("sha256:{h}"))).collect();
+    let _ = ureq::post(&format!("{}/cache/{link}/layers-links", served.url)).send(serde_json::json!({ "digests": had }).to_string());
     served.github.fail_none();
     served.later(40 * 86_400_000);
     served.upkeep();
