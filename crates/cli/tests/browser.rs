@@ -10955,6 +10955,17 @@ fn spot_machines_asked_of_a_fleet_are_started_or_refused_as_ec2_answers_each_way
         assert!(served.webhook(q) < 300, "case {i}");
         ids.push(id);
     }
+    // One machine at a time (no fleet): EC2 slowing it down, asked again after a pause; then slowing it down past
+    // the waits it takes.
+    for times in [Some(2), None] {
+        served.aws.fail_none();
+        served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+        served.aws.fail("RunInstances", 503, &slow, times);
+        served.aws.fail("RunInstances", 200, &started, None);
+        let (id, q) = served.github.queue("superci", "superci", served.now_ms());
+        assert!(served.webhook(q) < 300, "{times:?}");
+        ids.push(id);
+    }
     served.aws.fail_none();
     let asked = served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("Action=CreateFleet")).count();
     assert!(asked >= 10, "fleets asked: {asked}");
