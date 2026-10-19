@@ -1100,6 +1100,9 @@ fn what_settings_forms_must_not_take_is_refused_or_left_out_and_nothing_else_cha
         (&[("action", "pool"), ("cloud", "elsewhere")], "Unknown provider"),
         (&[("action", "pool"), ("cloud", "aws"), ("region_0", "mars-north-1")], "Choose a region from the list"),
         (&[("action", "account"), ("cloud", "aws"), ("networks", "not networks")], "Check your networks"),
+        (&[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-12 sg-00000000000000001")], "is not a subnet id"),
+        (&[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-0000000000000000000001 sg-00000000000000001")], "is not a subnet id"),
+        (&[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-0000000g sg-00000000000000001")], "is not a subnet id"),
         (&[("action", "pool"), ("cloud", "cloudflare"), ("image", "ftp://example.com/image")], "https://"),
         (&[("action", "nothing-of-the-kind")], "Unknown change"),
     ] {
