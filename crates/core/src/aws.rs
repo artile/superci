@@ -66,7 +66,8 @@ pub fn sigv4(method: &str, url: &str, headers: &[(String, String)], body: &[u8],
     query.sort();
     let canonical = [
         method.to_string(),
-        if u.path().is_empty() { "/".into() } else { u.path().to_string() },
+        // (Never empty: an http(s) address's path is `/` at least.)
+        u.path().to_string(),
         query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&"),
         all.iter().map(|(k, v)| format!("{k}:{v}\n")).collect::<String>(),
         signed.clone(),

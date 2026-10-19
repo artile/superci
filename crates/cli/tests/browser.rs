@@ -9646,6 +9646,94 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
     }
+
+    /// Workflows written in the rarer ways GitHub reads: an empty `env:` and `with:`, an image with no inputs, an action
+    /// in a folder of an owner with `_` in its name, a step's `if` with functions of other names, an expression never
+    /// closed, a `wait-all`, a quoted matrix value. Each step as its runner is given it; a `wait` that also uses an
+    /// action, and inputs to a manual start of a workflow that has none, refused saying why.
+    #[test]
+    fn workflows_written_in_the_rarer_ways_are_given_to_the_runner_as_github_reads_them_and_their_mistakes_said() {
+        let served = serve(|_| {});
+        let rare = "on: workflow_dispatch\nenv:\njobs:\n  t:\n    runs-on: superci\n    strategy:\n      matrix:\n        os: ['quoted', plain]\n    steps:\n      - id: bg\n        run: echo ${{ oops }\n        background: true\n        env:\n      - uses: docker://alpine:3\n      - uses: my_org/tools/sub/dir@v1\n        with:\n      - if: my_success() || steps.bg.cancelled()\n        run: echo two\n      - wait-all: true\n";
+        let dir = checkout_with(&[(".github/workflows/rare.yml", rare),
+            (".github/workflows/wait-uses.yml", "jobs:\n  w:\n    runs-on: superci\n    steps:\n      - id: bg\n        run: sleep 1\n        background: true\n      - wait: bg\n        uses: actions/checkout@v4\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/rare.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let runner = runner_of(&served, &run, "t (quoted)");
+        let steps = runner.handed(&served)["steps"].clone();
+        let step = |i: usize| steps[i].clone();
+        // (The expression never closed is the script as written; the image and the action have no inputs; the action
+        // is in a folder of its repository; the `if` is the job's to read; the `wait-all` names no step.)
+        assert!(step(0).to_string().contains("echo ${{ oops }") && step(0)["environment"].is_null(), "{}", step(0));
+        assert!(step(1)["reference"]["image"] == "alpine:3" && step(1)["inputs"].is_null(), "{}", step(1));
+        assert!(step(2)["reference"]["name"] == "my_org/tools" && step(2)["reference"]["path"] == "sub/dir" && step(2)["inputs"].is_null() && step(2)["contextName"] == "__my_org_tools", "{}", step(2));
+        assert_eq!(step(3)["condition"], "success() && (my_success() || steps.bg.cancelled())");
+        assert!(step(4)["controlType"] == "wait-all" && step(4)["stepIds"].is_null(), "{}", step(4));
+        assert!(served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().any(|j| j["name"] == "t (plain)"));
+        assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
+        for (args, said) in [(&["--workflow=.github/workflows/wait-uses.yml"][..], "a step that has `wait` runs nothing itself"),
+            (&["--workflow=.github/workflows/rare.yml", "--event=workflow_dispatch", "--input=who=me"], "has no input who (it has none)")] {
+            let o = superci(&served, &dir, &[&["runs", "create", "--detach"][..], args].concat()).output().unwrap();
+            let out = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success() && out.contains(said), "{said}: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Jobs' `if`s that read lists with `[*]` and a filter of a filter, `false` as a number, and one that holds when its
+    /// needed job failed (skipped, as it asks nothing of how the run goes); one with a number that is not one, refused.
+    #[test]
+    fn jobs_ifs_read_filters_of_filters_and_false_as_a_number_and_one_after_a_failed_job_is_skipped() {
+        let served = serve(|_| {});
+        let wf = "jobs:\n  a:\n    if: ${{ contains(fromJSON('[1]')[*], 1) && contains(fromJSON('[[1],[2]]').*.*, 2) && false == 0 && false < 1 }}\n    runs-on: superci\n    steps:\n      - run: exit 1\n  b:\n    needs: a\n    if: ${{ true }}\n    runs-on: superci\n    steps:\n      - run: echo\n";
+        let dir = checkout_with(&[(".github/workflows/ci.yml", wf)]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let a = runner_of(&served, &run, "a");
+        a.take();
+        a.finish("failed");
+        let result = |name: &str| served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().find(|j| j["key"] == name).map(|j| j["result"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while result("b").is_empty() { assert!(std::time::Instant::now() < end, "b never decided"); std::thread::sleep(std::time::Duration::from_millis(50)) }
+        assert_eq!((result("a").as_str(), result("b").as_str()), ("failure", "skipped"));
+        // A number with a sign after it that is no exponent's: not read, said.
+        std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  bad:\n    if: ${{ 1-2 }}\n    runs-on: superci\n    steps:\n      - run: echo\n").unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("the job bad's if"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A workflow file with `[` in its name: a secret kept for it by that very name is given; ones whose pattern
+    /// goes past a `?`, a class or a range that does not hold are not. Words that only look like `secrets` read none,
+    /// a name with a dash is one; a secret kept for a repository with a dash in its name, as `secrets create` keeps it.
+    #[test]
+    fn secrets_kept_for_a_workflow_named_with_a_bracket_are_given_only_by_patterns_that_hold_to_its_end() {
+        let served = serve(|_| {});
+        let patterns = [("W_LITERAL_OPEN", "x[.yml", true), ("W_ONE_THEN", "x?.yaml", false), ("W_CLASS_THEN", "[x]z.yml", false), ("W_RANGE_OUT", "[a-c][.yml", false)];
+        for (name, workflow, _) in patterns {
+            let scope = superci_core::secrets::Scope { workflow: Some(workflow.into()), ..Default::default() };
+            let kept = superci_core::secrets::Stored { name: name.to_string(), value: format!("{}-value", name.to_ascii_lowercase()), scope: scope.clone(), updated_ms: 1 };
+            served.aws.put(&format!("/superci/{}/{}", superci_testkit::PLANE, superci_core::secrets::setting(name, &scope)), &serde_json::to_string(&kept).unwrap());
+        }
+        let reads: String = patterns.iter().map(|(n, ..)| format!(" ${{{{ secrets.{n} }}}}")).collect();
+        let wf = format!("jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo{reads} ${{{{ asecrets }}}} ${{{{ secrets2 }}}} ${{{{ secrets.A-B }}}}\n");
+        let dir = checkout_with(&[(".github/workflows/x[.yml", &wf)]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/x[.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let handed = loop { if let Some((_, v)) = served.store.under("rjob:").into_iter().next() { break v } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let given = &handed["message"]["variables"];
+        for (name, _, holds) in patterns { assert_eq!(given[name].is_object(), holds, "{name}: {given}") }
+        // Kept for acme/my-app from the command line.
+        let home = signed_in(&served);
+        let o = common::command(&home).args(["secrets", "create", "DASHED", "--repo=acme/my-app", "--value-env=SUPERCI_TEST_VALUE"]).env("SUPERCI_TEST_VALUE", "v").output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(served.aws.settings(superci_testkit::PLANE).iter().any(|(k, v)| k.starts_with("SECRET_DASHED_") && v.contains("acme/my-app")), "kept");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 /// The dashboard as its own page asks it (each page, sign-ins, what it is given, where it listens), each scenario
