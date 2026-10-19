@@ -3,6 +3,8 @@ name: Coverage
 # The tests, measured by supercov: lines, branches and MC/DC, each test's own. Run by hand (Actions → Coverage):
 # every test; the browser suite alone (what the dashboard and control plane are covered by end to end, in Chrome); or
 # the end-to-end suites (the browser's and the CLI's own, each driving the `superci` program), without unit tests.
+# The browser suite and the end-to-end suites are measured in eight shards side by side (GitHub's runners are free for
+# a public repository), their runs merged into one.
 on:
   workflow_dispatch:
     inputs:
@@ -15,8 +17,23 @@ on:
 permissions:
   contents: read
 
+env:
+  # What `./build.sh` makes that the tests need (the program crates carry it): kept between runs while the sources it
+  # is built from are the same, so a run that changes tests alone does not build it again.
+  PROGRAMS: |
+    crates/plane-cloudflare/build
+    crates/runners-cloudflare/build
+    crates/plane-aws/build
+    crates/plane-modal/build
+    target/x86_64-unknown-linux-musl/release/superci-cache
+    target/x86_64-unknown-linux-musl/release/superci-layers
+    target/aarch64-unknown-linux-musl/release/superci-cache
+    target/aarch64-unknown-linux-musl/release/superci-layers
+    target/x86_64-pc-windows-gnu/release/superci-cache.exe
+
 jobs:
   coverage:
+    if: inputs.tests == 'all'
     # Ubuntu 26.04, as SuperCI's machines that keep Docker's images: its kernel mounts EROFS files, so the layer
     # store's setup is measured switching Docker over (GitHub's 24.04 kernel cannot).
     runs-on: ubuntu-26.04
@@ -48,7 +65,6 @@ jobs:
           grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
           sudo modprobe erofs && grep erofs /proc/filesystems
       - name: The tests, measured
-        if: inputs.tests == 'all'
         # (In supercov's own copy of the repository: what ./build.sh built is found in this one.)
         env:
           SUPERCI_BUILT: ${{ github.workspace }}
@@ -56,32 +72,135 @@ jobs:
           SUPERCI_LAYERS_E2E: "1"
           IMAGES: mirror.gcr.io/library
         run: npx -y supercov@4.19.0 -- cargo test --workspace
-      - name: The browser suite (or every end-to-end suite), measured
-        if: inputs.tests != 'all'
+      - name: What the tests reach
+        if: always()
+        run: .github/coverage-gaps.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: .supercov/runs
+          include-hidden-files: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gaps
+          path: gaps
+
+  # The browser suite, or every end-to-end suite: the programs built (or kept from before), and the tests listed and
+  # dealt into eight shards.
+  prepare:
+    if: inputs.tests != 'all'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    outputs:
+      shards: ${{ steps.deal.outputs.shards }}
+      programs: ${{ steps.key.outputs.programs }}
+    steps:
+      - uses: actions/checkout@v6
+      # (What the programs are built from: the control planes, the runner agent, the cache program and the layer
+      # store, with the core they share.)
+      - id: key
+        run: echo "programs=programs-${{ runner.os }}-${{ hashFiles('build.sh', 'Cargo.lock', 'Cargo.toml', 'scripts/mkfs-erofs/**', 'crates/core/src/**', 'crates/core/Cargo.toml', 'crates/plane-*/src/**', 'crates/plane-*/Cargo.toml', 'crates/plane-cloudflare/wrangler.toml', 'crates/runners-cloudflare/src/**', 'crates/runners-cloudflare/Cargo.toml', 'crates/runners-cloudflare/wrangler.toml', 'crates/cache/src/**', 'crates/cache/Cargo.toml', 'crates/layers/src/**', 'crates/layers/Cargo.toml', 'crates/layers/build.rs', 'crates/layers/assets/**', 'crates/layers/proto/**') }}"" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: programs
+        with:
+          path: ${{ env.PROGRAMS }}
+          key: ${{ steps.key.outputs.programs }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ steps.programs.outputs.cache-hit != 'true' && 'aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage-prepare
+      - uses: mlugg/setup-zig@v2
+        if: steps.programs.outputs.cache-hit != 'true'
+        with:
+          version: 0.16.0
+          use-cache: false
+      - uses: taiki-e/install-action@v2
+        if: steps.programs.outputs.cache-hit != 'true'
+        with:
+          tool: cargo-zigbuild
+      - name: worker-build
+        if: steps.programs.outputs.cache-hit != 'true'
+        run: cargo install --locked worker-build
+      - name: Build
+        if: steps.programs.outputs.cache-hit != 'true'
+        run: ./build.sh
+      - name: The tests, listed and dealt into shards
+        id: deal
+        run: |
+          if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
+          cargo test -p superci "$@" -- --list --format terse | sed -n 's/: test$//p' | sort -u > tests.txt
+          wc -l < tests.txt
+          # (Dealt in turn, in an order that mixes the suites' long and short tests, the same for the same names.)
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import hashlib, json
+          names = sorted(open("tests.txt").read().split(), key=lambda n: hashlib.sha256(n.encode()).hexdigest())
+          shards = [{"shard": i + 1, "tests": " ".join(names[i::8])} for i in range(8)]
+          print("shards=" + json.dumps(shards))
+          EOF
+
+  shard:
+    needs: prepare
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PROGRAMS }}
+          key: ${{ needs.prepare.outputs.programs }}
+          fail-on-cache-miss: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      # (One shard keeps the Rust cache; the others read it.)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage-shard
+          save-if: ${{ matrix.shard == 1 }}
+      - name: Shard ${{ matrix.shard }} of the tests, measured
         env:
           SUPERCI_BUILT: ${{ github.workspace }}
           # (A page waits longer under a coverage run, a few at a time.)
           SUPERCI_BROWSER_WAIT_S: "120"
+          TESTS: ${{ matrix.tests }}
         run: |
           # (Its tests skip themselves where there is no Chrome: a measure of skipped tests would say nothing.)
           google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
-          # (e2e: every test program of the CLI's, the browser's among them; none of its unit tests.)
           if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
-          npx -y supercov@4.19.0 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4
-      - name: What the tests reach
+          # shellcheck disable=SC2086
+          npx -y supercov@4.19.0 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
+      - uses: actions/upload-artifact@v4
         if: always()
-        run: |
-          npx -y supercov@4.19.0 runs latest
-          npx -y supercov@4.19.0 runs latest gaps
-          npx -y supercov@4.19.0 runs latest file crates/cli/src/dashboard.rs --group decision --sort missing --limit 80
-          # Each file's conditions still to show, by decision, kept with the run (to read without measuring again).
-          mkdir -p gaps
-          # (Every source file's, named by its path: crates/core/src/aws.rs is core-aws.txt.)
-          for f in crates/cli/src/*.rs crates/core/src/*.rs; do
-            n=$(echo "$f" | sed -e 's|^crates/||' -e 's|/src/|-|' -e 's|\.rs$||')
-            npx -y supercov@4.19.0 runs latest file "$f" --group decision --sort missing --limit 3000 > "gaps/$n.txt" || true
-          done
-          npx -y supercov@4.19.0 runs latest files --limit 0 > gaps/files.txt || true
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: .supercov/runs
+          include-hidden-files: true
+
+  # The shards' runs, as one: what the tests reach, and each file's conditions still to show.
+  merge:
+    needs: shard
+    if: ${{ !cancelled() && needs.shard.result != 'skipped' }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-shard-*
+          path: .supercov/runs
+          merge-multiple: true
+      - name: The shards' runs merged
+        run: npx -y supercov@4.19.0 merge
+      - name: What the tests reach
+        run: .github/coverage-gaps.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
