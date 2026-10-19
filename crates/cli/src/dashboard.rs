@@ -5003,14 +5003,16 @@ mark();load()})();</script>"#;
         let update = |i: usize, v: &PlaneView| if updating.as_ref().is_some_and(|u| u.plane == v.plane.plane_id() && !matches!(u.result, Some(Ok(_)))) { String::new() }
             // Updated, the old version still answering: said, and looked at again until the new one does.
             else if updating.as_ref().is_some_and(|u| u.restarting(v)) { r#"<span class="note upd-step"><span class="mini-spin"></span>Restarting…</span><div data-refresh="3"></div>"#.to_string() }
-            else if !v.outdated() || !v.online { String::new() } else if signed_in(v) {
+            // (Behind is said only of one that answers.)
+            else if !v.outdated() { String::new() } else if signed_in(v) {
             format!(r#"<form method="post" action="/plane/update" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Updating…'"><input type="hidden" name="plane" value="{}"><input type="hidden" name="next"><button class="button {} sm">Update to {DASHBOARD_VERSION}</button></form>"#, esc(v.plane.plane_id()), if i == used { "primary" } else { "secondary" })
         } else { String::new() };
         // Not signed in to a control plane's cloud: one button for that (the rest follows once signed in).
         let sign_in = |cloud: &str| format!(r#"<form method="post" action="/{cloud}/signin"><input type="hidden" name="next"><button class="button secondary sm">Sign in with {}</button></form>"#, provider_name(cloud));
+        // (Its items are its rarer actions, each one that ends something: Delete, Stop using SuperCI.)
         let menu = |items: &[(&str, String)]| if items.is_empty() { String::new() } else {
             format!(r#"<details class="menu"><summary class="icon-btn" aria-label="More">{ICON_MORE}</summary><div class="menu-pop">{}</div></details>"#,
-                items.iter().map(|(label, dialog)| format!(r#"<button type="button" class="{}" onclick="this.closest('details').open=false;document.getElementById('{dialog}').showModal()">{label}</button>"#, if label.starts_with("Delete") || label.starts_with("Stop") { "danger-item" } else { "" })).collect::<String>())
+                items.iter().map(|(label, dialog)| format!(r#"<button type="button" class="danger-item" onclick="this.closest('details').open=false;document.getElementById('{dialog}').showModal()">{label}</button>"#)).collect::<String>())
         };
         // An update under way: its progress in the row's second line (the address otherwise), a spinner at its end.
         let busy = |v: &PlaneView| updating.as_ref().filter(|u| u.plane == v.plane.plane_id() && !matches!(u.result, Some(Ok(_)))).map(|u| {

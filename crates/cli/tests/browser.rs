@@ -3245,6 +3245,220 @@ fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_t
 
 
 #[test]
+fn cloudflare_jobs_are_measured_in_each_account_that_answers_and_what_is_no_cloudflare_container_is_left_alone() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    // Jobs that ran on Cloudflare's containers, each ended as said; their containers as Cloudflare named them.
+    let mut ids = vec![];
+    for (name, machine, cloud, kind, ago) in [
+        ("measured", "a".repeat(64), "cloudflare", Some("4cpu-12gb"), 300_000u64),
+        // (A name as long as a container's, but not one; one ended three days ago; one that ran elsewhere; one of no
+        // size Cloudflare counted nothing for.)
+        ("not hex", "g".repeat(64), "cloudflare", Some("4cpu-12gb"), 300_000),
+        ("days ago", "b".repeat(64), "cloudflare", Some("4cpu-12gb"), 3 * 86_400_000),
+        ("on aws", "c".repeat(64), "aws", Some("4cpu-12gb"), 300_000),
+        ("counted nothing", "d".repeat(64), "cloudflare", None, 300_000),
+    ] {
+        let (id, q) = served.github.queue(name, "superci", served.now_ms()); served.webhook(q);
+        served.webhook(served.github.start(id));
+        served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+        let now = served.now_ms(); let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
+        j["machine_id"] = machine.into(); j["cloud"] = cloud.into(); j["started_ms"] = (now - ago - 60_000).into(); j["ended_ms"] = (now - ago).into();
+        match kind { Some(k) => j["machine_type"] = k.into(), None => { j.as_object_mut().unwrap().remove("machine_type"); } }
+        m.insert(k, j.to_string());
+        ids.push((name, id));
+    }
+    // Signed in to Cloudflare, two accounts; the first's usage not answered (Cloudflare's fault), the second's as it said.
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.fail("/client/v4/accounts?", 200, r#"{"result":[{"id":"1111111111111111111111111111111a","name":"Acme"},{"id":"2222222222222222222222222222222b","name":"Acme Labs"}],"success":true,"errors":[],"messages":[]}"#, None);
+    served.aws.fail("/workers/scripts", 200, r#"{"result":[],"success":true,"errors":[],"messages":[]}"#, None);
+    served.aws.fail("/workers/subdomain", 200, r#"{"result":{"subdomain":"acme"},"success":true,"errors":[],"messages":[]}"#, None);
+    served.aws.fail("/graphql", 500, r#"{"data":null,"errors":[{"message":"Internal server error"}]}"#, Some(1));
+    let sum = |id: String, mem: f64| serde_json::json!({ "dimensions": { "instanceId": id }, "sum": { "cpuTimeSec": 45.0, "allocatedMemory": mem, "allocatedDisk": 2.0e12, "txBytes": 1.0e8 } });
+    served.aws.fail("/graphql", 200, &serde_json::json!({ "data": { "viewer": { "accounts": [{ "g": [sum("a".repeat(64), 1.0e12), sum("c".repeat(64), 1.0e12), sum("d".repeat(64), 0.0)] }] } }, "errors": null }).to_string(), None);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=overview"));
+    b.wait(&shows("Usage"));
+    let job = |name: &str| served.store.under(&format!("job:{}", ids.iter().find(|(n, _)| *n == name).unwrap().1))[0].1.clone();
+    until("its cost settled at what the second account measured", || job("measured")["cost_from"] == "measured");
+    for name in ["not hex", "days ago", "on aws", "counted nothing"] { assert!(job(name)["cost_from"] != "measured", "{name}") }
+    // Both accounts asked.
+    let asked = served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().unwrap_or_default().contains("graphql")).map(|a| a["asked"].to_string()).collect::<Vec<_>>().join(" ");
+    assert!(asked.contains("1111111111111111111111111111111a") && asked.contains("2222222222222222222222222222222b"), "{asked}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_control_plane_that_stops_answering_a_moment_after_it_did_is_shown_as_it_last_answered() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    // (Read again on every page; how long a last answer stands, as it is out of a test: a minute.)
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "1"), ("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads(&format!("{} ", served.url.trim_start_matches("http://"))));
+    served.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    for p in ["overview", "planes"] {
+        b.goto(&format!("{link}&p={p}"));
+        b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+        let page = b.text("main");
+        assert!(!page.contains("not answering") && !page.contains("Not answering"), "{p}: {page}");
+    }
+    assert!(b.text("main").contains("In use"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn workspaces_are_made_renamed_and_forgotten_beside_others_and_what_is_there_already_is_refused() {
+    // A computer with nothing kept yet: the dashboard started in its first workspace, which has no folder.
+    let home = common::temp("home");
+    let (mut child, link) = dashboard(&home);
+    let said = |r: (u16, String, String)| (r.0, r.1, common::words(&r.2));
+    let (status, to, _) = said(common::post(&link, "/workspaces", &[("name", "Acme")]));
+    assert_eq!((status, to.as_str()), (303, "/?w=acme&c="));
+    assert!(home.join("workspaces/default").is_dir() && home.join("workspaces/acme").is_dir());
+    // The same name again: refused.
+    let (status, _, text) = said(common::post(&link, "/workspaces", &[("name", "Acme")]));
+    assert!(status == 400 && text.contains("There is a workspace with the id acme already"), "{status} {text}");
+    // Renamed to an id something else holds on this computer (a file, no workspace): refused, and its pages stay.
+    assert_eq!(common::part(&link, "/?w=acme&p=settings&fragment=1").0, 200);
+    std::fs::write(home.join("workspaces/taken"), "").unwrap();
+    let (status, _, text) = said(common::post(&link, "/workspaces/rename", &[("w", "acme"), ("id", "taken")]));
+    assert!(status == 400 && text.contains("There is a workspace with the id taken already"), "{status} {text}");
+    assert!(home.join("workspaces/acme").is_dir());
+    assert_eq!(common::part(&link, "/?w=acme&p=settings&fragment=1").0, 200);
+    // Renamed to a free one: its pages go on under it.
+    let (status, to, _) = said(common::post(&link, "/workspaces/rename", &[("w", "acme"), ("id", "acme2")]));
+    assert_eq!((status, to.as_str()), (303, "/?p=settings&w=acme2"));
+    assert!(home.join("workspaces/acme2").is_dir() && !home.join("workspaces/acme").exists());
+    let (status, text) = common::part(&link, "/?w=acme2&p=settings&fragment=1");
+    assert!(status == 200 && common::words(&text).contains("acme2"), "{status}");
+    // Where a change leads, with several: the workspace named, unless the address names one already; and only to
+    // this dashboard's own pages.
+    for (next, to) in [("", "/?w=default"), ("?w=acme2&p=planes", "/?w=acme2&p=planes"), ("?p=planes", "/?p=planes&w=default"),
+        (&format!("?p={}", "a".repeat(130)), "/?w=default"), ("?p=a.b", "/?w=default")] {
+        let (status, got, _) = common::post(&link, "/aws/look", &[("w", "default"), ("next", next)]);
+        assert_eq!((status, got.as_str()), (303, to), "{next}");
+    }
+    // A third, forgotten: the other two stay, and the list of them is next.
+    assert_eq!(common::post(&link, "/workspaces", &[("name", "Beta")]).0, 303);
+    let (status, to, _) = common::post(&link, "/workspaces/remove", &[("w", "beta")]);
+    assert_eq!((status, to.as_str()), (303, "/workspaces"));
+    assert!(!home.join("workspaces/beta").exists() && home.join("workspaces/default").is_dir() && home.join("workspaces/acme2").is_dir());
+    let _ = child.kill();
+    // Started again with none named: one made from there all the same.
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let mut started = common::command(&home).args(["dashboard", "--no-browser"]).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    use std::io::BufRead;
+    let mut lines = std::io::BufReader::new(started.stdout.take().unwrap()).lines().map_while(Result::ok);
+    let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
+    std::thread::spawn(move || lines.for_each(drop));
+    let (status, to, _) = common::post(&link, "/workspaces", &[("name", "Gamma")]);
+    assert_eq!((status, to.as_str()), (303, "/?w=gamma&c="));
+    assert!(home.join("workspaces/gamma").is_dir());
+    let _ = started.kill();
+    let _ = started.wait();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_gitlab_token_short_of_scopes_or_gitlab_failing_is_refused_and_one_whose_scopes_gitlab_keeps_to_itself_is_taken() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let token = superci_testkit::gitlab::GitLab::connection()["token"].as_str().unwrap().to_string();
+    let (mut child, link) = dashboard(&home);
+    let gitlabs = || served.aws.settings(PLANE).into_iter().filter(|(k, _)| k.starts_with("GITLAB")).map(|(k, _)| k).collect::<Vec<_>>();
+    let connect = || { let (status, _, text) = common::post(&link, "/gitlab/connect", &[("url", "https://gitlab.com"), ("token", &token), ("which", "new")]); (status, common::words(&text)) };
+    // A token made with fewer scopes than SuperCI asks for; GitLab answering an error of its own: refused, nothing kept.
+    served.gitlab.scopes(&["api"]);
+    let (status, text) = connect();
+    assert!(status == 400 && text.contains("it needs the scopes create_runner, manage_runner"), "{status} {text}");
+    served.gitlab.scopes(&["api", "create_runner", "manage_runner"]);
+    served.gitlab.fail("GET", "/api/v4/user", 502);
+    let (status, text) = connect();
+    assert!(status == 400 && text.contains("GitLab answered 502"), "{status} {text}");
+    served.gitlab.fail_none();
+    assert!(gitlabs().is_empty(), "{:?}", gitlabs());
+    // GitLab not saying the token's scopes (as for a token it has no record of): taken, as GitLab took it.
+    served.gitlab.fail("GET", "/personal_access_tokens/self", 404);
+    let (status, text) = connect();
+    assert!(status < 400, "{status} {text}");
+    assert_eq!(gitlabs().len(), 1, "{:?}", gitlabs());
+    // Disconnecting one by a name with what no name has: only its letters and digits are taken, and the one connected stays.
+    let (status, to, _) = common::post(&link, "/gitlab/disconnect", &[("gitlab", "Zz9!")]);
+    assert_eq!((status, to.as_str()), (303, "/?p=repos"));
+    assert_eq!(gitlabs().len(), 1, "{:?}", gitlabs());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn another_control_plane_behind_is_offered_its_update_beside_moving_and_restarts_while_the_one_in_use_stays_behind() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The one in use and another in the account, both from before 0.19.13 (their keys under the old name).
+    let served = serve(|_| {});
+    // (The other reads its settings where the dashboard writes them: the account's.)
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("testplane0002", move |c| { let s = aws.settings("testplane0002"); if !s.is_empty() { c.read_settings(&s) } });
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    for (aws, id, key) in [(&served.aws, PLANE, &served.key), (&other.aws, "testplane0002", &other.key)] {
+        aws.put(&format!("/superci/{id}/DASHBOARD_KEY_4102444800_TEST"), key);
+        *aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    }
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&format!("{link}&p=planes"));
+    // Its row: its update, and moving to it.
+    let other_row = format!("[...document.querySelectorAll('main .pick')].find(p => p.innerText.includes({:?}))", other.url.trim_start_matches("http://"));
+    b.wait(&format!("{other_row} && {other_row}.innerText.includes('Update to') && {other_row}.innerText.includes('Move here')"));
+    // The Changelog says what the one in use does not have yet.
+    b.goto(&format!("{link}&p=changes"));
+    b.wait(&format!("{} && document.querySelector('main').innerText.toLowerCase().includes('not on your control plane yet')", shows("Control plane 0.19.12")));
+    // The other updated: uploaded, and while it still answers as before, said to be restarting.
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{other_row} && {other_row}.querySelector('form[action=\"/plane/update\"] button')"));
+    b.eval(&format!("{other_row}.querySelector('form[action=\"/plane/update\"] button').click()"));
+    b.wait(&page_shows("Updating to"));
+    // (Its new code went to the account both are in; the one in use is still as it was.) Once its new version
+    // answers the update is done; then, a moment later, the old one answers again, as while its cloud switches over.
+    b.wait(&reads("Waiting for the new version"));
+    *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    *other.aws.old_version.lock().unwrap() = None;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        b.goto(&format!("{link}&p=planes"));
+        b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+        if !b.text("main").contains("Updating to") { break }
+        assert!(std::time::Instant::now() < end, "{}", b.text("main"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    *other.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        b.goto(&format!("{link}&p=planes"));
+        b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+        let row = b.eval(&format!("({other_row} || {{innerText: ''}}).innerText")).as_str().unwrap_or_default().to_string();
+        if row.contains("Restarting") { break }
+        assert!(std::time::Instant::now() < end, "{row}\n{}", b.text("main"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    // The one in use still offers its own update.
+    assert!(b.eval("document.body.innerText").as_str().unwrap_or_default().contains("Update available"), "{}", b.eval("document.body.innerText"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
