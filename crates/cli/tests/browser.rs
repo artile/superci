@@ -5360,6 +5360,23 @@ mod runs_suite_in_browser {
         assert_eq!(status, 200, "{said}");
         assert_eq!(call("tool-finish", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "size": 12 })).0, 200);
         assert!(call("tool-get", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).1.contains("\"hit\":true"));
+        // Another sent from a computer signed in (with its device key, not a run key): its machine writes as that key.
+        let home = common::signed_in(&served);
+        let before = served.aws.asked.lock().unwrap().len();
+        let o = common::command(&home).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let asked = loop {
+            if let Some(a) = served.aws.asked.lock().unwrap()[before..].iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()) { break a }
+            assert!(std::time::Instant::now() < end, "no machine asked for");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+        let script = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(data).unwrap()).unwrap();
+        let link2 = script.split("/cache/").nth(1).unwrap().split(|c| c == '\'' || c == '"' || c == '/').next().unwrap().to_string();
+        let mut r = agent.post(&format!("{}/cache/{link2}/tool-begin", served.url)).send(serde_json::json!({ "tool": "turbo", "hash": "fedcba9876543210" }).to_string()).unwrap();
+        assert_eq!(r.status().as_u16(), 200, "{}", r.body_mut().read_to_string().unwrap_or_default());
+        let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
