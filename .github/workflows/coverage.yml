@@ -194,7 +194,8 @@ jobs:
   # The shards' runs, as one: what the tests reach, and each file's conditions still to show.
   merge:
     needs: shard
-    if: ${{ !cancelled() && needs.shard.result != 'skipped' }}
+    # (Also when a shard was cut off at its time limit: the others' runs, merged, still say what they reach.)
+    if: ${{ always() && needs.shard.result != 'skipped' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
