@@ -915,6 +915,69 @@ fn a_setting_the_control_plane_does_not_show_in_time_is_said_as_not_taken() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Cloudflare signed in to again from the dashboard after its sign-in had ended (as Cloudflare answered a real one):
+/// what fails afterwards is said as it is, not as the sign-in that ended; signed in once more, its control planes are
+/// looked for again.
+#[test]
+fn cloudflare_signed_in_again_after_its_sign_in_ended_is_taken_as_signed_in() {
+    let served = serve(|_| {});
+    served.aws.replaying(&[include_str!("../fixtures/cloudflare/01-look.jsonl"), include_str!("../fixtures/cloudflare/sign-in/sign-in.jsonl")].concat(), &[]);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["cloudflare_ended"] = true.into();
+    std::fs::write(&file, k.to_string()).unwrap();
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_OAUTH_PORT", &port.to_string()), ("SUPERCI_PORT", &port.to_string())]);
+    // (On Cloudflare's own port its cookie is the usual one.)
+    let key = link.split_once("/?k=").unwrap().1.to_string();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
+    let get = |path: &str| { let mut r = agent.get(&format!("http://127.0.0.1:{port}{path}")).header("cookie", &format!("superci_local={key}")).header("sec-fetch-site", "same-origin").call().unwrap();
+        let to = r.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string(); (r.status().as_u16(), to, r.body_mut().read_to_string().unwrap_or_default()) };
+    let page = |p: &str| common::words(&get(&format!("/?p={p}&fragment=1")).2);
+    until("the page read", || { let p = page("overview"); p.contains("Usage") && !p.contains("Reading your control plane") });
+    let sign_in = || {
+        let (_, to, said) = get("/connect/cloudflare");
+        let to = if to.is_empty() { said.split("https://dash.cloudflare.com/oauth2/auth?").nth(1).map(|r| format!("https://dash.cloudflare.com/oauth2/auth?{}", r.split(['"', '\'']).next().unwrap().replace("&amp;", "&"))).unwrap_or_default() } else { to };
+        let state = to.split("state=").nth(1).and_then(|r| r.split('&').next()).expect("a state").to_string();
+        let (status, _, done) = get(&format!("/oauth/callback?code=a-code-from-cloudflare&state={state}"));
+        assert!(status < 400 && common::words(&done).contains("Signed in with Cloudflare"), "{status} {}", common::words(&done));
+    };
+    let accounts_asked = || served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/client/v4/accounts?per_page=50"))).count();
+    sign_in();
+    until("its accounts read", || { page("overview"); accounts_asked() == 1 });
+    // What fails now is said as what it is.
+    let (status, _, said) = get("/run/artifact?run=1&name=report");
+    assert!(status >= 400 && !common::words(&said).contains("Cloudflare sign-in has expired"), "{status} {}", common::words(&said));
+    // Signed in once more: its control planes looked for again.
+    sign_in();
+    let before = served.aws.asked.lock().unwrap().len();
+    until("looked in again", || { page("overview"); served.aws.asked.lock().unwrap()[before..].iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("/workers/scripts"))) });
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane in the account standing by for a move (given the App with the settings, the switch not made yet)
+/// is a place this workspace's CI can still move to, not another CI: listed with this workspace's control planes.
+#[test]
+fn a_control_plane_standing_by_for_a_move_is_a_place_to_move_to_not_another_ci() {
+    let role = |name: &str, description: &str| format!("<member><Path>/</Path><RoleName>{name}</RoleName><RoleId>AROAEXAMPLE{:09}</RoleId><Arn>arn:aws:iam::111111111111:role/{name}</Arn><CreateDate>2026-10-18T10:00:00Z</CreateDate><Description>{description}</Description><MaxSessionDuration>3600</MaxSessionDuration></member>", name.len());
+    let roles = |members: &[String]| format!("<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{}</Roles></ListRolesResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ResponseMetadata></ListRolesResponse>", members.concat());
+    let served = serve(|_| {});
+    served.connect_github();
+    let target = superci_testkit::serve_as("otherci000001", |_| {});
+    target.connect_github();
+    target.store.0.lock().unwrap().insert("standby".into(), "1".into());
+    served.aws.fail("ListRoles", 200, &roles(&[role(&format!("superci-plane-{PLANE}"), &format!("Runs the SuperCI control plane {} (Lambda, us-east-1, runs-on superci).", served.url)),
+        role("superci-plane-otherci000001", &format!("Runs the SuperCI control plane {} (Lambda, us-east-1, runs-on superci).", target.url))]), None);
+    let home = signed_in(&served);
+    let (_child, link) = dashboard(&home);
+    let page = || common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    until("the place listed", || page().contains(&target.url));
+    let p = page();
+    assert!(!p.contains("Other CIs in your signed-in accounts") && !p.contains("Another CI"), "{p}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

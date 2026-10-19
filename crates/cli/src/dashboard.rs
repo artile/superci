@@ -2181,13 +2181,13 @@ impl Dashboard {
             self.aws_others.retain(|s| !ended.contains(&s.account_id));
         }
         let modal = if self.looked_modal { None } else { self.modal.clone() };
-        let accounts = self.cf_accounts.clone();
+        // (Cloudflare is looked in again only after a sign-in changed, which forgets the accounts it reached: asked anew.)
         let (cf_found, aws_found, modal_found) = std::thread::scope(|s| {
-            let c = cf.as_ref().map(|cf| { let accounts = accounts.clone(); s.spawn(move || -> Result<(Vec<(String, String)>, Vec<Plane>)> {
-                let accounts = if accounts.is_empty() { timed("Cloudflare: accounts", || cf.accounts())? } else { accounts };
+            let c = cf.as_ref().map(|cf| s.spawn(move || -> Result<(Vec<(String, String)>, Vec<Plane>)> {
+                let accounts = timed("Cloudflare: accounts", || cf.accounts())?;
                 let planes = timed("Cloudflare: find control planes", || cf.find_planes(&accounts))?;
                 Ok((accounts, planes))
-            }) });
+            }));
             let a: Vec<_> = aws.iter().map(|(creds, _)| s.spawn(move || timed("AWS: find control planes", || aws::connected_planes(creds)))).collect();
             let m = modal.as_ref().map(|session| s.spawn(move || -> Result<Vec<Plane>> {
                 let found = timed("Modal: find control planes", || modal::find_planes(session))?;
@@ -2323,7 +2323,8 @@ impl Dashboard {
             let hs: Vec<_> = asked.iter().map(|p| { let creds = &creds; s.spawn(move || {
                 let health = cloudflare::health(p.url()).unwrap_or_default();
                 // (One not answering is taken as a CI: nothing of it is taken in by guess.)
-                let serves = health.is_null() || health["github"] == true || health["gitlab"] == true || health["moved_to"].is_string();
+                // (One standing by for a move is not in use yet, whatever it was given: a place, as `serves_its_own` has it.)
+                let serves = health.is_null() || (health["standby"] != true && (health["github"] == true || health["gitlab"] == true || health["moved_to"].is_string()));
                 let mut a = FoundAbout { label: health["label"].as_str().map(str::to_string), version: health["version"].as_str().map(str::to_string), serves, ..Default::default() };
                 if let Plane::Aws { account_id, region, plane_id, .. } = p {
                     if let Some((_, c)) = creds.iter().find(|(id, _)| id == account_id) { if let Ok((name, owners)) = aws_plane::about(c, region, plane_id) { (a.name, a.owners) = (name, owners) } }
