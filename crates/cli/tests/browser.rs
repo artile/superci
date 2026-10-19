@@ -11032,6 +11032,12 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     // Read with a read key alone (as a script reads it): said so.
     let o = common::command(&home).args(["status"]).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.key).output().unwrap();
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("with a read key"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    // With that key the cache is read, and not changed.
+    let with_key = |args: &[&str]| { let o = common::command(&home).args(args).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.key).output().unwrap(); (o.status.code().unwrap_or(-1), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))) };
+    let (code, said) = with_key(&["caches", "list"]);
+    assert!(code == 0, "{code} {said}");
+    let (code, said) = with_key(&["caches", "delete", "--repo=acme/app", "--confirm"]);
+    assert!(code != 0 && !said.contains("panicked"), "{code} {said}");
     // Its id changed: to what it is, to one taken, to what is no id, as a dry run, then to a new one and back; one
     // not kept here; the command with nothing to say which.
     for (args, said_part) in [(vec!["workspaces", "update", "twin", "--id=twin"], "has the id twin"), (vec!["workspaces", "update", "twin", "--id=default"], "already"),
