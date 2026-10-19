@@ -11879,7 +11879,7 @@ fn a_machine_start_out_of_time_ended_meanwhile_or_with_its_runner_name_taken_is_
     let tick = served.ticker();
     served.aws.during("RunInstances", move || tick(6_000));
     served.aws.fail("RunInstances", 500, &no_room, None);
-    let (id, q) = served.github.queue("slow", "superci", served.now_ms());
+    let (id, q) = served.github.queue("slow", "superci/spot=false", served.now_ms());
     assert!(served.webhook(q) < 300);
     ids.push(id);
     served.aws.during.lock().unwrap().clear();
@@ -11891,16 +11891,32 @@ fn a_machine_start_out_of_time_ended_meanwhile_or_with_its_runner_name_taken_is_
         let keys: Vec<String> = s.keys().filter(|k| k.starts_with("job:")).cloned().collect();
         for k in keys {
             let mut j: serde_json::Value = serde_json::from_str(&s[&k]).unwrap();
-            if j["name"] == "ends meanwhile" && j["ended_ms"].is_null() { j["state"] = "done".into(); j["ended_ms"] = j["at_ms"].clone(); s.insert(k, j.to_string()); }
+            if ["ends meanwhile", "ends as it starts"].contains(&j["name"].as_str().unwrap_or_default()) && j["ended_ms"].is_null() {
+                j["state"] = "done".into(); j["ended_ms"] = j["at_ms"].clone(); j["rev"] = (j["rev"].as_u64().unwrap_or(0) + 1).into(); s.insert(k, j.to_string());
+            }
         }
     });
-    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
-    served.aws.fail("RunInstances", 200, &started, None);
+    // (AWS failing it, Cloudflare next in the order: its record is read again before Cloudflare is asked.)
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"cloudflare"}]}"#);
+    served.aws.fail("RunInstances", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
     let (id, q) = served.github.queue("ends meanwhile", "superci", served.now_ms());
     assert!(served.webhook(q) < 300);
     ids.push(id);
+    served.aws.fail_none();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    // And one that ends as its machine starts: the machine ended at once, its runner taken back.
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.aws.fail("RunInstances", 200, &started, None);
+    let (as_it_starts, q) = served.github.queue("ends as it starts", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
     served.aws.during.lock().unwrap().clear();
+    // GitHub failing the runner's registration otherwise: tried again later.
+    served.github.fail("POST", "generate-jitconfig", 500, "Server Error");
+    let (id, q) = served.github.queue("registration failed", "superci", served.now_ms());
+    assert!(served.webhook(q) < 500);
+    ids.push(id);
+    served.github.fail_none();
     // The runner's name taken at GitHub.
     served.github.fail("POST", "generate-jitconfig", 409, "Already exists - A runner with the name acmeci-1 already exists.");
     let (id, q) = served.github.queue("name taken", "superci", served.now_ms());
@@ -11908,6 +11924,11 @@ fn a_machine_start_out_of_time_ended_meanwhile_or_with_its_runner_name_taken_is_
     ids.push(id);
     served.github.fail_none();
     served.aws.fail_none();
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(state(ids[0])["error"].as_str().unwrap_or_default().contains("out of time") || state(ids[0])["asks"].as_array().is_some_and(|a| a.len() > 1), "{}", state(ids[0]));
+    assert!(state(ids[1])["machine_id"].is_null() && state(ids[1])["cloud"] != "cloudflare", "{}", state(ids[1]));
+    assert!(state(ids[2])["error"].as_str().unwrap_or_default().contains("500") && state(ids[3])["runner_suffix"].is_string(), "{} {}", state(ids[2]), state(ids[3]));
+    assert!(state(as_it_starts)["state"] == "done" && served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("Action=TerminateInstances")), "{}", state(as_it_starts));
     // A sweep on: the slow one asked again.
     served.later(70_000);
     served.upkeep();
