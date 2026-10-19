@@ -6421,16 +6421,14 @@ fn jobs_card(v: Option<&PlaneView>, limit: usize) -> String {
     // Each job links to where its GitHub or GitLab is.
     let listed: Vec<serde_json::Value> = jobs.iter().take(limit).map(|j| match v { Some(v) => with_hosts(v, j), None => j.clone() }).collect();
     let rows = match v { Some(_) if !listed.is_empty() => job_table(&listed), _ => String::new() };
-    let more = if jobs.len() > limit { r#"<div style="text-align:right"><a class="chip" href="/?p=jobs">All jobs ›</a></div>"#.to_string() } else { String::new() };
     let label = esc(&v.map(|v| v.label()).unwrap_or_else(|| "superci".into()));
     let snippet = format!(r#"<pre class="snippet" style="text-align:left;padding:12px 16px;border-radius:10px;background:var(--card-2)">jobs:
   test:
     <span class="hl">runs-on: {label}</span></pre>"#);
+    // (A control plane whose status is not read yet, or not at all, never gets here: its page waits, or says why.)
     let body = match v {
-        Some(v) if v.status.is_none() && v.online => SK_ROWS.repeat(3),
-        Some(v) if v.status.is_none() => empty_state(&icon("jobs"), "Jobs are out of reach", "Sign in where the control plane runs to see its jobs.", ""),
         Some(_) if rows.is_empty() => empty_state(&icon("play"), "No jobs yet", "They show up here as soon as a workflow uses your label:", &snippet),
-        Some(_) => format!("{}{rows}{more}", spot_limit_notice(&jobs)),
+        Some(_) => format!("{}{rows}", spot_limit_notice(&jobs)),
         None => empty_state(&icon("play"), "No jobs yet", "Once setup is done, every job with this label shows up here, with the machine it ran on:", &snippet),
     };
     format!(r#"<section class="card"><div class="card-head"><h2>Recent jobs</h2></div>{body}</section>"#)
@@ -6445,9 +6443,8 @@ fn jobs_tabs(runs: bool) -> String {
 fn runs_card(v: Option<&PlaneView>) -> String {
     let jobs: Vec<serde_json::Value> = v.map(|v| v.jobs().iter().map(|j| with_hosts(v, j)).collect()).unwrap_or_default();
     let runs = runs_of(&jobs);
+    // (As for jobs: one whose status is not read never gets here.)
     let body = match v {
-        Some(v) if v.status.is_none() && v.online => SK_ROWS.repeat(3),
-        Some(v) if v.status.is_none() => empty_state(&icon("jobs"), "Runs are out of reach", "Sign in where the control plane runs to see its jobs.", ""),
         _ if runs.is_empty() => empty_state(&icon("play"), "No runs yet", "A workflow's jobs that ran here show up together, with how long the run took and what it cost.", ""),
         _ => format!(r#"{}<p class="note" style="margin:10px 8px 0">A run's time is from its first job queued here to its last one over. Jobs of it on other runners are not counted.</p>"#, run_table(&runs)),
     };
