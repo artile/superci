@@ -9912,6 +9912,16 @@ fn a_finished_cloudflare_jobs_cost_is_settled_at_what_cloudflare_measured() {
     let container = "a".repeat(64);
     { let now = served.now_ms(); let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
       j["machine_id"] = container.clone().into(); j["started_ms"] = (now - 360_000).into(); j["ended_ms"] = (now - 300_000).into(); m.insert(k, j.to_string()); }
+    // Beside it: one whose container Cloudflare counted less than it ran (read again later), one whose machine is no
+    // container's, one ended a moment ago (Cloudflare has not counted it yet). None settled.
+    let others: Vec<(u64, String, u64)> = [("short", "b".repeat(64), 300_000), ("not a container", "not-a-container".to_string(), 300_000), ("just ended", "c".repeat(64), 30_000)].into_iter().map(|(name, machine, ago)| {
+        let (oid, q) = served.github.queue(name, "superci", served.now_ms()); served.webhook(q);
+        served.webhook(served.github.start(oid));
+        served.webhook(served.github.finish(oid, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+        let now = served.now_ms(); let mut m = served.store.0.lock().unwrap(); let k = format!("job:{oid}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
+        j["machine_id"] = machine.clone().into(); j["machine_type"] = "4cpu-12gb".into(); j["started_ms"] = (now - ago - 600_000).into(); j["ended_ms"] = (now - ago).into(); m.insert(k, j.to_string());
+        (oid, machine, ago)
+    }).collect();
     // Signed in to Cloudflare: its account, no control plane of SuperCI's there, and its usage figures for the job.
     let home = signed_in(&served);
     let file = home.join("workspaces/default/sign-ins.json");
@@ -9921,11 +9931,13 @@ fn a_finished_cloudflare_jobs_cost_is_settled_at_what_cloudflare_measured() {
     served.aws.fail("/client/v4/accounts?", 200, r#"{"result":[{"id":"1111111111111111111111111111111a","name":"Acme"}],"success":true,"errors":[],"messages":[]}"#, None);
     served.aws.fail("/workers/scripts", 200, r#"{"result":[],"success":true,"errors":[],"messages":[]}"#, None);
     served.aws.fail("/workers/subdomain", 200, r#"{"result":{"subdomain":"acme"},"success":true,"errors":[],"messages":[]}"#, None);
-    served.aws.fail("/graphql", 200, &serde_json::json!({ "data": { "viewer": { "accounts": [{ "g": [{ "dimensions": { "instanceId": container }, "sum": { "cpuTimeSec": 45.0, "allocatedMemory": 1.0e12, "allocatedDisk": 2.0e12, "txBytes": 1.0e8 } }] }] } }, "errors": null }).to_string(), None);
+    served.aws.fail("/graphql", 200, &serde_json::json!({ "data": { "viewer": { "accounts": [{ "g": [{ "dimensions": { "instanceId": container }, "sum": { "cpuTimeSec": 45.0, "allocatedMemory": 1.0e12, "allocatedDisk": 2.0e12, "txBytes": 1.0e8 } },
+        { "dimensions": { "instanceId": "b".repeat(64) }, "sum": { "cpuTimeSec": 1.0, "allocatedMemory": 1.0e3, "allocatedDisk": 1.0e3, "txBytes": 0.0 } }] }] } }, "errors": null }).to_string(), None);
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=overview"));
     b.wait(&shows("Usage"));
     until("its cost settled at what Cloudflare measured", || served.store.under(&format!("job:{id}"))[0].1["cost_from"] == "measured");
+    for (oid, machine, _) in &others { assert!(served.store.under(&format!("job:{oid}"))[0].1["cost_from"] != "measured", "{machine}") }
     b.goto(&format!("{link}&p=job&id={id}"));
     b.wait(&format!("{} && {}", shows("Status"), shows("Passed")));
     let _ = child.kill();
