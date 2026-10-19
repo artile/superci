@@ -3732,6 +3732,35 @@ fn a_runs_runner_is_given_its_masks_and_checkout_as_its_tree_was_sent_and_its_se
     assert!(checkouts[1].contains("--ignore-zeros") && checkouts[1].contains(".superci-removed"), "each part on the one before: {}", checkouts[1]);
 }
 
+/// A run's artifact of a name kept once: begun by one of its jobs, then refused to that job again and to the other.
+#[test]
+fn a_runs_artifact_name_is_its_first_jobs_and_neither_that_job_again_nor_another_takes_it() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let link = "machine-cache-link-000000000012";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner" }).to_string());
+    let body = serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n  b:\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main" });
+    let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
+    let said: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+    let run = said["run_id"].as_str().unwrap().to_string();
+    let token = |name: &str| {
+        let runner = loop { if let Some(r) = superci_testkit::Runner::of_job(&served, &run, name) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        runner.handed(&served)["resources"]["endpoints"].as_array().into_iter().flatten().find_map(|e| e["authorization"]["parameters"]["AccessToken"].as_str().map(str::to_string)).unwrap_or_default()
+    };
+    let (a, b) = (token("a"), token("b"));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let begin = |t: &str| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/cache/{link}/artifact-begin", served.url)).send(serde_json::json!({ "token": t, "name": "report" }).to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    assert_eq!(begin(&a).1["ok"], true);
+    for t in [&a, &b] {
+        let (status, said) = begin(t);
+        assert_eq!((status, said["why"].as_str()), (409, Some("an artifact of this name exists in the run")), "{said}");
+    }
+}
+
 #[test]
 fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
