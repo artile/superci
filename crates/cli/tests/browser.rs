@@ -11319,3 +11319,45 @@ fn a_workspace_whose_control_plane_refuses_the_key_can_still_be_removed_from_set
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// What the dashboard sends a control plane that it should never take: costs that are no cost (negative, too large,
+/// not a number), for what is no job, for a job not on Cloudflare or still running; a job's log asked by an id that
+/// is none, or of a GitLab that is no name. Each left alone, the job's page as it was.
+#[test]
+fn costs_and_logs_asked_of_a_control_plane_with_what_is_no_job_are_left_alone() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let (done, q) = served.github.queue("ended", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(done));
+    served.webhook(served.github.finish(done, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    let (running, q) = served.github.queue("running", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(running));
+    // (The ended one as if it ran on AWS: not Cloudflare's to measure.)
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let post = |body: serde_json::Value| -> serde_json::Value { agent.post(&format!("{}/costs", served.url)).header("authorization", &format!("Bearer {}", served.key)).send(body.to_string()).map(|mut r| r.body_mut().read_json().unwrap_or_default()).unwrap_or_default() };
+    for bad in [serde_json::json!(-1.0), serde_json::json!(5000.0), serde_json::json!("x")] {
+        assert_eq!(post(serde_json::json!({ "measured": { format!("job:{done}"): bad } }))["kept"], 0, "{bad}");
+    }
+    let said = post(serde_json::json!({ "measured": { format!("job:{running}"): 0.5, "run:1": 0.5, "job:999": 0.5 } }));
+    assert_eq!(said["kept"], 0, "a job still running, no job, one not kept: {said}");
+    assert_eq!(post(serde_json::json!({ "measured": { format!("job:{done}"): 0.5 } }))["kept"], 1, "the ended Cloudflare job");
+    {
+        let mut store = served.store.0.lock().unwrap();
+        let k = format!("job:{done}");
+        let mut j: serde_json::Value = serde_json::from_str(&store[&k]).unwrap();
+        j["cloud"] = "aws".into();
+        store.insert(k, j.to_string());
+    }
+    assert_eq!(post(serde_json::json!({ "measured": { format!("job:{done}"): 0.5 } }))["kept"], 0, "not Cloudflare's");
+    for path in ["/job/log?id=abc", "/job/log?id=", "/job/log?id=1&gl=Not%20a%20name", "/job/log?id=1&gl=", &format!("/job/log?id={done}&steps=1")] {
+        let status = agent.get(&format!("{}{path}", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().map(|r| r.status().as_u16()).unwrap_or(0);
+        assert!(status < 500, "{path}: {status}");
+    }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=job&id={done}"));
+    b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

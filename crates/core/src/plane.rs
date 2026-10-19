@@ -1598,9 +1598,10 @@ impl<'a> ControlPlane<'a> {
     /// trace. Its end (`bytes`: how much, a megabyte at most), since the end says why a job failed.
     async fn job_log(&self, url: &url::Url) -> Result<Response> {
         let q = |n: &str| url.query_pairs().find(|(k, _)| k == n).map(|(_, v)| v.into_owned());
-        let id = q("id").filter(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())).ok_or("which job?")?;
+        // (What names no job is the asker's mistake: said as that, not as the control plane's failure.)
+        let Some(id) = q("id").filter(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())) else { return Ok(Response::text(400, "which job?")) };
         // A GitLab job is kept under its connection's name and its id (`gl`: the name; nothing for the first).
-        let key = match q("gl") { Some(g) if gitlab::valid_id(&g) || g.is_empty() => format!("job:gl{}", gitlab::local(&g, id.parse().unwrap_or_default())), Some(_) => return Err("which GitLab?".into()), None => format!("job:{id}") };
+        let key = match q("gl") { Some(g) if gitlab::valid_id(&g) || g.is_empty() => format!("job:gl{}", gitlab::local(&g, id.parse().unwrap_or_default())), Some(_) => return Ok(Response::text(400, "which GitLab?")), None => format!("job:{id}") };
         let Some(j) = get_json::<Job>(self.store, &key).await? else { return Ok(Response::json(&serde_json::json!({ "error": "This control plane has no such job (it keeps the latest ones)." }))) };
         // With `link`: where GitHub keeps a job's whole log, for it to be fetched from there whatever its size.
         // (`link=steps`: its run's logs, each step's apart, for steps run side by side.)
