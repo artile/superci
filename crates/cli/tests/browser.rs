@@ -789,6 +789,52 @@ fn a_way_back_from_elsewhere_naming_no_workspace_goes_to_the_one_awaiting_it_and
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// An AWS sign-in to another account is kept beside the one before (the same account's replaces it); an account
+/// named is taken in hand whichever was; and credentials AWS calls expired as an account is looked at are renewed,
+/// and it is looked at again (as AWS answered a real sign-in and its renewal).
+#[test]
+fn aws_sign_ins_to_more_accounts_are_kept_beside_each_other_taken_in_hand_by_name_and_renewed_when_cut_short() {
+    let kept = |home: &std::path::Path| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap() };
+    let write = |home: &std::path::Path, k: &serde_json::Value| std::fs::write(home.join("workspaces/default/sign-ins.json"), k.to_string()).unwrap();
+    let ids = |v: &serde_json::Value| v.as_array().into_iter().flatten().filter_map(|a| a["account_id"].as_str().map(str::to_string)).collect::<Vec<_>>();
+    for (before, beside) in [("222222222222", vec!["222222222222".to_string()]), ("111111111111", vec![])] {
+        let served = serve(|_| {});
+        served.aws.replaying(&[include_str!("../fixtures/aws/sign-in/sign-in.jsonl"), include_str!("../fixtures/aws/sign-in/renew.jsonl")].concat(), &[]);
+        let home = signed_in(&served);
+        let mut k = kept(&home);
+        k["aws"]["account_id"] = before.into();
+        write(&home, &k);
+        let (child, link) = dashboard(&home);
+        let (_, to, page) = common::post(&link, "/aws/signin", &[("next", "?p=overview"), ("w", "default")]);
+        let at = if to.is_empty() { page } else { to };
+        let state = at.split("state=").nth(1).and_then(|r| r.split(['&', '"']).next()).expect("a state").to_string();
+        let (status, _, done) = common::get(&link, &format!("/oauth/callback?code=a-code-from-aws&state={state}"));
+        assert!(status < 400 && common::words(&done).contains("Signed in with AWS"), "{status} {}", common::words(&done));
+        drop(child);
+        assert!(kept(&home)["aws"]["account_id"] == "111111111111" && ids(&kept(&home)["aws_more"]) == beside, "{before}: {}", kept(&home));
+        if before == "111111111111" {
+            // Its credentials called expired by AWS as the account is looked at: renewed, and looked at again.
+            served.aws.fail("DescribeVpcs", 400, &superci_testkit::ec2_error("RequestExpired", "Request has expired."), Some(superci_core::page::REGIONS.len() as u32));
+            let (code, said) = common::json(&home, &["accounts", "retrieve", "aws"]);
+            served.aws.fail_none();
+            assert!(code == 0 && said["id"] == "111111111111", "{said}");
+            assert_eq!(kept(&home)["aws"]["refresh_token"], "example-refreshToken-2", "{}", kept(&home));
+        } else {
+            // Another account named: taken in hand.
+            let (code, said) = common::json(&home, &["accounts", "retrieve", "aws", "--account=222222222222"]);
+            assert!(code == 0 && said["id"] == "222222222222", "{said}");
+            // And with it alone kept beside none in hand.
+            let mut k = kept(&home);
+            k["aws_more"] = serde_json::json!([k["aws_more"][0].clone()]);
+            k.as_object_mut().unwrap().remove("aws");
+            write(&home, &k);
+            let (code, said) = common::json(&home, &["accounts", "retrieve", "aws", "--account=222222222222"]);
+            assert!(code == 0 && said["id"] == "222222222222", "{said}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
