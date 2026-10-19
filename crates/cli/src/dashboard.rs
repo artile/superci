@@ -3974,8 +3974,14 @@ mark();load()})();</script>"#;
             // Half a minute on, one that still does not take the key will not by itself (it is from before the key's
             // name, or the key expired): why, and what to do, said; looked at again now and then.
             let waited = current.is_some_and(|v| now_ms() >= self.first_asked.get(v.plane.plane_id()).copied().unwrap_or(u64::MAX - KEY_WAIT_MS) + key_wait_ms());
-            if let Some(why) = current.filter(|_| waited).and_then(|v| self.key_refused(v)) {
-                return format!(r#"<div data-refresh="5"></div><div class="bar"><h1 class="page-title">{}</h1></div><div class="cards"><section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section></div>"#, esc(title), esc(&why))
+            let refused = current.filter(|_| waited).and_then(|v| self.key_refused(v)).map(|why| format!(r#"<section class="card"><div class="card-head"><h2>Its control plane does not take this computer's key</h2></div><p class="note bad-text">{}</p></section>"#, esc(&why)));
+            // (Settings keeps what is this computer's own meanwhile: the workspace's id, signing out, removing it.)
+            if section == "settings" {
+                let local = self.settings_page(None).replacen(r#"<div class="cards">"#, &format!(r#"<div class="cards">{}"#, refused.as_deref().unwrap_or_default()), 1);
+                return format!(r#"<div data-refresh="{}"></div>{local}"#, if refused.is_some() { 5 } else { 2 });
+            }
+            if let Some(card) = refused {
+                return format!(r#"<div data-refresh="5"></div><div class="bar"><h1 class="page-title">{}</h1></div><div class="cards">{card}</div>"#, esc(title))
             }
             return format!(r#"<div data-refresh="2"></div>{}"#, skeleton(section, title));
         }

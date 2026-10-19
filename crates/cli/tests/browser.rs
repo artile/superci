@@ -11270,3 +11270,28 @@ fn finding_control_planes_with_awss_sign_in_over_or_the_only_cloud_not_answering
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A workspace whose control plane does not take this computer's key: its Settings still has what is this
+/// computer's own (its id, removing it when there are others), under the card that says why, and it is removed.
+#[test]
+fn a_workspace_whose_control_plane_refuses_the_key_can_still_be_removed_from_settings() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    let home = home(&served);
+    let other = home.join("workspaces/other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::copy(home.join("workspaces/default/sign-ins.json"), other.join("sign-ins.json")).unwrap();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "1")]);
+    b.goto(&link);
+    b.wait("document.querySelector('main') !== null");
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&format!("{} && {}", shows("does not take this computer's key"), shows("Remove this workspace")));
+    b.click("main button", "Remove");
+    b.wait("document.getElementById('remove-workspace').open");
+    b.click("#remove-workspace button", "Remove from this computer");
+    until("the workspace forgotten here", || !home.join("workspaces/default").exists());
+    assert!(other.exists(), "the other one kept");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}

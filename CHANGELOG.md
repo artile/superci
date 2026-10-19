@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.19
+- Settings keeps what is this computer's own while the workspace's control plane does not take this computer's key: its id, signing out, and removing the workspace when there are others. The page showed only why the key was not taken, so a workspace kept twice could not be removed there.
+
 ## 0.19.18 — 2026-10-19
 - A change's note in the dashboard ("Removed Cloudflare. Left: …") is shown once its page has loaded. A page still loading took it, and it was not shown.
 - A job with nowhere to run names the operating systems as they are written: "Nowhere to run Windows: Cloudflare runs Linux only" (it said "windows" and "linux").
