@@ -5346,7 +5346,7 @@ fn gitlabs_jobs_untold_are_found_by_the_upkeep_begun_or_given_a_machine_once_the
 /// none): a job that needs a failed job, a skipped one, a cancelled one and a called workflow whose job failed is told
 /// each as it ended (the called workflow's input given as a number, read as text); a job's whole log in steps (its own
 /// record, a skipped and a pending step among them; no links); its machine reaches the cache as its job. One whose event
-/// is too large is refused.
+/// is too large is refused. (A job shown by its `name:`; the called workflow given no secrets.)
 #[test]
 fn a_run_from_a_computer_tells_a_job_how_each_job_it_needs_ended_failed_skipped_cancelled_or_called() {
     let served = serve(|_| {});
@@ -5367,7 +5367,7 @@ fn a_run_from_a_computer_tells_a_job_how_each_job_it_needs_ended_failed_skipped_
     assert!(status == 400 && said.as_str().is_some_and(|s| s.contains("a run takes 64 KB at most")), "{status} {said}");
 
     let called = "on:\n  workflow_call:\n    inputs:\n      n:\n        type: string\njobs:\n  x:\n    runs-on: superci\n    steps:\n      - run: echo ${{ inputs.n }}\n";
-    let wf = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: make test ${{ secrets.TOKEN }}\n  b:\n    if: false\n    runs-on: superci\n    steps:\n      - run: never\n  d:\n    runs-on: superci\n    steps:\n      - run: make lint\n  caller:\n    uses: ./.github/workflows/called.yml\n    with:\n      n: ${{ 5 }}\n  c:\n    needs: [a, b, d, caller]\n    if: ${{ always() && !(needs.a.result == 'failure' && needs.b.result == 'skipped' && needs.d.result == 'cancelled' && needs.caller.result == 'failure') }}\n    runs-on: superci\n    steps:\n      - run: echo told otherwise\n";
+    let wf = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: make test ${{ secrets.TOKEN }}\n  b:\n    if: false\n    runs-on: superci\n    steps:\n      - run: never\n  d:\n    name: Lint ${{ 1 }}\n    runs-on: superci\n    steps:\n      - run: make lint\n  caller:\n    uses: ./.github/workflows/called.yml\n    with:\n      n: ${{ 5 }}\n    secrets: none\n  c:\n    needs: [a, b, d, caller]\n    if: ${{ always() && !(needs.a.result == 'failure' && needs.b.result == 'skipped' && needs.d.result == 'cancelled' && needs.caller.result == 'failure') }}\n    runs-on: superci\n    steps:\n      - run: echo told otherwise\n";
     let (status, said) = create(wf, serde_json::json!({ ".github/workflows/called.yml": called }), serde_json::json!({ "secrets": [["TOKEN", "s3cret"]] }));
     assert!(status == 200 && said["missing_secrets"] == serde_json::json!([]), "{status} {said}");
     let id = said["run_id"].as_str().unwrap().to_string();
@@ -5391,7 +5391,7 @@ fn a_run_from_a_computer_tells_a_job_how_each_job_it_needs_ended_failed_skipped_
     let mut r = agent.post(&format!("{}/cache/local-machine-link-0001/tool-get", served.url)).send(r#"{"tool":"turbo","hash":"0123456789abcdef"}"#).unwrap();
     assert_eq!(r.body_mut().read_json::<serde_json::Value>().unwrap()["why"], "this control plane has no AWS account");
     a.finish("failed");
-    let d = runner("d");
+    let d = runner("Lint 1");
     d.take();
     d.finish("canceled");
     let x = runner("caller / x");
