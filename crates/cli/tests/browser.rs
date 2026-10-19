@@ -6557,6 +6557,50 @@ mod runs_suite_in_browser {
         super::seen_in_browser(&served);
     }
 
+    /// A workflow using what YAML and GitHub's workflows allow: anchors and merge keys, empty and null values,
+    /// defaults, a step's own directory and shell, a Docker image, a local action, an action with inputs, a matrix with include and exclude, typed inputs to a manual start. Started; each
+    /// input that does not hold refused, as are an unknown alias, a merge key and a step with neither `run` nor `uses`.
+    #[test]
+    fn a_workflow_with_anchors_defaults_each_kind_of_step_and_typed_inputs_is_run_or_its_inputs_refused() {
+        let served = serve(|_| {});
+        let rich = "on:\n  workflow_dispatch:\n    inputs:\n      flag: { type: boolean, required: true }\n      count: { type: number, default: '2' }\n      who: { type: string }\n      quiet: { type: boolean }\n      size: { type: choice, options: [s, m], default: s }\n\
+defaults:\n  run:\n    shell: bash\n    working-directory: app\n\
+x-envs: &envs\n  A: ~\n  B: null\n  C: ''\n  D: Null\n\
+jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - id: one\n        run: echo ${{ inputs.who }} ${{ hashFiles('**/x') }} \"${{ '}}' }}\"\n        working-directory: sub\n        shell: sh\n        env: { E: e }\n      - uses: docker://alpine:3\n        with: { args: echo hi }\n      - uses: ./local-action\n        with: { who: me }\n      - uses: .\\\\win-action\n      - uses: actions/checkout@v4\n        with: { path: here }\n      - uses: actions/cache@v4\n\
+  second:\n    runs-on: *on\n    env: *envs\n    needs: first\n    strategy:\n      matrix:\n        os: [a, b]\n        n: [1]\n        include:\n          - os: a\n            extra: 1\n          - os: c\n          - os: b\n            n: 1\n            more: x\n        exclude:\n          - os: b\n            n: 1\n    steps:\n      - run: echo ${{ matrix.os }} ${{ toJSON(matrix) }} ${{ format('{0}', matrix.n) }}\n";
+        let dir = checkout_with(&[(".github/workflows/rich.yml", rich), ("local-action/action.yml", "runs:\n  using: composite\n  steps:\n    - run: echo hi\n      shell: bash\n"),
+            (".github/workflows/bad-anchor.yml", "jobs:\n  a:\n    runs-on: *nowhere\n    steps:\n      - run: true\n"), (".github/workflows/matrix.yml", "jobs:\n  m:\n    runs-on: superci\n    strategy:\n      matrix:\n        os: [a, b]\n        n: [1, 2]\n        include:\n          - os: a\n            extra: 1\n          - os: c\n          - os: b\n            n: 1\n            more: x\n        exclude:\n          - os: b\n            n: 2\n          - os: z\n    steps:\n      - run: echo ${{ matrix.os }} ${{ matrix.extra }}\n"), (".github/workflows/neither.yml", "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - name: neither\n"), (".github/workflows/merge.yml", "x: &x\n  runs-on: superci\njobs:\n  a:\n    <<: *x\n    steps:\n      - run: true\n")]);
+        let start = |extra: &[&str]| {
+            let mut args = vec!["runs", "create", "--workflow=.github/workflows/rich.yml", "--event=workflow_dispatch", "--detach"];
+            args.extend(extra);
+            let o = superci(&served, &dir, &args).output().unwrap();
+            (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+        };
+        for (extra, said) in [(&[][..], "is required"), (&["--input=flag=maybe"], "true or false"), (&["--input=flag=true", "--input=count=many"], "is a number"),
+            (&["--input=flag=true", "--input=size=xl"], "size"), (&["--input=flag=true", "--input=nope=1"], "has no input nope")] {
+            let (ok, out) = start(extra);
+            assert!(!ok && out.contains(said), "{extra:?}: {out}");
+        }
+        let (ok, out) = start(&["--input=flag=true", "--input=count=3", "--input=who=me"]);
+        assert!(ok, "{out}");
+        let run = run_of(&served);
+        let names: Vec<String> = served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().filter_map(|j| j["name"].as_str().map(str::to_string)).collect();
+        assert!(names.iter().any(|n| n == "first"), "{names:?}");
+        assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/matrix.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let names: Vec<String> = served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().filter_map(|j| j["name"].as_str().map(str::to_string)).collect();
+        assert!(names.len() >= 4, "each combination a job: {names:?}");
+        assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
+        for file in ["bad-anchor.yml", "merge.yml", "neither.yml"] {
+            let o = superci(&served, &dir, &["runs", "create", &format!("--workflow=.github/workflows/{file}"), "--detach"]).output().unwrap();
+            assert!(!o.status.success(), "{file}: {}", String::from_utf8_lossy(&o.stdout));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        super::seen_in_browser(&served);
+    }
+
     #[test]
     fn a_step_whose_result_never_came_is_judged_by_its_own_lines_and_its_failed_test_named() {
         let served = serve(|_| {});
