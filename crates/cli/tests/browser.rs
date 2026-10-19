@@ -153,9 +153,14 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
     let home = signed_in(&served);
-    let (mut child, link) = dashboard(&home);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
     let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
     let pool = || setting("ROUTING").and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok()).map(|r| r["order"][0].clone()).unwrap_or_default();
+    // A job running on its containers.
+    served.connect_github();
+    let (id, queued) = served.github.queue("test", "superci/provider=cloudflare", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
     b.goto(&link);
     b.wait(&shows("Usage"));
     b.click("nav a", "Runners");
@@ -183,10 +188,27 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     b.wait("document.getElementById('pool-100').open");
     b.click("#pool-100 button.danger", "Remove");
     b.wait("document.getElementById('pool-remove-100').open");
+    // (A job running there finishes on its own: the containers are the control plane's.)
+    assert!(b.eval("document.getElementById('pool-remove-100').innerText").as_str().unwrap().replace('\n', " ").contains("1 job is running there finish on their own"));
     b.click("#pool-remove-100 button.danger", "");
     until("its containers off", || setting("CONTAINERS").as_deref() == Some("off"));
     b.wait(&shows("Removed Cloudflare"));
     assert!(pool().is_null(), "{}", pool());
+    // A launcher in a Cloudflare account instead, the job still running there: it is stopped with the launcher.
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}]}"#);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait(r#"document.querySelector('button[aria-label="Cloudflare account settings"]') !== null"#);
+    b.click(r#"button[aria-label="Cloudflare account settings"]"#, "");
+    b.wait("document.getElementById('pool-100').open");
+    b.click("#pool-100 button.danger", "Remove");
+    b.wait("document.getElementById('pool-remove-100').open");
+    let dialog = b.eval("document.getElementById('pool-remove-100').innerText").as_str().unwrap().replace('\n', " ");
+    assert!(dialog.contains("1 job is running there stop, and fail on GitHub") && dialog.contains("Sign in with Cloudflare to delete these") && dialog.contains("superci-runners-"), "{dialog}");
+    // (Not signed in with Cloudflare here: taken out of SuperCI only.)
+    b.click("#pool-remove-100 button[name=only]", "");
+    b.wait(&shows("Removed Cloudflare"));
+    until("the launcher forgotten", || setting("LAUNCHERS").is_none_or(|l| !l.contains("cloudflare")));
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
@@ -1449,7 +1471,7 @@ fn the_aws_accounts_own_budget_set_raised_made_to_stop_lifted_and_removed_shows_
     let home = signed_in(&served);
     // Each step as a real account answered it (`fixtures/aws/budget`).
     let step = |file: &str| served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/aws/budget/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[("abcdefghijkl", superci_testkit::PLANE)]);
-    let (mut child, link) = dashboard(&home);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
     b.goto(&link);
     b.wait(&shows("Usage"));
     b.click("nav a", "Runners");
@@ -1468,6 +1490,12 @@ fn the_aws_accounts_own_budget_set_raised_made_to_stop_lifted_and_removed_shows_
         b.goto(&format!("{link}&p=runners"));
         b.wait(&reads(card));
         if !gone.is_empty() { assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().replace('\n', " ").contains(gone), "{file}") }
+        // Once AWS's rule stopped a machine (the control plane noted it): stopped, with Lift; lifted, it says the rule again.
+        if file == "06-stop.jsonl" {
+            served.store.0.lock().unwrap().insert("aws:budget-stopped".into(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis().to_string());
+            b.goto(&format!("{link}&p=runners"));
+            b.wait(&format!("{} && !!document.querySelector('input[name=budget][value=lift]')", reads("topped by AWS's budget")));
+        }
         // The same from the CLI: the limits, and the account with its budget as AWS has it.
         for args in [&["limits", "retrieve"][..], &["accounts", "retrieve", "aws"]] {
             let o = common::command(&home).args(args).output().unwrap();
@@ -2263,7 +2291,7 @@ fn the_default_machine_and_keys_forms_take_only_what_they_may_and_the_machine_is
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     let served = serve(|_| {});
     let home = signed_in(&served);
-    let (mut child, link) = dashboard(&home);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
     b.goto(&format!("{link}&p=workflows"));
     b.wait(&shows("Default machine"));
     let machine = || served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "MACHINE").map(|(_, v)| v);
@@ -2284,6 +2312,19 @@ fn the_default_machine_and_keys_forms_take_only_what_they_may_and_the_machine_is
     assert!(got == 409 && text.contains("That is not a device key"), "{got} {text}");
     let (got, text) = post(&mut b, "/keys/remove", &[("name", "READER")]);
     assert!(got == 409 && text.contains("That is not a device key"), "{got} {text}");
+    // GitLab alone: its steps, its prompt. Then GitHub too: both hosts' steps, switched; the prompt follows the switch.
+    served.connect_gitlab();
+    b.goto(&format!("{link}&p=workflows"));
+    b.wait(&shows("In GitLab CI"));
+    b.eval("superciPrompt()");
+    b.wait("document.getElementById('agent-prompt').open && document.querySelector('#agent-prompt [data-preview]').innerText.includes('GitLab CI')");
+    served.connect_github();
+    b.goto(&format!("{link}&p=workflows"));
+    b.wait(&format!("!!document.getElementById('use-gl') && {}", shows("GitLab CI")));
+    b.eval("superciPrompt()");
+    b.wait("document.getElementById('agent-prompt').open && document.querySelector('#agent-prompt [data-preview]').innerText.includes('GitHub Actions')");
+    b.eval("document.getElementById('agent-prompt').close(); document.getElementById('use-gl').click(); superciPrompt()");
+    b.wait("document.querySelector('#agent-prompt [data-preview]').innerText.includes('GitLab CI')");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
