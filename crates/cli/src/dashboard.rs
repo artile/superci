@@ -1227,10 +1227,8 @@ impl Dashboard {
         if self.signed_in_as().is_none() { return Err(self.nowhere().into()) }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
         if let Some(live) = view::several(&views).filter(|_| one) { return Err(view::name_one(&live)) }
-        if !views.is_empty() {
-            let id = views[view::in_use(&views)].plane.plane_id().to_string();
-            if let Some(i) = self.planes.iter().position(|p| p.plane_id() == id) { self.select(i) }
-        }
+        // (Each view is of the control plane at its own place in the list.)
+        if !views.is_empty() { self.select(view::in_use(&views)) }
         self.keep();
         Ok(())
     }
@@ -1255,9 +1253,9 @@ impl Dashboard {
     }
 
     /// The kept Cloudflare sign-in is over (Cloudflare said so): forgotten, and said from here on where Cloudflare
-    /// is needed. (One given by name for this run is not SuperCI's to forget: its error is said as it is.)
+    /// is needed. (One given by name for this run is not SuperCI's to forget: its error is said as it is, and this is
+    /// never asked of it.)
     fn cf_over(&mut self) {
-        if self.cf_given { return }
         (self.cf, self.cf_ended, self.views) = (None, true, None);
         self.cf_accounts.clear();
     }
@@ -1274,7 +1272,6 @@ impl Dashboard {
 
     /// The same of Modal's.
     fn modal_over(&mut self) {
-        if self.modal_given { return }
         (self.modal, self.modal_ended, self.views) = (None, true, None);
     }
 
@@ -1371,8 +1368,9 @@ impl Dashboard {
         if self.planes.is_empty() { return if self.signed_in_as().is_none() { Err(self.nowhere().into()) } else { Ok(None) } }
         let views: Vec<PlaneView> = self.planes.iter().map(|p| view::plane_view(p, None)).collect();
         if let Some(live) = view::several(&views) { return Err(view::name_one(&live)) }
-        let p = views[view::in_use(&views)].plane.clone();
-        if let Some(i) = self.planes.iter().position(|x| x.plane_id() == p.plane_id()) { self.select(i) }
+        let i = view::in_use(&views);
+        let p = views[i].plane.clone();
+        self.select(i);
         let mut v = view::plane_view(&p, Some(&self.status_key));
         // Just handed the key: its whole status, once it takes it (a few tries).
         for _ in 0..8 { if !v.online || v.status.is_some() || !self.keyed.contains(p.plane_id()) { break } std::thread::sleep(Duration::from_millis(1500)); v.status = cloudflare::status(p.url(), &self.status_key) }
