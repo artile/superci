@@ -3045,6 +3045,57 @@ fn a_modal_control_planes_own_sandboxes_are_shown_added() {
 }
 
 #[test]
+fn github_just_made_and_not_installed_yet_is_said_on_its_way_on_each_overview_read_anew() {
+    let served = serve(|_| {});
+    served.github.set_installed(false, true);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "acme")]);
+    assert_eq!(status, 200, "{}", common::words(&form));
+    let state = form.split("state=").nth(1).unwrap().split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap().to_string();
+    let (status, _, _) = common::get(&link, &format!("/github/callback?code=a1b2c3d4e5f6&state={state}"));
+    assert_eq!(status, 303);
+    // Back from GitHub (its App made, installed nowhere yet): Set up's second step says it is on its way, and the page
+    // reads the control plane anew each time (not what it read a moment ago) until it is.
+    for _ in 0..2 {
+        let (_, html) = common::part(&link, "/?p=overview&fragment=1");
+        assert!(common::words(&html).contains("Connect GitHub or GitLab Where your jobs come from. Connecting GitHub") && html.contains("data-refresh="), "{}", common::words(&html));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_control_plane_that_stops_taking_the_key_while_its_reading_is_kept_is_read_again_beside_the_page_and_one_that_never_took_it_waits() {
+    // Ready (GitHub installed, runners), read by a workspace not signed in to its cloud.
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    let key = format!("/superci/{PLANE}/DEVICE_KEY_4102444800_TEST");
+    let (mut child, link) = common::dashboard(&home);
+    let page = || common::words(&common::part(&link, "/?p=overview&fragment=1").1);
+    assert!(page().contains("Latest No jobs yet"));
+    // A few seconds on, its key no longer taken: the page shows what was read (its jobs), and reads it again beside
+    // it each time; that reading, without what the key reads, is not kept in its place.
+    std::thread::sleep(std::time::Duration::from_millis(3_200));
+    served.aws.params.lock().unwrap().remove(&key).expect("its key");
+    for _ in 0..4 { assert!(page().contains("Latest No jobs yet")); std::thread::sleep(std::time::Duration::from_millis(400)) }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // A workspace whose key the ready control plane does not take from the start: Overview's loading shape, looked
+    // at again.
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/DEVICE_KEY_4102444800_TEST"));
+    let home = common::home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let (_, html) = common::part(&link, "/?p=overview&fragment=1");
+    assert!(html.contains("data-refresh=") && html.contains(r#"class="sk"#) && !common::words(&html).contains("Set up"), "{}", common::words(&html));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // A control plane whose own account runs jobs, with a budget in AWS for its limit; AWS answering nothing more.
