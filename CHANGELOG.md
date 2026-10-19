@@ -10,6 +10,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A machine that came up and waits while GitHub keeps its job queued (as when GitHub's Actions hand out jobs late) is ended, and the job waits ten minutes with no machine before another is started, saying GitHub has not handed it out. Such a machine was ended and another started in its place, twice, each paid while it waited, and then the job failed saying the cloud did not start a machine for it. Update your control plane for it.
 - A long job of a run from a computer shows its log while it runs. Its page could say "the control plane answered 502 Bad Gateway" once the job had logged a few MB: an AWS control plane gave each step's log whole beside the log asked for, over the 6 MB an answer from AWS may be. Update your control plane for it.
 - A job whose machine did not start three times fails on GitHub too, saying why, when GitHub still has it queued. It failed in SuperCI only, and GitHub kept it queued, with no machine coming, for up to a day. Update your control plane for it.
+- The dashboard's Set up a control plane page goes on to Overview by itself once the deploy has made the control plane (to its own pages, with others beside it). It showed the list of control planes instead, and went on nowhere.
 
 ## 0.19.18 — 2026-10-19
 - A change's note in the dashboard ("Removed Cloudflare. Left: …") is shown once its page has loaded. A page still loading took it, and it was not shown.

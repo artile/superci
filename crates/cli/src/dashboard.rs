@@ -4007,7 +4007,8 @@ mark();load()})();</script>"#;
                 empty_state(&logo(v.plane.cloud(), 40), "Your control plane is not answering", &format!("{} did not answer just now. Jobs wait until it does; this page looks again by itself.", esc(v.plane.url().trim_start_matches("https://"))), r#"<a class="button secondary sm" href="/?p=planes">Control plane</a>"#))
         }
         let (html, waiting) = match section {
-            "plane" if !views.is_empty() => (self.planes_page(views), self.deploy_running()),
+            // (A deploy that finished is shown no list: on to its pages, as `plane_page` says.)
+            "plane" if !views.is_empty() && !*lock(&self.deployed) => (self.planes_page(views), self.deploy_running()),
             "plane" => (self.plane_page(), false),
             "runners" => (self.runners_page(current), false),
             // (With what the AWS account in hand allows, when that is not everything.)

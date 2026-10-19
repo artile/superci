@@ -2840,6 +2840,136 @@ fn a_control_plane_in_aws_that_runs_jobs_there_is_updated_beside_a_job_elsewhere
 }
 
 #[test]
+fn removing_aws_deletes_its_budget_in_aws_as_aws_answered_and_a_launcher_the_control_plane_keeps_is_left_where_it_is() {
+    // A control plane whose own account runs jobs, with a budget in AWS for its limit; AWS deleting the budget as it
+    // did a real one (its role and network not answered: left).
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"account_usd":{"aws":100.0},"aws_budget":{"stop":true},"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/budget/09-remove.jsonl"), &[("abcdefghijkl", PLANE)]);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let (status, to, said) = common::post(&link, "/runners/remove", &[("cloud", "aws")]);
+    assert!(status == 303 && to == "/?p=runners", "{status} {to} {}", common::words(&said));
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["target"] == "AWSBudgetServiceGateway.DeleteBudget"), "its budget deleted");
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(page.contains("Removed AWS.") && !page.contains("its budget in AWS"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // A launcher in Modal removed while the control plane does not take the change (its settings written, not read):
+    // its part in Modal is left until it has, and said so.
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners-testplane0001.modal.run"}]"#);
+    served.aws.fail("AmazonSSM.PutParameter|/LAUNCHERS", 200, r#"{"Tier":"Standard","Version":2}"#, None);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    let (status, to, said) = common::post(&link, "/runners/remove", &[("cloud", "modal")]);
+    assert!(status == 303 && to == "/?p=runners", "{status} {to} {}", common::words(&said));
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(page.contains("Removed Modal. Left: its part in Modal: the control plane had not taken the change yet"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_control_plane_with_a_job_running_is_not_deleted_and_one_that_moved_away_is_not_held_as_in_use() {
+    // The one this workspace kept moved away (to one that no longer answers); beside it, one that serves nothing, a job
+    // of a run from a computer still running there.
+    let served = serve(|_| {});
+    served.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!("http://127.0.0.1:9").to_string());
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    let checkout = common::temp("checkout");
+    played(&other, &checkout);
+    let _ = std::fs::remove_dir_all(&checkout);
+    {
+        let mut m = other.store.0.lock().unwrap();
+        let (k, v) = m.iter().find(|(k, _)| k.starts_with("job:")).map(|(k, v)| (k.clone(), v.clone())).expect("its job");
+        let mut j: serde_json::Value = serde_json::from_str(&v).unwrap();
+        j["state"] = "running".into();
+        m.insert(k, j.to_string());
+    }
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    let (status, _, said) = common::post(&link, "/plane/delete", &[("plane", "testplane0002")]);
+    assert!(status == 409 && common::words(&said).contains("1 job is still running there"), "{status} {}", common::words(&said));
+    // The one moved away: no longer the one in use, whatever is kept here (deleting it is not refused as that).
+    let (status, _, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
+    assert!(!common::words(&said).contains("This control plane is in use"), "{status} {}", common::words(&said));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_move_whose_switch_did_not_finish_is_finished_and_while_one_is_under_way_nothing_more_starts_or_deletes_where_it_goes() {
+    // The CI in use moved to another one beside it, whose switch did not finish (it stands by, jobs reaching it through
+    // the old one). (No runners of its own to carry along.)
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let new = superci_testkit::serve_as("testplane0002", |_| {});
+    served.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!(new.url).to_string());
+    new.store.0.lock().unwrap().insert("standby".into(), "1".into());
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    // Move here, again: the switch finished (it takes GitHub over), nothing else moved.
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    assert!(new.store.under("standby").is_empty(), "it stands by no more");
+    // Once more, AWS slow to answer: a move under way. Asked again meanwhile, nothing more starts; the one it goes to
+    // is not deleted from under it.
+    let slow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let s = slow.clone();
+    served.aws.during("amazonaws.com", move || if s.load(std::sync::atomic::Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_secs(2)) });
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    let (status, to, _) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to}");
+    let (status, _, said) = common::post(&link, "/plane/delete", &[("plane", "testplane0002")]);
+    assert!(status == 409 && common::words(&said).contains("A move to it is under way"), "{status} {}", common::words(&said));
+    slow.store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_first_control_plane_set_up_goes_on_from_its_page_to_the_overview_once() {
+    // Signed in to an AWS account with no control plane yet; AWS answering as it did a real account.
+    let account = superci_testkit::Aws::serve();
+    let new = superci_testkit::serve_as("deployplane1", |_| {});
+    account.replaying(include_str!("../fixtures/aws/planes/deploy.jsonl"), &[("testplane0002", "deployplane1"), ("http://new-plane.test", &new.url)]);
+    let home = common::aws_only(&account);
+    let (mut child, link) = common::dashboard(&home);
+    let (status, to, _) = common::post(&link, "/plane/aws", &[("region", "us-east-1"), ("plane", "deployplane1")]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to}");
+    // Its page while it deploys, then, made: on to the overview (the page goes there by itself), once.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let (_, page) = common::part(&link, "/?p=plane&fragment=1");
+        if page.contains(r#"<div data-go="/"></div>"#) { break }
+        assert!(std::time::Instant::now() < end, "{}", common::words(&page));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let (_, page) = common::part(&link, "/?p=plane&fragment=1");
+    assert!(!page.contains("data-go=") && common::words(&page).contains(&new.url), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // A control plane whose own account runs jobs, with a budget in AWS for its limit; AWS answering nothing more.
