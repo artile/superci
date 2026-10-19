@@ -10901,8 +10901,19 @@ fn jobs_not_this_cis_and_runs_from_outside_a_public_repository_are_left_or_refus
     let (id, q) = served.github.queue("public, not allowed", "superci", served.now_ms()); served.webhook(q);
     let why = |id: u64| served.store.under(&format!("job:{id}"))[0].1["error"].as_str().unwrap_or_default().to_string();
     assert!(why(id).contains("allow it in the dashboard"), "{}", why(id));
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}],"public_repos":["acme/app"]}"#);
+    // Allowed by each kind of pattern: every repository, the owner's, the name in another case; not by another owner's.
     let mut ids = vec![id];
+    for (pattern, allowed) in [("*", true), ("acme/*", true), ("ACME/App", true), ("globex/*", false)] {
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"order":[{{"cloud":"cloudflare"}}],"public_repos":["{pattern}"]}}"#));
+        let next = served.github.queue("pattern", "superci", served.now_ms());
+        let run = served.github.job(next.0)["run_id"].as_u64().unwrap();
+        served.github.answer_with("GET", &format!("/actions/runs/{run}"), 200, &[], r#"{"id":1,"event":"push","repository":{"id":7},"head_repository":{"id":7}}"#);
+        served.webhook(next.1);
+        served.github.fail_none();
+        assert_eq!(!why(next.0).contains("allow it in the dashboard"), allowed, "{pattern}: {}", why(next.0));
+        ids.push(next.0);
+    }
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}],"public_repos":["acme/app"]}"#);
     for (answer, status, said) in [
         (r#"{"id":1,"event":"pull_request","repository":{"id":7},"head_repository":{"id":8}}"#, 200, "a pull request from a fork"),
         (r#"{"id":1,"event":"pull_request_target","repository":{"id":7},"head_repository":{"id":7}}"#, 200, "a pull_request_target run"),
