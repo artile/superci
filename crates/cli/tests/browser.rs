@@ -1932,6 +1932,7 @@ fn every_provider_s_runners_on_an_aws_control_plane_and_then_a_move_to_cloudflar
         (vec![missing.clone(), (&blobs[..], 404, vec![], "", None), (layer, 200, vec![], "layer", None), (&chunk[..], 400, vec![], "{}", None), (&uploads[..], 202, vec![("location", &at[..])], "", None)], "refused a layer chunk"),
         (vec![missing.clone(), (&blobs[..], 404, vec![], "", None), (layer, 200, vec![], "layer", None), (&done[..], 400, vec![], "{}", None), (&chunk[..], 202, vec![], "", None), (&uploads[..], 202, vec![("location", &at[..])], "", None)], "refused layer"),
         (vec![missing.clone(), (&blobs[..], 200, vec![], "", None), (&manifest[..], 400, vec![], "{}", None)], "refused the image manifest"),
+        (vec![("image-preparations", 200, vec![], r#"{"success":true,"errors":[],"messages":[],"result":{"status":"error","reason":"the image is not linux/amd64"}}"#, None)], "could not prepare the runner image"),
     ] {
         let said = copy(rules);
         assert!(said.contains(expect), "{expect}: {said}");
@@ -1944,6 +1945,9 @@ fn every_provider_s_runners_on_an_aws_control_plane_and_then_a_move_to_cloudflar
     served.aws.fail_with_headers(&blobs, 404, &[], "", None);
     served.aws.fail_with_headers(layer, 200, &[], "layer", None);
     served.aws.fail_with_headers(&manifest, 201, &[], "", None);
+    // (Cloudflare not seeing it at first, then preparing it a while.)
+    served.aws.fail("image-preparations", 404, r#"{"success":false,"errors":[{"code":1000,"message":"image does not exist"}],"messages":[],"result":null}"#, Some(1));
+    served.aws.fail("image-preparations", 200, r#"{"success":true,"errors":[],"messages":[],"result":{"status":"preparing"}}"#, Some(1));
     let (ok, said) = run("", &["runners", "create", "cloudflare", "--plane=awsplane0001"]);
     served.aws.fail_none();
     assert!(said.contains("Runner image ready"), "{said}");
