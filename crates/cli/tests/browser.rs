@@ -5090,7 +5090,7 @@ fn the_cache_takes_only_tokens_given_for_it_and_machines_whose_job_it_can_name()
     {
         let mut m = served.store.0.lock().unwrap();
         m.insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": "arn:aws:iam::111111111111:role/superci-testplane0001", "connected": true }).to_string());
-        for (n, runner, job) in [(1, "a-runner", ""), (2, "gl:ggone-77", ""), (3, "gl:78", ""), (4, "", "job:gl79")] {
+        for (n, runner, job) in [(1, "a-runner", ""), (2, "gl:ggone-77", ""), (3, "gl:78", ""), (4, "", "job:gl79"), (5, "", "job:999999")] {
             m.insert(format!("cachem:{}", link(n)), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": runner, "job": job }).to_string());
         }
         m.insert("glrunner:ggone-77".into(), serde_json::json!({ "id": 77, "gitlab": "ggone" }).to_string());
@@ -5110,6 +5110,8 @@ fn the_cache_takes_only_tokens_given_for_it_and_machines_whose_job_it_can_name()
     assert_eq!(tool(2), (403, serde_json::json!({ "ok": false, "why": "its job has not begun" })));
     assert!(tool(3).0 == 200 && served.store.under("cachename:").is_empty(), "{:?}", tool(3));
     assert_eq!(tool(4).1["why"], "not a GitHub job");
+    // One whose job's record is gone, and no runner to find it by.
+    assert_eq!(tool(5).1["why"], "no job on this machine");
 
     // GitHub's tokens: the keys kept a minute ago are used as kept (one GitHub's token names); a day on, asked again,
     // and, GitHub not answering, the ones kept used still.
@@ -5396,32 +5398,63 @@ fn a_run_from_a_computer_tells_a_job_how_each_job_it_needs_ended_failed_skipped_
 
 /// Runs from a computer ended by the upkeep: one cancelled whose runner never stops is ended once its time is up (AWS
 /// took its machine back meanwhile: not started again); one whose machine failed without saying when is over, a
-/// failure. (Started with a key named as no key can be, said as named; one of no repository has no name in the
+/// failure. What their runners do after that changes nothing (one's record gone, the other's run unreadable: said). Its
+/// working tree fetched from the store, what its machine said of its start shown with it, a log the bucket refused kept
+/// in the store. (Started with a key named as no key can be, said as named; one of no repository has no name in the
 /// cache's list.)
 #[test]
 fn runs_from_a_computer_cancelled_or_failed_on_their_machines_are_ended_by_the_upkeep() {
-    let served = serve(|_| {});
+    // Its own AWS account's bucket (its jobs on Cloudflare's containers).
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare"}]}"#);
+    served.github.put_object(&format!("{}/{}", superci_core::cache::bucket(PLANE, "us-east-1"), superci_core::cache::program_key("x86_64")), b"program");
     let key = format!("superci_run_{}", "02".repeat(16));
     served.aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_bot+x"), &format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes())));
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
     let one = "jobs:\n  e:\n    runs-on: superci\n    steps:\n      - run: sleep 600\n";
-    let create = |key: &str, repository: &str| -> String {
-        let body = serde_json::json!({ "workflow": one, "path": ".github/workflows/ci.yml", "repository": repository, "ref": "refs/heads/main", "sha": "0".repeat(40), "actor": "someone", "event_name": "push" });
+    let create = |key: &str, more: serde_json::Value| -> String {
+        let mut body = serde_json::json!({ "workflow": one, "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main", "sha": "0".repeat(40), "actor": "someone", "event_name": "push" });
+        for (k, v) in more.as_object().into_iter().flatten() { body[k] = v.clone() }
         let said: serde_json::Value = agent.post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {key}")).send(body.to_string()).unwrap().body_mut().read_json().unwrap();
         said["run_id"].as_str().unwrap().to_string()
     };
     let run = |id: &str| served.store.under(&format!("run:{id}")).into_iter().next().map(|(_, r)| r).unwrap_or_default();
     let of = |id: &str| run(id)["jobs"][0].clone();
-    let record = |id: &str| { let j = of(id)["job_id"].as_str().unwrap_or_default().to_string(); served.store.under(&format!("job:{j}")).into_iter().find(|(k, _)| *k == format!("job:{j}")).map(|(_, v)| v).unwrap_or_default() };
-    let take = |id: &str| { let end = std::time::Instant::now() + std::time::Duration::from_secs(15); loop { if let Some(r) = superci_testkit::Runner::of_run(&served, id) { r.take(); break } assert!(std::time::Instant::now() < end); std::thread::sleep(std::time::Duration::from_millis(20)) } };
-    let cancelled = create(&key, "acme/app");
+    let job_id = |id: &str| of(id)["job_id"].as_str().unwrap_or_default().to_string();
+    let record = |id: &str| { let j = job_id(id); served.store.under(&format!("job:{j}")).into_iter().find(|(k, _)| *k == format!("job:{j}")).map(|(_, v)| v).unwrap_or_default() };
+    let runner = |id: &str| { let end = std::time::Instant::now() + std::time::Duration::from_secs(15); loop { if let Some(r) = superci_testkit::Runner::of_run(&served, id) { break r } assert!(std::time::Instant::now() < end); std::thread::sleep(std::time::Duration::from_millis(20)) } };
+    // A working tree sent in a part the control plane keeps (no link asked), then the run.
+    let tree = "tree-for-a-cancelled-run-0001";
+    assert_eq!(agent.post(&format!("{}/runs/tree?id={tree}&part=0", served.url)).header("authorization", &format!("Bearer {key}")).send(&b"the tree"[..]).unwrap().status().as_u16(), 200);
+    // (A name to keep it by that no name can be: kept as the run's own, not as a base.)
+    let mut said = agent.post(&format!("{}/runs/tree?id={tree}&part=1&link=1&keep=b0123-456789", served.url)).header("authorization", &format!("Bearer {key}")).send_empty().unwrap();
+    let said: serde_json::Value = said.body_mut().read_json().unwrap();
+    assert!(said["url"].as_str().is_some_and(|u| u.contains(&format!("/runs/{tree}/00001?"))), "{said}");
+    let cancelled = create(&key, serde_json::json!({ "tree": tree, "parts": 1 }));
     assert_eq!(run(&cancelled)["by"], "bot+x");
-    take(&cancelled);
-    let failed = create(&served.run_key, "");
-    take(&failed);
+    let c = runner(&cancelled);
+    c.take();
+    let mut got = agent.get(&format!("{}/superci/tree?part=0", c.at.trim_end_matches("/_apis/v1"))).call().unwrap();
+    assert_eq!(got.body_mut().read_to_string().unwrap(), "the tree");
+    let failed = create(&served.run_key, serde_json::json!({ "repository": "" }));
+    let f = runner(&failed);
+    f.take();
     assert!(served.store.under("cachename:").iter().all(|(_, n)| n == "acme/app"), "{:?}", served.store.under("cachename:"));
+    // Its log, the bucket refusing it: kept in the store.
+    served.github.refuse_puts(true);
+    f.log(1, "2026-10-15T10:00:01.0000000Z going\n");
+    served.github.refuse_puts(false);
+    assert!(served.store.under(&format!("rlog:")).iter().all(|(_, v)| !v.to_string().contains("s3:")) && !served.store.under("rlog:").is_empty(), "{:?}", served.store.under("rlog:"));
+    // What its machine said of its start, with the run.
+    let hello = format!("hello:{}", job_id(&failed));
+    served.store.0.lock().unwrap().insert(hello, serde_json::json!({ "script_ms": served.now_ms(), "boot_s": 7.5 }).to_string());
+    let status: serde_json::Value = agent.get(&format!("{}/runs/{failed}", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).call().unwrap().body_mut().read_json().unwrap();
+    assert_eq!(status["jobs"][0]["start"]["machine"]["boot_s"], 7.5, "{status}");
+
     assert_eq!(agent.post(&format!("{}/runs/{cancelled}/cancel", served.url)).header("authorization", &format!("Bearer {key}")).send_empty().unwrap().status().as_u16(), 200);
-    let edit = |id: &str, f: &dyn Fn(&mut serde_json::Value)| { let j = of(id)["job_id"].as_str().unwrap().to_string(); let mut rec = record(id); f(&mut rec); served.store.0.lock().unwrap().insert(format!("job:{j}"), rec.to_string()); };
+    let edit = |id: &str, f: &dyn Fn(&mut serde_json::Value)| { let j = job_id(id); let mut rec = record(id); f(&mut rec); served.store.0.lock().unwrap().insert(format!("job:{j}"), rec.to_string()); };
     edit(&cancelled, &|r| r["interrupted"] = true.into());
     edit(&failed, &|r| { r["state"] = "failed".into(); r["error"] = "its machine stopped".into(); });
     served.later(7 * 60_000);
@@ -5429,7 +5462,18 @@ fn runs_from_a_computer_cancelled_or_failed_on_their_machines_are_ended_by_the_u
     assert!(record(&cancelled)["state"] == "cancelled" && record(&cancelled)["error"] == "its run was cancelled, and its machine was ended", "{}", record(&cancelled));
     assert!(of(&cancelled)["restarted"].is_null() && of(&cancelled)["result"] == "cancelled", "{}", of(&cancelled));
     assert_eq!(of(&failed)["result"], "failure", "{}", of(&failed));
+    // Their runners say how they ended after all: one's record gone (nothing more), the other's run no longer readable.
+    let gone = format!("job:{}", job_id(&failed));
+    served.store.0.lock().unwrap().remove(&gone);
+    assert_eq!(f.finish("failed"), 200);
+    let mut r = run(&cancelled);
+    r["workflow"] = "jobs: [".into();
+    served.store.0.lock().unwrap().insert(format!("run:{cancelled}"), r.to_string());
+    assert_eq!(c.finish("canceled"), 200);
+    assert!(!served.store.under(&format!("run-error:{cancelled}")).is_empty());
+    assert!(served.store.under(&format!("run-error:{failed}")).is_empty());
 }
+
 
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {

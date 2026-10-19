@@ -3572,7 +3572,8 @@ impl<'a> ControlPlane<'a> {
             // down on the one before.
             if let (Some(layer), Some(chain)) = (q.get("layer").filter(|n| named(n)), q.get("base")) {
                 let chain: Vec<&str> = chain.split(',').collect();
-                if chain.is_empty() || chain.len() > 16 || !chain.iter().all(|n| named(&n.to_string())) { return Ok(Response::text(400, "say which base and layers")) }
+                // (Never empty: a split gives one name at least, and an empty one is none.)
+                if chain.len() > 16 || !chain.iter().all(|n| named(&n.to_string())) { return Ok(Response::text(400, "say which base and layers")) }
                 for (i, name) in chain.iter().enumerate() {
                     let kept = format!("bases/{name}.tar.gz");
                     let there = aws::s3(self.http, "HEAD", &aws::s3_url(&bucket, &region, &kept), &region, &creds, vec![], &[], now).await.is_ok_and(|r| r.status == 200);
