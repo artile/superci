@@ -2722,6 +2722,7 @@ fn the_debug_commands_answer_as_the_clouds_answered_and_the_pages_stay() {
     let table: Vec<Vec<&str>> = vec![
         vec!["debug", "networks"], vec!["debug", "networks", "us-east-1"], vec!["debug", "budget"], vec!["debug", "budget", "set", "100", "ops@example.com", "stop"], vec!["debug", "budget", "lift"], vec!["debug", "budget", "remove"],
         vec!["debug", "launch", "us-east-1", "spot", "c8a.large"], vec!["debug", "launch", "us-east-1", "on-demand"], vec!["debug", "presign", "GET", "us-east-1", &bucket, "trees/x", "2"], vec!["debug", "presign", "GET", "us-east-1", &bucket, "x", "many"],
+        vec!["debug", "presign", "GET", "us-east-1", &bucket, "a name with spaces", "2"], vec!["debug", "presign", "PUT", "us-east-1", &bucket, "x?versionId=1", "2"],
         vec!["debug", "rest", "us-east-1", "s3", "GET", &s3], vec!["debug", "cloudflare", "GET", "/accounts"], vec!["debug", "cloudflare", "POST", "/graphql", &body],
         vec!["debug", "ec2", "us-east-1", "DescribeRegions"], vec!["debug", "iam", "GetRole", "RoleName=superci-plane-testplane0001"], vec!["debug", "json", "us-east-1", "ssm", "AmazonSSM.GetParameter", r#"{"Name":"/superci/x"}"#],
         vec!["debug", "abandon", "us-east-1", "testplane0009"],
