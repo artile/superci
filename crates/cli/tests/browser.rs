@@ -5139,6 +5139,9 @@ mod gitlab_in_browser {
         let long = (0..45_000).map(|n| format!("line {n:05} {}", "x".repeat(90))).collect::<Vec<_>>().join("\n");
         assert!(served.gitlab_webhook(served.gitlab.finish(id3, "success", &long, served.now_ms())) < 300);
         served.gitlab.trace(id3, &long);
+        // The failed one's tests, read from GitLab's log of it.
+        let o = common::command(&home).args(["jobs", "retrieve", &id2.to_string(), "--tests"]).output().unwrap();
+        assert!(o.status.code().is_some_and(|c| c <= 3) && !String::from_utf8_lossy(&o.stderr).contains("panicked"), "{}", String::from_utf8_lossy(&o.stderr));
         let o = common::command(&home).args(["jobs", "retrieve", &id3.to_string(), &format!("--out={}", home.join("long.log").display())]).output().unwrap();
         assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("gives only the last 4.0 MB of a GitLab job's log: GitLab's page of the job has it whole"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let _ = child.kill();
