@@ -5074,6 +5074,150 @@ fn a_gitlab_of_another_name_runs_its_jobs_and_runners_past_their_time_are_remove
     assert_eq!(left, vec!["glrunner:gsecond-66".to_string(), "glrunner:gsecond-68".to_string()]);
 }
 
+/// The cache asked by machines of every kind and with tokens of every kind: a GitLab machine whose connection is gone,
+/// or whose job came without its project's path, a GitLab job's machine asking as GitHub's; GitHub's keys kept a day
+/// and used when GitHub would not give them again; tokens this control plane signed for another use (AWS's, as STS was
+/// handed it), or at another address, and one signed with GitHub's key that GitHub did not give: refused. The list by a
+/// repository's id or its name (one GitHub no longer has, one it says no name of); taking out a GitLab project's or a
+/// run's entries; the upkeep keeps a kept run's artifacts and forgets one it cannot read.
+#[test]
+fn the_cache_takes_only_tokens_given_for_it_and_machines_whose_job_it_can_name() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let now = served.now_ms();
+    let link = |n: u32| format!("machine-cache-link-{n:012}");
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": "arn:aws:iam::111111111111:role/superci-testplane0001", "connected": true }).to_string());
+        for (n, runner, job) in [(1, "a-runner", ""), (2, "gl:ggone-77", ""), (3, "gl:78", ""), (4, "", "job:gl79")] {
+            m.insert(format!("cachem:{}", link(n)), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": runner, "job": job }).to_string());
+        }
+        m.insert("glrunner:ggone-77".into(), serde_json::json!({ "id": 77, "gitlab": "ggone" }).to_string());
+        m.insert("glrunner:78".into(), serde_json::json!({ "id": 78, "gitlab": "", "running": { "job": 1, "project_id": 5, "project": "", "ref": "main", "tag": false, "default_branch": "main" } }).to_string());
+        m.insert("job:gl79".into(), serde_json::json!({ "job_id": 79, "run_id": 1, "repo": "acme/app", "state": "running", "provider": "gitlab", "at_ms": now, "installation_id": 0, "cloud": "aws", "seen_in_progress": true }).to_string());
+        // GitHub's keys as kept a minute ago, with one GitHub's tokens name.
+        m.insert("github-keys".into(), serde_json::json!([{ "keys": [{ "kid": "kept-key", "kty": "RSA", "alg": "RS256", "n": "AQAB", "e": "AQAB" }] }, now - 120_000]).to_string());
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let call = |n: u32, what: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/cache/{}/{what}", served.url, link(n))).send(body.to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    let tool = |n: u32| call(n, "tool-get", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" }));
+    // GitLab machines: one whose connection is gone (its job not known), one whose job came with no path; a GitLab
+    // job's machine is not GitHub's.
+    assert_eq!(tool(2), (403, serde_json::json!({ "ok": false, "why": "its job has not begun" })));
+    assert!(tool(3).0 == 200 && served.store.under("cachename:").is_empty(), "{:?}", tool(3));
+    assert_eq!(tool(4).1["why"], "not a GitHub job");
+
+    // GitHub's tokens: the keys kept a minute ago are used as kept (one GitHub's token names); a day on, asked again,
+    // and, GitHub not answering, the ones kept used still.
+    use base64::Engine;
+    let b64 = |v: serde_json::Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+    let exp = 4_102_444_800u64;
+    let kept_kid = format!("{}.{}.c2ln", b64(serde_json::json!({ "alg": "RS256", "kid": "kept-key" })), b64(serde_json::json!({ "repository_id": "197814629", "ac": "[]", "exp": exp })));
+    let lookup = |token: &str| call(1, "lookup", serde_json::json!({ "token": token, "key": "deps", "version": "c".repeat(64) }));
+    assert_eq!((lookup(&kept_kid).0, served.github.jwks_asked()), (403, 0));
+    served.later(2 * 86_400_000);
+    served.github.fail("GET", "token.actions.githubusercontent.com", 500, "unavailable");
+    assert_eq!((lookup(&kept_kid).0, served.github.jwks_asked()), (403, 0), "GitHub would not: the kept ones");
+    served.github.fail_none();
+    // A token signed with GitHub's key that is not GitHub's (another issuer): refused. GitHub's own: taken (AWS's
+    // credentials asked for once, then kept).
+    let pem = superci_testkit::GitHub::app()["pem"].as_str().unwrap().to_string();
+    let other = superci_core::crypto::rs256_jwt(&serde_json::json!({ "iss": "https://elsewhere.example", "repository_id": "197814629", "ac": "[]", "exp": exp }), &pem).unwrap();
+    assert_eq!(lookup(&other).1["why"], "not a GitHub job's token");
+    let main = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "197814629", "ac": serde_json::json!([{ "Scope": "refs/heads/main", "Permission": 3 }]).to_string(), "exp": exp }));
+    let sts =|| -> Vec<String> { served.github.asked.lock().unwrap().iter().filter(|a| a.contains("AssumeRoleWithWebIdentity")).filter_map(|a| url::Url::parse(a.split_once(' ').unwrap().1).ok()?.query_pairs().find(|(k, _)| k == "WebIdentityToken").map(|(_, v)| v.into_owned())).collect() };
+    let before = sts().len();
+    for _ in 0..2 { let (status, said) = lookup(&main); assert!(status == 200 && said["hit"] == false, "{status} {said}") }
+    assert_eq!(sts().len(), before + 1, "asked once, then kept");
+    // What this control plane signed for AWS: not the cache's.
+    assert_eq!(lookup(sts().last().unwrap()).1["why"], "not this control plane's token");
+    // Signed while it answered at another address: not this one's.
+    *served.public.lock().unwrap() = Some("https://ci.acme.example".into());
+    served.later(3_100_000);
+    assert_eq!(lookup(&main).0, 200);
+    *served.public.lock().unwrap() = None;
+    assert_eq!(sts().len(), before + 2, "asked again once its credentials were nearly over");
+    assert_eq!(lookup(sts().last().unwrap()).1["why"], "not this control plane's token");
+
+    // The list: entries of a repository GitHub no longer has, and one it says no name of; a layer it cannot read.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for ns in ["gh123", "gh5", "glabcdef01x5", "local-acme"] {
+            m.insert(format!("cache:{ns}:refs/heads/main:v1:deps"), serde_json::json!({ "id": "deps", "region": "us-east-1", "size": 1_000, "made": now, "done": true }).to_string());
+        }
+        m.insert("layer:us-east-1:sha256-0".into(), "not a layer".into());
+    }
+    served.github.answer_with("GET", "/repositories/5", 200, &[], "{}");
+    let caches = |q: &str| -> serde_json::Value { agent.get(&format!("{}/caches{q}", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap() };
+    let all = caches("");
+    assert!(all["repos"].as_array().is_some_and(|r| r.len() == 4 && r.iter().all(|r| r["name"].is_null())) && all["images"]["layers"] == 0, "{all}");
+    assert!(caches("?repo=gh123")["entries"].as_array().is_some_and(|e| e.len() == 1));
+    assert!(caches("?repo=acme/nothing")["repo"].is_null());
+    // Taken out: a GitLab project's, a run's by their ids; a name none has: nothing.
+    let delete = |repo: &str| -> serde_json::Value { agent.post(&format!("{}/caches/delete", served.url)).header("authorization", &format!("Bearer {}", served.key)).send(serde_json::json!({ "repo": repo }).to_string()).unwrap().body_mut().read_json().unwrap() };
+    assert_eq!(delete("glabcdef01x5")["removed"], 1);
+    assert_eq!(delete("local-acme")["removed"], 1);
+    assert_eq!(delete("acme/nothing")["removed"], 0);
+    // The upkeep: a kept run's artifacts stay; one that cannot be read, of a run gone, goes.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("run:111".into(), serde_json::json!({ "id": 111, "at_ms": served.now_ms() }).to_string());
+        m.insert("artifact:111:report".into(), serde_json::json!({ "id": "report", "region": "us-east-1", "size": 3, "made": now, "done": true }).to_string());
+        m.insert("artifact:222:report".into(), "not an entry".into());
+    }
+    served.upkeep();
+    let left: Vec<String> = served.store.under("artifact:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(left, vec!["artifact:111:report".to_string()]);
+}
+
+/// Jobs kept from before their indexes and before runs were counted (more than one upkeep goes through at once): their
+/// indexes made over several upkeeps, then their runs counted once each, over several more (a job of no run, and one
+/// older than the days kept, not counted); an hour kept with a cost and no job, and a job still going from before this
+/// month began, counted in the usage as kept.
+#[test]
+fn jobs_from_before_their_indexes_and_run_counts_are_indexed_then_their_runs_counted_over_several_upkeeps() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let now = served.now_ms();
+    let today = now / 86_400_000;
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let job = |id: u64, run: u64, at: u64| serde_json::json!({ "job_id": id, "run_id": run, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "", "at_ms": at,
+            "ended_ms": at + 1_000, "installation_id": 42, "seen_in_progress": true, "counted_usd": 0.0 }).to_string();
+        // 160 jobs of 80 runs, each counted (at nothing) and its run not; one of no run; one kept from 401 days ago.
+        for i in 0..160u64 { m.insert(format!("job:{}", 50_000 + i), job(50_000 + i, 900 + i / 2, now - 3_600_000)); }
+        m.insert("job:60000".into(), job(60_000, 0, now - 3_600_000));
+        m.insert("job:60001".into(), job(60_001, 7_777, now - 401 * 86_400_000));
+        // An hour of yesterday's that cost and ran no job.
+        let mut hours = vec![serde_json::json!({}); 24];
+        hours[12] = serde_json::json!({ "jobs": 0, "usd": 1.5 });
+        m.insert(superci_core::plane::day_key(today - 1), serde_json::json!({ "hours": hours, "spend": { "aws": 1.5 } }).to_string());
+        // (The jobs, as their day's totals hold them.)
+        let at = now - 3_600_000;
+        let mut hours = vec![serde_json::json!({}); 24];
+        hours[(at % 86_400_000 / 3_600_000) as usize] = serde_json::json!({ "jobs": 161, "ran": 161 });
+        m.insert(superci_core::plane::day_key(at / 86_400_000), serde_json::json!({ "hours": hours, "spend": {} }).to_string());
+    }
+    let counted = || served.store.under("day:").iter().map(|(_, d)| d["hours"].as_array().into_iter().flatten().map(|h| h["runs"].as_u64().unwrap_or(0)).sum::<u64>()).sum::<u64>();
+    // Indexed in two upkeeps (150 jobs at a time); the runs counted from the second on, 150 jobs at a time.
+    served.upkeep();
+    assert!(served.store.under("indexed").is_empty() && !served.store.under("reindex-at").is_empty());
+    served.upkeep();
+    assert!(!served.store.under("indexed").is_empty() && served.store.under("runs-counted").is_empty() && counted() == 75, "{}", counted());
+    served.upkeep();
+    assert!(!served.store.under("runs-counted").is_empty() && counted() == 80, "{}", counted());
+    served.upkeep();
+    assert_eq!(counted(), 80, "once");
+    // What the dashboard reads: the runs, and the hour that cost with no job.
+    let status: serde_json::Value = ureq::get(&format!("{}/status", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap();
+    let month = &status["usage"]["month"];
+    assert!(month["runs"] == 80 && month["usd"].as_f64().is_some_and(|u| u >= 1.5), "{month}");
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

@@ -2598,7 +2598,8 @@ impl<'a> ControlPlane<'a> {
         let (mut month, mut day) = (HashMap::new(), HashMap::new());
         for (d, by) in spend {
             for (place, usd) in by {
-                if d >= month_day { *month.entry(place.clone()).or_insert(0.0) += usd }
+                // (Every day `hours` gives is of this month: it is asked from the month's first day on.)
+                *month.entry(place.clone()).or_insert(0.0) += usd;
                 if d == today { *day.entry(place).or_insert(0.0) += usd }
             }
         }
