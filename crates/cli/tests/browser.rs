@@ -161,10 +161,16 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     let (id, queued) = served.github.queue("test", "superci/provider=cloudflare", served.now_ms());
     assert_eq!(served.webhook(queued), 202);
     assert_eq!(served.webhook(served.github.start(id)), 202);
+    // And one waiting for room: said under the order, with why.
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let (waits, queued) = served.github.queue("waits", "superci/provider=cloudflare", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    edit(waits, &|j| { j["state"] = "waiting".into(); j["error"] = "waiting: Cloudflare runs 1 at once".into(); for k in ["machine_id", "runner", "runner_id"] { j.as_object_mut().unwrap().remove(k); } });
     b.goto(&link);
     b.wait(&shows("Usage"));
     b.click("nav a", "Runners");
-    b.wait(r#"document.querySelector('button[aria-label="Cloudflare settings"]') !== null"#);
+    b.wait(&format!("{} && {}", r#"document.querySelector('button[aria-label="Cloudflare settings"]') !== null"#, reads("Waiting 1 job · Cloudflare runs 1 at once")));
+    let _ = served.webhook(served.github.cancel(waits, served.now_ms()));
 
     // Its settings: jobs at once, money a month, where its containers start.
     b.click(r#"button[aria-label="Cloudflare settings"]"#, "");
@@ -195,8 +201,13 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     b.wait(&shows("Removed Cloudflare"));
     assert!(pool().is_null(), "{}", pool());
     // A launcher in a Cloudflare account instead, the job still running there: it is stopped with the launcher.
-    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#);
-    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}]}"#);
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners-testplane0001.modal.run"}]"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"},{"cloud":"modal"}]}"#);
+    // (Both launchers are added, as Add a provider says.)
+    b.goto(&format!("{link}&p=add-runners"));
+    b.wait(&shows("Add a provider"));
+    let added = b.eval("[...document.querySelectorAll('main .pick')].filter(r => r.innerText.includes('Added')).map(r => r.innerText.split('\\n')[0]).join(',')").as_str().unwrap_or_default().to_string();
+    assert!(added.contains("Cloudflare") && added.contains("Modal"), "{added}");
     b.goto(&format!("{link}&p=runners"));
     b.wait(r#"document.querySelector('button[aria-label="Cloudflare account settings"]') !== null"#);
     b.click(r#"button[aria-label="Cloudflare account settings"]"#, "");
@@ -1591,11 +1602,18 @@ fn what_an_aws_account_allows_is_said_in_its_section_as_real_accounts_answered()
 #[test]
 fn the_permissions_card_says_what_each_place_still_needs_and_with_which_sign_in() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
-    for (case, said) in [("older app", "1 permission to add in its App"), ("other account", "Signed in to account 222222222222; its role is in 111111111111"), ("key only", "Sign in to check its role")] {
+    for (case, said) in [("older app", "1 permission to add in its App"), ("other account", "Signed in to account 222222222222; its role is in 111111111111"), ("key only", "Sign in to check its role"),
+        ("two apps", "acme: 1 permission to add in its App")] {
         let served = serve(|_| {});
         served.connect_github();
-        // (An App made before it asked for Actions; a sign-in to another account than its role's; no sign-in.)
-        if case == "older app" { served.github.set_older_app(true) }
+        // (An App made before it asked for Actions; a sign-in to another account than its role's; no sign-in; and
+        // two such Apps, the second a person's own.)
+        if case == "older app" || case == "two apps" { served.github.set_older_app(true) }
+        if case == "two apps" {
+            let mut second = superci_testkit::github::GitHub::app();
+            second["id"] = 2002.into(); second["owner"] = "someone".into(); second["slug"] = "superci-someone".into(); second["owner_is_org"] = false.into();
+            served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_2002"), &second.to_string());
+        }
         let home = if case == "key only" { home(&served) } else { signed_in(&served) };
         if case == "other account" {
             let file = home.join("workspaces/default/sign-ins.json");
@@ -1606,6 +1624,7 @@ fn the_permissions_card_says_what_each_place_still_needs_and_with_which_sign_in(
         let (mut child, link) = dashboard(&home);
         b.goto(&format!("{link}&p=planes"));
         b.wait(&reads(said));
+        if case == "two apps" { b.wait(&reads("someone: ")) }
         if case == "older app" {
             // Its review: what to add, and why.
             b.eval("[...document.querySelectorAll('main button')].find(x => x.innerText === 'Review').click(); true");
@@ -4880,6 +4899,9 @@ mod gitlab_in_browser {
         }
         let (_, page) = part(&link, &format!("/?p=run&repo=acme/app&id={pipeline}&attempt=0&fragment=1"));
         assert!(words(&page).contains("Running") && words(&page).contains("Jobs here 2") && !page.contains("Cancel run"), "{}", words(&page));
+        // The same with no attempt given (a link from before attempts): its first.
+        let (_, same) = part(&link, &format!("/?p=run&repo=acme/app&id={pipeline}&fragment=1"));
+        assert!(words(&same).contains("Jobs here 2"), "{}", words(&same));
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
         super::seen_in_browser(&served);
