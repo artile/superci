@@ -1295,3 +1295,69 @@ fn a_ci_whose_app_is_installed_nowhere_with_two_gitlabs_and_no_runner_provider_s
     assert!(code == Some(0) && runners.starts_with("No runner provider yet: `superci runners create aws` (or cloudflare, or modal).\n"), "{runners}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Changes checked before they are made: a machine no label could ask for, a provider's networks given as none, what
+/// a control plane's AWS role lacks where AWS has none of it; GitHub's deliveries, one sent again among them.
+#[test]
+fn changes_are_checked_before_they_are_made_and_githubs_deliveries_are_said_as_github_lists_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let said = |args: &[&str]| { let o = superci(&home, args); (o.status.code(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (code, refused) = said(&["machine", "update", "--os=windows", "--image=ubuntu24"]);
+    assert!(code == Some(2) && refused.starts_with("superci: image=ubuntu24 is an Ubuntu for Linux machines, and the label says os=windows\n"), "{refused}");
+    assert_eq!(said(&["runners", "update", "cloudflare", "--networks=none", "--dry-run"]), (Some(0), "Would update cloudflare: --networks=none. Nothing was changed.\n".to_string()));
+    // (AWS has no policy of the role's: all of it is lacking.)
+    served.aws.fail("GetRolePolicy", 404, "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><Error><Type>Sender</Type><Code>NoSuchEntity</Code><Message>The role policy with name runner-machines cannot be found.</Message></Error><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ErrorResponse>", None);
+    let (code, would) = said(&["planes", "allow", "--dry-run"]);
+    assert!(code == Some(0) && would.starts_with("Would give the AWS role of the control plane testplane0001 what it lacks: Start machines, each tagged as this control plane's (since 0.1.0);"), "{would}");
+    served.github.answer_with("GET", "/app/hook/deliveries", 200, &[("content-type", "application/json")], &serde_json::json!([
+        { "id": 2, "guid": "b", "delivered_at": "2026-10-15T10:01:00Z", "redelivery": true, "status": "OK", "status_code": 200, "event": "workflow_job", "action": "queued" },
+        { "id": 1, "guid": "a", "delivered_at": "2026-10-15T10:00:00Z", "redelivery": false, "status": "Invalid HTTP Response: 503", "status_code": 503, "event": "workflow_job", "action": "queued" }]).to_string());
+    assert_eq!(said(&["deliveries", "list"]), (Some(0), "2026-10-15 10:01:00  workflow_job  queued       200 OK  (sent again)  2\n2026-10-15 10:00:00  workflow_job  queued       503 Invalid HTTP Response: 503  1\n".to_string()));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A run from a computer checked with --dry-run: a workflow of two jobs, said with a variable a shell would run; one
+/// with none, refused. A key the control plane does not take, for a run and for following one, said as it answered.
+#[test]
+fn a_dry_run_of_a_workflow_of_two_jobs_or_none_and_a_key_not_taken_are_said_as_they_stand() {
+    let served = serve(|_| {});
+    let dir = common::temp("dry-run");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: make\n  test:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
+    std::fs::write(dir.join(".github/workflows/none.yml"), "on: push\njobs: {}\n").unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let run = |key: &str, args: &[&str]| {
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", key).output().unwrap();
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let (code, out) = run(&served.run_key, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--dry-run", "--var=WHERE=a;b", "--json"]);
+    let would: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+    assert!(code == Some(0) && would["jobs"] == serde_json::json!(["build", "test"]) && would["would"].as_str().is_some_and(|w| w.contains(": its jobs build, test, on this control plane's machines")), "{would}");
+    assert!(would["steps"][0].as_str().is_some_and(|s| s.starts_with("Note: --var WHERE's value has characters a shell runs (;)")), "{would}");
+    assert_eq!(run(&served.run_key, &["runs", "create", "--workflow=.github/workflows/none.yml", "--dry-run"]), (Some(1), "superci: .github/workflows/none.yml has no jobs.\n".to_string()));
+    for args in [&["runs", "create", "--workflow=.github/workflows/ci.yml"][..], &["runs", "wait", "123"]] {
+        let (code, said) = run("superci_run_0000000000000000000000000000dead", args);
+        assert!(code == Some(1) && said.starts_with("superci: the control plane said 401: This control plane does not take this key"), "{args:?}: {said}");
+    }
+    assert!(served.store.under("run:").is_empty(), "no run started");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A debug build's own commands with what they take left out: a machine started where none is said (us-east-1), and
+/// a header given with no name and value in it, left out of what is signed.
+#[cfg(debug_assertions)]
+#[test]
+fn a_debug_launch_with_no_region_starts_in_us_east_1_and_a_header_without_a_colon_is_left_out() {
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let home = common::signed_in(&served);
+    let (code, v) = json(&home, &["debug", "launch"]);
+    let said = v["answer"].as_str().unwrap_or_default();
+    assert!(code == 0 && (said.starts_with("started ") || said.starts_with("not started: ")), "{v}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("ec2.us-east-1.")) && a["asked"].as_str().is_some_and(|s| s.contains("RunInstances") || s.contains("CreateFleet"))), "asked in us-east-1");
+    let (code, v) = json(&home, &["debug", "rest", "us-east-1", "s3", "GET", "https://bucket-for-tests.s3.us-east-1.amazonaws.com/a.txt", "--header=no-colon-here"]);
+    assert!(code == 0 && v["answer"].as_str().and_then(|a| a.split(' ').next()).is_some_and(|s| s.parse::<u16>().is_ok()), "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}
