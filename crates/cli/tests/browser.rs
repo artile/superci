@@ -3892,6 +3892,29 @@ fn aws_runners_come_along_to_another_control_plane_in_their_own_account_which_st
 }
 
 #[test]
+fn a_control_plane_behind_in_a_cloud_not_signed_in_to_says_its_update_needs_that_sign_in() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // Its control plane in Cloudflare, from before 0.19.13, seen from AWS; this workspace signed in to AWS only.
+    let served = serve(|_| {});
+    served.connect_github();
+    let cf = superci_testkit::serve_as("cfplane00004", |_| {});
+    *cf.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.replaying(include_str!("../fixtures/runners/10-cf-remove-aws.jsonl"), &[]);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Seen": { "url": "https://superci.acme.workers.dev", "plane_id": "cfplane00004" } });
+    kept["key"]["planes"] = serde_json::json!(["cfplane00004"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && {}", page_shows("Update available"), page_shows("Sign in where it runs to update it")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
