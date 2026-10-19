@@ -10967,6 +10967,12 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let out = home.join("running.log");
     let (code, said) = cli(&["jobs", "retrieve", &rid.to_string(), &format!("--out={}", out.display())]);
     assert!(code == 0 && said.contains("Its log so far (the job is still running)"), "{code} {said}");
+    // A line written a moment ago: its log said with how many seconds ago its last line was.
+    let now = String::from_utf8(std::process::Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%S.0000000Z"]).output().unwrap().stdout).unwrap().trim().to_string();
+    let first = "2026-10-15T10:00:01.0000000Z building\n".len();
+    assert_eq!(agent.post(&format!("{}/hello?runner={runner}&t=machine-link-running-0001&live=timeline_aaaaaaaa-0000-0000-0000-000000000001_1.log&at={first}", served.url)).send(format!("{now} testing\n")).unwrap().status().as_u16(), 200);
+    let (code, said) = cli(&["jobs", "retrieve", &rid.to_string()]);
+    assert!(code == 0 && said.contains(" s ago; the job is still running"), "{code} {said}");
     let table: Vec<Vec<&str>> = vec![
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
         vec!["jobs", "list", &by_run], vec!["jobs", "list", "--run=abc"], vec!["jobs", "retrieve"], vec!["jobs", "retrieve", "abc"], vec!["jobs", "retrieve", &id_s, "--bytes=200"], vec!["jobs", "retrieve", &id_s, "--tests"],
@@ -11024,7 +11030,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["caches", "list", "--repo=acme/nothing"], vec!["secrets", "create", "DRY", "--value-env=HOME", "--dry-run"], vec!["keys", "create", "agent", "--max-cpu=8"], vec!["keys", "create", "agent", "--daily-usd=5"],
         vec!["accounts", "retrieve", "gcp"], vec!["images", "create", "eu-west-1", "--from=nothing"], vec!["images", "create", "eu-west-1", "--from=us-east-1:ami-0123456789abcdef0", "--dry-run"],
         vec!["runners", "update", "cloudflare"], vec!["runners", "update", "aws", "--networks=subnet-0123456789abcdef0", "--dry-run"], vec!["public_repos", "list"], vec!["runs", "cancel", "999"],
-        vec!["login", "aws"], vec!["login"], vec!["login", "nowhere"], vec!["connections", "create", "github", "acme", "--dry-run"],
+        vec!["login", "aws"], vec!["login"], vec!["login", "nowhere"], vec!["connections", "create", "github", "acme", "--dry-run"], vec!["jobs", "list", "-"],
         // Help, a resource alone, what is no command.
         vec!["help"], vec!["help", "runs"], vec!["runs"], vec!["runs", "--help"], vec!["nothing"], vec!["runs", "nothing"], vec!["--version"],
     ];
@@ -11089,6 +11095,11 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         let mut r = ureq::get(&format!("{}/status?{q}", served.url)).header("authorization", &format!("Bearer {}", served.key)).config().http_status_as_error(false).build().call().unwrap();
         assert!(r.status().as_u16() == 200 && r.body_mut().read_to_string().unwrap_or_default().contains("\"installations\""), "{q}");
     }
+    // Several workspaces, none named: `leave` asks for one on itself; a read key given reads its control plane anyway.
+    let (code, said) = cli(&["leave"]);
+    assert!(code != 0 && said.contains("(on this command itself)"), "{code} {said}");
+    let o = common::command(&home).args(["status"]).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.key).output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     // Its status, named: which workspace it is said, there being several.
     let (code, said) = cli(&["status", "--workspace=twin", "--json"]);
     assert!(code == 0 && said.contains("\"workspace\"") && said.contains("\"workspaces\""), "{code} {said}");
