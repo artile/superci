@@ -3544,6 +3544,112 @@ fn another_aws_control_plane_is_deleted_with_its_budget_in_aws_as_budgets_answer
 }
 
 #[test]
+fn a_move_says_what_needs_a_sign_in_and_what_stays_and_the_new_one_drops_apps_and_gitlabs_the_old_one_no_longer_has() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The one in use: GitHub, AWS runners in another account than its own, and a launcher in Modal (not signed in to).
+    let served = serve(|_| {});
+    served.connect_github();
+    served.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": "222222222222", "region": "us-east-1", "role_arn": "arn:aws:iam::222222222222:role/superci-plane-testplane0001", "connected": true, "error": null }).to_string());
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners-testplane0001.modal.run"}]"#);
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    // Another in its account, with an App and a GitLab of an earlier move that the one in use no longer has.
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let mut gone = superci_testkit::github::GitHub::app();
+    gone["id"] = 3003.into(); gone["owner"] = "initech".into(); gone["slug"] = "superci-initech".into();
+    served.aws.put("/superci/testplane0002/GITHUB_APP_3003", &gone.to_string());
+    served.aws.put("/superci/testplane0002/GITLAB_gstale", r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gstale"}"#);
+    // (Standing by for a move, as an earlier one that did not finish left it: a place to move to, not a CI of its own;
+    // this workspace's, as it was kept then.)
+    new.store.0.lock().unwrap().insert("standby".into(), "1".into());
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    // Its dialog: Modal's sign-in first (Move waits for it), and AWS's runners staying with their account.
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows(&new.url));
+    b.click("main button", "Move here");
+    b.wait("document.querySelector('dialog[open]') !== null");
+    let dialog = b.eval("document.querySelector('dialog[open]').innerText").as_str().unwrap_or_default().replace('\n', " ");
+    assert!(dialog.contains("Sign in with Modal") && dialog.contains("AWS runners: AWS runners stay with their account"), "{dialog}");
+    assert!(b.eval("document.querySelector('dialog[open] button.primary').disabled") == true);
+    // Its Modal launcher removed: moved, AWS's runners said to have stayed.
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/LAUNCHERS"));
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows(&new.url));
+    b.click("main button", "Move here");
+    b.wait("document.querySelector('dialog[open]') !== null && !document.querySelector('dialog[open] button.primary').disabled");
+    b.click("dialog[open] button.primary", "");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "moved: {}", b.eval("document.querySelector('main').innerText.slice(0, 600)")); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    let has = |k: &str| served.aws.settings("testplane0002").into_iter().any(|(n, _)| n == k);
+    assert!(has("GITHUB_APP") && !has("GITHUB_APP_3003") && !has("GITLAB_gstale"), "{:?}", served.aws.settings("testplane0002").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("AWS runners stayed behind"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn control_planes_whose_status_this_computer_cannot_read_are_listed_by_the_code_host_their_health_names() {
+    let served = serve(|_| {});
+    served.connect_github();
+    // Two more CIs this workspace kept, neither taking this computer's key: one GitHub's, one GitLab's.
+    let github = superci_testkit::serve_as("testplane0002", |_| {});
+    github.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::github::GitHub::app().to_string());
+    let gitlab = superci_testkit::serve_as("testplane0003", |_| {});
+    gitlab.aws.put("/superci/testplane0003/GITLAB", &superci_testkit::gitlab::GitLab::connection().to_string());
+    // (Not signed in to AWS: what this workspace kept is what it has.)
+    let home = home(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([
+        { "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": github.url, "plane_id": "testplane0002", "label": "superci" } },
+        { "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": gitlab.url, "plane_id": "testplane0003", "label": "superci" } }]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0"), ("SUPERCI_KEY_WAIT_S", "1")]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let page = common::words(&common::part(&link, "/?p=all&fragment=1").1);
+        if page.contains("GitHub · AWS · 111111111111") && page.contains("GitLab · AWS · 111111111111") { break }
+        assert!(std::time::Instant::now() < end, "{page}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn the_changelog_says_what_updating_asks_for_and_nothing_of_a_control_plane_that_does_not_answer() {
+    let served = serve(|_| {});
+    served.connect_github();
+    // From before 0.17: updating asks AWS and GitHub for more.
+    served.aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &served.key);
+    *served.aws.old_version.lock().unwrap() = Some("0.16.0".into());
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0"), ("SUPERCI_LAST_GOOD_S", "0")]);
+    let changes = || common::words(&common::part(&link, "/?p=changes&fragment=1").1);
+    let page = changes();
+    assert!(page.contains("Control plane 0.16.0") && page.contains("Updating also asks for") && page.contains("AWS:"), "{page}");
+    // Not answering: nothing said of what it has.
+    served.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let page = changes();
+        if !page.contains("Control plane 0.16.0") && !page.contains("Updating also asks for") && page.contains("Changelog") { break }
+        assert!(std::time::Instant::now() < end, "{page}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
