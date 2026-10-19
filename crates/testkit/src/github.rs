@@ -436,7 +436,9 @@ impl GitHub {
                 h.runners.insert(id, name.clone());
                 let labels: Vec<Value> = body["labels"].as_array()?.iter().enumerate().map(|(i, l)| json!({ "id": i + 1, "name": l, "type": "custom" })).collect();
                 ok(201, json!({ "runner": { "id": id, "name": name, "os": "unknown", "status": "offline", "busy": false, "labels": labels },
-                    "encoded_jit_config": superci_core::crypto::b64(format!("{{\"runner\":{id}}}").as_bytes()) }))
+                    // (As GitHub's: its files by name, `.runner` saying where the runner reaches GitHub: its broker and service,
+                    // and an address no host could be, which the machine leaves out.)
+                    "encoded_jit_config": superci_core::crypto::b64(json!({ "runner": id, ".runner": superci_core::crypto::b64(json!({ "AgentId": id, "ServerUrlV2": "https://broker.actions.githubusercontent.com/", "ServerUrl": "https://pipelinesghubeus1.actions.githubusercontent.com/abc/", "serverUrl": "https://pipelinesghubeus1.actions.githubusercontent.com/abc/", "serverUrlV2": "https://bad_host.example/" }).to_string().as_bytes()) }).to_string().as_bytes()) }))
             }
             ("GET", ["orgs", OWNER, "actions", "runners", id] | ["repos", OWNER, "app", "actions", "runners", id]) => {
                 let id: u64 = id.parse().ok()?;

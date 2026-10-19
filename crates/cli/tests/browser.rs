@@ -465,6 +465,17 @@ fn what_runners_and_workflows_refuse_is_said_in_the_browser_and_changes_nothing(
         let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", text)]);
         assert!(status == 400 && common::words(&said).contains(why), "{text}: {status} {}", common::words(&said));
     }
+    // Subnets AWS has in two VPCs: said (one network is one VPC).
+    let ec2 = |inside: &str| format!(r#"<DescribeSubnetsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>1</requestId><subnetSet>{inside}</subnetSet></DescribeSubnetsResponse>"#);
+    served.aws.fail("DescribeSubnets", 200, &ec2("<item><subnetId>subnet-00000000000000001</subnetId><availabilityZone>us-east-1a</availabilityZone><vpcId>vpc-00000000000000001</vpcId></item><item><subnetId>subnet-00000000000000003</subnetId><availabilityZone>us-east-1b</availabilityZone><vpcId>vpc-00000000000000002</vpcId></item>"), None);
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-00000000000000001 subnet-00000000000000003 sg-00000000000000001")]);
+    served.aws.fail_none();
+    assert!(status == 400 && common::words(&said).contains("more than one VPC"), "{status} {}", common::words(&said));
+    // A subnet with no security group, a group with no subnet.
+    for text in ["us-east-1 subnet-00000000000000001", "us-east-1 sg-00000000000000001"] {
+        let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", text)]);
+        assert!(status == 400, "{text}: {status} {}", common::words(&said));
+    }
     assert!(setting("AWS_NETWORKS").unwrap().contains("subnet-00000000000000002"));
     // The same again: nothing asked of AWS. Then none: back to SuperCI's network; none again changes nothing.
     let asked = served.aws.asked.lock().unwrap().len();
@@ -10841,6 +10852,9 @@ fn machines_of_a_control_plane_at_an_address_their_script_cannot_carry_start_wit
         assert!(served.webhook(q) < 300);
         assert!(scripts().len() > before, "a machine asked for {days} days on");
     }
+    // (Each script reaches GitHub's addresses its runner's configuration names first, leaving out one no host could be.)
+    let last = scripts().last().cloned().unwrap_or_default();
+    assert!(last.contains("broker.actions.githubusercontent.com") && !last.contains("bad_host"), "{}", last.lines().filter(|l| l.contains("github")).collect::<Vec<_>>().join("\n"));
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=overview"));
