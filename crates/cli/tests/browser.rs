@@ -10506,6 +10506,29 @@ fn each_regions_cache_bucket_is_made_filled_once_and_removed_as_s3_answers_and_a
     assert!(said.contains("deleted in eu-north-1") && !has(&program), "{said}");
     let said = remove();
     assert!(said.contains("deleted in eu-north-1"), "{said}");
+    // Its network removed as EC2 answers one in use: a machine still running (ended, then waited for), its own
+    // network and the shared one (which keeps another's machine), each part found, one gone already.
+    let ec2 = |inside: &str| format!(r#"<Response xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>1</requestId>{inside}</Response>"#);
+    let not_found = r#"<Response><Errors><Error><Code>InvalidGroup.NotFound</Code><Message>The security group does not exist</Message></Error></Errors><RequestID>1</RequestID></Response>"#;
+    let machine = ec2("<reservationSet><item><instancesSet><item><instanceId>i-00000000000000001</instanceId></item></instancesSet></item></reservationSet>");
+    served.aws.fail_none();
+    for (action, status, answer, times) in [
+        ("DescribeInstances|vpc-id", 200, machine.clone(), None), ("DescribeInstances", 200, machine.clone(), Some(1)), ("DescribeInstances", 200, ec2(""), None),
+        ("DescribeVpcs|superci-network", 200, ec2("<vpcSet><item><vpcId>vpc-00000000000000002</vpcId></item></vpcSet>"), None),
+        ("DescribeVpcs", 200, ec2("<vpcSet><item><vpcId>vpc-00000000000000001</vpcId></item><item><vpcId>vpc-00000000000000001</vpcId></item></vpcSet>"), None),
+        ("DescribeSecurityGroups", 200, ec2("<securityGroupInfo><item><groupId>sg-00000000000000001</groupId></item></securityGroupInfo>"), None), ("DeleteSecurityGroup", 400, not_found.to_string(), None),
+        ("DescribeSubnets", 200, ec2("<subnetSet><item><subnetId>subnet-00000000000000001</subnetId></item></subnetSet>"), None),
+        ("DescribeVpcEndpoints", 200, ec2("<vpcEndpointSet><item><vpcEndpointId>vpce-00000000000000001</vpcEndpointId></item></vpcEndpointSet>"), None),
+        ("DescribeRouteTables", 200, ec2("<routeTableSet><item><routeTableId>rtb-00000000000000001</routeTableId></item></routeTableSet>"), None),
+        ("DescribeInternetGateways", 200, ec2("<internetGatewaySet><item><internetGatewayId>igw-00000000000000001</internetGatewayId></item></internetGatewaySet>"), None),
+        ("ec2.eu-north-1", 200, ec2("<return>true</return>"), None),
+    ] { served.aws.fail(action, status, &answer, times) }
+    let o = common::command(&home).args(["debug", "networks", "eu-north-1"]).output().unwrap();
+    served.aws.fail_none();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("deleted in eu-north-1"), "{said}");
+    let asked = |action: &str| served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains(&format!("Action={action}"))).count();
+    assert!(asked("TerminateInstances") >= 1 && asked("DeleteVpcEndpoints") >= 1 && asked("DeleteVpc") >= 1, "each part removed");
     // AWS's runners connected: their role and its OpenID provider there already, the spot role too (or refused as
     // AWS refuses one it has), then IAM refusing the role.
     let iam_error = |code: &str| format!(r#"<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><Error><Type>Sender</Type><Code>{code}</Code><Message>{code}</Message></Error><RequestId>1</RequestId></ErrorResponse>"#);
@@ -10544,6 +10567,9 @@ fn machines_of_a_control_plane_at_an_address_their_script_cannot_carry_start_wit
         .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
     served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
     served.aws.fail("RunInstances", 200, &started, None);
+    // (The cache's programs in the region's bucket: each machine is given the cache, with the address it can carry.)
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    for arch in ["x86_64", "aarch64", "x86_64-windows"] { served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key(arch)), b"program") }
     let scripts = || -> Vec<String> {
         use base64::Engine;
         served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str().filter(|s| s.contains("Action=RunInstances")).map(str::to_string))
