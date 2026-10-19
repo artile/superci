@@ -5671,6 +5671,967 @@ fn connecting_github_takes_a_name_and_a_host_as_github_would_and_refuses_what_is
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Moving here and away, as the dashboard asks it with a device's key: what is here already stays (a GitLab runner, a
+/// job; a record that is neither is not taken), the switch says an organization whose App would not move (none moving:
+/// it fails); a move token too short to be one is none; going away needs an address that can be one, and an event that
+/// arrives after is passed on with its headers. The public repositories are read again after five minutes, not kept
+/// while an organization's could not be read; stopping removes only its own GitLab's runners.
+#[test]
+fn moving_here_keeps_what_is_here_the_switch_says_an_app_not_moved_and_leaving_removes_only_its_own_runners() {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let ask = |served: &superci_testkit::Served, path: &str, key: &str, body: &str, token: Option<&str>| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}{path}", served.url)).header("authorization", &format!("Bearer {key}"));
+        if let Some(t) = token { r = r.header("x-move-token", t) }
+        let mut got = r.send(body).unwrap();
+        let text = got.body_mut().read_to_string().unwrap_or_default();
+        (got.status().as_u16(), serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+    };
+    let read = |served: &superci_testkit::Served, path: &str, key: &str| -> (u16, String) {
+        let mut got = agent.get(&format!("{}{path}", served.url)).header("authorization", &format!("Bearer {key}")).call().unwrap();
+        (got.status().as_u16(), got.body_mut().read_to_string().unwrap_or_default())
+    };
+    // A move token shorter than any made: none.
+    let short = serve(|c| c.move_token = Some("short-token".into()));
+    assert_eq!(ask(&short, "/move/export", &short.key, "", Some("short-token")).0, 403);
+
+    let token = "move-token-for-tests-00000002";
+    let served = serve(move |c| c.move_token = Some(token.into()));
+    served.connect_gitlab();
+    // The public repositories, with no App: none to read.
+    assert_eq!(read(&served, "/github/public-repos", &served.key).0, 500);
+    served.connect_github();
+    served.github.set_public(true);
+    let now = served.now_ms();
+    let kept_job = serde_json::json!({ "job_id": 41, "run_id": 1, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "cloudflare", "at_ms": now - 60_000, "ended_ms": now - 1_000, "installation_id": 1 });
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("glrunner:acme/app".into(), serde_json::json!({ "id": 5, "token": "kept-here", "gitlab": "" }).to_string());
+        m.insert("job:41".into(), kept_job.to_string());
+    }
+    // Moving in without the token: refused. With it: the runner and job kept here stay, another record is not taken.
+    assert_eq!(ask(&served, "/move/import", &served.key, "{}", None).0, 403);
+    let theirs = |s: &str| serde_json::json!({ "job_id": 41, "run_id": 1, "repo": "acme/app", "state": s, "cloud": "cloudflare", "at_ms": now - 90_000, "installation_id": 1 }).to_string();
+    let state = serde_json::json!({ "state": [
+        ["glrunner:acme/app", serde_json::json!({ "id": 9, "token": "theirs", "gitlab": "" }).to_string()],
+        ["glrunner:acme/lib", serde_json::json!({ "id": 10, "token": "theirs", "gitlab": "" }).to_string()],
+        ["job:41", theirs("failed")],
+        ["moved_to", "\"https://elsewhere.example\""],
+    ] });
+    let (status, said) = ask(&served, "/move/import", &served.key, &state.to_string(), Some(token));
+    assert!(status == 200 && said["taken"] == 1, "{status} {said}");
+    let record = |k: &str| served.store.under(k).into_iter().find(|(key, _)| key == k).map(|(_, v)| v);
+    assert!(record("glrunner:acme/app").is_some_and(|r| r["token"] == "kept-here") && record("glrunner:acme/lib").is_some_and(|r| r["token"] == "theirs"), "{:?}", served.store.under("glrunner:"));
+    assert!(record("job:41").is_some_and(|j| j["state"] == "done") && record("moved_to").is_none());
+
+    // The switch, with globex's App at a GitHub that does not answer: said, acme's moved.
+    let mut second = superci_testkit::github::GitHub::app();
+    second["id"] = 2002.into(); second["owner"] = "globex".into(); second["slug"] = "superci-globex".into(); second["host"] = "github.globex.example".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_2002"), &second.to_string());
+    let (status, said) = ask(&served, "/move/claim", &served.key, r#"{"from":"http://127.0.0.1:9"}"#, None);
+    let failed = said["github_failed"].as_array().cloned().unwrap_or_default();
+    assert!(status == 200 && said["github_apps"] == 2 && failed.len() == 1 && failed[0].as_str().unwrap().starts_with("globex: "), "{status} {said}");
+    assert!(served.store.under("standby").is_empty() && !served.store.under("claimed_at").is_empty());
+    // Neither moving: a failure, said.
+    served.github.fail("PATCH", "/app/hook/config", 500, "Server Error");
+    let (status, said) = ask(&served, "/move/claim", &served.key, "{}", None);
+    assert!(status == 500 && said.as_str().is_some_and(|s| s.contains("acme: ") && s.contains("globex: ")), "{status} {said}");
+    served.github.fail_none();
+
+    // The public repositories: globex's could not be read, so read again next time; then kept five minutes.
+    let (status, repos) = read(&served, "/github/public-repos", &served.key);
+    assert!(status == 200 && repos.contains("acme/app") && repos.contains("globex: "), "{status} {repos}");
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_2002"), "");
+    let asked = || served.github.asked.lock().unwrap().iter().filter(|a| a.contains("/installation/repositories")).count();
+    let before = asked();
+    for _ in 0..2 { assert!(read(&served, "/github/public-repos", &served.key).1.contains("acme/app")) }
+    assert_eq!(asked(), before + 1, "read once, then kept");
+    served.later(301_000);
+    assert!(read(&served, "/github/public-repos", &served.key).1.contains("acme/app"));
+    assert_eq!(asked(), before + 2, "read again after five minutes");
+
+    // Stopping: GitLab's runners made here (one of another connection's stays; one with no id is just forgotten).
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("glrunner:acme/other".into(), serde_json::json!({ "id": 11, "token": "x", "gitlab": "gsecond" }).to_string());
+        m.insert("glrunner:acme/noid".into(), serde_json::json!({ "token": "x", "gitlab": "" }).to_string());
+    }
+    let (status, said) = ask(&served, "/leave", &served.key, "{}", None);
+    assert!(status == 200 && said["gitlab_runners"] == 2, "{status} {said}");
+    let left: Vec<String> = served.store.under("glrunner:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(left, vec!["glrunner:acme/other".to_string()]);
+
+    // Going away: to an address that can be none, refused; to another control plane, moved, and what GitHub sends
+    // after is passed on as it came (its own headers with it).
+    let to = serve(|_| {});
+    to.connect_github();
+    for nowhere in ["ftp://elsewhere.example", ""] {
+        let (status, _) = ask(&served, "/move/away", &served.key, &serde_json::json!({ "to": nowhere }).to_string(), None);
+        assert_eq!(status, 400, "{nowhere}");
+    }
+    assert!(served.store.under("moved_to").is_empty());
+    let (status, said) = ask(&served, "/move/away", &served.key, &serde_json::json!({ "to": to.url }).to_string(), None);
+    assert!(status == 200 && said["moved_to"] == to.url.as_str(), "{status} {said}");
+    let (id, (body, signature)) = served.github.queue("moved on", "superci", served.now_ms());
+    let mut got = agent.post(&format!("{}/webhook", served.url)).header("x-hub-signature-256", &signature).header("x-github-event", "workflow_job")
+        .header("content-type", "application/json").header("user-agent", "GitHub-Hookshot/7f3b2a1").send(&body[..]).unwrap();
+    assert!(got.status().as_u16() < 300, "{}", got.body_mut().read_to_string().unwrap_or_default());
+    assert!(!to.store.under(&format!("job:{id}")).is_empty() && served.store.under(&format!("job:{id}")).is_empty(), "taken there, not here");
+    // A run key asks what only a device's key may: said as that.
+    let (status, said) = read(&served, "/keys", &served.run_key);
+    assert!(status == 403 && said.contains("needs a device's key"), "{status} {said}");
+}
+
+/// What a machine says with its job's link: a spot machine taken back is noted once, for a job still going (a run from
+/// a computer's is started again at once, a GitLab job's says nothing more); a job's log as GitHub has it, then the lines
+/// its machine sent after it (untimed lines going with the timed line before them), and none when GitHub's is empty.
+#[test]
+fn a_machine_taken_back_is_noted_once_and_a_jobs_log_is_githubs_then_what_its_machine_sent_after_it() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let say = |path: &str, body: &str| -> (u16, String) { let mut r = agent.post(&format!("{}{path}", served.url)).send(body).unwrap(); (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()) };
+    let log = |q: &str| -> serde_json::Value { agent.get(&format!("{}/job/log?{q}", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap() };
+    let now = served.now_ms();
+    let notice = "notice-token-for-tests-0001";
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let job = |id: u64, state: &str, provider: &str, runner: &str| serde_json::json!({ "job_id": id, "run_id": 7, "repo": "acme/app", "state": state, "provider": provider, "cloud": "aws", "at_ms": now - 60_000,
+            "installation_id": 42, "runner": runner, "machine_id": format!("i-0{id}"), "notice": notice, "hello": notice, "region": "us-east-1", "machine_type": "m7i.large", "zone": "us-east-1a", "seen_in_progress": true });
+        m.insert("job:71".into(), job(71, "running", "local", "r-local").to_string());
+        m.insert("runner:r-local".into(), "71".into());
+        m.insert("job:72".into(), job(72, "done", "", "r-done").to_string());
+        m.insert("runner:r-done".into(), "72".into());
+        m.insert("job:gl73".into(), job(73, "running", "gitlab", "").to_string());
+        m.insert("job:74".into(), job(74, "running", "", "r-live").to_string());
+        m.insert("runner:r-live".into(), "74".into());
+    }
+    let record = |k: &str| served.store.under(k).into_iter().find(|(key, _)| key == k).map(|(_, v)| v).unwrap_or_default();
+    // A run from a computer's machine taken back: started again at once, it says; said again, noted once.
+    for _ in 0..2 {
+        let (status, said) = say(&format!("/interrupted?runner=r-local&t={notice}"), "");
+        assert!(status == 200 && said.contains("starts the job again by itself at once"), "{status} {said}");
+    }
+    assert!(record("job:71")["interrupted"] == true && served.store.under("spot:interrupted:").len() == 1, "{:?}", served.store.under("spot:"));
+    // A job over already: nothing noted.
+    let (status, _) = say(&format!("/interrupted?runner=r-done&t={notice}"), "");
+    assert!(status == 200 && record("job:72")["interrupted"].is_null() && served.store.under("spot:interrupted:").len() == 1);
+    // A GitLab job's (its connection the first, its record found by its id): noted, nothing said to its log.
+    let (status, said) = say(&format!("/interrupted?gl=73&t={notice}"), "");
+    assert!(status == 200 && said.is_empty() && record("job:gl73")["interrupted"] == true, "{status} {said}");
+
+    // A GitHub job running: GitHub's log so far, then what its machine sent after GitHub's last line.
+    served.github.answer_with("GET", "/actions/jobs/74/logs", 200, &[], "2026-10-15T10:00:01.0000000Z build started\n");
+    let page = "2026-10-15T10:00:00.5000000Z before GitHub's last\n2026-10-15T10:00:09.0000000Z tests passed\nshort\n2026x10-15T10:00:09 not a time\n2026-10-15X10:00:09 not a time\nabcd-10-15T10:00:09 not a time\n";
+    assert_eq!(say(&format!("/hello?runner=r-live&t={notice}&live=Worker_20261015-100000-utc.log&at=0"), page), (200, "ok".into()));
+    let got = log("id=74");
+    let text = got["log"].as_str().unwrap_or_default();
+    assert!(got["source"] == "GitHub's, then what its machine sent after it" && text.starts_with("2026-10-15T10:00:01.0000000Z build started\n2026-10-15T10:00:09.0000000Z tests passed\nshort\n"), "{got}");
+    assert!(text.contains("abcd-10-15T10:00:09 not a time") && !text.contains("before GitHub's last"), "{text}");
+    // GitHub's log empty: what its machine sent, all of it.
+    served.github.fail_none();
+    served.github.answer_with("GET", "/actions/jobs/74/logs", 200, &[], "");
+    let got = log("id=74");
+    assert!(got["source"] == "what its machine sent" && got["log"].as_str().unwrap_or_default().contains("before GitHub's last"), "{got}");
+    // A GitLab job's link: GitLab's, which has no link (its log is said as GitLab has it, here none: no project).
+    let got = log("id=73&gl=&link=1");
+    assert!(got["error"].as_str().is_some_and(|e| e.contains("no longer connected")), "{got}");
+    // Another connection's job by its name: none here.
+    let got = log("id=73&gl=gsecond");
+    assert!(got["error"].as_str().is_some_and(|e| e.contains("no such job")), "{got}");
+}
+
+/// GitLab through a connection of another name (the first one not connected): its job is that connection's; an event
+/// with a secret none of them has is refused (one too short to be a secret matches nothing). A runner made for a job
+/// whose record is gone takes another: that one runs and ends on it, its own record told its runner's job is over.
+/// The upkeep removes runners past their machine's time at their GitLab (one GitLab would not remove stays, one of a
+/// connection gone is only forgotten), and leaves the newer.
+#[test]
+fn a_gitlab_of_another_name_runs_its_jobs_and_runners_past_their_time_are_removed_where_gitlab_lets_them_be() {
+    let served = serve(|_| {});
+    let mut second = superci_testkit::GitLab::connection();
+    second["id"] = "gsecond".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gsecond"), &second.to_string());
+    let mut short = superci_testkit::GitLab::connection();
+    short["id"] = "gshort".into(); short["hook_secret"] = "short".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gshort"), &short.to_string());
+    let (gid, pending) = served.gitlab.pending("gl-second", &["superci"], served.now_ms());
+    assert_eq!(served.gitlab_webhook(pending), 200);
+    let key = format!("job:glgsecond-{gid}");
+    let job = || served.store.under(&key).into_iter().next().map(|(_, j)| j).unwrap_or_default();
+    assert!(job()["gitlab"] == "gsecond" && job()["state"] == "launched", "{}", job());
+    // A secret none has (nor the one too short to be one).
+    let host = served.url.trim_start_matches("http://");
+    for token in ["short", "not-the-hook-secret-0000"] {
+        use std::io::{Read, Write};
+        let body = served.gitlab.running_on(gid, 1, served.now_ms());
+        let mut s = std::net::TcpStream::connect(host).unwrap();
+        s.write_all(format!("POST /gitlab/webhook HTTP/1.1\r\nhost: {host}\r\nx-gitlab-event: Job Hook\r\nx-gitlab-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+        s.write_all(&body).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        assert!(out.starts_with("HTTP/1.1 401"), "{token}: {out}");
+    }
+    // A runner of this connection's, made for a job whose record is gone, takes it: it runs and ends there.
+    served.store.0.lock().unwrap().insert("glrunner:gsecond-555".into(), serde_json::json!({ "id": 555, "job": 1234, "gitlab": "gsecond", "at_ms": served.now_ms() }).to_string());
+    assert_eq!(served.gitlab_webhook(served.gitlab.running_on(gid, 555, served.now_ms())), 200);
+    assert!(served.store.under("glrunner:gsecond-555")[0].1["running"]["job"] == gid);
+    assert_eq!(served.gitlab_webhook(served.gitlab.finish(gid, "success", "ok", served.now_ms())), 200);
+    assert!(served.store.under("glrunner:gsecond-555").is_empty() && job()["over"] == true && job()["for_job"] == 1234, "{}", job());
+
+    // Runners past their machine's time (five days on AWS, and ten minutes).
+    let old = served.now_ms() - 6 * 86_400_000;
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (k, v) in [("gsecond-61", serde_json::json!({ "id": 61, "gitlab": "gsecond", "at_ms": old })), ("gsecond-66", serde_json::json!({ "id": 66, "gitlab": "gsecond", "at_ms": old })),
+            ("ggone-67", serde_json::json!({ "id": 67, "gitlab": "ggone", "at_ms": old })), ("gsecond-68", serde_json::json!({ "id": 68, "gitlab": "gsecond", "at_ms": served.now_ms() }))] {
+            m.insert(format!("glrunner:{k}"), v.to_string());
+        }
+    }
+    served.gitlab.fail("DELETE", "/runners/66", 500);
+    served.upkeep();
+    let left: Vec<String> = served.store.under("glrunner:").into_iter().map(|(k, _)| k).filter(|k| k.contains("-6")).collect();
+    assert_eq!(left, vec!["glrunner:gsecond-66".to_string(), "glrunner:gsecond-68".to_string()]);
+}
+
+/// The cache asked by machines of every kind and with tokens of every kind: a GitLab machine whose connection is gone,
+/// or whose job came without its project's path, a GitLab job's machine asking as GitHub's; GitHub's keys kept a day
+/// and used when GitHub would not give them again; tokens this control plane signed for another use (AWS's, as STS was
+/// handed it), or at another address, and one signed with GitHub's key that GitHub did not give: refused. The list by a
+/// repository's id or its name (one GitHub no longer has, one it says no name of); taking out a GitLab project's or a
+/// run's entries; the upkeep keeps a kept run's artifacts and forgets one it cannot read.
+#[test]
+fn the_cache_takes_only_tokens_given_for_it_and_machines_whose_job_it_can_name() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let now = served.now_ms();
+    let link = |n: u32| format!("machine-cache-link-{n:012}");
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": "arn:aws:iam::111111111111:role/superci-testplane0001", "connected": true }).to_string());
+        for (n, runner, job) in [(1, "a-runner", ""), (2, "gl:ggone-77", ""), (3, "gl:78", ""), (4, "", "job:gl79"), (5, "", "job:999999")] {
+            m.insert(format!("cachem:{}", link(n)), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": runner, "job": job }).to_string());
+        }
+        m.insert("glrunner:ggone-77".into(), serde_json::json!({ "id": 77, "gitlab": "ggone" }).to_string());
+        m.insert("glrunner:78".into(), serde_json::json!({ "id": 78, "gitlab": "", "running": { "job": 1, "project_id": 5, "project": "", "ref": "main", "tag": false, "default_branch": "main" } }).to_string());
+        m.insert("job:gl79".into(), serde_json::json!({ "job_id": 79, "run_id": 1, "repo": "acme/app", "state": "running", "provider": "gitlab", "at_ms": now, "installation_id": 0, "cloud": "aws", "seen_in_progress": true }).to_string());
+        // GitHub's keys as kept a minute ago, with one GitHub's tokens name.
+        m.insert("github-keys".into(), serde_json::json!([{ "keys": [{ "kid": "kept-key", "kty": "RSA", "alg": "RS256", "n": "AQAB", "e": "AQAB" }] }, now - 120_000]).to_string());
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let call = |n: u32, what: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/cache/{}/{what}", served.url, link(n))).send(body.to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    let tool = |n: u32| call(n, "tool-get", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" }));
+    // GitLab machines: one whose connection is gone (its job not known), one whose job came with no path; a GitLab
+    // job's machine is not GitHub's.
+    assert_eq!(tool(2), (403, serde_json::json!({ "ok": false, "why": "its job has not begun" })));
+    assert!(tool(3).0 == 200 && served.store.under("cachename:").is_empty(), "{:?}", tool(3));
+    assert_eq!(tool(4).1["why"], "not a GitHub job");
+    // One whose job's record is gone, and no runner to find it by.
+    assert_eq!(tool(5).1["why"], "no job on this machine");
+
+    // GitHub's tokens: the keys kept a minute ago are used as kept (one GitHub's token names); a day on, asked again,
+    // and, GitHub not answering, the ones kept used still.
+    use base64::Engine;
+    let b64 = |v: serde_json::Value| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string());
+    let exp = 4_102_444_800u64;
+    let kept_kid = format!("{}.{}.c2ln", b64(serde_json::json!({ "alg": "RS256", "kid": "kept-key" })), b64(serde_json::json!({ "repository_id": "197814629", "ac": "[]", "exp": exp })));
+    let lookup = |token: &str| call(1, "lookup", serde_json::json!({ "token": token, "key": "deps", "version": "c".repeat(64) }));
+    assert_eq!((lookup(&kept_kid).0, served.github.jwks_asked()), (403, 0));
+    served.later(2 * 86_400_000);
+    served.github.fail("GET", "token.actions.githubusercontent.com", 500, "unavailable");
+    assert_eq!((lookup(&kept_kid).0, served.github.jwks_asked()), (403, 0), "GitHub would not: the kept ones");
+    served.github.fail_none();
+    // A token signed with GitHub's key that is not GitHub's (another issuer): refused. GitHub's own: taken (AWS's
+    // credentials asked for once, then kept).
+    let pem = superci_testkit::GitHub::app()["pem"].as_str().unwrap().to_string();
+    let other = superci_core::crypto::rs256_jwt(&serde_json::json!({ "iss": "https://elsewhere.example", "repository_id": "197814629", "ac": "[]", "exp": exp }), &pem).unwrap();
+    assert_eq!(lookup(&other).1["why"], "not a GitHub job's token");
+    let main = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "197814629", "ac": serde_json::json!([{ "Scope": "refs/heads/main", "Permission": 3 }]).to_string(), "exp": exp }));
+    let sts =|| -> Vec<String> { served.github.asked.lock().unwrap().iter().filter(|a| a.contains("AssumeRoleWithWebIdentity")).filter_map(|a| url::Url::parse(a.split_once(' ').unwrap().1).ok()?.query_pairs().find(|(k, _)| k == "WebIdentityToken").map(|(_, v)| v.into_owned())).collect() };
+    let before = sts().len();
+    for _ in 0..2 { let (status, said) = lookup(&main); assert!(status == 200 && said["hit"] == false, "{status} {said}") }
+    assert_eq!(sts().len(), before + 1, "asked once, then kept");
+    // What this control plane signed for AWS: not the cache's.
+    assert_eq!(lookup(sts().last().unwrap()).1["why"], "not this control plane's token");
+    // Signed while it answered at another address: not this one's.
+    *served.public.lock().unwrap() = Some("https://ci.acme.example".into());
+    served.later(3_100_000);
+    assert_eq!(lookup(&main).0, 200);
+    *served.public.lock().unwrap() = None;
+    assert_eq!(sts().len(), before + 2, "asked again once its credentials were nearly over");
+    assert_eq!(lookup(sts().last().unwrap()).1["why"], "not this control plane's token");
+
+    // The list: entries of a repository GitHub no longer has, and one it says no name of; a layer it cannot read.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for ns in ["gh123", "gh5", "glabcdef01x5", "local-acme"] {
+            m.insert(format!("cache:{ns}:refs/heads/main:v1:deps"), serde_json::json!({ "id": "deps", "region": "us-east-1", "size": 1_000, "made": now, "done": true }).to_string());
+        }
+        m.insert("layer:us-east-1:sha256-0".into(), "not a layer".into());
+    }
+    served.github.answer_with("GET", "/repositories/5", 200, &[], "{}");
+    let caches = |q: &str| -> serde_json::Value { agent.get(&format!("{}/caches{q}", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap() };
+    let all = caches("");
+    assert!(all["repos"].as_array().is_some_and(|r| r.len() == 4 && r.iter().all(|r| r["name"].is_null())) && all["images"]["layers"] == 0, "{all}");
+    assert!(caches("?repo=gh123")["entries"].as_array().is_some_and(|e| e.len() == 1));
+    assert!(caches("?repo=acme/nothing")["repo"].is_null());
+    // Taken out: a GitLab project's, a run's by their ids; a name none has: nothing.
+    let delete = |repo: &str| -> serde_json::Value { agent.post(&format!("{}/caches/delete", served.url)).header("authorization", &format!("Bearer {}", served.key)).send(serde_json::json!({ "repo": repo }).to_string()).unwrap().body_mut().read_json().unwrap() };
+    assert_eq!(delete("glabcdef01x5")["removed"], 1);
+    assert_eq!(delete("local-acme")["removed"], 1);
+    assert_eq!(delete("acme/nothing")["removed"], 0);
+    // The upkeep: a kept run's artifacts stay; one that cannot be read, of a run gone, goes.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("run:111".into(), serde_json::json!({ "id": 111, "at_ms": served.now_ms() }).to_string());
+        m.insert("artifact:111:report".into(), serde_json::json!({ "id": "report", "region": "us-east-1", "size": 3, "made": now, "done": true }).to_string());
+        m.insert("artifact:222:report".into(), "not an entry".into());
+    }
+    served.upkeep();
+    let left: Vec<String> = served.store.under("artifact:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(left, vec!["artifact:111:report".to_string()]);
+}
+
+/// Jobs kept from before their indexes and before runs were counted (more than one upkeep goes through at once): their
+/// indexes made over several upkeeps, then their runs counted once each, over several more (a job of no run, and one
+/// older than the days kept, not counted); an hour kept with a cost and no job, and a job still going from before this
+/// month began, counted in the usage as kept.
+#[test]
+fn jobs_from_before_their_indexes_and_run_counts_are_indexed_then_their_runs_counted_over_several_upkeeps() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let now = served.now_ms();
+    let today = now / 86_400_000;
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let job = |id: u64, run: u64, at: u64| serde_json::json!({ "job_id": id, "run_id": run, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "", "at_ms": at,
+            "ended_ms": at + 1_000, "installation_id": 42, "seen_in_progress": true, "counted_usd": 0.0 }).to_string();
+        // 160 jobs of 80 runs, each counted (at nothing) and its run not; one of no run; one kept from 401 days ago.
+        for i in 0..160u64 { m.insert(format!("job:{}", 50_000 + i), job(50_000 + i, 900 + i / 2, now - 3_600_000)); }
+        m.insert("job:60000".into(), job(60_000, 0, now - 3_600_000));
+        m.insert("job:60001".into(), job(60_001, 7_777, now - 401 * 86_400_000));
+        // An hour of yesterday's that cost and ran no job.
+        let mut hours = vec![serde_json::json!({}); 24];
+        hours[12] = serde_json::json!({ "jobs": 0, "usd": 1.5 });
+        m.insert(superci_core::plane::day_key(today - 1), serde_json::json!({ "hours": hours, "spend": { "aws": 1.5 } }).to_string());
+        // (The jobs, as their day's totals hold them.)
+        let at = now - 3_600_000;
+        let mut hours = vec![serde_json::json!({}); 24];
+        hours[(at % 86_400_000 / 3_600_000) as usize] = serde_json::json!({ "jobs": 161, "ran": 161 });
+        m.insert(superci_core::plane::day_key(at / 86_400_000), serde_json::json!({ "hours": hours, "spend": {} }).to_string());
+    }
+    let counted = || served.store.under("day:").iter().map(|(_, d)| d["hours"].as_array().into_iter().flatten().map(|h| h["runs"].as_u64().unwrap_or(0)).sum::<u64>()).sum::<u64>();
+    // Indexed in two upkeeps (150 jobs at a time); the runs counted from the second on, 150 jobs at a time.
+    served.upkeep();
+    assert!(served.store.under("indexed").is_empty() && !served.store.under("reindex-at").is_empty());
+    served.upkeep();
+    assert!(!served.store.under("indexed").is_empty() && served.store.under("runs-counted").is_empty() && counted() == 75, "{}", counted());
+    served.upkeep();
+    assert!(!served.store.under("runs-counted").is_empty() && counted() == 80, "{}", counted());
+    served.upkeep();
+    assert_eq!(counted(), 80, "once");
+    // What the dashboard reads: the runs, and the hour that cost with no job.
+    let status: serde_json::Value = ureq::get(&format!("{}/status", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap();
+    let month = &status["usage"]["month"];
+    assert!(month["runs"] == 80 && month["usd"].as_f64().is_some_and(|u| u >= 1.5), "{month}");
+}
+
+/// The upkeep, of what it keeps for a while: AWS jobs over days ago (what they sent counted, or too late to be) leave
+/// the live ones; a launch template left days ago is given up on, a newer one kept; a run's working tree of yesterday
+/// forgotten. A machine that never began its job and is tried again with its place full waits for room; one begun keeps
+/// on. AWS refusing this control plane's sign-in: the cache's and the layers' upkeep say why, the rest goes on.
+#[test]
+fn the_upkeep_forgets_what_is_past_waits_a_job_tried_again_for_room_and_says_why_the_caches_upkeep_failed() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let now = served.now_ms();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let over = |id: u64, sent: Option<f64>| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "aws", "at_ms": now - 3 * 86_400_000,
+            "ended_ms": now - 3 * 86_400_000 + 60_000, "installation_id": 42, "seen_in_progress": true, "began": true, "cost_from": "estimate", "sent_gb": sent }).to_string();
+        m.insert("job:81".into(), over(81, Some(0.5)));
+        m.insert("job:82".into(), over(82, None));
+        for id in [81, 82] { m.insert(format!("live:{id}"), String::new()); }
+        m.insert("aws:template:us-east-1:superci-lt-old".into(), (now - 2 * 86_400_000).to_string());
+        m.insert("aws:template:us-east-1:superci-lt-new".into(), (now - 60_000).to_string());
+        m.insert("rtree-at:tree0001".into(), (now - 2 * 86_400_000).to_string());
+        m.insert("rtree:tree0001:00000".into(), "\"part\"".into());
+        m.insert("rtree-at:tree0002".into(), (now - 60_000).to_string());
+        m.insert("job:85".into(), serde_json::json!({ "job_id": 85, "run_id": 1, "repo": "acme/app", "state": "orphan", "cloud": "aws", "machine_id": "i-0orphan", "region": "us-east-1", "at_ms": now - 60_000, "installation_id": 42, "seen_in_progress": false }).to_string());
+        m.insert("live:85".into(), String::new());
+    }
+    // A job running, and one whose machine never began it.
+    let (a, q) = served.github.queue("first", "superci", now);
+    assert!(served.webhook(q) < 300);
+    assert!(served.webhook(served.github.start(a)) < 300);
+    let (b, q) = served.github.queue("second", "superci", now);
+    assert!(served.webhook(q) < 300);
+    let job = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
+    assert!(job(a)["state"] == "running" && job(b)["state"] == "launched", "{} {}", job(a), job(b));
+    // One at once on Cloudflare from now on.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare","max_jobs":1}]}"#);
+    served.later(4 * 60_000);
+    served.upkeep();
+    assert!(served.store.under("live:81").is_empty() && served.store.under("live:82").is_empty(), "past caring for");
+    let templates: Vec<String> = served.store.under("aws:template:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(templates, vec!["aws:template:us-east-1:superci-lt-new".to_string()]);
+    assert!(served.store.under("rtree:tree0001").is_empty() && served.store.under("rtree-at:tree0001").is_empty() && !served.store.under("rtree-at:tree0002").is_empty());
+    assert!(job(a)["state"] == "running", "{}", job(a));
+    assert_eq!(job(85)["state"], "swept", "an AWS machine, with no AWS account any more: forgotten");
+    assert!(job(b)["state"] == "waiting" && job(b)["error"].as_str().unwrap_or_default().contains("runs 1 at once") && job(b)["retries"] == 1, "{}", job(b));
+
+    // AWS connected by a role it will not let this control plane take: the cache's and layers' upkeep say so.
+    let refused = serve(|_| {});
+    // (Its containers turned off.)
+    refused.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "");
+    let now = refused.now_ms();
+    {
+        let mut m = refused.store.0.lock().unwrap();
+        m.insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": "arn:aws:iam::111111111111:role/superci-testplane0001", "connected": true }).to_string());
+        m.insert("artifact:333:report".into(), serde_json::json!({ "id": "report", "region": "us-east-1", "size": 3, "made": now, "done": true, "pieces": [["p00000", 3]] }).to_string());
+        m.insert("aws:template:us-east-1:superci-lt-old".into(), (now - 2 * 86_400_000).to_string());
+        // (Just moved here: looked after every minute, for a while.)
+        m.insert("claimed_at".into(), now.to_string());
+        let orphan = |id: u64, cloud: &str| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "orphan", "cloud": cloud, "machine_id": format!("m-{id}"), "region": "us-east-1", "at_ms": now - 60_000, "installation_id": 42, "seen_in_progress": false }).to_string();
+        for (id, cloud) in [(86u64, "aws"), (87, "cloudflare")] { m.insert(format!("job:{id}"), orphan(id, cloud)); m.insert(format!("live:{id}"), String::new()); }
+    }
+    refused.github.fail("GET", "sts.us-east-1.amazonaws.com", 403, "not authorized to perform sts:AssumeRoleWithWebIdentity");
+    refused.upkeep();
+    let said = |k: &str| refused.store.under(k).into_iter().next().map(|(_, v)| v.to_string()).unwrap_or_default();
+    assert!(said("cache-sweep-error").contains("sts:AssumeRoleWithWebIdentity") && said("layers-sweep-error").contains("sts:AssumeRoleWithWebIdentity"), "{} {}", said("cache-sweep-error"), said("layers-sweep-error"));
+    assert!(refused.store.under("aws:template:").is_empty(), "given up on after a day");
+    // Machines left by jobs over (orphans): AWS's, its sign-in refused; a container's, containers off since: forgotten all the same.
+    for id in [86u64, 87] { assert_eq!(refused.store.under(&format!("job:{id}"))[0].1["state"], "swept", "{id}") }
+}
+
+/// GitLab's jobs as the upkeep finds them when GitLab's events do not come: one its runner holds but has not begun
+/// stays as it is; begun, it is running (its runner's record gone meanwhile, or already saying what it runs: kept as
+/// it says); a job no event told of is given a machine once it has waited a while (not one made a moment ago), and
+/// GitLab is not asked again within three minutes. A job of a connection not this one's is left to that one.
+#[test]
+fn gitlabs_jobs_untold_are_found_by_the_upkeep_begun_or_given_a_machine_once_they_have_waited_a_while() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    // Its project sends its jobs here.
+    let on = agent.post(&format!("{}/gitlab/projects", served.url)).header("authorization", &format!("Bearer {}", served.key)).send(serde_json::json!({ "gitlab": "", "id": superci_testkit::gitlab::PROJECT, "enabled": true }).to_string()).unwrap().status().as_u16();
+    assert_eq!(on, 200);
+    let job = |id: u64| served.store.under(&format!("job:gl{id}")).into_iter().find(|(k, _)| *k == format!("job:gl{id}")).map(|(_, j)| j).unwrap_or_default();
+    let (a, p) = served.gitlab.pending("held", &["superci"], served.now_ms());
+    assert_eq!(served.gitlab_webhook(p), 200);
+    let (b, p) = served.gitlab.pending("said", &["superci"], served.now_ms());
+    assert_eq!(served.gitlab_webhook(p), 200);
+    let (ra, rb) = (job(a)["runner_id"].as_u64().unwrap(), job(b)["runner_id"].as_u64().unwrap());
+    // A job of another connection's (not connected here any more).
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("job:glgother-5".into(), serde_json::json!({ "job_id": 5, "run_id": 1, "repo": "acme/app", "state": "running", "provider": "gitlab", "gitlab": "gother",
+        "project_id": superci_testkit::gitlab::PROJECT, "runner_id": 99, "at_ms": now, "installation_id": 0, "cloud": "cloudflare", "seen_in_progress": true }).to_string());
+    served.store.0.lock().unwrap().insert("live:glgother-5".into(), String::new());
+    // a: its runner has it, not begun. b: begun, its runner's record already saying what it runs. And c, never told of.
+    served.gitlab.set(a, "runner", serde_json::json!({ "id": ra }));
+    served.gitlab_webhook(served.gitlab.running_on(b, rb, served.now_ms()));
+    let said_b = served.store.under(&format!("glrunner:{rb}"))[0].1["running"].clone();
+    let (c, _) = served.gitlab.pending("untold", &["superci"], served.now_ms());
+    served.upkeep();
+    assert!(job(a)["state"] == "launched" && job(a)["seen_in_progress"] == false, "{}", job(a));
+    assert!(job(c).is_null(), "made a moment ago: its event may be on its way");
+    // A while on: begun on GitLab (a's runner record gone meanwhile); c given a machine.
+    served.later(200_000);
+    served.gitlab.set(a, "status", "running".into());
+    served.gitlab.set(a, "started_at", "2026-10-19T10:00:00.000Z".into());
+    served.store.0.lock().unwrap().remove(&format!("glrunner:{ra}"));
+    served.gitlab.set(b, "status", "running".into());
+    // (Its own word that it began, lost.)
+    let mut lost = job(b);
+    (lost["state"], lost["seen_in_progress"]) = ("launched".into(), false.into());
+    served.store.0.lock().unwrap().insert(format!("job:gl{b}"), lost.to_string());
+    served.upkeep();
+    assert!(job(a)["state"] == "running" && job(a)["started_ms"].as_u64().is_some(), "{}", job(a));
+    assert!(job(b)["state"] == "running" && served.store.under(&format!("glrunner:{rb}"))[0].1["running"] == said_b, "{}", job(b));
+    assert!(job(c)["state"] == "launched", "{}", job(c));
+    assert!(served.store.under("job:glgother-5")[0].1["state"] == "running", "another connection's, left");
+    // Asked again within three minutes: GitLab is not.
+    let asked = served.store.under("gitlab:untold")[0].1.clone();
+    served.later(60_000);
+    served.upkeep();
+    assert_eq!(served.store.under("gitlab:untold")[0].1, asked);
+}
+
+
+/// A run from a computer, asked of the control plane as the CLI asks it, with a key of no name (said as started by
+/// none): a job that needs a failed job, a skipped one, a cancelled one and a called workflow whose job failed is told
+/// each as it ended (the called workflow's input given as a number, read as text); a job's whole log in steps (its own
+/// record, a skipped and a pending step among them; no links); its machine reaches the cache as its job. One whose event
+/// is too large is refused. (A job shown by its `name:`; the called workflow given no secrets.)
+#[test]
+fn a_run_from_a_computer_tells_a_job_how_each_job_it_needs_ended_failed_skipped_cancelled_or_called() {
+    let served = serve(|_| {});
+    let key = format!("superci_run_{}", "01".repeat(16));
+    served.aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_"), &format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes())));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let create = |workflow: &str, called: serde_json::Value, more: serde_json::Value| -> (u16, serde_json::Value) {
+        let mut body = serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main", "sha": "0".repeat(40), "actor": "someone", "event_name": "push", "called": called });
+        for (k, v) in more.as_object().into_iter().flatten() { body[k] = v.clone() }
+        let mut r = agent.post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {key}")).send(body.to_string()).unwrap();
+        let text = r.body_mut().read_to_string().unwrap_or_default();
+        (r.status().as_u16(), serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+    };
+    let read = |path: &str| -> serde_json::Value { agent.get(&format!("{}{path}", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap() };
+
+    // Its event's payload larger than a run keeps.
+    let (status, said) = create("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: true\n", serde_json::json!({}), serde_json::json!({ "event": { "x": "a".repeat(70_000) } }));
+    assert!(status == 400 && said.as_str().is_some_and(|s| s.contains("a run takes 64 KB at most")), "{status} {said}");
+
+    let called = "on:\n  workflow_call:\n    inputs:\n      n:\n        type: string\njobs:\n  x:\n    runs-on: superci\n    steps:\n      - run: echo ${{ inputs.n }}\n";
+    let wf = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: make test ${{ secrets.TOKEN }}\n  b:\n    if: false\n    runs-on: superci\n    steps:\n      - run: never\n  d:\n    name: Lint ${{ 1 }}\n    runs-on: superci\n    steps:\n      - run: make lint\n  caller:\n    uses: ./.github/workflows/called.yml\n    with:\n      n: ${{ 5 }}\n    secrets: none\n  c:\n    needs: [a, b, d, caller]\n    if: ${{ always() && !(needs.a.result == 'failure' && needs.b.result == 'skipped' && needs.d.result == 'cancelled' && needs.caller.result == 'failure') }}\n    runs-on: superci\n    steps:\n      - run: echo told otherwise\n";
+    let (status, said) = create(wf, serde_json::json!({ ".github/workflows/called.yml": called }), serde_json::json!({ "secrets": [["TOKEN", "s3cret"]] }));
+    assert!(status == 200 && said["missing_secrets"] == serde_json::json!([]), "{status} {said}");
+    let id = said["run_id"].as_str().unwrap().to_string();
+    let run = || served.store.under(&format!("run:{id}")).into_iter().next().map(|(_, r)| r).unwrap_or_default();
+    assert!(run()["by"] == "", "a key of no name: {}", run()["by"]);
+    let of = |name: &str| run()["jobs"].as_array().into_iter().flatten().find(|j| j["name"] == name).cloned().unwrap_or_default();
+    let runner = |name: &str| { let end = std::time::Instant::now() + std::time::Duration::from_secs(15); loop { if let Some(r) = superci_testkit::Runner::of_job(&served, &id, name) { break r } assert!(std::time::Instant::now() < end, "{name} not started: {}", run()); std::thread::sleep(std::time::Duration::from_millis(20)) } };
+    // a's steps: its own record, one with its whole log, one skipped and one pending (neither with a log).
+    let a = runner("a");
+    a.take();
+    a.records(vec![serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000000", "type": "Job", "name": "a", "order": 0, "state": "inProgress" }),
+        serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000001", "type": "Task", "name": "Run make test", "order": 1, "state": "completed", "result": "failed", "log": { "id": 1 } }),
+        serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000002", "type": "Task", "name": "Upload", "order": 2, "state": "completed", "result": "skipped" }),
+        serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000003", "type": "Task", "name": "Post", "order": 3, "state": "pending" })]);
+    a.log(1, "2026-10-15T10:00:01.0000000Z 3 tests failed\n");
+    let a_id = of("a")["job_id"].as_str().unwrap().to_string();
+    assert!(read(&format!("/job/log?id={a_id}&link=1"))["urls"].is_null());
+    assert_eq!(read(&format!("/job/log?id={a_id}"))["log"], "2026-10-15T10:00:01.0000000Z 3 tests failed\n");
+    // (Its machine asks the cache as its job: allowed as far as the cache, which has no AWS account here.)
+    served.store.0.lock().unwrap().insert("cachem:local-machine-link-0001".into(), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "", "job": format!("job:{a_id}") }).to_string());
+    let mut r = agent.post(&format!("{}/cache/local-machine-link-0001/tool-get", served.url)).send(r#"{"tool":"turbo","hash":"0123456789abcdef"}"#).unwrap();
+    assert_eq!(r.body_mut().read_json::<serde_json::Value>().unwrap()["why"], "this control plane has no AWS account");
+    a.finish("failed");
+    let d = runner("Lint 1");
+    d.take();
+    d.finish("canceled");
+    let x = runner("caller / x");
+    let inputs = x.handed(&served)["contextData"]["inputs"].to_string();
+    assert!(inputs.contains(r#"{"k":"n","v":"5"}"#), "given as a number, read as text: {inputs}");
+    x.take();
+    x.finish("failed");
+    // c runs only if it was told otherwise than each ended: skipped, never started.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while of("c")["state"] != "done" { assert!(std::time::Instant::now() < end, "{}", run()); std::thread::sleep(std::time::Duration::from_millis(20)) }
+    assert!(of("c")["result"] == "skipped" && of("c")["job_id"].is_null(), "{}", of("c"));
+}
+
+/// Runs from a computer ended by the upkeep: one cancelled whose runner never stops is ended once its time is up (AWS
+/// took its machine back meanwhile: not started again); one whose machine failed without saying when is over, a
+/// failure. What their runners do after that changes nothing (one's record gone, the other's run unreadable: said). Its
+/// working tree fetched from the store, what its machine said of its start shown with it, a log the bucket refused kept
+/// in the store. (Started with a key named as no key can be, said as named; one of no repository has no name in the
+/// cache's list.)
+#[test]
+fn runs_from_a_computer_cancelled_or_failed_on_their_machines_are_ended_by_the_upkeep() {
+    // Its own AWS account's bucket (its jobs on Cloudflare's containers).
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare"}]}"#);
+    served.github.put_object(&format!("{}/{}", superci_core::cache::bucket(PLANE, "us-east-1"), superci_core::cache::program_key("x86_64")), b"program");
+    let key = format!("superci_run_{}", "02".repeat(16));
+    served.aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_bot+x"), &format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes())));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let one = "jobs:\n  e:\n    runs-on: superci\n    steps:\n      - run: sleep 600\n";
+    let create = |key: &str, more: serde_json::Value| -> String {
+        let mut body = serde_json::json!({ "workflow": one, "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main", "sha": "0".repeat(40), "actor": "someone", "event_name": "push" });
+        for (k, v) in more.as_object().into_iter().flatten() { body[k] = v.clone() }
+        let said: serde_json::Value = agent.post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {key}")).send(body.to_string()).unwrap().body_mut().read_json().unwrap();
+        said["run_id"].as_str().unwrap().to_string()
+    };
+    let run = |id: &str| served.store.under(&format!("run:{id}")).into_iter().next().map(|(_, r)| r).unwrap_or_default();
+    let of = |id: &str| run(id)["jobs"][0].clone();
+    let job_id = |id: &str| of(id)["job_id"].as_str().unwrap_or_default().to_string();
+    let record = |id: &str| { let j = job_id(id); served.store.under(&format!("job:{j}")).into_iter().find(|(k, _)| *k == format!("job:{j}")).map(|(_, v)| v).unwrap_or_default() };
+    let runner = |id: &str| { let end = std::time::Instant::now() + std::time::Duration::from_secs(15); loop { if let Some(r) = superci_testkit::Runner::of_run(&served, id) { break r } assert!(std::time::Instant::now() < end); std::thread::sleep(std::time::Duration::from_millis(20)) } };
+    // A working tree sent in a part the control plane keeps (no link asked), then the run.
+    let tree = "tree-for-a-cancelled-run-0001";
+    assert_eq!(agent.post(&format!("{}/runs/tree?id={tree}&part=0", served.url)).header("authorization", &format!("Bearer {key}")).send(&b"the tree"[..]).unwrap().status().as_u16(), 200);
+    // (A name to keep it by that no name can be: kept as the run's own, not as a base.)
+    let mut said = agent.post(&format!("{}/runs/tree?id={tree}&part=1&link=1&keep=b0123-456789", served.url)).header("authorization", &format!("Bearer {key}")).send_empty().unwrap();
+    let said: serde_json::Value = said.body_mut().read_json().unwrap();
+    assert!(said["url"].as_str().is_some_and(|u| u.contains(&format!("/runs/{tree}/00001?"))), "{said}");
+    let cancelled = create(&key, serde_json::json!({ "tree": tree, "parts": 1 }));
+    assert_eq!(run(&cancelled)["by"], "bot+x");
+    let c = runner(&cancelled);
+    c.take();
+    let mut got = agent.get(&format!("{}/superci/tree?part=0", c.at.trim_end_matches("/_apis/v1"))).call().unwrap();
+    assert_eq!(got.body_mut().read_to_string().unwrap(), "the tree");
+    let failed = create(&served.run_key, serde_json::json!({ "repository": "" }));
+    let f = runner(&failed);
+    f.take();
+    assert!(served.store.under("cachename:").iter().all(|(_, n)| n == "acme/app"), "{:?}", served.store.under("cachename:"));
+    // Its log, the bucket refusing it: kept in the store.
+    served.github.refuse_puts(true);
+    f.log(1, "2026-10-15T10:00:01.0000000Z going\n");
+    served.github.refuse_puts(false);
+    assert!(served.store.under(&format!("rlog:")).iter().all(|(_, v)| !v.to_string().contains("s3:")) && !served.store.under("rlog:").is_empty(), "{:?}", served.store.under("rlog:"));
+    // What its machine said of its start, with the run.
+    let hello = format!("hello:{}", job_id(&failed));
+    served.store.0.lock().unwrap().insert(hello, serde_json::json!({ "script_ms": served.now_ms(), "boot_s": 7.5 }).to_string());
+    let status: serde_json::Value = agent.get(&format!("{}/runs/{failed}", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).call().unwrap().body_mut().read_json().unwrap();
+    assert_eq!(status["jobs"][0]["start"]["machine"]["boot_s"], 7.5, "{status}");
+
+    assert_eq!(agent.post(&format!("{}/runs/{cancelled}/cancel", served.url)).header("authorization", &format!("Bearer {key}")).send_empty().unwrap().status().as_u16(), 200);
+    let edit = |id: &str, f: &dyn Fn(&mut serde_json::Value)| { let j = job_id(id); let mut rec = record(id); f(&mut rec); served.store.0.lock().unwrap().insert(format!("job:{j}"), rec.to_string()); };
+    edit(&cancelled, &|r| r["interrupted"] = true.into());
+    edit(&failed, &|r| { r["state"] = "failed".into(); r["error"] = "its machine stopped".into(); });
+    served.later(7 * 60_000);
+    served.upkeep();
+    assert!(record(&cancelled)["state"] == "cancelled" && record(&cancelled)["error"] == "its run was cancelled, and its machine was ended", "{}", record(&cancelled));
+    assert!(of(&cancelled)["restarted"].is_null() && of(&cancelled)["result"] == "cancelled", "{}", of(&cancelled));
+    assert_eq!(of(&failed)["result"], "failure", "{}", of(&failed));
+    // Their runners say how they ended after all: one's record gone (nothing more), the other's run no longer readable.
+    let gone = format!("job:{}", job_id(&failed));
+    served.store.0.lock().unwrap().remove(&gone);
+    assert_eq!(f.finish("failed"), 200);
+    let mut r = run(&cancelled);
+    r["workflow"] = "jobs: [".into();
+    served.store.0.lock().unwrap().insert(format!("run:{cancelled}"), r.to_string());
+    assert_eq!(c.finish("canceled"), 200);
+    assert!(!served.store.under(&format!("run-error:{cancelled}")).is_empty());
+    assert!(served.store.under(&format!("run-error:{failed}")).is_empty());
+}
+
+
+/// GitHub's events and the upkeep, for jobs off the usual way: a runner of a job here begins one never told of (noted
+/// as what it ran); a runner started to fail one job that ends another already running elsewhere leaves that one be; a
+/// job whose spot machine AWS took back, run again already, ends as it ended. Jobs failed at once: one kept with no
+/// label (the control plane's own), one asking for macOS past the month's limit (said as the limit, in cents), a
+/// GitLab one whose connection is gone (nothing to cancel there). A machine whose job ended untold is taken back from
+/// GitHub (its runner's name not kept), a GitLab job's is not GitHub's to take back. Spot not paused for two machines
+/// taken back long ago.
+#[test]
+fn jobs_off_the_usual_way_are_noted_failed_at_once_or_taken_back_as_their_events_and_the_upkeep_find_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let now = served.now_ms();
+    // (Two machines AWS took back within minutes of each other, three quarters of an hour ago; one long before.)
+    for ago in [200, 50, 45] { let at = now - ago * 60_000; served.store.0.lock().unwrap().insert(format!("spot:interrupted:{at}:{ago}"), at.to_string()); }
+    let job = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
+    let (a, q) = served.github.queue("a", "superci", now);
+    assert!(served.webhook(q) < 300);
+    assert!(job(a)["state"] == "launched" && job(a)["no_spot"].is_null(), "{}", job(a));
+    let ra = job(a)["runner"].as_str().unwrap().to_string();
+    // Its runner begins a job never told of here.
+    let (untold, _) = served.github.queue("untold", "superci", now);
+    assert!(served.webhook(served.github.start_on(untold, &ra)) < 300);
+    assert!(job(a)["ran"] == untold && job(a)["state"] == "running" && job(untold).is_null(), "{}", job(a));
+
+    // macOS: a runner started to fail it; it ends another job, running on its own machine: that one is left be.
+    let (mac, q) = served.github.queue("mac", "superci/os=macos", now);
+    assert!(served.webhook(q) < 300);
+    assert!(job(mac)["failed_fast"] == true, "{}", job(mac));
+    let failing = served.store.under("runner:").into_iter().find(|(k, v)| k.ends_with("-x") && *v == serde_json::json!(mac)).map(|(k, _)| k.trim_start_matches("runner:").to_string()).expect("its failing runner");
+    let (y, q) = served.github.queue("y", "superci", now);
+    assert!(served.webhook(q) < 300);
+    assert!(served.webhook(served.github.start(y)) < 300);
+    let _ = served.github.start_on(y, &failing);
+    assert!(served.webhook(served.github.finish(y, "failure", "", now)) < 300);
+    assert!(job(y)["state"] == "running" && job(y)["error"].is_null() && served.store.under(&format!("runner:{failing}")).is_empty(), "{}", job(y));
+
+    // Taken back by AWS, already run again: it ends as it ended (not failed for the machine).
+    let (i, q) = served.github.queue("i", "superci", now);
+    assert!(served.webhook(q) < 300);
+    assert!(served.webhook(served.github.start(i)) < 300);
+    let mut taken = job(i);
+    taken["interrupted"] = true.into();
+    taken["rerun"] = serde_json::json!({ "job_id": i, "run_id": taken["run_id"], "repo": "acme/app", "name": "i", "state": "asked", "at_ms": now });
+    served.store.0.lock().unwrap().insert(format!("job:{i}"), taken.to_string());
+    assert!(served.webhook(served.github.finish(i, "failure", "", now)) < 300);
+    assert!(job(i)["state"] == "done" && job(i)["conclusion"] == "failure", "{}", job(i));
+
+    // Kept waiting: one with no label, nowhere to run it now (the containers off); a GitLab one of a connection gone.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare","off":true}]}"#);
+    let waiting = |id: u64, provider: &str, gitlab: &str, label: &str| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "waiting", "provider": provider, "gitlab": gitlab, "label": label,
+        "project_id": superci_testkit::gitlab::PROJECT, "at_ms": now, "installation_id": 42, "cloud": "", "seen_in_progress": false }).to_string();
+    // A machine whose GitHub job ended untold, its runner's name not kept; a GitLab job's, the same.
+    let launched = |id: u64, provider: &str| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "launched", "provider": provider, "gitlab": "", "label": "superci",
+        "project_id": superci_testkit::gitlab::PROJECT, "at_ms": now, "launched_ms": now, "installation_id": 42, "cloud": "cloudflare", "machine_id": format!("machine-{id}"), "runner_id": 7, "seen_in_progress": false }).to_string();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (k, v) in [("job:91", waiting(91, "", "", "")), ("job:glgother-92", waiting(92, "gitlab", "gother", "superci/os=macos")), ("job:93", launched(93, "")), ("job:gl94", launched(94, "gitlab"))] {
+            m.insert(k.into(), v);
+            m.insert(format!("live:{}", k.trim_start_matches("job:")), String::new());
+        }
+        m.insert("gone:93".into(), now.to_string());
+        m.insert("gone:gl94".into(), now.to_string());
+    }
+    served.upkeep();
+    assert!(job(91)["state"] == "failed" && job(91)["failed_fast"] == true && job(91)["error"].as_str().unwrap_or_default().contains("Cloudflare is turned off"), "{}", job(91));
+    let gl = served.store.under("job:glgother-92")[0].1.clone();
+    assert!(gl["state"] == "failed" && gl["error"].as_str().unwrap_or_default().starts_with("nowhere to run"), "{gl}");
+    assert!(job(93)["state"] == "cancelled", "{}", job(93));
+    let gl94 = served.store.under("job:gl94")[0].1.clone();
+    assert!(gl94["state"] == "launched" && !served.store.under("gone:gl94").is_empty(), "{gl94}");
+
+    // macOS past the month's limit ($12.50, $20 spent): said as the limit.
+    let limited = serve(|c| c.routing.monthly_usd = Some(12.5));
+    limited.connect_github();
+    // (Its days' totals read: indexed.)
+    limited.upkeep();
+    let now = limited.now_ms();
+    limited.store.0.lock().unwrap().insert(superci_core::plane::day_key(now / 86_400_000), serde_json::json!({ "hours": [], "spend": { "cloudflare": 20.0 } }).to_string());
+    let (m, q) = limited.github.queue("mac", "superci/os=macos", now);
+    assert!(limited.webhook(q) < 300);
+    let j = limited.store.under(&format!("job:{m}"))[0].1.clone();
+    assert!(j["error"].as_str().unwrap_or_default().contains("reached its limit of $12.50 a month") && j["failed_fast"] == true, "{j}");
+}
+
+/// AWS's machines asked for when AWS will not say which image (spot alone, and with on-demand): tried again, saying
+/// so. A start out of time after spot failed: the next try says so (and one asked on spot again after AWS took a
+/// machine back stays on spot). On-demand alone at the account's limit, a machine of its own ended a moment ago: it
+/// waits for AWS to stop counting that one (asked on spot again or not). An event for a job whose start is under way
+/// starts nothing more. Spot at its limit past the two minutes waited for it: on-demand. A start whose record ended
+/// meanwhile with the very machine given: nothing more to end (another runner on it: that one withdrawn). A GPU
+/// machine without spot room and at the on-demand limit: the on-demand quota said alone.
+#[test]
+fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_so_and_wait() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let routing = |order: &str| served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"default":null,"rules":[],"order":{order}}}"#));
+    let state = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut j = state(id); f(&mut j); served.store.0.lock().unwrap().insert(format!("job:{id}"), j.to_string()); };
+    let fresh = || { served.aws.fail_none(); served.aws.during.lock().unwrap().clear(); served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:") && !k.starts_with("spot:")); served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string()); };
+    let queue = |name: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); assert!(served.webhook(q) < 300); id };
+    // AWS will not say which image: spot alone, then spot and on-demand. Each tried again.
+    fresh();
+    served.aws.fail("DescribeImages", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
+    for (order, name) in [(r#"[{"cloud":"aws"},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]"#, "spot alone"), (r#"[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#, "both")] {
+        routing(order);
+        let id = queue(name);
+        assert!(state(id)["state"] == "waiting" && state(id)["error"].as_str().unwrap_or_default().contains("trying again (us-east-1") && state(id)["error"].as_str().unwrap_or_default().contains("internal error"), "{name}: {}", state(id));
+    }
+    // Spot failing, AWS taking sixteen seconds to say so: out of time before on-demand.
+    fresh();
+    let tick = served.ticker();
+    served.aws.during("RunInstances|MarketType", move || tick(16_000));
+    served.aws.fail("RunInstances|MarketType", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
+    let oot = queue("out of time");
+    assert!(state(oot)["state"] == "waiting" && state(oot)["error"].as_str().unwrap_or_default().contains("out of time for more tries"), "{}", state(oot));
+    // Asked on spot again (on-demand first now, spot having failed it): on-demand full, AWS as slow, out of time before
+    // spot: still asked on spot.
+    served.aws.fail_none();
+    served.aws.during.lock().unwrap().clear();
+    let tick = served.ticker();
+    served.aws.during("RunInstances", move || tick(16_000));
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("InsufficientInstanceCapacity", "no"), None);
+    edit(oot, &|j| j["spot_again"] = true.into());
+    served.later(30_000);
+    served.upkeep();
+    assert!(state(oot)["no_spot"] != true && state(oot)["error"].as_str().unwrap_or_default().contains("out of time"), "{} {}", state(oot)["error"], state(oot)["no_spot"]);
+
+
+    // On-demand alone, at the account's limit, a machine of this control plane's ended a moment ago.
+    fresh();
+    routing(r#"[{"cloud":"aws","off":true},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#);
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("VcpuLimitExceeded", "You have requested more vCPU capacity than your current vCPU limit of 64 allows"), None);
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("job:96".into(), serde_json::json!({ "job_id": 96, "run_id": 1, "repo": "acme/app", "state": "done", "cloud": "aws", "machine_id": "i-0ended", "at_ms": now - 600_000,
+        "ended_ms": now - 30_000, "installation_id": 42, "seen_in_progress": true, "began": true }).to_string());
+    served.store.0.lock().unwrap().insert("live:96".into(), String::new());
+    let limited = queue("at the limit");
+    let still_counted = |id: u64| state(id)["state"] == "waiting" && state(id)["error"].as_str().unwrap_or_default().contains("AWS still counts a machine of yours that ended a moment ago");
+    assert!(still_counted(limited), "{}", state(limited));
+    edit(limited, &|j| j["spot_again"] = true.into());
+    served.upkeep();
+    assert!(still_counted(limited), "{}", state(limited));
+
+    // Its event again while its start is under way: nothing more.
+    let (again, q) = served.github.queue("under way", "superci", served.now_ms());
+    served.store.0.lock().unwrap().insert(format!("job:{again}"), serde_json::json!({ "job_id": again, "run_id": 1, "repo": "acme/app", "state": "launching", "cloud": "", "at_ms": served.now_ms(), "installation_id": 42, "seen_in_progress": false }).to_string());
+    assert!(served.webhook(q) < 300);
+    assert!(state(again)["state"] == "launching" && state(again)["rev"].is_null(), "{}", state(again));
+
+    // Spot refused for the account's spot limit while a spot machine of its own that just ended still counts, and the
+    // two minutes it waits for that over: on-demand.
+    fresh();
+    routing(r#"[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#);
+    served.aws.fail("RunInstances|MarketType", 400, &superci_testkit::ec2_error("MaxSpotInstanceCountExceeded", "Max spot instance count exceeded"), None);
+    served.aws.fail("RunInstances", 200, &started, None);
+    let now = served.now_ms();
+    let (waited, _) = served.github.queue("waited for spot", "superci", now);
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("job:98".into(), serde_json::json!({ "job_id": 98, "run_id": 1, "repo": "acme/app", "state": "done", "cloud": "aws", "machine_id": "i-0spotended", "region": "us-east-1", "at_ms": now - 600_000,
+            "ended_ms": now - 30_000, "installation_id": 42, "seen_in_progress": true, "began": true }).to_string());
+        m.insert(format!("job:{waited}"), serde_json::json!({ "job_id": waited, "run_id": 1, "repo": "acme/app", "state": "waiting", "label": "superci", "cloud": "", "at_ms": now, "installation_id": 42,
+            "seen_in_progress": false, "spot_ending": true, "spot_limit_wait": now - 180_000 }).to_string());
+        for id in [98, waited] { m.insert(format!("live:{id}"), String::new()); }
+    }
+    served.upkeep();
+    assert!(state(waited)["state"] == "launched" && state(waited)["on_demand"] == true && state(waited)["spot_waited_ms"].as_u64().is_some(), "{}", state(waited));
+
+    // Its record ended meanwhile (its job cancelled as its machine was asked for), already saying that very machine:
+    // nothing more to end; and saying another runner too: that one withdrawn.
+    for another_runner in [false, true] {
+        fresh();
+        routing(r#"[{"cloud":"aws-on-demand"},{"cloud":"aws","off":true},{"cloud":"cloudflare","off":true}]"#);
+        served.aws.fail("RunInstances", 200, &started, None);
+        let (id, q) = served.github.queue("ended with its machine", "superci", served.now_ms());
+        let (store, now) = (served.store.0.clone(), served.now_ms());
+        served.aws.during("RunInstances", move || {
+            let mut m = store.lock().unwrap();
+            let k = format!("job:{id}");
+            if let Some(v) = m.get(&k).cloned() {
+                let mut j: serde_json::Value = serde_json::from_str(&v).unwrap();
+                (j["state"], j["ended_ms"], j["machine_id"]) = ("cancelled".into(), now.into(), "i-00000000000000002".into());
+                if another_runner { j["runner"] = "another-runner".into() }
+                j["rev"] = (j["rev"].as_u64().unwrap_or(0) + 1).into();
+                m.insert(k, j.to_string());
+            }
+        });
+        assert!(served.webhook(q) < 300);
+        assert!(state(id)["state"] == "cancelled" && state(id)["machine_id"] == "i-00000000000000002", "{}", state(id));
+    }
+    // A GPU machine: spot refused for want of room, on-demand for the account's limit: what to ask AWS for is the
+    // on-demand quota alone.
+    fresh();
+    served.aws.replaying(include_str!("../fixtures/aws/launch/gpu-on-demand.jsonl"), &[]);
+    routing(r#"[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#);
+    served.aws.fail("RunInstances|MarketType", 400, &superci_testkit::ec2_error("InsufficientInstanceCapacity", "no"), None);
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("VcpuLimitExceeded", "You have requested more vCPU capacity than your current vCPU limit of 0 allows"), None);
+    let (gpu, q) = served.github.queue("train", "superci/gpu=any", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let said = state(gpu)["error"].as_str().unwrap_or_default().to_string();
+    assert!(said.contains("Running On-Demand G and VT instances") && !said.contains("Spot Instance Requests"), "{}", state(gpu));
+}
+
+/// AWS's networks as the control plane's role may read them: refused to the role, the machine starts in the region's
+/// default network and the refusal is noted for the dashboard; refused by the account's organization, not noted (no
+/// permission of the role's would change it); a network of the account's own set wrong, the start fails saying so.
+/// What an ended machine sent, CloudWatch refusing to say: noted as not known, not asked again. A zone noted a day ago
+/// as not offering a type is asked again.
+#[test]
+fn aws_networks_refused_to_the_role_or_by_the_organization_and_traffic_refused_are_said_as_aws_refused_them() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"aws-on-demand"},{"cloud":"aws","off":true},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let state = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
+    let queue = |name: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let denied = || served.store.under("denied:aws:ReadNetwork");
+    // (A zone noted as lacking a type a day and more ago.)
+    served.store.0.lock().unwrap().insert("aws:unoffered:us-east-1:c8a.xlarge:us-east-1f".into(), (served.now_ms() - 2 * 86_400_000).to_string());
+    // Refused to the role.
+    served.aws.fail("RunInstances", 200, &started, None);
+    served.aws.fail("DescribeVpcs", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane/plane is not authorized to perform: ec2:DescribeVpcs because no identity-based policy allows the ec2:DescribeVpcs action"), None);
+    let role = queue("refused to the role");
+    assert!(state(role)["state"] == "launched" && denied().len() == 1, "{} {:?}", state(role), denied());
+    assert!(served.store.under("aws:unoffered:").is_empty(), "asked again");
+    // Refused by the organization (a while on: the default network is looked up again).
+    served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("denied:"));
+    served.aws.fail_none();
+    served.aws.fail("RunInstances", 200, &started, None);
+    served.aws.fail("DescribeVpcs", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane/plane is not authorized to perform: ec2:DescribeVpcs with an explicit deny in a service control policy"), None);
+    served.later(130_000);
+    let org = queue("refused by the organization");
+    assert!(state(org)["state"] == "launched" && denied().is_empty(), "{} {:?}", state(org), denied());
+    // A network of its own with no subnet: said.
+    served.aws.put(&format!("/superci/{PLANE}/AWS_NETWORKS"), r#"{"us-east-1":{"subnets":[],"security_groups":[]}}"#);
+    let own = queue("its own network");
+    assert!(state(own)["error"].as_str().unwrap_or_default().contains("a network of your own needs a subnet and a security group"), "{}", state(own));
+    // What an ended machine sent: CloudWatch refuses to say.
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("job:97".into(), serde_json::json!({ "job_id": 97, "run_id": 1, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "aws", "machine_id": "i-0sent", "region": "us-east-1",
+        "at_ms": now - 3_600_000, "launched_ms": now - 3_600_000, "ended_ms": now - 13 * 60_000, "installation_id": 42, "seen_in_progress": true, "began": true, "cost_usd": 0.1, "cost_from": "prices" }).to_string());
+    served.store.0.lock().unwrap().insert("live:97".into(), String::new());
+    served.aws.fail("monitoring.us-east-1", 400, &superci_testkit::json_error("AccessDeniedException", "User is not authorized to perform: cloudwatch:GetMetricData"), None);
+    served.upkeep();
+    assert_eq!(state(97)["sent_gb"], -1.0, "{}", state(97));
+}
+
+/// AWS's runners connected by the stack's report: with a connect token too short to be one, refused whatever it
+/// says; one whose role cannot see the machine image yet is not connected and its token stays good, so the report
+/// sent again once it can connects it (and only once).
+#[test]
+fn aws_connected_by_the_stacks_report_only_once_its_role_sees_the_image_and_never_with_a_short_token() {
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let report = |served: &superci_testkit::Served, token: &str| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/aws/callback", served.url)).header("content-type", "application/json")
+            .send(serde_json::json!({ "token": token, "accountId": "123456789012", "region": "us-east-1", "roleArn": format!("arn:aws:iam::123456789012:role/superci-plane-{PLANE}") }).to_string()).unwrap();
+        let text = r.body_mut().read_to_string().unwrap_or_default();
+        (r.status().as_u16(), serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+    };
+    let short = serve(|c| { c.aws_connect_token = Some("short".into()); c.aws_region = Some("us-east-1".into()); });
+    assert_eq!(report(&short, "short").0, 403);
+    let served = serve(|c| { c.aws_connect_token = Some("connect-token-for-tests-0002".into()); c.aws_region = Some("us-east-1".into()); });
+    // Its role cannot see the image yet.
+    served.aws.fail("DescribeImages", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation."), None);
+    let (status, said) = report(&served, "connect-token-for-tests-0002");
+    assert!(status == 200 && said["connected"] == false && said["error"].is_string(), "{status} {said}");
+    assert!(served.store.under("aws_token_used").is_empty());
+    // Now it can: connected, once.
+    served.aws.fail_none();
+    let (status, said) = report(&served, "connect-token-for-tests-0002");
+    assert!(status == 200 && said["connected"] == true, "{status} {said}");
+    assert_eq!(report(&served, "connect-token-for-tests-0002").0, 409);
+}
+
+/// The upkeep, for jobs left midway: a start cut off before any machine is placed again; a job that waits with what
+/// an earlier machine left on its record gets a runner of its own name again. Machines left by jobs over are ended
+/// and their runners withdrawn where that can be: a GitLab one whose connection is gone, or that GitLab would not
+/// remove (kept, for the next sweep), a GitHub one of an App not here any more, of an installation GitHub gives no
+/// token for, or with no runner's name kept: each forgotten here all the same.
+#[test]
+fn the_upkeep_places_again_what_was_cut_off_and_forgets_machines_left_whatever_their_runners_say() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let now = served.now_ms();
+    let record = |id: u64, state: &str, provider: &str, gitlab: &str, more: serde_json::Value| {
+        let mut j = serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "provider": provider, "gitlab": gitlab, "label": "superci", "at_ms": now - 180_000, "installation_id": 42, "cloud": "", "seen_in_progress": false });
+        for (k, v) in more.as_object().into_iter().flatten() { j[k] = v.clone() }
+        j.to_string()
+    };
+    let orphan = serde_json::json!({ "cloud": "cloudflare", "machine_id": "m-left", "runner_id": 5 });
+    let with = |extra: serde_json::Value| { let mut o = orphan.clone(); for (k, v) in extra.as_object().into_iter().flatten() { o[k] = v.clone() } o };
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (key, v) in [
+            ("job:88", record(88, "launching", "", "", serde_json::json!({}))),
+            ("job:89", record(89, "waiting", "", "", serde_json::json!({ "machine_id": "m-before", "runner": format!("superci-{PLANE}-89"), "runner_id": 12345 }))),
+            ("job:glggone-1", record(1, "orphan", "gitlab", "ggone", orphan.clone())),
+            ("job:gl3", record(3, "orphan", "gitlab", "", with(serde_json::json!({ "runner_id": 66 })))),
+            ("job:4", record(4, "orphan", "", "", with(serde_json::json!({ "app_id": 9999 })))),
+            ("job:5", record(5, "orphan", "", "", with(serde_json::json!({ "installation_id": 7 })))),
+            ("job:6", record(6, "orphan", "", "", orphan.clone())),
+        ] {
+            m.insert(format!("live:{}", key.trim_start_matches("job:")), String::new());
+            m.insert(key.to_string(), v);
+        }
+        m.insert("glrunner:66".into(), serde_json::json!({ "id": 66, "gitlab": "", "at_ms": now }).to_string());
+    }
+    served.gitlab.fail("DELETE", "/runners/66", 500);
+    served.github.fail("POST", "/app/installations/7/access_tokens", 404, "Not Found");
+    served.upkeep();
+    let job = |key: &str| served.store.under(key).into_iter().find(|(k, _)| k == key).map(|(_, j)| j).unwrap_or_default();
+    assert!(job("job:88")["state"] == "launched" && job("job:88")["retries"] == 1, "{}", job("job:88"));
+    assert!(job("job:89")["state"] == "launched" && job("job:89")["runner_id"] != 12345 && job("job:89")["machine_id"] != "m-before", "{}", job("job:89"));
+    for key in ["job:glggone-1", "job:gl3", "job:4", "job:5", "job:6"] { assert_eq!(job(key)["state"], "swept", "{key}: {}", job(key)) }
+    assert!(!served.store.under("glrunner:66").is_empty(), "GitLab would not remove it: kept");
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

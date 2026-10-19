@@ -123,7 +123,7 @@ impl Config {
     /// The labels as set in the dashboard (a JSON list, the one workflows are shown first): taken when it holds at
     /// least one that can be a label.
     pub fn set_labels(&mut self, json: &str) {
-        let mut set: Vec<String> = serde_json::from_str::<Vec<String>>(json).unwrap_or_default().into_iter().map(|l| l.to_ascii_lowercase()).filter(|l| crate::spec::valid_label(l).is_ok() || l == "superci").collect();
+        let mut set: Vec<String> = serde_json::from_str::<Vec<String>>(json).unwrap_or_default().into_iter().map(|l| l.to_ascii_lowercase()).filter(|l| crate::spec::valid_label(l).is_ok()).collect();
         set.dedup();
         if let Some(first) = set.first().cloned() { self.label = first; self.more_labels = set.split_off(1); }
     }
@@ -662,8 +662,8 @@ fn name_in_names(ci: &str) -> String {
 /// every CI before. Nothing reads a name back by how it begins (a runner is found by the whole name kept with its
 /// job), so a CI given another name just names its next runners by it.
 fn runner_prefix(ci: &str, plane_id: &str) -> String {
-    let named = name_in_names(ci);
-    format!("{}-{plane_id}", if named.is_empty() { "superci" } else { named.as_str() })
+    // (Never empty: a name begins with a letter, and is SuperCI unless set.)
+    format!("{}-{plane_id}", name_in_names(ci))
 }
 
 /// What a job that ran on-demand is told of spot when the account's AWS organization allows none (see `aws::refusal`).
@@ -1359,7 +1359,7 @@ impl<'a> ControlPlane<'a> {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let mut kept = 0;
                 for (key, usd) in body["measured"].as_object().into_iter().flatten() {
-                    let Some(usd) = usd.as_f64().filter(|u| u.is_finite() && (0.0..1000.0).contains(u)) else { continue };
+                    let Some(usd) = usd.as_f64().filter(|u| (0.0..1000.0).contains(u)) else { continue };
                     if !key.starts_with("job:") { continue }
                     let Some(mut j) = get_json::<Job>(self.store, key).await? else { continue };
                     if j.cloud != "cloudflare" || active(&j) { continue }
@@ -1401,7 +1401,8 @@ impl<'a> ControlPlane<'a> {
     /// SuperCI older or newer than it, or a key replaced since), never as nothing being here; a read or run key it
     /// takes, asking for what only a device's key may, said as that; with no key, nothing here.
     fn not_taken(&self, req: &Request) -> Response {
-        if self.reader(req) || self.run_key(req).is_some() { return Response::text(403, "This key reads (a run key also starts runs from a computer): what was asked needs a device's key, from the SuperCI dashboard's computer") }
+        // (A run key is a read key too: `reader` takes it.)
+        if self.reader(req) { return Response::text(403, "This key reads (a run key also starts runs from a computer): what was asked needs a device's key, from the SuperCI dashboard's computer") }
         if req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).is_some_and(|k| k.len() >= 16) { return Response::text(401, &format!("{KEY_REFUSED} (SuperCI {VERSION})")) }
         nothing_here()
     }
@@ -2367,9 +2368,8 @@ impl<'a> ControlPlane<'a> {
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
                 if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month (`superci runners update {cloud} --monthly-usd=N` raises it)", dollars(cap))); continue }
             }
-            if let Some(max) = pool.and_then(|p| p.max_jobs).or(Some(if cloud == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE })) {
-                if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
-            }
+            let max = pool.and_then(|p| p.max_jobs).unwrap_or(if cloud == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE });
+            if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
             // A label that names this provider, and it is not added here: said as it is.
             let Some((capacity, runner)) = runner else {
                 if spec.cloud.is_some() { return Ok(Placement::Fail(format!("its label needs {} runners, which this control plane has not added", cloud_name(spec.cloud.as_deref().unwrap_or(cloud))))) }
@@ -2598,7 +2598,8 @@ impl<'a> ControlPlane<'a> {
         let (mut month, mut day) = (HashMap::new(), HashMap::new());
         for (d, by) in spend {
             for (place, usd) in by {
-                if d >= month_day { *month.entry(place.clone()).or_insert(0.0) += usd }
+                // (Every day `hours` gives is of this month: it is asked from the month's first day on.)
+                *month.entry(place.clone()).or_insert(0.0) += usd;
                 if d == today { *day.entry(place).or_insert(0.0) += usd }
             }
         }
@@ -2854,9 +2855,8 @@ impl<'a> ControlPlane<'a> {
                 let folder = if spec.os() == "windows" { "_work" } else { "/home/runner/work" };
                 // Registered at GitHub on an earlier try that started no machine (it waited for spot): taken out
                 // first, as GitHub takes a runner's name once ("already exists").
-                if job.machine_id.is_none() && job.runner.as_deref() == Some(name.as_str()) && job.runner_id.is_some() {
-                    if let Some(rid) = job.runner_id { let _ = github::delete_runner(self.http, &app.api(), &token, &owner, &job.repo, rid).await; }
-                    job.runner_id = None;
+                if job.machine_id.is_none() && job.runner.as_deref() == Some(name.as_str()) {
+                    if let Some(rid) = job.runner_id.take() { let _ = github::delete_runner(self.http, &app.api(), &token, &owner, &job.repo, rid).await; }
                 }
                 // (Still taken, by a registration this control plane no longer knows of: a name of its own.)
                 let (jit, runner_id) = match github::jit_config(self.http, &app.api(), &token, &owner, &job.repo, &name, &[&label], folder).await {
@@ -2985,7 +2985,8 @@ impl<'a> ControlPlane<'a> {
                             // A job whose files are in memory or on its machine's own disk keeps the layers there
                             // too (the store's folder is bound there with Docker's): no disk of their own, which
                             // would be slower than either.
-                            let on_scratch = spec.scratch.is_some() && spec.os() == "linux";
+                            // (Linux only: AWS's place refuses a RAM disk or a local disk elsewhere, see `Capacity::refuses`.)
+                            let on_scratch = spec.scratch.is_some();
                             let (user_data, set_up, keeps) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, &key, now).await;
                             job.layers = set_up;
                             job.keeps = keeps;
@@ -3079,14 +3080,14 @@ impl<'a> ControlPlane<'a> {
                         let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.ok() }
                             else { aws::spot_price(self.http, &region, Some(&machine.zone), &creds, &machine.kind, spec.os(), now).await.ok() };
                         let cpu = job.cpu.unwrap_or(4);
-                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers && !(spec.scratch.is_some() && spec.os() == "linux")));
+                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers && spec.scratch.is_none()));
                         job.region = Some(region);
                         job.zone = Some(machine.zone).filter(|z| !z.is_empty());
                         job.disk_gb = Some(disk_gb);
                         job.disk_mibs = Some(disk_mibs).filter(|m| *m > DISK_MIBS_INCLUDED);
                         job.disk_iops = Some(disk_iops).filter(|i| *i > DISK_IOPS_INCLUDED);
                         // (In memory as its label asked, or on its machine's own disk: a machine type that has one uses it.)
-                        job.ramdisk = spec.ramdisk() && spec.os() == "linux";
+                        job.ramdisk = spec.ramdisk();
                         job.local_disk = !job.ramdisk && spec.os() == "linux" && machine.kind.split('.').next().is_some_and(|family| family.ends_with('d') && crate::spec::FAMILIES.iter().any(|(f, _)| *f == family));
                         Ok(Tried::Started(machine.id, machine.kind))
                     }.await,
@@ -3133,7 +3134,8 @@ impl<'a> ControlPlane<'a> {
                 self.keep(&key, &*job).await?;
                 return Ok(())
             }
-            if more_spot && started.is_none() { job.spot_rounds += 1; return Err(MORE_SPOT.into()) }
+            // (Never with a machine: more spot pools to ask ends the tries before any starts.)
+            if more_spot { job.spot_rounds += 1; return Err(MORE_SPOT.into()) }
             // Out of time with spot machines refused: the next try starts below them.
             if out_of_time {
                 if !answers.is_empty() && !job.spot_again { job.no_spot = true; job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
@@ -3500,7 +3502,8 @@ impl<'a> ControlPlane<'a> {
             // job now (or for whichever job this machine was for).
             if j.job_id != job_id {
                 if let Some(mut other) = get_json::<Job>(self.store, &format!("job:{job_id}")).await? {
-                    let coming = active(&other) && !other.seen_in_progress;
+                    // (Active: one that is not took this runner's machine above.)
+                    let coming = !other.seen_in_progress;
                     if coming { other.for_job = Some(j.for_job.unwrap_or(j.job_id)) }
                     if coming || !other.began {
                         other.began = true;
@@ -3571,7 +3574,8 @@ impl<'a> ControlPlane<'a> {
             // down on the one before.
             if let (Some(layer), Some(chain)) = (q.get("layer").filter(|n| named(n)), q.get("base")) {
                 let chain: Vec<&str> = chain.split(',').collect();
-                if chain.is_empty() || chain.len() > 16 || !chain.iter().all(|n| named(&n.to_string())) { return Ok(Response::text(400, "say which base and layers")) }
+                // (Never empty: a split gives one name at least, and an empty one is none.)
+                if chain.len() > 16 || !chain.iter().all(|n| named(&n.to_string())) { return Ok(Response::text(400, "say which base and layers")) }
                 for (i, name) in chain.iter().enumerate() {
                     let kept = format!("bases/{name}.tar.gz");
                     let there = aws::s3(self.http, "HEAD", &aws::s3_url(&bucket, &region, &kept), &region, &creds, vec![], &[], now).await.is_ok_and(|r| r.status == 200);
@@ -4512,6 +4516,7 @@ impl<'a> ControlPlane<'a> {
     async fn completed(&self, plane_url: &str, ev: &github::JobEvent) -> Result<()> {
         let (job_id, runner) = (ev.job_id, ev.runner_name.as_deref());
         if let Some(name) = runner.filter(|r| failing_runner(r)) { return self.failed_by_runner(name, job_id).await }
+        // (Only with a runner of this control plane's: with none, it is none below.)
         let mut on_anothers = None;
         if let Some(mut j) = self.by_runner(runner).await? {
             if j.job_id != job_id { on_anothers = Some(j.for_job.unwrap_or(j.job_id)) }
@@ -4549,7 +4554,7 @@ impl<'a> ControlPlane<'a> {
             // Cancelled while waiting for room: nothing was started. (Noted too, for a sweep that listed it a moment
             // ago as waiting and is about to start it from that: it stops there, see `gone_key`.)
             if own.state == "waiting" {
-                if runner.is_none() && on_anothers.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
+                if runner.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
                 own.state = "cancelled".into();
                 own.began = true;
                 own.ended_ms = Some(self.clock.now_ms());
@@ -4558,7 +4563,7 @@ impl<'a> ControlPlane<'a> {
             }
             // Ended before any runner took it (cancelled), with its machine still being asked for: noted for the start
             // that is under way, which stops there or ends the machine it has just been given (see `gone_key`).
-            if own.state == "launching" && runner.is_none() && on_anothers.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
+            if own.state == "launching" && runner.is_none() { let _ = self.store.put(&gone_key(&own), self.clock.now_ms().to_string()).await; }
             if own.state == "launched" && !own.seen_in_progress {
                 // It ran on another job's runner: that job, still queued, is what its own machine is for now. It
                 // ran nowhere (cancelled before a runner took it): its machine is ended now if its runner can be
@@ -4580,7 +4585,7 @@ impl<'a> ControlPlane<'a> {
             } else if own.conclusion != said_before {
                 self.keep(&format!("job:{job_id}"), &own).await?;
             }
-        } else if runner.is_none() && on_anothers.is_none() {
+        } else if runner.is_none() {
             // Ended before this control plane knew of it: GitHub sends a job's events side by side, and the end of
             // one cancelled as it was queued (a newer push took its place) can arrive first. Noted, so that its
             // queued event, a moment behind, starts nothing (see `gone_key`).
