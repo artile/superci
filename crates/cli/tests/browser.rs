@@ -2423,6 +2423,25 @@ fn a_second_control_plane_given_a_code_host_of_its_own_makes_two_cis_listed_and_
     // The dashboard, naming neither: the list of them, to open one.
     b.goto(&link);
     b.wait(&format!("{} && {} && {}", shows("Control planes"), reads("GitHub: acme · AWS · 111111111111"), reads("GitLab: gitlab.com · Cloudflare · Acme")));
+    // A command naming neither, or naming it, goes to the one this computer keeps; naming the other, which this
+    // computer does not keep, is refused saying which it would have acted on.
+    let cli = |args: &[&str]| { let o = common::command(&home).args(args).output().unwrap(); (o.status.code(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))) };
+    for args in [&["jobs", "list"][..], &["jobs", "list", &format!("--plane={PLANE}")]] {
+        let (code, said) = cli(args);
+        assert!(code == Some(0), "{args:?}: {code:?} {said}");
+    }
+    let (code, said) = cli(&["jobs", "list", "--plane=cfplane00003"]);
+    assert!(code != Some(0) && said.contains("which is not among the control planes here") && said.contains("Nothing was done"), "{code:?} {said}");
+    // A computer that keeps none, signed in where its clouds list none: said so, with how to set one up.
+    let fresh = home.with_extension("fresh");
+    std::fs::create_dir_all(fresh.join("workspaces/default")).unwrap();
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+    for k in ["plane", "key", "planes_more"] { kept.as_object_mut().unwrap().remove(k); }
+    std::fs::write(fresh.join("workspaces/default/sign-ins.json"), kept.to_string()).unwrap();
+    std::fs::copy(home.join("aws-at"), fresh.join("aws-at")).unwrap();
+    let o = common::command(&fresh).args(["jobs", "list"]).output().unwrap();
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("There is no control plane yet"), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&fresh);
     // The GitLab one stops answering: no longer a live CI, the dashboard opens the other; the list (asked for) says
     // which does not answer. Answering again, as before.
     cf.down.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2431,6 +2450,9 @@ fn a_second_control_plane_given_a_code_host_of_its_own_makes_two_cis_listed_and_
     b.wait(&shows("Usage"));
     b.goto(&format!("{link}&p=all"));
     b.wait(&reads("Not answering"));
+    // (A command then goes to the one answering.)
+    let (code, said) = cli(&["jobs", "list"]);
+    assert!(code == Some(0), "{code:?} {said}");
     cf.down.store(false, std::sync::atomic::Ordering::SeqCst);
     b.goto(&link);
     b.wait(&format!("{} && {}", shows("Control planes"), reads("GitLab: gitlab.com · Cloudflare · Acme")));
