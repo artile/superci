@@ -10544,6 +10544,8 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["accounts", "update", "aws", "--budget=stops", "--monthly-usd=10", "--email=ops@example.com", "--dry-run"], vec!["accounts", "retrieve", "aws"],
         vec!["images", "list"], vec!["images", "create", "--region=mars-1", "--dry-run"], vec!["images", "create", "--region=eu-west-1", "--dry-run"], vec!["images", "update", "--dry-run"], vec!["images", "update", "--region=mars-1"],
         vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=nope"], vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=a/b/c"], vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=o/n!"],
+        vec!["deliveries", "retrieve"], vec!["planes", "move"], vec!["runners", "order"], vec!["runners", "order", "aws"], vec!["runners", "update", "aws"], vec!["runners", "update", "aws", "--networks=none", "--dry-run"],
+        vec!["connections", "create", "github"], vec!["jobs", "list", "--run="], vec!["runs", "nothing"], vec!["nothing"],
         vec!["deliveries", "list"], vec!["deliveries", "retrieve", "abc"], vec!["deliveries", "retrieve", "123"], vec!["usage", "retrieve"],
         vec!["labels", "create", "ubuntu"], vec!["labels", "create", "a"], vec!["labels", "create", "9ab"], vec!["labels", "create", "ab_c"],
         vec!["workspaces", "create", "Ab", "--dry-run"], vec!["workspaces", "create", "x"], vec!["workspaces", "create", "Ab  c"], vec!["workspaces", "create", "Ab-"], vec!["workspaces", "create", "9ab"],
