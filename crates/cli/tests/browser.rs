@@ -723,6 +723,31 @@ fn the_aws_account_section_and_its_regions_say_what_more_kinds_of_account_allow(
     }
 }
 
+/// The runner image asked into the regions that lack it, as AWS answered such a copy: into both of them (said of
+/// both), and into an account that has it nowhere yet (said as on its way).
+#[test]
+fn the_runner_image_asked_into_every_region_without_it_or_into_an_account_with_none_is_said_as_on_its_way() {
+    let no_images = "<DescribeImagesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>00000000-0000-4000-8000-000000000001</requestId><imagesSet/></DescribeImagesResponse>";
+    for nowhere in [false, true] {
+        let served = serve(|_| {});
+        if nowhere { for r in superci_core::page::REGIONS.iter().filter(|r| **r != "ca-central-1") { served.aws.fail(&format!("DescribeImages|ec2.{r}."), 200, no_images, None) } }
+        let home = signed_in(&served);
+        let (_child, link) = dashboard(&home);
+        let page = || common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+        until("the account looked at", || { let p = page(); p.contains("Runner image") && !p.contains("Asking AWS") });
+        let regions: &[&str] = if nowhere { &["ca-central-1"] } else { &["ca-central-1", "eu-north-1"] };
+        for r in regions {
+            served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[("ca-central-1", r)]);
+            let (status, _, said) = common::post(&link, "/aws/image", &[("account", "111111111111"), ("region", r), ("next", "?p=planes")]);
+            assert!(status < 400, "{r}: {status} {}", common::words(&said));
+        }
+        let said = page();
+        if nowhere { assert!(said.contains("It is being copied in: about ten minutes."), "{said}") }
+        else { assert!(said.contains("It is being copied into Canada, Stockholm: about ten minutes. Then they can be added as a region on Runners.") && !said.contains("Copy into"), "{said}") }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
