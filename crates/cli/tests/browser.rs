@@ -6747,7 +6747,8 @@ mod runs_suite_in_browser {
             ("B_STAR", Some("release/*"), None, true), ("B_ONE_STAR", Some("*"), None, false), ("B_TWO_STARS", Some("**"), None, true), ("B_QUESTION", Some("release/v?.?-rc"), None, true),
             ("B_RANGE", Some("release/v[0-9].[2-3]-rc"), None, true), ("B_SET", Some("release/v[abc].2-rc"), None, false), ("B_ONE", Some("release/v[1].2-rc"), None, true),
             ("B_EMPTY_CLASS", Some("release/[]x"), None, false), ("B_OPEN", Some("release/[v1.2-rc"), None, false), ("B_DASH", Some("release/v1.2[-c]rc"), None, true),
-            ("B_EXACT", Some("release/v1.2-rc"), None, true), ("B_LONGER", Some("release/v1.2-rc/x"), None, false), ("B_OTHER", Some("main"), None, false),
+            ("B_EXACT", Some("release/v1.2-rc"), None, true), ("B_ONE_MORE", Some("release/v1.2-rc?"), None, false), ("B_CLASS_AFTER", Some("release/v1.2-rc[x]"), None, false),
+            ("B_OUT_OF_RANGE", Some("release/v1.2-r[d-f]"), None, false), ("B_LITERAL_CLASS", Some("release/[v]1.2-rc"), None, true), ("B_LONGER", Some("release/v1.2-rc/x"), None, false), ("B_OTHER", Some("main"), None, false),
             ("W_NAME", None, Some("named.yml"), true), ("W_PATH", None, Some(".github/workflows/n*.yml"), true), ("W_ANY", None, Some("**/named.yml"), true), ("W_OTHER", None, Some("deploy.yml"), false),
         ];
         for (name, branch, workflow, _) in &patterns {
@@ -10591,7 +10592,8 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         // Labels, its name, the default machine, limits: nothing given, defaults, what does not hold.
         vec!["labels", "create"], vec!["labels", "create", "acmeci-big"], vec!["labels", "list"], vec!["labels", "delete", "acmeci-big", "--confirm"], vec!["labels", "delete"],
         vec!["name", "update"], vec!["name", "update", "Acme CI", "--dry-run"], vec!["name", "update", "a<b>"], vec!["name", "update", &long_x], vec!["name", "update", " "],
-        vec!["-h"], vec!["-V"], vec!["--weird"], vec!["runs", "-h"], vec!["secrets", "create"], vec!["secrets", "delete", "NOPE", "--confirm", "--dry-run"], vec!["caches", "update"], vec!["caches", "update", "--days=5", "--dry-run"],
+        vec!["-h"], vec!["-V"], vec!["--weird"], vec!["runs", "-h"], vec!["secrets", "create"], vec!["secrets", "delete", "NOPE", "--confirm", "--dry-run"], vec!["secrets", "create", "   ", "--value-env=HOME"], vec!["secrets", "create", "SCOPED", "--value-env=HOME", "--repo=acme/"],
+        vec!["secrets", "create", "SCOPED", "--value-env=HOME", "--repo=acme/a b"], vec!["secrets", "create", "SCOPED", "--value-env=HOME", "--repo=acme/app/x"], vec!["caches", "update"], vec!["caches", "update", "--days=5", "--dry-run"],
         vec!["keys", "list"], vec!["keys", "delete"], vec!["keys", "delete", "somekey", "--confirm", "--dry-run"], vec!["keys", "delete", "DEVICE_KEY_x", "--confirm"], vec!["limits", "update", "--max-cpu=8", "--daily-usd=5", "--dry-run"],
         vec!["accounts", "update", "aws", "--budget=sometimes"], vec!["accounts", "update", "aws", "--budget=emails", "--monthly-usd=50"], vec!["accounts", "update", "gcp", "--monthly-usd=5"],
         vec!["accounts", "update", "aws", "--budget=stops", "--monthly-usd=10", "--email=ops@example.com", "--dry-run"], vec!["accounts", "retrieve", "aws"],
