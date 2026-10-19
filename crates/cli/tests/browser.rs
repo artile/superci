@@ -3649,6 +3649,89 @@ fn gitlab_events_logs_runners_and_webhooks_are_read_as_gitlab_answers_them_each_
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Keys and signatures as they come: an App's key in PKCS#1 (as GitHub gives it) signs its requests; an App kept with
+/// no webhook secret takes no event; GitHub's key set naming an EC key where a job's token wants an RSA one, refused;
+/// a runner role whose policy IAM gives back with one-item lists, as having what it should.
+#[test]
+fn keys_signatures_and_policies_are_taken_in_each_form_their_issuers_give_them() {
+    // The App's key as GitHub gives it.
+    let served = serve(|_| {});
+    let mut openssl = std::process::Command::new("openssl").args(["rsa", "-traditional"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().expect("openssl");
+    { use std::io::Write; openssl.stdin.take().unwrap().write_all(superci_testkit::GitHub::app()["pem"].as_str().unwrap().as_bytes()).unwrap(); }
+    let pkcs1 = String::from_utf8(openssl.wait_with_output().unwrap().stdout).unwrap();
+    assert!(pkcs1.contains("BEGIN RSA PRIVATE KEY"), "{pkcs1}");
+    let mut app = superci_testkit::GitHub::app();
+    app["pem"] = pkcs1.into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &app.to_string());
+    let (id, q) = served.github.queue("test", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(job["state"] == "launched" && job["runner_id"].is_u64(), "its runner registered with a token the App's key asked for: {job}");
+    // An App kept with no webhook secret: nothing signed with it is taken.
+    app["webhook_secret"] = "".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &app.to_string());
+    let (_, q) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(q), 401);
+    // GitHub's key set with an EC key where the token names none: not GitHub's job's token.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    let link = "machine-cache-link-000000000011";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner" }).to_string());
+    served.github.answer_with("GET", "/.well-known/jwks", 200, &[], r#"{"keys":[{"kty":"EC","crv":"P-256","x":"AA","y":"AA"}]}"#);
+    let token = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "197814629", "ac": "[]", "exp": 4_102_444_800u64 }));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let mut r = agent.post(&format!("{}/cache/{link}/lookup", served.url)).send(serde_json::json!({ "token": token, "key": "deps", "version": "c".repeat(64) }).to_string()).unwrap();
+    let said: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+    assert_eq!(said["why"], "signed by a key not in the set", "{said}");
+    served.github.fail_none();
+    // The runner role's policy as IAM gives it back, each one-item list as a list: it has what it should.
+    let mut policy = superci_core::permissions::aws_runner_policy(superci_testkit::ACCOUNT, PLANE);
+    for s in policy["Statement"].as_array_mut().unwrap() { for k in ["Action", "Resource"] { if s[k].is_string() { s[k] = serde_json::json!([s[k].clone()]) } } }
+    let encoded: String = url::form_urlencoded::byte_serialize(policy.to_string().as_bytes()).collect();
+    served.aws.fail("GetRolePolicy", 200, &format!("<GetRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><GetRolePolicyResult><PolicyName>runner-machines</PolicyName><RoleName>superci-plane-{PLANE}</RoleName><PolicyDocument>{encoded}</PolicyDocument></GetRolePolicyResult></GetRolePolicyResponse>"), None);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let home = signed_in(&served);
+    let (_, said) = common::json(&home, &["planes", "allow", "--dry-run"]);
+    served.aws.fail_none();
+    assert!(said["lacks"].as_array().is_some_and(|l| l.iter().all(|n| n["id"] != "Ec2Run" && n["id"] != "RunMachines")) && said["lacks"].as_array().is_some_and(|l| l.len() <= 1), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Runs asked for by the API, their runners served as GitHub's runner is: a secret with what a pattern reads as its
+/// own (masked as it is), a run with no working tree (its checkout fetches nothing) and one layered on a base (its
+/// checkout unpacks each part on the one before); the runner ending its session, and sending no lines at all.
+#[test]
+fn a_runs_runner_is_given_its_masks_and_checkout_as_its_tree_was_sent_and_its_session_ended() {
+    let served = serve(|_| {});
+    let workflow = "jobs:\n  t:\n    runs-on: superci\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo ${{ secrets.ODD }}\n";
+    let mut checkouts = vec![];
+    for (tree, layered) in [(None, false), (Some("tree-0123456789abcdef0123"), true)] {
+        let before: Vec<String> = served.store.under("run:").into_iter().map(|(k, _)| k).collect();
+        let mut body = serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main", "secrets": [["ODD", "a.b(c)*[d]{e}|f^g$h?+\\"]] });
+        if let Some(t) = tree { (body["tree"], body["parts"], body["layered"]) = (t.into(), 2.into(), layered.into()) }
+        let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
+        assert!(r.status().as_u16() < 300, "{}", r.body_mut().read_to_string().unwrap_or_default());
+        let run = served.store.under("run:").into_iter().map(|(k, _)| k).find(|k| !before.contains(k)).unwrap().trim_start_matches("run:").to_string();
+        let runner = loop { if let Some(r) = superci_testkit::Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let handed = runner.handed(&served);
+        assert!(handed["mask"].as_array().unwrap().iter().any(|m| m["value"] == "a\\.b\\(c\\)\\*\\[d\\]\\{e\\}\\|f\\^g\\$h\\?\\+\\\\"), "{}", handed["mask"]);
+        let base = runner.at.split("/_apis/").next().unwrap().to_string();
+        let gz = ureq::get(&format!("{base}/superci/checkout.tar.gz")).call().unwrap().body_mut().read_to_vec().unwrap();
+        let mut unzip = std::process::Command::new("gzip").arg("-dc").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        { use std::io::Write; unzip.stdin.take().unwrap().write_all(&gz).unwrap(); }
+        checkouts.push(String::from_utf8_lossy(&unzip.wait_with_output().unwrap().stdout).to_string());
+        // The runner sends no lines (an empty post), and ends its session.
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let status = agent.put(&format!("{}/TimeLineWebConsoleLog/scope/hub/plan/timeline/step", runner.at)).send(serde_json::json!({ "value": [] }).to_string()).unwrap().status().as_u16();
+        assert!(status < 300, "{status}");
+        assert!(agent.delete(&format!("{}/AgentSession/scope/hub/1", runner.at)).call().unwrap().status().as_u16() < 300);
+    }
+    assert!(!checkouts[0].contains("fetch()") && checkouts[0].contains("git init"), "nothing to fetch: {}", checkouts[0]);
+    assert!(checkouts[1].contains("--ignore-zeros") && checkouts[1].contains(".superci-removed"), "each part on the one before: {}", checkouts[1]);
+}
+
 #[test]
 fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

@@ -242,7 +242,8 @@ fn tar(files: &[(&str, &[u8])]) -> Vec<u8> {
         h
     };
     let folder = files.first().and_then(|(n, _)| n.split_once('/')).map(|(f, _)| format!("{f}/")).unwrap_or_default();
-    if !folder.is_empty() { out.extend_from_slice(&header(&folder, 0, b'5', "0000755")) }
+    // (Its one caller puts its files in a folder.)
+    out.extend_from_slice(&header(&folder, 0, b'5', "0000755"));
     for (name, data) in files {
         out.extend_from_slice(&header(name, data.len(), b'0', "0000644"));
         out.extend_from_slice(data);
@@ -255,7 +256,8 @@ fn tar(files: &[(&str, &[u8])]) -> Vec<u8> {
 /// Gzip of these bytes, not compressed (stored blocks): what an action of a few kilobytes needs.
 fn gzip_stored(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
-    let chunks: Vec<&[u8]> = if data.is_empty() { vec![&[][..]] } else { data.chunks(65_535).collect() };
+    // (Never empty: a tar is a kilobyte at least.)
+    let chunks: Vec<&[u8]> = data.chunks(65_535).collect();
     for (i, c) in chunks.iter().enumerate() {
         out.push(if i + 1 == chunks.len() { 1 } else { 0 });
         let len = c.len() as u16;
