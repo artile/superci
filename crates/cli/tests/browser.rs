@@ -5218,6 +5218,118 @@ fn jobs_from_before_their_indexes_and_run_counts_are_indexed_then_their_runs_cou
     assert!(month["runs"] == 80 && month["usd"].as_f64().is_some_and(|u| u >= 1.5), "{month}");
 }
 
+/// The upkeep, of what it keeps for a while: AWS jobs over days ago (what they sent counted, or too late to be) leave
+/// the live ones; a launch template left days ago is given up on, a newer one kept; a run's working tree of yesterday
+/// forgotten. A machine that never began its job and is tried again with its place full waits for room; one begun keeps
+/// on. AWS refusing this control plane's sign-in: the cache's and the layers' upkeep say why, the rest goes on.
+#[test]
+fn the_upkeep_forgets_what_is_past_waits_a_job_tried_again_for_room_and_says_why_the_caches_upkeep_failed() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let now = served.now_ms();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let over = |id: u64, sent: Option<f64>| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "aws", "at_ms": now - 3 * 86_400_000,
+            "ended_ms": now - 3 * 86_400_000 + 60_000, "installation_id": 42, "seen_in_progress": true, "began": true, "cost_from": "estimate", "sent_gb": sent }).to_string();
+        m.insert("job:81".into(), over(81, Some(0.5)));
+        m.insert("job:82".into(), over(82, None));
+        for id in [81, 82] { m.insert(format!("live:{id}"), String::new()); }
+        m.insert("aws:template:us-east-1:superci-lt-old".into(), (now - 2 * 86_400_000).to_string());
+        m.insert("aws:template:us-east-1:superci-lt-new".into(), (now - 60_000).to_string());
+        m.insert("rtree-at:tree0001".into(), (now - 2 * 86_400_000).to_string());
+        m.insert("rtree:tree0001:00000".into(), "\"part\"".into());
+        m.insert("rtree-at:tree0002".into(), (now - 60_000).to_string());
+    }
+    // A job running, and one whose machine never began it.
+    let (a, q) = served.github.queue("first", "superci", now);
+    assert!(served.webhook(q) < 300);
+    assert!(served.webhook(served.github.start(a)) < 300);
+    let (b, q) = served.github.queue("second", "superci", now);
+    assert!(served.webhook(q) < 300);
+    let job = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
+    assert!(job(a)["state"] == "running" && job(b)["state"] == "launched", "{} {}", job(a), job(b));
+    // One at once on Cloudflare from now on.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":null,"rules":[],"order":[{"cloud":"cloudflare","max_jobs":1}]}"#);
+    served.later(4 * 60_000);
+    served.upkeep();
+    assert!(served.store.under("live:81").is_empty() && served.store.under("live:82").is_empty(), "past caring for");
+    let templates: Vec<String> = served.store.under("aws:template:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(templates, vec!["aws:template:us-east-1:superci-lt-new".to_string()]);
+    assert!(served.store.under("rtree:tree0001").is_empty() && served.store.under("rtree-at:tree0001").is_empty() && !served.store.under("rtree-at:tree0002").is_empty());
+    assert!(job(a)["state"] == "running", "{}", job(a));
+    assert!(job(b)["state"] == "waiting" && job(b)["error"].as_str().unwrap_or_default().contains("runs 1 at once") && job(b)["retries"] == 1, "{}", job(b));
+
+    // AWS connected by a role it will not let this control plane take: the cache's and layers' upkeep say so.
+    let refused = serve(|_| {});
+    let now = refused.now_ms();
+    {
+        let mut m = refused.store.0.lock().unwrap();
+        m.insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": "arn:aws:iam::111111111111:role/superci-testplane0001", "connected": true }).to_string());
+        m.insert("artifact:333:report".into(), serde_json::json!({ "id": "report", "region": "us-east-1", "size": 3, "made": now, "done": true, "pieces": [["p00000", 3]] }).to_string());
+        m.insert("aws:template:us-east-1:superci-lt-old".into(), (now - 2 * 86_400_000).to_string());
+        // (Just moved here: looked after every minute, for a while.)
+        m.insert("claimed_at".into(), now.to_string());
+    }
+    refused.github.fail("GET", "sts.us-east-1.amazonaws.com", 403, "not authorized to perform sts:AssumeRoleWithWebIdentity");
+    refused.upkeep();
+    let said = |k: &str| refused.store.under(k).into_iter().next().map(|(_, v)| v.to_string()).unwrap_or_default();
+    assert!(said("cache-sweep-error").contains("sts:AssumeRoleWithWebIdentity") && said("layers-sweep-error").contains("sts:AssumeRoleWithWebIdentity"), "{} {}", said("cache-sweep-error"), said("layers-sweep-error"));
+    assert!(refused.store.under("aws:template:").is_empty(), "given up on after a day");
+}
+
+/// GitLab's jobs as the upkeep finds them when GitLab's events do not come: one its runner holds but has not begun
+/// stays as it is; begun, it is running (its runner's record gone meanwhile, or already saying what it runs: kept as
+/// it says); a job no event told of is given a machine once it has waited a while (not one made a moment ago), and
+/// GitLab is not asked again within three minutes. A job of a connection not this one's is left to that one.
+#[test]
+fn gitlabs_jobs_untold_are_found_by_the_upkeep_begun_or_given_a_machine_once_they_have_waited_a_while() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    // Its project sends its jobs here.
+    let on = agent.post(&format!("{}/gitlab/projects", served.url)).header("authorization", &format!("Bearer {}", served.key)).send(serde_json::json!({ "gitlab": "", "id": superci_testkit::gitlab::PROJECT, "enabled": true }).to_string()).unwrap().status().as_u16();
+    assert_eq!(on, 200);
+    let job = |id: u64| served.store.under(&format!("job:gl{id}")).into_iter().find(|(k, _)| *k == format!("job:gl{id}")).map(|(_, j)| j).unwrap_or_default();
+    let (a, p) = served.gitlab.pending("held", &["superci"], served.now_ms());
+    assert_eq!(served.gitlab_webhook(p), 200);
+    let (b, p) = served.gitlab.pending("said", &["superci"], served.now_ms());
+    assert_eq!(served.gitlab_webhook(p), 200);
+    let (ra, rb) = (job(a)["runner_id"].as_u64().unwrap(), job(b)["runner_id"].as_u64().unwrap());
+    // A job of another connection's (not connected here any more).
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("job:glgother-5".into(), serde_json::json!({ "job_id": 5, "run_id": 1, "repo": "acme/app", "state": "running", "provider": "gitlab", "gitlab": "gother",
+        "project_id": superci_testkit::gitlab::PROJECT, "runner_id": 99, "at_ms": now, "installation_id": 0, "cloud": "cloudflare", "seen_in_progress": true }).to_string());
+    served.store.0.lock().unwrap().insert("live:glgother-5".into(), String::new());
+    // a: its runner has it, not begun. b: begun, its runner's record already saying what it runs. And c, never told of.
+    served.gitlab.set(a, "runner", serde_json::json!({ "id": ra }));
+    served.gitlab_webhook(served.gitlab.running_on(b, rb, served.now_ms()));
+    let said_b = served.store.under(&format!("glrunner:{rb}"))[0].1["running"].clone();
+    let (c, _) = served.gitlab.pending("untold", &["superci"], served.now_ms());
+    served.upkeep();
+    assert!(job(a)["state"] == "launched" && job(a)["seen_in_progress"] == false, "{}", job(a));
+    assert!(job(c).is_null(), "made a moment ago: its event may be on its way");
+    // A while on: begun on GitLab (a's runner record gone meanwhile); c given a machine.
+    served.later(200_000);
+    served.gitlab.set(a, "status", "running".into());
+    served.gitlab.set(a, "started_at", "2026-10-19T10:00:00.000Z".into());
+    served.store.0.lock().unwrap().remove(&format!("glrunner:{ra}"));
+    served.gitlab.set(b, "status", "running".into());
+    // (Its own word that it began, lost.)
+    let mut lost = job(b);
+    (lost["state"], lost["seen_in_progress"]) = ("launched".into(), false.into());
+    served.store.0.lock().unwrap().insert(format!("job:gl{b}"), lost.to_string());
+    served.upkeep();
+    assert!(job(a)["state"] == "running" && job(a)["started_ms"].as_u64().is_some(), "{}", job(a));
+    assert!(job(b)["state"] == "running" && served.store.under(&format!("glrunner:{rb}"))[0].1["running"] == said_b, "{}", job(b));
+    assert!(job(c)["state"] == "launched", "{}", job(c));
+    assert!(served.store.under("job:glgother-5")[0].1["state"] == "running", "another connection's, left");
+    // Asked again within three minutes: GitLab is not.
+    let asked = served.store.under("gitlab:untold")[0].1.clone();
+    served.later(60_000);
+    served.upkeep();
+    assert_eq!(served.store.under("gitlab:untold")[0].1, asked);
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
