@@ -543,6 +543,55 @@ fn sign_ins_written_elsewhere_are_taken_in_only_where_this_dashboard_holds_none_
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Other CIs found in the AWS accounts signed in to are listed once each (two accounts' sign-ins both seeing them),
+/// with whose jobs each runs as kept in AWS; one that moved away is another CI all the same; one whose name AWS does
+/// not give is listed by its id; and a workspace on this computer with no CI yet is not one to open them in.
+#[test]
+fn other_cis_found_in_aws_are_listed_once_each_with_whose_jobs_they_run_and_by_id_when_unnamed() {
+    let role = |name: &str, description: &str| format!("<member><Path>/</Path><RoleName>{name}</RoleName><RoleId>AROAEXAMPLE{:09}</RoleId><Arn>arn:aws:iam::111111111111:role/{name}</Arn><CreateDate>2026-10-18T10:00:00Z</CreateDate><Description>{description}</Description><MaxSessionDuration>3600</MaxSessionDuration></member>", name.len());
+    let roles = |members: &[String]| format!("<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{}</Roles></ListRolesResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ResponseMetadata></ListRolesResponse>", members.concat());
+    let served = serve(|_| {});
+    served.connect_github();
+    // One that moved away (it serves no code host itself now), whose jobs were GitHub's and GitLab's.
+    let moved = superci_testkit::serve_as("otherci000001", |_| {});
+    moved.store.0.lock().unwrap().insert("moved_to".into(), "https://next.example".into());
+    served.aws.put("/superci/otherci000001/OWNERS", "github:globex,gitlab:gitlab.com");
+    served.aws.put("/superci/otherci000001/NAME", "GlobexCI");
+    // And one that does not answer, whose name AWS refuses to give.
+    served.aws.fail("AmazonSSM.GetParameters|otherci000002", 400, &superci_testkit::json_error("AccessDeniedException", "not authorized to perform: ssm:GetParameters"), None);
+    served.aws.fail("ListRoles", 200, &roles(&[role(&format!("superci-plane-{PLANE}"), &format!("Runs the SuperCI control plane {} (Lambda, us-east-1, runs-on superci).", served.url)),
+        role("superci-plane-otherci000001", &format!("Runs the SuperCI control plane {} (Lambda, us-east-1, runs-on globex).", moved.url)),
+        role("superci-plane-otherci000002", "Runs the SuperCI control plane https://otherci2.example (Lambda, us-east-1, runs-on initech).")]), None);
+    let home = signed_in(&served);
+    // A second account signed in, whose listing (the same stand-in's) holds the same ones.
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut second = kept["aws"].clone();
+    second["account_id"] = "222222222222".into();
+    kept["aws_more"] = serde_json::json!([second]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    // A workspace with nothing yet beside it.
+    std::fs::create_dir_all(home.join("workspaces/globex")).unwrap();
+    std::fs::write(home.join("workspaces/globex/sign-ins.json"), "{}").unwrap();
+    let (child, link) = dashboard(&home);
+    let listed = |link: &str, w: &str, until: &str| { let mut page = String::new(); for _ in 0..40 { page = common::words(&common::part(link, &format!("/?p=planes&w={w}&fragment=1")).1); if page.contains(until) { break } std::thread::sleep(std::time::Duration::from_millis(300)) } page };
+    let page = listed(&link, "default", "otherci000002");
+    assert!(page.contains("Other CIs in your signed-in accounts") && page.contains("GlobexCI") && page.contains("GitHub globex, GitLab gitlab.com") && page.contains("A CI (otherci000002)"), "{page}");
+    assert_eq!(page.matches("GlobexCI").count(), 1, "{page}");
+    assert!(!page.contains("Open globex") && page.contains("Another CI"), "{page}");
+    drop(child);
+    // A workspace with no CI of its own, Cloudflare not answering: what was found in AWS is offered all the same.
+    let mut theirs = kept.clone();
+    for k in ["plane", "planes_more", "key", "aws_more"] { theirs.as_object_mut().unwrap().remove(k); }
+    theirs["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(home.join("workspaces/globex/sign-ins.json"), theirs.to_string()).unwrap();
+    served.aws.fail("api.cloudflare.com", 503, r#"{"success":false,"errors":[{"code":10000,"message":"Service Unavailable"}]}"#, None);
+    let (_child, link) = dashboard(&home);
+    let page = listed(&link, "globex", "Use this one");
+    assert!(page.contains("CIs in your signed-in accounts") && page.contains("Use this one"), "{page}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
