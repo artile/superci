@@ -5574,7 +5574,8 @@ fn jobs_off_the_usual_way_are_noted_failed_at_once_or_taken_back_as_their_events
 /// machine back stays on spot). On-demand alone at the account's limit, a machine of its own ended a moment ago: it
 /// waits for AWS to stop counting that one (asked on spot again or not). An event for a job whose start is under way
 /// starts nothing more. Spot at its limit past the two minutes waited for it: on-demand. A start whose record ended
-/// meanwhile with the very machine given: nothing more to end (another runner on it: that one withdrawn).
+/// meanwhile with the very machine given: nothing more to end (another runner on it: that one withdrawn). A GPU
+/// machine without spot room and at the on-demand limit: the on-demand quota said alone.
 #[test]
 fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_so_and_wait() {
     let served = serve(|c| {
@@ -5679,6 +5680,17 @@ fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_
         assert!(served.webhook(q) < 300);
         assert!(state(id)["state"] == "cancelled" && state(id)["machine_id"] == "i-00000000000000002", "{}", state(id));
     }
+    // A GPU machine: spot refused for want of room, on-demand for the account's limit: what to ask AWS for is the
+    // on-demand quota alone.
+    fresh();
+    served.aws.replaying(include_str!("../fixtures/aws/launch/gpu-on-demand.jsonl"), &[]);
+    routing(r#"[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#);
+    served.aws.fail("RunInstances|MarketType", 400, &superci_testkit::ec2_error("InsufficientInstanceCapacity", "no"), None);
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("VcpuLimitExceeded", "You have requested more vCPU capacity than your current vCPU limit of 0 allows"), None);
+    let (gpu, q) = served.github.queue("train", "superci/gpu=any", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let said = state(gpu)["error"].as_str().unwrap_or_default().to_string();
+    assert!(said.contains("Running On-Demand G and VT instances") && !said.contains("Spot Instance Requests"), "{}", state(gpu));
 }
 
 /// AWS's networks as the control plane's role may read them: refused to the role, the machine starts in the region's

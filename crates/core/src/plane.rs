@@ -3134,7 +3134,8 @@ impl<'a> ControlPlane<'a> {
                 self.keep(&key, &*job).await?;
                 return Ok(())
             }
-            if more_spot && started.is_none() { job.spot_rounds += 1; return Err(MORE_SPOT.into()) }
+            // (Never with a machine: more spot pools to ask ends the tries before any starts.)
+            if more_spot { job.spot_rounds += 1; return Err(MORE_SPOT.into()) }
             // Out of time with spot machines refused: the next try starts below them.
             if out_of_time {
                 if !answers.is_empty() && !job.spot_again { job.no_spot = true; job.spot_refused = Some(answers.join("; ").chars().take(300).collect()) }
