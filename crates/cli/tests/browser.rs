@@ -1041,6 +1041,13 @@ fn what_settings_forms_must_not_take_is_refused_or_left_out_and_nothing_else_cha
         post(&mut b, "/routing", &[("action", "monthly_usd"), ("usd", usd)]);
         until("the limit left out", || routing().get("monthly_usd").is_none_or(|v| v.is_null()));
     }
+    // An account's limit that is no amount: none kept for it; a budget's address with a space in it refused.
+    for usd in ["-5", "inf"] {
+        post(&mut b, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", usd)]);
+        until("the account's limit left out", || routing().get("account_usd").is_none_or(|v| v.get("aws").is_none()));
+    }
+    let (status, text) = post(&mut b, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails"), ("email", "ops @example.com")]);
+    assert!(status >= 400 && text.contains("email address"), "{status} {text}");
     for cpu in ["0", "500", "nope", "32"] {
         post(&mut b, "/routing", &[("action", "max_cpu"), ("max_cpu", cpu)]);
         until("no largest machine", || routing().get("max_cpu").is_none_or(|v| v.is_null()));
