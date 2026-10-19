@@ -1361,3 +1361,66 @@ fn a_debug_launch_with_no_region_starts_in_us_east_1_and_a_header_without_a_colo
     assert!(code == 0 && v["answer"].as_str().and_then(|a| a.split(' ').next()).is_some_and(|s| s.parse::<u16>().is_ok()), "{v}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The runner service a debug build serves on this computer leaves what is no request alone (a first line or a header
+/// that is not text, a header with no colon, a body cut short) and goes on to serve the job to its runner.
+#[cfg(debug_assertions)]
+#[test]
+fn the_runner_service_here_leaves_what_is_no_request_alone_and_serves_the_job() {
+    use std::io::Write;
+    let dir = common::temp("runner-service-odd");
+    let workflow = dir.join("ci.yml");
+    std::fs::write(&workflow, "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ok\n").unwrap();
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let root = format!("http://127.0.0.1:{port}/runner/rig");
+    let jit = dir.join("jit");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).env("SUPERCI_HOME", dir.join(".home"))
+        .args(["debug", "runner-service", workflow.to_str().unwrap(), "tests", &root, &port.to_string(), jit.to_str().unwrap(), "--json"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() { assert!(std::time::Instant::now() < until, "it did not listen"); std::thread::sleep(std::time::Duration::from_millis(50)) }
+    // (A header that is not text ends the headers: what came before is answered.)
+    for (odd, answered) in [(&b"\xff\xfe\r\n\r\n"[..], false), (b"GET /runner/rig/x HTTP/1.1\r\nno colon here\r\n\xff\xfe\r\n\r\n", true), (b"POST /runner/rig/x HTTP/1.1\r\ncontent-length: 100\r\n\r\nabc", false)] {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(odd).unwrap();
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let mut back = String::new();
+        let _ = std::io::Read::read_to_string(&mut s, &mut back);
+        assert_eq!(back.starts_with("HTTP/1.1 404"), answered, "{back}");
+        assert_eq!(back.is_empty(), !answered, "{back}");
+    }
+    let runner = superci_testkit::Runner { at: format!("{root}/_apis/v1") };
+    runner.take();
+    let s = "dddddddd-0000-0000-0000-000000000004";
+    runner.steps(&[(s, "Run echo ok", 1, "inProgress", None, None)]);
+    runner.lines(s, 1, &["ok".to_string()]);
+    runner.steps(&[(s, "Run echo ok", 1, "completed", Some("succeeded"), Some(1))]);
+    runner.finish("succeeded");
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+    let out = child.wait_with_output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+    assert!(v["answer"].as_str().is_some_and(|a| a.starts_with("the job ended: succeeded") && a.contains("Run echo ok succeeded")), "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A secret typed at a terminal (hidden), and one a run started with a run key used: listed as used by that key.
+#[test]
+fn a_secret_typed_at_a_terminal_is_kept_and_one_a_run_key_used_is_listed_as_used_by_that_key() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    // (A terminal of its own: `script` gives the command one, and types what is written to it.)
+    let mut typed = std::process::Command::new("script").args(["-qec", &format!("{} secrets create TYPED", env!("CARGO_BIN_EXE_superci")), "/dev/null"])
+        .env("SUPERCI_HOME", &home).env("SUPERCI_STAND_IN", &served.aws.url).env_remove("SUPERCI_PLANE").env_remove("SUPERCI_KEY")
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    std::io::Write::write_all(typed.stdin.as_mut().unwrap(), b"s3cret-typed\n").unwrap();
+    let out = typed.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success() && said.contains("TYPED's value (typed hidden; Enter when done): ") && said.contains("TYPED is kept for every run"), "{said}{}", String::from_utf8_lossy(&out.stderr));
+    let o = common::command(&home).args(["secrets", "create", "TOKEN", "--value-env=THE_TOKEN"]).env("THE_TOKEN", "s3cret").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    common::played_steps(&served, &home.join("checkout"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.TOKEN }}\n", &[("Run echo", "succeeded")]);
+    let said = String::from_utf8_lossy(&superci(&home, &["secrets", "list"]).stdout).into_owned();
+    let line = |name: &str| said.lines().find(|l| l.starts_with(name)).unwrap_or_default().to_string();
+    assert!(line("TOKEN").ends_with("used just now by the key agent") && line("TYPED").ends_with("not used yet"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
