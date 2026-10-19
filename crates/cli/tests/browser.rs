@@ -3822,6 +3822,42 @@ fn a_secret_given_to_a_run_a_coding_agents_key_started_says_that_key_in_settings
 }
 
 #[test]
+fn the_first_question_marks_the_cloud_this_browser_picked_last() {
+    let home = common::temp("home");
+    let (mut child, link) = dashboard(&home);
+    // (As this browser asks: its key's cookie, and the one Connect left when AWS was picked.)
+    let (base, key) = link.split_once("/?k=").unwrap();
+    let port = base.rsplit(':').next().unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
+    let html = agent.get(&format!("{base}/?fragment=1")).header("cookie", &format!("superci_local_{port}={key}; superci_last=aws")).header("sec-fetch-site", "same-origin").call().unwrap().body_mut().read_to_string().unwrap();
+    assert!(html.contains(r#"<a class="pick last-used" href="/connect/aws">"#) && common::words(&html).contains("My AWS Last used"), "{}", common::words(&html));
+    assert!(!html.contains(r#"<a class="pick last-used" href="/connect/cloudflare">"#));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_manifest_code_github_refuses_is_said_and_one_with_underscores_and_dashes_is_taken_as_github_gives_it() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "acme")]);
+    assert_eq!(status, 200, "{}", common::words(&form));
+    let state = form.split("state=").nth(1).unwrap().split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap().to_string();
+    // GitHub refusing it once (a code used already): said as GitHub said it, nothing kept.
+    served.github.fail("POST", "app-manifests", 422, "Validation Failed");
+    let (status, _, said) = common::get(&link, &format!("/github/callback?code=a1b2_c3d4-e5f6&state={state}"));
+    assert!(status >= 400 && common::words(&said).contains("GitHub: 422"), "{status} {}", common::words(&said));
+    assert!(!served.aws.settings(PLANE).iter().any(|(k, _)| k == "GITHUB_APP"));
+    served.github.fail_none();
+    let (status, to, _) = common::get(&link, &format!("/github/callback?code=a1b2_c3d4-e5f6&state={state}"));
+    assert_eq!((status, to.as_str()), (303, "https://github.com/apps/superci-acme/installations/new"));
+    assert!(served.aws.settings(PLANE).iter().any(|(k, _)| k == "GITHUB_APP"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
