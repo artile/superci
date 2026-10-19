@@ -748,6 +748,23 @@ fn the_runner_image_asked_into_every_region_without_it_or_into_an_account_with_n
     }
 }
 
+/// A month in which Cloudflare metered nothing for the account's containers is said as within what it includes.
+#[test]
+fn a_month_with_nothing_metered_by_cloudflare_is_said_as_included() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(&[include_str!("../fixtures/cloudflare/01-look.jsonl"), include_str!("../fixtures/cloudflare/sign-in/usage.jsonl")].concat(), &[]);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}]}"#);
+    served.aws.fail("/graphql", 200, r#"{"data":{"viewer":{"accounts":[{"g":[{"sum":{"cpuTimeSec":0,"allocatedMemory":0,"allocatedDisk":0,"txBytes":0}}]}]}},"errors":null}"#, None);
+    let (_child, link) = dashboard(&home);
+    until("the month as Cloudflare metered it", || common::words(&common::part(&link, "/?p=runners&fragment=1").1).contains("this month · included"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
