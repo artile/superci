@@ -7907,6 +7907,20 @@ mod commands_dashboard_in_browser {
         super::seen_in_browser(&served);
     }
 
+    /// Stopped before any code host was connected: its control plane deleted, and no workflow to change back.
+    #[test]
+    fn superci_stopped_before_any_code_host_was_connected_has_no_workflow_to_change_back() {
+        let served = serve(|_| {});
+        let home = common::signed_in(&served);
+        let (mut child, link) = common::dashboard(&home);
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+        let (status, _, said) = common::post(&link, "/plane/leave", &[("confirm", "superci")]);
+        let said = common::words(&said);
+        assert!(status == 200 && said.contains("SuperCI is stopped") && !said.contains("runs-on") && !said.contains("GitHub App"), "{status} {said}");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn superci_is_stopped_from_the_dashboard_github_and_gitlab_let_go_of_and_its_control_plane_deleted_as_aws_answered() {
         let served = serve(|_| {});
