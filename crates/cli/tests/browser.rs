@@ -10515,6 +10515,21 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         let (code, said) = cli(&args);
         assert!(code <= 3 && said.contains(said_part), "{args:?}: {said}");
     }
+    // A workspace named that is not kept here: by the flag, by SUPERCI_WORKSPACE, and on a computer with none yet; two
+    // kept and none named.
+    for (args, var) in [(vec!["status", "--workspace=ghost"], None), (vec!["status"], Some("ghost")), (vec!["workspaces", "list", "--workspace=ghost"], None), (vec!["planes", "list"], None)] {
+        let mut c = common::command(&home);
+        c.args(&args);
+        if let Some(v) = var { c.env("SUPERCI_WORKSPACE", v); }
+        let o = c.output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked"), "{args:?}: {said}");
+    }
+    let none = common::temp("no-workspaces-named");
+    std::fs::create_dir_all(&none).unwrap();
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).args(["status", "--workspace=ghost"]).env("SUPERCI_HOME", &none).output().unwrap();
+    assert!(String::from_utf8_lossy(&o.stderr).contains("the only one is default"), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&none);
     let _ = std::fs::remove_dir_all(&twin);
     // The control plane named by its id, by its address, and by what is neither; and how long each part took.
     for plane in [PLANE.to_string(), served.url.clone(), format!("{}/", served.url), "nosuchplane1".to_string()] {
