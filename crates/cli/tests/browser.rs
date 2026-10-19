@@ -1498,6 +1498,12 @@ fn the_runner_image_is_copied_into_another_region_from_the_aws_accounts_section_
     assert!(got < 400, "{got} {text}");
     let copies = served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.contains("Action=CopyImage"))).count();
     assert_eq!(copies, 1, "one copy asked for");
+    // Asked again with the copy on its way (from the set-up page): nothing more asked for, and back there.
+    served.aws.replaying(include_str!("../fixtures/aws/images/03-list-pending.jsonl"), &[]);
+    let (got, text) = post(&mut b, "/aws/image", &[("region", "ca-central-1")]);
+    assert!(got < 400, "{got} {text}");
+    let copies = served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.contains("Action=CopyImage"))).count();
+    assert_eq!(copies, 1, "still one copy asked for");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
