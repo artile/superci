@@ -3186,6 +3186,11 @@ fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_t
     b.click(".tabs a", "Jobs");
     // Past its longest time; never started, three times: each said; the one that ended as it ended.
     b.wait(&format!("{} && {} && {}", reads("ran past its longest time (6 hours)"), reads("did not start a machine for it, three times"), reads("ended")));
+    // Their tests from the CLI: the swept one's too, though no code host said it failed.
+    for id in [b2, c] {
+        let o = common::command(&home).args(["jobs", "retrieve", &id.to_string(), "--tests"]).output().unwrap();
+        assert!(o.status.code().is_some_and(|c| c <= 3) && !String::from_utf8_lossy(&o.stderr).contains("panicked"), "{}", String::from_utf8_lossy(&o.stderr));
+    }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
     // A longest time of 90 minutes; a job GitHub says nothing of when asked; one GitHub says another runner took,
