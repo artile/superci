@@ -206,8 +206,7 @@ fn a_runner_providers_limits_and_location_are_set_in_its_dialog_and_it_is_remove
     // (Both launchers are added, as Add a provider says.)
     b.goto(&format!("{link}&p=add-runners"));
     b.wait(&shows("Add a provider"));
-    let added = b.eval("[...document.querySelectorAll('main .pick')].filter(r => r.innerText.includes('Added')).map(r => r.innerText.split('\\n')[0]).join(',')").as_str().unwrap_or_default().to_string();
-    assert!(added.contains("Cloudflare") && added.contains("Modal"), "{added}");
+    b.wait("(() => { const a = [...document.querySelectorAll('main .pick')].filter(r => r.innerText.includes('Added')).map(r => r.innerText).join(','); return a.includes('Cloudflare') && a.includes('Modal') })()");
     b.goto(&format!("{link}&p=runners"));
     b.wait(r#"document.querySelector('button[aria-label="Cloudflare account settings"]') !== null"#);
     b.click(r#"button[aria-label="Cloudflare account settings"]"#, "");
