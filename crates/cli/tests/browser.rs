@@ -105,6 +105,99 @@ fn its_name_labels_and_largest_machine_are_changed_in_settings_and_the_control_p
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Jobs kept as the control plane kept them before some of what is kept now: one ended without how it ended, one with
+/// no price (a Cloudflare container's, from before prices were kept), one failed with no cloud, one whose machine said
+/// no more than its boot. Each said as it stands.
+#[test]
+fn jobs_kept_without_how_they_ended_their_price_their_cloud_or_their_runner_are_said_as_they_stand() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let job = |name: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); assert!(served.webhook(q) < 300); id };
+    let (unsaid, unpriced, nowhere, booted) = (job("unsaid"), job("unpriced"), job("nowhere"), job("booted"));
+    let now = served.now_ms();
+    edit(unsaid, &|j| { j["state"] = "done".into(); j.as_object_mut().unwrap().remove("conclusion"); });
+    edit(unpriced, &|j| { j["state"] = "running".into(); j["cloud"] = "cloudflare".into(); j["machine_id"] = "machine-unpriced".into(); j["started_ms"] = (now - 600_000).into(); for k in ["usd_per_hour", "waiting_usd_per_hour"] { j.as_object_mut().unwrap().remove(k); } });
+    edit(nowhere, &|j| { j["state"] = "failed".into(); j["error"] = "runner container: the container cannot be kept running".into(); j["cloud"] = "".into(); });
+    edit(booted, &|j| { j["state"] = "launched".into(); j["cloud"] = "aws".into(); j["machine_id"] = "i-0booted".into(); j["launched_ms"] = (now + 1_000).into(); });
+    served.store.0.lock().unwrap().insert(format!("hello:{booted}"), serde_json::json!({ "script_ms": now + 30_000, "boot_s": 9.5 }).to_string());
+    let home = signed_in(&served);
+    let (code, listed) = common::json(&home, &["jobs", "list"]);
+    assert_eq!(code, 0, "{listed}");
+    let of = |id: u64| listed["jobs"].as_array().unwrap().iter().find(|j| j["id"] == id).cloned().unwrap_or_default();
+    // Ended, how not said: done, and nothing more.
+    assert!(of(unsaid)["state"] == "done" && of(unsaid)["ended"].is_null(), "{}", of(unsaid));
+    // Its price as Cloudflare's containers were priced then.
+    assert!(of(unpriced)["usd"].as_f64().is_some_and(|u| u > 0.0), "{}", of(unpriced));
+    // Its container not kept running, the cloud unsaid: Cloudflare's, whose containers those are.
+    assert_eq!(of(nowhere)["why"], "Cloudflare could not keep its container running", "{listed}");
+    // Its start as far as its machine said it: made and booted, no runner yet.
+    let (code, one) = common::json(&home, &["jobs", "retrieve", &booted.to_string()]);
+    let steps: Vec<String> = one["job"]["start"]["steps"].as_array().into_iter().flatten().filter_map(|s| s["what"].as_str().map(str::to_string)).collect();
+    assert!(code == 0 && steps.contains(&"it booted".to_string()) && !steps.iter().any(|s| s.contains("runner")), "{one}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A key kept from before each control plane had one of its own is replaced at the next look: not while the control
+/// plane, too old to read it by its new name, cannot be handed it by its old one too; then the new one, which it says
+/// is on this computer.
+#[test]
+fn a_key_from_before_is_replaced_only_once_every_name_it_is_read_by_is_written_and_says_its_computer() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let kept = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap() };
+    // Too old for the key's new name, and its old one refused by AWS: the key from before stays, and reads on.
+    *served.aws.old_version.lock().unwrap() = Some("0.19.0".into());
+    served.aws.fail("AmazonSSM.PutParameter|DASHBOARD_KEY_", 400, &superci_testkit::json_error("AccessDeniedException", "User is not authorized to perform: ssm:PutParameter"), None);
+    let (_, said) = common::json(&home, &["status"]);
+    assert!(said["error"].as_str().unwrap_or_default().contains("reads this computer's key under its old name") && kept()["key"]["value"] == served.key.as_str(), "{said} {}", kept());
+    // Taken under both names: replaced, and said once to be on this computer.
+    served.aws.fail_none();
+    *served.aws.old_version.lock().unwrap() = None;
+    let (code, said) = common::json(&home, &["status"]);
+    let key = kept()["key"].clone();
+    assert!(code == 0 && key["value"] != served.key.as_str() && key["name"].as_str().unwrap().starts_with("DEVICE_KEY_"), "{said} {key}");
+    // (Once: the control plane's answer taken as the answer it is, not asked again a second and two seconds on.)
+    let seen = served.store.under(&format!("dkey:{}", key["name"].as_str().unwrap()));
+    assert!(seen.first().is_some_and(|(_, d)| d["device"].is_string() && d["last_ms"].as_u64().unwrap() < d["first_ms"].as_u64().unwrap() + 900), "{seen:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A request as tools other than browsers send it (its lines ended by a newline alone, or the connection closed before
+/// its blank line) is read as the same request; a job asked of a GitLab it is not of is no job of that GitLab's.
+#[test]
+fn requests_ended_otherwise_than_browsers_end_them_are_answered_and_a_job_asked_of_another_gitlab_is_not_found() {
+    use std::io::{Read, Write};
+    let served = serve(|_| {});
+    served.connect_github();
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let home = signed_in(&served);
+    let (_child, link) = dashboard(&home);
+    let (base, key) = link.split_once("/?k=").unwrap();
+    let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+    let ask = |head: &str, close: bool| -> String {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(head.as_bytes()).unwrap();
+        if close { s.shutdown(std::net::Shutdown::Write).unwrap() }
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+    let path = format!("/job/view?id={id}");
+    let cookie = format!("cookie: superci_local_{port}={key}");
+    let usual = ask(&format!("GET {path} HTTP/1.1\r\nhost: localhost:{port}\r\n{cookie}\r\nsec-fetch-site: same-origin\r\nconnection: close\r\n\r\n"), false);
+    let bare = ask(&format!("GET {path} HTTP/1.1\nhost: localhost:{port}\n{cookie}\nsec-fetch-site: same-origin\nconnection: close\n\n"), false);
+    let cut = ask(&format!("GET {path} HTTP/1.1\r\nhost: localhost:{port}\r\n{cookie}\r\nsec-fetch-site: same-origin\r\n"), true);
+    assert!(usual.starts_with("HTTP/1.1 200"), "{usual}");
+    for got in [&bare, &cut] { assert_eq!(got.lines().next(), usual.lines().next(), "{got}") }
+    // The GitHub job's id with a GitLab's name: that GitLab's job of that id, which there is none of.
+    let (status, said) = common::part(&link, &format!("/job/view?id={id}&gl=selfhosted"));
+    let (_, its) = common::part(&link, &path);
+    assert!(status < 500 && said != its && said.contains("no such job"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
