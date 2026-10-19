@@ -4851,6 +4851,229 @@ fn connecting_github_takes_a_name_and_a_host_as_github_would_and_refuses_what_is
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Moving here and away, as the dashboard asks it with a device's key: what is here already stays (a GitLab runner, a
+/// job; a record that is neither is not taken), the switch says an organization whose App would not move (none moving:
+/// it fails); a move token too short to be one is none; going away needs an address that can be one, and an event that
+/// arrives after is passed on with its headers. The public repositories are read again after five minutes, not kept
+/// while an organization's could not be read; stopping removes only its own GitLab's runners.
+#[test]
+fn moving_here_keeps_what_is_here_the_switch_says_an_app_not_moved_and_leaving_removes_only_its_own_runners() {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let ask = |served: &superci_testkit::Served, path: &str, key: &str, body: &str, token: Option<&str>| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}{path}", served.url)).header("authorization", &format!("Bearer {key}"));
+        if let Some(t) = token { r = r.header("x-move-token", t) }
+        let mut got = r.send(body).unwrap();
+        let text = got.body_mut().read_to_string().unwrap_or_default();
+        (got.status().as_u16(), serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+    };
+    let read = |served: &superci_testkit::Served, path: &str, key: &str| -> (u16, String) {
+        let mut got = agent.get(&format!("{}{path}", served.url)).header("authorization", &format!("Bearer {key}")).call().unwrap();
+        (got.status().as_u16(), got.body_mut().read_to_string().unwrap_or_default())
+    };
+    // A move token shorter than any made: none.
+    let short = serve(|c| c.move_token = Some("short-token".into()));
+    assert_eq!(ask(&short, "/move/export", &short.key, "", Some("short-token")).0, 403);
+
+    let token = "move-token-for-tests-00000002";
+    let served = serve(move |c| c.move_token = Some(token.into()));
+    served.connect_gitlab();
+    // The public repositories, with no App: none to read.
+    assert_eq!(read(&served, "/github/public-repos", &served.key).0, 500);
+    served.connect_github();
+    served.github.set_public(true);
+    let now = served.now_ms();
+    let kept_job = serde_json::json!({ "job_id": 41, "run_id": 1, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "cloudflare", "at_ms": now - 60_000, "ended_ms": now - 1_000, "installation_id": 1 });
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("glrunner:acme/app".into(), serde_json::json!({ "id": 5, "token": "kept-here", "gitlab": "" }).to_string());
+        m.insert("job:41".into(), kept_job.to_string());
+    }
+    // Moving in without the token: refused. With it: the runner and job kept here stay, another record is not taken.
+    assert_eq!(ask(&served, "/move/import", &served.key, "{}", None).0, 403);
+    let theirs = |s: &str| serde_json::json!({ "job_id": 41, "run_id": 1, "repo": "acme/app", "state": s, "cloud": "cloudflare", "at_ms": now - 90_000, "installation_id": 1 }).to_string();
+    let state = serde_json::json!({ "state": [
+        ["glrunner:acme/app", serde_json::json!({ "id": 9, "token": "theirs", "gitlab": "" }).to_string()],
+        ["glrunner:acme/lib", serde_json::json!({ "id": 10, "token": "theirs", "gitlab": "" }).to_string()],
+        ["job:41", theirs("failed")],
+        ["moved_to", "\"https://elsewhere.example\""],
+    ] });
+    let (status, said) = ask(&served, "/move/import", &served.key, &state.to_string(), Some(token));
+    assert!(status == 200 && said["taken"] == 1, "{status} {said}");
+    let record = |k: &str| served.store.under(k).into_iter().find(|(key, _)| key == k).map(|(_, v)| v);
+    assert!(record("glrunner:acme/app").is_some_and(|r| r["token"] == "kept-here") && record("glrunner:acme/lib").is_some_and(|r| r["token"] == "theirs"), "{:?}", served.store.under("glrunner:"));
+    assert!(record("job:41").is_some_and(|j| j["state"] == "done") && record("moved_to").is_none());
+
+    // The switch, with globex's App at a GitHub that does not answer: said, acme's moved.
+    let mut second = superci_testkit::github::GitHub::app();
+    second["id"] = 2002.into(); second["owner"] = "globex".into(); second["slug"] = "superci-globex".into(); second["host"] = "github.globex.example".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_2002"), &second.to_string());
+    let (status, said) = ask(&served, "/move/claim", &served.key, r#"{"from":"http://127.0.0.1:9"}"#, None);
+    let failed = said["github_failed"].as_array().cloned().unwrap_or_default();
+    assert!(status == 200 && said["github_apps"] == 2 && failed.len() == 1 && failed[0].as_str().unwrap().starts_with("globex: "), "{status} {said}");
+    assert!(served.store.under("standby").is_empty() && !served.store.under("claimed_at").is_empty());
+    // Neither moving: a failure, said.
+    served.github.fail("PATCH", "/app/hook/config", 500, "Server Error");
+    let (status, said) = ask(&served, "/move/claim", &served.key, "{}", None);
+    assert!(status == 500 && said.as_str().is_some_and(|s| s.contains("acme: ") && s.contains("globex: ")), "{status} {said}");
+    served.github.fail_none();
+
+    // The public repositories: globex's could not be read, so read again next time; then kept five minutes.
+    let (status, repos) = read(&served, "/github/public-repos", &served.key);
+    assert!(status == 200 && repos.contains("acme/app") && repos.contains("globex: "), "{status} {repos}");
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_2002"), "");
+    let asked = || served.github.asked.lock().unwrap().iter().filter(|a| a.contains("/installation/repositories")).count();
+    let before = asked();
+    for _ in 0..2 { assert!(read(&served, "/github/public-repos", &served.key).1.contains("acme/app")) }
+    assert_eq!(asked(), before + 1, "read once, then kept");
+    served.later(301_000);
+    assert!(read(&served, "/github/public-repos", &served.key).1.contains("acme/app"));
+    assert_eq!(asked(), before + 2, "read again after five minutes");
+
+    // Stopping: GitLab's runners made here (one of another connection's stays; one with no id is just forgotten).
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("glrunner:acme/other".into(), serde_json::json!({ "id": 11, "token": "x", "gitlab": "gsecond" }).to_string());
+        m.insert("glrunner:acme/noid".into(), serde_json::json!({ "token": "x", "gitlab": "" }).to_string());
+    }
+    let (status, said) = ask(&served, "/leave", &served.key, "{}", None);
+    assert!(status == 200 && said["gitlab_runners"] == 2, "{status} {said}");
+    let left: Vec<String> = served.store.under("glrunner:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(left, vec!["glrunner:acme/other".to_string()]);
+
+    // Going away: to an address that can be none, refused; to another control plane, moved, and what GitHub sends
+    // after is passed on as it came (its own headers with it).
+    let to = serve(|_| {});
+    to.connect_github();
+    for nowhere in ["ftp://elsewhere.example", ""] {
+        let (status, _) = ask(&served, "/move/away", &served.key, &serde_json::json!({ "to": nowhere }).to_string(), None);
+        assert_eq!(status, 400, "{nowhere}");
+    }
+    assert!(served.store.under("moved_to").is_empty());
+    let (status, said) = ask(&served, "/move/away", &served.key, &serde_json::json!({ "to": to.url }).to_string(), None);
+    assert!(status == 200 && said["moved_to"] == to.url.as_str(), "{status} {said}");
+    let (id, (body, signature)) = served.github.queue("moved on", "superci", served.now_ms());
+    let mut got = agent.post(&format!("{}/webhook", served.url)).header("x-hub-signature-256", &signature).header("x-github-event", "workflow_job")
+        .header("content-type", "application/json").header("user-agent", "GitHub-Hookshot/7f3b2a1").send(&body[..]).unwrap();
+    assert!(got.status().as_u16() < 300, "{}", got.body_mut().read_to_string().unwrap_or_default());
+    assert!(!to.store.under(&format!("job:{id}")).is_empty() && served.store.under(&format!("job:{id}")).is_empty(), "taken there, not here");
+    // A run key asks what only a device's key may: said as that.
+    let (status, said) = read(&served, "/keys", &served.run_key);
+    assert!(status == 403 && said.contains("needs a device's key"), "{status} {said}");
+}
+
+/// What a machine says with its job's link: a spot machine taken back is noted once, for a job still going (a run from
+/// a computer's is started again at once, a GitLab job's says nothing more); a job's log as GitHub has it, then the lines
+/// its machine sent after it (untimed lines going with the timed line before them), and none when GitHub's is empty.
+#[test]
+fn a_machine_taken_back_is_noted_once_and_a_jobs_log_is_githubs_then_what_its_machine_sent_after_it() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let say = |path: &str, body: &str| -> (u16, String) { let mut r = agent.post(&format!("{}{path}", served.url)).send(body).unwrap(); (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()) };
+    let log = |q: &str| -> serde_json::Value { agent.get(&format!("{}/job/log?{q}", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap() };
+    let now = served.now_ms();
+    let notice = "notice-token-for-tests-0001";
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let job = |id: u64, state: &str, provider: &str, runner: &str| serde_json::json!({ "job_id": id, "run_id": 7, "repo": "acme/app", "state": state, "provider": provider, "cloud": "aws", "at_ms": now - 60_000,
+            "installation_id": 42, "runner": runner, "machine_id": format!("i-0{id}"), "notice": notice, "hello": notice, "region": "us-east-1", "machine_type": "m7i.large", "zone": "us-east-1a", "seen_in_progress": true });
+        m.insert("job:71".into(), job(71, "running", "local", "r-local").to_string());
+        m.insert("runner:r-local".into(), "71".into());
+        m.insert("job:72".into(), job(72, "done", "", "r-done").to_string());
+        m.insert("runner:r-done".into(), "72".into());
+        m.insert("job:gl73".into(), job(73, "running", "gitlab", "").to_string());
+        m.insert("job:74".into(), job(74, "running", "", "r-live").to_string());
+        m.insert("runner:r-live".into(), "74".into());
+    }
+    let record = |k: &str| served.store.under(k).into_iter().find(|(key, _)| key == k).map(|(_, v)| v).unwrap_or_default();
+    // A run from a computer's machine taken back: started again at once, it says; said again, noted once.
+    for _ in 0..2 {
+        let (status, said) = say(&format!("/interrupted?runner=r-local&t={notice}"), "");
+        assert!(status == 200 && said.contains("starts the job again by itself at once"), "{status} {said}");
+    }
+    assert!(record("job:71")["interrupted"] == true && served.store.under("spot:interrupted:").len() == 1, "{:?}", served.store.under("spot:"));
+    // A job over already: nothing noted.
+    let (status, _) = say(&format!("/interrupted?runner=r-done&t={notice}"), "");
+    assert!(status == 200 && record("job:72")["interrupted"].is_null() && served.store.under("spot:interrupted:").len() == 1);
+    // A GitLab job's (its connection the first, its record found by its id): noted, nothing said to its log.
+    let (status, said) = say(&format!("/interrupted?gl=73&t={notice}"), "");
+    assert!(status == 200 && said.is_empty() && record("job:gl73")["interrupted"] == true, "{status} {said}");
+
+    // A GitHub job running: GitHub's log so far, then what its machine sent after GitHub's last line.
+    served.github.answer_with("GET", "/actions/jobs/74/logs", 200, &[], "2026-10-15T10:00:01.0000000Z build started\n");
+    let page = "2026-10-15T10:00:00.5000000Z before GitHub's last\n2026-10-15T10:00:09.0000000Z tests passed\nshort\n2026x10-15T10:00:09 not a time\n2026-10-15X10:00:09 not a time\nabcd-10-15T10:00:09 not a time\n";
+    assert_eq!(say(&format!("/hello?runner=r-live&t={notice}&live=Worker_20261015-100000-utc.log&at=0"), page), (200, "ok".into()));
+    let got = log("id=74");
+    let text = got["log"].as_str().unwrap_or_default();
+    assert!(got["source"] == "GitHub's, then what its machine sent after it" && text.starts_with("2026-10-15T10:00:01.0000000Z build started\n2026-10-15T10:00:09.0000000Z tests passed\nshort\n"), "{got}");
+    assert!(text.contains("abcd-10-15T10:00:09 not a time") && !text.contains("before GitHub's last"), "{text}");
+    // GitHub's log empty: what its machine sent, all of it.
+    served.github.fail_none();
+    served.github.answer_with("GET", "/actions/jobs/74/logs", 200, &[], "");
+    let got = log("id=74");
+    assert!(got["source"] == "what its machine sent" && got["log"].as_str().unwrap_or_default().contains("before GitHub's last"), "{got}");
+    // A GitLab job's link: GitLab's, which has no link (its log is said as GitLab has it, here none: no project).
+    let got = log("id=73&gl=&link=1");
+    assert!(got["error"].as_str().is_some_and(|e| e.contains("no longer connected")), "{got}");
+    // Another connection's job by its name: none here.
+    let got = log("id=73&gl=gsecond");
+    assert!(got["error"].as_str().is_some_and(|e| e.contains("no such job")), "{got}");
+}
+
+/// GitLab through a connection of another name (the first one not connected): its job is that connection's; an event
+/// with a secret none of them has is refused (one too short to be a secret matches nothing). A runner made for a job
+/// whose record is gone takes another: that one runs and ends on it, its own record told its runner's job is over.
+/// The upkeep removes runners past their machine's time at their GitLab (one GitLab would not remove stays, one of a
+/// connection gone is only forgotten), and leaves the newer.
+#[test]
+fn a_gitlab_of_another_name_runs_its_jobs_and_runners_past_their_time_are_removed_where_gitlab_lets_them_be() {
+    let served = serve(|_| {});
+    let mut second = superci_testkit::GitLab::connection();
+    second["id"] = "gsecond".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gsecond"), &second.to_string());
+    let mut short = superci_testkit::GitLab::connection();
+    short["id"] = "gshort".into(); short["hook_secret"] = "short".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gshort"), &short.to_string());
+    let (gid, pending) = served.gitlab.pending("gl-second", &["superci"], served.now_ms());
+    assert_eq!(served.gitlab_webhook(pending), 200);
+    let key = format!("job:glgsecond-{gid}");
+    let job = || served.store.under(&key).into_iter().next().map(|(_, j)| j).unwrap_or_default();
+    assert!(job()["gitlab"] == "gsecond" && job()["state"] == "launched", "{}", job());
+    // A secret none has (nor the one too short to be one).
+    let host = served.url.trim_start_matches("http://");
+    for token in ["short", "not-the-hook-secret-0000"] {
+        use std::io::{Read, Write};
+        let body = served.gitlab.running_on(gid, 1, served.now_ms());
+        let mut s = std::net::TcpStream::connect(host).unwrap();
+        s.write_all(format!("POST /gitlab/webhook HTTP/1.1\r\nhost: {host}\r\nx-gitlab-event: Job Hook\r\nx-gitlab-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+        s.write_all(&body).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        assert!(out.starts_with("HTTP/1.1 401"), "{token}: {out}");
+    }
+    // A runner of this connection's, made for a job whose record is gone, takes it: it runs and ends there.
+    served.store.0.lock().unwrap().insert("glrunner:gsecond-555".into(), serde_json::json!({ "id": 555, "job": 1234, "gitlab": "gsecond", "at_ms": served.now_ms() }).to_string());
+    assert_eq!(served.gitlab_webhook(served.gitlab.running_on(gid, 555, served.now_ms())), 200);
+    assert!(served.store.under("glrunner:gsecond-555")[0].1["running"]["job"] == gid);
+    assert_eq!(served.gitlab_webhook(served.gitlab.finish(gid, "success", "ok", served.now_ms())), 200);
+    assert!(served.store.under("glrunner:gsecond-555").is_empty() && job()["over"] == true && job()["for_job"] == 1234, "{}", job());
+
+    // Runners past their machine's time (five days on AWS, and ten minutes).
+    let old = served.now_ms() - 6 * 86_400_000;
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (k, v) in [("gsecond-61", serde_json::json!({ "id": 61, "gitlab": "gsecond", "at_ms": old })), ("gsecond-66", serde_json::json!({ "id": 66, "gitlab": "gsecond", "at_ms": old })),
+            ("ggone-67", serde_json::json!({ "id": 67, "gitlab": "ggone", "at_ms": old })), ("gsecond-68", serde_json::json!({ "id": 68, "gitlab": "gsecond", "at_ms": served.now_ms() }))] {
+            m.insert(format!("glrunner:{k}"), v.to_string());
+        }
+    }
+    served.gitlab.fail("DELETE", "/runners/66", 500);
+    served.upkeep();
+    let left: Vec<String> = served.store.under("glrunner:").into_iter().map(|(k, _)| k).filter(|k| k.contains("-6")).collect();
+    assert_eq!(left, vec!["glrunner:gsecond-66".to_string(), "glrunner:gsecond-68".to_string()]);
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

@@ -123,7 +123,7 @@ impl Config {
     /// The labels as set in the dashboard (a JSON list, the one workflows are shown first): taken when it holds at
     /// least one that can be a label.
     pub fn set_labels(&mut self, json: &str) {
-        let mut set: Vec<String> = serde_json::from_str::<Vec<String>>(json).unwrap_or_default().into_iter().map(|l| l.to_ascii_lowercase()).filter(|l| crate::spec::valid_label(l).is_ok() || l == "superci").collect();
+        let mut set: Vec<String> = serde_json::from_str::<Vec<String>>(json).unwrap_or_default().into_iter().map(|l| l.to_ascii_lowercase()).filter(|l| crate::spec::valid_label(l).is_ok()).collect();
         set.dedup();
         if let Some(first) = set.first().cloned() { self.label = first; self.more_labels = set.split_off(1); }
     }
@@ -662,8 +662,8 @@ fn name_in_names(ci: &str) -> String {
 /// every CI before. Nothing reads a name back by how it begins (a runner is found by the whole name kept with its
 /// job), so a CI given another name just names its next runners by it.
 fn runner_prefix(ci: &str, plane_id: &str) -> String {
-    let named = name_in_names(ci);
-    format!("{}-{plane_id}", if named.is_empty() { "superci" } else { named.as_str() })
+    // (Never empty: a name begins with a letter, and is SuperCI unless set.)
+    format!("{}-{plane_id}", name_in_names(ci))
 }
 
 /// What a job that ran on-demand is told of spot when the account's AWS organization allows none (see `aws::refusal`).
@@ -1359,7 +1359,7 @@ impl<'a> ControlPlane<'a> {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
                 let mut kept = 0;
                 for (key, usd) in body["measured"].as_object().into_iter().flatten() {
-                    let Some(usd) = usd.as_f64().filter(|u| u.is_finite() && (0.0..1000.0).contains(u)) else { continue };
+                    let Some(usd) = usd.as_f64().filter(|u| (0.0..1000.0).contains(u)) else { continue };
                     if !key.starts_with("job:") { continue }
                     let Some(mut j) = get_json::<Job>(self.store, key).await? else { continue };
                     if j.cloud != "cloudflare" || active(&j) { continue }
@@ -1401,7 +1401,8 @@ impl<'a> ControlPlane<'a> {
     /// SuperCI older or newer than it, or a key replaced since), never as nothing being here; a read or run key it
     /// takes, asking for what only a device's key may, said as that; with no key, nothing here.
     fn not_taken(&self, req: &Request) -> Response {
-        if self.reader(req) || self.run_key(req).is_some() { return Response::text(403, "This key reads (a run key also starts runs from a computer): what was asked needs a device's key, from the SuperCI dashboard's computer") }
+        // (A run key is a read key too: `reader` takes it.)
+        if self.reader(req) { return Response::text(403, "This key reads (a run key also starts runs from a computer): what was asked needs a device's key, from the SuperCI dashboard's computer") }
         if req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).is_some_and(|k| k.len() >= 16) { return Response::text(401, &format!("{KEY_REFUSED} (SuperCI {VERSION})")) }
         nothing_here()
     }
@@ -2367,9 +2368,8 @@ impl<'a> ControlPlane<'a> {
             if let Some(cap) = pool.and_then(|p| p.monthly_usd) {
                 if spend.get(cloud).copied().unwrap_or(0.0) >= cap { never.push(format!("{name} reached its {} a month (`superci runners update {cloud} --monthly-usd=N` raises it)", dollars(cap))); continue }
             }
-            if let Some(max) = pool.and_then(|p| p.max_jobs).or(Some(if cloud == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE })) {
-                if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
-            }
+            let max = pool.and_then(|p| p.max_jobs).unwrap_or(if cloud == "cloudflare" { CLOUDFLARE_JOBS_AT_ONCE } else { JOBS_AT_ONCE });
+            if jobs.iter().filter(|j| place_of(j) == cloud && active(j)).count() as u32 >= max { later.push(format!("{name} runs {max} at once")); continue }
             // A label that names this provider, and it is not added here: said as it is.
             let Some((capacity, runner)) = runner else {
                 if spec.cloud.is_some() { return Ok(Placement::Fail(format!("its label needs {} runners, which this control plane has not added", cloud_name(spec.cloud.as_deref().unwrap_or(cloud))))) }
