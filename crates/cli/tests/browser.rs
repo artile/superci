@@ -4118,6 +4118,11 @@ mod github_in_browser {
         assert_eq!((kept["id"].as_u64(), kept["owner"].as_str(), kept["owner_is_org"].as_bool()), (Some(1001), Some("acme"), Some(true)));
         // A code that is not this tab's is refused.
         assert_eq!(common::get(&link, "/github/callback?code=a1b2c3d4e5f6&state=other").0, 400);
+        // Not installed anywhere yet: Repositories says GitHub is on its way (it looks again by itself).
+        served.github.set_installed(false, true);
+        let (_, repos) = part(&link, "/?p=repos&fragment=1");
+        assert!(words(&repos).contains("Connecting GitHub: a few seconds"), "{}", words(&repos));
+        served.github.set_installed(false, false);
         // Installed: back here, and Repositories shows acme.
         assert_eq!(common::get(&link, "/github/installed").0, 200);
         let (_, repos) = part(&link, "/?p=repos&fragment=1");
