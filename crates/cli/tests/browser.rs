@@ -2524,6 +2524,14 @@ fn a_cloud_that_does_not_answer_while_control_planes_are_looked_for_is_noted_and
     b.goto(&link);
     b.wait(&format!("{} && {}", page_shows("Cloudflare did not answer ("), shows("AWS · 111111111111")));
     let _ = child.kill();
+    // Signed in with Cloudflare alone, which answers nothing, and no control plane kept here: that is the page.
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    for k in ["aws", "plane", "key", "planes_more"] { kept.as_object_mut().unwrap().remove(k); }
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    b.goto(&link);
+    b.wait(&format!("{} && {}", page_shows("Your cloud did not answer"), page_shows("Cloudflare")));
+    let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
     // AWS's credentials due, and AWS not renewing them (its answer a refusal): the sign-in is said to have ended.
     let served = serve(|_| {});
