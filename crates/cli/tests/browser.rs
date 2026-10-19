@@ -7405,6 +7405,13 @@ mod dashboard_suite_in_browser {
         let state = to.split("state=").nth(1).and_then(|r| r.split('&').next()).unwrap().to_string();
         let (status, _, done) = get(&format!("/oauth/callback?code=a-code-from-cloudflare&state={state}"));
         assert!(status < 400 && words(&done).contains("Signed in with Cloudflare"), "{status} {}", words(&done));
+        // Started again and turned down on Cloudflare's page: said, nothing changed.
+        let (_, to, page) = get("/connect/cloudflare");
+        let to = if to.is_empty() { page.split("https://dash.cloudflare.com/oauth2/auth?").nth(1).map(|r| format!("https://dash.cloudflare.com/oauth2/auth?{}", r.split(['"', '\'']).next().unwrap().replace("&amp;", "&"))).unwrap_or_default() } else { to };
+        if let Some(again) = to.split("state=").nth(1).and_then(|r| r.split('&').next()) {
+            let (status, _, said) = get(&format!("/oauth/callback?state={again}&error=access_denied"));
+            assert!(status == 400 && words(&said).contains("Cloudflare sign-in was not completed"), "{status} {}", words(&said));
+        }
         let _ = child.kill();
         let file = home.join("workspaces/default/sign-ins.json");
         let kept = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap() };
@@ -10545,6 +10552,12 @@ fn two_gitlabs_are_each_listed_on_the_permissions_card_and_repositories() {
         b.goto(&format!("{link}&p={p}"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", reads(said)));
     }
+    // A control plane from before several GitLabs: a third asks to update it first.
+    *served.aws.old_version.lock().unwrap() = Some("0.9.30".into());
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/gitlab/connect", &[("url", "https://gitlab.com"), ("token", "gitlab-token-for-tests"), ("which", "new")]);
+    *served.aws.old_version.lock().unwrap() = None;
+    assert!(got == 409 && text.contains("0.9.37"), "{got} {text}");
     // Their tokens made with fewer scopes than SuperCI asks for: each said with what it lacks.
     served.gitlab.scopes(&["read_api"]);
     // (Read again once the control plane's ten minutes with the last answer are over.)
@@ -11162,6 +11175,16 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let o = common::command(&more).args(["jobs", "list"]).output().unwrap();
     assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     let _ = std::fs::remove_dir_all(&more);
+    // How long each look took, when asked for; a key named nothing.
+    let o = common::command(&home).args(["planes", "list", "--workspace=default"]).env("SUPERCI_TIMING", "1").output().unwrap();
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stderr).contains(" ms "), "{}", String::from_utf8_lossy(&o.stderr));
+    let (code, said) = cli(&["keys", "create", "", "--workspace=default"]);
+    assert!(code != 0 && !said.contains("panicked"), "{code} {said}");
+    // A control plane from before secrets for runs from a computer: asked to be updated first.
+    *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    let o = common::command(&home).args(["secrets", "create", "OLD", "--value-env=HOME", "--workspace=default"]).output().unwrap();
+    *served.aws.old_version.lock().unwrap() = None;
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("0.19.13"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     // A name set in the control plane as the standard one, or as what can be no name: each read as the standard name.
     for name in ["SuperCI", "a<b>"] {
         served.aws.put(&format!("/superci/{PLANE}/NAME"), name);
