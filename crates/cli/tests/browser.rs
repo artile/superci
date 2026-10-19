@@ -11011,6 +11011,9 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         let o = common::command(&nowhere).args(args).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.key).output().unwrap();
         assert!(!o.status.success() && !String::from_utf8_lossy(&o.stderr).contains("panicked"), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
     }
+    // (And the accounts signed in to there: none.)
+    let o = common::command(&nowhere).args(["accounts", "list"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked") && format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)).contains("superci login"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     let _ = std::fs::remove_dir_all(&nowhere);
     // A run whose job still waits for room (no machine, no end): its tests are not looked for.
     let (wid, q) = served.github.queue("waits for room", "superci", served.now_ms()); served.webhook(q);
