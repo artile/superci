@@ -11040,3 +11040,42 @@ fn sign_ins_another_process_writes_are_taken_in_by_the_next_page_and_not_undone(
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A control plane told of the AWS role made for it, as the dashboard reports it: refused with no connection under
+/// way, a token not its own, an account, role or region it did not ask for; taken once with its own token, and not
+/// a second time. The dashboard's pages read it after.
+#[test]
+fn the_aws_role_reported_to_a_control_plane_is_taken_once_and_only_as_it_asked() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let token = "connect-token-for-tests-0001";
+    let quiet = serve(|_| {});
+    let served = serve(move |c| { c.aws_connect_token = Some(token.into()); c.aws_region = Some("us-east-1".into()); });
+    let report = |s: &superci_testkit::Served, body: serde_json::Value| -> (u16, String) {
+        let mut r = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent().post(&format!("{}/aws/callback", s.url)).send(body.to_string()).unwrap();
+        (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default())
+    };
+    let role = format!("arn:aws:iam::111111111111:role/superci-plane-{PLANE}");
+    let good = serde_json::json!({ "token": token, "accountId": "111111111111", "roleArn": role, "region": "us-east-1" });
+    assert_eq!(report(&quiet, good.clone()).0, 409, "no connection under way");
+    for (body, status) in [
+        (serde_json::json!({ "token": "not-this-planes-token-0000", "accountId": "111111111111", "roleArn": role, "region": "us-east-1" }), 403),
+        (serde_json::json!({ "token": token, "accountId": "1111", "roleArn": role, "region": "us-east-1" }), 400),
+        (serde_json::json!({ "token": token, "accountId": "11111111111x", "roleArn": role, "region": "us-east-1" }), 400),
+        (serde_json::json!({ "token": token, "accountId": "111111111111", "roleArn": "arn:aws:iam::111111111111:role/someone-else", "region": "us-east-1" }), 400),
+        (serde_json::json!({ "token": token, "accountId": "111111111111", "roleArn": role, "region": "eu-west-1" }), 400),
+    ] {
+        let (got, said) = report(&served, body.clone());
+        assert_eq!(got, status, "{body}: {said}");
+    }
+    let (got, said) = report(&served, good.clone());
+    assert!(got < 500, "{got} {said}");
+    if serde_json::from_str::<serde_json::Value>(&said).is_ok_and(|v| v["connected"] == true) {
+        assert_eq!(report(&served, good).0, 409, "taken once");
+    }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=runners"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
