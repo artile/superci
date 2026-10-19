@@ -11105,3 +11105,39 @@ fn a_cloud_account_at_its_monthly_or_daily_limit_takes_no_job_and_says_how_to_ra
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A control plane that moved: GitHub's and GitLab's events passed on to the one it moved to as they came (one not
+/// signed as theirs refused); and moving out, only with its one-time move token, once. Its jobs' pages still read.
+#[test]
+fn a_moved_control_plane_passes_events_on_and_moving_out_takes_its_one_time_token_once() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let to = serve(|_| {});
+    to.connect_github();
+    let token = "move-token-for-tests-00000001";
+    let served = serve(move |c| c.move_token = Some(token.into()));
+    served.connect_github();
+    served.connect_gitlab();
+    served.store.0.lock().unwrap().insert("moved_to".into(), serde_json::to_string(&to.url).unwrap());
+    // Events: GitHub's and GitLab's passed on; one with another signature refused.
+    let (_, q) = served.github.queue("moved", "superci", served.now_ms());
+    assert!(served.webhook(q) < 500);
+    let (_, (body, _)) = served.github.queue("forged", "superci", served.now_ms());
+    assert_eq!(served.webhook((body, "sha256=00".into())), 401);
+    let (_, pending) = served.gitlab.pending("moved", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(pending) < 500);
+    // Moving out: no token, another, a short one; then its own, once.
+    let export = |t: Option<&str>| {
+        let mut r = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent().post(&format!("{}/move/export", served.url)).header("authorization", &format!("Bearer {}", served.key));
+        if let Some(t) = t { r = r.header("x-move-token", t) }
+        r.send_empty().map(|r| r.status().as_u16()).unwrap_or(0)
+    };
+    for t in [None, Some("another-move-token-0000000"), Some("short")] { assert_eq!(export(t), 403, "{t:?}") }
+    assert_eq!(export(Some(token)), 200);
+    assert_eq!(export(Some(token)), 403, "taken once");
+    let home = signed_in(&to);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
