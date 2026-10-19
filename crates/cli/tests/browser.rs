@@ -2104,6 +2104,30 @@ fn cloudflare_jobs_estimated_costs_are_replaced_by_what_cloudflare_measured_once
     b.goto(&format!("{link}&p=runners"));
     b.wait(&reads("this month ·"));
     let _ = child.kill();
+    // A month past what Workers Paid includes (a share of it billed), and with Cloudflare's own limit set (its figure
+    // says the spend: only what is billed is added); then a month with nothing metered.
+    for (usage, routing, said) in [
+        ((5.0e7, 9.0e17, 9.0e17, 1.0e12), r#"{"order":[{"cloud":"cloudflare"}]}"#, "billed"),
+        ((5.0e7, 9.0e17, 9.0e17, 1.0e12), r#"{"order":[{"cloud":"cloudflare","monthly_usd":500}]}"#, "billed"),
+        ((0.0, 0.0, 0.0, 0.0), r#"{"order":[{"cloud":"cloudflare"}]}"#, "Cloudflare"),
+    ] {
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), routing);
+        let (cpu, mem, disk, tx) = usage;
+        served.aws.fail("/graphql", 200, &format!(r#"{{"data":{{"viewer":{{"accounts":[{{"g":[{{"dimensions":{{"instanceId":"{:064x}"}},"sum":{{"cpuTimeSec":{cpu},"allocatedMemory":{mem},"allocatedDisk":{disk},"txBytes":{tx}}}}}]}}]}}}},"errors":null}}"#, 1), None);
+        let (mut child, link) = dashboard(&home);
+        // (Measured in the background once the page has asked: looked at again until it is said.)
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            b.goto(&format!("{link}&p=runners"));
+            b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')");
+            let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace(char::is_whitespace, " ");
+            if page.contains(said) { break }
+            assert!(std::time::Instant::now() < end, "{said}: {page}");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        served.aws.fail_none();
+        let _ = child.kill();
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
 
