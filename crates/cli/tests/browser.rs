@@ -6680,6 +6680,7 @@ mod runs_suite_in_browser {
             "contains(github.*, 'push') && github.event_name >= 'PUSH' && 'b' > 'A'",
             "fromJSON('{\"my-key\": 1e3}').my-key == 1000",
             "'it''s' == 'it''s' && github._none == null && contains(fromJSON('[{\"a\":1},{\"a\":2}]').*.a, 2) && fromJSON('[1]').*.a",
+            "1e+3 == 1000 && 2E-1 == 0.2 && fromJSON('{\"a\":{\"b\":1}}').a.b == 1 && (true && 1) == 1",
             "!!0.5 && !(0.0) && !false == true && format('{0} {1}', 1.5, 2) == '1.5 2' && format('{0}', 1e16) != '' && success() && !cancelled()",
         ];
         let fails = ["0x10 == 15", "'a' && ''", "-1 > 0 || 'NaN' == 0", "1e400 < 0", "!(fromJSON('[1]').*.a)"];
@@ -6696,6 +6697,13 @@ mod runs_suite_in_browser {
         let (state, ended) = result("yes");
         assert!(state == "started" && ended.is_empty(), "started: {jobs}");
         for (i, c) in fails.iter().enumerate() { assert_eq!(result(&format!("no-{i}")).1, "skipped", "{c}: {jobs}") }
+        // A condition that cannot be read: the run refused, saying which job's and why.
+        for bad in ["(1 == 1", "1 1", "-a == 1"] {
+            std::fs::write(dir.join(".github/workflows/ci.yml"), format!("jobs:\n  bad:\n    if: ${{{{ {bad} }}}}\n    runs-on: superci\n    steps:\n      - run: echo\n")).unwrap();
+            let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+            let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success() && said.contains("the job bad's if"), "{bad}: {said}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
     }
