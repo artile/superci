@@ -765,6 +765,30 @@ fn a_month_with_nothing_metered_by_cloudflare_is_said_as_included() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A way back from a sign-in elsewhere that names no workspace goes to the one awaiting it, else the first: one with
+/// no state is awaited by none; GitHub's installation, when no App was being made; and the page back keeps the
+/// workspace the sign-in started from as it was named, once.
+#[test]
+fn a_way_back_from_elsewhere_naming_no_workspace_goes_to_the_one_awaiting_it_and_keeps_where_it_started() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let (_child, link) = dashboard(&home);
+    common::part(&link, "/?p=overview&fragment=1");
+    // A sign-in started from a page that names its workspace: its way back names it once.
+    common::post(&link, "/aws/signin", &[("next", "?p=overview&w=default"), ("w", "default")]);
+    let (_, _, back) = common::get(&link, "/oauth/modal");
+    assert!(back.contains("/?p=overview&amp;w=default\"") || back.contains("/?p=overview&w=default\""), "{back}");
+    assert_eq!(back.matches("w=default").count(), back.matches("p=overview").count(), "{back}");
+    // A way back with no state: awaited by none, and refused.
+    let (status, _, said) = common::get(&link, "/oauth/callback?code=a-code&state=");
+    assert!(status == 400 && common::words(&said).contains("sign-in has expired"), "{status} {}", common::words(&said));
+    // GitHub's installation, with no App being made here.
+    let (status, _, said) = common::get(&link, "/github/installed?installation_id=42&setup_action=install");
+    assert!(status == 200 && common::words(&said).contains("Installed on GitHub"), "{status} {}", common::words(&said));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
