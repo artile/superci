@@ -11060,6 +11060,19 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         assert!(o.status.success() == works, "{ended}: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let _ = std::fs::remove_dir_all(&alone);
     }
+    // AWS's first sign-in noted as ended, a further AWS account still signed in: it goes on, and what is kept says no
+    // sign-in has ended.
+    let more = home.with_extension("more");
+    std::fs::create_dir_all(more.join("workspaces/default")).unwrap();
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+    kept["aws_more"] = serde_json::json!([kept["aws"].clone()]);
+    kept.as_object_mut().unwrap().remove("aws");
+    kept["aws_ended"] = true.into();
+    std::fs::write(more.join("workspaces/default/sign-ins.json"), kept.to_string()).unwrap();
+    std::fs::copy(home.join("aws-at"), more.join("aws-at")).unwrap();
+    let o = common::command(&more).args(["jobs", "list"]).output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&more);
     // A name set in the control plane as the standard one, or as what can be no name: each read as the standard name.
     for name in ["SuperCI", "a<b>"] {
         served.aws.put(&format!("/superci/{PLANE}/NAME"), name);
