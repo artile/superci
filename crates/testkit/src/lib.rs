@@ -308,6 +308,8 @@ pub struct Aws {
     /// its status and answer, and how many more times (none: every time). Written as AWS documents its errors, for what
     /// a test cannot have a real account answer (throttling, a fault of AWS's, an organization's policy).
     pub failing: Arc<Mutex<Vec<(String, u16, String, Option<u32>)>>>,
+    /// Headers some of those answers carry (see `fail_with_headers`), by the same action.
+    pub failing_headers: Arc<Mutex<BTreeMap<String, Vec<(String, String)>>>>,
     /// What happens as an action is asked (`during`): time passing while AWS answers, a job's end arriving meanwhile.
     pub during: Arc<Mutex<Vec<(String, Arc<dyn Fn() + Send + Sync>)>>>,
 }
@@ -426,7 +428,8 @@ impl Aws {
                     (404, vec![], json!({ "success": false, "errors": [{ "code": 0, "message": format!("the test kit's Cloudflare has no answer for {method} {url}") }] }).to_string())
                 });
                 a.asked.lock().unwrap().push(json!({ "method": method, "url": url, "target": "", "asked": asked, "status": status, "answer": answer }));
-                let said = if said.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) { said } else { vec![("content-type".into(), "application/json".into())] };
+                let mut said = said;
+                if !said.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) { said.push(("content-type".into(), "application/json".into())) }
                 let _ = write(stream, status, &said, answer.as_bytes());
                 continue;
             }
@@ -499,7 +502,7 @@ impl Aws {
         // (`Action|part of the address`: that action there only, `RunInstances|ec2.eu-west-1`; `DryRun=true` and the
         // like match what was asked.)
         let i = f.iter().position(|(a, ..)| a.split('|').all(|p| p == doing || url.contains(p) || asked.contains(p)))?;
-        let got = (f[i].1, vec![], f[i].2.clone());
+        let got = (f[i].1, self.failing_headers.lock().unwrap().get(&f[i].0).cloned().unwrap_or_default(), f[i].2.clone());
         match &mut f[i].3 { Some(1) => { f.remove(i); } Some(n) => *n -= 1, None => {} }
         Some(got)
     }
@@ -511,7 +514,13 @@ impl Aws {
     pub fn during(&self, action: &str, f: impl Fn() + Send + Sync + 'static) { self.during.lock().unwrap().push((action.to_string(), Arc::new(f))) }
 
     /// No call answered with an error any more (each answered as before `fail`).
-    pub fn fail_none(&self) { self.failing.lock().unwrap().clear() }
+    pub fn fail_none(&self) { self.failing.lock().unwrap().clear(); self.failing_headers.lock().unwrap().clear() }
+
+    /// As `fail`, the answer with these headers (a registry's `location`, say).
+    pub fn fail_with_headers(&self, action: &str, status: u16, headers: &[(&str, &str)], answer: &str, times: Option<u32>) {
+        self.failing_headers.lock().unwrap().insert(action.to_string(), headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+        self.fail(action, status, answer, times)
+    }
 
     /// A parameter written as the dashboard writes one.
     pub fn put(&self, name: &str, value: &str) {

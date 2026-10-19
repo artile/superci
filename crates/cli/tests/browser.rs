@@ -1906,7 +1906,47 @@ fn every_provider_s_runners_on_an_aws_control_plane_and_then_a_move_to_cloudflar
     let (ok, said) = run("", &["runners", "create", "aws", "--plane=awsplane0001"]);
     assert!(ok && said.contains("aws runs jobs now."), "{said}");
     step("03-cf-agent");
+    // GitHub's runner image copied into the account's registry when it is not there, as the registries answer each
+    // step: GitHub's failing; Cloudflare's asking a sign-in it already has (not there, then), or giving a challenge with no realm; a
+    // layer GitHub would not give; no upload address; a chunk, a layer, the manifest refused; then all of it copied.
+    let reg = "registry.cloudflare.com/v2/1111111111111111111111111111111a/superci-runner";
+    let (manifest, blobs, uploads, chunk, done) = (format!("{reg}/manifests/gh-"), format!("{reg}/blobs/sha256"), format!("{reg}/blobs/uploads/"), format!("{reg}/blobs/uploads/u1"), "digest=sha256".to_string());
+    let at = format!("https://{reg}/blobs/uploads/u1");
+    let at_more = format!("https://{reg}/blobs/uploads/u1?state=2");
+    let layer = "actions-runner/blobs/sha256";
+    type Rule<'a> = (&'a str, u16, Vec<(&'a str, &'a str)>, &'a str, Option<u32>);
+    let copy = |rules: Vec<Rule>| {
+        served.aws.fail_none();
+        for (part, status, headers, answer, times) in &rules { served.aws.fail_with_headers(part, *status, headers, answer, *times) }
+        let said = run("", &["runners", "create", "cloudflare", "--plane=awsplane0001"]).1;
+        served.aws.fail_none();
+        said
+    };
+    let missing: Rule = (&manifest, 404, vec![], "", Some(1));
+    for (rules, expect) in [
+        (vec![("ghcr.io/v2/actions/actions-runner/manifests/latest", 500, vec![], "{}", None)], "GitHub's registry: 500"),
+        (vec![(&manifest[..], 401, vec![("www-authenticate", r#"Basic realm="registry.cloudflare.com""#)], "", None)], "for layer"),
+        (vec![(&manifest[..], 401, vec![("www-authenticate", r#"Bearer service="registry.cloudflare.com""#)], "", None)], "without a realm"),
+        (vec![missing.clone(), (&blobs[..], 404, vec![], "", None), (layer, 500, vec![], "", None)], "for layer"),
+        (vec![missing.clone(), (&blobs[..], 404, vec![], "", None), (layer, 200, vec![], "layer", None), (&uploads[..], 202, vec![], "", None)], "no upload location"),
+        (vec![missing.clone(), (&blobs[..], 404, vec![], "", None), (layer, 200, vec![], "layer", None), (&chunk[..], 400, vec![], "{}", None), (&uploads[..], 202, vec![("location", &at[..])], "", None)], "refused a layer chunk"),
+        (vec![missing.clone(), (&blobs[..], 404, vec![], "", None), (layer, 200, vec![], "layer", None), (&done[..], 400, vec![], "{}", None), (&chunk[..], 202, vec![], "", None), (&uploads[..], 202, vec![("location", &at[..])], "", None)], "refused layer"),
+        (vec![missing.clone(), (&blobs[..], 200, vec![], "", None), (&manifest[..], 400, vec![], "{}", None)], "refused the image manifest"),
+    ] {
+        let said = copy(rules);
+        assert!(said.contains(expect), "{expect}: {said}");
+    }
+    // (All of it: each layer not there copied, its upload's address moving on as the registry says.)
+    served.aws.fail_with_headers(&manifest, 404, &[], "", Some(1));
+    served.aws.fail_with_headers(&done, 201, &[], "", None);
+    served.aws.fail_with_headers(&chunk, 202, &[("location", &at_more)], "", None);
+    served.aws.fail_with_headers(&uploads, 202, &[("location", &at)], "", None);
+    served.aws.fail_with_headers(&blobs, 404, &[], "", None);
+    served.aws.fail_with_headers(layer, 200, &[], "layer", None);
+    served.aws.fail_with_headers(&manifest, 201, &[], "", None);
     let (ok, said) = run("", &["runners", "create", "cloudflare", "--plane=awsplane0001"]);
+    served.aws.fail_none();
+    assert!(said.contains("Runner image ready"), "{said}");
     assert!(ok && said.contains("cloudflare runs jobs now."), "{said}");
     step("04-modal-agent");
     let (ok, said) = run("", &["runners", "create", "modal", "--plane=awsplane0001"]);
@@ -6481,6 +6521,42 @@ mod runs_suite_in_browser {
         super::seen_in_browser(&served);
     }
 
+    /// Secrets kept for some branches or workflow files only, by GitHub's filter patterns (`*` within a part, `**`
+    /// across, `?`, a class of characters or a range, a bracket that is no class), given to a run on a release branch
+    /// only where they hold; the names a workflow reads in each way an expression can say one, or all of them.
+    #[test]
+    fn secrets_kept_for_branches_and_workflow_files_by_pattern_are_given_only_where_they_hold() {
+        let served = serve(|_| {});
+        let patterns: Vec<(&str, Option<&str>, Option<&str>, bool)> = vec![
+            ("B_STAR", Some("release/*"), None, true), ("B_ONE_STAR", Some("*"), None, false), ("B_TWO_STARS", Some("**"), None, true), ("B_QUESTION", Some("release/v?.?-rc"), None, true),
+            ("B_RANGE", Some("release/v[0-9].[2-3]-rc"), None, true), ("B_SET", Some("release/v[abc].2-rc"), None, false), ("B_ONE", Some("release/v[1].2-rc"), None, true),
+            ("B_EMPTY_CLASS", Some("release/[]x"), None, false), ("B_OPEN", Some("release/[v1.2-rc"), None, false), ("B_DASH", Some("release/v1.2[-c]rc"), None, true),
+            ("B_EXACT", Some("release/v1.2-rc"), None, true), ("B_LONGER", Some("release/v1.2-rc/x"), None, false), ("B_OTHER", Some("main"), None, false),
+            ("W_NAME", None, Some("named.yml"), true), ("W_PATH", None, Some(".github/workflows/n*.yml"), true), ("W_ANY", None, Some("**/named.yml"), true), ("W_OTHER", None, Some("deploy.yml"), false),
+        ];
+        for (name, branch, workflow, _) in &patterns {
+            let scope = superci_core::secrets::valid_scope(None, *branch, *workflow, None).unwrap();
+            let kept = superci_core::secrets::Stored { name: name.to_string(), value: format!("{}-value", name.to_ascii_lowercase()), scope: scope.clone(), updated_ms: 1 };
+            served.aws.put(&format!("/superci/{}/{}", superci_testkit::PLANE, superci_core::secrets::setting(name, &scope)), &serde_json::to_string(&kept).unwrap());
+        }
+        let reads: String = patterns.iter().map(|(n, ..)| format!(" ${{{{ secrets.{n} }}}}")).collect();
+        let named = format!("jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo{reads} ${{{{ secrets['QUOTED'] }}}} ${{{{ secrets[\"DOUBLE\"] }}}} ${{{{ secrets . SPACED }}}} ${{{{ github.secrets_x }}}} ${{{{ secrets_like }}}} ${{{{ secrets[ 'X' ]}}}}\n");
+        let all = "jobs:\n  tests:\n    runs-on: superci\n    strategy:\n      matrix:\n        n: [B_STAR]\n    steps:\n      - run: echo ${{ secrets[matrix.n] }} ${{ secrets[ \"unclosed ] }}\n";
+        let dir = checkout_with(&[(".github/workflows/named.yml", &named), (".github/workflows/all.yml", all)]);
+        assert!(Command::new("git").current_dir(&dir).args(["checkout", "-qb", "release/v1.2-rc"]).status().unwrap().success());
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/named.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let handed = loop { if let Some((_, v)) = served.store.under("rjob:").into_iter().next() { break v } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let given = &handed["message"]["variables"];
+        for (name, _, _, holds) in &patterns { assert_eq!(given[*name].is_object(), *holds, "{name}: {given}") }
+        assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/all.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+        super::seen_in_browser(&served);
+    }
+
     #[test]
     fn a_step_whose_result_never_came_is_judged_by_its_own_lines_and_its_failed_test_named() {
         let served = serve(|_| {});
@@ -10520,6 +10596,65 @@ fn the_aws_accounts_budget_is_made_raised_lifted_and_removed_as_budgets_and_iam_
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=runners"));
     b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Jobs GitHub tells of that are not this CI's to run (another owner's repository, two of its labels, a label that
+/// is neither its nor GitHub's own) left alone; GitHub's own labels beside its one taken. A public repository's job
+/// run only when its run came from the repository itself: not a fork's pull request, not pull_request_target, and
+/// not when GitHub cannot say. Each job's page says why.
+#[test]
+fn jobs_not_this_cis_and_runs_from_outside_a_public_repository_are_left_or_refused_saying_why() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let shaped = |label: &str, change: &dyn Fn(&mut serde_json::Value)| {
+        let (id, (body, _)) = served.github.queue("shaped", label, served.now_ms());
+        let mut payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        change(&mut payload);
+        let status = served.webhook(served.github.signed(&payload));
+        (id, status, served.store.under(&format!("job:{id}")).first().map(|(_, j)| j.clone()))
+    };
+    for (label, change, ours) in [
+        ("superci", &(|p: &mut serde_json::Value| p["repository"]["full_name"] = "globex/app".into()) as &dyn Fn(&mut serde_json::Value), false),
+        ("superci", &|p: &mut serde_json::Value| p["workflow_job"]["labels"] = serde_json::json!(["superci", "superci/cpu=8"]), false),
+        ("superci", &|p: &mut serde_json::Value| p["workflow_job"]["labels"] = serde_json::json!(["superci", "gpu-box"]), false),
+        ("superci", &|p: &mut serde_json::Value| p["workflow_job"]["labels"] = serde_json::json!(["superci", "self-hosted", "Linux", "X64"]), true),
+        ("superci", &|p: &mut serde_json::Value| { p["installation"] = serde_json::Value::Null; }, false),
+    ] {
+        let (_, status, job) = shaped(label, change);
+        assert!(status < 500 && job.is_some() == ours, "{status} {job:?}");
+    }
+    // A public repository: allowed, then each run's origin as GitHub says it.
+    served.github.set_public(true);
+    let (id, q) = served.github.queue("public, not allowed", "superci", served.now_ms()); served.webhook(q);
+    let why = |id: u64| served.store.under(&format!("job:{id}"))[0].1["error"].as_str().unwrap_or_default().to_string();
+    assert!(why(id).contains("allow it in the dashboard"), "{}", why(id));
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}],"public_repos":["acme/app"]}"#);
+    let mut ids = vec![id];
+    for (answer, status, said) in [
+        (r#"{"id":1,"event":"pull_request","repository":{"id":7},"head_repository":{"id":8}}"#, 200, "a pull request from a fork"),
+        (r#"{"id":1,"event":"pull_request_target","repository":{"id":7},"head_repository":{"id":7}}"#, 200, "a pull_request_target run"),
+        (r#"{"id":1,"event":"push"}"#, 200, "could not check where its run came from"),
+        (r#"{"message":"Server Error"}"#, 500, "could not check where its run came from"),
+        (r#"{"id":1,"event":"push","repository":{"id":7},"head_repository":{"id":7}}"#, 200, ""),
+    ] {
+        let next = served.github.queue("probe", "superci", served.now_ms());
+        let run = served.github.job(next.0)["run_id"].as_u64().unwrap();
+        served.github.answer_with("GET", &format!("/actions/runs/{run}"), status, &[], answer);
+        served.webhook(next.1);
+        served.github.fail_none();
+        let w = why(next.0);
+        assert!(if said.is_empty() { !w.contains("not run on your clouds") } else { w.contains(said) }, "{said}: {w}");
+        ids.push(next.0);
+    }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for id in ids {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

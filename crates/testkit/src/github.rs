@@ -202,6 +202,13 @@ impl GitHub {
     /// GitHub's record of job `id` as it stands.
     pub fn job(&self, id: u64) -> Value { self.hub.lock().unwrap().jobs.get(&id).cloned().unwrap_or_default() }
 
+    /// A webhook's payload as given, signed as GitHub signs it (one GitHub would not send as it is, say).
+    pub fn signed(&self, payload: &Value) -> (Vec<u8>, String) {
+        let body = payload.to_string().into_bytes();
+        let signature = format!("sha256={}", superci_core::crypto::hex(&superci_core::crypto::hmac_sha256(WEBHOOK_SECRET.as_bytes(), &body)));
+        (body, signature)
+    }
+
     /// The webhook GitHub sends of a job's change (`action`), as it sends it.
     fn event(&self, action: &str, id: u64) -> (Vec<u8>, String) {
         let payload = json!({ "action": action, "workflow_job": self.job(id), "repository": self.repo(), "organization": { "login": OWNER, "id": 9_919 },

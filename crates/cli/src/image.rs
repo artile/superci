@@ -123,7 +123,7 @@ fn copy_blob(github: &mut Registry, cloudflare: &mut Registry, repo: &str, diges
     // GitHub answers with a redirect to its storage; the download itself needs no token.
     let mut source = {
         let bearer = github.bearer.clone().unwrap_or_default();
-        github.agent.get(&format!("https://ghcr.io/v2/{SOURCE_REPO}/blobs/{digest}")).header("authorization", &format!("Bearer {bearer}")).call().map_err(|e| e.to_string())?
+        github.agent.get(crate::aws::stand_in(&format!("https://ghcr.io/v2/{SOURCE_REPO}/blobs/{digest}")).as_str()).header("authorization", &format!("Bearer {bearer}")).call().map_err(|e| e.to_string())?
     };
     if source.status().as_u16() != 200 { return Err(format!("GitHub's registry: {} for layer {digest}", source.status())) }
     let mut reader = source.body_mut().with_config().limit(size + 1).reader();

@@ -121,15 +121,6 @@ async fn gh(http: &dyn Http, api: &str, method: &str, path: &str, token: Option<
     serde_json::from_slice(&r.body).map_err(|e| format!("GitHub {path}: {e}"))
 }
 
-/// The manifest flow's last step: the code GitHub redirected back with becomes the App's id, key and webhook secret.
-pub async fn convert_manifest_code(http: &dyn Http, host: Option<&str>, code: &str) -> Result<App> {
-    if code.len() < 8 || code.len() > 100 || !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') { return Err("invalid manifest code".into()); }
-    let r = gh(http, &api_base(host), "POST", &format!("/app-manifests/{code}/conversions"), None, None).await?;
-    let s = |k: &str| r[k].as_str().map(str::to_string).ok_or_else(|| format!("App conversion without {k}"));
-    Ok(App { id: r["id"].as_u64().ok_or("App conversion without id")?, slug: s("slug")?, pem: s("pem")?, webhook_secret: s("webhook_secret")?,
-        owner: r["owner"]["login"].as_str().unwrap_or_default().to_string(), owner_is_org: r["owner"]["type"] == "Organization", host: host.map(str::to_string) })
-}
-
 pub fn app_jwt(app: &App, now_ms: u64) -> Result<String> {
     let iat = now_ms / 1000 - 60;
     rs256_jwt(&serde_json::json!({ "iat": iat, "exp": iat + 540, "iss": app.id.to_string() }), &app.pem)
