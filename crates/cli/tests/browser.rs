@@ -3007,12 +3007,15 @@ fn connecting_github_takes_a_name_and_a_host_as_github_would_and_refuses_what_is
     b.wait("document.querySelector('main') !== null");
     b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
     for (fields, said) in [(vec![("login", "bad name!")], "not a GitHub name"), (vec![("login", "acme"), ("host", "localhost")], "not a host name"), (vec![("login", "acme"), ("host", "-x.com")], "not a host name"),
-        (vec![("login", "acme"), ("host", "x..com")], "not a host name"), (vec![("login", "acme"), ("host", "a b.com")], "not a host name"), (vec![("login", "acme"), ("host", "github.example.com/path")], "not a host name")] {
+        (vec![("login", "acme"), ("host", "x..com")], "not a host name"), (vec![("login", "acme"), ("host", "a b.com")], "not a host name"), (vec![("login", "acme"), ("host", "github.example.com/path")], "not a host name"),
+        (vec![("login", "acme"), ("host", ".x.com")], "not a host name"), (vec![("login", "acme"), ("host", "x.com-")], "not a host name"), (vec![("login", "acme"), ("host", "x.com.")], "not a host name"),
+        (vec![("login", "acme"), ("host", &format!("{}.com", "a".repeat(260)))], "not a host name"), (vec![("login", &"a".repeat(40))], "not a GitHub name"), (vec![("login", "under_score")], "not a GitHub name"), (vec![("login", "")], "")] {
         let (got, text) = post(&mut b, "/github/start", &fields);
         assert!(got == 400 && text.contains(said), "{fields:?}: {got} {text}");
     }
     // Good names: GitHub's own (as typed in any case), and one at a host of its own.
-    for fields in [vec![("login", "acme"), ("host", "https://GitHub.com/")], vec![("login", "acme"), ("host", "github.example.com")], vec![("login", "acme")]] {
+    for fields in [vec![("login", "acme"), ("host", "https://GitHub.com/")], vec![("login", "acme"), ("host", "github.example.com")], vec![("login", "acme")], vec![("login", "acme"), ("host", "www.github.com")],
+        vec![("login", "acme"), ("host", "acme.ghe.com")], vec![("login", "a-very-long-organization-name")], vec![("login", "Acme-Corp")]] {
         let (got, _) = post(&mut b, "/github/start", &fields);
         assert!(got < 500, "{fields:?}: {got}");
     }
