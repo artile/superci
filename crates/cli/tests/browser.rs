@@ -5330,6 +5330,107 @@ fn gitlabs_jobs_untold_are_found_by_the_upkeep_begun_or_given_a_machine_once_the
     assert_eq!(served.store.under("gitlab:untold")[0].1, asked);
 }
 
+
+/// A run from a computer, asked of the control plane as the CLI asks it, with a key of no name (said as started by
+/// none): a job that needs a failed job, a skipped one, a cancelled one and a called workflow whose job failed is told
+/// each as it ended (the called workflow's input given as a number, read as text); a job's whole log in steps (its own
+/// record, a skipped and a pending step among them; no links); its machine reaches the cache as its job. One whose event
+/// is too large is refused.
+#[test]
+fn a_run_from_a_computer_tells_a_job_how_each_job_it_needs_ended_failed_skipped_cancelled_or_called() {
+    let served = serve(|_| {});
+    let key = format!("superci_run_{}", "01".repeat(16));
+    served.aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_"), &format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes())));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let create = |workflow: &str, called: serde_json::Value, more: serde_json::Value| -> (u16, serde_json::Value) {
+        let mut body = serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main", "sha": "0".repeat(40), "actor": "someone", "event_name": "push", "called": called });
+        for (k, v) in more.as_object().into_iter().flatten() { body[k] = v.clone() }
+        let mut r = agent.post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {key}")).send(body.to_string()).unwrap();
+        let text = r.body_mut().read_to_string().unwrap_or_default();
+        (r.status().as_u16(), serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+    };
+    let read = |path: &str| -> serde_json::Value { agent.get(&format!("{}{path}", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap() };
+
+    // Its event's payload larger than a run keeps.
+    let (status, said) = create("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: true\n", serde_json::json!({}), serde_json::json!({ "event": { "x": "a".repeat(70_000) } }));
+    assert!(status == 400 && said.as_str().is_some_and(|s| s.contains("a run takes 64 KB at most")), "{status} {said}");
+
+    let called = "on:\n  workflow_call:\n    inputs:\n      n:\n        type: string\njobs:\n  x:\n    runs-on: superci\n    steps:\n      - run: echo ${{ inputs.n }}\n";
+    let wf = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: make test ${{ secrets.TOKEN }}\n  b:\n    if: false\n    runs-on: superci\n    steps:\n      - run: never\n  d:\n    runs-on: superci\n    steps:\n      - run: make lint\n  caller:\n    uses: ./.github/workflows/called.yml\n    with:\n      n: ${{ 5 }}\n  c:\n    needs: [a, b, d, caller]\n    if: ${{ always() && !(needs.a.result == 'failure' && needs.b.result == 'skipped' && needs.d.result == 'cancelled' && needs.caller.result == 'failure') }}\n    runs-on: superci\n    steps:\n      - run: echo told otherwise\n";
+    let (status, said) = create(wf, serde_json::json!({ ".github/workflows/called.yml": called }), serde_json::json!({ "secrets": [["TOKEN", "s3cret"]] }));
+    assert!(status == 200 && said["missing_secrets"] == serde_json::json!([]), "{status} {said}");
+    let id = said["run_id"].as_str().unwrap().to_string();
+    let run = || served.store.under(&format!("run:{id}")).into_iter().next().map(|(_, r)| r).unwrap_or_default();
+    assert!(run()["by"] == "", "a key of no name: {}", run()["by"]);
+    let of = |name: &str| run()["jobs"].as_array().into_iter().flatten().find(|j| j["name"] == name).cloned().unwrap_or_default();
+    let runner = |name: &str| { let end = std::time::Instant::now() + std::time::Duration::from_secs(15); loop { if let Some(r) = superci_testkit::Runner::of_job(&served, &id, name) { break r } assert!(std::time::Instant::now() < end, "{name} not started: {}", run()); std::thread::sleep(std::time::Duration::from_millis(20)) } };
+    // a's steps: its own record, one with its whole log, one skipped and one pending (neither with a log).
+    let a = runner("a");
+    a.take();
+    a.records(vec![serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000000", "type": "Job", "name": "a", "order": 0, "state": "inProgress" }),
+        serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000001", "type": "Task", "name": "Run make test", "order": 1, "state": "completed", "result": "failed", "log": { "id": 1 } }),
+        serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000002", "type": "Task", "name": "Upload", "order": 2, "state": "completed", "result": "skipped" }),
+        serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000003", "type": "Task", "name": "Post", "order": 3, "state": "pending" })]);
+    a.log(1, "2026-10-15T10:00:01.0000000Z 3 tests failed\n");
+    let a_id = of("a")["job_id"].as_str().unwrap().to_string();
+    assert!(read(&format!("/job/log?id={a_id}&link=1"))["urls"].is_null());
+    assert_eq!(read(&format!("/job/log?id={a_id}"))["log"], "2026-10-15T10:00:01.0000000Z 3 tests failed\n");
+    // (Its machine asks the cache as its job: allowed as far as the cache, which has no AWS account here.)
+    served.store.0.lock().unwrap().insert("cachem:local-machine-link-0001".into(), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "", "job": format!("job:{a_id}") }).to_string());
+    let mut r = agent.post(&format!("{}/cache/local-machine-link-0001/tool-get", served.url)).send(r#"{"tool":"turbo","hash":"0123456789abcdef"}"#).unwrap();
+    assert_eq!(r.body_mut().read_json::<serde_json::Value>().unwrap()["why"], "this control plane has no AWS account");
+    a.finish("failed");
+    let d = runner("d");
+    d.take();
+    d.finish("canceled");
+    let x = runner("caller / x");
+    let inputs = x.handed(&served)["contextData"]["inputs"].to_string();
+    assert!(inputs.contains(r#"{"k":"n","v":"5"}"#), "given as a number, read as text: {inputs}");
+    x.take();
+    x.finish("failed");
+    // c runs only if it was told otherwise than each ended: skipped, never started.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while of("c")["state"] != "done" { assert!(std::time::Instant::now() < end, "{}", run()); std::thread::sleep(std::time::Duration::from_millis(20)) }
+    assert!(of("c")["result"] == "skipped" && of("c")["job_id"].is_null(), "{}", of("c"));
+}
+
+/// Runs from a computer ended by the upkeep: one cancelled whose runner never stops is ended once its time is up (AWS
+/// took its machine back meanwhile: not started again); one whose machine failed without saying when is over, a
+/// failure. (Started with a key named as no key can be, said as named; one of no repository has no name in the
+/// cache's list.)
+#[test]
+fn runs_from_a_computer_cancelled_or_failed_on_their_machines_are_ended_by_the_upkeep() {
+    let served = serve(|_| {});
+    let key = format!("superci_run_{}", "02".repeat(16));
+    served.aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_bot+x"), &format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes())));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let one = "jobs:\n  e:\n    runs-on: superci\n    steps:\n      - run: sleep 600\n";
+    let create = |key: &str, repository: &str| -> String {
+        let body = serde_json::json!({ "workflow": one, "path": ".github/workflows/ci.yml", "repository": repository, "ref": "refs/heads/main", "sha": "0".repeat(40), "actor": "someone", "event_name": "push" });
+        let said: serde_json::Value = agent.post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {key}")).send(body.to_string()).unwrap().body_mut().read_json().unwrap();
+        said["run_id"].as_str().unwrap().to_string()
+    };
+    let run = |id: &str| served.store.under(&format!("run:{id}")).into_iter().next().map(|(_, r)| r).unwrap_or_default();
+    let of = |id: &str| run(id)["jobs"][0].clone();
+    let record = |id: &str| { let j = of(id)["job_id"].as_str().unwrap_or_default().to_string(); served.store.under(&format!("job:{j}")).into_iter().find(|(k, _)| *k == format!("job:{j}")).map(|(_, v)| v).unwrap_or_default() };
+    let take = |id: &str| { let end = std::time::Instant::now() + std::time::Duration::from_secs(15); loop { if let Some(r) = superci_testkit::Runner::of_run(&served, id) { r.take(); break } assert!(std::time::Instant::now() < end); std::thread::sleep(std::time::Duration::from_millis(20)) } };
+    let cancelled = create(&key, "acme/app");
+    assert_eq!(run(&cancelled)["by"], "bot+x");
+    take(&cancelled);
+    let failed = create(&served.run_key, "");
+    take(&failed);
+    assert!(served.store.under("cachename:").iter().all(|(_, n)| n == "acme/app"), "{:?}", served.store.under("cachename:"));
+    assert_eq!(agent.post(&format!("{}/runs/{cancelled}/cancel", served.url)).header("authorization", &format!("Bearer {key}")).send_empty().unwrap().status().as_u16(), 200);
+    let edit = |id: &str, f: &dyn Fn(&mut serde_json::Value)| { let j = of(id)["job_id"].as_str().unwrap().to_string(); let mut rec = record(id); f(&mut rec); served.store.0.lock().unwrap().insert(format!("job:{j}"), rec.to_string()); };
+    edit(&cancelled, &|r| r["interrupted"] = true.into());
+    edit(&failed, &|r| { r["state"] = "failed".into(); r["error"] = "its machine stopped".into(); });
+    served.later(7 * 60_000);
+    served.upkeep();
+    assert!(record(&cancelled)["state"] == "cancelled" && record(&cancelled)["error"] == "its run was cancelled, and its machine was ended", "{}", record(&cancelled));
+    assert!(of(&cancelled)["restarted"].is_null() && of(&cancelled)["result"] == "cancelled", "{}", of(&cancelled));
+    assert_eq!(of(&failed)["result"], "failure", "{}", of(&failed));
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
