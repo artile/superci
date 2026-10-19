@@ -101,7 +101,7 @@ jobs:
       # (What the programs are built from: the control planes, the runner agent, the cache program and the layer
       # store, with the core they share.)
       - id: key
-        run: echo "programs=programs-${{ runner.os }}-${{ hashFiles('build.sh', 'Cargo.lock', 'Cargo.toml', 'scripts/mkfs-erofs/**', 'crates/core/src/**', 'crates/core/Cargo.toml', 'crates/plane-*/src/**', 'crates/plane-*/Cargo.toml', 'crates/plane-cloudflare/wrangler.toml', 'crates/runners-cloudflare/src/**', 'crates/runners-cloudflare/Cargo.toml', 'crates/runners-cloudflare/wrangler.toml', 'crates/cache/src/**', 'crates/cache/Cargo.toml', 'crates/layers/src/**', 'crates/layers/Cargo.toml', 'crates/layers/build.rs', 'crates/layers/assets/**', 'crates/layers/proto/**') }}"" >> "$GITHUB_OUTPUT"
+        run: echo "programs=programs-${{ runner.os }}-${{ hashFiles('build.sh', 'Cargo.lock', 'Cargo.toml', 'scripts/mkfs-erofs/**', 'crates/core/src/**', 'crates/core/Cargo.toml', 'crates/plane-*/src/**', 'crates/plane-*/Cargo.toml', 'crates/plane-cloudflare/wrangler.toml', 'crates/runners-cloudflare/src/**', 'crates/runners-cloudflare/Cargo.toml', 'crates/runners-cloudflare/wrangler.toml', 'crates/cache/src/**', 'crates/cache/Cargo.toml', 'crates/layers/src/**', 'crates/layers/Cargo.toml', 'crates/layers/build.rs', 'crates/layers/assets/**', 'crates/layers/proto/**') }}" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         id: programs
         with:
