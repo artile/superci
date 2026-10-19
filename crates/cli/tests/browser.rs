@@ -5411,7 +5411,8 @@ mod runs_suite_in_browser {
     fn lines_left_out_as_a_step_went_come_late_without_empty_ones_at_their_ends() {
         let served = serve(|_| {});
         let dir = checkout();
-        let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).spawn().unwrap();
+        // (With the wait for steps' logs as it comes: they all come here.)
+        let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).env_remove("SUPERCI_LOGS_WAIT_S").spawn().unwrap();
         let run = run_of(&served);
         let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
         let a = "cccccccc-0000-0000-0000-000000000003";
