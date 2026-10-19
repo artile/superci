@@ -198,6 +198,220 @@ fn requests_ended_otherwise_than_browsers_end_them_are_answered_and_a_job_asked_
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A sign-in started from the terminal, its tab at the dashboard's own address: AWS's, before AWS and once begun
+/// there without coming back; one more AWS account beside the one signed in to; Modal's, until approved there.
+#[test]
+fn a_sign_in_started_in_the_terminal_shows_its_own_page_at_each_step_until_it_is_done() {
+    use std::io::BufRead;
+    let started = |home: &std::path::Path, args: &[&str]| -> (std::process::Child, std::sync::mpsc::Receiver<String>, String) {
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut child = common::command(home).args(args).args(["--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { let _ = tx.send(l); });
+        let link = loop { let l = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("its link"); if let Some(w) = l.split_whitespace().find(|w| w.starts_with("http://localhost")) { break w.to_string() } };
+        (child, rx, link)
+    };
+    let served = serve(|_| {});
+    // AWS's: a button to it; begun there and not come back, the way on (signed out of AWS first, or the same again).
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let (mut child, _, link) = started(&home, &["login", "aws"]);
+    let (_, _, page) = common::get(&link, "/");
+    assert!(common::words(&page).contains("Sign in with AWS") && page.contains("Continue to AWS"), "{}", common::words(&page));
+    common::post(&link, "/aws/signin", &[("next", ""), ("w", "default")]);
+    let (_, _, page) = common::get(&link, "/");
+    assert!(common::words(&page).contains("Your AWS sign-in is not finished") && page.contains("Sign out of AWS and try again") && page.contains(">Try again<"), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // One more AWS account, beside the one signed in to: not done by the one there already.
+    let home = signed_in(&served);
+    let (mut child, _, link) = started(&home, &["login", "aws", "--add"]);
+    let (_, _, page) = common::get(&link, "/");
+    assert!(page.contains("Continue to AWS") && !common::words(&page).contains("Signed in"), "{}", common::words(&page));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // Modal's: to Modal's page, then this tab waits for its approval there, and says it is done.
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
+    let home = signed_in(&served);
+    let (mut child, rx, link) = started(&home, &["login", "modal"]);
+    let (status, to, _) = common::get(&link, "/");
+    assert!(status == 303 && to.ends_with("/connect/modal"), "{status} {to}");
+    let (_, _, page) = common::get(&link, "/connect/modal");
+    assert!(page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{}", common::words(&page));
+    let (_, _, page) = common::get(&link, "/");
+    let page = common::words(&page);
+    assert!(page.contains("Approve it in Modal's tab") || page.contains("Signed in with Modal"), "{page}");
+    // (Approved: its last page, then the command ends.)
+    let mut done = String::new();
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < end && !done.contains("Signed in with Modal") { done = common::words(&common::get(&link, "/").2); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    assert!(done.contains("Signed in with Modal"), "{done}");
+    let said: Vec<String> = rx.iter().collect();
+    assert!(child.wait().unwrap().success() && said.iter().any(|l| l.contains("Modal workspace acmeci1")), "{said:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The dashboard and what a person finishes in the browser open there by themselves (its link handed to the
+/// computer's browser); the port asked for, when it is Cloudflare's own and taken, is said as taken; on the next port,
+/// with the usual folder, it says that both share its sign-ins.
+#[test]
+fn the_dashboard_and_a_task_open_in_the_browser_and_a_port_taken_is_said_as_it_stands() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    // A browser that notes what it is handed.
+    let bin = common::temp("browser");
+    let opened = bin.join("opened");
+    std::fs::write(bin.join("xdg-open"), format!("#!/bin/sh\necho \"$1\" >> {}\n", opened.display())).unwrap();
+    std::fs::set_permissions(bin.join("xdg-open"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let free = || { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let first = |c: &mut std::process::Child| -> Vec<String> { std::io::BufReader::new(c.stdout.take().unwrap()).lines().map_while(Result::ok).take(2).collect() };
+    let handed = || std::fs::read_to_string(&opened).unwrap_or_default();
+    for (args, says) in [(&["dashboard", "--workspace=default"][..], "It is opening in your browser"), (&["connections", "create", "github", "acme", "--workspace=default"], "Create the GitHub App and choose its repositories here")] {
+        let _ = std::fs::remove_file(&opened);
+        let mut c = common::command(&home).args(args).env("SUPERCI_PORT", free().to_string()).env("PATH", &bin).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let said = first(&mut c).join("\n");
+        let link = said.split_whitespace().find(|w| w.starts_with("http://localhost")).unwrap().to_string();
+        until("the browser handed its link", || handed().contains(&link));
+        assert!(said.contains(says), "{said}");
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    // Cloudflare's own port, asked for by name and taken: said as taken (no other is tried).
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port().to_string();
+    let o = common::command(&home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", &port).env("SUPERCI_OAUTH_PORT", &port).output().unwrap();
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(&format!("port {port} is in use")), "{}", String::from_utf8_lossy(&o.stderr));
+    // The usual folder (no SUPERCI_HOME of its own), its port taken: the next one, and both share the sign-ins.
+    let user = common::temp("user");
+    std::fs::rename(&home, user.join(".superci")).unwrap();
+    let mut c = common::command(&user).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_HOME", "").env("HOME", &user).env("SUPERCI_STAND_IN", &served.aws.url).env("SUPERCI_OAUTH_PORT", &port).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let said = first(&mut c).join("\n");
+    let _ = c.kill();
+    let _ = c.wait();
+    assert!(said.contains(&format!("Port {port} is taken")) && said.contains("Both use the same sign-ins (SUPERCI_HOME gives this one a folder of its own)"), "{said}");
+    let _ = std::fs::remove_dir_all(&user);
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
+/// A change to a control plane in Modal or Cloudflare is made only with the sign-in of the place it lives in: another
+/// Modal workspace's, or a Cloudflare sign-in that does not reach its account, is refused saying which; a sign-in the
+/// cloud no longer takes is said as that.
+#[test]
+fn a_change_with_another_places_sign_in_or_one_its_cloud_no_longer_takes_is_refused_saying_which() {
+    let served = serve(|_| {});
+    let at = |plane: serde_json::Value, more: &[(&str, serde_json::Value)]| {
+        let home = home(&served);
+        std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["plane"] = plane;
+        for (k, v) in more { kept[*k] = v.clone() }
+        std::fs::write(&file, kept.to_string()).unwrap();
+        home
+    };
+    let modal = |workspace: &str| serde_json::json!({ "Modal": { "workspace": workspace, "url": served.url, "plane_id": PLANE, "label": "superci" } });
+    let cloudflare = serde_json::json!({ "Cloudflare": { "account_id": "acc-plane", "account_name": "Plane Co", "script": "superci-plane", "url": served.url, "plane_id": PLANE, "label": "superci" } });
+    let cf_sign_in = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    let refused = |home: &std::path::Path| { let (code, said) = common::json(home, &["name", "update", "Acme"]); assert_ne!(code, 0, "{said}"); let e = said["error"].as_str().unwrap_or_default().to_string(); let _ = std::fs::remove_dir_all(home); e };
+    // Another Modal workspace's sign-in.
+    let home = at(modal("globex"), &[("modal", serde_json::json!({ "token_id": "ak-acme", "token_secret": "as-acme", "workspace": "acmeci" }))]);
+    let e = refused(&home);
+    assert!(e.contains("This control plane is in the Modal workspace globex, and SuperCI is signed in to acmeci") && e.contains("Nothing has changed"), "{e}");
+    // Its own workspace's, which Modal no longer takes.
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/ended.jsonl"), &[]);
+    let home = at(modal("acmeci"), &[("modal", serde_json::json!({ "token_id": "ak-superciendedrecording00", "token_secret": "as-superciendedrecording00", "workspace": "acmeci" }))]);
+    assert_eq!(refused(&home), "Modal no longer accepts SuperCI's sign-in. Run `superci login modal` to sign in again.");
+    // Cloudflare's, its token taken no more.
+    served.aws.fail("api.cloudflare.com", 403, &serde_json::json!({ "success": false, "errors": [{ "code": 10000, "message": "Invalid access token" }], "messages": [], "result": null }).to_string(), None);
+    let home = at(cloudflare.clone(), &[("cloudflare", cf_sign_in.clone())]);
+    assert_eq!(refused(&home), "SuperCI's Cloudflare sign-in has expired. Run `superci login cloudflare` to sign in again.");
+    served.aws.fail_none();
+    // Cloudflare's, reaching another account only (as Cloudflare lists it, with no control plane there).
+    let list = |result: serde_json::Value| serde_json::json!({ "success": true, "errors": [], "messages": [], "result": result }).to_string();
+    served.aws.fail("workers/scripts", 200, &list(serde_json::json!([])), None);
+    served.aws.fail("workers/subdomain", 200, &list(serde_json::json!({ "subdomain": "other" })), None);
+    served.aws.fail("accounts?per_page", 200, &list(serde_json::json!([{ "id": "acc-other", "name": "Other Co" }])), None);
+    let home = at(cloudflare, &[("cloudflare", cf_sign_in)]);
+    let (_child, link) = dashboard(&home);
+    let (_, page) = common::part(&link, "/?p=settings&fragment=1");
+    assert!(page.contains("Plane Co") || page.contains("Cloudflare"), "{}", common::words(&page));
+    let (status, _, said) = common::post(&link, "/name", &[("name", "Acme")]);
+    assert!(status >= 400 && common::words(&said).contains("This control plane is in the Cloudflare account Plane Co, which the Cloudflare sign-in kept does not reach"), "{status} {}", common::words(&said));
+    assert!(served.aws.settings(PLANE).iter().all(|(k, _)| k != "NAME"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `superci leave` says what its page says, in words: the control plane deleted, and what is left to do by hand (the
+/// GitHub App, the workflows), each in a sentence of its own.
+#[test]
+fn stopping_superci_from_the_terminal_says_what_is_left_to_do_as_its_page_says_it() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    let o = common::superci(&home, &["leave", "--confirm"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("SuperCI is stopped: Its control planes and what was made for them are deleted from your clouds. Delete the GitHub App")
+        && said.contains("(Advanced → Delete). It is uninstalled already. Change runs-on: superci back in your workflows") && !said.contains('<'), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What a command reads is the control plane in use as it stands: read with this computer's key alone when signed in
+/// nowhere (one listed twice, one that does not answer, one that moved away); with a sign-in, one of two live CIs
+/// only when named; and none when the only sign-in turns out to have ended.
+#[test]
+fn a_command_reads_the_control_plane_in_use_as_it_stands_with_a_key_alone_two_live_or_a_sign_in_ended() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    other.connect_github();
+    let elsewhere = serde_json::json!({ "Aws": { "account_id": "222222222222", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } });
+    let with = |home: &std::path::Path, f: &dyn Fn(&mut serde_json::Value)| { let file = home.join("workspaces/default/sign-ins.json"); let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap(); f(&mut k); std::fs::write(&file, k.to_string()).unwrap(); };
+    let status = |home: &std::path::Path| { let (_, s) = common::json(home, &["status"]); s.to_string() };
+    // Signed in nowhere, the one in use listed twice beside another: the one in use, read with the key.
+    let home = home(&served);
+    with(&home, &|k| { k["planes_more"] = serde_json::json!([k["plane"].clone(), elsewhere.clone()]); k["key"]["planes"] = serde_json::json!([PLANE, "testplane0002"]); });
+    let (code, s) = common::json(&home, &["status"]);
+    assert!(code == 0 && s.to_string().contains(PLANE) && !s.to_string().contains("control planes are live"), "{s}");
+    // Not answering: said, not guessed.
+    served.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (_, s) = common::json(&home, &["status"]);
+    served.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(s["control_plane"]["id"] == PLANE && s["control_plane"]["online"] == false && s["status"].is_null(), "{s}");
+    // Moved away: still read as it is, with nothing to find the next one with.
+    served.store.0.lock().unwrap().insert("moved_to".into(), other.url.clone());
+    let s = status(&home);
+    assert!(s.contains(&other.url) || s.contains("moved"), "{s}");
+    let _ = std::fs::remove_dir_all(&home);
+    // Signed in: the one that moved away is looked for again, and the other live CI beside it is one of two to name.
+    let home = signed_in(&served);
+    with(&home, &|k| { k["planes_more"] = serde_json::json!([elsewhere.clone()]); });
+    served.store.0.lock().unwrap().remove("moved_to");
+    let (_, s) = common::json(&home, &["status"]);
+    assert!(s["error"].as_str().unwrap_or_default().contains("2 control planes are live here. Name one: --plane=ID"), "{s}");
+    let (_, s) = common::json(&home, &["connections", "create", "github", "octocat", "--dry-run"]);
+    assert!(s["error"].as_str().unwrap_or_default().contains("2 control planes are live here"), "{s}");
+    let _ = std::fs::remove_dir_all(&home);
+    // The only sign-in, AWS's, found ended as the clouds are looked in (nothing kept to read with a key): said as that.
+    // (AWS's answer to a refresh token it does not take, as it answered.)
+    served.aws.replaying(include_str!("../fixtures/aws/sign-in/ended.jsonl"), &[]);
+    for args in [&["status"][..], &["connections", "create", "github", "octocat", "--dry-run"]] {
+        let home = signed_in(&served);
+        with(&home, &|k| {
+            for f in ["plane", "key"] { k.as_object_mut().unwrap().remove(f); }
+            (k["aws"]["creds"]["expires_at_ms"], k["aws"]["refresh_token"]) = (0.into(), "superci-ended-refresh-token-for-a-recording".into());
+            k["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+        });
+        let (_, s) = common::json(&home, args);
+        assert!(s["error"].as_str().unwrap_or_default().contains("SuperCI's AWS sign-in has ended"), "{args:?}: {s}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
