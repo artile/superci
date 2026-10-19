@@ -1261,7 +1261,13 @@ fn removing_a_runner_provider_is_refused_while_it_runs_jobs_or_its_cloud_is_not_
     until("AWS forgotten", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_RUNNERS" && v == "off"));
     b.goto(&format!("{link}&p=runners"));
     b.wait(&page_shows("the role superci-plane-"));
-    // Cloudflare with its running job stopped: its containers off.
+    // A second job running there: said in the plural.
+    let (two, queued) = served.github.queue("test 2", "superci/provider=cloudflare", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(two)), 202);
+    let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "cloudflare")]);
+    assert!(got == 409 && text.contains("2 jobs are running on Cloudflare"), "{got} {text}");
+    // Cloudflare with its running jobs stopped: its containers off.
     let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "cloudflare"), ("stop", "on")]);
     assert!(got < 400, "{got} {text}");
     until("Cloudflare's containers off", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "CONTAINERS" && v == "off"));
