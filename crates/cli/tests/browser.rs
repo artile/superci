@@ -3650,6 +3650,72 @@ fn the_changelog_says_what_updating_asks_for_and_nothing_of_a_control_plane_that
 }
 
 #[test]
+fn aws_spot_in_one_region_far_from_github_with_few_cpus_and_refused_by_the_role_is_said_in_its_settings() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    // Its machines in Ireland only, where the account may run 8 spot CPUs; spot refused by the role signed in as.
+    served.aws.put(&format!("/superci/{PLANE}/AWS_REGIONS"), r#"["eu-west-1"]"#);
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare"}]}"#);
+    served.aws.fail("ServiceQuotasV20190624.GetServiceQuota|servicequotas.eu-west-1", 200, r#"{"Quota":{"QuotaCode":"L-34B43A08","ServiceCode":"ec2","Value":8.0}}"#, None);
+    served.aws.fail("RunInstances|MarketType", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/ReadOnly/someone is not authorized to perform: ec2:RunInstances because no identity-based policy allows the ec2:RunInstances action"), None);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let page = loop {
+        let (_, html) = common::part(&link, "/?p=runners&fragment=1");
+        let page = common::words(&html);
+        if page.contains("the role or user signed in as") && page.contains("up to 8 spot CPUs") { break (page, html) }
+        assert!(std::time::Instant::now() < end, "{page}");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    };
+    // Ireland in its list, N. Virginia among those to add, said to be closest to GitHub; asking for more CPUs there.
+    assert!(page.0.contains("eu-west-1 · up to 8 spot CPUs") && page.0.contains("us-east-1 · closest to GitHub") && page.0.contains("Request more in"), "{}", page.0);
+    assert!(page.1.contains(r#"<option value="us-east-1">"#), "us-east-1 can be added");
+    // Taken out of the order as the page showed it (a provider named twice there counted once).
+    let (status, _, _) = common::post(&link, "/routing", &[("action", "take_out"), ("cloud", "cloudflare"), ("current", "aws,cloudflare,aws")]);
+    assert!(status < 400, "{status}");
+    let routing: serde_json::Value = serde_json::from_str(&served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").unwrap().1).unwrap();
+    assert_eq!(routing["order"].as_array().unwrap().iter().map(|p| (p["cloud"].as_str().unwrap().to_string(), p["off"] == true)).collect::<Vec<_>>(), vec![("aws".to_string(), false), ("cloudflare".to_string(), true)]);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_ci_of_github_alone_with_two_jobs_on_cloudflare_an_app_short_of_a_read_permission_and_aws_in_its_order_not_added() {
+    let served = serve(|_| {});
+    served.connect_github();
+    // Two jobs running on Cloudflare's containers.
+    for name in ["one", "two"] {
+        let (id, queued) = served.github.queue(name, "superci/provider=cloudflare", served.now_ms());
+        assert_eq!(served.webhook(queued), 202);
+        assert_eq!(served.webhook(served.github.start(id)), 202);
+    }
+    // AWS first in its order, never added here (after a move: the order of the one before); and a computer of its
+    // own, which is no provider to add.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare"},{"cloud":"machine:laptop"}]}"#);
+    // GitHub saying its App asks for less than SuperCI needs: no metadata, which is read only.
+    served.github.answer_with("GET", "/app", 200, &[("content-type", "application/json")], r#"{"id":1,"slug":"superci-acme","permissions":{"organization_self_hosted_runners":"write","actions":"write"}}"#);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    // Its workflows: the prompt for coding agents is GitHub Actions' only.
+    let (_, html) = common::part(&link, "/?p=workflows&fragment=1");
+    assert!(html.contains(" data-gh=\"") && !html.contains(" data-gl=\""));
+    // Removing Cloudflare says both jobs finish on their own; AWS is said not to be added.
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(page.contains("2 jobs are running there finish on their own"), "{page}");
+    assert!(page.contains("Not added AWS is not added to this control plane yet") && !page.contains("laptop is not added"), "{page}");
+    let status: serde_json::Value = ureq::get(&format!("{}/status?light=1", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap();
+    assert!(status["routing"]["order"].to_string().contains("machine:laptop"), "{}", status["routing"]);
+    // What the App lacks, said as what it reads.
+    let page = common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    assert!(page.contains("Metadata (read)Reads") || page.contains("Metadata (read) Reads"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
