@@ -1424,3 +1424,94 @@ fn a_secret_typed_at_a_terminal_is_kept_and_one_a_run_key_used_is_listed_as_used
     assert!(line("TOKEN").ends_with("used just now by the key agent") && line("TYPED").ends_with("not used yet"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// What a person does in the browser, begun from the terminal with --no-browser: a sign-in to one more AWS account
+/// beside the one signed in to, and GitHub's App for an organization, each a link to open.
+#[test]
+fn another_aws_account_and_githubs_app_are_begun_from_the_terminal_with_a_link_to_open() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    for args in [&["login", "aws", "--add", "--no-browser"][..], &["connections", "create", "github", "acme", "--no-browser"]] {
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut child = common::command(&home).args(args).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
+        let mut said = vec![];
+        for l in lines.by_ref().take(20) { let link = l.contains(&format!("http://localhost:{port}/")); said.push(l); if link { break } }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(said.last().is_some_and(|l| l.contains(&format!("http://localhost:{port}/"))), "{args:?}: {said:?}");
+        if args[0] == "connections" { assert!(said[0].starts_with("Only an owner of acme can create its App"), "{said:?}") }
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A run of two jobs from a computer, the second waiting on the first: its lines in groups, a post sent again from
+/// a line already out, a step over once the next began, two steps whose logs never came (their tests counted from
+/// their lines), a line whose time is not where a runner puts it; then the second failing with a step still going and
+/// one never begun, what its runner logged while slow to listen said after it.
+#[test]
+fn a_run_of_two_jobs_is_followed_through_groups_lines_sent_again_and_steps_whose_logs_or_results_never_came() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    served.connect_github();
+    let dir = common::temp("two-jobs");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: make\n      - run: make test\n      - run: make docs\n  check:\n    needs: build\n    runs-on: superci\n    steps:\n      - run: make check\n      - run: make lint\n      - run: make fmt\n").unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let mut cli = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme/app"])
+        .env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_LOGS_WAIT_S", "3").env("SUPERCI_STAND_IN", &served.aws.url)
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let p = printed.clone();
+    let out = cli.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { p.lock().unwrap().push(l) });
+    let until = |what: &str| { let end = std::time::Instant::now() + std::time::Duration::from_secs(20); while !printed.lock().unwrap().iter().any(|l| l.contains(what)) { assert!(std::time::Instant::now() < end, "no {what:?} in {:?}", printed.lock().unwrap()); std::thread::sleep(std::time::Duration::from_millis(50)) } };
+    let run = loop { if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let build = loop { if let Some(r) = superci_testkit::Runner::of_job(&served, &run, "build") { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let (a, b, c) = ("aaaaaaaa-0000-0000-0000-000000000001", "bbbbbbbb-0000-0000-0000-000000000002", "cccccccc-0000-0000-0000-000000000003");
+    build.take();
+    build.steps(&[(a, "Run make", 1, "inProgress", None, None), (b, "Run make test", 2, "pending", None, None), (c, "Run make docs", 3, "pending", None, None)]);
+    let lines = |v: &[&str]| v.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    build.lines(a, 1, &lines(&["##[group]Setting up", "inside the group", "##[endgroup]"]));
+    build.lines(a, 2, &lines(&["inside the group", "##[endgroup]", "after the group"]));
+    until("after the group");
+    // The next step begun while its record still says this one goes on (its log there already): this one is over.
+    build.log(1, "2026-10-15T10:00:01.0000000Z ##[group]Setting up\n2026-10-15T10:00:01.0000000Z inside the group\n2026-10-15T10:00:01.0000000Z ##[endgroup]\n2026-10-15T10:00:02.0000000Z after the group");
+    build.records(vec![serde_json::json!({ "id": a, "type": "Task", "name": "Run make", "order": 1, "state": "inProgress", "result": null, "log": { "id": 1 }, "startTime": "2026-10-15T10:00:00Z" }),
+        serde_json::json!({ "id": b, "type": "Task", "name": "Run make test", "order": 2, "state": "inProgress", "result": null, "startTime": "2026-10-15T10:00:02Z" })]);
+    build.lines(b, 1, &lines(&["test a ... ok", "2026-10-15T10:00:01 is when this one began, as its Z says much later on"]));
+    until("test a ... ok");
+    build.lines(c, 1, &lines(&["test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"]));
+    build.steps(&[(a, "Run make", 1, "completed", Some("succeeded"), Some(1)), (b, "Run make test", 2, "completed", Some("succeeded"), None), (c, "Run make docs", 3, "completed", Some("succeeded"), None)]);
+    build.finish("succeeded");
+    // The second, once the first passed: its runner slow to listen, then a step that fails, one still going, one never begun.
+    let check = loop { if let Some(r) = superci_testkit::Runner::of_job(&served, &run, "check") { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let job = served.store.under("job:").into_iter().find(|(_, j)| j["name"] == "check").unwrap().1["job_id"].to_string();
+    served.store.0.lock().unwrap().insert(format!("hello:{job}"), serde_json::json!({ "script_ms": served.now_ms(), "boot_s": 9.5, "log": "[RUNNER 2026-10-15 10:00:00Z INFO] Waiting for GitHub\n[RUNNER 2026-10-15 10:00:12Z INFO] Listening for Jobs" }).to_string());
+    let (x, y, z) = ("dddddddd-0000-0000-0000-000000000004", "eeeeeeee-0000-0000-0000-000000000005", "ffffffff-0000-0000-0000-000000000006");
+    check.take();
+    check.steps(&[(x, "Run make check", 1, "inProgress", None, None)]);
+    check.lines(x, 1, &lines(&["checking", "check failed"]));
+    check.log(1, "2026-10-15T10:00:03.0000000Z checking\n2026-10-15T10:00:03.0000000Z check failed");
+    check.records(vec![
+        serde_json::json!({ "id": x, "type": "Task", "name": "Run make check", "order": 1, "state": "completed", "result": "failed", "log": { "id": 1 }, "startTime": "2026-10-15T10:00:00Z", "finishTime": "2026-10-15T10:00:04Z" }),
+        serde_json::json!({ "id": y, "type": "Task", "name": "Run make lint", "order": 2, "state": "inProgress", "result": null, "startTime": "2026-10-15T10:00:04Z" }),
+        serde_json::json!({ "id": z, "type": "Task", "name": "Run make fmt", "order": 3, "state": "pending", "result": null })]);
+    check.finish("failed");
+    let status = cli.wait().unwrap();
+    reader.join().unwrap();
+    let said = printed.lock().unwrap().join("\n");
+    assert_eq!(status.code(), Some(1), "{said}");
+    // Each line once, a group's heading as a line and its end as nothing; a line's own time kept as its own.
+    for line in ["[build] Setting up", "[build] inside the group", "[build] after the group", "[build] 2026-10-15T10:00:01 is when this one began, as its Z says much later on"] {
+        assert_eq!(said.lines().filter(|l| *l == line).count(), 1, "{line}: {said}");
+    }
+    assert!(!said.contains("endgroup") && said.contains("\n[check] checking\n[check] check failed\n"), "{said}");
+    // The tests of steps whose logs never came, counted from their lines, and said so.
+    assert!(said.contains("  Tests: 0 failed, 2 passed (cargo)\n  (Counted from what came: 2 steps' logs had not come. `superci runs retrieve "), "{said}");
+    // A step still going and one never begun when its job failed: neither passed nor failed.
+    assert!(said.contains("  ✗ Run make check 4 s\n  · Run make lint\n  · Run make fmt\n"), "{said}");
+    assert!(said.contains("  What its runner logged while it was slow to reach the control plane") && said.contains("    [RUNNER 2026-10-15 10:00:12Z INFO] Listening for Jobs"), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
