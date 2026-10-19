@@ -6453,7 +6453,7 @@ mod runs_suite_in_browser {
         let served = serve(|_| {});
         // Each job runs when its condition holds as GitHub would have it: numbers in hex and with exponents, negatives,
         // text and booleans as numbers, `&&` and `||` giving a side's value, `join` and `format`, an id with a dash,
-        // a filter over an object.
+        // a filter over an object, an empty list being true, a doubled quote.
         let holds = [
             "0x10 == 16 && 1.5e2 == 150 && -2 < 0 && 2.5 > 2",
             "'' == 0 && true == 1 && ' ' == 0 && null == 0 && '0x1F' == 31",
@@ -6462,8 +6462,10 @@ mod runs_suite_in_browser {
             "format('{0}{1}', 3.0, 0.5) == '30.5' && format('{{x}}') == '{x}'",
             "contains(github.*, 'push') && github.event_name >= 'PUSH' && 'b' > 'A'",
             "fromJSON('{\"my-key\": 1e3}').my-key == 1000",
+            "'it''s' == 'it''s' && github._none == null && contains(fromJSON('[{\"a\":1},{\"a\":2}]').*.a, 2) && fromJSON('[1]').*.a",
+            "!!0.5 && !(0.0) && !false == true && format('{0} {1}', 1.5, 2) == '1.5 2' && format('{0}', 1e16) != '' && success() && !cancelled()",
         ];
-        let fails = ["0x10 == 15", "'a' && ''", "-1 > 0 || 'NaN' == 0", "1e400 < 0"];
+        let fails = ["0x10 == 15", "'a' && ''", "-1 > 0 || 'NaN' == 0", "1e400 < 0", "!(fromJSON('[1]').*.a)"];
         let mut wf = String::from("jobs:\n");
         // (One job for all that hold: each is read, as each holds. A job each for what does not.)
         wf += &format!("  yes:\n    if: >-\n      ${{{{ {} }}}}\n    runs-on: superci\n    steps:\n      - run: echo\n", holds.map(|c| format!("({c})")).join(" && "));
