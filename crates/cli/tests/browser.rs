@@ -9370,6 +9370,19 @@ fn a_gitlab_jobs_cache_is_kept_as_its_projects_once_its_job_began_and_settings_l
     let _ = served.gitlab.running_on(id2, runner2, served.now_ms());
     let mut r = agent.post(&format!("{}/cache/{link2}/tool-begin", served.url)).send(serde_json::json!({ "tool": "gitlab", "hash": "gl/project/250833/other/cache.zip" }).to_string()).unwrap();
     assert_eq!(r.status().as_u16(), 200, "{}", r.body_mut().read_to_string().unwrap_or_default());
+    // A tag's pipeline, its runner's word never come: its cache is the tag's.
+    let (id3, p) = served.gitlab.pending("tagged", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(p) < 300);
+    let asked = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()).unwrap();
+    let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+    let script3 = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(data).unwrap()).unwrap();
+    let link3 = script3.split("/cache/").nth(1).unwrap().split('\'').next().unwrap().to_string();
+    let runner3 = served.store.under(&format!("job:gl{id3}"))[0].1["runner_id"].as_u64().unwrap();
+    served.gitlab.set(id3, "tag", serde_json::json!(true));
+    served.gitlab.set(id3, "ref", serde_json::json!("v1.0.0"));
+    let _ = served.gitlab.running_on(id3, runner3, served.now_ms());
+    let mut r = agent.post(&format!("{}/cache/{link3}/tool-begin", served.url)).send(serde_json::json!({ "tool": "gitlab", "hash": "gl/project/250833/tagged/cache.zip" }).to_string()).unwrap();
+    assert!(r.status().as_u16() < 500, "{}", r.body_mut().read_to_string().unwrap_or_default());
     // A link that is no machine's: nothing.
     let (status, _) = { let mut r = agent.post(&format!("{}/cache/not-a-machines-link/tool-get", served.url)).send("{}").unwrap(); (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()) };
     assert!(status >= 400, "{status}");

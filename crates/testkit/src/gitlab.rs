@@ -52,6 +52,9 @@ impl GitLab {
 
     pub fn job(&self, id: u64) -> Value { self.lab.lock().unwrap().jobs.get(&id).cloned().unwrap_or_default() }
 
+    /// A field of a job set as given (a tag's pipeline: `tag`, true), as GitLab would have it.
+    pub fn set(&self, id: u64, field: &str, value: Value) { if let Some(j) = self.lab.lock().unwrap().jobs.get_mut(&id) { j[field] = value } }
+
     /// The job event GitLab sends of a job as it stands now.
     fn event(&self, id: u64) -> Vec<u8> {
         let (j, p) = (self.job(id), fixture("project"));
