@@ -11079,3 +11079,29 @@ fn the_aws_role_reported_to_a_control_plane_is_taken_once_and_only_as_it_asked()
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A cloud account at its limit for the month, then for the day: no job goes to its providers, and each job says
+/// which limit and how to raise it, on its page.
+#[test]
+fn a_cloud_account_at_its_monthly_or_daily_limit_takes_no_job_and_says_how_to_raise_it() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let mut ids = vec![];
+    for (routing, said) in [(r#"{"order":[{"cloud":"cloudflare"}],"account_usd":{"cloudflare":0}}"#, "a month"), (r#"{"order":[{"cloud":"cloudflare"}],"account_daily_usd":{"cloudflare":0}}"#, "a day")] {
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), routing);
+        let (id, q) = served.github.queue("limited", "superci", served.now_ms());
+        assert!(served.webhook(q) < 300);
+        let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+        assert!(job.to_string().contains(said), "{said}: {job}");
+        ids.push(id);
+    }
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for id in ids {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
