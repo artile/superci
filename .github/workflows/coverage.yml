@@ -1,14 +1,15 @@
 name: Coverage
 
 # The tests, measured by supercov: lines, branches and MC/DC, each test's own. Run by hand (Actions → Coverage):
-# every test, or the browser suite alone (what the dashboard and control plane are covered by end to end, in Chrome).
+# every test; the browser suite alone (what the dashboard and control plane are covered by end to end, in Chrome); or
+# the end-to-end suites (the browser's and the CLI's own, each driving the `superci` program), without unit tests.
 on:
   workflow_dispatch:
     inputs:
       tests:
-        description: Every test, or the browser suite alone
+        description: Every test, the browser suite alone, or the end-to-end suites (browser and CLI)
         type: choice
-        options: [all, browser]
+        options: [all, browser, e2e]
         default: all
 
 permissions:
@@ -47,7 +48,7 @@ jobs:
           grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
           sudo modprobe erofs && grep erofs /proc/filesystems
       - name: The tests, measured
-        if: inputs.tests != 'browser'
+        if: inputs.tests == 'all'
         # (In supercov's own copy of the repository: what ./build.sh built is found in this one.)
         env:
           SUPERCI_BUILT: ${{ github.workspace }}
@@ -55,8 +56,8 @@ jobs:
           SUPERCI_LAYERS_E2E: "1"
           IMAGES: mirror.gcr.io/library
         run: npx -y supercov@4.19.0 -- cargo test --workspace
-      - name: The browser suite, measured
-        if: inputs.tests == 'browser'
+      - name: The browser suite (or every end-to-end suite), measured
+        if: inputs.tests != 'all'
         env:
           SUPERCI_BUILT: ${{ github.workspace }}
           # (A page waits longer under a coverage run, a few at a time.)
@@ -64,7 +65,9 @@ jobs:
         run: |
           # (Its tests skip themselves where there is no Chrome: a measure of skipped tests would say nothing.)
           google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
-          npx -y supercov@4.19.0 -- cargo test -p superci --no-fail-fast --test browser -- --test-threads=4
+          # (e2e: every test program of the CLI's, the browser's among them; none of its unit tests.)
+          if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
+          npx -y supercov@4.19.0 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4
       - name: What the tests reach
         if: always()
         run: |
