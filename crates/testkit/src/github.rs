@@ -32,6 +32,9 @@ struct Hub {
     run_logs: BTreeMap<u64, Vec<u8>>,
     /// The runners registered (each machine's, by the control plane): id to name.
     runners: BTreeMap<u64, String>,
+    /// The runners whose machines came up and that wait for work (`ready`): online. A runner is offline until then, as
+    /// GitHub has a just-in-time runner until it connects.
+    online: std::collections::BTreeSet<u64>,
     next: u64,
     /// `acme/app` is public (anyone can open a pull request that runs code there).
     public: bool,
@@ -247,6 +250,14 @@ impl GitHub {
         self.event("in_progress", id)
     }
 
+    /// The runner of this name (registered here) is up and waits for work: online, as its machine came up, whether or
+    /// not GitHub hands it a job.
+    pub fn ready(&self, runner: &str) {
+        let mut h = self.hub.lock().unwrap();
+        let rid = h.runners.iter().find(|(_, n)| n.as_str() == runner).map(|(i, _)| *i).expect("that runner registered");
+        h.online.insert(rid);
+    }
+
     /// Taken by the runner of this name (any registered here), as GitHub hands a job to any runner with its label:
     /// its webhook, which a test may leave undelivered.
     pub fn start_on(&self, id: u64, runner: &str) -> (Vec<u8>, String) {
@@ -444,9 +455,10 @@ impl GitHub {
                 let id: u64 = id.parse().ok()?;
                 let name = h.runners.get(&id)?.clone();
                 let busy = h.jobs.values().any(|j| j["runner_id"] == id && j["status"] == "in_progress");
-                ok(200, json!({ "id": id, "name": name, "os": "linux", "status": "online", "busy": busy, "labels": [] }))
+                let online = busy || h.online.contains(&id);
+                ok(200, json!({ "id": id, "name": name, "os": "linux", "status": if online { "online" } else { "offline" }, "busy": busy, "labels": [] }))
             }
-            ("DELETE", ["orgs", OWNER, "actions", "runners", id] | ["repos", OWNER, "app", "actions", "runners", id]) => { h.runners.remove(&id.parse().ok()?); Some(Response::new(204, "text/plain", "")) }
+            ("DELETE", ["orgs", OWNER, "actions", "runners", id] | ["repos", OWNER, "app", "actions", "runners", id]) => { let id: u64 = id.parse().ok()?; h.runners.remove(&id); h.online.remove(&id); Some(Response::new(204, "text/plain", "")) }
             // Its repository, runs and jobs (in the shape recorded).
             ("GET", ["repos", o, n]) if format!("{o}/{n}") == REPO => { drop(h); ok(200, self.repo()) }
             ("GET", ["repos", o, n, "actions", "jobs", id]) if format!("{o}/{n}") == REPO => h.jobs.get(&id.parse().ok()?).cloned().map(|j| Response::new(200, "application/json", j.to_string())),

@@ -345,6 +345,9 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub began: bool,
     /// Why it failed, while a failing runner (see `fail_fast`) is still to be started for it.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub fail_pending: Option<String>,
+    /// GitHub kept its job queued while its runner was up and waiting for it (as when GitHub's Actions are degraded):
+    /// its machine was ended, and no other is started for it before this time (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub held_until_ms: Option<u64>,
     /// The GitHub App its event came through (one per organization); none: the first.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub app_id: Option<u64>,
     /// Its AWS machine is an on-demand one (the place `AWS_ON_DEMAND`): as its label asks, or as the order has it.
@@ -461,6 +464,18 @@ fn is_zero(n: &u32) -> bool { *n == 0 }
 
 /// Spot is paused for half an hour once AWS took back two machines within a quarter of an hour.
 const SPOT_PAUSE: (usize, u64, u64) = (2, 15 * 60_000, 30 * 60_000);
+
+/// The most an answer of the control plane's may be (bytes): AWS's function URLs answer 502 for one over six MB.
+const ANSWER_MAX: usize = 5_500_000;
+
+/// Where the last `want` bytes of a log begin: at a line's start, when the cut falls inside one.
+fn tail_from(log: &[u8], want: usize) -> usize {
+    let from = log.len().saturating_sub(want);
+    if from == 0 { 0 } else { log[from..].iter().position(|b| *b == b'\n').map(|n| from + n + 1).unwrap_or(from) }
+}
+
+/// How long a job is held with no machine once GitHub kept it from a runner that was up and waiting for it.
+const HELD_MS: u64 = 10 * 60_000;
 
 /// Where a job to be run again off spot machines is noted until it arrives: by its repository, run and name (GitHub gives the
 /// new attempt's job a new id).
@@ -1621,8 +1636,10 @@ impl<'a> ControlPlane<'a> {
         }
         // With `steps`: the job's steps too (GitHub's as it has them now, with their times; a run from a computer's with
         // each one's log, or its lines so far while it runs). GitLab's are in its log, marked as sections.
+        // (A run from a computer's steps are read once: its log is made of them.)
+        let local = if j.provider == "local" { self.local_steps(j.local.as_deref().unwrap_or_default()).await? } else { vec![] };
         let steps = if q("steps").is_none() { serde_json::Value::Null } else if j.provider == "local" {
-            serde_json::Value::Array(self.local_steps(j.local.as_deref().unwrap_or_default()).await?)
+            serde_json::Value::Array(local.clone())
         } else if j.provider.is_empty() {
             match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_steps(self.http, &app.api(), &token, &j.repo, j.job_id).await.map(serde_json::Value::Array).unwrap_or_default(), _ => serde_json::Value::Null }
         } else { serde_json::Value::Null };
@@ -1630,7 +1647,7 @@ impl<'a> ControlPlane<'a> {
         let mut source = if j.provider == "gitlab" { "GitLab's" } else { "its runner's" };
         let fetched = if j.provider == "local" {
             let token = j.local.clone().unwrap_or_default();
-            self.local_log(&token).await
+            self.local_log(&token, &local).await
         } else if j.provider == "gitlab" {
             match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(project)) => gitlab::job_trace(self.http, gl, project, j.job_id).await, _ => Err("its GitLab is no longer connected".into()) }
         } else {
@@ -1650,16 +1667,29 @@ impl<'a> ControlPlane<'a> {
         let log = match fetched { Ok(l) => l, Err(e) => return Ok(Response::json(&serde_json::json!({ "error": e, "steps": steps }))) };
         // (Four MB at most: what the runtimes answer with, written as JSON, stays within their six.)
         let want = q("bytes").and_then(|b| b.parse::<usize>().ok()).unwrap_or(200_000).clamp(1_000, 4_000_000);
-        // From a line's start, when the cut falls inside one.
-        let from = log.len().saturating_sub(want);
-        let from = if from == 0 { 0 } else { log[from..].iter().position(|b| *b == b'\n').map(|n| from + n + 1).unwrap_or(from) };
         // Its steps' shape (which run in the background, in a parallel group, wait for which), as its runner was
         // handed them: a run from a computer's from the message made here, a GitHub job's as its machine said.
         let shape = if q("steps").is_none() { None } else if j.provider == "local" {
             get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{}", j.local.as_deref().unwrap_or_default())).await?.map(|h| step_shape(&h.message))
         } else { get_json::<Vec<serde_json::Value>>(self.store, &format!("shape:{}", key.trim_start_matches("job:"))).await? };
-        Ok(Response::json(&serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0, "steps": steps, "shape": shape,
-            "source": source, "last_line_at": last_time(&log), "running": active(&j) })))
+        // The last `want` bytes of its log, and of its steps' own logs (a run from a computer's: each one's text, the
+        // newest kept first). Less, if that written as JSON would be over what an answer may be (escaped, a log's
+        // colours take six times their bytes).
+        let mut budget = want;
+        loop {
+            let from = tail_from(&log, budget);
+            let (mut steps, mut left, mut cut) = (steps.clone(), budget, false);
+            for s in steps.as_array_mut().into_iter().flatten().rev() {
+                let Some(text) = s["text"].as_str().map(str::as_bytes) else { continue };
+                let at = tail_from(text, left);
+                left = left.saturating_sub(text.len() - at);
+                if at > 0 { cut = true; s["text"] = String::from_utf8_lossy(&text[at..]).into_owned().into() }
+            }
+            let body = serde_json::json!({ "log": String::from_utf8_lossy(&log[from..]), "bytes": log.len(), "truncated": from > 0 || cut, "steps": steps, "shape": shape,
+                "source": source, "last_line_at": last_time(&log), "running": active(&j) }).to_string();
+            if body.len() <= ANSWER_MAX || budget <= 1_000 { return Ok(Response::new(200, "application/json", body)) }
+            budget /= 2;
+        }
     }
 
     /// What the dashboard shows, for a key a dashboard session set and that has not expired (or one that only reads):
@@ -1809,6 +1839,13 @@ impl<'a> ControlPlane<'a> {
     /// A job whose machine never began it: its runner registration is withdrawn and it is placed again (elsewhere, or
     /// waiting for room).
     async fn again(&self, plane_url: &str, key: &str, j: &mut Job, why: &str) -> Result<()> {
+        self.unplace(key, j, why).await?;
+        self.start(plane_url, j).await
+    }
+
+    /// A job taken off its machine (ended already) to wait for another, saying why: its runner withdrawn, and what the
+    /// machine cost kept in its cost.
+    async fn unplace(&self, key: &str, j: &mut Job, why: &str) -> Result<()> {
         // What its machine cost until now stays in the job's cost (the next machine's is counted from its own start).
         if j.machine_id.is_some() {
             let now = self.clock.now_ms();
@@ -1828,8 +1865,7 @@ impl<'a> ControlPlane<'a> {
         j.cloud = String::new();
         j.state = "waiting".into();
         j.error = Some(format!("waiting: {why}"));
-        self.keep(key, &*j).await?;
-        self.start(plane_url, j).await
+        self.keep(key, &*j).await
     }
 
     /// The GitHub App a job's event came through (jobs from before there could be several: the first), and the
@@ -1848,6 +1884,13 @@ impl<'a> ControlPlane<'a> {
     /// An installation token for a job's repository (None without the App, or if GitHub would not give one).
     async fn installation_token_for(&self, j: &Job) -> Option<String> {
         self.installation_token(self.app_of(j)?, j.installation_id).await.ok()
+    }
+
+    /// Whether a job's runner is up at GitHub and waiting for work (online, running nothing): its machine came up.
+    async fn runner_waits(&self, j: &Job) -> bool {
+        let (Some(app), Some(id)) = (self.app_of(j), j.runner_id) else { return false };
+        let Some(token) = self.installation_token_for(j).await else { return false };
+        github::runner_state(self.http, &app.api(), &token, &Self::owner_of(app), &j.repo, id).await.is_ok_and(|s| s == Some((true, false)))
     }
 
     /// Whether the App is installed anywhere (asked with its own key, at most once a minute).
@@ -3792,13 +3835,11 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// A run's job's log: each step's whole log in order, where the runner sent them; else the lines it sent as it went.
-    async fn local_log(&self, token: &str) -> Result<Vec<u8>> {
-        let handed = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.unwrap_or_default();
+    /// (`steps`: its steps as `local_steps` reads them.)
+    async fn local_log(&self, token: &str, steps: &[serde_json::Value]) -> Result<Vec<u8>> {
         // Each step's: its whole log once sent, else what its machine sent of it so far.
         let mut out = vec![];
-        if !handed.steps.is_empty() {
-            for s in self.local_steps(token).await? { out.extend(s["text"].as_str().unwrap_or_default().as_bytes()); if !out.ends_with(b"\n") && !out.is_empty() { out.push(b'\n') } }
-        }
+        for s in steps { out.extend(s["text"].as_str().unwrap_or_default().as_bytes()); if !out.ends_with(b"\n") && !out.is_empty() { out.push(b'\n') } }
         if !out.is_empty() { return Ok(out) }
         let mut lines = vec![];
         for (_, v) in self.store.list(&format!("rline:{token}:")).await? { lines.extend(crate::runner_service::feed(&v).2) }
@@ -4584,6 +4625,9 @@ impl<'a> ControlPlane<'a> {
             if j.state == "waiting" {
                 match get_json::<Job>(self.store, &key).await? { Some(fresh) if fresh.state == "waiting" => j = fresh, _ => continue }
                 if now.saturating_sub(j.at_ms) > 24 * 3_600_000 { j.state = "failed".into(); j.error = Some("waited a day for room".into()); self.keep(&key, &j).await?; continue }
+                // Held after GitHub kept it from a runner that waited for it: no machine yet (see `HELD_MS`).
+                if j.held_until_ms.is_some_and(|t| now < t) { active += 1; continue }
+                j.held_until_ms = None;
                 self.start(&plane_url, &mut j).await?;
                 if j.state == "waiting" { waiting += 1 }
                 continue;
@@ -4654,13 +4698,16 @@ impl<'a> ControlPlane<'a> {
                     // Only while GitHub still has the job queued (another runner may have taken it, or it was
                     // cancelled, and the event never came).
                     let (mut gone, mut on_runner) = ((j.failed_fast || j.over) && j.for_job.is_none(), None);
+                    // (And whether it answered that the job still waits: not known, when it could not be asked.)
+                    let mut waits_there = false;
                     if !gone && j.provider == "gitlab" {
                         // GitLab has it on this machine's runner (the events that said so never came): as if told.
                         if self.gitlab_settle(&key, &mut j, now).await { if j.state == "running" { active += 1 } continue }
-                        gone = match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(p)) => gitlab::job(self.http, gl, p, wanted).await.is_ok_and(|(_, s)| s != "pending"), _ => false };
+                        let status = match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(p)) => gitlab::job(self.http, gl, p, wanted).await.ok().map(|(_, s)| s), _ => None };
+                        (gone, waits_there) = (status.as_deref().is_some_and(|s| s != "pending"), status.as_deref() == Some("pending"));
                     } else if !gone {
                         if let (Some(app), Some(t)) = (self.app_of(&j), self.installation_token_for(&j).await) {
-                            if let Ok((status, runner)) = github::job_state(self.http, &app.api(), &t, &j.repo, wanted).await { (gone, on_runner) = (status != "queued", runner) }
+                            if let Ok((status, runner)) = github::job_state(self.http, &app.api(), &t, &j.repo, wanted).await { (gone, on_runner, waits_there) = (status != "queued", runner, status == "queued") }
                         }
                     }
                     if gone && j.provider.is_empty() {
@@ -4728,13 +4775,29 @@ impl<'a> ControlPlane<'a> {
                         continue;
                     }
                     if late {
+                        // Its machine came up and its runner waits, and GitHub still has the job queued: GitHub has not
+                        // handed the job out (as when its Actions are degraded), and another machine would wait the
+                        // same. The machine is ended (it is paid while it waits) and the job held, with no machine,
+                        // for `HELD_MS`; then one is started again. Not counted as a machine that did not start.
+                        if waits_there && j.provider.is_empty() && j.for_job.is_none() && self.runner_waits(&j).await {
+                            self.stop_machine(&plane_url, &j).await;
+                            j.held_until_ms = Some(now + HELD_MS);
+                            self.unplace(&key, &mut j, &format!("GitHub had not handed this job to its runner {} minutes after its machine was started, though the runner was ready for it (GitHub may be slow to hand out jobs); a machine is started again in {} minutes",
+                                age / 60_000, HELD_MS / 60_000)).await?;
+                            active += 1;
+                            continue;
+                        }
                         self.stop_machine(&plane_url, &j).await;
                         if j.retries >= 2 {
                             self.withdraw_runner(&j).await;
                             j.state = "failed".into();
-                            j.error = Some(format!("{place} did not start a machine for it, three times"));
+                            let why = format!("{place} did not start a machine for it, three times");
+                            j.error = Some(why.clone());
                             j.ended_ms.get_or_insert(now);
                             self.keep(&key, &j).await?;
+                            // GitHub (or GitLab) still has it queued, and no machine is coming for it: failed there
+                            // too, saying why, rather than left queued for a day.
+                            if waits_there && j.for_job.is_none() { self.fail_fast(&plane_url, &mut j, &why).await }
                         } else {
                             j.retries += 1;
                             self.again(&plane_url, &key, &mut j, &format!("{place} did not start its machine; trying again")).await?;

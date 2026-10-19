@@ -7924,9 +7924,15 @@ fn jobs_on_each_others_runners_and_a_machine_that_never_begins_are_said_on_their
     // A fifth whose machine never begins it: tried again by the sweep, twice, then failed with why.
     let (f, q) = served.github.queue("fifth", "superci", served.now_ms()); served.webhook(q);
     for _ in 0..4 { served.later(4 * 60_000); served.upkeep(); }
+    // A sixth whose machine came up, its runner waiting, and GitHub never hands it the job (its Actions slow to hand
+    // jobs out): the machine is ended, and the job waits with no machine, saying it is GitHub's doing.
+    let (g, q) = served.github.queue("sixth", "superci", served.now_ms()); served.webhook(q);
+    served.github.ready(&runner_of(g));
+    for _ in 0..3 { served.later(4 * 60_000); served.upkeep(); }
+    assert_eq!((state(g)["state"].as_str(), state(g)["retries"].as_u64()), (Some("waiting"), Some(0)), "{}", state(g));
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
-    for (id, said) in [(a, "Passed"), (c, "Failed"), (d, "Running"), (f, "Failed")] {
+    for (id, said) in [(a, "Passed"), (c, "Failed"), (d, "Running"), (f, "Failed"), (g, "GitHub had not handed this job to its runner")] {
         b.goto(&format!("{link}&p=job&id={id}"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
         let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");

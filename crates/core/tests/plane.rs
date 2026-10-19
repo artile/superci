@@ -559,6 +559,86 @@ fn a_machine_that_never_begins_its_job_is_tried_again_then_the_job_fails() {
     assert_eq!((starts(), job(&store, 7)["state"].as_str(), job(&store, 7)["error"].as_str()), (3, Some("failed"), Some("Cloudflare did not start a machine for it, three times")));
 }
 
+/// GitHub as it answers while its Actions hand out no jobs: job 7 still queued, and each runner of ours online and idle
+/// while `online` holds (else offline: its machine never came up).
+fn github_holding(online: &std::cell::Cell<bool>) -> impl Fn(&Request, &str) -> Option<Response> + '_ {
+    move |r: &Request, _: &str| {
+        if r.method != "GET" { return None }
+        if r.url == "https://api.github.com/repos/acme/app/actions/jobs/7" { return Some(Response::new(200, "application/json", serde_json::json!({ "id": 7, "status": "queued", "runner_name": null }).to_string())) }
+        let id = r.url.strip_prefix("https://api.github.com/orgs/acme/actions/runners/")?.parse::<u64>().ok()?;
+        Some(Response::new(200, "application/json", serde_json::json!({ "id": id, "status": if online.get() { "online" } else { "offline" }, "busy": false }).to_string()))
+    }
+}
+
+#[test]
+fn a_machine_whose_runner_waits_while_github_keeps_its_job_queued_is_ended_and_the_job_held_then_given_one_again() {
+    let online = std::cell::Cell::new(true);
+    let clouds = With(FakeClouds::default(), github_holding(&online));
+    let (store, wakes, cache, own) = (Mem::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(webhook("queued", None)));
+    let starts = || own.0.borrow().iter().filter(|c| c.starts_with("start")).count();
+    let stops = || own.0.borrow().iter().filter(|c| c.starts_with("stop")).count();
+    // Two minutes: its runner is up and GitHub has not handed it the job yet; waited for.
+    clock.0.set(clock.0.get() + 2 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!((starts(), stops(), job(&store, 7)["state"].as_str()), (1, 0, Some("launched")));
+    // Over three: GitHub still keeps the job from a runner that waits for it. Its machine is ended (another would wait
+    // the same), and the job is held with no machine, said as GitHub's doing; not counted as a machine that did not start.
+    clock.0.set(clock.0.get() + 2 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    let held = job(&store, 7);
+    assert_eq!((starts(), stops(), held["state"].as_str(), held["retries"].as_u64()), (1, 1, Some("waiting"), Some(0)), "{held}");
+    assert!(held["error"].as_str().unwrap().starts_with("waiting: GitHub had not handed this job to its runner 4 minutes after its machine was started, though the runner was ready for it"), "{held}");
+    assert_eq!(held["held_until_ms"].as_u64(), Some(clock.0.get() + 10 * 60_000));
+    assert!(held["earlier_usd"].as_f64().unwrap_or(0.0) > 0.0, "what its machine cost stays in the job's");
+    assert!(clouds.0.calls.borrow().iter().any(|c| c.0 == "DELETE" && c.1 == "https://api.github.com/orgs/acme/actions/runners/5"), "its runner withdrawn");
+    // Held: no machine for ten minutes, however often the sweep comes by.
+    for _ in 0..3 {
+        clock.0.set(clock.0.get() + 3 * 60_000);
+        block_on(plane.alarm()).unwrap();
+        assert_eq!((starts(), job(&store, 7)["state"].as_str()), (1, Some("waiting")));
+    }
+    // Then a machine again, its hold over.
+    clock.0.set(clock.0.get() + 2 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    let again = job(&store, 7);
+    assert_eq!((starts(), again["state"].as_str(), again.get("held_until_ms")), (2, Some("launched"), None), "{again}");
+    // This one never comes up (its runner offline): started again as a machine that did not start, twice; then the
+    // job fails, and GitHub, which still has it queued, is told so by a failing runner rather than keeping it a day.
+    online.set(false);
+    for n in 3..=4 {
+        clock.0.set(clock.0.get() + 4 * 60_000);
+        block_on(plane.alarm()).unwrap();
+        assert_eq!((starts(), job(&store, 7)["state"].as_str(), job(&store, 7)["retries"].as_u64()), (n, Some("launched"), Some(n as u64 - 2)));
+    }
+    clock.0.set(clock.0.get() + 4 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    let failed = job(&store, 7);
+    assert_eq!((failed["state"].as_str(), failed["error"].as_str(), failed["failed_fast"].as_bool()), (Some("failed"), Some("Cloudflare did not start a machine for it, three times"), Some(true)), "{failed}");
+    assert!(own.0.borrow().last().is_some_and(|c| c.starts_with(&format!("start superci-{PLANE_ID}-7-x fail "))), "{:?}", own.0.borrow());
+}
+
+#[test]
+fn a_job_whose_machine_never_starts_while_github_cannot_be_asked_fails_here_alone() {
+    // GitHub does not answer for the job (it may have ended, or been taken elsewhere): no failing runner is started for
+    // it, as it might take another job with the label.
+    let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let clock = MovingClock(std::cell::Cell::new(1_790_000_000_000));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.containers = true;
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(webhook("queued", None)));
+    for _ in 0..3 { clock.0.set(clock.0.get() + 4 * 60_000); block_on(plane.alarm()).unwrap() }
+    assert_eq!((job(&store, 7)["state"].as_str(), job(&store, 7).get("failed_fast")), (Some("failed"), None));
+    assert!(!own.0.borrow().iter().any(|c| c.contains(" fail ")), "{:?}", own.0.borrow());
+}
+
 #[test]
 fn a_start_cut_off_midway_is_placed_again_by_the_sweep() {
     let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
@@ -3549,6 +3629,44 @@ fn the_runners_calls_for_a_job_are_answered_as_its_service_answers_them() {
     // Another job's prefix, or none at all, is nothing here.
     let res = block_on(answer(&store, "other", &Request::new("GET", "https://plane.example/runner/other/_apis/connectionData"), "/_apis/connectionData")).unwrap();
     assert_eq!(res.status, 404);
+}
+
+#[test]
+fn a_long_run_from_a_computers_log_is_given_with_its_steps_within_what_an_answer_may_be() {
+    use superci_core::runner_service::HandedJob;
+    // A job of a run from a computer, still running, its three steps' logs 2.5 MB each, the last one in colour (each
+    // colour six bytes once written as JSON): asked with its steps, as the dashboard asks while it runs and for its
+    // raw log. AWS's function URLs answer 502 for an answer over six MB, so each must stay within it.
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let job = serde_json::json!({ "job_id": 7, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": 1_790_000_000_000u64, "runner": null, "runner_id": null, "installation_id": 0,
+        "cloud": "aws", "machine_id": "i-0abc", "machine_type": null, "error": null, "seen_in_progress": true, "provider": "local", "local": "abc" });
+    block_on(store.put("job:7", job.to_string())).unwrap();
+    let steps: Vec<serde_json::Value> = (1..=3).map(|n| serde_json::json!({ "id": format!("0000000{n}-0000-0000-0000-000000000000"), "name": format!("Step {n}"), "type": "Task", "order": n, "log": n, "state": "completed" })).collect();
+    block_on(store.put("rjob:abc", serde_json::to_string(&HandedJob { steps, ..Default::default() }).unwrap())).unwrap();
+    for n in 1..=3u64 {
+        let colour = if n == 3 { "\u{1b}[32m" } else { "" };
+        let text = (0..25_000).map(|i| format!("{colour}step {n} line {i:05} {}", "x".repeat(if n == 3 { 74 } else { 80 }))).collect::<Vec<_>>().join("\n");
+        block_on(store.put(&format!("rlog:abc:{n:04}:0000"), STANDARD.encode(text))).unwrap();
+    }
+    for bytes in [1_000_000, 4_000_000] {
+        let r = block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/job/log?id=7&bytes={bytes}&steps=1")).with_header("authorization", "Bearer dashboard-session-key-1")));
+        assert!(r.status == 200 && r.body.len() <= 5_500_000, "{bytes}: {} {} bytes", r.status, r.body.len());
+        let got: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        // The newest of it kept, from a line's start: the log's end, and the last step's whole lines up to its end.
+        let (log, last) = (got["log"].as_str().unwrap(), got["steps"][2]["text"].as_str().unwrap());
+        assert!(log.trim_end().ends_with(&format!("step 3 line 24999 {}", "x".repeat(74))) && (log.starts_with("step ") || log.starts_with("\u{1b}[32mstep ")), "{}", &log[..80]);
+        assert!(last.ends_with(&"x".repeat(74)) && last.starts_with("\u{1b}[32mstep 3 line "), "{}", &last[..80]);
+        let shown: usize = got["steps"].as_array().unwrap().iter().map(|s| s["text"].as_str().unwrap().len()).sum();
+        assert!(shown <= bytes && got["truncated"] == true && got["bytes"].as_u64() > Some(7_000_000), "{bytes}: {shown}");
+    }
+    // A short one is given whole, its steps' too.
+    block_on(store.put("rlog:abc:0003:0000", STANDARD.encode("done\n"))).unwrap();
+    for n in 1..=2u64 { block_on(store.put(&format!("rlog:abc:{n:04}:0000"), STANDARD.encode(format!("step {n}\n")))).unwrap(); }
+    let got = json(&block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/job/log?id=7&steps=1")).with_header("authorization", "Bearer dashboard-session-key-1"))));
+    assert_eq!((got["log"].as_str(), got["truncated"].as_bool(), got["steps"][0]["text"].as_str()), (Some("step 1\nstep 2\ndone\n"), Some(false), Some("step 1\n")), "{got}");
 }
 
 #[test]

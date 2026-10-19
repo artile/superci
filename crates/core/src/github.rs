@@ -342,10 +342,16 @@ pub async fn job_state(http: &dyn Http, api: &str, token: &str, repo: &str, job_
 /// Whether a runner is running a job now. One GitHub no longer knows (it removes a just-in-time runner once its job
 /// has ended) is not.
 pub async fn runner_busy(http: &dyn Http, api: &str, token: &str, owner: &Owner, repo: &str, runner_id: u64) -> Result<bool> {
+    runner_state(http, api, token, owner, repo, runner_id).await.map(|s| s.is_some_and(|(_, busy)| busy))
+}
+
+/// A runner as GitHub has it: whether it is online (its machine up and asking for work), and whether it is running a
+/// job. None: GitHub no longer knows it.
+pub async fn runner_state(http: &dyn Http, api: &str, token: &str, owner: &Owner, repo: &str, runner_id: u64) -> Result<Option<(bool, bool)>> {
     let path = if owner.org { format!("/orgs/{}/actions/runners/{runner_id}", owner.login) } else { format!("/repos/{repo}/actions/runners/{runner_id}") };
     match gh(http, api, "GET", &path, Some(token), None).await {
-        Ok(v) => Ok(v["busy"].as_bool().unwrap_or(false)),
-        Err(e) if e.contains(": 404 ") => Ok(false),
+        Ok(v) => Ok(Some((v["status"] == "online", v["busy"].as_bool().unwrap_or(false)))),
+        Err(e) if e.contains(": 404 ") => Ok(None),
         Err(e) => Err(e),
     }
 }
