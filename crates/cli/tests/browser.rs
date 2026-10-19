@@ -3761,6 +3761,35 @@ fn a_runs_artifact_name_is_its_first_jobs_and_neither_that_job_again_nor_another
     }
 }
 
+/// A control plane whose store keeps each record's end beside it (as a Durable Object's does): a secret's use noted
+/// by two runs a day apart, the upkeep's hourly mark taken once an hour; past the first use's end, at the upkeep, what
+/// is due goes, the use noted again stays (its newer end not due), and its older mark goes with nothing more.
+#[test]
+fn a_store_keeping_ends_beside_its_records_removes_only_what_has_passed_its_newest_end() {
+    let served = superci_testkit::serve_with_ends(|_| {});
+    let scope = superci_core::secrets::Scope::default();
+    let kept = superci_core::secrets::Stored { name: "EVERYWHERE".into(), value: "v".into(), scope: scope.clone(), updated_ms: 1 };
+    served.aws.put(&format!("/superci/{PLANE}/{}", superci_core::secrets::setting("EVERYWHERE", &scope)), &serde_json::to_string(&kept).unwrap());
+    let run = || {
+        let body = serde_json::json!({ "workflow": "jobs:\n  t:\n    if: false\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.EVERYWHERE }}\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main" });
+        assert!(ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send(body.to_string()).unwrap().status().as_u16() < 300);
+    };
+    let marks = |of: &str| served.store.under("~x:").into_iter().filter(|(k, _)| k.ends_with(of)).count();
+    run();
+    served.upkeep();
+    served.upkeep();
+    assert_eq!(served.store.under("upkeep:").len(), 1, "once an hour");
+    served.later(86_400_000);
+    run();
+    let used = served.store.under("sused:")[0].0.clone();
+    assert_eq!(marks(&used), 2, "an end for each use");
+    // Past the first use's end (400 days), not the second's.
+    served.later(399 * 86_400_000 + 43_200_000);
+    served.upkeep();
+    assert!(!served.store.under(&used).is_empty() && marks(&used) == 1, "the use kept, its older mark gone: {:?}", served.store.under("~x:"));
+    assert_eq!(served.store.under("upkeep:").len(), 1, "the old hour's mark gone, this hour's kept");
+}
+
 #[test]
 fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

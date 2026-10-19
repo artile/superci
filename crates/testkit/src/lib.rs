@@ -767,3 +767,42 @@ impl Runner {
         served.store.under(&format!("rjob:{token}")).into_iter().next().map(|(_, v)| v["message"].clone()).unwrap_or_default()
     }
 }
+
+/// A control plane served as `serve` serves one, its store keeping each record's end beside it as a Durable Object's
+/// or a Modal Dict's keeps it (`io::Ending`): what has passed its end goes at the upkeep's hourly `expire`. The test
+/// reads the store as it is, the ends' records with the rest (`~e:`, `~x:`).
+pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (store, machines, aws) = (Shared::default(), Machines::default(), Aws::serve());
+    *aws.plane_url.lock().unwrap() = url.clone();
+    let github = GitHub::default();
+    *aws.github.lock().unwrap() = Some(github.clone());
+    *github.aws.lock().unwrap() = Some(aws.clone());
+    let (key, run_key) = ("dashboard-key-for-tests-0001".to_string(), "superci_run_0123456789abcdef0123456789abcdef".to_string());
+    aws.put(&format!("/superci/{PLANE}/DEVICE_KEY_4102444800_TEST"), &key);
+    aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
+    aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "on");
+    let clock = Now::default();
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let public: Arc<Mutex<Option<String>>> = Arc::default();
+    let (s, m, a, u, c, g, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone());
+    std::thread::spawn(move || {
+        let cache = Cache::default();
+        let ending = io::Ending(s);
+        block_on(ending.put("plane_url", format!("\"{u}\""))).unwrap();
+        for stream in listener.incoming().flatten() {
+            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
+            let mut config = Config::new(PLANE.to_string());
+            let settings = a.settings(PLANE);
+            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.read_settings(&settings);
+            configure(&mut config);
+            let plane = ControlPlane { store: &ending, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
+            let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
+            let _ = answer(&plane, &base, stream, None);
+        }
+    });
+    let gitlab = github.gitlab.clone();
+    Served { plane: PLANE.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public }
+}
