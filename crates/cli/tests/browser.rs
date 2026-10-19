@@ -3146,6 +3146,14 @@ fn connecting_github_takes_a_name_and_a_host_as_github_would_and_refuses_what_is
     // Back from GitHub with a state that is not this one's: said, nothing made.
     let (status, page) = common::part(&link, "/github/callback?state=not-this-ones&code=x");
     assert!(status == 400 && page.contains("expired"), "{status}");
+    // A control plane from before several organizations, with an App already: another asks to update it first.
+    served.connect_github();
+    *served.aws.old_version.lock().unwrap() = Some("0.9.30".into());
+    for (fields, status, said) in [(vec![("login", "octocat")], 409, "Adding another organization needs control plane 0.9.31")] {
+        let (got, text) = post(&mut b, "/github/start", &fields);
+        assert!(got == status && text.contains(said), "{fields:?}: {got} {text}");
+    }
+    *served.aws.old_version.lock().unwrap() = None;
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
