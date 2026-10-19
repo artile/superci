@@ -3181,6 +3181,10 @@ fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_t
     let _ = served.github.start_elsewhere(taken, "someone-elses-runner");
     served.github.fail("GET", &format!("/actions/jobs/{untold}"), 500, "Server Error");
     served.github.fail("GET", "/actions/runners/", 502, "Bad Gateway");
+    // (And a GitLab job no runner ever takes: its runners taken back from GitLab as it is given up.)
+    served.connect_gitlab();
+    let (gl, p) = served.gitlab.pending("gl never taken", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(p) < 300);
     let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
     // Up a while, not yet late: kept as they are, asked again at the next sweep.
     served.later(2 * 60_000); served.upkeep();
@@ -3188,6 +3192,9 @@ fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_t
     // Late: started again, and the other ended (its job is elsewhere); the long one past its 90 minutes.
     served.later(4 * 60_000); served.upkeep();
     served.later(100 * 60_000); served.upkeep();
+    for _ in 0..3 { served.later(5 * 60_000); served.upkeep(); }
+    let g = served.store.under(&format!("job:gl{gl}"))[0].1.clone();
+    assert!(g["state"] == "failed" && g["error"].as_str().unwrap_or_default().contains("three times"), "{g}");
     assert!(state(long)["error"].as_str().unwrap_or_default().contains("ran past its longest time (90 minutes)"), "{}", state(long));
     let home = common::home(&served);
     let (mut child, link) = dashboard(&home);
