@@ -4725,12 +4725,18 @@ mod github_in_browser {
         // One GitHub could not deliver (the control plane was restarting): asked to be sent again, once.
         let (other, queued) = served.github.queue("lint", "superci", served.now_ms());
         served.github.delivered(&queued.0, 0, "", &format!("{}/webhook", served.url), served.now_ms());
+        // (Beside it: one the control plane refused, one that failed long ago, and one the runtime failed now: only
+        // that last is asked for again too.)
+        for (name, code, ago) in [("refused", 400, 0), ("long ago", 503, 3 * 86_400_000), ("runtime failed", 502, 0)] {
+            let (_, q) = served.github.queue(name, "superci", served.now_ms());
+            served.github.delivered(&q.0, code, "", &format!("{}/webhook", served.url), served.now_ms() - ago);
+        }
         let failed = served.github.redelivered().len();
         served.upkeep();
         served.later(120_000);
         served.upkeep();
         let asked = served.github.redelivered();
-        assert_eq!(asked.len(), failed + 1, "{asked:?} (job {other})");
+        assert_eq!(asked.len(), failed + 2, "{asked:?} (job {other})");
         super::seen_in_browser(&served);
     }
 
