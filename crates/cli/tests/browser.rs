@@ -3361,6 +3361,9 @@ fn workspaces_are_made_renamed_and_forgotten_beside_others_and_what_is_there_alr
     let mut lines = std::io::BufReader::new(started.stdout.take().unwrap()).lines().map_while(Result::ok);
     let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
     std::thread::spawn(move || lines.for_each(drop));
+    // (Its address alone opens on one of them, by name.)
+    let (status, to, _) = common::get(&link, "/");
+    assert!(status == 303 && (to == "/?w=default" || to == "/?w=acme2"), "{status} {to}");
     let (status, to, _) = common::post(&link, "/workspaces", &[("name", "Gamma")]);
     assert_eq!((status, to.as_str()), (303, "/?w=gamma&c="));
     assert!(home.join("workspaces/gamma").is_dir());
@@ -3799,6 +3802,21 @@ fn a_job_of_an_organization_on_a_github_of_its_own_links_to_it_there() {
     let (mut child, link) = dashboard(&home);
     let (_, html) = common::part(&link, &format!("/?p=job&id={id}&fragment=1"));
     assert!(html.contains("https://github.example.com/"), "{}", common::words(&html));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_secret_given_to_a_run_a_coding_agents_key_started_says_that_key_in_settings() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let o = common::command(&home).args(["secrets", "create", "NPM_TOKEN", "--value-env=THE_VALUE"]).env("THE_VALUE", "npm-token-for-tests").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    // A run from a computer, started with the key for coding agents, whose workflow names it.
+    played_steps(&served, &home.join("checkout"), "jobs:\n  publish:\n    runs-on: superci\n    steps:\n      - run: npm publish\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n", &[("Run npm publish", "succeeded")]);
+    let (mut child, link) = dashboard(&home);
+    let page = common::words(&common::part(&link, "/?p=settings&fragment=1").1);
+    assert!(page.contains("NPM_TOKEN") && page.contains("started by the key agent"), "{page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
