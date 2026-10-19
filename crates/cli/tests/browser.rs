@@ -7731,10 +7731,25 @@ mod commands_dashboard_in_browser {
         // reading its settings where the dashboard writes them.
         let served = serve(|_| {});
         served.connect_github();
+        served.connect_gitlab();
         let (id, queued) = served.github.queue("test", "superci", served.now_ms());
         assert_eq!(served.webhook(queued), 202);
         assert_eq!(served.webhook(served.github.start(id)), 202);
         assert_eq!(served.webhook(served.github.finish(id, "success", "ok", served.now_ms())), 202);
+        // More than its first App and GitLab: another organization's App, a second GitLab, a secret, its labels,
+        // where Cloudflare's containers start. The new one has a secret the old one has not.
+        let setting = |n: &str| served.aws.settings(superci_testkit::PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v).unwrap();
+        let mut app: serde_json::Value = serde_json::from_str(&setting("GITHUB_APP")).unwrap();
+        app["id"] = 2002.into(); app["owner"] = "globex".into();
+        let mut gl: serde_json::Value = serde_json::from_str(&setting("GITLAB")).unwrap();
+        gl["id"] = "second".into();
+        let put = |plane: &str, k: &str, v: &str| served.aws.put(&format!("/superci/{plane}/{k}"), v);
+        put(superci_testkit::PLANE, "GITHUB_APP_2002", &app.to_string());
+        put(superci_testkit::PLANE, "GITLAB_second", &gl.to_string());
+        put(superci_testkit::PLANE, "SECRET_TOKEN_ALL", r#"{"name":"TOKEN","value":"token-for-tests","updated_ms":1}"#);
+        put(superci_testkit::PLANE, "LABELS", r#"["superci","acmeci"]"#);
+        put(superci_testkit::PLANE, "CF_LOCATION", "weur");
+        put("testplane0002", "SECRET_OLD_ALL", r#"{"name":"OLD","value":"old-for-tests","updated_ms":1}"#);
         let aws = served.aws.clone();
         let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
         for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
@@ -7744,7 +7759,7 @@ mod commands_dashboard_in_browser {
         served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
         let (mut child, link) = common::dashboard(&home);
         // (Found in the account, on Control planes.)
-        assert!((0..60).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&new.url) }), "the other one found");
+        assert!((0..60).any(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&new.url) }), "the other one found: {}", common::words(&common::part(&link, "/?p=planes&fragment=1").1));
         let (status, _, said) = common::post(&link, "/plane/move", &[("plane", "nowhere00000")]);
         assert!(status >= 400 && common::words(&said).contains("That control plane is not known here"), "{status}");
         let (status, _, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
@@ -7754,6 +7769,9 @@ mod commands_dashboard_in_browser {
         let (_, page) = common::part(&link, "/?p=planes&fragment=1");
         assert!(moved, "{}", common::words(&page));
         assert!(served.aws.settings("testplane0002").iter().any(|(k, _)| k == "GITHUB_APP"));
+        let there: Vec<String> = served.aws.settings("testplane0002").into_iter().map(|(k, _)| k).collect();
+        for k in ["GITHUB_APP_2002", "GITLAB", "GITLAB_second", "SECRET_TOKEN_ALL", "LABELS", "CF_LOCATION"] { assert!(there.iter().any(|t| t == k), "{k} carried: {there:?}") }
+        for k in ["SECRET_OLD_ALL"] { assert!(!there.iter().any(|t| t == k), "{k} gone: {there:?}") }
         assert!(!new.store.under(&format!("job:{id}")).is_empty(), "the job it ran came along");
         let health: serde_json::Value = ureq::get(&format!("{}/health", served.url)).call().unwrap().body_mut().read_json().unwrap();
         assert_eq!(health["moved_to"].as_str(), Some(new.url.as_str()), "{health}");
