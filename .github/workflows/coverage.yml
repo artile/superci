@@ -101,8 +101,8 @@ jobs:
       # (What the programs are built from: the control planes, the runner agent, the cache program and the layer
       # store, with the core they share.)
       - id: key
-        run: echo "programs=programs-${{ runner.os }}-${{ hashFiles('build.sh', 'Cargo.lock', 'Cargo.toml', 'scripts/mkfs-erofs/**', 'crates/core/src/**', 'crates/core/Cargo.toml', 'crates/plane-*/src/**', 'crates/plane-*/Cargo.toml', 'crates/plane-cloudflare/wrangler.toml', 'crates/runners-cloudflare/src/**', 'crates/runners-cloudflare/Cargo.toml', 'crates/runners-cloudflare/wrangler.toml', 'crates/cache/src/**', 'crates/cache/Cargo.toml', 'crates/layers/src/**', 'crates/layers/Cargo.toml', 'crates/layers/build.rs', 'crates/layers/assets/**', 'crates/layers/proto/**') }}" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+        run: echo "programs=programs-2-${{ runner.os }}-${{ hashFiles('build.sh', 'Cargo.lock', 'Cargo.toml', 'scripts/mkfs-erofs/**', 'crates/core/src/**', 'crates/core/Cargo.toml', 'crates/plane-*/src/**', 'crates/plane-*/Cargo.toml', 'crates/plane-cloudflare/wrangler.toml', 'crates/runners-cloudflare/src/**', 'crates/runners-cloudflare/Cargo.toml', 'crates/runners-cloudflare/wrangler.toml', 'crates/cache/src/**', 'crates/cache/Cargo.toml', 'crates/layers/src/**', 'crates/layers/Cargo.toml', 'crates/layers/build.rs', 'crates/layers/assets/**', 'crates/layers/proto/**') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
         id: programs
         with:
           path: ${{ env.PROGRAMS }}
@@ -128,6 +128,13 @@ jobs:
       - name: Build
         if: steps.programs.outputs.cache-hit != 'true'
         run: ./build.sh
+      # (Kept at once: the Rust cache's own cleanup, at the job's end, takes what was built for other targets out of
+      # target/.)
+      - uses: actions/cache/save@v4
+        if: steps.programs.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.PROGRAMS }}
+          key: ${{ steps.key.outputs.programs }}
       - name: The tests, listed and dealt into shards
         id: deal
         run: |
