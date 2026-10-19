@@ -1558,3 +1558,36 @@ fn a_github_jobs_log_is_put_in_its_steps_by_their_times_and_its_parallel_groups_
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Another control plane with more settings than SSM gives at once: deleted with every one of them, read page by page.
+#[test]
+fn another_control_plane_with_more_settings_than_ssm_lists_at_once_is_deleted_with_every_one() {
+    let served = serve(|_| {});
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    for n in 0..25 { served.aws.put(&format!("/superci/testplane0002/SECRET_KEPT{n}_ALL"), "{}") }
+    let o = superci(&home, &["planes", "delete", "testplane0002", "--confirm"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("Deleted"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(served.aws.settings("testplane0002").is_empty(), "{:?}", served.aws.settings("testplane0002"));
+    let pages = served.aws.asked.lock().unwrap().iter().filter(|a| a["target"] == "AmazonSSM.GetParametersByPath" && a["asked"].as_str().is_some_and(|s| s.contains("testplane0002") && s.contains("NextToken"))).count();
+    assert!(pages >= 2, "asked page by page: {pages}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An update whose image converter Lambda failed to take in: the control plane is updated all the same (the converter
+/// is not what runs it), and the converter is not waited for again.
+#[test]
+fn an_update_whose_converter_lambda_failed_to_take_in_still_updates_the_control_plane() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.fail("functions/superci-plane-testplane0001-convert/configuration", 200, r#"{"FunctionName":"superci-plane-testplane0001-convert","State":"Active","LastUpdateStatus":"Failed","LastUpdateStatusReason":"The code is not a bootstrap Lambda can run."}"#, None);
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains(&format!("Updated to {}", env!("CARGO_PKG_VERSION"))), "{said}");
+    let asked = served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "GET" && a["url"].as_str().is_some_and(|u| u.ends_with("-convert/configuration"))).count();
+    assert_eq!(asked, 1, "its state asked once: Failed");
+    let _ = std::fs::remove_dir_all(&home);
+}
