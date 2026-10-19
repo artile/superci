@@ -6329,6 +6329,7 @@ mod runs_suite_in_browser {
         let (status, said) = cache("lookup", serde_json::json!({ "key": "deps-1", "version": version }));
         assert_eq!((status, said["ok"].as_bool()), (403, Some(false)), "{said}");
         assert_eq!(cache("lookup", serde_json::json!({ "token": "eyJhbGciOiJFUzI1NiJ9.e30.c2ln", "key": "deps-1", "version": version })).0, 403);
+        assert_eq!(cache("lookup", serde_json::json!({ "token": "eyJhbGciOiJFUzI1NiJ9.e30", "key": "deps-1", "version": version })).0, 403);
         assert_eq!(http("POST", &format!("{}/cache/not-a-machine-link-0000/lookup", served.url), b"{}").0, 404);
         // A tool's outputs (Turbo's), by the machine's job, with no token: one piece, then two more, and read back.
         assert_eq!(cache("tool-begin", serde_json::json!({ "tool": "make", "hash": "abc" })).0, 400);
@@ -6478,6 +6479,9 @@ mod runs_suite_in_browser {
         served.later(8 * 86_400_000);
         served.upkeep();
         assert_eq!(pieces(), 0, "{:?}", served.github.objects());
+        // Its job's token, a week on: expired.
+        let (status, said) = cache("lookup", serde_json::json!({ "token": token, "key": "deps-1", "version": version }));
+        assert!(status == 403 && said.to_string().contains("expired"), "{status} {said}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&out);
         super::seen_in_browser(&served);
