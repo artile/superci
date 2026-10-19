@@ -10166,6 +10166,16 @@ fn what_the_cli_reads_and_the_keys_it_makes_are_what_the_dashboard_shows() {
     // Keys: a read key, a run key; names and lengths that are not one, a name kept already.
     let (code, said) = cli(&["keys", "create", "reader", "--days=7"]);
     assert!(code == 0 && said.contains("superci_read_"), "{said}");
+    // The read key read with (as SUPERCI_PLANE, SUPERCI_KEY), one that is no key, and the read key once it expired.
+    let reader = said.split_whitespace().find(|w| w.contains("superci_read_")).map(|w| w.trim_start_matches("SUPERCI_KEY=").trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_').to_string()).unwrap();
+    let read_with = |key: &str| { let o = common::command(&home).args(["runs", "list"]).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", key).output().unwrap(); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (ok, said) = read_with(&reader);
+    assert!(ok, "{said}");
+    assert!(!read_with("superci_read_not-a-key-00000000").0);
+    assert!(!read_with("short").0);
+    served.later(8 * 86_400_000);
+    let (ok, said) = read_with(&reader);
+    assert!(!ok, "expired: {said}");
     let (code, said) = cli(&["keys", "create", "ci2", "--runs"]);
     assert!(code == 0 && said.contains("SUPERCI_KEY=superci_run_"), "{said}");
     for (args, why) in [(&["keys", "create", "reader"][..], "a key named reader already"), (&["keys", "create", "not-a-name"], "letters and digits"), (&["keys", "create", "averyveryverylongnamethatgoeson"], "letters and digits"),
