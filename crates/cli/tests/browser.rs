@@ -11060,6 +11060,22 @@ fn a_cloudflare_sign_in_at_its_end_is_renewed_or_said_over_as_cloudflare_answers
         if status == 200 && refresh.is_some() { assert_eq!(now["cloudflare"]["refresh"], "cloudflare-refresh-for-tests", "the one before kept: {now}") }
     }
     assert!(served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().unwrap_or_default().contains(token)).count() >= 4, "renewals asked");
+    // A sign-in good by its time that Cloudflare refuses (its token no longer valid, code 9109): forgotten and asked
+    // for again on the page; a token given by name that Cloudflare refuses, said as that.
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let invalid = r#"{"success":false,"errors":[{"code":9109,"message":"Invalid access token"}],"messages":[],"result":null}"#;
+    served.aws.fail("api.cloudflare.com", 403, invalid, None);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_CLOUDFLARE_TOKEN", "cloudflare-token-for-tests")]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait("document.querySelector('main') !== null");
+    served.aws.fail_none();
+    let _ = child.kill();
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=planes"));
     b.wait("document.querySelector('main') !== null");
