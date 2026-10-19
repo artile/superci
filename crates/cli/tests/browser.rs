@@ -11004,6 +11004,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["caches", "list", "--repo=acme/nothing"], vec!["secrets", "create", "DRY", "--value-env=HOME", "--dry-run"], vec!["keys", "create", "agent", "--max-cpu=8"], vec!["keys", "create", "agent", "--daily-usd=5"],
         vec!["accounts", "retrieve", "gcp"], vec!["images", "create", "eu-west-1", "--from=nothing"], vec!["images", "create", "eu-west-1", "--from=us-east-1:ami-0123456789abcdef0", "--dry-run"],
         vec!["runners", "update", "cloudflare"], vec!["runners", "update", "aws", "--networks=subnet-0123456789abcdef0", "--dry-run"], vec!["public_repos", "list"], vec!["runs", "cancel", "999"],
+        vec!["login", "aws"], vec!["login"], vec!["login", "nowhere"], vec!["connections", "create", "github", "acme", "--dry-run"],
         // Help, a resource alone, what is no command.
         vec!["help"], vec!["help", "runs"], vec!["runs"], vec!["runs", "--help"], vec!["nothing"], vec!["runs", "nothing"], vec!["--version"],
     ];
