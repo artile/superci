@@ -2,12 +2,12 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.18
+## 0.19.18 — 2026-10-19
 - A change's note in the dashboard ("Removed Cloudflare. Left: …") is shown once its page has loaded. A page still loading took it, and it was not shown.
 - A job with nowhere to run names the operating systems as they are written: "Nowhere to run Windows: Cloudflare runs Linux only" (it said "windows" and "linux").
 - `superci runs create --repo=OWNER/NAME` names the GitHub repository a run is of, for a checkout whose origin is not GitHub's (a copy of it, say). Such a run's cache was its own, apart from what GitHub's jobs saved, and nothing said so: now the run says when its cache is its own, and why.
 - A job cancelled while its machine came up shows as Cancelled, saying its machine is ended unless it takes another job. It showed as Failed ("Its machine was lost") and counted among the failures.
-- An artifact a job fetches with `actions/download-artifact` is unpacked. SuperCI's machines said it was a plain file, not the zip it is, so newer versions of download-artifact kept the zip as it was, under the artifact's name.
+- An artifact a job fetches with `actions/download-artifact` is unpacked. SuperCI's machines said it was a plain file, not the zip it is, so newer versions of download-artifact kept the zip as it was, under the artifact's name. Update your control plane for it.
 - Following a run (`superci runs create`, `superci runs wait`), a passed job's end and the run's summary come together. The summary waited up to a minute more for steps' logs and results the job's end had already been said without.
 - `superci runs retrieve --tests` reads every job's tests that ran, whatever ran it. A passed job with no machine on its record was skipped, so only the failed jobs' tests were shown.
 

@@ -843,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "image-reader"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "fuser",
  "libc",
@@ -1934,7 +1934,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superci"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "superci-cache"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "getrandom 0.2.17",
  "serde_json",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "superci-core"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "superci-layers"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "base64 0.22.1",
  "hyper-util",
@@ -2014,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "superci-plane-aws"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "superci-plane-cloudflare"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "async-trait",
  "getrandom 0.2.17",
@@ -2046,7 +2046,7 @@ dependencies = [
 
 [[package]]
 name = "superci-plane-modal"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2058,19 +2058,19 @@ dependencies = [
 
 [[package]]
 name = "superci-programs-cache"
-version = "0.19.17"
+version = "0.19.18"
 
 [[package]]
 name = "superci-programs-layers"
-version = "0.19.17"
+version = "0.19.18"
 
 [[package]]
 name = "superci-programs-planes"
-version = "0.19.17"
+version = "0.19.18"
 
 [[package]]
 name = "superci-runners-cloudflare"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "getrandom 0.2.17",
  "js-sys",
@@ -2083,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "superci-testkit"
-version = "0.19.17"
+version = "0.19.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
