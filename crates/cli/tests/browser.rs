@@ -5560,6 +5560,73 @@ fn jobs_off_the_usual_way_are_noted_failed_at_once_or_taken_back_as_their_events
     assert!(j["error"].as_str().unwrap_or_default().contains("reached its limit of $12.50 a month") && j["failed_fast"] == true, "{j}");
 }
 
+/// AWS's machines asked for when AWS will not say which image (spot alone, and with on-demand): tried again, saying
+/// so. A start out of time after spot failed: the next try says so (and one asked on spot again after AWS took a
+/// machine back stays on spot). On-demand alone at the account's limit, a machine of its own ended a moment ago: it
+/// waits for AWS to stop counting that one (asked on spot again or not). An event for a job whose start is under way
+/// starts nothing more.
+#[test]
+fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_so_and_wait() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let routing = |order: &str| served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"default":null,"rules":[],"order":{order}}}"#));
+    let state = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut j = state(id); f(&mut j); served.store.0.lock().unwrap().insert(format!("job:{id}"), j.to_string()); };
+    let fresh = || { served.aws.fail_none(); served.aws.during.lock().unwrap().clear(); served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:") && !k.starts_with("spot:")); served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string()); };
+    let queue = |name: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); assert!(served.webhook(q) < 300); id };
+    // AWS will not say which image: spot alone, then spot and on-demand. Each tried again.
+    fresh();
+    served.aws.fail("DescribeImages", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
+    for (order, name) in [(r#"[{"cloud":"aws"},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]"#, "spot alone"), (r#"[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#, "both")] {
+        routing(order);
+        let id = queue(name);
+        assert!(state(id)["state"] == "waiting" && state(id)["error"].as_str().unwrap_or_default().contains("trying again (us-east-1") && state(id)["error"].as_str().unwrap_or_default().contains("internal error"), "{name}: {}", state(id));
+    }
+    // Spot failing, AWS taking sixteen seconds to say so: out of time before on-demand.
+    fresh();
+    let tick = served.ticker();
+    served.aws.during("RunInstances|MarketType", move || tick(16_000));
+    served.aws.fail("RunInstances|MarketType", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
+    let oot = queue("out of time");
+    assert!(state(oot)["state"] == "waiting" && state(oot)["error"].as_str().unwrap_or_default().contains("out of time for more tries"), "{}", state(oot));
+    // Asked on spot again (on-demand first now, spot having failed it): on-demand full, AWS as slow, out of time before
+    // spot: still asked on spot.
+    served.aws.fail_none();
+    served.aws.during.lock().unwrap().clear();
+    let tick = served.ticker();
+    served.aws.during("RunInstances", move || tick(16_000));
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("InsufficientInstanceCapacity", "no"), None);
+    edit(oot, &|j| j["spot_again"] = true.into());
+    served.later(30_000);
+    served.upkeep();
+    assert!(state(oot)["no_spot"] != true && state(oot)["error"].as_str().unwrap_or_default().contains("out of time"), "{} {}", state(oot)["error"], state(oot)["no_spot"]);
+
+
+    // On-demand alone, at the account's limit, a machine of this control plane's ended a moment ago.
+    fresh();
+    routing(r#"[{"cloud":"aws","off":true},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#);
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("VcpuLimitExceeded", "You have requested more vCPU capacity than your current vCPU limit of 64 allows"), None);
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("job:96".into(), serde_json::json!({ "job_id": 96, "run_id": 1, "repo": "acme/app", "state": "done", "cloud": "aws", "machine_id": "i-0ended", "at_ms": now - 600_000,
+        "ended_ms": now - 30_000, "installation_id": 42, "seen_in_progress": true, "began": true }).to_string());
+    served.store.0.lock().unwrap().insert("live:96".into(), String::new());
+    let limited = queue("at the limit");
+    let still_counted = |id: u64| state(id)["state"] == "waiting" && state(id)["error"].as_str().unwrap_or_default().contains("AWS still counts a machine of yours that ended a moment ago");
+    assert!(still_counted(limited), "{}", state(limited));
+    edit(limited, &|j| j["spot_again"] = true.into());
+    served.upkeep();
+    assert!(still_counted(limited), "{}", state(limited));
+
+    // Its event again while its start is under way: nothing more.
+    let (again, q) = served.github.queue("under way", "superci", served.now_ms());
+    served.store.0.lock().unwrap().insert(format!("job:{again}"), serde_json::json!({ "job_id": again, "run_id": 1, "repo": "acme/app", "state": "launching", "cloud": "", "at_ms": served.now_ms(), "installation_id": 42, "seen_in_progress": false }).to_string());
+    assert!(served.webhook(q) < 300);
+    assert!(state(again)["state"] == "launching" && state(again)["rev"].is_null(), "{}", state(again));
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

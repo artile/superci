@@ -2986,7 +2986,8 @@ impl<'a> ControlPlane<'a> {
                             // A job whose files are in memory or on its machine's own disk keeps the layers there
                             // too (the store's folder is bound there with Docker's): no disk of their own, which
                             // would be slower than either.
-                            let on_scratch = spec.scratch.is_some() && spec.os() == "linux";
+                            // (Linux only: AWS's place refuses a RAM disk or a local disk elsewhere, see `Capacity::refuses`.)
+                            let on_scratch = spec.scratch.is_some();
                             let (user_data, set_up, keeps) = self.with_cache(user_data.clone(), region, spec.os(), spec.arch(), images, setup, &creds, plane_url, &cache_runner, &key, now).await;
                             job.layers = set_up;
                             job.keeps = keeps;
@@ -3080,14 +3081,14 @@ impl<'a> ControlPlane<'a> {
                         let price = if on_demand { let p = aws::on_demand_price(self.http, &creds, &region, &machine.kind, spec.os(), now).await; self.note_permission("aws", "Prices", &p).await; p.ok() }
                             else { aws::spot_price(self.http, &region, Some(&machine.zone), &creds, &machine.kind, spec.os(), now).await.ok() };
                         let cpu = job.cpu.unwrap_or(4);
-                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers && !(spec.scratch.is_some() && spec.os() == "linux")));
+                        job.usd_per_hour = Some(price.unwrap_or_else(|| aws::on_demand_usd_per_hour(cpu, spec.ram_gb.unwrap_or(cpu * 4))) + aws::extras_usd_per_hour(aws::disk_gb_month(&region), disk_gb, disk_mibs, disk_iops, !private) + store_disk_usd_per_hour(aws::disk_gb_month(&region), job.layers && spec.scratch.is_none()));
                         job.region = Some(region);
                         job.zone = Some(machine.zone).filter(|z| !z.is_empty());
                         job.disk_gb = Some(disk_gb);
                         job.disk_mibs = Some(disk_mibs).filter(|m| *m > DISK_MIBS_INCLUDED);
                         job.disk_iops = Some(disk_iops).filter(|i| *i > DISK_IOPS_INCLUDED);
                         // (In memory as its label asked, or on its machine's own disk: a machine type that has one uses it.)
-                        job.ramdisk = spec.ramdisk() && spec.os() == "linux";
+                        job.ramdisk = spec.ramdisk();
                         job.local_disk = !job.ramdisk && spec.os() == "linux" && machine.kind.split('.').next().is_some_and(|family| family.ends_with('d') && crate::spec::FAMILIES.iter().any(|(f, _)| *f == family));
                         Ok(Tried::Started(machine.id, machine.kind))
                     }.await,
