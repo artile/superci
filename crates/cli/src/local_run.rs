@@ -566,14 +566,9 @@ fn get(plane: &str, key: &str, at: &str) -> Result<Value> {
     serde_json::from_slice(&res.body).map_err(|e| format!("the control plane's answer: {e}"))
 }
 
-fn run_ok(run: &str) -> Result<()> {
-    if run.is_empty() || !run.bytes().all(|b| b.is_ascii_digit()) { return Err("Say which run: --run=ID (ids are in `superci runs list`).".into()) }
-    Ok(())
-}
-
-/// `superci artifacts list --run=ID`: what a run from a computer's jobs kept with `upload-artifact`.
+/// `superci artifacts list --run=ID`: what a run from a computer's jobs kept with `upload-artifact`. (The run's id and
+/// the artifact's name are checked by the command, before it asks.)
 pub fn artifacts(plane: &str, key: &str, run: &str) -> Result<Done> {
-    run_ok(run)?;
     let got = get(plane, key, &format!("/runs/{run}/artifacts"))?;
     let all = got["artifacts"].as_array().cloned().unwrap_or_default();
     let said = if all.is_empty() { vec!["No artifacts: its jobs kept none, or the run is over a day old.".into()] }
@@ -584,8 +579,6 @@ pub fn artifacts(plane: &str, key: &str, run: &str) -> Result<Done> {
 /// `superci artifacts retrieve NAME --run=ID [--out=DIR]`: fetches one and unpacks it into DIR (`./NAME` unless
 /// given), as `download-artifact` would. One that is not a zip is kept as the file it is.
 pub fn artifact(plane: &str, key: &str, run: &str, name: &str, out: Option<&str>) -> Result<Done> {
-    run_ok(run)?;
-    if name.is_empty() { return Err("Say which artifact: `superci artifacts retrieve NAME --run=ID` (names are in `superci artifacts list --run=ID`).".into()) }
     let at = format!("/runs/{run}/artifacts?name={}", url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>());
     let got = get(plane, key, &at)?;
     let dir = std::path::PathBuf::from(out.unwrap_or(name));
@@ -842,11 +835,6 @@ mod tests {
         assert_eq!(last_lines(&plain).len(), 40);
     }
 
-    #[test]
-    fn a_run_is_said_by_its_number() {
-        assert!(run_ok("123").is_ok());
-        for bad in ["", "12a", "-1"] { assert!(run_ok(bad).unwrap_err().starts_with("Say which run")) }
-    }
 
     #[test]
     fn a_zip_as_upload_artifact_makes_it_is_unpacked_inside_its_folder() {

@@ -3546,6 +3546,22 @@ mod runs_in_browser {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A run named as a repository GitHub's App is installed on (`--repo`): its cache is the repository's, nothing
+    /// said of it; one named as a repository the App is not on says its cache is its own, and why.
+    #[test]
+    fn a_run_named_as_a_repository_with_the_app_shares_its_cache_and_one_without_says_so() {
+        let served = serve(|_| {});
+        served.connect_github();
+        let dir = checkout();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme/app", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string();
+        assert!(o.status.success() && !said.contains("Its cache is its own"), "{said}{}", String::from_utf8_lossy(&o.stderr));
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=globex/site", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string();
+        assert!(o.status.success() && said.contains("GitHub's App is not installed on globex/site"), "{said}{}", String::from_utf8_lossy(&o.stderr));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A run from a computer whose job passed: `runs retrieve --tests` reads its tests too, as a failed job's.
     #[test]
     fn a_passing_run_from_a_computer_has_its_tests_read_by_runs_retrieve() {
