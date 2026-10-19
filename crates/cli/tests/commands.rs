@@ -1236,6 +1236,10 @@ fn the_accounts_copies_of_the_image_are_said_by_their_builds_and_an_older_one_is
     account.fail("servicequotas.", 200, r#"{"Quota":{"QuotaCode":"L-34B43A08","ServiceCode":"ec2","Value":16.0}}"#, None);
     let look = said(&["accounts", "retrieve", "aws"]);
     assert!(look.contains("At once       spot 16 vCPUs · on-demand 16 vCPUs") && look.contains("16 vCPUs is 4 jobs of the default size at a time. Ask AWS for more: "), "{look}");
+    // AWS failing to say whether the image is in a region: not known there.
+    account.fail("DescribeImages|ec2.ap-south-1.", 500, &superci_testkit::ec2_error("InternalError", "We encountered an internal error."), None);
+    let images = said(&["images", "list"]);
+    assert!(images.lines().any(|l| l.starts_with("ap-south-1") && l.ends_with("not known")), "{images}");
     let _ = std::fs::remove_dir_all(&alone);
 }
 
@@ -1589,5 +1593,32 @@ fn an_update_whose_converter_lambda_failed_to_take_in_still_updates_the_control_
     assert!(o.status.success() && said.contains(&format!("Updated to {}", env!("CARGO_PKG_VERSION"))), "{said}");
     let asked = served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "GET" && a["url"].as_str().is_some_and(|u| u.ends_with("-convert/configuration"))).count();
     assert_eq!(asked, 1, "its state asked once: Failed");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An AWS sign-in renewed as it is used, AWS refusing: one whose user may not sign in developer tools, and one AWS
+/// answers with no JSON at all; either is over, and a sign-in is asked for.
+#[test]
+fn an_aws_sign_in_aws_will_not_renew_is_said_as_aws_refused_it() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["aws"]["creds"]["expires_at_ms"] = 0.into();
+    kept["aws"]["refresh_token"] = "refresh-for-tests".into();
+    kept["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    let due = kept.to_string();
+    for (answer, said) in [(r#"{"error":"INSUFFICIENT_PERMISSIONS"}"#, "AWS says this sign-in may not be used by developer tools"), ("Bad Request", "AWS sign-in: 400 Bad Request")] {
+        std::fs::write(&file, &due).unwrap();
+        served.aws.fail_none();
+        served.aws.fail("signin.aws.amazon.com/v1/token", 400, answer, None);
+        let o = superci(&home, &["accounts", "retrieve", "aws"]);
+        let e = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        // (Its renewal refused: no longer signed in to it, and a sign-in asked for.)
+        assert!(o.status.code() == Some(3) && e.contains("Sign in with AWS first."), "{answer}: {e}");
+        let renewal = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/v1/token"))).cloned().unwrap_or_default();
+        assert_eq!((renewal["status"].as_u64(), renewal["answer"].as_str()), (Some(400), Some(answer)), "{said}");
+        assert!(serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap()).unwrap()["aws"].is_null(), "{said}");
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
