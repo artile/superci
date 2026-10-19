@@ -615,6 +615,65 @@ fn an_update_uploaded_while_the_control_plane_still_answers_as_before_is_said_as
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A command with no key kept hands the control plane one and reads it once it takes it: one that does not answer is
+/// read as not answering; one too old for the key's new name, whose old name AWS refuses or keeps from it, says why it
+/// does not take it.
+#[test]
+fn a_key_handed_by_a_command_is_waited_for_only_while_the_control_plane_answers_and_may_still_take_it() {
+    let served = serve(|_| {});
+    let fresh = || { let home = signed_in(&served); let file = home.join("workspaces/default/sign-ins.json"); let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap(); k.as_object_mut().unwrap().remove("key"); std::fs::write(&file, k.to_string()).unwrap(); home };
+    // Not answering: read as it is, not waited for.
+    let home = fresh();
+    served.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (_, s) = common::json(&home, &["status"]);
+    served.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(s["control_plane"]["online"] == false && s["status"].is_null(), "{s}");
+    let _ = std::fs::remove_dir_all(&home);
+    // Too old for the new name: its old name refused by AWS (no key handed), or taken by AWS and kept from it (waited for).
+    *served.aws.old_version.lock().unwrap() = Some("0.19.0".into());
+    for (status, answer) in [(400, superci_testkit::json_error("AccessDeniedException", "User is not authorized to perform: ssm:PutParameter")), (200, r#"{"Tier":"Standard","Version":1}"#.to_string())] {
+        served.aws.fail("AmazonSSM.PutParameter|DASHBOARD_KEY_", status, &answer, None);
+        let home = fresh();
+        let (_, s) = common::json(&home, &["status"]);
+        assert!(s["error"].as_str().unwrap_or_default().contains("The control plane runs SuperCI 0.19.0, which reads this computer's key under its old name"), "{status}: {s}");
+        served.aws.fail_none();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+    *served.aws.old_version.lock().unwrap() = None;
+}
+
+/// What commands say of the sign-ins beside AWS's: each cloud signed in to (Cloudflare's as kept or as a token given
+/// for the run, Modal's workspace), Modal's noted as ended beside the control planes listed, and a change made where
+/// the control plane in use was not kept as such (it is looked for first).
+#[test]
+fn commands_say_each_cloud_signed_in_to_one_noted_as_ended_and_change_a_control_plane_not_kept_as_in_use() {
+    let served = serve(|_| {});
+    let at = |f: &dyn Fn(&mut serde_json::Value)| { let home = signed_in(&served); let file = home.join("workspaces/default/sign-ins.json"); let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap(); f(&mut k); std::fs::write(&file, k.to_string()).unwrap(); home };
+    let home = at(&|k| {
+        k["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+        k["modal"] = serde_json::json!({ "token_id": "ak-acme", "token_secret": "as-acme", "workspace": "acmeci" });
+    });
+    let accounts = |envs: &[(&str, &str)]| { let o = common::command(&home).args(["accounts", "list", "--json"]).envs(envs.iter().copied()).output().unwrap(); serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_default()["accounts"].clone() };
+    let of = |a: &serde_json::Value, cloud: &str| a.as_array().into_iter().flatten().find(|x| x["cloud"] == cloud).map(|x| x["id"].clone()).unwrap_or_default();
+    let kept = accounts(&[]);
+    assert!(of(&kept, "cloudflare") == "signed in" && of(&kept, "modal") == "acmeci" && of(&kept, "aws") == "111111111111", "{kept}");
+    let given = accounts(&[("SUPERCI_CLOUDFLARE_TOKEN", "a-token-for-this-run")]);
+    assert_eq!(of(&given, "cloudflare"), "a token given for this run", "{given}");
+    let _ = std::fs::remove_dir_all(&home);
+    // Modal's sign-in noted as ended: said beside what the others reach.
+    let home = at(&|k| k["modal_ended"] = true.into());
+    let o = common::superci(&home, &["planes", "list"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(said.contains("Modal no longer accepts the sign-in: what is in Modal was not looked at. `superci login modal` signs in again."), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&home);
+    // The control plane known only beside another (not kept as the one in use): looked for, then changed.
+    let home = at(&|k| { k["planes_more"] = serde_json::json!([k["plane"].clone()]); k.as_object_mut().unwrap().remove("plane"); });
+    let (code, said) = common::json(&home, &["name", "update", "AcmeCI"]);
+    assert!(code == 0 && said["name"] == "AcmeCI", "{said}");
+    assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k == "NAME" && v == "AcmeCI"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
