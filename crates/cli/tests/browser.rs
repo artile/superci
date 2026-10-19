@@ -2693,6 +2693,16 @@ fn the_debug_commands_answer_as_the_clouds_answered_and_the_pages_stay() {
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
     b.wait("document.querySelector('main') !== null");
+    // The dashboard's own calls to AWS answered so (its request out of date, its token expired): its pages say to
+    // sign in again, and keep working.
+    for (code, message) in [("RequestExpired", "Request has expired."), ("ExpiredTokenException", "The security token included in the request is expired")] {
+        served.aws.fail("iam.amazonaws.com", 403, &format!(r#"<ErrorResponse><Error><Type>Sender</Type><Code>{code}</Code><Message>{message}</Message></Error><RequestId>1</RequestId></ErrorResponse>"#), None);
+        for p in ["planes", "overview"] {
+            b.goto(&format!("{link}&p={p}"));
+            b.wait("document.querySelector('main') !== null");
+        }
+        served.aws.fail_none();
+    }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -2850,7 +2860,7 @@ fn each_test_runners_failures_are_read_from_a_jobs_log_by_the_cli_and_the_job_pa
             "  ✘  10 [chromium] › e2e/f.spec.ts:1:1 › expected to fail (1s)", "  ✘  11 [chromium] › e2e/g.spec.ts:1:1 › again (1s)", "  ✘  12 [chromium] › e2e/g.spec.ts:1:1 › again (retry #1) (1s)",
             "  ✓  13 [chromium] › e2e/g.spec.ts:2:1 › twice (1s)", "  ✓  14 [chromium] › e2e/g.spec.ts:2:1 › twice (1s)", "  ✓  15 [chromium] › e2e/a.spec.ts › no line", "  ✓  16 [chromium]", "  ✓  17 e2e/nofile › x",
             "  1) [chromium] › e2e/g.spec.ts:1:1 › again ───", "    Error: no", "  2) [chromium] › short", "  1 failed", "  1 interrupted", "  2 did not run", "  1 skipped", "  1 passed in a sentence that is long", "  1 flaky"])),
-        ("pytest and cargo and go each way", t(&["= 2 passed in 0.10s =", "=== short test summary info in 1 passed ===", "====== 3 errors in 1.00s ======", "FAILED tests/a.py::test_x", "test lone ... FAILED", "test result: ok. 0 passed; 0 failed; 2 ignored",
+        ("pytest and cargo and go each way", t(&["= 2 passed in 0.10s =", "=== short test summary info in 1 passed ===", "====== 3 errors in 1.00s ======", "FAILED tests/a.py::test_x", "FAILED tests/a.py::test_x - said again", " FAIL  src/b.spec.ts > spec one", " FAIL  lib/c > in a folder", " FAIL  plain.ts > no folder", "Running tests using nothing", "test lone ... FAILED", "test result: ok. 0 passed; 0 failed; 2 ignored",
             "--- FAIL: TestA (0.01s)", "    --- FAIL: TestA/sub (0.00s)", "        a_test.go:3: inner", "    a_test.go:4: outer", "--- PASS: TestB (0.00s)"])),
         ("ran nothing", t(&["[web] Running 0 tests using 1 worker", "[api] test result: ok. 0 passed; 0 failed; 0 ignored", "[web] › not a mark", "[ab]c not a mark", "[a] Error: No tests found", "[b] Error: No tests found"])),
         ("many", t(&(0..450).map(|i| if i < 225 { format!("[one] FAILED tests/t.py::test_{i} - no") } else { format!("[two] FAILED tests/u.py::test_{i} - no") }).collect::<Vec<_>>().iter().map(String::as_str).collect::<Vec<_>>())),
