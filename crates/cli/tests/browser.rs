@@ -11130,6 +11130,16 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         assert!(o.status.success() == works, "{ended}: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let _ = std::fs::remove_dir_all(&alone);
     }
+    // An AWS sign-in that does not say whom it is of: the account's look said without it.
+    let anon = home.with_extension("anon");
+    std::fs::create_dir_all(anon.join("workspaces/default")).unwrap();
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+    kept["aws"]["who"] = "".into();
+    std::fs::write(anon.join("workspaces/default/sign-ins.json"), kept.to_string()).unwrap();
+    std::fs::copy(home.join("aws-at"), anon.join("aws-at")).unwrap();
+    let o = common::command(&anon).args(["accounts", "retrieve", "aws"]).output().unwrap();
+    assert!(o.status.code().is_some_and(|c| c <= 3) && !String::from_utf8_lossy(&o.stdout).contains("signed in as"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&anon);
     // AWS's first sign-in noted as ended, a further AWS account still signed in: it goes on, and what is kept says no
     // sign-in has ended.
     let more = home.with_extension("more");
