@@ -10175,6 +10175,15 @@ fn pages_open_by_older_links_a_control_plane_by_its_place_and_set_up_shown_or_no
         b.goto(&format!("{link}&{q}"));
         b.wait(&format!("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane') && {}", page_shows(said)));
     }
+    // A page opened again a few seconds on: shown from what was read, read again behind it, and the next shows that.
+    for _ in 0..2 {
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        b.goto(&format!("{link}&p=overview"));
+        b.wait(&page_shows("Usage"));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&page_shows("Recent jobs"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
