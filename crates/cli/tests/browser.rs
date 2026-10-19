@@ -4755,6 +4755,27 @@ mod gitlab_in_browser {
         assert_eq!(named("Executing \"step_script\" stage"), "failure", "{steps:?}");
         let text = view.to_string();
         assert!(text.contains("npm ci") && text.contains("added 312 packages") && text.contains("2 tests failed") && !text.contains("00O") && !text.contains("01E"), "{text}");
+        // Another: a section with no heading at all (named by its id), one whose heading comes after a blank line, and
+        // one that never ends: shown while the job runs, then where it failed.
+        let (id2, pending) = served.gitlab.pending("unfinished", &["superci"], served.now_ms());
+        assert!(served.gitlab_webhook(pending) < 300);
+        assert!(served.gitlab_webhook(served.gitlab.running(id2, served.now_ms())) < 300);
+        let log2 = [
+            t(0, "00O", "\u{1b}[0Ksection_start:1760522401:upload_cache\r\u{1b}[0K"),
+            t(0, "00O", "\u{1b}[0Ksection_end:1760522402:upload_cache\r\u{1b}[0K"),
+            t(1, "00O", "\u{1b}[0Ksection_start:1760522403:fetch\r\u{1b}[0K"),
+            t(1, "00O+", "\u{1b}[0K"),
+            t(2, "00O", "Fetching the sources"),
+            t(3, "00O", "\u{1b}[0Ksection_end:1760522404:fetch\r\u{1b}[0K"),
+            t(4, "00O", "\u{1b}[0Ksection_start:1760522405:step_script\r\u{1b}[0K\u{1b}[36;1mExecuting \"step_script\" stage\u{1b}[0;m"),
+            t(5, "00O", "running tests\r"),
+        ].join("\n");
+        served.gitlab.trace(id2, &log2);
+        let (_, going) = part(&link, &format!("/job/view?id={id2}"));
+        assert!(going.contains("running tests"), "{going}");
+        assert!(served.gitlab_webhook(served.gitlab.finish(id2, "failed", &log2, served.now_ms())) < 300);
+        let (_, ended) = part(&link, &format!("/job/view?id={id2}"));
+        assert!(ended.contains("failure"), "{ended}");
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
         super::seen_in_browser(&served);

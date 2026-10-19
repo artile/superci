@@ -105,6 +105,9 @@ impl GitLab {
         self.event(id)
     }
 
+    /// Its log so far, while it runs.
+    pub fn trace(&self, id: u64, log: &str) { self.lab.lock().unwrap().logs.insert(id, log.to_string()); }
+
     /// It ended (`success`, `failed`), with its log.
     pub fn finish(&self, id: u64, status: &str, log: &str, now_ms: u64) -> Vec<u8> {
         {
