@@ -3449,6 +3449,47 @@ mod runs_in_browser {
         assert!(at(&line(4)) < has("Ended: success"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// A job that passed with a step whose result and log never came: its end is said once its lines are waited for,
+    /// and its run's summary at once after it, not a minute later.
+    #[test]
+    fn a_passed_jobs_summary_comes_at_once_though_a_steps_result_never_came() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let began = std::time::Instant::now();
+        let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).env("SUPERCI_LOGS_WAIT_S", "60").spawn().unwrap();
+        let run = run_of(&served);
+        let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let (a, b) = ("aaaaaaaa-0000-0000-0000-000000000011", "bbbbbbbb-0000-0000-0000-000000000012");
+        runner.take();
+        runner.steps(&[(a, "Run make", 1, "completed", Some("succeeded"), Some(1)), (b, "Run the tests", 2, "inProgress", None, None)]);
+        runner.lines(b, 1, &["ok".to_string()]);
+        runner.finish("succeeded");
+        let out = cli.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success() && said.contains("The run ended: success"), "{said}");
+        assert!(began.elapsed().as_secs() < 40, "the summary waited: {} s\n{said}", began.elapsed().as_secs());
+        // (Its end said, then at once its summary: the end does not come a minute before it.)
+        let lines: Vec<&str> = said.lines().collect();
+        let ended = lines.iter().position(|l| l.contains("Ended: success")).unwrap_or_else(|| panic!("{said}"));
+        assert!(lines[ended + 1].contains("tests · job"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run from a computer whose job passed: `runs retrieve --tests` reads its tests too, as a failed job's.
+    #[test]
+    fn a_passing_run_from_a_computer_has_its_tests_read_by_runs_retrieve() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"]).spawn().unwrap();
+        let run = run_of(&served);
+        play(&served, &run, &["test api::adds ... ok".to_string(), "test result: ok. 3 passed; 0 failed; 1 ignored".to_string()], "succeeded");
+        let out = cli.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        let o = superci(&served, &dir, &["runs", "retrieve", &run, "--tests", "--json"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(said.contains("\"passed\": 3") || said.contains("\"passed\":3"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     fn play(served: &superci_testkit::Served, run: &str, lines: &[String], result: &str) {
         let runner = loop { if let Some(r) = Runner::of_run(served, run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
         let a = "cccccccc-0000-0000-0000-000000000003";
@@ -6645,7 +6686,8 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
         let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/matrix.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
-        let run = run_of(&served);
+        // (The run it started: the one that is not the first.)
+        let run = served.store.under("run:").into_iter().map(|(k, _)| k.trim_start_matches("run:").to_string()).find(|r| *r != run).unwrap();
         let names: Vec<String> = served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().filter_map(|j| j["name"].as_str().map(str::to_string)).collect();
         assert!(names.len() >= 4, "each combination a job: {names:?}");
         assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
@@ -10870,6 +10912,31 @@ fn a_cloudflare_sign_in_at_its_end_is_renewed_or_said_over_as_cloudflare_answers
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=planes"));
     b.wait("document.querySelector('main') !== null");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A run whose jobs passed: `runs retrieve --tests` reads each job's tests all the same (how many ran, by which
+/// runner), as it does a failed one's; and the run's page shows the jobs.
+#[test]
+fn a_passing_runs_tests_are_read_by_runs_retrieve_as_a_failed_ones_are() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(id));
+    served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z test api::adds ... ok\n2026-10-15T10:00:02.0000000Z test result: ok. 3 passed; 0 failed; 1 ignored\n", served.now_ms()));
+    let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
+    let home = signed_in(&served);
+    let o = common::command(&home).args(["runs", "retrieve", &run, "--tests", "--json"]).output().unwrap();
+    let said: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)));
+    let tests = &said["runs"][0]["job_list"][0]["tests"];
+    assert_eq!(tests["passed"], 3, "{said}");
+    let o = common::command(&home).args(["runs", "retrieve", &run, "--tests"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&o.stdout).contains("3 passed"), "{}", String::from_utf8_lossy(&o.stdout));
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&shows("Recent jobs"));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }

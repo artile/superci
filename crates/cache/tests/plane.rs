@@ -164,7 +164,9 @@ fn a_run_from_a_computers_artifacts_and_nx_and_bazels_outputs_go_through_the_con
     assert_eq!((listed["artifacts"][0]["name"].as_str(), listed["artifacts"][0]["size"].as_str()), (Some("report"), Some("12")), "{listed}");
     assert_eq!(artifacts("ListArtifacts", serde_json::json!({ "id_filter": "1" })).1["artifacts"], serde_json::json!([]));
     let (_, signed) = artifacts("GetSignedArtifactURL", serde_json::json!({ "name": "report" }));
-    assert_eq!(call(port, "GET", &path(signed["signed_url"].as_str().unwrap()), &[], b"").2, b"first-second");
+    let (_, head, body) = call(port, "GET", &path(signed["signed_url"].as_str().unwrap()), &[], b"");
+    // (Said to be a zip, as GitHub's storage says it: `download-artifact` unpacks only that.)
+    assert!(body == b"first-second" && head.contains("content-type: application/zip"), "{head}");
     assert_eq!(artifacts("GetSignedArtifactURL", serde_json::json!({ "name": "none" })).0, 404);
     assert_eq!(artifacts("DeleteArtifact", serde_json::json!({ "name": "report" })).1["ok"], true);
     assert_eq!(artifacts("DeleteArtifact", serde_json::json!({ "name": "report" })).0, 404);

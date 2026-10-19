@@ -382,6 +382,8 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
     let (mut after, mut last): (Vec<u64>, Vec<String>) = (vec![], vec![]);
     let mut logs: Vec<Lines> = vec![];
     let mut ended_at: Vec<Option<std::time::Instant>> = vec![];
+    // (Jobs whose end was said without all their steps' lines: the summary does not wait for those again.)
+    let mut said_without: Vec<bool> = vec![];
     let mut over_at: Option<std::time::Instant> = None;
     // (Said once: the run is over, and its summary waits for what its runner still sends.)
     let mut told_waiting = false;
@@ -404,6 +406,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
         last.resize(jobs.len(), String::new());
         logs.resize_with(jobs.len(), Lines::default);
         ended_at.resize(jobs.len(), None);
+        said_without.resize(jobs.len(), false);
         let several = jobs.len() > 1;
         for (i, j) in jobs.iter().enumerate() {
             let name = j["name"].as_str().unwrap_or_default();
@@ -447,19 +450,25 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 if line.starts_with("##[endgroup]") || how.quiet { continue }
                 say(&format!("{}{mark}{}", crate::commands::JOB_LINE, line.strip_prefix("##[group]").unwrap_or(&line)))
             }
-            if ended && (logs[i].complete() || give_up) { said_state(say, state, &mut last[i]) }
+            if ended && (logs[i].complete() || give_up) {
+                if !logs[i].complete() { said_without[i] = true }
+                said_state(say, state, &mut last[i])
+            }
             after[i] = j["next"].as_u64().unwrap_or(after[i]);
         }
         // Over: once every step's lines are out (its log may come a while after: the runner sends steps' logs as it
         // can, a large one after the job has ended), or a minute later at most.
         if st["over"] == true && over_at.is_none() { over_at = Some(std::time::Instant::now()) }
         // (And for each step's result, which its runner may send after the job has ended too.)
-        let results_missing = jobs.iter().any(|j| j["result"].is_string() && !["skipped", "cancelled"].contains(&j["result"].as_str().unwrap_or_default()) && j["steps"].as_array().is_some_and(|ss| ss.iter().any(|s| s["result"].is_null() && s["start"].is_string())));
+        // (Only a job that did not pass: a step's result that never comes is judged by its log then. A passed job's
+        // summary does not wait for it.)
+        let results_missing = jobs.iter().any(|j| j["result"].is_string() && !["skipped", "cancelled", "success", "succeeded"].contains(&j["result"].as_str().unwrap_or_default()) && j["steps"].as_array().is_some_and(|ss| ss.iter().any(|s| s["result"].is_null() && s["start"].is_string())));
         // (And for what a machine that keeps Docker's images had from the cache, which it says as its job ends: 10
         // seconds at most.)
         let images_missing = jobs.iter().any(|j| j["result"].is_string() && j["start"]["keeps"] == true && j["start"]["images"].is_null());
         let waited = over_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-        if st["over"] == true && (((logs.iter().any(|l| !l.complete()) || results_missing) && waited <= logs_wait_s()) || (images_missing && waited <= logs_wait_s().min(10))) {
+        let lines_missing = logs.iter().zip(&said_without).any(|(l, without)| !l.complete() && !without);
+        if st["over"] == true && (((lines_missing || results_missing) && waited <= logs_wait_s()) || (images_missing && waited <= logs_wait_s().min(10))) {
             if !told_waiting && over_at.is_some_and(|t| t.elapsed().as_secs() >= 2) { say("The run is over; its summary comes once its runner has sent the steps' logs (a minute at most)."); told_waiting = true }
             continue
         }

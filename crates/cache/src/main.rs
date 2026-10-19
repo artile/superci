@@ -653,7 +653,10 @@ impl State {
         let Some((what, pieces)) = self.downloads.lock().unwrap().get(id).cloned() else { return empty(404) };
         let size: u64 = pieces.iter().map(|(_, s)| s).sum();
         let mut headers = azure_headers();
-        headers.extend([("content-type", "application/octet-stream"), ("accept-ranges", "bytes"), ("x-ms-blob-type", "BlockBlob")].iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        // (An artifact is the zip `upload-artifact` made, said as GitHub's storage says it: `download-artifact` unpacks
+        // only what is said to be a zip, and keeps anything else as the file it is.)
+        let kind = if what.starts_with("artifact ") { "application/zip" } else { "application/octet-stream" };
+        headers.extend([("content-type", kind), ("accept-ranges", "bytes"), ("x-ms-blob-type", "BlockBlob")].iter().map(|(k, v)| (k.to_string(), v.to_string())));
         let (status, first, len) = match req.header("x-ms-range").or(req.header("range")).map(|r| range(r, size)) {
             None => (200, 0, size),
             Some(Some((a, b))) => { headers.push(("content-range".into(), format!("bytes {a}-{b}/{size}"))); (206, a, b - a + 1) }

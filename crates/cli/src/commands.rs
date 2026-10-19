@@ -641,8 +641,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 said.push(r["link"].as_str().unwrap_or_default().to_string());
                 for (j, words) in raw.iter().zip(its.iter_mut()) {
                     said.push(format!("  {}", job_line(words)));
-                    // Its tests, from its whole log: a passed job's too (it may have run fewer than asked, or none).
-                    if args.has("tests") && (failed_job(j) || j["machine_id"].is_string()) {
+                    // Its tests, from its whole log: a passed job's too (it may have run fewer than asked, or none),
+                    // whatever ran it.
+                    if args.has("tests") && (failed_job(j) || j["machine_id"].is_string() || j["conclusion"].is_string()) {
                         let tests = job_tests(&v, &key, j);
                         said.extend(tests_lines(&tests, "    "));
                         words["tests"] = tests;
