@@ -10989,6 +10989,13 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let out = home.join("running.log");
     let (code, said) = cli(&["jobs", "retrieve", &rid.to_string(), &format!("--out={}", out.display())]);
     assert!(code == 0 && said.contains("Its log so far (the job is still running)"), "{code} {said}");
+    // A run whose job still waits for room (no machine, no end): its tests are not looked for.
+    let (wid, q) = served.github.queue("waits for room", "superci", served.now_ms()); served.webhook(q);
+    { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{wid}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
+      j["state"] = "waiting".into(); j["error"] = "waiting: Cloudflare runs 1 at once".into(); for f in ["machine_id", "runner", "runner_id"] { j.as_object_mut().unwrap().remove(f); } m.insert(k, j.to_string()); }
+    let wrun = served.store.under(&format!("job:{wid}"))[0].1["run_id"].to_string();
+    let (code, said) = cli(&["runs", "retrieve", &wrun, "--tests"]);
+    assert!(code == 0 && said.contains("waits for room") && !said.contains("No test results"), "{code} {said}");
     // A line written a moment ago: its log said with how many seconds ago its last line was.
     let now = String::from_utf8(std::process::Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%S.0000000Z"]).output().unwrap().stdout).unwrap().trim().to_string();
     let first = "2026-10-15T10:00:01.0000000Z building\n".len();
