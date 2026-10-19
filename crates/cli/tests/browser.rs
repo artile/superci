@@ -6542,6 +6542,12 @@ mod runs_suite_in_browser {
         for (name, bytes) in [("folders", zip_of(&[("site/", b""), ("site/a.html", b"<p>a</p>")])), ("deflated", with_method(8, &deflated)), ("odd", with_method(99, b"?????")),
             ("damaged", damaged), ("zip64", zip64), ("rooted", zip_of(&[("/etc/x", b"x")])), ("drive", zip_of(&[("c:x", b"x")])), ("tiny", b"PK".to_vec())] { keep(name, &bytes); }
         assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "report" })).0, 409);
+        // Names GitHub would not take for an artifact, and a piece's name too long.
+        for name in ["bad/name".to_string(), "quote\"d".to_string(), String::new(), "n".repeat(257), "line\nbreak".to_string()] {
+            assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": name })).0, 400, "{name:?}");
+        }
+        assert_eq!(cache("begin", serde_json::json!({ "token": token, "key": "pieces-1", "version": version })).1["ok"], true);
+        assert_eq!(cache("sign", serde_json::json!({ "token": token, "key": "pieces-1", "version": version, "names": ["p".repeat(65)] })).0, 400);
         assert_eq!(cache("artifact-begin", serde_json::json!({ "token": token, "name": "a/b:c" })).0, 400);
         assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "none", "names": ["p00000"] })).0, 404);
         assert_eq!(cache("artifact-sign", serde_json::json!({ "token": token, "name": "report", "names": ["p00001"] })).0, 404, "(kept already)");
