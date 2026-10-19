@@ -5573,7 +5573,8 @@ fn jobs_off_the_usual_way_are_noted_failed_at_once_or_taken_back_as_their_events
 /// so. A start out of time after spot failed: the next try says so (and one asked on spot again after AWS took a
 /// machine back stays on spot). On-demand alone at the account's limit, a machine of its own ended a moment ago: it
 /// waits for AWS to stop counting that one (asked on spot again or not). An event for a job whose start is under way
-/// starts nothing more.
+/// starts nothing more. Spot at its limit past the two minutes waited for it: on-demand. A start whose record ended
+/// meanwhile with the very machine given: nothing more to end (another runner on it: that one withdrawn).
 #[test]
 fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_so_and_wait() {
     let served = serve(|c| {
@@ -5581,6 +5582,8 @@ fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_
     });
     served.connect_github();
     served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
     let routing = |order: &str| served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{{"default":null,"rules":[],"order":{order}}}"#));
     let state = |id: u64| served.store.under(&format!("job:{id}")).into_iter().find(|(k, _)| *k == format!("job:{id}")).map(|(_, j)| j).unwrap_or_default();
     let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut j = state(id); f(&mut j); served.store.0.lock().unwrap().insert(format!("job:{id}"), j.to_string()); };
@@ -5634,6 +5637,48 @@ fn aws_starts_that_find_no_image_run_out_of_time_or_meet_the_accounts_limit_say_
     served.store.0.lock().unwrap().insert(format!("job:{again}"), serde_json::json!({ "job_id": again, "run_id": 1, "repo": "acme/app", "state": "launching", "cloud": "", "at_ms": served.now_ms(), "installation_id": 42, "seen_in_progress": false }).to_string());
     assert!(served.webhook(q) < 300);
     assert!(state(again)["state"] == "launching" && state(again)["rev"].is_null(), "{}", state(again));
+
+    // Spot refused for the account's spot limit while a spot machine of its own that just ended still counts, and the
+    // two minutes it waits for that over: on-demand.
+    fresh();
+    routing(r#"[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]"#);
+    served.aws.fail("RunInstances|MarketType", 400, &superci_testkit::ec2_error("MaxSpotInstanceCountExceeded", "Max spot instance count exceeded"), None);
+    served.aws.fail("RunInstances", 200, &started, None);
+    let now = served.now_ms();
+    let (waited, _) = served.github.queue("waited for spot", "superci", now);
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("job:98".into(), serde_json::json!({ "job_id": 98, "run_id": 1, "repo": "acme/app", "state": "done", "cloud": "aws", "machine_id": "i-0spotended", "region": "us-east-1", "at_ms": now - 600_000,
+            "ended_ms": now - 30_000, "installation_id": 42, "seen_in_progress": true, "began": true }).to_string());
+        m.insert(format!("job:{waited}"), serde_json::json!({ "job_id": waited, "run_id": 1, "repo": "acme/app", "state": "waiting", "label": "superci", "cloud": "", "at_ms": now, "installation_id": 42,
+            "seen_in_progress": false, "spot_ending": true, "spot_limit_wait": now - 180_000 }).to_string());
+        for id in [98, waited] { m.insert(format!("live:{id}"), String::new()); }
+    }
+    served.upkeep();
+    assert!(state(waited)["state"] == "launched" && state(waited)["on_demand"] == true && state(waited)["spot_waited_ms"].as_u64().is_some(), "{}", state(waited));
+
+    // Its record ended meanwhile (its job cancelled as its machine was asked for), already saying that very machine:
+    // nothing more to end; and saying another runner too: that one withdrawn.
+    for another_runner in [false, true] {
+        fresh();
+        routing(r#"[{"cloud":"aws-on-demand"},{"cloud":"aws","off":true},{"cloud":"cloudflare","off":true}]"#);
+        served.aws.fail("RunInstances", 200, &started, None);
+        let (id, q) = served.github.queue("ended with its machine", "superci", served.now_ms());
+        let (store, now) = (served.store.0.clone(), served.now_ms());
+        served.aws.during("RunInstances", move || {
+            let mut m = store.lock().unwrap();
+            let k = format!("job:{id}");
+            if let Some(v) = m.get(&k).cloned() {
+                let mut j: serde_json::Value = serde_json::from_str(&v).unwrap();
+                (j["state"], j["ended_ms"], j["machine_id"]) = ("cancelled".into(), now.into(), "i-00000000000000002".into());
+                if another_runner { j["runner"] = "another-runner".into() }
+                j["rev"] = (j["rev"].as_u64().unwrap_or(0) + 1).into();
+                m.insert(k, j.to_string());
+            }
+        });
+        assert!(served.webhook(q) < 300);
+        assert!(state(id)["state"] == "cancelled" && state(id)["machine_id"] == "i-00000000000000002", "{}", state(id));
+    }
 }
 
 /// AWS's networks as the control plane's role may read them: refused to the role, the machine starts in the region's
@@ -5709,6 +5754,50 @@ fn aws_connected_by_the_stacks_report_only_once_its_role_sees_the_image_and_neve
     let (status, said) = report(&served, "connect-token-for-tests-0002");
     assert!(status == 200 && said["connected"] == true, "{status} {said}");
     assert_eq!(report(&served, "connect-token-for-tests-0002").0, 409);
+}
+
+/// The upkeep, for jobs left midway: a start cut off before any machine is placed again; a job that waits with what
+/// an earlier machine left on its record gets a runner of its own name again. Machines left by jobs over are ended
+/// and their runners withdrawn where that can be: a GitLab one whose connection is gone, or that GitLab would not
+/// remove (kept, for the next sweep), a GitHub one of an App not here any more, of an installation GitHub gives no
+/// token for, or with no runner's name kept: each forgotten here all the same.
+#[test]
+fn the_upkeep_places_again_what_was_cut_off_and_forgets_machines_left_whatever_their_runners_say() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let now = served.now_ms();
+    let record = |id: u64, state: &str, provider: &str, gitlab: &str, more: serde_json::Value| {
+        let mut j = serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "provider": provider, "gitlab": gitlab, "label": "superci", "at_ms": now - 180_000, "installation_id": 42, "cloud": "", "seen_in_progress": false });
+        for (k, v) in more.as_object().into_iter().flatten() { j[k] = v.clone() }
+        j.to_string()
+    };
+    let orphan = serde_json::json!({ "cloud": "cloudflare", "machine_id": "m-left", "runner_id": 5 });
+    let with = |extra: serde_json::Value| { let mut o = orphan.clone(); for (k, v) in extra.as_object().into_iter().flatten() { o[k] = v.clone() } o };
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (key, v) in [
+            ("job:88", record(88, "launching", "", "", serde_json::json!({}))),
+            ("job:89", record(89, "waiting", "", "", serde_json::json!({ "machine_id": "m-before", "runner": format!("superci-{PLANE}-89"), "runner_id": 12345 }))),
+            ("job:glggone-1", record(1, "orphan", "gitlab", "ggone", orphan.clone())),
+            ("job:gl3", record(3, "orphan", "gitlab", "", with(serde_json::json!({ "runner_id": 66 })))),
+            ("job:4", record(4, "orphan", "", "", with(serde_json::json!({ "app_id": 9999 })))),
+            ("job:5", record(5, "orphan", "", "", with(serde_json::json!({ "installation_id": 7 })))),
+            ("job:6", record(6, "orphan", "", "", orphan.clone())),
+        ] {
+            m.insert(format!("live:{}", key.trim_start_matches("job:")), String::new());
+            m.insert(key.to_string(), v);
+        }
+        m.insert("glrunner:66".into(), serde_json::json!({ "id": 66, "gitlab": "", "at_ms": now }).to_string());
+    }
+    served.gitlab.fail("DELETE", "/runners/66", 500);
+    served.github.fail("POST", "/app/installations/7/access_tokens", 404, "Not Found");
+    served.upkeep();
+    let job = |key: &str| served.store.under(key).into_iter().find(|(k, _)| k == key).map(|(_, j)| j).unwrap_or_default();
+    assert!(job("job:88")["state"] == "launched" && job("job:88")["retries"] == 1, "{}", job("job:88"));
+    assert!(job("job:89")["state"] == "launched" && job("job:89")["runner_id"] != 12345 && job("job:89")["machine_id"] != "m-before", "{}", job("job:89"));
+    for key in ["job:glggone-1", "job:gl3", "job:4", "job:5", "job:6"] { assert_eq!(job(key)["state"], "swept", "{key}: {}", job(key)) }
+    assert!(!served.store.under("glrunner:66").is_empty(), "GitLab would not remove it: kept");
 }
 
 #[test]

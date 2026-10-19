@@ -2855,9 +2855,8 @@ impl<'a> ControlPlane<'a> {
                 let folder = if spec.os() == "windows" { "_work" } else { "/home/runner/work" };
                 // Registered at GitHub on an earlier try that started no machine (it waited for spot): taken out
                 // first, as GitHub takes a runner's name once ("already exists").
-                if job.machine_id.is_none() && job.runner.as_deref() == Some(name.as_str()) && job.runner_id.is_some() {
-                    if let Some(rid) = job.runner_id { let _ = github::delete_runner(self.http, &app.api(), &token, &owner, &job.repo, rid).await; }
-                    job.runner_id = None;
+                if job.machine_id.is_none() && job.runner.as_deref() == Some(name.as_str()) {
+                    if let Some(rid) = job.runner_id.take() { let _ = github::delete_runner(self.http, &app.api(), &token, &owner, &job.repo, rid).await; }
                 }
                 // (Still taken, by a registration this control plane no longer knows of: a name of its own.)
                 let (jit, runner_id) = match github::jit_config(self.http, &app.api(), &token, &owner, &job.repo, &name, &[&label], folder).await {
