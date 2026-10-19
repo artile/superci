@@ -11026,6 +11026,9 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let _ = std::fs::remove_dir_all(&empty);
     let (code, said) = cli(&["workspaces", "list"]);
     assert!(code <= 3 && said.contains("twin"), "{said}");
+    // Its status, named: which workspace it is said, there being several.
+    let (code, said) = cli(&["status", "--workspace=twin", "--json"]);
+    assert!(code == 0 && said.contains("\"workspace\"") && said.contains("\"workspaces\""), "{code} {said}");
     // Its id changed: to what it is, to one taken, to what is no id, as a dry run, then to a new one and back; one
     // not kept here; the command with nothing to say which.
     for (args, said_part) in [(vec!["workspaces", "update", "twin", "--id=twin"], "has the id twin"), (vec!["workspaces", "update", "twin", "--id=default"], "already"),
