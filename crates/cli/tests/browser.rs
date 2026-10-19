@@ -11029,6 +11029,9 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     // Its status, named: which workspace it is said, there being several.
     let (code, said) = cli(&["status", "--workspace=twin", "--json"]);
     assert!(code == 0 && said.contains("\"workspace\"") && said.contains("\"workspaces\""), "{code} {said}");
+    // Read with a read key alone (as a script reads it): said so.
+    let o = common::command(&home).args(["status"]).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.key).output().unwrap();
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("with a read key"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     // Its id changed: to what it is, to one taken, to what is no id, as a dry run, then to a new one and back; one
     // not kept here; the command with nothing to say which.
     for (args, said_part) in [(vec!["workspaces", "update", "twin", "--id=twin"], "has the id twin"), (vec!["workspaces", "update", "twin", "--id=default"], "already"),
