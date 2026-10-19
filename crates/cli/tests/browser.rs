@@ -2908,11 +2908,21 @@ fn labels_at_each_limit_and_in_each_combination_are_fitted_to_a_provider_or_refu
         let job = served.store.under(&format!("job:{id}"))[0].1.clone();
         assert!(job["state"].is_string(), "{label}: {job}");
     }
+    // With a default machine of its own (arm64, Ubuntu 26.04, eight CPUs, a disk speed): a label that names another
+    // system, a GPU or an architecture does not take the default's along; the rest do.
+    served.aws.put(&format!("/superci/{PLANE}/MACHINE"), r#"{"cpu":8,"arch":"arm64","os":"linux","image":"ubuntu26","disk_mibs":250,"disk_iops":4000,"families":["c8g"],"scratch":"ramdisk","spot":false}"#);
+    for label in ["superci", "superci/os=windows", "superci/gpu=t4", "superci/arch=x64", "superci/os=linux", "superci/cpu=16", "superci/image=ubuntu24/docker-cache=true"] {
+        let (id, q) = served.github.queue(label, label, served.now_ms());
+        assert!(served.webhook(q) < 300, "{label}");
+        assert!(served.store.under(&format!("job:{id}"))[0].1["state"].is_string(), "{label}");
+    }
     served.aws.fail_none();
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=jobs"));
     b.wait(&shows("Recent jobs"));
+    // (Each job's page, which says the machine its label asked for.)
+    seen_in_browser(&served);
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
