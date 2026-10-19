@@ -592,6 +592,29 @@ fn other_cis_found_in_aws_are_listed_once_each_with_whose_jobs_they_run_and_by_i
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// An update uploaded whose control plane still answers with the version before (its cloud switching it over) is
+/// said as restarting, not as one to update again.
+#[test]
+fn an_update_uploaded_while_the_control_plane_still_answers_as_before_is_said_as_restarting() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    // (As one from before reads this computer's key: under its old name.)
+    served.aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &served.key);
+    *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let page = || common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    until("the update offered", || page().contains("Update"));
+    common::post(&link, "/plane/update", &[("plane", PLANE)]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !page().contains("Updated to") { assert!(std::time::Instant::now() < end, "{}", page()); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    // Uploaded, and its cloud still answering with the one before.
+    *served.aws.old_version.lock().unwrap() = Some("0.19.14".into());
+    until("restarting said", || page().contains("Restarting"));
+    assert!(!page().contains("Update to "), "{}", page());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
