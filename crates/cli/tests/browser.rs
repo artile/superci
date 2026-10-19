@@ -412,6 +412,42 @@ fn a_command_reads_the_control_plane_in_use_as_it_stands_with_a_key_alone_two_li
     }
 }
 
+/// A secret's new value, or its removal, that the control plane does not show within half a minute (its cloud took
+/// the change and the control plane goes on with the old one) is said as that, never as done.
+#[test]
+fn a_secret_changed_or_taken_out_that_the_control_plane_does_not_show_is_said_as_not_taken_yet() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let secrets = |args: &[&str]| { let o = common::command(&home).args(args).env("NPM_VALUE", "s3cr3t-value").output().unwrap(); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (ok, said) = secrets(&["secrets", "create", "NPM_TOKEN", "--value-env=NPM_VALUE"]);
+    assert!(ok, "{said}");
+    // AWS takes the new value and keeps the old one (as a parameter written elsewhere would leave it).
+    served.aws.fail("AmazonSSM.PutParameter|SECRET_NPM_TOKEN", 200, r#"{"Tier":"Standard","Version":2}"#, None);
+    let (ok, said) = secrets(&["secrets", "update", "NPM_TOKEN", "--value-env=NPM_VALUE"]);
+    assert!(!ok && said.contains("NPM_TOKEN is written; the control plane has not taken it yet"), "{said}");
+    served.aws.fail_none();
+    // And says it is gone, and keeps it.
+    served.aws.fail("AmazonSSM.DeleteParameter|SECRET_NPM_TOKEN", 200, "{}", None);
+    let (ok, said) = secrets(&["secrets", "delete", "NPM_TOKEN", "--confirm"]);
+    assert!(!ok && said.contains("the control plane still has it") && !said.contains("is taken out:"), "{said}");
+    served.aws.fail_none();
+    let (_, listed) = common::json(&home, &["secrets", "list"]);
+    assert!(listed.to_string().contains("NPM_TOKEN"), "{listed}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A key the control plane does not show within twenty seconds is said as not taken yet (and was never shown).
+#[test]
+fn a_key_the_control_plane_does_not_take_in_time_is_said_as_not_taken_and_not_shown() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.fail("AmazonSSM.PutParameter|READ_KEY_", 200, r#"{"Tier":"Standard","Version":1}"#, None);
+    let o = common::superci(&home, &["keys", "create", "late"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("The control plane has not taken the key yet") && !said.contains("superci_read_"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

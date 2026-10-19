@@ -1529,10 +1529,11 @@ impl Dashboard {
         self.drop_secret(&plane, &setting)?;
         for _ in 0..60 {
             let seen = cloudflare::plane_get(plane.url(), &self.status_key, "/secrets").unwrap_or_default();
-            if !seen["secrets"].as_array().into_iter().flatten().any(|s| s["setting"] == setting.as_str()) { break }
+            if !seen["secrets"].as_array().into_iter().flatten().any(|s| s["setting"] == setting.as_str()) { return Ok(name) }
             std::thread::sleep(Duration::from_millis(500));
         }
-        Ok(name)
+        // (Never said as done while the control plane still gives it to runs.)
+        Err(format!("{name} is taken out of the control plane's cloud; the control plane still has it. Look with `superci secrets list` in a moment."))
     }
 
     /// `superci logout`: what is kept on this machine is removed, after the clouds that can end a sign-in were asked
