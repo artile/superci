@@ -10695,6 +10695,14 @@ fn machines_of_a_control_plane_at_an_address_their_script_cannot_carry_start_wit
         }
     }
     *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    // In the new year (January, then February): a machine asked for and its job told of with those dates.
+    for days in [80, 30] {
+        served.later(days * 86_400_000);
+        let before = scripts().len();
+        let (_, q) = served.github.queue("winter", "superci", served.now_ms());
+        assert!(served.webhook(q) < 300);
+        assert!(scripts().len() > before, "a machine asked for {days} days on");
+    }
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=overview"));
