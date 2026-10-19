@@ -4744,9 +4744,15 @@ mod github_in_browser {
         served.upkeep();
         let asked = served.github.redelivered();
         assert_eq!(asked.len(), failed + 2, "{asked:?} (job {other})");
-        // Listed again: the ones sent again are marked as that.
+        // Listed again: the ones sent again are marked as that. One that came to no answer, whole.
         let o = superci(&home, &["deliveries", "list"]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let (_, listed) = json(&home, &["deliveries", "list"]);
+        let unanswered = listed[0]["deliveries"].as_array().unwrap().iter().find(|d| d["status_code"] == 0).map(|d| d["id"].as_u64().unwrap());
+        if let Some(d) = unanswered {
+            let o = superci(&home, &["deliveries", "retrieve", &d.to_string()]);
+            assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("answer:"), "{}", String::from_utf8_lossy(&o.stdout));
+        }
         super::seen_in_browser(&served);
     }
 
