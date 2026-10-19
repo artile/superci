@@ -10177,6 +10177,8 @@ fn a_modal_control_plane_is_deployed_given_sandboxes_and_deleted_from_the_dashbo
     // Deployed: its images built in the workspace, `modal deploy` run in a sandbox, answering.
     step("02-deploy");
     quiet(&mut b);
+    // (Its id given, as a second try gives it; pressed again while it is set up: the set-up under way, nothing more.)
+    assert!(post(&mut b, "/plane/modal", &[("plane", "mdplane00001")]).0 < 400);
     assert!(post(&mut b, "/plane/modal", &[]).0 < 400);
     until_page(&mut b, "p=planes", "acmeorg--superci-plane-mdplane00001");
     step("03-use");
