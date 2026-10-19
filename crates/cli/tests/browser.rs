@@ -2804,6 +2804,18 @@ fn a_first_control_plane_made_from_the_cli_is_followed_to_its_end_and_shown_on_t
         let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
         assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked"), "{args:?}: {said}");
     }
+    // Again, as Lambda answers otherwise: the new role not usable yet (asked again a moment later), then the
+    // function failing to start.
+    for (part, status, answer, times, expect) in [
+        ("provided.al2023", 400, r#"{"__type":"InvalidParameterValueException","message":"The role defined for the function cannot be assumed by Lambda."}"#, Some(1), ""),
+        ("/configuration", 200, r#"{"State":"Failed","StateReason":"The function's code could not be read.","LastUpdateStatus":"Failed"}"#, None, "failed to start"),
+    ] {
+        account.fail(part, status, answer, times);
+        let o = common::command(&home).args(["planes", "create", "aws", "--region=us-east-1"]).env("SUPERCI_NEW_PLANE_ID", "deployplane1").output().unwrap();
+        account.fail_none();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.code().is_some_and(|c| c <= 3) && !said.contains("panicked") && said.contains(expect), "{part}: {said}");
+    }
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=planes"));
     b.wait("document.querySelector('main') !== null");
