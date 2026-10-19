@@ -10947,3 +10947,42 @@ fn a_passing_runs_tests_are_read_by_runs_retrieve_as_a_failed_ones_are() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Sign-ins another process writes while the dashboard runs (`superci login` in a terminal, a second dashboard):
+/// each page takes them in, and its own next write does not undo them. Modal signed in elsewhere; a second AWS
+/// account added there (the one in use stays in use); AWS's sign-ins said to have ended; Cloudflare's taken out;
+/// Cloudflare's and Modal's said to have ended.
+#[test]
+fn sign_ins_another_process_writes_are_taken_in_by_the_next_page_and_not_undone() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let read = || serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut kept = read();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    let page = |b: &mut Browser, p: &str| { b.goto(&format!("{link}&p={p}")); b.wait("document.querySelector('main') && !document.querySelector('main').innerText.includes('Reading your control plane')"); };
+    page(&mut b, "overview");
+    let aws = kept["aws"].clone();
+    let mut other = aws.clone();
+    other["account_id"] = "222222222222".into();
+    other["who"] = "arn:aws:sts::222222222222:assumed-role/Admin/someone".into();
+    for change in [
+        &(|k: &mut serde_json::Value| k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" })) as &dyn Fn(&mut serde_json::Value),
+        &|k: &mut serde_json::Value| { k["aws"] = other.clone(); k["aws_more"] = serde_json::json!([aws.clone()]); },
+        &|k: &mut serde_json::Value| { k["aws"] = serde_json::Value::Null; k["aws_more"] = serde_json::json!([]); k["aws_ended"] = true.into(); },
+        &|k: &mut serde_json::Value| { k["cloudflare"] = serde_json::Value::Null; },
+        &|k: &mut serde_json::Value| { k["cloudflare_ended"] = true.into(); k["modal"] = serde_json::Value::Null; k["modal_ended"] = true.into(); },
+    ] {
+        let mut k = read();
+        change(&mut k);
+        std::fs::write(&file, k.to_string()).unwrap();
+        for p in ["overview", "planes", "add-runners"] { page(&mut b, p) }
+    }
+    let now = read();
+    assert!(now["modal_ended"] == true && now["cloudflare"].is_null() && now["aws_ended"] == true, "what the other process wrote, kept: {now}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
