@@ -5226,6 +5226,56 @@ mod runs_suite_in_browser {
         super::seen_in_browser(&served);
     }
 
+    /// Lines its runner left out as a step went (empty ones, which it never sends, and others): once the step's log is
+    /// here, only the ones with something in them come late, without the empty lines at either end of each gap.
+    #[test]
+    fn lines_left_out_as_a_step_went_come_late_without_empty_ones_at_their_ends() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).spawn().unwrap();
+        let run = run_of(&served);
+        let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let a = "cccccccc-0000-0000-0000-000000000003";
+        let whole = ["one", "two", "", "four", "", "six", "seven", "", "", "ten"];
+        runner.take();
+        runner.steps(&[(a, "Run make test", 1, "inProgress", None, None)]);
+        runner.lines(a, 1, &["one".into(), "two".into()]);
+        runner.lines(a, 7, &["seven".into()]);
+        runner.lines(a, 10, &["ten".into()]);
+        runner.log(1, &whole.iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n"));
+        runner.steps(&[(a, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+        runner.finish("succeeded");
+        let out = cli.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(said.contains("lines 4–6 of this step, which came late:") && said.contains("four") && said.contains("six"), "{said}");
+        assert_eq!(said.matches("came late").count(), 1, "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run whose steps were skipped, cancelled, and one passed whose own log never came: each said with its mark, the
+    /// tests counted from the lines that came, and that said.
+    #[test]
+    fn a_runs_skipped_and_cancelled_steps_are_marked_and_tests_of_a_step_whose_log_never_came_are_counted_from_its_lines() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let cli = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"]).spawn().unwrap();
+        let run = run_of(&served);
+        let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let (a, b, c) = ("cccccccc-0000-0000-0000-000000000003", "cccccccc-0000-0000-0000-000000000004", "cccccccc-0000-0000-0000-000000000005");
+        runner.take();
+        runner.steps(&[(a, "Run cargo test", 1, "inProgress", None, None)]);
+        runner.lines(a, 1, &["test api::adds ... ok".into(), "test api::subtracts ... ok".into(), "test result: ok. 2 passed; 0 failed; 0 ignored".into()]);
+        runner.steps(&[(a, "Run cargo test", 1, "completed", Some("succeeded"), None), (b, "Deploy", 2, "completed", Some("skipped"), None), (c, "Notify", 3, "completed", Some("cancelled"), None)]);
+        runner.finish("succeeded");
+        let out = cli.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "{said}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(said.contains("– Deploy") && said.contains("– Notify") && said.contains("✓ Run cargo test"), "{said}");
+        assert!(said.contains("2 passed") && said.contains("Counted from what came: 1 step's log had not come"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn play(served: &superci_testkit::Served, run: &str, lines: &[String], result: &str) {
         let runner = loop { if let Some(r) = Runner::of_run(served, run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
         let a = "cccccccc-0000-0000-0000-000000000003";
