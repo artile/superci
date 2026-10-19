@@ -3858,6 +3858,40 @@ fn a_manifest_code_github_refuses_is_said_and_one_with_underscores_and_dashes_is
 }
 
 #[test]
+fn aws_runners_come_along_to_another_control_plane_in_their_own_account_which_starts_them_itself() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    // The one in use with AWS's runners in its own account; another there, AWS's runners its own too.
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let connected = |plane: &str| serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": format!("arn:aws:iam::111111111111:role/superci-plane-{plane}"), "connected": true, "error": null }).to_string();
+    served.store.0.lock().unwrap().insert("aws".into(), connected(PLANE));
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    new.store.0.lock().unwrap().insert("aws".into(), connected("testplane0002"));
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&shows(&new.url));
+    b.click("main button", "Move here");
+    b.wait("document.querySelector('dialog[open]') !== null && !document.querySelector('dialog[open] button.primary').disabled");
+    let dialog = b.eval("document.querySelector('dialog[open]').innerText").as_str().unwrap_or_default().replace('\n', " ");
+    assert!(dialog.contains("AWS runners") && !dialog.contains("Stays behind") && !dialog.to_lowercase().contains("stays behind"), "{dialog}");
+    b.click("dialog[open] button.primary", "");
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while served.store.under("moved_to").is_empty() { assert!(std::time::Instant::now() < end, "moved: {}", b.eval("document.querySelector('main').innerText.slice(0, 600)")); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    // Nothing said to have stayed, nor asked of AWS for it (it starts its machines with its own role).
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&reads("Moved to AWS"));
+    assert!(!b.text("main").contains("stayed behind") && !b.text("main").contains("had not started with every runner provider"), "{}", b.text("main"));
+    assert!(!served.aws.settings("testplane0002").iter().any(|(k, _)| k == "AWS_CONNECT"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
