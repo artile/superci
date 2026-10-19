@@ -5327,11 +5327,12 @@ mod runs_suite_in_browser {
     }
 
     /// A run from a computer on an AWS machine: its machine reaches the cache with its own link, as the run's token
-    /// would (its own scope to write), and keeps a tool's artifact there.
+    /// would (its own scope to write), and keeps a tool's artifact there. (The control plane's AWS access is a plain
+    /// access key here, with no session token.)
     #[test]
     fn a_run_from_a_computer_on_aws_keeps_a_tools_artifact_in_the_cache_by_its_machines_link() {
         let served = serve(|c| {
-            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: None, expires_at_ms: u64::MAX }));
         });
         *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
         served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
