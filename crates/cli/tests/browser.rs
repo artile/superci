@@ -4579,18 +4579,22 @@ mod github_in_browser {
             let step = "aaaaaaaa-0000-0000-0000-000000000001";
             let first = "2026-10-15T10:00:01.0000000Z ##[group]Run make test\n2026-10-15T10:00:02.0000000Z test 1 passed\n";
             let second = "2026-10-15T10:00:03.0000000Z test 2 passed\n";
+            // (Then a message of several lines, its time on its first only, among them lines that only look timed; and
+            // a last line still being written, left until it is whole.)
+            let third = "2026-10-15T10:00:04.0000000Z a message of lines\nshort\n2026_10-15T10:00:05.0000000Z one\n2026-10-15 10:00:05.0000000Z two\n20x6-10-15T10:00:05.0000000Z three\n2026-10-15T10:00:06.0000000Z half wri";
             let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
-            for (at, page) in [(0, first), (first.len(), second)] {
+            for (at, page) in [(0, first), (first.len(), second), (first.len() + second.len(), third)] {
                 let r = agent.post(&format!("{}/hello?runner={runner}&t={hello}&live=timeline_{step}_1.log&at={at}", served.url)).send(page).unwrap();
                 assert_eq!(r.status().as_u16(), 200);
             }
             // An empty page is nothing to keep; a link not its own is not taken.
             assert_eq!(agent.post(&format!("{}/hello?runner={runner}&t={hello}&live=timeline_{step}_2.log&at=0", served.url)).send("").unwrap().status().as_u16(), 200);
             assert_eq!(agent.post(&format!("{}/hello?runner={runner}&t=not-its-link-at-all&live=x_1.log", served.url)).send("x").unwrap().status().as_u16(), 404);
-            assert_eq!(served.github.objects().iter().filter(|(k, _)| k.contains("/live/")).count(), if bucket { 2 } else { 0 }, "{:?}", served.github.objects());
+            assert_eq!(served.github.objects().iter().filter(|(k, _)| k.contains("/live/")).count(), if bucket { 3 } else { 0 }, "{:?}", served.github.objects());
             let o = superci(&home, &["jobs", "retrieve", &id.to_string()]);
             let said = String::from_utf8_lossy(&o.stdout);
             assert!(o.status.success() && said.contains("test 1 passed") && said.contains("test 2 passed"), "bucket {bucket}: {said}{}", String::from_utf8_lossy(&o.stderr));
+            assert!(said.contains("short") && said.contains("20x6-10-15T10:00:05.0000000Z three") && !said.contains("half wri"), "bucket {bucket}: {said}");
             let _ = std::fs::remove_dir_all(&home);
             super::seen_in_browser(&served);
         }
@@ -5176,6 +5180,11 @@ mod runs_suite_in_browser {
         runner.take();
         runner.steps(&[(a, "Run make test", 1, "inProgress", None, None)]);
         for (k, chunk) in lines.chunks(100).enumerate() { runner.lines(a, k as u64 * 100 + 1, chunk); }
+        // A step still going, asked for its pages: none sent by its machine, so its lines as they came (when asked
+        // for); a step that is no step's id, nothing.
+        let step_log = |q: &str| { let mut r = ureq::get(&format!("{}/runs/{run}/log?job=0&{q}", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().call().unwrap(); (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()) };
+        assert!(step_log(&format!("step={a}&lines=1")).1.contains("line 0001"));
+        for q in [format!("step={a}"), "step=".into(), "step=not-a-step!".into(), "step=zz".into()] { assert_eq!(step_log(&q).0, 404, "{q}") }
         runner.log(1, &lines.iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n"));
         runner.steps(&[(a, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
         runner.finish("succeeded");
