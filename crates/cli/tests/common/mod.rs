@@ -171,3 +171,14 @@ pub fn get(link: &str, path: &str) -> (u16, String, String) {
     let to = r.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     (r.status().as_u16(), to, r.body_mut().read_to_string().unwrap_or_default())
 }
+
+/// A workspace signed in to an AWS account with no control plane yet (the account's AWS: `account`).
+pub fn aws_only(account: &superci_testkit::Aws) -> std::path::PathBuf {
+    let home = temp("aws-only");
+    let ws = home.join("workspaces/default");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("sign-ins.json"), serde_json::json!({ "aws": { "region": "us-east-1", "account_id": "111111111111", "who": "arn:aws:sts::111111111111:assumed-role/Admin/someone",
+        "creds": { "access_key_id": "ASIAEXAMPLE", "secret_access_key": "example", "session_token": "example", "expires_at_ms": 4102444800000u64 }, "refresh_token": "", "dpop": { "private_b64": "", "kid": "" } } }).to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    home
+}
