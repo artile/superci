@@ -331,8 +331,9 @@ impl ControlPlane<'_> {
     pub(crate) async fn layers_propose(&self, machine: &cache::Machine, link: &str, creds: &aws::Credentials, body: &[u8], now: u64) -> Result<Response> {
         let proposed: Vec<Proposed> = serde_json::from_slice::<Value>(body).ok().and_then(|b| serde_json::from_value(b["layers"].clone()).ok()).unwrap_or_default();
         let (ns, granted) = self.layer_reader(machine).await?;
-        // (Only a control plane on AWS has a converter: elsewhere the store keeps what it has, and takes nothing new.)
-        let converts = self.config.aws_own.is_some() && self.config.aws_own_creds.is_some();
+        // (Only a control plane on AWS has a converter: elsewhere the store keeps what it has, and takes nothing new.
+        // On AWS, its credentials are there: `creds` are those.)
+        let converts = self.config.aws_own.is_some();
         let proposed: Vec<Proposed> = proposed.into_iter().filter(|p| is_digest(&p.digest)).take(PROPOSED_MOST).collect();
         let keys: Vec<String> = proposed.iter().map(|p| layer_key(&machine.region, &p.digest)).collect();
         let records = self.store.get_many(&keys).await?;

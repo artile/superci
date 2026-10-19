@@ -3009,6 +3009,813 @@ fn every_provider_s_runners_on_an_aws_control_plane_and_then_a_move_to_cloudflar
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// An AWS control plane with a machine of a job whose images are kept (`docker-cache=true`), as AWS answered Test:
+/// the served control plane, the machine's own link, and the job's number. (`own`: in that AWS account; else outside
+/// it, its AWS runners connected by a role.)
+fn layers_machine(own: bool) -> (superci_testkit::Served, String, u64) {
+    let served = serve(move |c| if own {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    if !own { served.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": format!("arn:aws:iam::111111111111:role/superci-plane-{PLANE}"), "connected": true, "error": null }).to_string()); }
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances", 200, &started, None);
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::layers_key("x86_64")), b"program");
+    let label = "superci/image=ubuntu26/docker-cache=true";
+    let (id, q) = served.github.queue(label, label, served.now_ms());
+    assert!(served.webhook(q) < 300);
+    served.aws.fail_none();
+    let asked = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()).expect("a machine asked for");
+    let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+    use base64::Engine;
+    let script = String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(data).unwrap()).to_string();
+    let link = script.split("plane.acme.test/cache/").nth(1).unwrap().split(|c: char| c == '\'' || c == '"' || c == '/' || c.is_whitespace()).next().unwrap().to_string();
+    (served, link, id)
+}
+
+/// The layer store as its index and links show it to a machine, with layers of each kind in its records: one public,
+/// one made too long ago, one neither public nor this repository's, two of its own (one too large to fetch ahead, one
+/// used long ago); what is asked of it by names no digest has; what a job said it had, as the job ended and after.
+#[test]
+fn a_machines_layer_index_and_links_show_only_current_layers_its_repository_may_read_and_note_their_use() {
+    let (served, link, id) = layers_machine(true);
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let call = |what: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body.to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    let ns = format!("gh{}", job["repo_id"].as_u64().expect("its repository's id"));
+    let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    let now = served.now_ms();
+    let day = 86_400_000u64;
+    // (public, made, used, its EROFS file's size, its digest said)
+    let layers = [('1', true, now, now - 2 * day, 100, true), ('2', true, now - 31 * day, now, 100, true), ('3', false, now, now, 100, true), ('4', false, now, now, 20u64 << 30, false), ('5', false, now, now - 2 * day, 100, true)];
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (c, public, made, used, size, said) in layers {
+            let hex = c.to_string().repeat(64);
+            let mut erofs = serde_json::json!({ "key": format!("layers/{hex}.erofs"), "size": size });
+            if said { erofs["digest"] = format!("sha256:{hex}").into() }
+            let mut l = serde_json::json!({ "size": 100, "diff_id": "", "erofs": erofs, "blob": { "key": format!("layers/{hex}.blob"), "size": 100 }, "made": made, "used": used });
+            if public { l["public"] = serde_json::json!({ "registry": "docker.io", "repository": "library/node", "checked": now }) }
+            m.insert(format!("layer:us-east-1:{}", digest(c)), l.to_string());
+        }
+        for c in ['4', '5'] { m.insert(format!("lgrant:{ns}:{}", digest(c)), now.to_string()); }
+    }
+    // What the job said it had, after it ended: the layers it used (the large one among them), enough for its next
+    // machine to have the store; then, said as another job of it ended, nothing more of it kept.
+    let (status, _) = call("layers-kept", serde_json::json!({ "pulled": 3, "pulled_bytes": 300u64 << 20, "served_digests": [digest('5')], "used": [digest('4'), digest('1')] }));
+    assert_eq!(status, 200);
+    let kept = served.store.under(&format!("job:{id}"))[0].1["images"].clone();
+    assert_eq!(kept["pulled_bytes"], 300u64 << 20, "{kept}");
+    assert!(served.store.under("limg:").iter().any(|(k, _)| k.ends_with(":repo")), "the repository's word kept for its next machines");
+    assert_eq!(call("layers-kept", serde_json::json!({ "keeping": true, "pulled": 9 })).0, 200);
+    assert_eq!(served.store.under(&format!("job:{id}"))[0].1["images"]["pulled"], 3, "what was kept said already: not said again");
+    // (Used again: noted.)
+    assert!(served.store.under(&format!("layer:us-east-1:{}", digest('5')))[0].1["used"].as_u64().unwrap() >= now);
+    // Its index: the public one and its repository's own, the one used fetched ahead and the large one not.
+    let index: serde_json::Value = agent.get(&format!("{}/cache/{link}/layers.json", served.url)).call().unwrap().body_mut().read_json().unwrap();
+    let shown: Vec<&String> = index["layers"].as_object().unwrap().keys().collect();
+    assert_eq!(shown, [&digest('1'), &digest('4'), &digest('5')], "{index}");
+    assert!(index["layers"][digest('1')]["ahead"] == true && index["layers"][digest('4')]["ahead"] == false && index["layers"][digest('5')]["ahead"] == false, "{index}");
+    assert!(index["layers"][digest('4')]["erofs"]["digest"].is_null() && index["layers"][digest('1')]["erofs"]["digest"] == digest('1'));
+    // Links to each, and to names no layer has: the same ones; the use of one used long ago noted.
+    let mut asked: Vec<String> = ['1', '2', '3', '4', '5'].map(digest).to_vec();
+    asked.extend([format!("sha512:{}", "a".repeat(64)), format!("sha256:{}", "g".repeat(64))]);
+    let (status, links) = call("layers-links", serde_json::json!({ "digests": asked }));
+    let linked: Vec<&String> = links["layers"].as_object().unwrap().keys().collect();
+    assert!(status == 200 && linked == [&digest('1'), &digest('4'), &digest('5')], "{links}");
+    assert!(served.store.under(&format!("layer:us-east-1:{}", digest('1')))[0].1["used"].as_u64().unwrap() >= now, "its use noted");
+    // A job whose repository is not known: nothing fetched ahead for it, and what it says is on its record only.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&m[&format!("job:{id}")]).unwrap();
+        j["repo"] = "".into();
+        m.insert(format!("job:{id}"), j.to_string());
+    }
+    let index: serde_json::Value = agent.get(&format!("{}/cache/{link}/layers.json", served.url)).call().unwrap().body_mut().read_json().unwrap();
+    assert!(index["layers"].as_object().unwrap().values().all(|l| l["ahead"] == false), "{index}");
+    let before = served.store.under("limg:").len();
+    assert_eq!(call("layers-kept", serde_json::json!({ "pulled": 1, "pulled_bytes": 1 })).0, 200);
+    assert_eq!(served.store.under("limg:").len(), before);
+    assert_eq!(served.store.under(&format!("job:{id}"))[0].1["images"]["pulled"], 1);
+}
+
+/// Layers a machine proposes, each answered by what the store has of it and what its registry says (a repository
+/// named as none is, a registry that gives the blob at once or by a redirect); uploads said done for a layer the
+/// store has or has on its way (granted), another machine's or region's upload (none); the converter refusing calls
+/// (queued, and the queue stopped there), then busy with a region's most at once (queued again), then saying it made
+/// layers without their files (not kept); the store's hourly upkeep taking out what is too old, past the region's
+/// room or not a layer, and asking again of a public layer whose name is no digest. A job whose branch is not known
+/// may propose nothing.
+#[test]
+fn layers_proposed_after_a_job_are_kept_queued_or_refused_as_the_store_registries_and_converter_answer() {
+    let (served, link, id) = layers_machine(true);
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let call = |what: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body.to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    let now = served.now_ms();
+    let day = 86_400_000u64;
+    let layer = |hex: &str, made: u64, size: u64, public: Option<u64>| {
+        let mut l = serde_json::json!({ "size": size, "diff_id": "", "erofs": { "key": format!("layers/{hex}.erofs"), "size": 1 }, "blob": { "key": format!("layers/{hex}.blob"), "size": size }, "made": made, "used": made });
+        if let Some(checked) = public { l["public"] = serde_json::json!({ "registry": "docker.io", "repository": "library/node", "checked": checked }) }
+        l.to_string()
+    };
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert(format!("layer:us-east-1:{}", digest('1')), layer(&"1".repeat(64), now, 100, Some(now)));
+        m.insert(format!("layer:us-east-1:{}", digest('3')), layer(&"3".repeat(64), now, 100, None));
+        // For the upkeep: one made too long ago, one past the region's room, one that is no layer, one public a week
+        // ago under a name that is no digest.
+        m.insert(format!("layer:us-east-1:{}", digest('d')), layer(&"d".repeat(64), now - 31 * day, 100, None));
+        m.insert(format!("layer:us-east-1:{}", digest('e')), layer(&"e".repeat(64), now, 300u64 << 30, None));
+        m.insert(format!("layer:us-east-1:{}", digest('f')), "not a layer".into());
+        m.insert(format!("layer:us-east-1:sha256:{}", "z".repeat(64)), layer(&"z".repeat(64), now, 100, Some(now - 8 * day)));
+    }
+    served.github.answer_with("GET", &format!("/blobs/{}", digest('8')), 200, &[], "");
+    served.github.answer_with("GET", &format!("/blobs/{}", digest('9')), 307, &[("location", "https://cdn.example/blob")], "");
+    let source = |registry: &str, repository: &str| serde_json::json!([{ "registry": registry, "repository": repository }]);
+    let (status, said) = call("layers-propose", serde_json::json!({ "layers": [
+        { "digest": digest('1'), "size": 100 }, { "digest": digest('3'), "size": 100 },
+        { "digest": digest('6'), "size": 500, "sources": source("ghcr.io", "") }, { "digest": digest('7'), "size": 500, "sources": source("ghcr.io", &"a".repeat(256)) },
+        { "digest": digest('8'), "size": 500, "sources": source("ghcr.io", "acme/app2") }, { "digest": digest('9'), "size": 500, "sources": source("quay.io", "acme/tool") },
+        { "digest": digest('b'), "size": 500 }, { "digest": digest('5'), "size": 500, "sources": source(&format!("{}.gcr.io", "a".repeat(100)), "acme/x") }] }));
+    assert_eq!(status, 200, "{said}");
+    let answer = |c: char| said["layers"][digest(c)].clone();
+    assert_eq!(answer('1')["do"], "have", "public, and in the store: {said}");
+    for c in ['3', '5', '6', '7', '8', '9', 'b'] { assert_eq!(answer(c)["do"], "upload", "{c}: {said}") }
+    served.github.fail_none();
+    let upload = |c: char, size: usize| {
+        let a = answer(c);
+        served.github.put_at(a["url"].as_str().unwrap(), &vec![0u8; size], &[("x-amz-checksum-sha256", a["headers"]["x-amz-checksum-sha256"].as_str().unwrap())]);
+        call("layers-uploaded", serde_json::json!({ "id": a["id"] }))
+    };
+    // A layer the store has, and one waiting for the converter: this repository granted them, nothing converted.
+    served.store.0.lock().unwrap().insert(format!("lwant:us-east-1:{}", digest('b')), serde_json::json!({ "at": now, "size": 500, "source": { "key": "x" }, "public": null }).to_string());
+    for (c, size) in [('3', 100), ('b', 500)] { assert_eq!(upload(c, size), (200, serde_json::json!({ "do": "granted" })), "{c}") }
+    // Uploads given to a machine of another region or repository: not this machine's.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (up, region, ns) in [("another-region-00001", "eu-west-1", "gh1"), ("another-repository-1", "us-east-1", "gh999999")] {
+            m.insert(format!("lup:{up}"), serde_json::json!({ "region": region, "digest": digest('6'), "size": 500, "ns": ns, "key": "layers/staging/x" }).to_string());
+        }
+    }
+    for up in ["another-region-00001", "another-repository-1"] { assert_eq!(call("layers-uploaded", serde_json::json!({ "id": up })).0, 404, "{up}") }
+    // The converter refusing to be called: each upload queued; at the sweep, the first still refused and the queue
+    // left there; the upkeep's hour taking out what goes, and asking again of the public one with a bad name.
+    served.aws.fail("invocations", 500, &superci_testkit::json_error("ServiceException", "Lambda was unable to run it"), None);
+    for (c, size) in [('6', 500), ('7', 500), ('8', 500), ('9', 500)] { assert_eq!(upload(c, size).1["do"], "converting", "{c}") }
+    assert_eq!(served.store.under("lwant:").len(), 5, "queued: {:?}", served.store.under("lwant:"));
+    served.upkeep();
+    assert_eq!(served.store.under("lwant:").len(), 5, "still queued");
+    assert!(served.store.under("layers-convert-error").first().is_some_and(|(_, e)| e.to_string().contains("Lambda was unable to run it")));
+    let kept: Vec<String> = served.store.under("layer:").into_iter().map(|(k, _)| k).collect();
+    for gone in [digest('d'), digest('e')] { assert!(!kept.iter().any(|k| k.ends_with(&gone)), "{gone} taken out: {kept:?}") }
+    assert!(kept.iter().any(|k| k.ends_with(&digest('f'))), "what is no layer is left as it is: {kept:?}");
+    assert!(served.store.under(&format!("layer:us-east-1:sha256:{}", "z".repeat(64)))[0].1["public"].is_null(), "no longer taken as public");
+    // The converter called again, with the region's most at once under way: the queue waits, and an upload is queued.
+    served.aws.fail_none();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for i in 0..superci_core::layers::AT_ONCE { m.insert(format!("lconv:us-east-1:sha256:{i:064x}"), serde_json::json!({ "at": now, "size": 1 }).to_string()); }
+    }
+    served.later(60_000);
+    served.upkeep();
+    assert_eq!((served.store.under("lwant:").len(), served.store.under("lconv:").len()), (5, superci_core::layers::AT_ONCE), "none heard of, none given up yet");
+    let (status, said) = call("layers-propose", serde_json::json!({ "layers": [{ "digest": digest('c'), "size": 500 }] }));
+    assert_eq!(status, 200);
+    let a = said["layers"][digest('c')].clone();
+    served.github.put_at(a["url"].as_str().unwrap(), &[0u8; 500], &[("x-amz-checksum-sha256", a["headers"]["x-amz-checksum-sha256"].as_str().unwrap())]);
+    assert_eq!(call("layers-uploaded", serde_json::json!({ "id": a["id"] })).1["do"], "converting");
+    assert!(served.store.under(&format!("lwant:us-east-1:{}", digest('c'))).len() == 1, "queued for room");
+    // What the converter said of two: their digest, without the EROFS file or the blob. Read, and not kept.
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    for (i, erofs, blob) in [(0u64, "", "layers/b.blob"), (1, "layers/e.erofs", "")] {
+        let d = format!("sha256:{i:064x}");
+        served.github.put_object(&format!("{bucket}/layers/done/{i:064x}.json"), serde_json::json!({ "digest": d, "erofs": { "key": erofs, "size": 1 }, "blob": { "key": blob, "size": 1 } }).to_string().as_bytes());
+    }
+    served.later(60_000);
+    served.upkeep();
+    // (Heard of, and two of the queue converted in the room they left.)
+    assert!(served.store.under(&format!("lconv:us-east-1:sha256:{:064x}", 0)).is_empty() && served.store.under(&format!("lconv:us-east-1:sha256:{:064x}", 1)).is_empty(), "two heard of");
+    assert_eq!(served.store.under("lwant:").len(), 4, "two of the queue converted");
+    assert!(served.store.under(&format!("layer:us-east-1:sha256:{:064x}", 0)).is_empty() && served.store.under(&format!("layer:us-east-1:sha256:{:064x}", 1)).is_empty());
+    // A job whose branch GitHub did not say, or said as no ref SuperCI keeps: no repository to keep its layers for.
+    // Its default branch not said, or not one SuperCI keeps: its own branch's all the same.
+    for (branch, default, takes) in [("", "main", false), ("a:b", "main", false), ("x/", "main", false), ("fix", "", true), ("fix", "a:b", true)] {
+        {
+            let mut m = served.store.0.lock().unwrap();
+            let mut j: serde_json::Value = serde_json::from_str(&m[&format!("job:{id}")]).unwrap();
+            (j["branch"], j["default_branch"]) = (branch.into(), default.into());
+            m.insert(format!("job:{id}"), j.to_string());
+        }
+        let (_, said) = call("layers-propose", serde_json::json!({ "layers": [{ "digest": digest('a'), "size": 500 }] }));
+        assert_eq!(said["layers"][digest('a')]["do"], if takes { "upload" } else { "no" }, "{branch:?} {default:?}: {said}");
+    }
+    // A control plane outside AWS (its AWS runners by a role) has no converter: it takes no layer.
+    let (served, link, _) = layers_machine(false);
+    let mut r = agent.post(&format!("{}/cache/{link}/layers-propose", served.url)).send(serde_json::json!({ "layers": [{ "digest": digest('a'), "size": 500 }] }).to_string()).unwrap();
+    let said: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+    assert_eq!(said["layers"][digest('a')]["do"], "no", "{said}");
+}
+
+/// GitHub's jobs in the cache over a month: a token that may only write, one whose scope is longer than SuperCI keeps;
+/// an entry being saved is no hit; one saved a month ago is none either, may be saved anew, and goes at the upkeep
+/// though used lately, as does one past the repository's size; one begun and not finished stays meanwhile. Pieces
+/// named as none is; a scope's entries taken out with the command, what is no entry with them.
+#[test]
+fn github_jobs_cache_entries_are_found_saved_again_and_taken_out_by_age_size_and_scope_over_a_month() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    let link = "machine-cache-link-000000000009";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner" }).to_string());
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let post = |what: &str, body: serde_json::Value| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body.to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    let exp = 4_102_444_800u64;
+    let token = |ac: serde_json::Value| superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "197814629", "ac": ac.to_string(), "exp": exp }));
+    let main = token(serde_json::json!([{ "Scope": "refs/heads/main", "Permission": 3 }]));
+    let version = "c".repeat(64);
+    let save = |t: &str, key: &str, pieces: serde_json::Value| -> (u16, serde_json::Value) {
+        assert_eq!(post("begin", serde_json::json!({ "token": t, "key": key, "version": version })).1["ok"], true, "{key}");
+        post("finish", serde_json::json!({ "token": t, "key": key, "version": version, "pieces": pieces }))
+    };
+    let found = |key: &str| post("lookup", serde_json::json!({ "token": main, "key": key, "restore_keys": ["deps-"], "version": version })).1;
+    // One whose scope is longer than SuperCI keeps a scope's name: refused.
+    let long = token(serde_json::json!([{ "Scope": format!("refs/heads/{}", "a".repeat(520)), "Permission": 3 }]));
+    assert_eq!(post("lookup", serde_json::json!({ "token": long, "key": "deps-x", "version": version })).1["why"], "a cache scope with characters SuperCI does not keep");
+    // Pieces with no name: not finished.
+    assert!(save(&main, "deps-nameless", serde_json::json!([["", 1]])).0 >= 400);
+    // Being saved: no hit of its own (the entry of main found by its restore key instead, once there is one).
+    assert_eq!(found("deps-nameless")["hit"], false);
+    for key in ["deps-aged", "deps-again"] { assert_eq!(save(&main, key, serde_json::json!([["p-1", 10]])).1["ok"], true, "{key}") }
+    // Used a few weeks on (not too old yet): noted.
+    served.later(29 * 86_400_000 + 43_200_000);
+    assert_eq!(found("deps-aged")["key"], "deps-aged");
+    // A day later, a month after they were saved: neither found, by its key or as a restore key; one saved anew (and
+    // left unfinished); one too large for the repository's room.
+    served.later(86_400_000);
+    assert_eq!(found("deps-aged")["hit"], false, "too old");
+    assert_eq!(post("begin", serde_json::json!({ "token": main, "key": "deps-again", "version": version })).1["ok"], true, "saved anew");
+    assert_eq!(save(&main, "deps-big", serde_json::json!([["p-1", 2u64 << 30]])).1["ok"], true);
+    // A token that may write its branch's and not read it: saves there.
+    let writes = token(serde_json::json!([{ "Scope": "refs/heads/w", "Permission": 2 }]));
+    assert_eq!(save(&writes, "deps-w", serde_json::json!([["p-1", 10]])).1["ok"], true);
+    let home = signed_in(&served);
+    let o = common::superci(&home, &["caches", "update", "--size-gb=1"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    served.upkeep();
+    let entries: Vec<String> = served.store.under("cache:").into_iter().map(|(k, _)| k).collect();
+    let has = |key: &str| entries.iter().any(|k| k.ends_with(&format!(":{key}")));
+    assert!(!has("deps-aged") && !has("deps-big") && has("deps-again") && has("deps-w"), "{entries:?}");
+    // Main's entries taken out by its scope, what is no entry among them; the other scope's kept.
+    served.store.0.lock().unwrap().insert(format!("cache:gh197814629:refs/heads/main:{version}:junk"), "not an entry".into());
+    let o = common::superci(&home, &["caches", "delete", "--repo=acme/app", "--scope=refs/heads/main", "--confirm"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let entries: Vec<String> = served.store.under("cache:").into_iter().map(|(k, _)| k).collect();
+    assert!(entries.iter().all(|k| k.contains(":refs/heads/w:")), "{entries:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An AWS account refused a region by its organization's policy in other words than AWS's usual ones, the policy's
+/// account named as no account is: the policy said, no management account. A region with no quota of its own set:
+/// AWS's default asked for.
+#[test]
+fn an_accounts_look_says_its_organizations_policy_without_a_management_account_aws_did_not_write_as_one() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    for account in ["12345", "22222222222x"] {
+        served.aws.replaying(include_str!("../fixtures/aws/classic/look.jsonl"), &[]);
+        served.aws.fail_none();
+        served.aws.fail("DescribeVpcs|ec2.eu-west-1", 403, &superci_testkit::ec2_error("Client.Restricted", &format!("Not here, with an explicit deny in a service control policy: arn:aws:organizations::{account}:policy/o-example001/service_control_policy/p-example9")), None);
+        served.aws.fail("ServiceQuotasV20190624.GetServiceQuota", 400, &superci_testkit::json_error("NoSuchResourceException", "The request failed because the specified service quota does not exist."), None);
+        served.aws.fail("ServiceQuotasV20190624.GetAWSDefaultServiceQuota", 200, r#"{"Quota":{"QuotaCode":"L-1216C47A","Value":640.0}}"#, None);
+        let (_, said) = common::json(&home, &["accounts", "retrieve", "aws"]);
+        assert!(said["organization"]["policy"] == "p-example9" && said["organization"]["management_account"].is_null(), "{account}: {said}");
+        assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["target"] == "ServiceQuotasV20190624.GetAWSDefaultServiceQuota"), "AWS's default asked for");
+    }
+    served.aws.fail_none();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A copy of the runner image, with its source from the maker's list: rows of regions not written as AWS writes them
+/// left out; from the same continent's other region, never from the region itself.
+#[test]
+fn an_image_copy_comes_from_another_region_of_the_same_continent_of_those_the_makers_list_writes_as_aws_does() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let body = "### `ubuntu24-full-x64`\n\n| Region | AMI ID |\n| --- | --- |\n| US-EAST-1 | `ami-0123456789abcdef0` |\n| us_east_2 | `ami-0123456789abcdef1` |\n| ca-central-1 | `ami-0123456789abcdef2` |\n| ca-west-1 | `ami-0123456789abcdef3` |\n| us-east-1 | `ami-0123456789abcdef4` |\n";
+    let releases = serde_json::json!([{ "tag_name": "linux-20261006080844", "body": body }]).to_string();
+    served.github.answer_with("GET", "runner-images-for-aws/releases", 200, &[("content-type", "application/json")], &releases);
+    let o = common::superci(&home, &["images", "create", "ca-central-1", "--dry-run"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("ca-west-1") && said.contains("ami-0123456789abcdef3"), "{said}");
+    let o = common::superci(&home, &["images", "create", "eu-west-1", "--dry-run"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("ca-central-1") && said.contains("ami-0123456789abcdef2"), "the first listed: {said}");
+    served.github.fail_none();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// One machine started from this computer (`superci debug launch`: no clock, no waiting), as AWS answers each step:
+/// with no network of the control plane's (its zones from the spot prices, or none), the best pool full, the others
+/// asked at once (refused for the rate of requests, refused outright, none with room, one machine given with no zone
+/// said), each pool alone after (refused for the rate too); few pools, asked one by one; no type at all.
+#[test]
+fn a_machine_started_from_this_computer_is_asked_of_aws_pool_by_pool_or_all_at_once_as_aws_answers() {
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let home = signed_in(&served);
+    let five = ["c8a.large", "c7a.large", "m8a.large", "m7a.large", "r8a.large"];
+    let offered = format!("<DescribeInstanceTypeOfferingsResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><instanceTypeOfferingSet>{}</instanceTypeOfferingSet></DescribeInstanceTypeOfferingsResponse>",
+        five.iter().map(|t| format!("<item><instanceType>{t}</instanceType><locationType>region</locationType><location>us-east-1</location></item>")).collect::<String>());
+    let prices = |types: &[&str]| format!("<DescribeSpotPriceHistoryResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><spotPriceHistorySet>{}</spotPriceHistorySet><nextToken/></DescribeSpotPriceHistoryResponse>",
+        types.iter().flat_map(|t| ["us-east-1a", "us-east-1b"].map(|z| format!("<item><instanceType>{t}</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>0.030000</spotPrice><timestamp>2026-10-15T10:00:00.000Z</timestamp><availabilityZone>{z}</availabilityZone></item>"))).collect::<String>());
+    let fleet = |inside: &str| format!("<CreateFleetResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><fleetId>fleet-0123456789abcdef0</fleetId>{inside}</CreateFleetResponse>");
+    let full = superci_testkit::ec2_error("InsufficientInstanceCapacity", "We currently do not have sufficient capacity in the Availability Zone you requested.");
+    let throttled = superci_testkit::ec2_error("RequestLimitExceeded", "Request limit exceeded.");
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let launch = |types: &str, rules: Vec<(&str, u16, String, Option<u32>)>| -> String {
+        served.aws.fail_none();
+        served.aws.fail("DescribeVpcs", 200, "<DescribeVpcsResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><vpcSet/></DescribeVpcsResponse>", None);
+        served.aws.fail("DescribeInstanceTypeOfferings", 200, &offered, None);
+        served.aws.fail("DeleteLaunchTemplate", 400, &superci_testkit::ec2_error("InvalidLaunchTemplateName.NotFoundException", "At least one of the launch templates specified in the request does not exist."), None);
+        for (action, status, answer, times) in &rules { served.aws.fail(action, *status, answer, *times) }
+        let (_, said) = common::json(&home, &["debug", "launch", "us-east-1", "spot", types]);
+        served.aws.fail_none();
+        said["answer"].as_str().unwrap_or_default().to_string()
+    };
+    let asked = |action: &str| served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains(&format!("Action={action}&"))).count();
+    let three = "c8a.large,c7a.large,m8a.large";
+    // Its zones from the prices; the others refused all at once for the rate, then each alone the same: no waiting here.
+    let fleets = asked("CreateFleet");
+    let said = launch(three, vec![("DescribeSpotPriceHistory", 200, prices(&["c8a.large", "c7a.large", "m8a.large"]), None), ("RunInstances", 400, full.clone(), Some(1)), ("CreateFleet", 503, throttled.clone(), None), ("RunInstances", 503, throttled.clone(), None)]);
+    assert!(said.starts_with("not started: RequestLimitExceeded"), "{said}");
+    assert_eq!(asked("CreateFleet"), fleets + 1);
+    // No prices (no zones): the others asked at once in no zone; refused outright, then each alone, the next started.
+    let said = launch(&five.join(","), vec![("DescribeSpotPriceHistory", 200, prices(&[]), None), ("RunInstances", 400, full.clone(), Some(1)),
+        ("CreateFleet", 400, superci_testkit::ec2_error("InvalidFleetConfiguration", "The fleet configuration is not valid."), None), ("RunInstances", 200, started.clone(), None)]);
+    assert!(said.starts_with("started "), "{said}");
+    // None with room, said of a pool without its zone and of one without its type; then one given, with no zone said.
+    let said = launch(&five.join(","), vec![("DescribeSpotPriceHistory", 200, prices(&[]), None), ("RunInstances", 400, full.clone(), None),
+        ("CreateFleet", 200, fleet("<errorSet><item><errorCode>InsufficientInstanceCapacity</errorCode><errorMessage>No room.</errorMessage><launchTemplateAndOverrides><overrides><instanceType>c7a.large</instanceType></overrides></launchTemplateAndOverrides></item><item><errorCode>UnfulfillableCapacity</errorCode><errorMessage>Not tried.</errorMessage></item></errorSet><fleetInstanceSet/>"), None)]);
+    assert!(said.starts_with("not started: InsufficientInstanceCapacity") && said.contains("c7a.large"), "{said}");
+    let said = launch(&five.join(","), vec![("DescribeSpotPriceHistory", 200, prices(&[]), None), ("RunInstances", 400, full.clone(), Some(1)),
+        ("CreateFleet", 200, fleet("<errorSet/><fleetInstanceSet><item><instanceIds><item>i-0123456789abcdef0</item></instanceIds><instanceType>m8a.large</instanceType><lifecycle>spot</lifecycle></item></fleetInstanceSet>"), None)]);
+    assert!(said.starts_with("started i-0123456789abcdef0 (m8a.large in )"), "{said}");
+    // One type in two zones: the second pool asked alone (too few to ask at once).
+    let fleets = asked("CreateFleet");
+    let said = launch("c8a.large", vec![("DescribeSpotPriceHistory", 200, prices(&["c8a.large"]), None), ("RunInstances", 400, full.clone(), Some(1)), ("RunInstances", 200, started.clone(), None)]);
+    assert!(said.starts_with("started ") && asked("CreateFleet") == fleets, "{said}");
+    // No type the region has: nothing asked.
+    let said = launch(",", vec![]);
+    assert!(said.starts_with("not started: no instance type given"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Jobs on AWS as its answers and the control plane's settings have it: its network with no subnet (the default
+/// network), a machine AWS started without saying its zone, a network of the account's own set by hand without a
+/// subnet or with an id that is none, GitHub giving a runner configuration that names no address of its or is no
+/// configuration, labels that size a GPU machine, a family's or an arm64 one past what one family has, a control plane
+/// whose address the cache's link cannot be made from; and a role AWS will not let the control plane take.
+#[test]
+fn aws_jobs_start_or_say_why_not_as_its_networks_githubs_runner_configurations_and_their_labels_have_it() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"max_cpu":128,"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let job = |label: &str| -> serde_json::Value {
+        served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:"));
+        served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+        let (id, q) = served.github.queue(label, label, served.now_ms());
+        assert!(served.webhook(q) < 300, "{label}");
+        served.store.under(&format!("job:{id}"))[0].1.clone()
+    };
+    let script = || {
+        let asked = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()).unwrap();
+        let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+        use base64::Engine;
+        String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(data).unwrap()).to_string()
+    };
+    // Its network found with no subnet: the region's default network; AWS not saying the machine's zone.
+    let no_zone = started.split("<availabilityZone>").next().unwrap().to_string() + started.split("</availabilityZone>").nth(1).unwrap();
+    served.aws.fail("DescribeSubnets", 200, "<DescribeSubnetsResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><subnetSet/></DescribeSubnetsResponse>", None);
+    served.aws.fail("RunInstances", 200, &no_zone, None);
+    let j = job("superci");
+    assert!(j["state"] == "launched" && j["zone"].is_null() && j["usd_per_hour"].is_number(), "{j}");
+    assert!(!script().contains("SubnetId") && !served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).unwrap()["asked"].as_str().unwrap().contains("SubnetId"), "the default network");
+    served.aws.fail_none();
+    served.later(700_000);
+    served.aws.fail("RunInstances", 200, &started, None);
+    // A network of the account's own set by hand: without a subnet, or with what is no subnet's id.
+    for (networks, why) in [(r#"{"us-east-1":{"subnets":[],"security_groups":["sg-0123456789abcdef0"]}}"#, "a network of your own needs a subnet and a security group"),
+        (r#"{"us-east-1":{"subnets":["subnet-nope"],"security_groups":["sg-0123456789abcdef0"]}}"#, "subnet-nope is not a subnet or security group id")] {
+        served.aws.put(&format!("/superci/{PLANE}/AWS_NETWORKS"), networks);
+        let j = job("superci");
+        assert!(j["machine_id"].is_null() && j["error"].as_str().unwrap_or_default().contains(why), "{why}: {j}");
+    }
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/AWS_NETWORKS"));
+    // GitHub's runner configuration naming no address of GitHub's: nothing to reach first, on Linux and Windows.
+    use base64::Engine;
+    let b64 = |v: serde_json::Value| base64::engine::general_purpose::STANDARD.encode(v.to_string());
+    let config = |encoded: String| serde_json::json!({ "runner": { "id": 77, "name": "superci-runner-77", "os": "unknown", "status": "offline", "busy": false, "labels": [] }, "encoded_jit_config": encoded }).to_string();
+    served.github.answer_with("POST", "generate-jitconfig", 201, &[], &config(b64(serde_json::json!({ "runner": 77, ".runner": b64(serde_json::json!({ "AgentId": 77 })) }))));
+    let j = job("superci");
+    let s = script();
+    assert!(j["state"] == "launched" && !s.contains("for h in") && !s.contains("wait $g"), "{j}");
+    served.github.fail_none();
+    served.github.answer_with("POST", "generate-jitconfig", 201, &[], &config(b64(serde_json::json!({ "runner": 78, ".runner": b64(serde_json::json!({ "AgentId": 78 })) }))));
+    let j = job("superci/os=windows");
+    assert!(j["state"] == "launched" && !script().contains("foreach ($h in"), "{j}");
+    // One that is no configuration: no machine started with it.
+    for (n, label) in [(79, "superci"), (80, "superci/os=windows")] {
+        served.github.fail_none();
+        served.github.answer_with("POST", "generate-jitconfig", 201, &[], &serde_json::json!({ "runner": { "id": n, "name": format!("superci-runner-{n}") }, "encoded_jit_config": "not a configuration!" }).to_string());
+        let j = job(label);
+        assert!(j["machine_id"].is_null() && j["error"].as_str().unwrap_or_default().contains("invalid runner config"), "{label}: {j}");
+    }
+    served.github.fail_none();
+    // Labels sizing a machine: a T4 with more memory than its smaller sizes have, a family's with more than its
+    // smaller sizes have, arm64 with more CPUs than one family's sizes have.
+    for (label, kind) in [("superci/gpu=t4/cpu=8/ram=64", "g4dn.4xlarge"), ("superci/family=c8a/cpu=2/ram=16", "c8a.2xlarge"), ("superci/arch=arm64/cpu=96", "g.24xlarge")] {
+        let j = job(label);
+        let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str()).filter(|a| a.contains("Action=RunInstances")).filter_map(|a| url::form_urlencoded::parse(a.as_bytes()).find(|(k, _)| k == "InstanceType").map(|(_, v)| v.to_string())).collect();
+        assert!(asked.last().is_some_and(|a| a.ends_with(kind)) && j["machine_type"].as_str().is_some_and(|t| t.ends_with(kind)), "{label}: {:?} {j}", asked.last());
+    }
+    // An address of its own the cache's link cannot be made from: machines start without the cache.
+    *served.public.lock().unwrap() = Some("https://plane+acme.test".into());
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    for arch in ["x86_64"] { served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key(arch)), b"program") }
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::layers_key("x86_64")), b"program");
+    let j = job("superci/image=ubuntu26/docker-cache=true");
+    assert!(j["state"] == "launched" && !script().contains("/cache/"), "{j}");
+    served.aws.fail_none();
+    // A control plane outside AWS whose role AWS will not let it take: its job says so.
+    let outside = serve(|_| {});
+    outside.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": format!("arn:aws:iam::111111111111:role/superci-plane-{PLANE}"), "connected": true, "error": null }).to_string());
+    outside.connect_github();
+    outside.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    outside.github.answer_with("GET", "AssumeRoleWithWebIdentity", 403, &[("content-type", "text/xml")], &superci_testkit::ec2_error("AccessDenied", "Not authorized to perform sts:AssumeRoleWithWebIdentity"));
+    let (id, q) = outside.github.queue("superci", "superci", outside.now_ms());
+    assert!(outside.webhook(q) < 300);
+    let j = outside.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(j["machine_id"].is_null() && j["error"].as_str().unwrap_or_default().contains("AccessDenied"), "{j}");
+}
+
+/// A region added with its network, as a real account answered but for each step changed: AWS refusing a route for
+/// a table it does not find (nothing more made, said), then two networks made at once (the other one kept, this one
+/// deleted), its gateway and route there already. Its network deleted again with no S3 endpoint in it, its bucket and
+/// one of its objects gone already; then with another control plane in the account that has no network of its own (the
+/// shared one kept for it).
+#[test]
+fn a_regions_network_is_made_and_deleted_as_aws_answers_each_step_and_the_shared_one_kept_for_another_control_plane() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let ec2 = |action: &str, inside: &str| format!("<{action}Response xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId>{inside}</{action}Response>");
+    let asked = |action: &str, part: &str| served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().unwrap_or_default().contains("eu-north-1") && a["asked"].as_str().unwrap_or_default().contains(&format!("Action={action}")) && a["asked"].as_str().unwrap_or_default().contains(part));
+    let add = |rules: &[(&str, u16, String, Option<u32>)]| {
+        served.aws.replaying(include_str!("../fixtures/aws/regions/add.jsonl"), &[("mixplane0001", PLANE)]);
+        served.aws.fail_none();
+        for (action, status, answer, times) in rules { served.aws.fail(action, *status, answer, *times) }
+        let o = common::superci(&home, &["runners", "update", "aws", "--regions=us-east-1,eu-north-1"]);
+        served.aws.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let (ok, said) = add(&[("CreateRoute|DestinationCidrBlock", 400, superci_testkit::ec2_error("InvalidRouteTableID.NotFound", "The routeTable ID 'rtb-1' does not exist"), None)]);
+    assert!(!ok && said.contains("InvalidRouteTableID.NotFound"), "{said}");
+    assert!(!served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_REGIONS" && v.contains("eu-north-1")), "not added");
+    // (The cache's program there already, of another build: put there again.)
+    let program = format!("superci-plane-{PLANE}-eu-north-1/{}", superci_core::cache::program_key("x86_64"));
+    served.github.put_object(&program, b"another build");
+    let (ok, said) = add(&[("DescribeVpcs|ec2.eu-north-1|tag%3Asuperci", 200, ec2("DescribeVpcs", "<vpcSet/>"), Some(2)),
+        ("CreateVpc", 200, ec2("CreateVpc", "<vpc><vpcId>vpc-0ffffffffffffffff</vpcId></vpc>"), Some(1)),
+        ("DescribeVpcs|ec2.eu-north-1|tag%3Asuperci", 200, ec2("DescribeVpcs", "<vpcSet><item><vpcId>vpc-00000000000000001</vpcId></item><item><vpcId>vpc-0ffffffffffffffff</vpcId></item></vpcSet>"), Some(1)),
+        ("AttachInternetGateway", 400, superci_testkit::ec2_error("Resource.AlreadyAssociated", "resource igw-1 is already attached to network vpc-00000000000000001"), None),
+        ("CreateRoute|DestinationCidrBlock", 400, superci_testkit::ec2_error("RouteAlreadyExists", "The route identified by 0.0.0.0/0 already exists."), None)]);
+    assert!(ok, "{said}");
+    assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_REGIONS" && v.contains("eu-north-1")), "added");
+    assert!(asked("DeleteVpc", "vpc-0ffffffffffffffff"), "the one made second deleted");
+    assert!(served.github.objects().iter().any(|(k, n)| *k == program && *n > 1000), "the program put again");
+    // Deleted: no endpoint to delete; the bucket, and one of what it kept, gone already as S3 answers.
+    let gone = |url: &str| serde_json::json!({ "method": "DELETE", "url": url, "target": "", "asked": "", "status": 404, "answer": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>" }).to_string();
+    let bucket = format!("https://superci-plane-{PLANE}-eu-north-1.s3.eu-north-1.amazonaws.com/");
+    let delete = |others: bool, rules: &[(&str, u16, String, Option<u32>)]| {
+        served.aws.replaying(include_str!("../fixtures/aws/regions/delete.jsonl"), &[("mixplane0001", PLANE)]);
+        served.aws.replaying(&[gone(&bucket), gone(&format!("{bucket}superci/cache-0.19.16-aarch64"))].join("\n"), &[]);
+        served.aws.fail_none();
+        if others { served.aws.fail("ListRoles", 200, "<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles><member><RoleName>superci-plane-otherplane02</RoleName><Description>SuperCI control plane https://other.example (Lambda, us-east-1, runs-on superci).</Description></member></Roles></ListRolesResult></ListRolesResponse>", None) }
+        for (action, status, answer, times) in rules { served.aws.fail(action, *status, answer, *times) }
+        let o = common::superci(&home, &["debug", "networks", "eu-north-1"]);
+        served.aws.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let before = served.aws.asked.lock().unwrap().len();
+    let (ok, said) = delete(false, &[("DescribeVpcEndpoints", 200, ec2("DescribeVpcEndpoints", "<vpcEndpointSet/>"), None)]);
+    assert!(ok && said.contains("deleted in eu-north-1"), "{said}");
+    assert!(!served.aws.asked.lock().unwrap()[before..].iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("Action=DeleteVpcEndpoints")), "no endpoint to delete");
+    // Another control plane in the account with no network of its own here: the shared one is its, and stays.
+    let before = served.aws.asked.lock().unwrap().len();
+    let (ok, said) = delete(true, &[("DescribeVpcs|otherplane02", 200, ec2("DescribeVpcs", "<vpcSet/>"), None)]);
+    assert!(ok && said.contains("deleted in eu-north-1"), "{said}");
+    assert!(served.aws.asked.lock().unwrap()[before..].iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("otherplane02")), "the other control plane's network asked for");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitHub as the control plane and the dashboard find it: an App begun for a name GitHub has none of (refused) and
+/// on a GitHub of its own whose address has digits and dashes (asked, and said not to answer from here); the
+/// deliveries that failed, asked again only those of jobs not asked again already; a job taken elsewhere whose runner
+/// GitHub no longer knows (swept); runs of repositories named as GitHub names none (their cache their own); a
+/// hundred public repositories and more; the cache's entries of repositories by ids that are none.
+#[test]
+fn github_is_asked_only_what_it_can_answer_and_its_answers_of_deliveries_runners_and_repositories_are_read_as_it_writes_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let (status, _, said) = common::post(&link, "/github/start", &[("login", "-acme"), ("host", "")]);
+    assert!(status == 400 && said.contains("That is not a GitHub name"), "{status} {said}");
+    // (A GitHub of its own, asked from this computer: none answers here.)
+    let (status, _, said) = common::post(&link, "/github/start", &[("login", "acme"), ("host", "git-hub2.example.com")]);
+    assert!(status == 400 && said.contains("git-hub2.example.com did not answer from this computer"), "{status} {}", common::words(&said));
+    let _ = child.kill();
+    // Deliveries GitHub lists as failed: an installation's, one asked again already, a job's (asked again).
+    let at = superci_core::aws::amz_iso(served.now_ms() - 60_000);
+    let listed = serde_json::json!([{ "id": 1, "guid": "g-1", "event": "installation", "status_code": 500, "delivered_at": at, "redelivery": false },
+        { "id": 2, "guid": "g-2", "event": "workflow_job", "status_code": 0, "delivered_at": at, "redelivery": true },
+        { "id": 3, "guid": "g-3", "event": "workflow_job", "status_code": 502, "delivered_at": at, "redelivery": false }]);
+    served.github.answer_with("GET", "/app/hook/deliveries?per_page=100", 200, &[], &listed.to_string());
+    // (GitHub taking it with nothing more to say.)
+    served.github.answer_with("POST", "/attempts", 202, &[], "");
+    served.upkeep();
+    let asked: Vec<String> = served.store.under("redelivered:").into_iter().map(|(k, _)| k).collect();
+    assert_eq!(asked, ["redelivered:g-3"]);
+    assert!(served.github.asked.lock().unwrap().iter().any(|a| a.ends_with("/app/hook/deliveries/3/attempts")));
+    served.github.fail_none();
+    // A job another runner took and ended untold, whose runner GitHub no longer has: its machine began nothing.
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    served.webhook(queued);
+    served.github.ended_untold(id);
+    served.github.fail("GET", "/actions/runners/", 404, "Not Found");
+    served.later(90_000);
+    served.upkeep();
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(["swept", "done"].contains(&job["state"].as_str().unwrap()), "{job}");
+    served.github.fail_none();
+    // Runs asked for by the API of repositories GitHub's names cannot be: their cache is their own.
+    for repository in ["acme/app/x", "acme/a!"] {
+        let body = serde_json::json!({ "workflow": "jobs:\n  t:\n    if: false\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": repository, "ref": "refs/heads/main" });
+        let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
+        let said: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+        assert_eq!(said["cache_own"], true, "{repository}: {said}");
+    }
+    // The public repositories of an installation with more than a hundred: each page read.
+    let page = |from: usize, n: usize| serde_json::json!({ "total_count": 130, "repositories": (from..from + n).map(|i| serde_json::json!({ "full_name": format!("acme/public-{i}"), "private": false })).collect::<Vec<_>>() }).to_string();
+    served.github.answer_with("GET", "/installation/repositories?per_page=100&page=1", 200, &[], &page(0, 100));
+    served.github.answer_with("GET", "/installation/repositories?per_page=100&page=2", 200, &[], &page(100, 30));
+    let repos: serde_json::Value = ureq::get(&format!("{}/github/public-repos", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap();
+    assert_eq!(repos["repos"].as_array().map(Vec::len), Some(130), "{repos}");
+    served.github.fail_none();
+    // The cache's entries of repositories whose ids are none: listed by those, GitHub not asked their names.
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let entry = serde_json::json!({ "id": "e1", "region": "us-east-1", "made": served.now_ms(), "used": served.now_ms(), "done": true, "size": 10, "pieces": [["p-1", 10]] }).to_string();
+        for ns in ["gh", "ghx"] { m.insert(format!("cache:{ns}:refs/heads/main:{}:deps", "c".repeat(64)), entry.clone()); }
+    }
+    let (_, listed) = common::json(&home, &["caches", "list"]);
+    assert!(listed["repos"].as_array().is_some_and(|r| r.len() >= 2), "{listed}");
+    assert!(!served.github.asked.lock().unwrap().iter().any(|a| a.contains("/repositories/x") || a.ends_with("/repositories/")), "no id to ask by");
+    // An App on a GitHub Enterprise Server of its own, installed nowhere it says: installed from that server's own page.
+    let mut app = superci_testkit::GitHub::app();
+    app["host"] = "ghe.acme.test".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &app.to_string());
+    let (mut child, link) = dashboard(&home);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let (_, page) = common::part(&link, "/?p=repos&fragment=1");
+        if page.contains("https://ghe.acme.test/github-apps/") { break }
+        assert!(std::time::Instant::now() < end, "{}", common::words(&page));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitLab as the control plane finds it: an event that is no job's (left), a job of a further connection (kept by
+/// that connection's name), a job whose log GitLab will not give (said), a runner GitLab removed already (as good as
+/// removed); a project's webhook GitLab will not remove (the change refused), then one it has removed already.
+#[test]
+fn gitlab_events_logs_runners_and_webhooks_are_read_as_gitlab_answers_them_each_connection_by_its_name() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    let home = signed_in(&served);
+    // An event of another kind than a job's.
+    assert_eq!(served.gitlab_webhook(serde_json::json!({ "object_kind": "pipeline", "object_attributes": { "id": 1 } }).to_string().into_bytes()), 200);
+    // A job of a further connection, by its own webhook secret.
+    let mut second = superci_testkit::GitLab::connection();
+    (second["hook_secret"], second["id"]) = ("gitlab-hook-secret-second".into(), "gsecond".into());
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gsecond"), &second.to_string());
+    let (gid, pending) = served.gitlab.pending("gl-second", &["superci"], served.now_ms());
+    let host = served.url.trim_start_matches("http://").to_string();
+    let mut s = std::net::TcpStream::connect(&host).unwrap();
+    use std::io::{Read, Write};
+    s.write_all(format!("POST /gitlab/webhook HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\nx-gitlab-event: Job Hook\r\nx-gitlab-token: gitlab-hook-secret-second\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", pending.len()).as_bytes()).unwrap();
+    s.write_all(&pending).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 2"), "{out}");
+    assert!(!served.store.under(&format!("job:glgsecond-{gid}")).is_empty(), "{:?}", served.store.under("job:gl").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());
+    // A job of the first: its log refused by GitLab, said; its runner removed at GitLab already when it ends.
+    let (id, pending) = served.gitlab.pending("gl-first", &["superci"], served.now_ms());
+    served.gitlab_webhook(pending);
+    served.gitlab_webhook(served.gitlab.running(id, served.now_ms()));
+    served.gitlab.fail("GET", "/trace", 500);
+    let mut r = ureq::get(&format!("{}/job/log?id={id}&gl=", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap();
+    let said = r.body_mut().read_to_string().unwrap_or_default();
+    assert!(said.contains("GitLab would not give its log"), "{said}");
+    served.gitlab.fail_none();
+    served.gitlab.fail("DELETE", "/runners/", 404);
+    assert!(served.gitlab_webhook(served.gitlab.finish(id, "success", "ok", served.now_ms())) < 300);
+    assert!(served.store.under("glrunner:").iter().all(|(k, _)| !k.ends_with(&format!(":{id}"))), "its runner's record gone");
+    served.gitlab.fail_none();
+    // The project's webhook: added, then GitLab refusing to remove it (the change refused), then gone there already.
+    let o = common::superci(&home, &["projects", "update", "250833", "--enabled=true"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    served.gitlab.fail("DELETE", "/hooks/", 500);
+    let o = common::superci(&home, &["projects", "update", "250833", "--enabled=false"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("500"), "{said}");
+    served.gitlab.fail_none();
+    served.gitlab.fail("DELETE", "/hooks/", 404);
+    let o = common::superci(&home, &["projects", "update", "250833", "--enabled=false"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    served.gitlab.fail_none();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Keys and signatures as they come: an App's key in PKCS#1 (as GitHub gives it) signs its requests; an App kept with
+/// no webhook secret takes no event; GitHub's key set naming an EC key where a job's token wants an RSA one, refused;
+/// a runner role whose policy IAM gives back with one-item lists, as having what it should.
+#[test]
+fn keys_signatures_and_policies_are_taken_in_each_form_their_issuers_give_them() {
+    // The App's key as GitHub gives it.
+    let served = serve(|_| {});
+    let mut openssl = std::process::Command::new("openssl").args(["rsa", "-traditional"]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().expect("openssl");
+    { use std::io::Write; openssl.stdin.take().unwrap().write_all(superci_testkit::GitHub::app()["pem"].as_str().unwrap().as_bytes()).unwrap(); }
+    let pkcs1 = String::from_utf8(openssl.wait_with_output().unwrap().stdout).unwrap();
+    assert!(pkcs1.contains("BEGIN RSA PRIVATE KEY"), "{pkcs1}");
+    let mut app = superci_testkit::GitHub::app();
+    app["pem"] = pkcs1.into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &app.to_string());
+    let (id, q) = served.github.queue("test", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let job = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(job["state"] == "launched" && job["runner_id"].is_u64(), "its runner registered with a token the App's key asked for: {job}");
+    // An App kept with no webhook secret: nothing signed with it is taken.
+    app["webhook_secret"] = "".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &app.to_string());
+    let (_, q) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(q), 401);
+    // GitHub's key set with an EC key where the token names none: not GitHub's job's token.
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    let link = "machine-cache-link-000000000011";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner" }).to_string());
+    served.github.answer_with("GET", "/.well-known/jwks", 200, &[], r#"{"keys":[{"kty":"EC","crv":"P-256","x":"AA","y":"AA"}]}"#);
+    let token = superci_testkit::GitHub::job_token(&serde_json::json!({ "repository_id": "197814629", "ac": "[]", "exp": 4_102_444_800u64 }));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let mut r = agent.post(&format!("{}/cache/{link}/lookup", served.url)).send(serde_json::json!({ "token": token, "key": "deps", "version": "c".repeat(64) }).to_string()).unwrap();
+    let said: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+    assert_eq!(said["why"], "signed by a key not in the set", "{said}");
+    served.github.fail_none();
+    // The runner role's policy as IAM gives it back, each one-item list as a list: it has what it should.
+    let mut policy = superci_core::permissions::aws_runner_policy(superci_testkit::ACCOUNT, PLANE);
+    for s in policy["Statement"].as_array_mut().unwrap() { for k in ["Action", "Resource"] { if s[k].is_string() { s[k] = serde_json::json!([s[k].clone()]) } } }
+    let encoded: String = url::form_urlencoded::byte_serialize(policy.to_string().as_bytes()).collect();
+    served.aws.fail("GetRolePolicy", 200, &format!("<GetRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><GetRolePolicyResult><PolicyName>runner-machines</PolicyName><RoleName>superci-plane-{PLANE}</RoleName><PolicyDocument>{encoded}</PolicyDocument></GetRolePolicyResult></GetRolePolicyResponse>"), None);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let home = signed_in(&served);
+    let (_, said) = common::json(&home, &["planes", "allow", "--dry-run"]);
+    served.aws.fail_none();
+    assert!(said["lacks"].as_array().is_some_and(|l| l.iter().all(|n| n["id"] != "Ec2Run" && n["id"] != "RunMachines")) && said["lacks"].as_array().is_some_and(|l| l.len() <= 1), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Runs asked for by the API, their runners served as GitHub's runner is: a secret with what a pattern reads as its
+/// own (masked as it is), a run with no working tree (its checkout fetches nothing) and one layered on a base (its
+/// checkout unpacks each part on the one before); the runner ending its session, and sending no lines at all.
+#[test]
+fn a_runs_runner_is_given_its_masks_and_checkout_as_its_tree_was_sent_and_its_session_ended() {
+    let served = serve(|_| {});
+    let workflow = "jobs:\n  t:\n    runs-on: superci\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo ${{ secrets.ODD }}\n";
+    let mut checkouts = vec![];
+    for (tree, layered) in [(None, false), (Some("tree-0123456789abcdef0123"), true)] {
+        let before: Vec<String> = served.store.under("run:").into_iter().map(|(k, _)| k).collect();
+        let mut body = serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main", "secrets": [["ODD", "a.b(c)*[d]{e}|f^g$h?+\\"]] });
+        if let Some(t) = tree { (body["tree"], body["parts"], body["layered"]) = (t.into(), 2.into(), layered.into()) }
+        let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
+        assert!(r.status().as_u16() < 300, "{}", r.body_mut().read_to_string().unwrap_or_default());
+        let run = served.store.under("run:").into_iter().map(|(k, _)| k).find(|k| !before.contains(k)).unwrap().trim_start_matches("run:").to_string();
+        let runner = loop { if let Some(r) = superci_testkit::Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let handed = runner.handed(&served);
+        assert!(handed["mask"].as_array().unwrap().iter().any(|m| m["value"] == "a\\.b\\(c\\)\\*\\[d\\]\\{e\\}\\|f\\^g\\$h\\?\\+\\\\"), "{}", handed["mask"]);
+        let base = runner.at.split("/_apis/").next().unwrap().to_string();
+        let gz = ureq::get(&format!("{base}/superci/checkout.tar.gz")).call().unwrap().body_mut().read_to_vec().unwrap();
+        let mut unzip = std::process::Command::new("gzip").arg("-dc").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        { use std::io::Write; unzip.stdin.take().unwrap().write_all(&gz).unwrap(); }
+        checkouts.push(String::from_utf8_lossy(&unzip.wait_with_output().unwrap().stdout).to_string());
+        // The runner sends no lines (an empty post), and ends its session.
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let status = agent.put(&format!("{}/TimeLineWebConsoleLog/scope/hub/plan/timeline/step", runner.at)).send(serde_json::json!({ "value": [] }).to_string()).unwrap().status().as_u16();
+        assert!(status < 300, "{status}");
+        assert!(agent.delete(&format!("{}/AgentSession/scope/hub/1", runner.at)).call().unwrap().status().as_u16() < 300);
+    }
+    assert!(!checkouts[0].contains("fetch()") && checkouts[0].contains("git init"), "nothing to fetch: {}", checkouts[0]);
+    assert!(checkouts[1].contains("--ignore-zeros") && checkouts[1].contains(".superci-removed"), "each part on the one before: {}", checkouts[1]);
+}
+
+/// A run's artifact of a name kept once: begun by one of its jobs, then refused to that job again and to the other.
+#[test]
+fn a_runs_artifact_name_is_its_first_jobs_and_neither_that_job_again_nor_another_takes_it() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let link = "machine-cache-link-000000000012";
+    served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner" }).to_string());
+    let body = serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n  b:\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main" });
+    let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
+    let said: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+    let run = said["run_id"].as_str().unwrap().to_string();
+    let token = |name: &str| {
+        let runner = loop { if let Some(r) = superci_testkit::Runner::of_job(&served, &run, name) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        runner.handed(&served)["resources"]["endpoints"].as_array().into_iter().flatten().find_map(|e| e["authorization"]["parameters"]["AccessToken"].as_str().map(str::to_string)).unwrap_or_default()
+    };
+    let (a, b) = (token("a"), token("b"));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let begin = |t: &str| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/cache/{link}/artifact-begin", served.url)).send(serde_json::json!({ "token": t, "name": "report" }).to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    assert_eq!(begin(&a).1["ok"], true);
+    for t in [&a, &b] {
+        let (status, said) = begin(t);
+        assert_eq!((status, said["why"].as_str()), (409, Some("an artifact of this name exists in the run")), "{said}");
+    }
+}
+
+/// A control plane whose store keeps each record's end beside it (as a Durable Object's does): a secret's use noted
+/// by two runs a day apart, the upkeep's hourly mark taken once an hour; past the first use's end, at the upkeep, what
+/// is due goes, the use noted again stays (its newer end not due), and its older mark goes with nothing more.
+#[test]
+fn a_store_keeping_ends_beside_its_records_removes_only_what_has_passed_its_newest_end() {
+    let served = superci_testkit::serve_with_ends(|_| {});
+    let scope = superci_core::secrets::Scope::default();
+    let kept = superci_core::secrets::Stored { name: "EVERYWHERE".into(), value: "v".into(), scope: scope.clone(), updated_ms: 1 };
+    served.aws.put(&format!("/superci/{PLANE}/{}", superci_core::secrets::setting("EVERYWHERE", &scope)), &serde_json::to_string(&kept).unwrap());
+    let run = || {
+        let body = serde_json::json!({ "workflow": "jobs:\n  t:\n    if: false\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.EVERYWHERE }}\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main" });
+        assert!(ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send(body.to_string()).unwrap().status().as_u16() < 300);
+    };
+    let marks = |of: &str| served.store.under("~x:").into_iter().filter(|(k, _)| k.ends_with(of)).count();
+    run();
+    served.upkeep();
+    served.upkeep();
+    assert_eq!(served.store.under("upkeep:").len(), 1, "once an hour");
+    served.later(86_400_000);
+    run();
+    let used = served.store.under("sused:")[0].0.clone();
+    assert_eq!(marks(&used), 2, "an end for each use");
+    // Past the first use's end (400 days), not the second's.
+    served.later(399 * 86_400_000 + 43_200_000);
+    served.upkeep();
+    assert!(!served.store.under(&used).is_empty() && marks(&used) == 1, "the use kept, its older mark gone: {:?}", served.store.under("~x:"));
+    assert_eq!(served.store.under("upkeep:").len(), 1, "the old hour's mark gone, this hour's kept");
+}
+
 #[test]
 fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
@@ -9658,6 +10465,133 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         assert!(job["state"] == "waiting" && job["error"].as_str().unwrap_or_default().contains("Your AWS account's limits do not let this machine start"), "{job}");
         let _ = std::fs::remove_dir_all(&dir);
         super::seen_in_browser(&served);
+    }
+
+    /// Workflows written in the rarer ways GitHub reads: an empty `env:` and `with:`, an image with no inputs, an action
+    /// in a folder of an owner with `_` in its name, a step's `if` with functions of other names, an expression never
+    /// closed, a `wait-all`, a quoted matrix value. Each step as its runner is given it; a `wait` that also uses an
+    /// action, and inputs to a manual start of a workflow that has none, refused saying why.
+    #[test]
+    fn workflows_written_in_the_rarer_ways_are_given_to_the_runner_as_github_reads_them_and_their_mistakes_said() {
+        let served = serve(|_| {});
+        let rare = "on: workflow_dispatch\nenv:\njobs:\n  t:\n    runs-on: superci\n    strategy:\n      matrix:\n        os: ['quoted', plain]\n    steps:\n      - id: bg\n        run: echo ${{ oops }\n        background: true\n        env:\n      - uses: docker://alpine:3\n      - uses: my_org/tools/sub/dir@v1\n        with:\n      - if: my_success() || steps.bg.cancelled()\n        run: echo two\n      - wait-all: true\n";
+        let dir = checkout_with(&[(".github/workflows/rare.yml", rare),
+            (".github/workflows/wait-uses.yml", "jobs:\n  w:\n    runs-on: superci\n    steps:\n      - id: bg\n        run: sleep 1\n        background: true\n      - wait: bg\n        uses: actions/checkout@v4\n")]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/rare.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let runner = runner_of(&served, &run, "t (quoted)");
+        let steps = runner.handed(&served)["steps"].clone();
+        let step = |i: usize| steps[i].clone();
+        // (The expression never closed is the script as written; the image and the action have no inputs; the action
+        // is in a folder of its repository; the `if` is the job's to read; the `wait-all` names no step.)
+        assert!(step(0).to_string().contains("echo ${{ oops }") && step(0)["environment"].is_null(), "{}", step(0));
+        assert!(step(1)["reference"]["image"] == "alpine:3" && step(1)["inputs"].is_null(), "{}", step(1));
+        assert!(step(2)["reference"]["name"] == "my_org/tools" && step(2)["reference"]["path"] == "sub/dir" && step(2)["inputs"].is_null() && step(2)["contextName"] == "__my_org_tools", "{}", step(2));
+        assert_eq!(step(3)["condition"], "success() && (my_success() || steps.bg.cancelled())");
+        assert!(step(4)["controlType"] == "wait-all" && step(4)["stepIds"].is_null(), "{}", step(4));
+        assert!(served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().any(|j| j["name"] == "t (plain)"));
+        assert!(ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send_empty().is_ok());
+        for (args, said) in [(&["--workflow=.github/workflows/wait-uses.yml"][..], "a step that has `wait` runs nothing itself"),
+            (&["--workflow=.github/workflows/rare.yml", "--event=workflow_dispatch", "--input=who=me"], "has no input who (it has none)")] {
+            let o = superci(&served, &dir, &[&["runs", "create", "--detach"][..], args].concat()).output().unwrap();
+            let out = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            assert!(!o.status.success() && out.contains(said), "{said}: {out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Jobs' `if`s that read lists with `[*]` and a filter of a filter, `false` as a number, and one that holds when its
+    /// needed job failed (skipped, as it asks nothing of how the run goes); one with a number that is not one, refused.
+    #[test]
+    fn jobs_ifs_read_filters_of_filters_and_false_as_a_number_and_one_after_a_failed_job_is_skipped() {
+        let served = serve(|_| {});
+        let wf = "jobs:\n  a:\n    if: ${{ contains(fromJSON('[1]')[*], 1) && contains(fromJSON('[[1],[2]]').*.*, 2) && false == 0 && false < 1 }}\n    runs-on: superci\n    steps:\n      - run: exit 1\n  b:\n    needs: a\n    if: ${{ true }}\n    runs-on: superci\n    steps:\n      - run: echo\n";
+        let dir = checkout_with(&[(".github/workflows/ci.yml", wf)]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let a = runner_of(&served, &run, "a");
+        a.take();
+        a.finish("failed");
+        let result = |name: &str| served.store.under(&format!("run:{run}"))[0].1["jobs"].as_array().unwrap().iter().find(|j| j["key"] == name).map(|j| j["result"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while result("b").is_empty() { assert!(std::time::Instant::now() < end, "b never decided"); std::thread::sleep(std::time::Duration::from_millis(50)) }
+        assert_eq!((result("a").as_str(), result("b").as_str()), ("failure", "skipped"));
+        // A number with a sign after it that is no exponent's: not read, said.
+        std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  bad:\n    if: ${{ 1-2 }}\n    runs-on: superci\n    steps:\n      - run: echo\n").unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("the job bad's if"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A workflow file with `[` in its name: a secret kept for it by that very name is given; ones whose pattern
+    /// goes past a `?`, a class or a range that does not hold are not. Words that only look like `secrets` read none,
+    /// a name with a dash is one; a secret kept for a repository with a dash in its name, as `secrets create` keeps it.
+    #[test]
+    fn secrets_kept_for_a_workflow_named_with_a_bracket_are_given_only_by_patterns_that_hold_to_its_end() {
+        let served = serve(|_| {});
+        let patterns = [("W_LITERAL_OPEN", "x[.yml", true), ("W_ONE_THEN", "x?.yaml", false), ("W_CLASS_THEN", "[x]z.yml", false), ("W_RANGE_OUT", "[a-c][.yml", false)];
+        for (name, workflow, _) in patterns {
+            let scope = superci_core::secrets::Scope { workflow: Some(workflow.into()), ..Default::default() };
+            let kept = superci_core::secrets::Stored { name: name.to_string(), value: format!("{}-value", name.to_ascii_lowercase()), scope: scope.clone(), updated_ms: 1 };
+            served.aws.put(&format!("/superci/{}/{}", superci_testkit::PLANE, superci_core::secrets::setting(name, &scope)), &serde_json::to_string(&kept).unwrap());
+        }
+        let reads: String = patterns.iter().map(|(n, ..)| format!(" ${{{{ secrets.{n} }}}}")).collect();
+        let wf = format!("jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo{reads} ${{{{ asecrets }}}} ${{{{ secrets2 }}}} ${{{{ secrets.A-B }}}}\n");
+        let dir = checkout_with(&[(".github/workflows/x[.yml", &wf)]);
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/x[.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let handed = loop { if let Some((_, v)) = served.store.under("rjob:").into_iter().next() { break v } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let given = &handed["message"]["variables"];
+        for (name, _, holds) in patterns { assert_eq!(given[name].is_object(), holds, "{name}: {given}") }
+        // Kept for acme/my-app from the command line.
+        let home = signed_in(&served);
+        let o = common::command(&home).args(["secrets", "create", "DASHED", "--repo=acme/my-app", "--value-env=SUPERCI_TEST_VALUE"]).env("SUPERCI_TEST_VALUE", "v").output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(served.aws.settings(superci_testkit::PLANE).iter().any(|(k, v)| k.starts_with("SECRET_DASHED_") && v.contains("acme/my-app")), "kept");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Runs a coding agent asks for by the API with each kind of ref: a bare branch name gets the secrets kept for
+    /// branches like it; a tag's, no ref, or a branch on which the run's cache is its default branch's get none of
+    /// those. Each job's token for the cache: its own scope, then its ref's and the default branch's to read, when
+    /// they are refs SuperCI keeps, each once.
+    #[test]
+    fn runs_asked_for_by_the_api_with_a_tag_a_bare_branch_or_no_ref_get_the_secrets_and_cache_scopes_their_ref_holds() {
+        use base64::Engine;
+        let served = serve(|_| {});
+        let scope = superci_core::secrets::Scope { branch: Some("rel*".into()), ..Default::default() };
+        let kept = superci_core::secrets::Stored { name: "BRANCHED".into(), value: "branched-value".into(), scope: scope.clone(), updated_ms: 1 };
+        served.aws.put(&format!("/superci/{}/{}", superci_testkit::PLANE, superci_core::secrets::setting("BRANCHED", &scope)), &serde_json::to_string(&kept).unwrap());
+        // (A job whose `if` holds starts, and its runner is handed its token; one that does not, nothing.)
+        let workflow = |starts: bool| format!("jobs:\n  t:\n    if: {starts}\n    runs-on: superci\n    steps:\n      - run: echo ${{{{ secrets.BRANCHED }}}}\n");
+        let cases: [(&str, bool, Option<Vec<&str>>); 5] = [("release", true, None), ("refs/tags/v1", false, None), ("", false, Some(vec!["refs/superci/AGENT", "refs/heads/main"])),
+            ("refs/heads/main", false, Some(vec!["refs/superci/AGENT", "refs/heads/main"])), ("refs/heads/a:b", false, Some(vec!["refs/superci/AGENT", "refs/heads/main"]))];
+        for (reference, given, scopes) in cases {
+            let before: Vec<String> = served.store.under("rjob:").into_iter().map(|(k, _)| k).collect();
+            let body = serde_json::json!({ "workflow": workflow(scopes.is_some()), "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": reference });
+            let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
+            let status = r.status().as_u16();
+            let said: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default();
+            assert!(status < 300, "{reference:?}: {said}");
+            // (Its use noted with the secret, for whoever looks after the CI: by this run, or not.)
+            let used = served.store.under("sused:").into_iter().any(|(_, u)| u["run_id"] == said["run_id"]);
+            assert_eq!(used, given, "{reference:?}: {:?}", served.store.under("sused:"));
+            let Some(scopes) = scopes else { continue };
+            let message = loop {
+                if let Some((_, v)) = served.store.under("rjob:").into_iter().find(|(k, _)| !before.contains(k)) { break v["message"].clone() }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            // (The cache's token, as its actions are given it: its scopes.)
+            let token = message["resources"]["endpoints"].as_array().into_iter().flatten().find_map(|e| e["authorization"]["parameters"]["AccessToken"].as_str()).unwrap_or_default().to_string();
+            let claims: serde_json::Value = token.split('.').nth(1).and_then(|c| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(c).ok()).and_then(|c| serde_json::from_slice(&c).ok()).unwrap_or_default();
+            let ac: serde_json::Value = serde_json::from_str(claims["ac"].as_str().unwrap_or("null")).unwrap_or_default();
+            let named: Vec<&str> = ac.as_array().into_iter().flatten().filter_map(|s| s["Scope"].as_str()).collect();
+            assert_eq!(named, scopes, "{reference:?}: {claims}");
+        }
     }
 }
 

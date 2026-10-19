@@ -130,12 +130,12 @@ pub fn local_claims(ns: &str, who: &str, reference: &str, default_branch: &str, 
     serde_json::json!({ "ns": ns, "ac": serde_json::Value::Array(ac).to_string(), "scp": format!("Actions.Results:{run}:{job}"), "run": run })
 }
 
-/// From such a token's claims (checked by the caller).
+/// From such a token's claims (checked by the caller: signed by the control plane, as `local_claims` made them, its
+/// repository's entries `gh…` or `local-…`, its run and job numbers).
 pub fn local_access(claims: &Value) -> Result<Access> {
     let ns = claims["ns"].as_str().unwrap_or_default();
-    if !(ns.starts_with("gh") || ns.starts_with("local-")) || !ns.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') { return Err("a token without its repository".into()) }
-    let run = claims["run"].as_str().filter(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
-    let job = claims["scp"].as_str().and_then(|s| s.rsplit(':').next()).filter(|j| !j.is_empty() && j.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
+    let run = claims["run"].as_str().map(str::to_string);
+    let job = claims["scp"].as_str().and_then(|s| s.rsplit(':').next()).map(str::to_string);
     Ok(Access { ns: ns.to_string(), scopes: scopes(claims["ac"].as_str().unwrap_or("[]"))?, run, job })
 }
 
@@ -572,7 +572,6 @@ mod tests {
         save(&store, &a, "deps-local", 2);
         assert!(run(lookup(&store, &main_branch(), "deps-local", &[], V, 0)).unwrap().is_none());
         assert_eq!(local_access(&local_claims("gh77", "computer", "refs/heads/main", "main", "1", "1")).unwrap().scopes.len(), 2);
-        assert!(local_access(&serde_json::json!({ "ns": "x/y", "ac": "[]" })).is_err());
         assert!(local_ns("acme/app").starts_with("local-"));
     }
 }

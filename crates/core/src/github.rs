@@ -108,12 +108,12 @@ pub fn manifest_target(host: Option<&str>, owner: &Owner, state: &str) -> String
     format!("{base}?state={state}")
 }
 
-async fn gh(http: &dyn Http, api: &str, method: &str, path: &str, token: Option<&str>, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
+async fn gh(http: &dyn Http, api: &str, method: &str, path: &str, token: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
     let mut req = Request::new(method, &format!("{api}{path}"))
         .with_header("accept", "application/vnd.github+json")
         .with_header("user-agent", "superci-plane")
-        .with_header("x-github-api-version", "2022-11-28");
-    if let Some(t) = token { req = req.with_header("authorization", &format!("Bearer {t}")); }
+        .with_header("x-github-api-version", "2022-11-28")
+        .with_header("authorization", &format!("Bearer {token}"));
     if let Some(b) = body { req = req.with_header("content-type", "application/json").with_body(b.to_string()); }
     let r = http.send(req).await?;
     if r.status >= 300 { return Err(format!("GitHub {method} {path}: {} {}", r.status, r.body_text().chars().take(300).collect::<String>())); }
@@ -137,7 +137,7 @@ pub struct Installation {
 }
 
 pub async fn installations(http: &dyn Http, app: &App, now_ms: u64) -> Result<Vec<Installation>> {
-    let r = gh(http, &app.api(), "GET", "/app/installations", Some(&app_jwt(app, now_ms)?), None).await?;
+    let r = gh(http, &app.api(), "GET", "/app/installations", &app_jwt(app, now_ms)?, None).await?;
     Ok(r.as_array().map(|a| a.iter().map(|i| Installation {
         id: i["id"].as_u64().unwrap_or_default(),
         account: i["account"]["login"].as_str().unwrap_or_default().to_string(),
@@ -150,7 +150,7 @@ pub async fn installations(http: &dyn Http, app: &App, now_ms: u64) -> Result<Ve
 pub async fn public_repositories(http: &dyn Http, api: &str, token: &str) -> Result<Vec<String>> {
     let mut out = vec![];
     for page in 1..=10 {
-        let r = gh(http, api, "GET", &format!("/installation/repositories?per_page=100&page={page}"), Some(token), None).await?;
+        let r = gh(http, api, "GET", &format!("/installation/repositories?per_page=100&page={page}"), token, None).await?;
         let repos = r["repositories"].as_array().cloned().unwrap_or_default();
         out.extend(repos.iter().filter(|x| x["private"] == false).filter_map(|x| x["full_name"].as_str().map(str::to_string)));
         if repos.len() < 100 { break }
@@ -166,11 +166,11 @@ pub async fn app_permissions(http: &dyn Http, app: &App, now_ms: u64) -> Result<
 /// The App as GitHub has it now: what it asks for, and its name and address (`slug`), which its owner can change on
 /// GitHub at any time.
 pub async fn app_now(http: &dyn Http, app: &App, now_ms: u64) -> Result<serde_json::Value> {
-    gh(http, &app.api(), "GET", "/app", Some(&app_jwt(app, now_ms)?), None).await
+    gh(http, &app.api(), "GET", "/app", &app_jwt(app, now_ms)?, None).await
 }
 
 pub async fn installation_token(http: &dyn Http, app: &App, installation_id: u64, now_ms: u64) -> Result<String> {
-    let r = gh(http, &app.api(), "POST", &format!("/app/installations/{installation_id}/access_tokens"), Some(&app_jwt(app, now_ms)?), Some(serde_json::json!({}))).await?;
+    let r = gh(http, &app.api(), "POST", &format!("/app/installations/{installation_id}/access_tokens"), &app_jwt(app, now_ms)?, Some(serde_json::json!({}))).await?;
     r["token"].as_str().map(str::to_string).ok_or_else(|| "installation token missing".into())
 }
 
@@ -221,13 +221,13 @@ pub async fn job_log(http: &dyn Http, api: &str, token: &str, repo: &str, job_id
 /// hosted runners).
 pub async fn jit_config(http: &dyn Http, api: &str, token: &str, owner: &Owner, repo: &str, name: &str, labels: &[&str], work_folder: &str) -> Result<(String, u64)> {
     let path = if owner.org { format!("/orgs/{}/actions/runners/generate-jitconfig", owner.login) } else { format!("/repos/{repo}/actions/runners/generate-jitconfig") };
-    let r = gh(http, api, "POST", &path, Some(token), Some(serde_json::json!({ "name": name, "runner_group_id": 1, "labels": labels, "work_folder": work_folder }))).await?;
+    let r = gh(http, api, "POST", &path, token, Some(serde_json::json!({ "name": name, "runner_group_id": 1, "labels": labels, "work_folder": work_folder }))).await?;
     Ok((r["encoded_jit_config"].as_str().ok_or("no runner config")?.to_string(), r["runner"]["id"].as_u64().unwrap_or_default()))
 }
 
 /// Webhook deliveries that failed recently (the runtime was restarting, or timed out): their ids, for redelivery.
 pub async fn failed_deliveries(http: &dyn Http, app: &App, since_ms: u64, now_ms: u64) -> Result<Vec<(u64, String)>> {
-    let r = gh(http, &app.api(), "GET", "/app/hook/deliveries?per_page=100", Some(&app_jwt(app, now_ms)?), None).await?;
+    let r = gh(http, &app.api(), "GET", "/app/hook/deliveries?per_page=100", &app_jwt(app, now_ms)?, None).await?;
     Ok(r.as_array().into_iter().flatten().filter(|d| {
         let code = d["status_code"].as_u64().unwrap_or(0);
         let at = d["delivered_at"].as_str().and_then(crate::aws::parse_iso_ms).unwrap_or(0);
@@ -241,10 +241,10 @@ pub async fn failed_deliveries(http: &dyn Http, app: &App, since_ms: u64, now_ms
 pub async fn waiting_jobs(http: &dyn Http, api: &str, token: &str, repo: &str, started_too: bool) -> Result<Vec<(serde_json::Value, bool)>> {
     let mut out = vec![];
     for status in if started_too { &["queued", "in_progress"][..] } else { &["queued"][..] } {
-        let runs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs?status={status}&per_page=10"), Some(token), None).await?;
+        let runs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs?status={status}&per_page=10"), token, None).await?;
         for run in runs["workflow_runs"].as_array().into_iter().flatten() {
             let Some(id) = run["id"].as_u64() else { continue };
-            let jobs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{id}/jobs?per_page=50"), Some(token), None).await?;
+            let jobs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{id}/jobs?per_page=50"), token, None).await?;
             for job in jobs["jobs"].as_array().into_iter().flatten().filter(|j| j["status"] == "queued") { out.push((job.clone(), run["repository"]["private"] == true)) }
         }
     }
@@ -258,13 +258,13 @@ pub async fn deliveries(http: &dyn Http, app: &App, id: Option<u64>, now_ms: u64
     let jwt = app_jwt(app, now_ms)?;
     match id {
         Some(id) => {
-            let d = gh(http, &app.api(), "GET", &format!("/app/hook/deliveries/{id}"), Some(&jwt), None).await?;
+            let d = gh(http, &app.api(), "GET", &format!("/app/hook/deliveries/{id}"), &jwt, None).await?;
             let job = &d["request"]["payload"]["workflow_job"];
             Ok(serde_json::json!({ "id": d["id"], "event": d["event"], "action": d["action"], "delivered_at": d["delivered_at"], "status": d["status"], "status_code": d["status_code"], "redelivery": d["redelivery"], "duration": d["duration"],
                 "url": d["url"], "job": job["id"], "job_name": job["name"], "labels": job["labels"], "answer": d["response"]["payload"].as_str().map(|p| p.chars().take(600).collect::<String>()) }))
         }
         None => {
-            let list = gh(http, &app.api(), "GET", "/app/hook/deliveries?per_page=100", Some(&jwt), None).await?;
+            let list = gh(http, &app.api(), "GET", "/app/hook/deliveries?per_page=100", &jwt, None).await?;
             Ok(serde_json::Value::Array(list.as_array().into_iter().flatten().map(|d| serde_json::json!({ "id": d["id"], "event": d["event"], "action": d["action"], "delivered_at": d["delivered_at"], "status": d["status"], "status_code": d["status_code"], "redelivery": d["redelivery"], "duration": d["duration"] })).collect()))
         }
     }
@@ -272,58 +272,58 @@ pub async fn deliveries(http: &dyn Http, app: &App, id: Option<u64>, now_ms: u64
 
 /// Points the App's webhook at a control plane (moving to another one keeps the App and its installations).
 pub async fn set_webhook_url(http: &dyn Http, app: &App, url: &str, now_ms: u64) -> Result<()> {
-    gh(http, &app.api(), "PATCH", "/app/hook/config", Some(&app_jwt(app, now_ms)?), Some(serde_json::json!({ "url": url, "content_type": "json" }))).await.map(|_| ())
+    gh(http, &app.api(), "PATCH", "/app/hook/config", &app_jwt(app, now_ms)?, Some(serde_json::json!({ "url": url, "content_type": "json" }))).await.map(|_| ())
 }
 
 /// Removes the App from an account it is installed on (stopping SuperCI: its jobs no longer come).
 pub async fn delete_installation(http: &dyn Http, app: &App, installation_id: u64, now_ms: u64) -> Result<()> {
-    gh(http, &app.api(), "DELETE", &format!("/app/installations/{installation_id}"), Some(&app_jwt(app, now_ms)?), None).await.map(|_| ())
+    gh(http, &app.api(), "DELETE", &format!("/app/installations/{installation_id}"), &app_jwt(app, now_ms)?, None).await.map(|_| ())
 }
 
 pub async fn redeliver(http: &dyn Http, app: &App, delivery_id: u64, now_ms: u64) -> Result<()> {
-    gh(http, &app.api(), "POST", &format!("/app/hook/deliveries/{delivery_id}/attempts"), Some(&app_jwt(app, now_ms)?), None).await.map(|_| ())
+    gh(http, &app.api(), "POST", &format!("/app/hook/deliveries/{delivery_id}/attempts"), &app_jwt(app, now_ms)?, None).await.map(|_| ())
 }
 
 /// A workflow run's status at GitHub ("queued", "in_progress", "completed").
 pub async fn run_status(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64) -> Result<String> {
-    let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{run_id}"), Some(token), None).await?;
+    let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{run_id}"), token, None).await?;
     v["status"].as_str().map(str::to_string).ok_or_else(|| "no run status".into())
 }
 
 /// Runs one job of a finished run again (and the jobs that depend on it), as a new attempt. Needs Actions: write;
 /// GitHub refuses while the run is still going.
 pub async fn rerun_job(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<()> {
-    gh(http, api, "POST", &format!("/repos/{repo}/actions/jobs/{job_id}/rerun"), Some(token), Some(serde_json::json!({}))).await.map(|_| ())
+    gh(http, api, "POST", &format!("/repos/{repo}/actions/jobs/{job_id}/rerun"), token, Some(serde_json::json!({}))).await.map(|_| ())
 }
 
 /// A workflow run cancelled, as its Cancel button does (its jobs' runners are told to stop; those not started end).
 pub async fn cancel_run(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64) -> Result<()> {
-    gh(http, api, "POST", &format!("/repos/{repo}/actions/runs/{run_id}/cancel"), Some(token), Some(serde_json::json!({}))).await.map(|_| ())
+    gh(http, api, "POST", &format!("/repos/{repo}/actions/runs/{run_id}/cancel"), token, Some(serde_json::json!({}))).await.map(|_| ())
 }
 
 /// Runs a finished run's failed jobs again (and the jobs that depend on them), as one new attempt: for a run with
 /// several jobs to run again (GitHub takes one request per attempt).
 pub async fn rerun_failed_jobs(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64) -> Result<()> {
-    gh(http, api, "POST", &format!("/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"), Some(token), Some(serde_json::json!({}))).await.map(|_| ())
+    gh(http, api, "POST", &format!("/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"), token, Some(serde_json::json!({}))).await.map(|_| ())
 }
 
 /// A job's status at GitHub ("queued", "in_progress", "completed", …).
 /// A repository as GitHub gives it (its id, its default branch, …).
 pub async fn repository(http: &dyn Http, api: &str, token: &str, repo: &str) -> Result<serde_json::Value> {
     if repo.split('/').count() != 2 || !repo.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_./".contains(&b)) { return Err("not a repository".into()) }
-    gh(http, api, "GET", &format!("/repos/{repo}"), Some(token), None).await
+    gh(http, api, "GET", &format!("/repos/{repo}"), token, None).await
 }
 
 /// A repository by GitHub's id of it.
 pub async fn repository_by_id(http: &dyn Http, api: &str, token: &str, id: &str) -> Result<serde_json::Value> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) { return Err("not a repository id".into()) }
-    gh(http, api, "GET", &format!("/repositories/{id}"), Some(token), None).await
+    gh(http, api, "GET", &format!("/repositories/{id}"), token, None).await
 }
 
 /// A job's steps as GitHub has them now: each one's name, status ("queued", "in_progress", "completed"), conclusion,
 /// and when it began and ended.
 pub async fn job_steps(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<Vec<serde_json::Value>> {
-    let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/jobs/{job_id}"), Some(token), None).await?;
+    let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/jobs/{job_id}"), token, None).await?;
     Ok(v["steps"].as_array().cloned().unwrap_or_default().into_iter().map(|s| serde_json::json!({ "name": s["name"], "status": s["status"], "conclusion": s["conclusion"], "number": s["number"],
         "started_at": s["started_at"], "completed_at": s["completed_at"] })).collect())
 }
@@ -334,7 +334,7 @@ pub async fn job_status(http: &dyn Http, api: &str, token: &str, repo: &str, job
 
 /// A job's status ("queued", "in_progress", "completed") and the runner it began on, if it has begun.
 pub async fn job_state(http: &dyn Http, api: &str, token: &str, repo: &str, job_id: u64) -> Result<(String, Option<String>)> {
-    let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/jobs/{job_id}"), Some(token), None).await?;
+    let v = gh(http, api, "GET", &format!("/repos/{repo}/actions/jobs/{job_id}"), token, None).await?;
     let status = v["status"].as_str().ok_or("no job status")?.to_string();
     Ok((status, v["runner_name"].as_str().filter(|n| !n.is_empty()).map(str::to_string)))
 }
@@ -349,7 +349,7 @@ pub async fn runner_busy(http: &dyn Http, api: &str, token: &str, owner: &Owner,
 /// job. None: GitHub no longer knows it.
 pub async fn runner_state(http: &dyn Http, api: &str, token: &str, owner: &Owner, repo: &str, runner_id: u64) -> Result<Option<(bool, bool)>> {
     let path = if owner.org { format!("/orgs/{}/actions/runners/{runner_id}", owner.login) } else { format!("/repos/{repo}/actions/runners/{runner_id}") };
-    match gh(http, api, "GET", &path, Some(token), None).await {
+    match gh(http, api, "GET", &path, token, None).await {
         Ok(v) => Ok(Some((v["status"] == "online", v["busy"].as_bool().unwrap_or(false)))),
         Err(e) if e.contains(": 404 ") => Ok(None),
         Err(e) => Err(e),
@@ -358,7 +358,7 @@ pub async fn runner_state(http: &dyn Http, api: &str, token: &str, owner: &Owner
 
 pub async fn delete_runner(http: &dyn Http, api: &str, token: &str, owner: &Owner, repo: &str, runner_id: u64) -> Result<()> {
     let path = if owner.org { format!("/orgs/{}/actions/runners/{runner_id}", owner.login) } else { format!("/repos/{repo}/actions/runners/{runner_id}") };
-    gh(http, api, "DELETE", &path, Some(token), None).await.map(|_| ())
+    gh(http, api, "DELETE", &path, token, None).await.map(|_| ())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -431,7 +431,7 @@ pub fn our_job_among(payload: &serde_json::Value, bases: &[String], owner_login:
 /// Whether a workflow run's code may come from outside the repository: a pull request from a fork, or a
 /// `pull_request_target` run (started by a pull request, with the repository's secrets). Asked of GitHub (Actions: read).
 pub async fn run_from_outside(http: &dyn Http, api: &str, token: &str, repo: &str, run_id: u64) -> Result<Option<String>> {
-    let r = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{run_id}"), Some(token), None).await?;
+    let r = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{run_id}"), token, None).await?;
     let (base, head) = (r["repository"]["id"].as_u64(), r["head_repository"]["id"].as_u64());
     if base.is_none() { return Err("GitHub did not say where the run came from".into()) }
     if head != base { return Ok(Some("a pull request from a fork".into())) }

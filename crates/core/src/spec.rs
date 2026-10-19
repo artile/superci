@@ -284,7 +284,6 @@ impl Capacity {
         if !self.arch.iter().any(|a| a == s.arch()) { return Err(format!("{} only", self.arch.join(", "))) }
         if !self.os.iter().any(|o| o == s.os()) { return Err(format!("{} only", self.os.iter().map(|o| os_name(o)).collect::<Vec<_>>().join(", "))) }
         if let Some(i) = s.image.as_deref().filter(|i| !self.images.iter().any(|x| x == i)) { return Err(format!("no {i} image (only {})", self.images.join(", "))) }
-        if s.on_demand() && !self.on_demand { return Err("spot machines only".into()) }
         if !s.families.is_empty() && !self.scratch { return Err("no AWS machine families".into()) }
         if s.scratch.is_some() && !self.scratch { return Err(format!("no {}", if s.ramdisk() { "RAM disk" } else { "machines with a local disk to ask for" })) }
         if s.scratch.is_some() && s.os() != "linux" { return Err("a RAM disk or a local disk on Linux only".into()) }

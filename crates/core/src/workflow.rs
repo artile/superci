@@ -90,8 +90,9 @@ impl MarkedEventReceiver for Build {
             }
             Event::SequenceStart(anchor, ..) => { self.stack.push(Node::Seq { items: vec![], line, col }); self.anchored.push(anchor) }
             Event::MappingStart(anchor, ..) => { self.stack.push(Node::Map { pairs: vec![], line, col }); self.keys.push(vec![]); self.anchored.push(anchor) }
-            Event::SequenceEnd => if let Some(n) = self.stack.pop() { self.end(n) },
-            Event::MappingEnd => { self.keys.pop(); if let Some(n) = self.stack.pop() { self.end(n) } }
+            // (The parser ends only what it began.)
+            Event::SequenceEnd => { let n = self.stack.pop().expect("a sequence begun"); self.end(n) }
+            Event::MappingEnd => { self.keys.pop(); let n = self.stack.pop().expect("a mapping begun"); self.end(n) }
             // An alias (`*name`): the value its anchor named, as if written here (as GitHub Actions reads it).
             Event::Alias(anchor) => match self.anchors.get(&anchor).cloned() {
                 Some(node) => self.put(node),
@@ -313,7 +314,7 @@ pub fn job_parts(workflow: &Node, path: &str, job: &str, ids: &mut dyn FnMut() -
         };
         // A parallel group: each of its steps run in the background, then waited for together.
         let (line, _) = s.place();
-        if let Node::Map { pairs, .. } = s { if pairs.len() > 1 { return Err(format!("line {line}: a `parallel` group has only its steps")) } }
+        if s.pairs().len() > 1 { return Err(format!("line {line}: a `parallel` group has only its steps")) }
         let group_id = format!("__parallel_{groups}");
         groups += 1;
         let mut names = vec![];
@@ -390,7 +391,7 @@ pub fn matrix_with(job: &Node, read: Reader) -> std::result::Result<Option<Vec<s
     for inc in entries("include")? {
         let mut matched = false;
         for c in combos.iter_mut().take(original) {
-            if inc.iter().filter(|(k, _)| keys.contains(k)).all(|(k, v)| c.get(k) == Some(v)) { for (k, v) in &inc { if !keys.contains(k) || c.get(k).is_none() { c.insert(k.clone(), v.clone()); } } matched = true }
+            if inc.iter().filter(|(k, _)| keys.contains(k)).all(|(k, v)| c.get(k) == Some(v)) { for (k, v) in &inc { if !keys.contains(k) { c.insert(k.clone(), v.clone()); } } matched = true }
         }
         if !matched { combos.push(inc) }
     }
