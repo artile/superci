@@ -5389,6 +5389,22 @@ mod runs_suite_in_browser {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A working tree with a file that cannot be read: nothing is sent, and why is said.
+    #[test]
+    fn a_working_tree_with_a_file_that_cannot_be_read_is_not_sent_and_says_why() {
+        use std::os::unix::fs::PermissionsExt;
+        let served = serve(|_| {});
+        let dir = checkout();
+        std::fs::write(dir.join("Makefile"), "test:\n\techo changed\n").unwrap();
+        std::fs::set_permissions(dir.join("Makefile"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        std::fs::set_permissions(dir.join("Makefile"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let said = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(!o.status.success() && said.contains("Makefile") && !said.contains("panicked"), "{said}");
+        assert!(served.store.under("run:").is_empty(), "no run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Lines its runner left out as a step went (empty ones, which it never sends, and others): once the step's log is
     /// here, only the ones with something in them come late, without the empty lines at either end of each gap.
     #[test]
