@@ -2979,9 +2979,12 @@ impl Dashboard {
                 let state = self.moving.clone();
                 *lock(&state) = Some(Move { to: to.plane_id().to_string(), at: 0, result: None, ended_ms: 0 });
                 std::thread::spawn(move || {
-                    let step = |n: usize| if let Some(m) = lock(&state).as_mut() { m.at = n };
+                    // (Its state is set before this thread starts, and nothing takes it away.)
+                    let step = |n: usize| lock(&state).as_mut().expect("a move under way").at = n;
                     let result = move_plane(&writer, &key, &from, &to, from_view.status.unwrap_or_default(), &plan, cf_account, aws_account, &step);
-                    if let Some(m) = lock(&state).as_mut() { m.result = Some(result); m.ended_ms = now_ms() }
+                    let mut m = lock(&state);
+                    let m = m.as_mut().expect("a move under way");
+                    (m.result, m.ended_ms) = (Some(result), now_ms());
                 });
                 Ok(Response::redirect("/?p=planes"))
             }
@@ -3121,7 +3124,8 @@ impl Dashboard {
                     renames(&status, &names)
                 } else { (vec![], vec![]) };
                 std::thread::spawn(move || {
-                    let step = |n: usize| if let Some(u) = lock(&state).as_mut() { u.at = n };
+                    // (Its state is set before this thread starts, and nothing takes it away.)
+                    let step = |n: usize| lock(&state).as_mut().expect("an update under way").at = n;
                     let result = (|| -> Result<()> {
                         for (name, value) in &puts { writer.put(&plane, name, value)? }
                         let url = match &plane {
@@ -3147,7 +3151,9 @@ impl Dashboard {
                         Ok(())
                     })();
                     if result.is_ok() { lock(side()).clear() }
-                    if let Some(u) = lock(&state).as_mut() { u.result = Some(result); u.ended_ms = now_ms() }
+                    let mut u = lock(&state);
+                    let u = u.as_mut().expect("an update under way");
+                    (u.result, u.ended_ms) = (Some(result), now_ms());
                 });
                 let next = safe_return(&field("next"));
                 Ok(Response::redirect(&format!("/{}", if next.is_empty() { "?p=planes" } else { &next })))

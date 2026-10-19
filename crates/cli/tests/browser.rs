@@ -3096,6 +3096,28 @@ fn a_control_plane_that_stops_taking_the_key_while_its_reading_is_kept_is_read_a
 }
 
 #[test]
+fn an_account_that_may_run_only_where_the_image_is_not_is_offered_the_copy_first_then_waits_for_it() {
+    // As a project of AWS's new sign-up answered (Stockholm alone allowed), without the image jobs run on there yet.
+    let account = superci_testkit::Aws::serve();
+    let none = r#"<?xml version="1.0" encoding="UTF-8"?><DescribeImagesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>00000000-0000-4000-8000-000000000001</requestId><imagesSet/></DescribeImagesResponse>"#;
+    account.fail("DescribeImages|ec2.eu-north-1", 200, none, None);
+    account.replaying(include_str!("../fixtures/aws/project-activated/look.jsonl"), &[]);
+    let home = common::aws_only(&account);
+    let (mut child, link) = common::dashboard(&home);
+    let page = || common::words(&common::part(&link, "/?p=plane&fragment=1").1);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !page().contains("Needed before Set up: about ten minutes Copy the image into Stockholm") { assert!(std::time::Instant::now() < end, "{}", page()); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    // Copied in (as AWS copied it into Canada): the row waits for the copy.
+    account.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[("ca-central-1", "eu-north-1")]);
+    let (status, to, said) = common::post(&link, "/aws/image", &[("region", "eu-north-1")]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to} {}", common::words(&said));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !page().contains("Copying the image into Stockholm: about ten minutes") { assert!(std::time::Instant::now() < end, "{}", page()); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // A control plane whose own account runs jobs, with a budget in AWS for its limit; AWS answering nothing more.
