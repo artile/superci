@@ -3703,7 +3703,7 @@ mod runs_in_browser {
     fn superci(served: &superci_testkit::Served, dir: &std::path::Path, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_superci"));
         // (A run over waits 3 seconds at most for steps' logs here, where a minute would only slow the tests.)
-        c.current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_LOGS_WAIT_S", "3").stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_LOGS_WAIT_S", "3").env("SUPERCI_STAND_IN", &served.aws.url).stdout(Stdio::piped()).stderr(Stdio::piped());
         c
     }
     /// The runner of the job shown as `name`, once it is started.
@@ -5226,6 +5226,43 @@ mod runs_suite_in_browser {
         super::seen_in_browser(&served);
     }
 
+    /// A run from a computer on an AWS machine: its machine reaches the cache with its own link, as the run's token
+    /// would (its own scope to write), and keeps a tool's artifact there.
+    #[test]
+    fn a_run_from_a_computer_on_aws_keeps_a_tools_artifact_in_the_cache_by_its_machines_link() {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+        served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+        served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+        let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+        served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+        served.aws.fail("RunInstances", 200, &started, None);
+        served.github.put_object(&format!("{}/{}", superci_core::cache::bucket(PLANE, "us-east-1"), superci_core::cache::program_key("x86_64")), b"program");
+        let dir = checkout();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let asked = loop {
+            if let Some(a) = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()) { break a }
+            assert!(std::time::Instant::now() < end, "no machine asked for");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+        use base64::Engine;
+        let script = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(data).unwrap()).unwrap();
+        let link = script.split("/cache/").nth(1).unwrap().split(|c| c == '\'' || c == '"' || c == '/').next().unwrap().to_string();
+        let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+        let call = |what: &str, body: serde_json::Value| { let mut r = agent.post(&format!("{}/cache/{link}/{what}", served.url)).send(body.to_string()).unwrap(); (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()) };
+        let (status, said) = call("tool-begin", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" }));
+        assert_eq!(status, 200, "{said}");
+        assert_eq!(call("tool-finish", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "size": 12 })).0, 200);
+        assert!(call("tool-get", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).1.contains("\"hit\":true"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Lines its runner left out as a step went (empty ones, which it never sends, and others): once the step's log is
     /// here, only the ones with something in them come late, without the empty lines at either end of each gap.
     #[test]
@@ -5297,7 +5334,7 @@ mod runs_suite_in_browser {
     fn superci(served: &superci_testkit::Served, dir: &std::path::Path, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_superci"));
         // (A run over waits 3 seconds at most for steps' logs here, where a minute would only slow the tests.)
-        c.current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_LOGS_WAIT_S", "3").stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_LOGS_WAIT_S", "3").env("SUPERCI_STAND_IN", &served.aws.url).stdout(Stdio::piped()).stderr(Stdio::piped());
         c
     }
 
@@ -5765,7 +5802,7 @@ mod runs_suite_in_browser {
         served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
         // (Two CPUs: the machines asked for on Test.)
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2\n    steps:\n      - run: make test\n")]);
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let run = run_of(&served);
         let job = loop {
@@ -5793,7 +5830,7 @@ mod runs_suite_in_browser {
         });
         served.aws.replaying(include_str!("../fixtures/aws/launch/on-demand.jsonl"), &[]);
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2/spot=false\n    steps:\n      - run: make test\n")]);
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let job = loop {
             if let Some((_, j)) = served.store.under("job:").into_iter().next().filter(|(_, j)| j["machine_id"].is_string() || j["state"] == "failed") { break j }
@@ -6426,7 +6463,7 @@ mod runs_suite_in_browser {
         served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
         served.github.refuse_puts(true);
         let dir = checkout();
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
         let run = run_of(&served);
         assert!(!o.status.success() && said.contains("The working tree was not sent (the bucket said 403") && said.contains(&format!("run {run} was cancelled")), "{said}");
@@ -6556,7 +6593,7 @@ mod runs_suite_in_browser {
         assert_eq!(cache(gh_link, "finish", serde_json::json!({ "token": main, "key": "test-times-1", "version": version, "pieces": [["p00000", 5]] })).1["size"], 5);
         // A checkout with no GitHub remote (a copy of the repository): its cache is its own, and it says so.
         let dir = checkout();
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         let said = String::from_utf8_lossy(&o.stdout).to_string();
         assert!(o.status.success() && said.contains("Its cache is its own: this checkout has no GitHub remote") && said.contains("--repo=OWNER/NAME"), "{said}{}", String::from_utf8_lossy(&o.stderr));
         let first = run_of(&served);
@@ -6567,7 +6604,7 @@ mod runs_suite_in_browser {
         let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme", "--detach"]).output().unwrap();
         assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("--repo is a GitHub repository, OWNER/NAME"), "{}", String::from_utf8_lossy(&o.stderr));
         // Named with --repo (as its origin would say it): the repository's entries, as GitHub's jobs saved them.
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme/app", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme/app", "--detach"]).output().unwrap();
         assert!(o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("Its cache is its own"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let run = served.store.under("run:").into_iter().map(|(k, _)| k.trim_start_matches("run:").to_string()).find(|k| *k != first).unwrap();
         let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
@@ -6599,7 +6636,7 @@ mod runs_suite_in_browser {
         let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
         served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
         let dir = checkout();
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let run = run_of(&served);
         let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
@@ -7055,7 +7092,7 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
         served.aws.replaying(include_str!("../fixtures/aws/launch/gpu-on-demand.jsonl"), &[]);
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  train:\n    runs-on: superci/gpu=any/spot=false\n    steps:\n      - run: make train\n")]);
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let job = job_of(&served);
         assert_eq!(job["state"], "failed", "{job}");
@@ -7067,7 +7104,7 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
         served.aws.replaying(include_str!("../fixtures/aws/launch/unsupported.jsonl"), &[]);
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2/spot=false\n    steps:\n      - run: make test\n")]);
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let job = job_of(&served);
         let asks = job["asks"].as_array().cloned().unwrap_or_default();
@@ -7089,7 +7126,7 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         // (Only AWS: Cloudflare off in the order, nowhere else to go.)
         served.aws.put(&format!("/superci/{}/ROUTING", superci_testkit::PLANE), r#"{"default":null,"rules":[],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
         let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci/cpu=2\n    steps:\n      - run: make test\n")]);
-        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_STAND_IN", &served.aws.url).output().unwrap();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let job = loop {
             if let Some((_, j)) = served.store.under("job:").into_iter().next().filter(|(_, j)| j["state"] != "launching") { break j }
