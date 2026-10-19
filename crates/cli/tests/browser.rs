@@ -11492,3 +11492,65 @@ fn costs_and_logs_asked_of_a_control_plane_with_what_is_no_job_are_left_alone() 
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Starting a job's machine when AWS answers slowly (each pool's answer taking seconds, until the time a start may
+/// take is over: the job waits for the next sweep), while the job itself ends (cancelled meanwhile: no machine kept
+/// for it), and when GitHub says the runner's name is taken. Each job's page says what happened.
+#[test]
+fn a_machine_start_out_of_time_ended_meanwhile_or_with_its_runner_name_taken_is_said_on_the_jobs_page() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let no_room = superci_testkit::ec2_error("InsufficientInstanceCapacity", "We currently do not have sufficient capacity in the Availability Zone you requested.");
+    let mut ids = vec![];
+    // Out of time: every pool's answer six seconds on, none with room.
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    let tick = served.ticker();
+    served.aws.during("RunInstances", move || tick(6_000));
+    served.aws.fail("RunInstances", 500, &no_room, None);
+    let (id, q) = served.github.queue("slow", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    ids.push(id);
+    served.aws.during.lock().unwrap().clear();
+    served.aws.fail_none();
+    // Ended while its machine was asked for: the job's record says it ended before AWS answered.
+    let store = served.store.0.clone();
+    served.aws.during("RunInstances", move || {
+        let mut s = store.lock().unwrap();
+        let keys: Vec<String> = s.keys().filter(|k| k.starts_with("job:")).cloned().collect();
+        for k in keys {
+            let mut j: serde_json::Value = serde_json::from_str(&s[&k]).unwrap();
+            if j["name"] == "ends meanwhile" && j["ended_ms"].is_null() { j["state"] = "done".into(); j["ended_ms"] = j["at_ms"].clone(); s.insert(k, j.to_string()); }
+        }
+    });
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    served.aws.fail("RunInstances", 200, &started, None);
+    let (id, q) = served.github.queue("ends meanwhile", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    ids.push(id);
+    served.aws.during.lock().unwrap().clear();
+    // The runner's name taken at GitHub.
+    served.github.fail("POST", "generate-jitconfig", 409, "Already exists - A runner with the name acmeci-1 already exists.");
+    let (id, q) = served.github.queue("name taken", "superci", served.now_ms());
+    assert!(served.webhook(q) < 500);
+    ids.push(id);
+    served.github.fail_none();
+    served.aws.fail_none();
+    // A sweep on: the slow one asked again.
+    served.later(70_000);
+    served.upkeep();
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    for id in ids {
+        b.goto(&format!("{link}&p=job&id={id}"));
+        b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
