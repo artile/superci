@@ -10989,6 +10989,14 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     let out = home.join("running.log");
     let (code, said) = cli(&["jobs", "retrieve", &rid.to_string(), &format!("--out={}", out.display())]);
     assert!(code == 0 && said.contains("Its log so far (the job is still running)"), "{code} {said}");
+    // A computer signed in nowhere, with a read key given: what changes something says that key only reads.
+    let nowhere = home.with_extension("nowhere");
+    std::fs::create_dir_all(&nowhere).unwrap();
+    for args in [&["labels", "create", "acmeci-x"][..], &["caches", "update", "--days=5"], &["caches", "delete", "--repo=acme/app", "--confirm"]] {
+        let o = common::command(&nowhere).args(args).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.key).output().unwrap();
+        assert!(!o.status.success() && !String::from_utf8_lossy(&o.stderr).contains("panicked"), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    let _ = std::fs::remove_dir_all(&nowhere);
     // A run whose job still waits for room (no machine, no end): its tests are not looked for.
     let (wid, q) = served.github.queue("waits for room", "superci", served.now_ms()); served.webhook(q);
     { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{wid}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
