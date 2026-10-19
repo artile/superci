@@ -10966,6 +10966,14 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     served.webhook(served.github.finish(tid, "failure", tests_log, served.now_ms()));
     let tid_s = tid.to_string();
     let trun = served.store.under(&format!("job:{tid}"))[0].1["run_id"].to_string();
+    // And one that passed with skipped and flaky tests (pytest's, Playwright's), and a cargo crate that ran none.
+    let mixed_log = "2026-10-15T10:00:00.0000000Z ##[group]Run tests\n2026-10-15T10:00:01.0000000Z ======= 3 passed, 1 skipped in 1.23s =======\n2026-10-15T10:00:01.0000000Z Running 6 tests using 2 workers\n2026-10-15T10:00:02.0000000Z   1 flaky\n2026-10-15T10:00:02.0000000Z   5 passed (3.1s)\n2026-10-15T10:00:03.0000000Z running 0 tests\n2026-10-15T10:00:03.0000000Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+    let (mid, q) = served.github.queue("mixed tests", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(mid));
+    served.webhook(served.github.finish(mid, "success", mixed_log, served.now_ms()));
+    let o = common::command(&home).args(["jobs", "retrieve", &mid.to_string(), "--tests"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(o.status.success() && said.contains("1 skipped") && said.contains("playwright"), "{said}{}", String::from_utf8_lossy(&o.stderr));
     for args in [vec!["jobs", "retrieve", tid_s.as_str(), "--tests"], vec!["runs", "retrieve", trun.as_str(), "--tests"], vec!["jobs", "retrieve", tid_s.as_str(), "--tests", "--json"]] {
         let o = common::command(&home).args(&args).output().unwrap();
         let said = String::from_utf8_lossy(&o.stdout).to_string();
@@ -11067,7 +11075,7 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["caches", "list", "--repo=acme/nothing"], vec!["secrets", "create", "DRY", "--value-env=HOME", "--dry-run"], vec!["keys", "create", "agent", "--max-cpu=8"], vec!["keys", "create", "agent", "--daily-usd=5"],
         vec!["accounts", "retrieve", "gcp"], vec!["images", "create", "eu-west-1", "--from=nothing"], vec!["images", "create", "eu-west-1", "--from=us-east-1:ami-0123456789abcdef0", "--dry-run"],
         vec!["runners", "update", "cloudflare"], vec!["runners", "update", "aws", "--networks=subnet-0123456789abcdef0", "--dry-run"], vec!["public_repos", "list"], vec!["runs", "cancel", "999"],
-        vec!["login", "aws"], vec!["login"], vec!["login", "nowhere"], vec!["connections", "create", "github", "acme", "--dry-run"], vec!["jobs", "list", "-"],
+        vec!["login", "aws"], vec!["login"], vec!["login", "nowhere"], vec!["connections", "create", "github", "acme", "--dry-run"], vec!["jobs", "list", "-"], vec!["images", "delete", "eu-west-1", "--confirm"],
         // Help, a resource alone, what is no command.
         vec!["help"], vec!["help", "runs"], vec!["runs"], vec!["runs", "--help"], vec!["nothing"], vec!["runs", "nothing"], vec!["--version"],
     ];
