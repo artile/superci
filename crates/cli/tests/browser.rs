@@ -11227,3 +11227,36 @@ fn a_dashboard_with_several_workspaces_and_none_named_opens_on_the_last_shown_an
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Finding control planes when there are none to show: AWS's sign-in over (its credentials ended, nothing to renew
+/// them with), then only Cloudflare signed in and Cloudflare not answering at all. Each page says so and still reads.
+#[test]
+fn finding_control_planes_with_awss_sign_in_over_or_the_only_cloud_not_answering_says_so() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let home = common::home(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::Value::Null;
+    kept["aws"] = serde_json::json!({ "region": "us-east-1", "account_id": "111111111111", "who": "arn:aws:sts::111111111111:assumed-role/Admin/someone",
+        "creds": { "access_key_id": "ASIAEXAMPLE", "secret_access_key": "example", "session_token": "example", "expires_at_ms": 1 }, "refresh_token": "", "dpop": { "private_b64": "", "kid": "" } });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let pages = |b: &mut Browser, link: &str| for p in ["overview", "planes", "plane"] { b.goto(&format!("{link}&p={p}")); b.wait("document.querySelector('main') !== null"); };
+    let (mut child, link) = dashboard(&home);
+    pages(&mut b, &link);
+    let _ = child.kill();
+    // Only Cloudflare, and it answers nothing.
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["aws"] = serde_json::Value::Null;
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.fail("api.cloudflare.com", 503, "upstream connect error", None);
+    let (mut child, link) = dashboard(&home);
+    pages(&mut b, &link);
+    let page = b.eval("document.body.innerText").as_str().unwrap_or_default().to_string();
+    assert!(!page.contains("panicked"), "{page}");
+    served.aws.fail_none();
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
