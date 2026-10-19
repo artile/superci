@@ -1457,6 +1457,11 @@ fn the_aws_accounts_own_budget_set_raised_made_to_stop_lifted_and_removed_shows_
         b.goto(&format!("{link}&p=runners"));
         b.wait(&reads(card));
         if !gone.is_empty() { assert!(!b.eval("document.querySelector('main').innerText").as_str().unwrap().replace('\n', " ").contains(gone), "{file}") }
+        // The same from the CLI: the limits, and the account with its budget as AWS has it.
+        for args in [&["limits", "retrieve"][..], &["accounts", "retrieve", "aws"]] {
+            let o = common::command(&home).args(args).output().unwrap();
+            assert!(o.status.code().is_some_and(|c| c <= 3) && !String::from_utf8_lossy(&o.stderr).contains("panicked"), "{file} {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        }
     }
     assert!(served.aws.unanswered.lock().unwrap().is_empty(), "{:?}", served.aws.unanswered.lock().unwrap());
     // What a budget in AWS must not be: no email address, an answer that is none of AWS's, a lift with nothing to
