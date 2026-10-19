@@ -3170,6 +3170,31 @@ fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_t
     b.wait(&format!("{} && {} && {}", reads("ran past its longest time (6 hours)"), reads("did not start a machine for it, three times"), reads("ended")));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
+    // A longest time of 90 minutes; a job GitHub says nothing of when asked; one GitHub says another runner took,
+    // whose own runner GitHub says nothing of. Swept as they stand, said in minutes.
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"cloudflare"}],"max_minutes":90}"#);
+    let (long, q) = served.github.queue("long", "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(long));
+    let (untold, q) = served.github.queue("untold", "superci", served.now_ms()); served.webhook(q);
+    let (taken, q) = served.github.queue("taken elsewhere", "superci", served.now_ms()); served.webhook(q);
+    let _ = served.github.start_elsewhere(taken, "someone-elses-runner");
+    served.github.fail("GET", &format!("/actions/jobs/{untold}"), 500, "Server Error");
+    served.github.fail("GET", "/actions/runners/", 502, "Bad Gateway");
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    // Up a while, not yet late: kept as they are, asked again at the next sweep.
+    served.later(2 * 60_000); served.upkeep();
+    assert!(state(untold)["state"] == "launched" && state(taken)["state"] == "launched", "{} {}", state(untold), state(taken));
+    // Late: started again, and the other ended (its job is elsewhere); the long one past its 90 minutes.
+    served.later(4 * 60_000); served.upkeep();
+    served.later(100 * 60_000); served.upkeep();
+    assert!(state(long)["error"].as_str().unwrap_or_default().contains("ran past its longest time (90 minutes)"), "{}", state(long));
+    let home = common::home(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=jobs"));
+    b.wait(&reads("ran past its longest time (90 minutes)"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 
