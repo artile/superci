@@ -268,12 +268,25 @@ fn the_dashboard_and_a_task_open_in_the_browser_and_a_port_taken_is_said_as_it_s
     std::fs::write(bin.join("xdg-open"), format!("#!/bin/sh\necho \"$1\" >> {}\n", opened.display())).unwrap();
     std::fs::set_permissions(bin.join("xdg-open"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let free = || { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-    let first = |c: &mut std::process::Child| -> Vec<String> { std::io::BufReader::new(c.stdout.take().unwrap()).lines().map_while(Result::ok).take(2).collect() };
+    // What it says up to the line with `upto`, read for half a minute at most (not said: the test fails saying what
+    // came, it does not wait on).
+    let first = |c: &mut std::process::Child, upto: &str| -> Vec<String> {
+        let out = c.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { if tx.send(l).is_err() { break } });
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut got: Vec<String> = vec![];
+        while !got.last().is_some_and(|l| l.contains(upto)) {
+            match rx.recv_timeout(end.saturating_duration_since(std::time::Instant::now())) { Ok(l) => got.push(l), Err(_) => panic!("said {got:?}, never {upto:?}") }
+        }
+        got
+    };
     let handed = || std::fs::read_to_string(&opened).unwrap_or_default();
+    // (The dashboard says its link, then that it opens; a task says its link alone.)
     for (args, says) in [(&["dashboard", "--workspace=default"][..], "It is opening in your browser"), (&["connections", "create", "github", "acme", "--workspace=default"], "Create the GitHub App and choose its repositories here")] {
         let _ = std::fs::remove_file(&opened);
         let mut c = common::command(&home).args(args).env("SUPERCI_PORT", free().to_string()).env("PATH", &bin).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
-        let said = first(&mut c).join("\n");
+        let said = first(&mut c, says).join("\n");
         let link = said.split_whitespace().find(|w| w.starts_with("http://localhost")).unwrap().to_string();
         until("the browser handed its link", || handed().contains(&link));
         assert!(said.contains(says), "{said}");
@@ -289,7 +302,7 @@ fn the_dashboard_and_a_task_open_in_the_browser_and_a_port_taken_is_said_as_it_s
     let user = common::temp("user");
     std::fs::rename(&home, user.join(".superci")).unwrap();
     let mut c = common::command(&user).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_HOME", "").env("HOME", &user).env("SUPERCI_STAND_IN", &served.aws.url).env("SUPERCI_OAUTH_PORT", &port).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
-    let said = first(&mut c).join("\n");
+    let said = first(&mut c, "SuperCI dashboard").join("\n");
     let _ = c.kill();
     let _ = c.wait();
     assert!(said.contains(&format!("Port {port} is taken")) && said.contains("Both use the same sign-ins (SUPERCI_HOME gives this one a folder of its own)"), "{said}");
