@@ -984,3 +984,641 @@ fn the_control_plane_is_updated_with_its_cloudflare_and_modal_launchers_as_a_rea
     assert!(asked.iter().any(|a| a.starts_with("PUT https://api.cloudflare.com/") && a.contains(&format!("/workers/scripts/superci-runners-{plane}"))), "{asked:?}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A job's tests as its log's lines say them, each process's apart where lines are marked by it, and what is not a
+/// runner's line not taken for one; a run's other jobs, another attempt's, and one that never ran, said as they are.
+#[test]
+fn a_jobs_tests_are_read_by_process_from_lines_that_only_look_like_a_runners_and_a_runs_other_jobs_are_said_as_they_stand() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let (job_id, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    served.webhook(served.github.start(job_id));
+    let log = [
+        "[web] starting the server",
+        "Running checks",
+        "Running 3 checks using 2 processes",
+        "[slot 1] Running 8 tests using 1 worker",
+        "[slot 1]   ✓  1 [chromium] › e2e/a.spec.ts:3:1 › logs in (2xs)",
+        "[slot 1]   ✘  2 [chromium] › e2e/a.spec.ts:5:1 › sometimes (1.0s)",
+        "[slot 1]   ✓  3 [chromium] › e2e/a.spec.ts:5:1 › sometimes (retry #1)",
+        "[slot 1]   -  4 [chromium] › e2e/a.spec.ts:7:1 › later",
+        "[slot 1]   ✓  5 [chromium] › e2e/a.spec.ts:9:1 › odd (retry #)",
+        "[slot 1]   ✓  6 [chromium] › e2e/a.spec.ts:11:1 › odder (retry #x)",
+        "[slot 1]   ✓  7 [chromium › e2e/a.spec.ts:13:1 › unclosed",
+        "[slot 1]   ✘  8 [chromium] › e2e/a.spec.ts:15:1 › known bug (1.0s)",
+        "[slot 1]   1) [chromium] › e2e/b.spec.ts:20:1 › breaks ───",
+        "[slot 1]     Error: nope",
+        "[slot 1]     2 workers",
+        "[slot 1]   1 failed",
+        "[slot 1]   1 flaky",
+        "[slot 1]   1 skipped",
+        "[slot 1]   5 passed (3.0s)",
+        "[slot 2] test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out",
+        " FAIL  src/sum.test.ts > sums > adds",
+        "AssertionError: expected 3 to be 4",
+        "FAIL as it says, but not a test",
+        "      Tests  1 failed (1)",
+        "=== 2 failed in 1.0s ===",
+    ].iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n");
+    served.webhook(served.github.finish(job_id, "success", &log, served.now_ms()));
+    let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &job_id.to_string(), "--tests"]).stdout).into_owned();
+    // Each process's own counts, a skipped and a flaky one among them; a title's own brackets kept as its own.
+    assert!(said.contains("Tests: 4 failed, 9 passed, 2 skipped (vitest, pytest, playwright, cargo), of the passed 1 failed as expected, 1 flaky"), "{said}");
+    assert!(said.contains("[slot 1] 1 failed, 6 passed, 1 skipped, 1 failed as expected, 1 flaky") && said.contains("[slot 2] 0 failed, 3 passed, 1 skipped"), "{said}");
+    assert!(!said.contains("[web]") && said.contains("✓ [chromium] logs in (2xs)") && said.contains("✓ [chromium] odder (retry #x)") && !said.contains("unclosed"), "{said}");
+    assert!(said.contains("✗ sums > adds  (src/sum.test.ts)") && said.contains("      FAIL as it says, but not a test") && said.contains("      2 workers"), "{said}");
+
+    // Its run with two jobs more: one ended though no machine of ours is said for it, and one of the run's next
+    // attempt, said with that attempt only.
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let run = served.store.under(&format!("job:{job_id}"))[0].1["run_id"].clone();
+    let (lint, q) = served.github.queue("lint", "superci", served.now_ms());
+    served.webhook(q);
+    served.webhook(served.github.start(lint));
+    served.webhook(served.github.finish(lint, "success", "2026-10-15T10:00:01.0000000Z lint ok", served.now_ms()));
+    let (again, q) = served.github.queue("again", "superci", served.now_ms());
+    served.webhook(q);
+    edit(lint, &|j| { j["run_id"] = run.clone(); j["machine_id"] = serde_json::Value::Null; });
+    edit(again, &|j| { j["run_id"] = run.clone(); j["attempt"] = 2.into(); for k in ["cpu", "machine_type", "usd_per_hour", "waiting_usd_per_hour", "machine_id"] { j[k] = serde_json::Value::Null; } j["cloud"] = "".into(); j["state"] = "queued".into(); });
+    let said = String::from_utf8_lossy(&superci(&home, &["runs", "retrieve", &run.to_string(), "--tests"]).stdout).into_owned();
+    let lines: Vec<&str> = said.lines().collect();
+    assert!(lines[0].ends_with("(2 jobs · 0s · $0.000 · Last to end: lint, 0s)") && lines.iter().any(|l| l.contains("lint · app") && l.contains("passed")), "{said}");
+    assert!(said.contains("    No test results in its log (none of Vitest, Jest, Playwright, pytest, cargo or Go said any)."), "{said}");
+    // (One not started yet: nothing more to say of it.)
+    let next = lines.iter().position(|l| l.contains("· attempt 2  (1 job")).unwrap_or_else(|| panic!("{said}"));
+    assert!(lines[next + 2].ends_with("starting  again · app · Build and Test"), "{said}");
+    assert!(!lines[..next].iter().any(|l| l.contains("again")), "{said}");
+
+    // Kept as a job of no code host's, of no run, and swept before it ended: its tests read all the same, with no
+    // artifacts to fetch, nor a run's page.
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    edit(job_id, &|j| { j.as_object_mut().unwrap().remove("provider"); j["run_id"] = 0.into(); j["state"] = "swept".into(); j["conclusion"] = "success".into(); });
+    let (code, got) = json(&home, &["jobs", "retrieve", &job_id.to_string(), "--tests"]);
+    assert!(code == 0 && got["tests"]["passed"] == 9 && got["tests"]["artifacts"].is_null() && got["tests"]["artifacts_at"].is_null(), "{got}");
+    // Taken for a run from a computer's, of a run not kept: none of its log here, and no artifacts said.
+    edit(job_id, &|j| { j["provider"] = "local".into(); j["run_id"] = 999.into(); j["state"] = "done".into(); });
+    let (code, got) = json(&home, &["jobs", "retrieve", &job_id.to_string(), "--tests"]);
+    assert!(code == 0 && got["tests"]["runners"] == serde_json::json!([]) && got["tests"]["artifacts"].is_null(), "{got}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// With a key given by name (SUPERCI_PLANE, SUPERCI_KEY) and no sign-in, a change is refused as that key only reads;
+/// what the control plane answers to a key it does not take, or at an address where it is not, is said as it
+/// answered; and with this computer's key what needs no cloud sign-in is done.
+#[test]
+fn a_key_given_by_name_only_reads_and_what_the_control_plane_refuses_or_has_not_is_said_as_it_answered() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    let with = |plane: &str, key: &str, args: &[&str]| {
+        let o = common::command(&home).env("SUPERCI_PLANE", plane).env("SUPERCI_KEY", key).args(args).arg("--json").output().unwrap();
+        (o.status.code().unwrap_or(-1), serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{args:?}: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
+    };
+    for change in [&["planes", "allow"][..], &["planes", "move", "testplane0002"]] {
+        let (code, v) = with(&served.url, &served.run_key, change);
+        assert!(code != 0 && v["error"].as_str().is_some_and(|e| e.starts_with("SUPERCI_KEY only reads.")), "{change:?}: {v}");
+    }
+    // The cache asked with no key it could take (as an older control plane, with none, answers), and with one it does not take.
+    let (code, v) = with(&served.url, "short", &["caches", "list"]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.starts_with("This control plane keeps no cache yet")), "{v}");
+    let (code, v) = with(&served.url, "superci_run_not_a_key", &["caches", "list"]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.starts_with("the control plane answered 40") && !e.contains("404")), "{v}");
+    // A run cancelled with a key it does not take, and one GitHub would not cancel: said as each answered.
+    let (code, v) = with(&served.url, "superci_run_not_a_key", &["runs", "cancel", "123"]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.starts_with("the control plane answered 40") && !e.contains("No run 123")), "{v}");
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
+    served.github.fail("POST", "/cancel", 500, "GitHub had a bad day");
+    let (code, v) = json(&home, &["runs", "cancel", &run]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.contains("GitHub had a bad day")), "{v}");
+
+    // A repository's cache of 2.5 GB, said in GB; its entries taken out with this computer's key alone.
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("cache:gh7:refs/heads/main:v1:deps-1".into(), serde_json::json!({ "id": "e1", "region": "us-east-1", "size": 2_500_000_000u64, "made": now, "used": now, "done": true }).to_string());
+    let said = String::from_utf8_lossy(&superci(&home, &["caches", "list"]).stdout).into_owned();
+    assert!(said.lines().any(|l| l.contains("1 entries") && l.contains("2.5 GB")), "{said}");
+    let o = superci(&home, &["caches", "delete", "--repo=gh7", "--confirm"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("gh7's cache entries are out."), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(served.store.under("cache:gh7:").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What is read where there is little to read: no control plane yet, a day with nothing run, no read or run keys and
+/// no device's key to list (read with a run key), a job of a run that has no job by that name, a copy from where
+/// no image is named; a job whose machine was not AWS's first choice says which it could not have.
+#[test]
+fn what_little_there_is_is_said_as_it_stands() {
+    // No control plane yet: none, said as none.
+    let account = superci_testkit::Aws::serve();
+    let alone = common::aws_only(&account);
+    let (code, status) = json(&alone, &["status"]);
+    assert_eq!((code, &status["control_plane"], status["signed_in"].as_str()), (0, &serde_json::Value::Null, Some("AWS account 111111111111")), "{status}");
+    let said = String::from_utf8_lossy(&superci(&alone, &["status"]).stdout).into_owned();
+    assert!(said.contains("Control plane none found in the clouds signed in to. Set one up: `superci planes create aws --region=us-east-1`"), "{said}");
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    // A day with nothing run: nothing saved, and no wait to say.
+    let said = String::from_utf8_lossy(&superci(&home, &["usage", "retrieve"]).stdout).into_owned();
+    assert!(said.contains("Spent $0.00; the same jobs on the code host's own runners: $0.00.\n") && !said.contains("saved") && !said.contains("Median wait"), "{said}");
+
+    // No read or run key: said, with this device's key.
+    let agent = format!("/superci/{}/READ_KEY_4102444800_AGENT", served.plane);
+    let kept = served.aws.params.lock().unwrap().remove(&agent).unwrap();
+    let said = String::from_utf8_lossy(&superci(&home, &["keys", "list"]).stdout).into_owned();
+    assert!(said.starts_with("No read or run keys.") && said.contains("Device keys: each device") && said.contains("(this one)"), "{said}");
+    served.aws.params.lock().unwrap().insert(agent, kept);
+    // A workspace that keeps a run key in place of a device's: the control plane lists no device's keys to it.
+    let reader = common::temp("run-key-home");
+    std::fs::create_dir_all(reader.join("workspaces/default")).unwrap();
+    let signs = std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap().replace(&served.key, &served.run_key);
+    std::fs::write(reader.join("workspaces/default/sign-ins.json"), signs).unwrap();
+    let (code, keys) = json(&reader, &["keys", "list"]);
+    assert!(code == 0 && keys["devices"] == serde_json::json!([]), "{keys}");
+    assert!(!String::from_utf8_lossy(&superci(&reader, &["keys", "list"]).stdout).contains("Device keys"));
+
+    // A job whose machine AWS had no spot c7a.large for, nor m7a.large: said, as the run's job by its name; a name
+    // the run has no job by, said with the names it has.
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let k = format!("job:{id}");
+        let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
+        j["machine_type"] = "c8a.large".into();
+        j["asks"] = serde_json::json!([{ "at": 1, "kind": "c7a.large", "spot": true, "said": "InsufficientInstanceCapacity", "ms": 5 }, { "at": 2, "kind": "m7a.large", "spot": true, "said": "InsufficientInstanceCapacity", "ms": 5 }]);
+        m.insert(k, j.to_string());
+    }
+    let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &format!("--run={run}"), "--job=tests"]).stdout).into_owned();
+    assert!(said.contains("\nNot the first choice: AWS had no spot c7a.large or m7a.large.\n"), "{said}");
+    let (code, v) = json(&home, &["jobs", "retrieve", &format!("--run={run}"), "--job=lint"]);
+    assert_eq!((code, v["error"].as_str()), (1, Some(format!("Run {run} has no job lint (its jobs: tests).").as_str())), "{v}");
+    // A copy of the image from a region with no image named: how to name one.
+    let (code, v) = json(&common::signed_in(&served), &["images", "create", "ca-central-1", "--from=eu-west-1:not-an-image"]);
+    assert_eq!((code, v["error"].as_str()), (2, Some("--from is a region and an image: --from=eu-west-1:ami-0123456789abcdef0.")), "{v}");
+    // A key the control plane does not take: its status not read, as the times asked say (SUPERCI_TIMING).
+    let stale = common::temp("stale-key");
+    std::fs::create_dir_all(stale.join("workspaces/default")).unwrap();
+    std::fs::write(stale.join("workspaces/default/sign-ins.json"), std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap().replace(&served.key, "a-key-no-control-plane-takes")).unwrap();
+    let o = common::command(&stale).env("SUPERCI_TIMING", "1").args(["status"]).output().unwrap();
+    let e = String::from_utf8_lossy(&o.stderr);
+    assert!(e.contains("ms status (not read)") && e.contains("The control plane does not take this computer's key"), "{e}");
+    let _ = std::fs::remove_dir_all(&stale);
+    // The control plane not answering: where it is, and its jobs not read.
+    served.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let said = String::from_utf8_lossy(&superci(&home, &["status"]).stdout).into_owned();
+    assert!(said.contains("Control plane AWS · 111111111111 · us-east-1 · not answering\n") && said.contains("Jobs can run  not yet:") && said.trim_end().ends_with("Its jobs could not be read just now (it did not answer with this machine's key yet). Try again in a moment."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&reader);
+    let _ = std::fs::remove_dir_all(&alone);
+}
+
+/// The account's own copies of the runner image as AWS lists them: one of an older build than its maker's newest
+/// (said, its update checked with a dry run), one before it removed, ones whose names carry no build; a copy asked
+/// for where one is; where it would come from, by the maker's list as GitHub gives it or GitHub not giving it; and an
+/// account that may use no region.
+#[test]
+fn the_accounts_copies_of_the_image_are_said_by_their_builds_and_an_older_one_is_removed_as_aws_answered() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let image = |id: &str, name: &str| format!("<item><imageId>{id}</imageId><imageState>available</imageState><name>{name}</name><blockDeviceMapping><item><ebs><snapshotId>snap-{}</snapshotId></ebs></item></blockDeviceMapping></item>", &id[4..]);
+    let copies = |items: &[String]| format!("<DescribeImagesResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><imagesSet>{}</imagesSet></DescribeImagesResponse>", items.concat());
+    let x64 = "runs-on-v2.2-ubuntu24-full-x64-";
+    served.aws.fail("DescribeImages|tag%3Asuperci|ec2.eu-west-2.", 200, &copies(&[image("ami-0a00000000000001", &format!("{x64}20261002111320")), image("ami-0a00000000000002", &format!("{x64}20260916102456")),
+        image("ami-0a00000000000003", &format!("{x64}custom")), image("ami-0a00000000000004", &format!("{x64}2026100208x320"))]), None);
+    served.aws.fail("DescribeImages|tag%3Asuperci|ec2.eu-west-1.", 200, &copies(&[image("ami-0b00000000000001", &format!("{x64}20261002111320"))]), None);
+    served.aws.fail("DeregisterImage", 200, "<DeregisterImageResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><return>true</return></DeregisterImageResponse>", None);
+    served.aws.fail("DeleteSnapshot", 200, "<DeleteSnapshotResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><return>true</return></DeleteSnapshotResponse>", None);
+    let said = |args: &[&str]| { let o = superci(&home, args); (o.status.code(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (code, listed) = said(&["images", "list"]);
+    let line = |region: &str| listed.lines().find(|l| l.starts_with(region)).unwrap_or_default().to_string();
+    assert_eq!(code, Some(0), "{listed}");
+    assert!(line("eu-west-2").contains("your copy ami-0a00000000000001 (runs-on-v2.2-ubuntu24-full-x64-20261002111320): the build of 2 October 2026; one of 6 October 2026 is out")
+        && line("eu-west-2").ends_with("(the copy before it is removed)"), "{listed}");
+    assert!(line("eu-west-1").contains("the build of 2 October 2026; one of 6 October 2026 is out") && !line("eu-west-1").contains("removed"), "{listed}");
+    // (Only the older build is removed, with its snapshot: not those whose names carry none.)
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str().filter(|s| s.contains("DeregisterImage") || s.contains("DeleteSnapshot")).map(str::to_string)).collect();
+    assert_eq!(asked, ["Action=DeregisterImage&Version=2016-11-15&ImageId=ami-0a00000000000002", "Action=DeleteSnapshot&Version=2016-11-15&SnapshotId=snap-0a00000000000002"]);
+    let (code, update) = said(&["images", "update", "eu-west-2", "--dry-run"]);
+    assert!(code == Some(0) && update.starts_with("Would copy the build of 6 October 2026 into eu-west-2, from eu-west-1 (") && update.contains("in place of your copy of 2 October 2026. Nothing was changed."), "{update}");
+    let (code, create) = said(&["images", "create", "eu-west-2"]);
+    assert!(code == Some(1) && create.contains("eu-west-2 has your copy of the image already: ami-0a00000000000001 (available)."), "{create}");
+
+    // Where a copy into a region with none would come from: the maker's newest build that lists this image, past
+    // builds that list none or whose names carry no build; then GitHub not answering for the list.
+    let table = "### `ubuntu24-full-x64`\n\n| Region | AMI |\n| --- | --- |\n| us-east-1 | `ami-0123456789abcdef0` |\n";
+    served.github.answer_with("GET", "runner-images-for-aws/releases", 200, &[("content-type", "application/json")], &serde_json::json!([
+        { "tag_name": "linux-20261012000000", "body": "### `ubuntu24-full-arm64`\n\n| us-east-1 | `ami-0123456789abcdef1` |\n" },
+        { "tag_name": "linux-2026", "body": table }, { "tag_name": "linux-2026101x000000", "body": table }, { "tag_name": "linux-20261011000000", "body": table }]).to_string());
+    let (code, create) = said(&["images", "create", "eu-north-1", "--dry-run"]);
+    assert!(code == Some(0) && create.contains("Would copy the image jobs run on into eu-north-1, from us-east-1 (ami-0123456789abcdef0)."), "{create}");
+    served.github.fail_none();
+    served.github.fail("GET", "runner-images-for-aws/releases", 503, "unavailable");
+    let (code, create) = said(&["images", "create", "eu-north-1", "--dry-run"]);
+    assert!(code == Some(1) && create.contains("The list of runner images could not be read from GitHub (it answered 503)."), "{create}");
+    let _ = std::fs::remove_dir_all(&home);
+
+    // An account AWS answers nothing of in any region: no region to use, its images nowhere, and nothing asked of
+    // spot or on-demand machines.
+    let account = superci_testkit::Aws::serve();
+    account.fail("DescribeVpcs", 500, &superci_testkit::ec2_error("InternalError", "We encountered an internal error."), None);
+    let alone = common::aws_only(&account);
+    let said = |args: &[&str]| String::from_utf8_lossy(&superci(&alone, args).stdout).into_owned();
+    assert_eq!(said(&["images", "list"]).trim(), "This account can use none of the regions SuperCI works in.");
+    let look = said(&["accounts", "retrieve", "aws"]);
+    assert!(look.contains("Regions       none allowed\n") && !look.contains("Spot ") && !look.contains("On-demand ") && !look.contains("At once"), "{look}");
+    // One that may run 16 vCPUs at once: four jobs of the default size, and where to ask for more.
+    account.fail_none();
+    account.fail("servicequotas.", 200, r#"{"Quota":{"QuotaCode":"L-34B43A08","ServiceCode":"ec2","Value":16.0}}"#, None);
+    let look = said(&["accounts", "retrieve", "aws"]);
+    assert!(look.contains("At once       spot 16 vCPUs · on-demand 16 vCPUs") && look.contains("16 vCPUs is 4 jobs of the default size at a time. Ask AWS for more: "), "{look}");
+    // AWS failing to say whether the image is in a region: not known there.
+    account.fail("DescribeImages|ec2.ap-south-1.", 500, &superci_testkit::ec2_error("InternalError", "We encountered an internal error."), None);
+    let images = said(&["images", "list"]);
+    assert!(images.lines().any(|l| l.starts_with("ap-south-1") && l.ends_with("not known")), "{images}");
+    let _ = std::fs::remove_dir_all(&alone);
+}
+
+/// Workspaces as they are kept: one looking after a CI it is signed out of, with its code hosts; one signed in to a
+/// further AWS account only; a name that makes an id with digits and runs of what is not a letter; the first one
+/// named before any is kept; one whose sign-ins cannot be removed, said; and what names no command or workspace.
+#[test]
+fn workspaces_kept_signed_out_or_in_another_account_only_are_listed_as_they_stand_and_what_names_none_is_said() {
+    let served = serve(|_| {});
+    let root = home(&served);
+    std::fs::write(root.join("workspaces/default/workspace.json"), serde_json::json!({ "name": "Acme", "hosts": [["github", "acme"], ["gitlab", "gitlab.example.com"]] }).to_string()).unwrap();
+    // (Signed in to a further AWS account, and to none as the first.)
+    let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(common::signed_in(&served).join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+    std::fs::create_dir_all(root.join("workspaces/other")).unwrap();
+    std::fs::write(root.join("workspaces/other/sign-ins.json"), serde_json::json!({ "aws_more": [kept["aws"]] }).to_string()).unwrap();
+    // A name with a dash between words and a digit: its id with one dash where the name has several marks between words.
+    let (code, made) = json(&root, &["workspaces", "create", "Build - Farm 2"]);
+    assert_eq!((code, made["workspace"].as_str()), (0, Some("build-farm-2")), "{made}");
+    let said = String::from_utf8_lossy(&superci(&root, &["workspaces", "list"]).stdout).into_owned();
+    let line = |id: &str| said.lines().find(|l| l.split_whitespace().next() == Some(id)).unwrap_or_else(|| panic!("{id}: {said}")).trim_end().to_string();
+    assert_eq!(line("default"), format!("{:<24} Acme · GitHub acme · GitLab gitlab.example.com · AWS · 111111111111 · us-east-1 · signed out", "default"));
+    assert_eq!((line("other").as_str(), line("build-farm-2").ends_with("Build - Farm 2 · nothing set up yet")), ("other", true), "{said}");
+    // The first workspace, named where none is kept yet: it is that one, with nothing signed in.
+    let empty = common::temp("no-workspaces");
+    let o = common::command(&empty).args(["status", "--workspace=default"]).output().unwrap();
+    assert!(o.status.code() == Some(3) && String::from_utf8_lossy(&o.stderr).contains("SuperCI is not signed in on this computer."), "{}", String::from_utf8_lossy(&o.stderr));
+    // A sign-in in a workspace not kept here; a command that is no word at all.
+    let o = superci(&root, &["login", "--workspace=nowhere"]);
+    assert!(o.status.code() == Some(1) && String::from_utf8_lossy(&o.stderr).contains("--workspace names the workspace nowhere, and none is called that on this machine (here: build-farm-2, default, other)."), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = superci(&root, &["", "--workspace=other"]);
+    assert!(o.status.code() == Some(2) && String::from_utf8_lossy(&o.stderr).starts_with("superci: \n\nSuperCI — GitHub Actions and GitLab CI jobs on your own clouds"), "{}", String::from_utf8_lossy(&o.stderr));
+    // Sign-ins kept where a folder is: not removed, said.
+    std::fs::create_dir_all(empty.join("workspaces/odd/sign-ins.json")).unwrap();
+    let o = common::command(&empty).args(["logout", "--workspace=odd"]).output().unwrap();
+    assert!(o.status.code() == Some(1) && String::from_utf8_lossy(&o.stderr).contains("workspaces/odd/sign-ins.json: Is a directory"), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// Where jobs come from and what runs them, as a CI that has little of either says it: GitHub's App installed
+/// nowhere yet, a second GitLab by its name beside the first, and no runner provider at all.
+#[test]
+fn a_ci_whose_app_is_installed_nowhere_with_two_gitlabs_and_no_runner_provider_says_so() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.github.set_installed(false, true);
+    served.connect_gitlab();
+    let mut other = superci_testkit::GitLab::connection();
+    other["id"] = "other".into();
+    other["url"] = "https://gitlab.example.com".into();
+    served.aws.put(&format!("/superci/{}/GITLAB_OTHER", served.plane), &other.to_string());
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{}/CONTAINERS", served.plane));
+    let home = home(&served);
+    let said = |args: &[&str]| { let o = superci(&home, args); (o.status.code(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    assert_eq!(said(&["connections", "list"]), (Some(0), "github  acme  its App is not installed yet\ngitlab  https://gitlab.com\ngitlab  https://gitlab.example.com  (other)\n".to_string()));
+    let (code, runners) = said(&["runners", "list"]);
+    assert!(code == Some(0) && runners.starts_with("No runner provider yet: `superci runners create aws` (or cloudflare, or modal).\n"), "{runners}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Changes checked before they are made: a machine no label could ask for, a provider's networks given as none, what
+/// a control plane's AWS role lacks where AWS has none of it; GitHub's deliveries, one sent again among them.
+#[test]
+fn changes_are_checked_before_they_are_made_and_githubs_deliveries_are_said_as_github_lists_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let said = |args: &[&str]| { let o = superci(&home, args); (o.status.code(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (code, refused) = said(&["machine", "update", "--os=windows", "--image=ubuntu24"]);
+    assert!(code == Some(2) && refused.starts_with("superci: image=ubuntu24 is an Ubuntu for Linux machines, and the label says os=windows\n"), "{refused}");
+    assert_eq!(said(&["runners", "update", "cloudflare", "--networks=none", "--dry-run"]), (Some(0), "Would update cloudflare: --networks=none. Nothing was changed.\n".to_string()));
+    // (AWS has no policy of the role's: all of it is lacking.)
+    served.aws.fail("GetRolePolicy", 404, "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><Error><Type>Sender</Type><Code>NoSuchEntity</Code><Message>The role policy with name runner-machines cannot be found.</Message></Error><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ErrorResponse>", None);
+    let (code, would) = said(&["planes", "allow", "--dry-run"]);
+    assert!(code == Some(0) && would.starts_with("Would give the AWS role of the control plane testplane0001 what it lacks: Start machines, each tagged as this control plane's (since 0.1.0);"), "{would}");
+    served.github.answer_with("GET", "/app/hook/deliveries", 200, &[("content-type", "application/json")], &serde_json::json!([
+        { "id": 2, "guid": "b", "delivered_at": "2026-10-15T10:01:00Z", "redelivery": true, "status": "OK", "status_code": 200, "event": "workflow_job", "action": "queued" },
+        { "id": 1, "guid": "a", "delivered_at": "2026-10-15T10:00:00Z", "redelivery": false, "status": "Invalid HTTP Response: 503", "status_code": 503, "event": "workflow_job", "action": "queued" }]).to_string());
+    assert_eq!(said(&["deliveries", "list"]), (Some(0), "2026-10-15 10:01:00  workflow_job  queued       200 OK  (sent again)  2\n2026-10-15 10:00:00  workflow_job  queued       503 Invalid HTTP Response: 503  1\n".to_string()));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A run from a computer checked with --dry-run: a workflow of two jobs, said with a variable a shell would run; one
+/// with none, refused. A key the control plane does not take, for a run and for following one, said as it answered.
+#[test]
+fn a_dry_run_of_a_workflow_of_two_jobs_or_none_and_a_key_not_taken_are_said_as_they_stand() {
+    let served = serve(|_| {});
+    let dir = common::temp("dry-run");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: make\n  test:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
+    std::fs::write(dir.join(".github/workflows/none.yml"), "on: push\njobs: {}\n").unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let run = |key: &str, args: &[&str]| {
+        let o = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", key).output().unwrap();
+        (o.status.code(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let (code, out) = run(&served.run_key, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--dry-run", "--var=WHERE=a;b", "--json"]);
+    let would: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+    assert!(code == Some(0) && would["jobs"] == serde_json::json!(["build", "test"]) && would["would"].as_str().is_some_and(|w| w.contains(": its jobs build, test, on this control plane's machines")), "{would}");
+    assert!(would["steps"][0].as_str().is_some_and(|s| s.starts_with("Note: --var WHERE's value has characters a shell runs (;)")), "{would}");
+    assert_eq!(run(&served.run_key, &["runs", "create", "--workflow=.github/workflows/none.yml", "--dry-run"]), (Some(1), "superci: .github/workflows/none.yml has no jobs.\n".to_string()));
+    for args in [&["runs", "create", "--workflow=.github/workflows/ci.yml"][..], &["runs", "wait", "123"]] {
+        let (code, said) = run("superci_run_0000000000000000000000000000dead", args);
+        assert!(code == Some(1) && said.starts_with("superci: the control plane said 401: This control plane does not take this key"), "{args:?}: {said}");
+    }
+    assert!(served.store.under("run:").is_empty(), "no run started");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A debug build's own commands with what they take left out: a machine started where none is said (us-east-1), and
+/// a header given with no name and value in it, left out of what is signed.
+#[cfg(debug_assertions)]
+#[test]
+fn a_debug_launch_with_no_region_starts_in_us_east_1_and_a_header_without_a_colon_is_left_out() {
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let home = common::signed_in(&served);
+    let (code, v) = json(&home, &["debug", "launch"]);
+    let said = v["answer"].as_str().unwrap_or_default();
+    assert!(code == 0 && (said.starts_with("started ") || said.starts_with("not started: ")), "{v}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("ec2.us-east-1.")) && a["asked"].as_str().is_some_and(|s| s.contains("RunInstances") || s.contains("CreateFleet"))), "asked in us-east-1");
+    let (code, v) = json(&home, &["debug", "rest", "us-east-1", "s3", "GET", "https://bucket-for-tests.s3.us-east-1.amazonaws.com/a.txt", "--header=no-colon-here"]);
+    assert!(code == 0 && v["answer"].as_str().and_then(|a| a.split(' ').next()).is_some_and(|s| s.parse::<u16>().is_ok()), "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The runner service a debug build serves on this computer leaves what is no request alone (a first line or a header
+/// that is not text, a header with no colon, a body cut short) and goes on to serve the job to its runner.
+#[cfg(debug_assertions)]
+#[test]
+fn the_runner_service_here_leaves_what_is_no_request_alone_and_serves_the_job() {
+    use std::io::Write;
+    let dir = common::temp("runner-service-odd");
+    let workflow = dir.join("ci.yml");
+    std::fs::write(&workflow, "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ok\n").unwrap();
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let root = format!("http://127.0.0.1:{port}/runner/rig");
+    let jit = dir.join("jit");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).env("SUPERCI_HOME", dir.join(".home"))
+        .args(["debug", "runner-service", workflow.to_str().unwrap(), "tests", &root, &port.to_string(), jit.to_str().unwrap(), "--json"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() { assert!(std::time::Instant::now() < until, "it did not listen"); std::thread::sleep(std::time::Duration::from_millis(50)) }
+    // (A header that is not text ends the headers: what came before is answered.)
+    for (odd, answered) in [(&b"\xff\xfe\r\n\r\n"[..], false), (b"GET /runner/rig/x HTTP/1.1\r\nno colon here\r\n\xff\xfe\r\n\r\n", true), (b"POST /runner/rig/x HTTP/1.1\r\ncontent-length: 100\r\n\r\nabc", false)] {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(odd).unwrap();
+        let _ = s.shutdown(std::net::Shutdown::Write);
+        let mut back = String::new();
+        let _ = std::io::Read::read_to_string(&mut s, &mut back);
+        assert_eq!(back.starts_with("HTTP/1.1 404"), answered, "{back}");
+        assert_eq!(back.is_empty(), !answered, "{back}");
+    }
+    let runner = superci_testkit::Runner { at: format!("{root}/_apis/v1") };
+    runner.take();
+    let s = "dddddddd-0000-0000-0000-000000000004";
+    runner.steps(&[(s, "Run echo ok", 1, "inProgress", None, None)]);
+    runner.lines(s, 1, &["ok".to_string()]);
+    runner.steps(&[(s, "Run echo ok", 1, "completed", Some("succeeded"), Some(1))]);
+    runner.finish("succeeded");
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+    let out = child.wait_with_output().unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+    assert!(v["answer"].as_str().is_some_and(|a| a.starts_with("the job ended: succeeded") && a.contains("Run echo ok succeeded")), "{v}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A secret typed at a terminal (hidden), and one a run started with a run key used: listed as used by that key.
+#[test]
+fn a_secret_typed_at_a_terminal_is_kept_and_one_a_run_key_used_is_listed_as_used_by_that_key() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    // (A terminal of its own: `script` gives the command one, and types what is written to it.)
+    let mut typed = std::process::Command::new("script").args(["-qec", &format!("{} secrets create TYPED", env!("CARGO_BIN_EXE_superci")), "/dev/null"])
+        .env("SUPERCI_HOME", &home).env("SUPERCI_STAND_IN", &served.aws.url).env_remove("SUPERCI_PLANE").env_remove("SUPERCI_KEY")
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    std::io::Write::write_all(typed.stdin.as_mut().unwrap(), b"s3cret-typed\n").unwrap();
+    let out = typed.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success() && said.contains("TYPED's value (typed hidden; Enter when done): ") && said.contains("TYPED is kept for every run"), "{said}{}", String::from_utf8_lossy(&out.stderr));
+    let o = common::command(&home).args(["secrets", "create", "TOKEN", "--value-env=THE_TOKEN"]).env("THE_TOKEN", "s3cret").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    common::played_steps(&served, &home.join("checkout"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.TOKEN }}\n", &[("Run echo", "succeeded")]);
+    let said = String::from_utf8_lossy(&superci(&home, &["secrets", "list"]).stdout).into_owned();
+    let line = |name: &str| said.lines().find(|l| l.starts_with(name)).unwrap_or_default().to_string();
+    assert!(line("TOKEN").ends_with("used just now by the key agent") && line("TYPED").ends_with("not used yet"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What a person does in the browser, begun from the terminal with --no-browser: a sign-in to one more AWS account
+/// beside the one signed in to, and GitHub's App for an organization, each a link to open.
+#[test]
+fn another_aws_account_and_githubs_app_are_begun_from_the_terminal_with_a_link_to_open() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    for args in [&["login", "aws", "--add", "--no-browser"][..], &["connections", "create", "github", "acme", "--no-browser"]] {
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut child = common::command(&home).args(args).env("SUPERCI_PORT", port.to_string()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
+        let mut said = vec![];
+        for l in lines.by_ref().take(20) { let link = l.contains(&format!("http://localhost:{port}/")); said.push(l); if link { break } }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(said.last().is_some_and(|l| l.contains(&format!("http://localhost:{port}/"))), "{args:?}: {said:?}");
+        if args[0] == "connections" { assert!(said[0].starts_with("Only an owner of acme can create its App"), "{said:?}") }
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A run of two jobs from a computer, the second waiting on the first: its lines in groups, a post sent again from
+/// a line already out, a step over once the next began, two steps whose logs never came (their tests counted from
+/// their lines), a line whose time is not where a runner puts it; then the second failing with a step still going and
+/// one never begun, what its runner logged while slow to listen said after it.
+#[test]
+fn a_run_of_two_jobs_is_followed_through_groups_lines_sent_again_and_steps_whose_logs_or_results_never_came() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    served.connect_github();
+    let dir = common::temp("two-jobs");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  build:\n    runs-on: superci\n    steps:\n      - run: make\n      - run: make test\n      - run: make docs\n  check:\n    needs: build\n    runs-on: superci\n    steps:\n      - run: make check\n      - run: make lint\n      - run: make fmt\n").unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let mut cli = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme/app"])
+        .env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_LOGS_WAIT_S", "3").env("SUPERCI_STAND_IN", &served.aws.url)
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let p = printed.clone();
+    let out = cli.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { p.lock().unwrap().push(l) });
+    let until = |what: &str| { let end = std::time::Instant::now() + std::time::Duration::from_secs(20); while !printed.lock().unwrap().iter().any(|l| l.contains(what)) { assert!(std::time::Instant::now() < end, "no {what:?} in {:?}", printed.lock().unwrap()); std::thread::sleep(std::time::Duration::from_millis(50)) } };
+    let run = loop { if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let build = loop { if let Some(r) = superci_testkit::Runner::of_job(&served, &run, "build") { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let (a, b, c) = ("aaaaaaaa-0000-0000-0000-000000000001", "bbbbbbbb-0000-0000-0000-000000000002", "cccccccc-0000-0000-0000-000000000003");
+    build.take();
+    build.steps(&[(a, "Run make", 1, "inProgress", None, None), (b, "Run make test", 2, "pending", None, None), (c, "Run make docs", 3, "pending", None, None)]);
+    let lines = |v: &[&str]| v.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+    build.lines(a, 1, &lines(&["##[group]Setting up", "inside the group", "##[endgroup]"]));
+    build.lines(a, 2, &lines(&["inside the group", "##[endgroup]", "after the group"]));
+    until("after the group");
+    // The next step begun while its record still says this one goes on (its log there already): this one is over.
+    build.log(1, "2026-10-15T10:00:01.0000000Z ##[group]Setting up\n2026-10-15T10:00:01.0000000Z inside the group\n2026-10-15T10:00:01.0000000Z ##[endgroup]\n2026-10-15T10:00:02.0000000Z after the group");
+    build.records(vec![serde_json::json!({ "id": a, "type": "Task", "name": "Run make", "order": 1, "state": "inProgress", "result": null, "log": { "id": 1 }, "startTime": "2026-10-15T10:00:00Z" }),
+        serde_json::json!({ "id": b, "type": "Task", "name": "Run make test", "order": 2, "state": "inProgress", "result": null, "startTime": "2026-10-15T10:00:02Z" })]);
+    build.lines(b, 1, &lines(&["test a ... ok", "2026-10-15T10:00:01 is when this one began, as its Z says much later on"]));
+    until("test a ... ok");
+    build.lines(c, 1, &lines(&["test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"]));
+    build.steps(&[(a, "Run make", 1, "completed", Some("succeeded"), Some(1)), (b, "Run make test", 2, "completed", Some("succeeded"), None), (c, "Run make docs", 3, "completed", Some("succeeded"), None)]);
+    build.finish("succeeded");
+    // The second, once the first passed: its runner slow to listen, then a step that fails, one still going, one never begun.
+    let check = loop { if let Some(r) = superci_testkit::Runner::of_job(&served, &run, "check") { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let job = served.store.under("job:").into_iter().find(|(_, j)| j["name"] == "check").unwrap().1["job_id"].to_string();
+    served.store.0.lock().unwrap().insert(format!("hello:{job}"), serde_json::json!({ "script_ms": served.now_ms(), "boot_s": 9.5, "log": "[RUNNER 2026-10-15 10:00:00Z INFO] Waiting for GitHub\n[RUNNER 2026-10-15 10:00:12Z INFO] Listening for Jobs" }).to_string());
+    let (x, y, z) = ("dddddddd-0000-0000-0000-000000000004", "eeeeeeee-0000-0000-0000-000000000005", "ffffffff-0000-0000-0000-000000000006");
+    check.take();
+    check.steps(&[(x, "Run make check", 1, "inProgress", None, None)]);
+    check.lines(x, 1, &lines(&["checking", "check failed"]));
+    check.log(1, "2026-10-15T10:00:03.0000000Z checking\n2026-10-15T10:00:03.0000000Z check failed");
+    check.records(vec![
+        serde_json::json!({ "id": x, "type": "Task", "name": "Run make check", "order": 1, "state": "completed", "result": "failed", "log": { "id": 1 }, "startTime": "2026-10-15T10:00:00Z", "finishTime": "2026-10-15T10:00:04Z" }),
+        serde_json::json!({ "id": y, "type": "Task", "name": "Run make lint", "order": 2, "state": "inProgress", "result": null, "startTime": "2026-10-15T10:00:04Z" }),
+        serde_json::json!({ "id": z, "type": "Task", "name": "Run make fmt", "order": 3, "state": "pending", "result": null })]);
+    check.finish("failed");
+    let status = cli.wait().unwrap();
+    reader.join().unwrap();
+    let said = printed.lock().unwrap().join("\n");
+    assert_eq!(status.code(), Some(1), "{said}");
+    // Each line once, a group's heading as a line and its end as nothing; a line's own time kept as its own.
+    for line in ["[build] Setting up", "[build] inside the group", "[build] after the group", "[build] 2026-10-15T10:00:01 is when this one began, as its Z says much later on"] {
+        assert_eq!(said.lines().filter(|l| *l == line).count(), 1, "{line}: {said}");
+    }
+    assert!(!said.contains("endgroup") && said.contains("\n[check] checking\n[check] check failed\n"), "{said}");
+    // The tests of steps whose logs never came, counted from their lines, and said so.
+    assert!(said.contains("  Tests: 0 failed, 2 passed (cargo)\n  (Counted from what came: 2 steps' logs had not come. `superci runs retrieve "), "{said}");
+    // A step still going and one never begun when its job failed: neither passed nor failed.
+    assert!(said.contains("  ✗ Run make check 4 s\n  · Run make lint\n  · Run make fmt\n"), "{said}");
+    assert!(said.contains("  What its runner logged while it was slow to reach the control plane") && said.contains("    [RUNNER 2026-10-15 10:00:12Z INFO] Listening for Jobs"), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A GitHub job's log in steps, as its page draws it: a line past the next step's second goes to it, a post step's
+/// lines that are not its cleanup's stay where they were, a step whose time GitHub gives cut short, a carriage return
+/// left out; the steps of a parallel group under its row, not all in the background; and a job named with slashes,
+/// its steps run side by side, looked for in its run's logs by its name made a folder's.
+#[test]
+fn a_github_jobs_log_is_put_in_its_steps_by_their_times_and_its_parallel_groups_and_one_named_with_slashes_found_in_its_runs_logs() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let ended = |name: &str, log: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(id)); served.webhook(served.github.finish(id, "success", log, served.now_ms())); id };
+    let log = ["2026-10-15T10:00:00.0000000Z Set up the runner", "2026-10-15T10:00:01.0000000Z ##[group]Run make", "2026-10-15T10:00:01.0000000Z making\rstill making",
+        "2026-10-15T10:00:03.0000000Z made later", "2026-10-15T10:00:05.0000000Z not the cleanup yet", "2026-10-15T10:00:06.0000000Z Cleaning up orphan processes"].join("\n");
+    let id = ended("tests", &log);
+    let step = |name: &str, n: u64, from: &str, to: &str| serde_json::json!({ "name": name, "number": n, "status": "completed", "conclusion": "success", "started_at": from, "completed_at": to });
+    served.github.set_steps(id, serde_json::json!([step("Set up job", 1, "2026-10-15T10:00:00Z", "2026-10-15T10:00:01Z"), step("Run make", 2, "2026-10-15T10:00:01Z", "2026-10-15T10:00:02Z"),
+        step("Run a", 3, "2026-10-15T10:00:02Z", "2026-10-15T10:00:04Z"), step("Run b", 4, "2026-10-15T10:00:02Z", "2026-10-15T10:00:04Z"), step("Parallel group", 5, "2026-10-15T10:00:02Z", "2026-10-15T10:00:04Z"),
+        step("Post Run make", 6, "2026-10-15T10:00:05Z", "2026-10-15T10:00:06Z"), step("Complete job", 7, "2026-10-15T10:00:06Z", "2026-10-15T10:00:06Z"), step("Odd", 8, "2026-10-15", "2026-10-15")]));
+    // (Its shape, as the control plane keeps a job's: a parallel group's two steps, one in the background, then its row.)
+    served.store.0.lock().unwrap().insert(format!("shape:{id}"), serde_json::json!([{ "id": "make" }, { "id": "a", "group": "g" }, { "id": "b", "group": "g", "bg": true }, { "id": "g", "group": "g", "control": "parallel" }]).to_string());
+    let (mut child, link) = common::dashboard(&home);
+    let (_, view) = common::part(&link, &format!("/job/view?id={id}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap_or_else(|_| panic!("{view}"));
+    let steps = view["steps"].as_array().cloned().unwrap_or_default();
+    let names: Vec<&str> = steps.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert_eq!(names, ["Set up job", "Run make", "Parallel group", "Run a", "Run b", "Post Run make", "Complete job", "Odd"], "{view}");
+    let lines = |name: &str| steps.iter().find(|s| s["name"] == name).map(|s| s["lines"].as_array().unwrap().iter().map(|l| l[2].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>()).unwrap_or_default();
+    // (The carriage return left out of what is shown.)
+    assert_eq!(lines("Run make"), ["Run make", "makingstill making"], "{view}");
+    assert_eq!((lines("Parallel group"), lines("Post Run make"), lines("Complete job")), (vec!["made later".to_string(), "not the cleanup yet".into()], vec![], vec!["Cleaning up orphan processes".to_string()]), "{view}");
+    let row = &steps[2];
+    assert!(row["group"] == 2 && row["bg"].is_null() && steps[4]["bg"] == true && steps[5]["child"].is_null() && steps[7]["ms"].is_null(), "{view}");
+    // Named with slashes, its steps side by side: its own lines looked for in its run's logs, by its folder's name.
+    let side = ended("build / linux\\x64", "2026-10-15T22:00:51.0000000Z mixed");
+    served.github.set_steps(side, serde_json::from_str(include_str!("../fixtures/github/parallel-steps.json")).unwrap());
+    served.github.run_ended(side, include_bytes!("../fixtures/github/run-logs.zip").to_vec());
+    let (_, view) = common::part(&link, &format!("/job/view?id={side}"));
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap_or_else(|_| panic!("{view}"));
+    // (Its folder is not among those of the run's logs: its lines as they came, said as mixed.)
+    assert!(view["mixed"] == true && view["steps"][0]["lines"][0][2] == "mixed", "{view}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Another control plane with more settings than SSM gives at once: deleted with every one of them, read page by page.
+#[test]
+fn another_control_plane_with_more_settings_than_ssm_lists_at_once_is_deleted_with_every_one() {
+    let served = serve(|_| {});
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    for n in 0..25 { served.aws.put(&format!("/superci/testplane0002/SECRET_KEPT{n}_ALL"), "{}") }
+    let o = superci(&home, &["planes", "delete", "testplane0002", "--confirm"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("Deleted"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(served.aws.settings("testplane0002").is_empty(), "{:?}", served.aws.settings("testplane0002"));
+    let pages = served.aws.asked.lock().unwrap().iter().filter(|a| a["target"] == "AmazonSSM.GetParametersByPath" && a["asked"].as_str().is_some_and(|s| s.contains("testplane0002") && s.contains("NextToken"))).count();
+    assert!(pages >= 2, "asked page by page: {pages}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An update whose image converter Lambda failed to take in: the control plane is updated all the same (the converter
+/// is not what runs it), and the converter is not waited for again.
+#[test]
+fn an_update_whose_converter_lambda_failed_to_take_in_still_updates_the_control_plane() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.fail("functions/superci-plane-testplane0001-convert/configuration", 200, r#"{"FunctionName":"superci-plane-testplane0001-convert","State":"Active","LastUpdateStatus":"Failed","LastUpdateStatusReason":"The code is not a bootstrap Lambda can run."}"#, None);
+    let o = superci(&home, &["planes", "update"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains(&format!("Updated to {}", env!("CARGO_PKG_VERSION"))), "{said}");
+    let asked = served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "GET" && a["url"].as_str().is_some_and(|u| u.ends_with("-convert/configuration"))).count();
+    assert_eq!(asked, 1, "its state asked once: Failed");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An AWS sign-in renewed as it is used, AWS refusing: one whose user may not sign in developer tools, and one AWS
+/// answers with no JSON at all; either is over, and a sign-in is asked for.
+#[test]
+fn an_aws_sign_in_aws_will_not_renew_is_said_as_aws_refused_it() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["aws"]["creds"]["expires_at_ms"] = 0.into();
+    kept["aws"]["refresh_token"] = "refresh-for-tests".into();
+    kept["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    let due = kept.to_string();
+    for (answer, said) in [(r#"{"error":"INSUFFICIENT_PERMISSIONS"}"#, "AWS says this sign-in may not be used by developer tools"), ("Bad Request", "AWS sign-in: 400 Bad Request")] {
+        std::fs::write(&file, &due).unwrap();
+        served.aws.fail_none();
+        served.aws.fail("signin.aws.amazon.com/v1/token", 400, answer, None);
+        let o = superci(&home, &["accounts", "retrieve", "aws"]);
+        let e = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        // (Its renewal refused: no longer signed in to it, and a sign-in asked for.)
+        assert!(o.status.code() == Some(3) && e.contains("Sign in with AWS first."), "{answer}: {e}");
+        let renewal = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/v1/token"))).cloned().unwrap_or_default();
+        assert_eq!((renewal["status"].as_u64(), renewal["answer"].as_str()), (Some(400), Some(answer)), "{said}");
+        assert!(serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap()).unwrap()["aws"].is_null(), "{said}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}

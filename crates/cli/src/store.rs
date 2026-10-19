@@ -96,7 +96,7 @@ pub fn valid_id(id: &str) -> crate::Result<()> {
 pub fn id_from(name: &str) -> crate::Result<String> {
     let mut id = String::new();
     for c in name.trim().chars() {
-        if c.is_ascii_alphanumeric() { id.push(c.to_ascii_lowercase()) } else if !id.is_empty() && !id.ends_with('-') { id.push('-') }
+        if c.is_ascii_alphanumeric() { id.push(c.to_ascii_lowercase()) } else if !id.ends_with('-') { id.push('-') }
     }
     let id: String = id.trim_start_matches(|c: char| !c.is_ascii_lowercase()).chars().take(24).collect();
     let id = id.trim_end_matches('-').to_string();

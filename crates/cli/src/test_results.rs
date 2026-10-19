@@ -145,7 +145,7 @@ pub fn read(log: &str) -> Tests {
     for (mark, lines) in streams {
         let mut one = read_lines(&lines);
         // A runner that ran nothing, and did not say why: said (the run may have passed without its tests).
-        if !one.runners.is_empty() && one.notes.is_empty() && one.passed + one.failed + one.skipped == 0 && one.failures.is_empty() {
+        if !one.runners.is_empty() && one.notes.is_empty() && one.passed + one.failed + one.skipped == 0 {
             one.notes.push(format!("{} ran no tests.", one.runners.iter().map(|r| runner_name(r)).collect::<Vec<_>>().join(", ")));
         }
         for r in one.runners.clone() { if !t.runners.contains(&r) { t.runners.push(r) } }
@@ -158,7 +158,7 @@ pub fn read(log: &str) -> Tests {
             t.by_process.push(Process { mark: mark.clone(), passed: one.passed, failed: one.failed, skipped: one.skipped, failed_as_expected: one.failed_as_expected, flaky: one.flaky });
         }
         // (Which process said it, where lines are marked so.)
-        for n in one.notes { let n = if mark.is_empty() { n } else { format!("{mark} {n}") }; if !t.notes.contains(&n) { t.notes.push(n) } }
+        for n in one.notes { let n = if mark.is_empty() { n } else { format!("{mark} {n}") }; t.notes.push(n) }
     }
     // (One process alone: its counts are the whole's.)
     if t.by_process.len() < 2 { t.by_process.clear() }
@@ -174,7 +174,7 @@ fn runner_name(r: &str) -> &'static str {
 fn listed(s: &str) -> Option<(char, String, String, bool)> {
     let mark = s.chars().next().filter(|c| ['✓', '✘', '-'].contains(c))?;
     let rest = s[mark.len_utf8()..].trim_start();
-    let rest = rest.split_once(' ').filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()).map(|(_, r)| r.trim_start()).unwrap_or(rest);
+    let rest = rest.split_once(' ').filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit())).map(|(_, r)| r.trim_start()).unwrap_or(rest);
     let parts: Vec<&str> = rest.split(" › ").collect();
     let (project, file, title) = match parts.as_slice() {
         [p, f, t @ ..] if p.starts_with('[') && p.ends_with(']') && !t.is_empty() => (Some(&p[1..p.len() - 1]), *f, t.join(" › ")),

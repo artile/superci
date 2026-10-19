@@ -81,7 +81,7 @@ Status: 0 done · 1 failed · 2 not a command, or not a whole one · 3 a person 
 /// `superci help`, `superci help RESOURCE`, `superci RESOURCE --help`, and a resource alone.
 pub fn help(topic: &str) -> String {
     match HELP.iter().find(|(word, ..)| *word == topic) {
-        Some((_, usage, more)) => format!("{usage}\n{}\n{FLAGS}", if more.is_empty() { String::new() } else { format!("\n{more}\n") }),
+        Some((_, usage, more)) => format!("{usage}\n\n{more}\n\n{FLAGS}"),
         None => {
             let group = |words: &[&str]| HELP.iter().filter(|(w, ..)| words.contains(w)).map(|(_, usage, _)| *usage).collect::<Vec<_>>().join("\n");
             format!("SuperCI — GitHub Actions and GitLab CI jobs on your own clouds
@@ -404,7 +404,7 @@ pub fn expected_lines(t: &Value, indent: &str) -> Vec<String> {
     if tests.is_empty() { return vec![] }
     let mut out = vec![];
     let ran = t["ran"].as_array().map(|r| r.len()).unwrap_or(0);
-    if ran == 0 || ran > 30 {
+    if ran > 30 {
         out.push(format!("{indent}Failed as expected:"));
         for r in &tests { out.push(format!("{indent}  ✓ {}{}", r["name"].as_str().unwrap_or_default(), r["file"].as_str().map(|f| format!("  ({f})")).unwrap_or_default())) }
     }
