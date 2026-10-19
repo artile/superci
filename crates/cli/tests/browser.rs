@@ -4593,6 +4593,14 @@ mod github_in_browser {
         // Cancelled before its runner took it: its runner taken back from the repository.
         assert_eq!(served.webhook(served.github.cancel(id, served.now_ms())), 202);
         assert!(asked().iter().any(|a| a.starts_with("DELETE https://api.github.com/repos/acme/app/actions/runners/")), "{:?}", asked());
+        // One whose runner GitHub never said took it, minutes on: its runner asked of the repository at the sweep.
+        let (quiet, queued) = served.github.queue("quiet", "superci", served.now_ms());
+        assert_eq!(served.webhook(queued), 202);
+        // (GitHub has it on another runner, and the event that said so never came.)
+        let _ = served.github.start_elsewhere(quiet, "someone-elses-runner");
+        served.later(6 * 60_000);
+        served.upkeep();
+        assert!(asked().iter().any(|a| a.starts_with("GET https://api.github.com/repos/acme/app/actions/runners/")), "{:?}", asked());
         // Made from Repositories for a person: GitHub's page for an App of their own.
         let home = signed_in(&served);
         let (_child, link) = dashboard(&home);
