@@ -11075,6 +11075,11 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         let (code, said) = cli(args);
         assert!((0..=3).contains(&code) && !said.contains("panicked"), "{args:?}: {code} {said}");
     }
+    // Each resource's help.
+    for topic in ["dashboard", "login", "logout", "status", "jobs", "runs", "planes", "runners", "labels", "name", "machine", "limits", "public_repos", "connections", "deliveries", "projects", "accounts", "usage", "artifacts", "caches", "secrets", "keys", "images", "workspaces", "leave"] {
+        let (code, said) = cli(&["help", topic]);
+        assert!(code == 0 && said.contains("superci"), "{topic}: {code} {said}");
+    }
     // (A second workspace looking after the same CI, as a copy of the first: listed as its twin.)
     let twin = home.join("workspaces/twin");
     std::fs::create_dir_all(&twin).unwrap();
