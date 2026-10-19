@@ -5684,6 +5684,33 @@ fn aws_networks_refused_to_the_role_or_by_the_organization_and_traffic_refused_a
     assert_eq!(state(97)["sent_gb"], -1.0, "{}", state(97));
 }
 
+/// AWS's runners connected by the stack's report: with a connect token too short to be one, refused whatever it
+/// says; one whose role cannot see the machine image yet is not connected and its token stays good, so the report
+/// sent again once it can connects it (and only once).
+#[test]
+fn aws_connected_by_the_stacks_report_only_once_its_role_sees_the_image_and_never_with_a_short_token() {
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let report = |served: &superci_testkit::Served, token: &str| -> (u16, serde_json::Value) {
+        let mut r = agent.post(&format!("{}/aws/callback", served.url)).header("content-type", "application/json")
+            .send(serde_json::json!({ "token": token, "accountId": "123456789012", "region": "us-east-1", "roleArn": format!("arn:aws:iam::123456789012:role/superci-plane-{PLANE}") }).to_string()).unwrap();
+        let text = r.body_mut().read_to_string().unwrap_or_default();
+        (r.status().as_u16(), serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+    };
+    let short = serve(|c| { c.aws_connect_token = Some("short".into()); c.aws_region = Some("us-east-1".into()); });
+    assert_eq!(report(&short, "short").0, 403);
+    let served = serve(|c| { c.aws_connect_token = Some("connect-token-for-tests-0002".into()); c.aws_region = Some("us-east-1".into()); });
+    // Its role cannot see the image yet.
+    served.aws.fail("DescribeImages", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation."), None);
+    let (status, said) = report(&served, "connect-token-for-tests-0002");
+    assert!(status == 200 && said["connected"] == false && said["error"].is_string(), "{status} {said}");
+    assert!(served.store.under("aws_token_used").is_empty());
+    // Now it can: connected, once.
+    served.aws.fail_none();
+    let (status, said) = report(&served, "connect-token-for-tests-0002");
+    assert!(status == 200 && said["connected"] == true, "{status} {said}");
+    assert_eq!(report(&served, "connect-token-for-tests-0002").0, 409);
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
