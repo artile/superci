@@ -25,3 +25,11 @@ yaml-rust2 = { version = "0.10", default-features = false }
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+# The RSA key each run's runner is given is made by these: unoptimized (tests, and coverage runs, build them so) a
+# key takes seconds, and every job of a run from a computer makes one. Their code is not this repository's, nor
+# measured.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3
