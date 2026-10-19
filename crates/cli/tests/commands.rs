@@ -984,3 +984,181 @@ fn the_control_plane_is_updated_with_its_cloudflare_and_modal_launchers_as_a_rea
     assert!(asked.iter().any(|a| a.starts_with("PUT https://api.cloudflare.com/") && a.contains(&format!("/workers/scripts/superci-runners-{plane}"))), "{asked:?}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A job's tests as its log's lines say them, each process's apart where lines are marked by it, and what is not a
+/// runner's line not taken for one; a run's other jobs, another attempt's, and one that never ran, said as they are.
+#[test]
+fn a_jobs_tests_are_read_by_process_from_lines_that_only_look_like_a_runners_and_a_runs_other_jobs_are_said_as_they_stand() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let (job_id, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    served.webhook(served.github.start(job_id));
+    let log = [
+        "[web] starting the server",
+        "Running checks",
+        "Running 3 checks using 2 processes",
+        "[slot 1] Running 8 tests using 1 worker",
+        "[slot 1]   ✓  1 [chromium] › e2e/a.spec.ts:3:1 › logs in (2xs)",
+        "[slot 1]   ✘  2 [chromium] › e2e/a.spec.ts:5:1 › sometimes (1.0s)",
+        "[slot 1]   ✓  3 [chromium] › e2e/a.spec.ts:5:1 › sometimes (retry #1)",
+        "[slot 1]   -  4 [chromium] › e2e/a.spec.ts:7:1 › later",
+        "[slot 1]   ✓  5 [chromium] › e2e/a.spec.ts:9:1 › odd (retry #)",
+        "[slot 1]   ✓  6 [chromium] › e2e/a.spec.ts:11:1 › odder (retry #x)",
+        "[slot 1]   ✓  7 [chromium › e2e/a.spec.ts:13:1 › unclosed",
+        "[slot 1]   ✘  8 [chromium] › e2e/a.spec.ts:15:1 › known bug (1.0s)",
+        "[slot 1]   1) [chromium] › e2e/b.spec.ts:20:1 › breaks ───",
+        "[slot 1]     Error: nope",
+        "[slot 1]     2 workers",
+        "[slot 1]   1 failed",
+        "[slot 1]   1 flaky",
+        "[slot 1]   1 skipped",
+        "[slot 1]   5 passed (3.0s)",
+        "[slot 2] test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out",
+        " FAIL  src/sum.test.ts > sums > adds",
+        "AssertionError: expected 3 to be 4",
+        "FAIL as it says, but not a test",
+        "      Tests  1 failed (1)",
+        "=== 2 failed in 1.0s ===",
+    ].iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n");
+    served.webhook(served.github.finish(job_id, "success", &log, served.now_ms()));
+    let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &job_id.to_string(), "--tests"]).stdout).into_owned();
+    // Each process's own counts, a skipped and a flaky one among them; a title's own brackets kept as its own.
+    assert!(said.contains("Tests: 4 failed, 9 passed, 2 skipped (vitest, pytest, playwright, cargo), of the passed 1 failed as expected, 1 flaky"), "{said}");
+    assert!(said.contains("[slot 1] 1 failed, 6 passed, 1 skipped, 1 failed as expected, 1 flaky") && said.contains("[slot 2] 0 failed, 3 passed, 1 skipped"), "{said}");
+    assert!(!said.contains("[web]") && said.contains("✓ [chromium] logs in (2xs)") && said.contains("✓ [chromium] odder (retry #x)") && !said.contains("unclosed"), "{said}");
+    assert!(said.contains("✗ sums > adds  (src/sum.test.ts)") && said.contains("      FAIL as it says, but not a test") && said.contains("      2 workers"), "{said}");
+
+    // Its run with two jobs more: one ended though no machine of ours is said for it, and one of the run's next
+    // attempt, said with that attempt only.
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    let run = served.store.under(&format!("job:{job_id}"))[0].1["run_id"].clone();
+    let (lint, q) = served.github.queue("lint", "superci", served.now_ms());
+    served.webhook(q);
+    served.webhook(served.github.start(lint));
+    served.webhook(served.github.finish(lint, "success", "2026-10-15T10:00:01.0000000Z lint ok", served.now_ms()));
+    let (again, q) = served.github.queue("again", "superci", served.now_ms());
+    served.webhook(q);
+    edit(lint, &|j| { j["run_id"] = run.clone(); j["machine_id"] = serde_json::Value::Null; });
+    edit(again, &|j| { j["run_id"] = run.clone(); j["attempt"] = 2.into(); for k in ["cpu", "machine_type", "usd_per_hour", "waiting_usd_per_hour", "machine_id"] { j[k] = serde_json::Value::Null; } j["cloud"] = "".into(); j["state"] = "queued".into(); });
+    let said = String::from_utf8_lossy(&superci(&home, &["runs", "retrieve", &run.to_string(), "--tests"]).stdout).into_owned();
+    let lines: Vec<&str> = said.lines().collect();
+    assert!(lines[0].ends_with("(2 jobs · 0s · $0.000 · Last to end: lint, 0s)") && lines.iter().any(|l| l.contains("lint · app") && l.contains("passed")), "{said}");
+    assert!(said.contains("    No test results in its log (none of Vitest, Jest, Playwright, pytest, cargo or Go said any)."), "{said}");
+    // (One not started yet: nothing more to say of it.)
+    let next = lines.iter().position(|l| l.contains("· attempt 2  (1 job")).unwrap_or_else(|| panic!("{said}"));
+    assert!(lines[next + 2].ends_with("starting  again · app · Build and Test"), "{said}");
+    assert!(!lines[..next].iter().any(|l| l.contains("again")), "{said}");
+
+    // Kept as a job of no code host's, of no run, and swept before it ended: its tests read all the same, with no
+    // artifacts to fetch, nor a run's page.
+    let edit = |id: u64, f: &dyn Fn(&mut serde_json::Value)| { let mut m = served.store.0.lock().unwrap(); let k = format!("job:{id}"); let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); f(&mut j); m.insert(k, j.to_string()); };
+    edit(job_id, &|j| { j.as_object_mut().unwrap().remove("provider"); j["run_id"] = 0.into(); j["state"] = "swept".into(); j["conclusion"] = "success".into(); });
+    let (code, got) = json(&home, &["jobs", "retrieve", &job_id.to_string(), "--tests"]);
+    assert!(code == 0 && got["tests"]["passed"] == 9 && got["tests"]["artifacts"].is_null() && got["tests"]["artifacts_at"].is_null(), "{got}");
+    // Taken for a run from a computer's, of a run not kept: none of its log here, and no artifacts said.
+    edit(job_id, &|j| { j["provider"] = "local".into(); j["run_id"] = 999.into(); j["state"] = "done".into(); });
+    let (code, got) = json(&home, &["jobs", "retrieve", &job_id.to_string(), "--tests"]);
+    assert!(code == 0 && got["tests"]["runners"] == serde_json::json!([]) && got["tests"]["artifacts"].is_null(), "{got}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// With a key given by name (SUPERCI_PLANE, SUPERCI_KEY) and no sign-in, a change is refused as that key only reads;
+/// what the control plane answers to a key it does not take, or at an address where it is not, is said as it
+/// answered; and with this computer's key what needs no cloud sign-in is done.
+#[test]
+fn a_key_given_by_name_only_reads_and_what_the_control_plane_refuses_or_has_not_is_said_as_it_answered() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    let with = |plane: &str, key: &str, args: &[&str]| {
+        let o = common::command(&home).env("SUPERCI_PLANE", plane).env("SUPERCI_KEY", key).args(args).arg("--json").output().unwrap();
+        (o.status.code().unwrap_or(-1), serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap_or_else(|_| panic!("{args:?}: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
+    };
+    for change in [&["planes", "allow"][..], &["planes", "move", "testplane0002"]] {
+        let (code, v) = with(&served.url, &served.run_key, change);
+        assert!(code != 0 && v["error"].as_str().is_some_and(|e| e.starts_with("SUPERCI_KEY only reads.")), "{change:?}: {v}");
+    }
+    // The cache asked with no key it could take (as an older control plane, with none, answers), and with one it does not take.
+    let (code, v) = with(&served.url, "short", &["caches", "list"]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.starts_with("This control plane keeps no cache yet")), "{v}");
+    let (code, v) = with(&served.url, "superci_run_not_a_key", &["caches", "list"]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.starts_with("the control plane answered 40") && !e.contains("404")), "{v}");
+    // A run cancelled with a key it does not take, and one GitHub would not cancel: said as each answered.
+    let (code, v) = with(&served.url, "superci_run_not_a_key", &["runs", "cancel", "123"]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.starts_with("the control plane answered 40") && !e.contains("No run 123")), "{v}");
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
+    served.github.fail("POST", "/cancel", 500, "GitHub had a bad day");
+    let (code, v) = json(&home, &["runs", "cancel", &run]);
+    assert!(code == 1 && v["error"].as_str().is_some_and(|e| e.contains("GitHub had a bad day")), "{v}");
+
+    // A repository's cache of 2.5 GB, said in GB; its entries taken out with this computer's key alone.
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("cache:gh7:refs/heads/main:v1:deps-1".into(), serde_json::json!({ "id": "e1", "region": "us-east-1", "size": 2_500_000_000u64, "made": now, "used": now, "done": true }).to_string());
+    let said = String::from_utf8_lossy(&superci(&home, &["caches", "list"]).stdout).into_owned();
+    assert!(said.lines().any(|l| l.contains("1 entries") && l.contains("2.5 GB")), "{said}");
+    let o = superci(&home, &["caches", "delete", "--repo=gh7", "--confirm"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("gh7's cache entries are out."), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(served.store.under("cache:gh7:").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What is read where there is little to read: no control plane yet, a day with nothing run, no read or run keys and
+/// no device's key to list (read with a run key), a job of a run that has no job by that name, a copy from where
+/// no image is named; a job whose machine was not AWS's first choice says which it could not have.
+#[test]
+fn what_little_there_is_is_said_as_it_stands() {
+    // No control plane yet: none, said as none.
+    let account = superci_testkit::Aws::serve();
+    let alone = common::aws_only(&account);
+    let (code, status) = json(&alone, &["status"]);
+    assert_eq!((code, &status["control_plane"], status["signed_in"].as_str()), (0, &serde_json::Value::Null, Some("AWS account 111111111111")), "{status}");
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    // A day with nothing run: nothing saved, and no wait to say.
+    let said = String::from_utf8_lossy(&superci(&home, &["usage", "retrieve"]).stdout).into_owned();
+    assert!(said.contains("Spent $0.00; the same jobs on the code host's own runners: $0.00.\n") && !said.contains("saved") && !said.contains("Median wait"), "{said}");
+
+    // No read or run key: said, with this device's key.
+    let agent = format!("/superci/{}/READ_KEY_4102444800_AGENT", served.plane);
+    let kept = served.aws.params.lock().unwrap().remove(&agent).unwrap();
+    let said = String::from_utf8_lossy(&superci(&home, &["keys", "list"]).stdout).into_owned();
+    assert!(said.starts_with("No read or run keys.") && said.contains("Device keys: each device") && said.contains("(this one)"), "{said}");
+    served.aws.params.lock().unwrap().insert(agent, kept);
+    // A workspace that keeps a run key in place of a device's: the control plane lists no device's keys to it.
+    let reader = common::temp("run-key-home");
+    std::fs::create_dir_all(reader.join("workspaces/default")).unwrap();
+    let signs = std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap().replace(&served.key, &served.run_key);
+    std::fs::write(reader.join("workspaces/default/sign-ins.json"), signs).unwrap();
+    let (code, keys) = json(&reader, &["keys", "list"]);
+    assert!(code == 0 && keys["devices"] == serde_json::json!([]), "{keys}");
+    assert!(!String::from_utf8_lossy(&superci(&reader, &["keys", "list"]).stdout).contains("Device keys"));
+
+    // A job whose machine AWS had no spot c7a.large for, nor m7a.large: said, as the run's job by its name; a name
+    // the run has no job by, said with the names it has.
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    let run = served.store.under(&format!("job:{id}"))[0].1["run_id"].to_string();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let k = format!("job:{id}");
+        let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
+        j["machine_type"] = "c8a.large".into();
+        j["asks"] = serde_json::json!([{ "at": 1, "kind": "c7a.large", "spot": true, "said": "InsufficientInstanceCapacity", "ms": 5 }, { "at": 2, "kind": "m7a.large", "spot": true, "said": "InsufficientInstanceCapacity", "ms": 5 }]);
+        m.insert(k, j.to_string());
+    }
+    let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &format!("--run={run}"), "--job=tests"]).stdout).into_owned();
+    assert!(said.contains("\nNot the first choice: AWS had no spot c7a.large or m7a.large.\n"), "{said}");
+    let (code, v) = json(&home, &["jobs", "retrieve", &format!("--run={run}"), "--job=lint"]);
+    assert_eq!((code, v["error"].as_str()), (1, Some(format!("Run {run} has no job lint (its jobs: tests).").as_str())), "{v}");
+    // A copy of the image from a region with no image named: how to name one.
+    let (code, v) = json(&common::signed_in(&served), &["images", "create", "ca-central-1", "--from=eu-west-1:not-an-image"]);
+    assert_eq!((code, v["error"].as_str()), (2, Some("--from is a region and an image: --from=eu-west-1:ami-0123456789abcdef0.")), "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&reader);
+    let _ = std::fs::remove_dir_all(&alone);
+}
