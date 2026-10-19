@@ -3597,6 +3597,58 @@ fn github_is_asked_only_what_it_can_answer_and_its_answers_of_deliveries_runners
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// GitLab as the control plane finds it: an event that is no job's (left), a job of a further connection (kept by
+/// that connection's name), a job whose log GitLab will not give (said), a runner GitLab removed already (as good as
+/// removed); a project's webhook GitLab will not remove (the change refused), then one it has removed already.
+#[test]
+fn gitlab_events_logs_runners_and_webhooks_are_read_as_gitlab_answers_them_each_connection_by_its_name() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    let home = signed_in(&served);
+    // An event of another kind than a job's.
+    assert_eq!(served.gitlab_webhook(serde_json::json!({ "object_kind": "pipeline", "object_attributes": { "id": 1 } }).to_string().into_bytes()), 200);
+    // A job of a further connection, by its own webhook secret.
+    let mut second = superci_testkit::GitLab::connection();
+    (second["hook_secret"], second["id"]) = ("gitlab-hook-secret-second".into(), "gsecond".into());
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gsecond"), &second.to_string());
+    let (gid, pending) = served.gitlab.pending("gl-second", &["superci"], served.now_ms());
+    let host = served.url.trim_start_matches("http://").to_string();
+    let mut s = std::net::TcpStream::connect(&host).unwrap();
+    use std::io::{Read, Write};
+    s.write_all(format!("POST /gitlab/webhook HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\nx-gitlab-event: Job Hook\r\nx-gitlab-token: gitlab-hook-secret-second\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", pending.len()).as_bytes()).unwrap();
+    s.write_all(&pending).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 2"), "{out}");
+    assert!(!served.store.under(&format!("job:glgsecond-{gid}")).is_empty(), "{:?}", served.store.under("job:gl").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());
+    // A job of the first: its log refused by GitLab, said; its runner removed at GitLab already when it ends.
+    let (id, pending) = served.gitlab.pending("gl-first", &["superci"], served.now_ms());
+    served.gitlab_webhook(pending);
+    served.gitlab_webhook(served.gitlab.running(id, served.now_ms()));
+    served.gitlab.fail("GET", "/trace", 500);
+    let mut r = ureq::get(&format!("{}/job/log?id={id}&gl=", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap();
+    let said = r.body_mut().read_to_string().unwrap_or_default();
+    assert!(said.contains("GitLab would not give its log"), "{said}");
+    served.gitlab.fail_none();
+    served.gitlab.fail("DELETE", "/runners/", 404);
+    assert!(served.gitlab_webhook(served.gitlab.finish(id, "success", "ok", served.now_ms())) < 300);
+    assert!(served.store.under("glrunner:").iter().all(|(k, _)| !k.ends_with(&format!(":{id}"))), "its runner's record gone");
+    served.gitlab.fail_none();
+    // The project's webhook: added, then GitLab refusing to remove it (the change refused), then gone there already.
+    let o = common::superci(&home, &["projects", "update", "250833", "--enabled=true"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    served.gitlab.fail("DELETE", "/hooks/", 500);
+    let o = common::superci(&home, &["projects", "update", "250833", "--enabled=false"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("500"), "{said}");
+    served.gitlab.fail_none();
+    served.gitlab.fail("DELETE", "/hooks/", 404);
+    let o = common::superci(&home, &["projects", "update", "250833", "--enabled=false"]);
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    served.gitlab.fail_none();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
