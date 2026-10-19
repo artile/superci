@@ -2511,6 +2511,168 @@ fn a_first_control_plane_in_aws_is_refused_where_the_sign_in_may_run_nothing_and
 }
 
 #[test]
+fn a_modal_sign_in_begun_from_the_dashboard_is_waited_for_where_runners_are_added_and_before_any_control_plane() {
+    // A control plane with no Modal runners, Modal not signed in to; its sign-in begun here (Modal's token flow, as it
+    // answered).
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    // The connect screen's link: to Modal's page, its flow made.
+    let (status, _, page) = common::get(&link, "/connect/modal");
+    assert!(status == 200 && page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{status} {}", common::words(&page));
+    // Adding runners meanwhile: Modal's row waits for it, and can open its page again.
+    let page = common::words(&common::part(&link, "/?p=add-runners&fragment=1").1);
+    assert!(page.contains("Waiting for Modal Open again"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // Signed in to AWS alone, with no control plane: the Jobs page is the first step of setting one up, looking again
+    // until Modal's approval comes.
+    let account = superci_testkit::Aws::serve();
+    account.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
+    let home = common::aws_only(&account);
+    let (mut child, link) = common::dashboard(&home);
+    let (status, to, _) = common::post(&link, "/modal/signin", &[("next", "?p=jobs")]);
+    assert!(status == 303 && to.starts_with("https://modal.com/token-flow/"), "{status} {to}");
+    let (_, html) = common::part(&link, "/?p=jobs&fragment=1");
+    assert!(html.contains("data-refresh=") && common::words(&html).contains("Set up control plane"), "{}", common::words(&html));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_first_control_plane_in_modal_given_an_id_that_is_none_gets_one_of_its_own_and_says_where_it_stopped() {
+    // Signed in to Modal alone, no control plane yet; Modal answering nothing of a deploy.
+    let account = superci_testkit::Aws::serve();
+    let home = common::temp("modal-only");
+    std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), serde_json::json!({ "modal": { "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" } }).to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    // (Its workspace looked at as Modal answered: no SuperCI there.)
+    account.replaying(&[include_str!("../fixtures/modal/01-look.jsonl"), include_str!("../fixtures/modal/05-dashboard.jsonl")].concat(), &[]);
+    let (mut child, link) = common::dashboard(&home);
+    let (status, to, _) = common::post(&link, "/plane/modal", &[("plane", "NOTANIDHERE1")]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to}");
+    let page = || common::part(&link, "/?p=plane&fragment=1").1;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !common::words(&page()).contains("The deploy to Modal stopped") { assert!(std::time::Instant::now() < end, "{}", common::words(&page())); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    // Tried again with the id it made (the one given was no id).
+    let html = page();
+    let id = html.split(r#"name="plane" value=""#).nth(1).and_then(|r| r.split('"').next()).unwrap_or_default().to_string();
+    assert!(html.contains(r#"action="/plane/modal""#) && id.len() == 12 && id != "NOTANIDHERE1", "{id}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_cloudflare_control_planes_aws_runners_in_another_account_are_set_without_asking_aws_its_update_gives_their_role_what_it_asks_and_its_containers_replace_its_launcher() {
+    // A control plane in Cloudflare (its Worker, served here, reading the secrets it was given), with its own containers
+    // and a launcher of Cloudflare's from before; its AWS runners in an account this workspace is not signed in to.
+    let served = serve(|_| {});
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00005", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        c.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00005/CONTAINERS");
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    {
+        let mut secrets = served.aws.worker_secrets.lock().unwrap();
+        let kept = secrets.entry("superci".into()).or_default();
+        kept.insert("CONTAINERS".into(), "on".into());
+        kept.insert("LAUNCHERS".into(), r#"[{"cloud":"cloudflare","url":"https://superci-runners-cfplane00005.acme.workers.dev"}]"#.into());
+        kept.insert("ROUTING".into(), r#"{"order":[{"cloud":"aws","regions":["us-east-1"]},{"cloud":"aws-on-demand","regions":["eu-west-1"]},{"cloud":"cloudflare"}]}"#.into());
+    }
+    let connected = |account: &str| cf.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": account, "region": "us-east-1", "role_arn": format!("arn:aws:iam::{account}:role/superci-plane-cfplane00005"), "connected": true }).to_string());
+    connected("222222222222");
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": "https://superci.acme.workers.dev", "plane_id": "cfplane00005", "label": "superci" } });
+    kept["key"] = serde_json::json!({ "name": "DEVICE_KEY_4102444800_TEST", "value": cf.key, "planes": ["cfplane00005"] });
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    // (Its account looked in, and its Worker updated later, as Cloudflare answered.)
+    served.aws.replaying(&[include_str!("../fixtures/update/05-update-cf.jsonl"), include_str!("../fixtures/cloudflare/sign-in/usage.jsonl")].concat(), &[]);
+    let (mut child, link) = common::dashboard(&home);
+    let secret = |n: &str| served.aws.worker_settings("superci").into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    // Its containers are its own: Cloudflare's row says added.
+    let page = common::words(&common::part(&link, "/?p=add-runners&fragment=1").1);
+    assert!(page.contains("Containers, one per job, started by your control plane. Added"), "{page}");
+    // AWS's networks and its spot machines' regions, set while not signed in to that account: kept as said (not looked
+    // up, no network made in a new region), the on-demand machines' regions left as they were.
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "pool"), ("cloud", "aws"), ("networks", "us-east-1 subnet-0123456789abcdef0 sg-0123456789abcdef0"),
+        ("region_0", "us-east-1"), ("region_1", "us-west-2")]);
+    assert!(status == 303, "{status} {}", common::words(&said));
+    assert!(secret("AWS_NETWORKS").is_some_and(|n| n.contains("subnet-0123456789abcdef0")), "{:?}", secret("AWS_NETWORKS"));
+    assert_eq!(secret("AWS_REGIONS").as_deref(), Some(r#"["us-east-1","us-west-2","eu-west-1"]"#));
+    let routing: serde_json::Value = serde_json::from_str(&secret("ROUTING").unwrap()).unwrap();
+    assert_eq!(routing["order"][1]["regions"], serde_json::json!(["eu-west-1"]), "{routing}");
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| ["Action=DescribeSubnets", "Action=CreateVpc"].iter().any(|x| s.starts_with(x)))), "AWS asked");
+    // Its AWS runners in the account signed in to: its update (the Worker uploaded again, as Cloudflare answered) gives
+    // their role what this version asks for, with that sign-in; its launcher of Cloudflare's from before is no
+    // launcher of a control plane elsewhere.
+    connected("111111111111");
+    let (status, to, said) = common::post(&link, "/plane/update", &[]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while !served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("iam.")) && a["asked"].as_str().is_some_and(|s| s.contains("superci-plane-cfplane00005"))) {
+        assert!(std::time::Instant::now() < end, "its role not asked for: {}", common::words(&common::part(&link, "/?p=planes&fragment=1").1));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    assert!(!common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Its Cloudflare launcher was not updated"));
+    // Its containers added again (its Worker given them anew): the launcher from before is no longer needed.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Updating") { assert!(std::time::Instant::now() < end, "updated"); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    let (status, to, said) = common::post(&link, "/runners/cloudflare", &[]);
+    assert!(status == 303 && to == "/?p=runners", "{status} {to} {}", common::words(&said));
+    assert_eq!(secret("LAUNCHERS").as_deref(), Some("[]"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn cloudflare_beside_aws_lists_its_accounts_when_first_asked_and_says_what_it_refuses() {
+    // The CI in AWS, with a launcher in Cloudflare (no containers of its own); Cloudflare signed in to, its account as it
+    // answered.
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(&[include_str!("../fixtures/cloudflare/01-look.jsonl"), include_str!("../fixtures/cloudflare/sign-in/usage.jsonl")].concat(), &[]);
+    let (mut child, link) = common::dashboard(&home);
+    let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    // Set up in Cloudflare before any page listed its accounts: they are asked for, and it is set up in the one named
+    // (beside the CI in use).
+    let (status, to, said) = common::post(&link, "/plane/cloudflare", &[("account", "1111111111111111111111111111111a")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    // Runners into an account the sign-in does not reach: refused.
+    let (status, _, said) = common::post(&link, "/runners/cloudflare", &[("account", "2222222222222222222222222222222b")]);
+    assert!(status >= 400 && common::words(&said).contains("The Cloudflare sign-in does not reach that account"), "{status} {}", common::words(&said));
+    // Its launcher removed, Cloudflare refusing to delete it: forgotten all the same, and what is left there said.
+    served.aws.fail("workers/scripts/superci-runners-testplane0001", 403, r#"{"success":false,"errors":[{"code":10000,"message":"Authentication error"}],"messages":[],"result":null}"#, None);
+    let (status, to, said) = common::post(&link, "/runners/remove", &[("cloud", "cloudflare")]);
+    assert!(status == 303 && to == "/?p=runners", "{status} {to} {}", common::words(&said));
+    assert_eq!(setting("LAUNCHERS").as_deref(), Some("[]"));
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(page.contains("Removed Cloudflare. Left: its Cloudflare launcher"), "{page}");
+    let _ = child.kill();
+    // A token given by name that Cloudflare refuses (said in words, with no code of its own): said as that token's.
+    served.aws.fail_none();
+    served.aws.fail("api.cloudflare.com", 403, r#"{"success":false,"errors":[{"code":10001,"message":"Invalid access token"}],"messages":[],"result":null}"#, None);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_CLOUDFLARE_TOKEN", "cloudflare-token-for-tests")]);
+    let page = common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    assert!(page.contains("Cloudflare refuses the token in SUPERCI_CLOUDFLARE_TOKEN"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // A control plane whose own account runs jobs, with a budget in AWS for its limit; AWS answering nothing more.
