@@ -3459,6 +3459,91 @@ fn another_control_plane_behind_is_offered_its_update_beside_moving_and_restarts
 }
 
 #[test]
+fn the_permissions_card_says_a_role_aws_would_not_let_be_read_an_app_github_did_not_describe_and_one_gitlabs_token() {
+    let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    // AWS refusing to show the role's policy; GitHub not saying what the App asks for.
+    served.aws.fail("GetRolePolicy", 403, &superci_testkit::ec2_error("AccessDenied", "User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: iam:GetRolePolicy"), None);
+    served.github.fail("GET", "/app", 502, "Server Error");
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && {} && {}", reads("Not read: AccessDenied"), reads("App superci-acme"), reads("Its token has every scope")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_cloudflare_control_plane_with_launchers_and_aws_runners_is_deleted_with_what_it_has_in_each_signed_in_account() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    // Its machines in AWS: in the account signed in to, then in another.
+    for (account, said) in [("111111111111", "Deleted Cloudflare"), ("222222222222", "Its role in AWS account 222222222222 (sign in with AWS to remove it)")] {
+        let served = serve(|_| {});
+        served.connect_github();
+        // A Cloudflare control plane beside the one in use: its own launcher in Cloudflare, one in Modal, AWS's runners
+        // in that account with a budget there.
+        // (It reads the key the dashboard hands it where Cloudflare keeps a Worker's secrets.)
+        let aws = served.aws.clone();
+        let cf = superci_testkit::serve_as("cfplane00003", move |c| c.read_settings(&aws.worker_settings("superci")));
+        served.aws.worker_secrets.lock().unwrap().insert("superci".into(), [
+            ("LAUNCHERS", r#"[{"cloud":"cloudflare","url":"https://superci-runners-cfplane00003.acme.workers.dev"},{"cloud":"modal","url":"https://acmeorg--superci-runners-cfplane00003.modal.run"}]"#),
+            ("ROUTING", r#"{"aws_budget":{"stop":false},"order":[{"cloud":"aws"}]}"#)].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+        cf.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": account, "region": "us-east-1", "role_arn": format!("arn:aws:iam::{account}:role/superci-plane-cfplane00003"), "connected": true, "error": null }).to_string());
+        served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+        let home = signed_in(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+        std::fs::write(&file, kept.to_string()).unwrap();
+        served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/update/07-delete-cf.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+        let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+        b.goto(&format!("{link}&p=planes"));
+        b.wait(&reads("superci.acme.workers.dev Move here"));
+        // (From a page that does not look again by itself: what it did is said once, on the next page.)
+        b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+        let (got, text) = post(&mut b, "/plane/delete", &[("plane", "cfplane00003")]);
+        assert!(got < 400, "{account}: {got} {text}");
+        b.goto(&format!("{link}&p=planes"));
+        b.wait(&format!("{} && {}", page_shows("Deleted"), page_shows("Its Modal launcher (sign in with Modal to remove it)")));
+        let page = b.eval("document.body.innerText").as_str().unwrap_or_default().replace('\n', " ");
+        assert!(page.contains(said), "{account}: {page}");
+        // Its Cloudflare launcher asked to go with it.
+        assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["method"] == "DELETE" && a["url"].as_str().unwrap_or_default().contains("workers/scripts/superci-runners-cfplane00003")), "{account}");
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[test]
+fn another_aws_control_plane_is_deleted_with_its_budget_in_aws_as_budgets_answered() {
+    let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
+    let served = serve(|_| {});
+    let aws = served.aws.clone();
+    let other = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    // (Its budget removed as a real account removed one.)
+    served.aws.replaying(include_str!("../fixtures/aws/budget/09-remove.jsonl"), &[("abcdefghijkl", "testplane0002")]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    served.aws.put("/superci/testplane0002/ROUTING", r#"{"aws_budget":{"stop":true},"order":[{"cloud":"aws"}]}"#);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&format!("{} && {}", shows("Control plane"), shows(&other.url)));
+    // (From a page that does not look again by itself: what it did is said once, on the next page.)
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
+    let (got, text) = post(&mut b, "/plane/delete", &[("plane", "testplane0002")]);
+    assert!(got < 400, "{got} {text}");
+    b.goto(&format!("{link}&p=planes"));
+    b.wait(&page_shows("Deleted"));
+    assert!(!b.eval("document.body.innerText").as_str().unwrap_or_default().contains("Its budget in AWS"), "{}", b.eval("document.body.innerText"));
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["target"] == "AWSBudgetServiceGateway.DeleteBudget" && a["status"] == 200));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
