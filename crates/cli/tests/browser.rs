@@ -1101,6 +1101,7 @@ fn what_settings_forms_must_not_take_is_refused_or_left_out_and_nothing_else_cha
         (&[("action", "pool"), ("cloud", "aws"), ("region_0", "mars-north-1")], "Choose a region from the list"),
         (&[("action", "account"), ("cloud", "aws"), ("networks", "not networks")], "Check your networks"),
         (&[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-12 sg-00000000000000001")], "is not a subnet id"),
+        (&[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1; subnet-00000000000000001; sg-00000000000000001\nus-east-1 subnet-00000000000000002 sg-00000000000000001")], "is there twice"),
         (&[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-0000000000000000000001 sg-00000000000000001")], "is not a subnet id"),
         (&[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-0000000g sg-00000000000000001")], "is not a subnet id"),
         (&[("action", "pool"), ("cloud", "cloudflare"), ("image", "ftp://example.com/image")], "https://"),
@@ -1152,6 +1153,16 @@ fn what_settings_forms_must_not_take_is_refused_or_left_out_and_nothing_else_cha
     }
     for _ in 0..2 { post(&mut b, "/routing", &[("action", "public_add"), ("repo", "acme/site")]); }
     until("the public repository", || routing()["public_repos"].as_array().is_some_and(|r| r.iter().filter(|r| r.as_str().is_some_and(|s| s.eq_ignore_ascii_case("acme/site"))).count() == 1));
+    // Many more (GitHub not listing them): the first few named and how many more, the dialog with a search.
+    for n in 1..=9 { post(&mut b, "/routing", &[("action", "public_add"), ("repo", &format!("acme/lib{n}"))]); }
+    until("nine more", || routing()["public_repos"].as_array().is_some_and(|r| r.len() >= 10));
+    b.goto(&format!("{link}&p=settings"));
+    b.wait(&format!("{} && !!document.querySelector('input.dlg-search')", reads("more")));
+    // A form's way back that is too long, or not a plain one: back to the start instead.
+    for next in [format!("?{}", "a".repeat(130)), "?p=jobs<script>".to_string()] {
+        let (got, _) = post(&mut b, "/routing", &[("action", "public_add"), ("repo", "acme/site"), ("next", &next)]);
+        assert!(got < 400, "{next}");
+    }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -2357,6 +2368,11 @@ fn the_default_machine_and_keys_forms_take_only_what_they_may_and_the_machine_is
     assert!(got < 400, "{got} {text}");
     b.goto(&format!("{link}&p=workflows"));
     b.wait(&format!("{} && {} && {}", reads("8 CPU"), reads("RAM disk"), reads("m8a")));
+    // Its own disk size, a local disk for its files, a disk speed of its own.
+    let (got, text) = post(&mut b, "/machine", &[("cpu", "8"), ("disk", "200"), ("scratch", "localdisk"), ("disk-speed", "750")]);
+    assert!(got < 400, "{got} {text}");
+    b.goto(&format!("{link}&p=workflows"));
+    b.wait(&format!("{} && {}", reads("200 GB disk"), reads("local disk")));
     // A key to take out that is no device key's name: refused, nothing changed.
     let (got, text) = post(&mut b, "/keys/remove", &[("name", "DEVICE_KEY_not-one")]);
     assert!(got == 409 && text.contains("That is not a device key"), "{got} {text}");
