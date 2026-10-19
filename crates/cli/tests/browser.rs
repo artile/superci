@@ -5456,6 +5456,9 @@ mod runs_suite_in_browser {
         runner.steps(&[(a, "Run cargo test", 1, "inProgress", None, None)]);
         runner.lines(a, 1, &["test api::adds ... ok".into(), "test api::subtracts ... ok".into(), "test result: ok. 2 passed; 0 failed; 0 ignored".into()]);
         runner.steps(&[(a, "Run cargo test", 1, "completed", Some("succeeded"), None), (b, "Deploy", 2, "completed", Some("skipped"), None), (c, "Notify", 3, "completed", Some("cancelled"), None)]);
+        // (And the job's own record, with its whole log, as a runner sends it: not a step.)
+        runner.records(vec![serde_json::json!({ "id": "dddddddd-0000-0000-0000-000000000001", "type": "Job", "name": "tests", "order": 1, "state": "completed", "result": "succeeded", "log": { "id": 9 } })]);
+        runner.log(9, "2026-10-15T10:00:01.0000000Z the job's own log\n");
         runner.finish("succeeded");
         let out = cli.wait_with_output().unwrap();
         let said = String::from_utf8_lossy(&out.stdout).to_string();

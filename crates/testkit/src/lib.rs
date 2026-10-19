@@ -737,6 +737,8 @@ impl Runner {
             "log": log.map(|n| json!({ "id": n })), "startTime": "2026-10-15T10:00:00Z", "finishTime": if *state == "completed" { json!("2026-10-15T10:00:07Z") } else { Value::Null } })).collect();
         self.post("/Timeline/scope/hub/plan/timeline", json!({ "value": value }).to_string().into_bytes())
     }
+    /// Timeline records as given (the job's own, of type `Job`, beside its steps').
+    pub fn records(&self, value: Vec<Value>) -> u16 { self.post("/Timeline/scope/hub/plan/timeline", json!({ "value": value }).to_string().into_bytes()) }
     /// Lines of a step as it sends them while it runs, from line `start` of the step's log.
     pub fn lines(&self, step: &str, start: u64, lines: &[String]) -> u16 {
         self.post(&format!("/TimeLineWebConsoleLog/scope/hub/plan/timeline/{step}"), json!({ "value": lines, "stepId": step, "startLine": start }).to_string().into_bytes())
