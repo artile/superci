@@ -10706,6 +10706,22 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
     }
     let (id_s, by_run) = (id.to_string(), format!("--run={run}"));
     let (long_x, long_l, long_id) = ("x".repeat(80), "l".repeat(80), format!("--id={}", "a".repeat(40)));
+    // (And one still running: its log so far, into a file.)
+    let (rid, q) = served.github.queue("still running", "superci", served.now_ms()); served.webhook(q);
+    served.webhook(served.github.start(rid));
+    let runner = {
+        let key = format!("job:{rid}");
+        let mut m = served.store.0.lock().unwrap();
+        let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap();
+        j["hello"] = serde_json::json!("machine-link-running-0001");
+        m.insert(key, j.to_string());
+        j["runner"].as_str().unwrap().to_string()
+    };
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    assert_eq!(agent.post(&format!("{}/hello?runner={runner}&t=machine-link-running-0001&live=timeline_aaaaaaaa-0000-0000-0000-000000000001_1.log&at=0", served.url)).send("2026-10-15T10:00:01.0000000Z building\n").unwrap().status().as_u16(), 200);
+    let out = home.join("running.log");
+    let (code, said) = cli(&["jobs", "retrieve", &rid.to_string(), &format!("--out={}", out.display())]);
+    assert!(code == 0 && said.contains("Its log so far (the job is still running)"), "{code} {said}");
     let table: Vec<Vec<&str>> = vec![
         // Jobs and runs: by run, by id, with their tests, and what is not an id.
         vec!["jobs", "list", &by_run], vec!["jobs", "list", "--run=abc"], vec!["jobs", "retrieve"], vec!["jobs", "retrieve", "abc"], vec!["jobs", "retrieve", &id_s, "--bytes=200"], vec!["jobs", "retrieve", &id_s, "--tests"],
@@ -10757,6 +10773,12 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         vec!["artifacts", "list"], vec!["artifacts", "list", "--run=abc"], vec!["artifacts", "retrieve", &by_run], vec!["artifacts", "list", &by_run], vec!["artifacts", "retrieve", "report", &by_run],
         vec!["caches", "update"], vec!["limits", "update", "--max-hours=3"], vec!["limits", "update", "--daily-usd=5"], vec!["machine", "update", "--cpu=3", "--ram=1"], vec!["machine", "update", "--disk=1"], vec!["machine", "update", "--os=windows", "--arch=arm64"], vec!["machine", "update", "--os=default", "--arch=default", "--dry-run"],
         vec!["secrets", "create", "LISTED", "--value-env=HOME"], vec!["secrets", "list"], vec!["secrets", "list", "--json"], vec!["secrets", "delete", "LISTED", "--confirm"],
+        // A run's job by a name it has not, of a run with none; a repository that is half a name; a cache of a
+        // repository with none; a secret, a key, an image, a provider's settings, each with what does not hold.
+        vec!["jobs", "retrieve", "--run=999", "--job=x"], vec!["jobs", "retrieve", &by_run, "--job=nope"], vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=/app"], vec!["runs", "create", "--workflow=.github/workflows/ci.yml", "--repo=acme/"],
+        vec!["caches", "list", "--repo=acme/nothing"], vec!["secrets", "create", "DRY", "--value-env=HOME", "--dry-run"], vec!["keys", "create", "agent", "--max-cpu=8"], vec!["keys", "create", "agent", "--daily-usd=5"],
+        vec!["accounts", "retrieve", "gcp"], vec!["images", "create", "eu-west-1", "--from=nothing"], vec!["images", "create", "eu-west-1", "--from=us-east-1:ami-0123456789abcdef0", "--dry-run"],
+        vec!["runners", "update", "cloudflare"], vec!["runners", "update", "aws", "--networks=subnet-0123456789abcdef0", "--dry-run"], vec!["public_repos", "list"], vec!["runs", "cancel", "999"],
         // Help, a resource alone, what is no command.
         vec!["help"], vec!["help", "runs"], vec!["runs"], vec!["runs", "--help"], vec!["nothing"], vec!["runs", "nothing"], vec!["--version"],
     ];
