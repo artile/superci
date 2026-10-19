@@ -11208,6 +11208,22 @@ fn each_commands_arguments_and_refusals_are_taken_or_said_and_the_dashboard_show
         assert!(code == 0 && said.contains("SuperCI"), "{name}: {code} {said}");
     }
     served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/NAME"));
+    // A run key asking what needs a device's key: said it only reads and runs. A GitHub event other than a job's:
+    // taken and let be.
+    let mut r = ureq::get(&format!("{}/status", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().call().unwrap();
+    assert!(r.status().as_u16() == 200 || r.body_mut().read_to_string().unwrap_or_default().contains("run key"), "{}", r.status());
+    let mut r = ureq::post(&format!("{}/secrets", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send("{}").unwrap();
+    assert!(r.status().as_u16() >= 400 && !r.body_mut().read_to_string().unwrap_or_default().is_empty());
+    let (body, signature) = served.github.signed(&serde_json::json!({ "zen": "Keep it logically awesome.", "hook_id": 1 }));
+    let r = ureq::post(&format!("{}/webhook", served.url)).header("x-github-event", "ping").header("x-hub-signature-256", &signature).config().http_status_as_error(false).build().send(&body[..]).unwrap();
+    assert_eq!(r.status().as_u16(), 202);
+    // Settings that say nothing, or more than they may: read as not set.
+    for (k, v) in [("CF_IMAGE", format!("https://images.example.com/{}", "x".repeat(300))), ("LABELS", r#"["superci","Bad Label"]"#.to_string()), ("LABELS", "[]".to_string()), ("CF_LOCATION", String::new())] {
+        served.aws.put(&format!("/superci/{PLANE}/{k}"), &v);
+        let (code, said) = cli(&["labels", "list", "--workspace=default"]);
+        assert!(code == 0, "{k}={v}: {code} {said}");
+    }
+    for k in ["CF_IMAGE", "LABELS", "CF_LOCATION"] { served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/{k}")); }
     // Its status asked with other values beside: as asked plainly.
     for q in ["light=0", "other=1"] {
         let mut r = ureq::get(&format!("{}/status?{q}", served.url)).header("authorization", &format!("Bearer {}", served.key)).config().http_status_as_error(false).build().call().unwrap();
