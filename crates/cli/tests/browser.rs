@@ -448,6 +448,101 @@ fn a_key_the_control_plane_does_not_take_in_time_is_said_as_not_taken_and_not_sh
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// AWS sign-ins due to be renewed as a command looks at the account: another account's that AWS no longer renews is
+/// left out and the rest kept; the one in hand renewed after AWS did not answer once, or not at all, or found over
+/// when AWS calls its credentials expired; and with no AWS sign-in, whether one ended is said.
+#[test]
+fn aws_sign_ins_due_as_an_account_is_looked_at_are_renewed_left_out_or_said_ended_as_aws_answers() {
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/sign-in/ended.jsonl"), &[]);
+    let dpop = || serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    let session = |account: &str, due: bool| {
+        let mut s = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(signed_in(&served).join("workspaces/default/sign-ins.json")).unwrap()).unwrap()["aws"].clone();
+        (s["account_id"], s["who"]) = (account.into(), format!("arn:aws:sts::{account}:assumed-role/Admin/someone").into());
+        if due { (s["creds"]["expires_at_ms"], s["refresh_token"], s["dpop"]) = (0.into(), "superci-ended-refresh-token-for-a-recording".into(), dpop()) }
+        s
+    };
+    let at = |f: &dyn Fn(&mut serde_json::Value)| { let home = signed_in(&served); let file = home.join("workspaces/default/sign-ins.json"); let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap(); f(&mut k); std::fs::write(&file, k.to_string()).unwrap(); home };
+    let kept = |home: &std::path::Path| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap_or_default()).unwrap_or_default() };
+    let look = |home: &std::path::Path| common::json(home, &["accounts", "retrieve", "aws", "--account=111111111111"]).1;
+    // Two more accounts: one due, which AWS no longer renews (left out), one not (kept).
+    let home = at(&|k| k["aws_more"] = serde_json::json!([session("222222222222", true), session("333333333333", false)]));
+    look(&home);
+    let more: Vec<String> = kept(&home)["aws_more"].as_array().into_iter().flatten().filter_map(|a| a["account_id"].as_str().map(str::to_string)).collect();
+    assert_eq!(more, ["333333333333"], "{}", kept(&home));
+    let _ = std::fs::remove_dir_all(&home);
+    // The one in hand due: AWS not answering once, then refusing: over, and said so.
+    served.aws.fail("signin.aws.amazon.com/v1/token", 500, r#"{"error":"InternalServerException"}"#, Some(1));
+    let home = at(&|k| k["aws"] = session("111111111111", true));
+    let said = common::json(&home, &["accounts", "retrieve", "aws"]).1;
+    assert!(said["error"] == "Your AWS sign-in has ended. Sign in with AWS again." && said["needs"] == "superci login aws", "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+    // Refused at once: no longer signed in to it.
+    let home = at(&|k| k["aws"] = session("111111111111", true));
+    let said = common::json(&home, &["accounts", "retrieve", "aws"]).1;
+    assert!(said["ok"] == false && kept(&home)["aws_ended"] == true, "{said} {}", kept(&home));
+    let _ = std::fs::remove_dir_all(&home);
+    // In hand and not due, AWS calling its credentials expired as it is looked at: renewed, and found over.
+    served.aws.fail("amazonaws.com", 400, &superci_testkit::ec2_error("RequestExpired", "Request has expired."), None);
+    let home = at(&|k| { k["aws"] = session("111111111111", false); (k["aws"]["refresh_token"], k["aws"]["dpop"]) = ("superci-ended-refresh-token-for-a-recording".into(), dpop()); });
+    let said = common::json(&home, &["accounts", "retrieve", "aws"]).1;
+    served.aws.fail_none();
+    assert!(said["error"].as_str().unwrap_or_default().contains("SuperCI's AWS sign-in has ended"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+    // No AWS sign-in: one that ended is said as ended; none ever, as to sign in.
+    for (ended, says) in [(true, "SuperCI's AWS sign-in has ended"), (false, "Sign in with AWS first.")] {
+        let home = at(&|k| { k.as_object_mut().unwrap().remove("aws"); if ended { k["aws_ended"] = true.into() } });
+        let said = common::json(&home, &["accounts", "retrieve", "aws"]).1;
+        assert!(said["error"].as_str().unwrap_or_default().contains(says), "{ended}: {said}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// Sign-ins another process writes while the dashboard runs are taken in by the next page, unless this one holds its
+/// own: an AWS sign-in noted as ended, taken by one signed in to none, not by one signed in to AWS; a Modal sign-in,
+/// not by one given its token for this run. And what the workspace is called, when it cannot be written, is said once.
+#[test]
+fn sign_ins_written_elsewhere_are_taken_in_only_where_this_dashboard_holds_none_of_its_own() {
+    let served = serve(|_| {});
+    let page = |link: &str| { let mut p = String::new(); for _ in 0..30 { p = common::words(&common::part(link, "/?p=overview&fragment=1").1); if !p.contains("Reading your control plane") { break } std::thread::sleep(std::time::Duration::from_millis(300)) } p };
+    let write = |home: &std::path::Path, f: &dyn Fn(&mut serde_json::Value)| { let file = home.join("workspaces/default/sign-ins.json"); let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap(); f(&mut k); std::fs::write(&file, k.to_string()).unwrap(); };
+    let ended = "Your AWS sign-in has ended (AWS ends one after 12 hours)";
+    // Signed in nowhere: AWS's sign-in noted as ended elsewhere is said here too.
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let (child, link) = dashboard(&home);
+    assert!(!page(&link).contains(ended));
+    write(&home, &|k| k["aws_ended"] = true.into());
+    assert!(page(&link).contains(ended), "{}", page(&link));
+    drop(child);
+    let _ = std::fs::remove_dir_all(&home);
+    // Signed in to AWS: its own sign-in stands.
+    let home = signed_in(&served);
+    let (child, link) = dashboard(&home);
+    page(&link);
+    write(&home, &|k| k["aws_ended"] = true.into());
+    assert!(!page(&link).contains(ended), "{}", page(&link));
+    drop(child);
+    let _ = std::fs::remove_dir_all(&home);
+    // A Modal token given for this run: a Modal sign-in written elsewhere is not taken in its place.
+    let home = signed_in(&served);
+    let (child, link) = common::dashboard_with(&home, &[("SUPERCI_MODAL_TOKEN_ID", "ak-given"), ("SUPERCI_MODAL_TOKEN_SECRET", "as-given")]);
+    page(&link);
+    write(&home, &|k| k["modal"] = serde_json::json!({ "token_id": "ak-elsewhere", "token_secret": "as-elsewhere", "workspace": "elsewhere" }));
+    let (_, settings) = common::part(&link, "/?p=settings&fragment=1");
+    assert!(!common::words(&settings).contains("elsewhere"), "{}", common::words(&settings));
+    drop(child);
+    let _ = std::fs::remove_dir_all(&home);
+    // What the workspace is called, where it cannot be written (its file a folder): said once, the name set all the same.
+    let home = signed_in(&served);
+    std::fs::create_dir_all(home.join("workspaces/default/workspace.json")).unwrap();
+    let o = common::superci(&home, &["name", "update", "AcmeCI"]);
+    let said = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(o.status.success() && said.matches("could not write in").count() == 1, "{said}{}", String::from_utf8_lossy(&o.stdout));
+    assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k == "NAME" && v == "AcmeCI"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
