@@ -4,6 +4,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 
 ## 0.19.19
 - A control plane asked for a job's log by an id that is no job's, or of a GitLab by a name that is none, answers 400 with what was wrong (it answered 500, as if it had failed itself).
+- `superci jobs retrieve ID --out=FILE` of a GitLab job whose log is over 4 MB says the control plane gives only its last 4 MB, and that GitLab's page of the job has it whole. It said a newer control plane would give it whole, which none does for GitLab.
 - Remove from SuperCI only, when removing a runner provider in the dashboard, removes it from SuperCI only. The button's choice was lost as the dialog was sent, so it removed the provider in its cloud too, or asked to sign in there.
 - Settings keeps what is this computer's own while the workspace's control plane does not take this computer's key: its id, signing out, and removing the workspace when there are others. The page showed only why the key was not taken, so a workspace kept twice could not be removed there.
 

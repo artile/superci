@@ -6173,7 +6173,11 @@ pub fn whole_log(plane_url: &str, key: &str, j: &serde_json::Value) -> Result<Ve
     let gl = if provider == "gitlab" { format!("&gl={}", j["gitlab"].as_str().unwrap_or_default()) } else { String::new() };
     let got = cloudflare::plane_get(plane_url, key, &format!("/job/log?id={id}&bytes=4000000{gl}"))?;
     // (Its end only is not the whole: said, not passed off as it.)
-    if got["truncated"] == true { return Err(format!("the control plane gave only the last {} of its log (a newer control plane gives it whole)", size_words(got["log"].as_str().unwrap_or_default().len() as u64))) }
+    if got["truncated"] == true {
+        let last = size_words(got["log"].as_str().unwrap_or_default().len() as u64);
+        return Err(if provider == "gitlab" { format!("the control plane gives only the last {last} of a GitLab job's log: GitLab's page of the job has it whole (Complete Raw)") }
+            else { format!("the control plane gave only the last {last} of its log (a newer control plane gives it whole)") })
+    }
     match got["log"].as_str() { Some(l) => Ok(l.as_bytes().to_vec()), None => Err(got["error"].as_str().unwrap_or("no log").to_string()) }
 }
 

@@ -5077,6 +5077,16 @@ mod gitlab_in_browser {
         assert!(served.gitlab_webhook(served.gitlab.finish(id2, "failed", &log2, served.now_ms())) < 300);
         let (_, ended) = part(&link, &format!("/job/view?id={id2}"));
         assert!(ended.contains("failure"), "{ended}");
+        // A log over the 4 MB the control plane gives at once, asked for whole: said to be only its end, not passed off
+        // as the whole of it.
+        let (id3, pending) = served.gitlab.pending("long log", &["superci"], served.now_ms());
+        assert!(served.gitlab_webhook(pending) < 300);
+        assert!(served.gitlab_webhook(served.gitlab.running(id3, served.now_ms())) < 300);
+        let long = (0..45_000).map(|n| format!("line {n:05} {}", "x".repeat(90))).collect::<Vec<_>>().join("\n");
+        assert!(served.gitlab_webhook(served.gitlab.finish(id3, "success", &long, served.now_ms())) < 300);
+        served.gitlab.trace(id3, &long);
+        let o = common::command(&home).args(["jobs", "retrieve", &id3.to_string(), &format!("--out={}", home.join("long.log").display())]).output().unwrap();
+        assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains("gives only the last 4.0 MB of a GitLab job's log: GitLab's page of the job has it whole"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
         super::seen_in_browser(&served);
