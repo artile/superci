@@ -10486,6 +10486,22 @@ fn each_regions_cache_bucket_is_made_filled_once_and_removed_as_s3_answers_and_a
     assert!(said.contains("deleted in eu-north-1") && !has(&program), "{said}");
     let said = remove();
     assert!(said.contains("deleted in eu-north-1"), "{said}");
+    // AWS's runners connected: their role and its OpenID provider there already, the spot role too (or refused as
+    // AWS refuses one it has), then IAM refusing the role.
+    let iam_error = |code: &str| format!(r#"<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><Error><Type>Sender</Type><Code>{code}</Code><Message>{code}</Message></Error><RequestId>1</RequestId></ErrorResponse>"#);
+    let iam_ok = r#"<Response xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></Response>"#;
+    for (role, spot) in [(iam_error("EntityAlreadyExists"), iam_error("InvalidInput")), (iam_error("EntityAlreadyExists"), iam_error("EntityAlreadyExists")), (iam_error("AccessDenied"), iam_ok.to_string()), (iam_ok.to_string(), iam_error("AccessDenied"))] {
+        served.aws.fail_none();
+        served.aws.replaying(&network, &[("mixplane0001", PLANE)]);
+        served.aws.fail("CreateOpenIDConnectProvider", 409, &iam_error("EntityAlreadyExists"), None);
+        served.aws.fail("CreateRole", if role.contains("Error") { 409 } else { 200 }, &role, None);
+        for a in ["UpdateAssumeRolePolicy", "PutRolePolicy"] { served.aws.fail(a, 200, iam_ok, None) }
+        served.aws.fail("CreateServiceLinkedRole", if spot.contains("Error") { 400 } else { 200 }, &spot, None);
+        let (got, text) = post(&mut b, "/aws/connect", &[("region", "eu-north-1")]);
+        assert!(got != 0 && !text.contains("panicked"), "{got} {text}");
+    }
+    served.aws.fail_none();
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("CreateServiceLinkedRole")), "the spot role asked for");
     b.goto(&format!("{link}&p=runners"));
     b.wait("document.querySelector('main') !== null");
     let _ = child.kill();
