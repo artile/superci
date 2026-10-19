@@ -9279,6 +9279,12 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
         { "digest": digest('0'), "size": 500, "sources": [source("x.gcr.io", "Upper/case"), source("-x.gcr.io", "a"), source(".gcr.io", "a"), source("europe-docker.pkg.dev", "/root"), source("index.docker.io", "a/../b"), source("registry-1.docker.io", &"a".repeat(256))] },
         { "digest": digest('e'), "size": 500, "sources": [source("UPPER.gcr.io", "a"), source("", "a"), source("europe-docker.pkg.dev", "p/r/i"), source("evil.example", "x")] }] }));
     assert_eq!(status, 200, "{said}");
+    // Each one it may upload, uploaded and said so: each converted (public or this repository's own).
+    for (d, a) in said["layers"].as_object().unwrap().iter().filter(|(_, a)| a["do"] == "upload") {
+        served.github.put_at(a["url"].as_str().unwrap(), &[0u8; 500], &[("x-amz-checksum-sha256", a["headers"]["x-amz-checksum-sha256"].as_str().unwrap())]);
+        let (status, done) = call("layers-uploaded", serde_json::json!({ "id": a["id"] }));
+        assert!(status == 200, "{d}: {status} {done}");
+    }
     let (status, again) = call("layers-propose", serde_json::json!({ "layers": [{ "digest": digest('1'), "size": 500 }, { "digest": digest('2'), "size": 500 }, { "digest": digest('3'), "size": 500 }] }));
     assert_eq!(status, 200, "{again}");
     served.github.fail_none();
@@ -9292,7 +9298,7 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
     // What the converter made of each layer under way, read at the sweep: a layer; one it refused; one of another
     // digest; one S3 would not give (asked again), then none heard of in time.
     let converting: Vec<String> = served.store.under("lconv:").into_iter().map(|(k, _)| k).collect();
-    assert!(!converting.is_empty(), "conversions under way");
+    assert!(converting.len() >= 4, "conversions under way: {}", converting.len());
     let done_key = |k: &str| { let hex = k.rsplit_once(":sha256:").unwrap().1.to_string(); (format!("{bucket}/layers/done/{hex}.json"), hex) };
     for (i, k) in converting.iter().enumerate() {
         let (key, hex) = done_key(k);
@@ -9307,6 +9313,7 @@ fn each_kind_of_machine_gets_the_cache_in_its_start_script_unless_it_is_turned_o
     // An hour on: the store's upkeep at the sweep.
     served.later(3_700_000);
     served.upkeep();
+    assert!(served.store.under("lconv:").len() < converting.len() && !served.store.under("layer:").is_empty(), "what the converter made, read");
     // Docker's images not kept: the cache still there.
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), &format!(r#"{order},"cache":{{"images_off":true}}}}"#));
     ids.push(job("superci"));
