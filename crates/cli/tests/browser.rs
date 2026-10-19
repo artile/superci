@@ -3769,6 +3769,41 @@ fn the_overview_after_one_run_from_a_computer_of_one_job_says_both_in_the_singul
 }
 
 #[test]
+fn a_workspaces_picture_is_shown_only_as_this_program_keeps_one() {
+    let home = common::temp("home");
+    // One workspace's picture as GitHub's was kept; another's edited into something else.
+    for (w, picture) in [("default", "data:image/png;base64,iVBORw0KGgo="), ("acme", "data:image/png;base64,iVBOR\"><script>alert(1)</script>")] {
+        std::fs::create_dir_all(home.join("workspaces").join(w)).unwrap();
+        std::fs::write(home.join("workspaces").join(w).join("workspace.json"), serde_json::json!({ "name": w, "hosts": [], "picture": picture, "picture_of": "acme" }).to_string()).unwrap();
+    }
+    let (mut child, link) = dashboard(&home);
+    let (_, _, list) = common::get(&link, "/workspaces");
+    assert!(list.contains(r#"<img class="logo" src="data:image/png;base64,iVBORw0KGgo=""#) && !list.contains("<script>alert"), "{list}");
+    let (_, _, page) = common::get(&link, "/?w=default&p=settings");
+    assert!(page.contains(r#"<img class="mark" src="data:image/png;base64,iVBORw0KGgo=""#));
+    let (_, _, page) = common::get(&link, "/?w=acme&p=settings");
+    assert!(!page.contains(r#"<img class="mark""#) && !page.contains("<script>alert"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_job_of_an_organization_on_a_github_of_its_own_links_to_it_there() {
+    let served = serve(|_| {});
+    // Its App at GitHub Enterprise Server's address, and a job of it.
+    let mut app = superci_testkit::github::GitHub::app();
+    app["host"] = "github.example.com".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &app.to_string());
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms()); served.webhook(q);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let (_, html) = common::part(&link, &format!("/?p=job&id={id}&fragment=1"));
+    assert!(html.contains("https://github.example.com/"), "{}", common::words(&html));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn jobs_waiting_for_room_start_once_there_is_some_and_one_waiting_a_day_is_given_up() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
     // Cloudflare runs one job at a time: a GitHub job running, another and a GitLab job waiting.
