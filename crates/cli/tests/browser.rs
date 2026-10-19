@@ -3279,6 +3279,197 @@ fn github_jobs_cache_entries_are_found_saved_again_and_taken_out_by_age_size_and
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// An AWS account refused a region by its organization's policy in other words than AWS's usual ones, the policy's
+/// account named as no account is: the policy said, no management account. A region with no quota of its own set:
+/// AWS's default asked for.
+#[test]
+fn an_accounts_look_says_its_organizations_policy_without_a_management_account_aws_did_not_write_as_one() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    for account in ["12345", "22222222222x"] {
+        served.aws.replaying(include_str!("../fixtures/aws/classic/look.jsonl"), &[]);
+        served.aws.fail_none();
+        served.aws.fail("DescribeVpcs|ec2.eu-west-1", 403, &superci_testkit::ec2_error("Client.Restricted", &format!("Not here, with an explicit deny in a service control policy: arn:aws:organizations::{account}:policy/o-example001/service_control_policy/p-example9")), None);
+        served.aws.fail("ServiceQuotasV20190624.GetServiceQuota", 400, &superci_testkit::json_error("NoSuchResourceException", "The request failed because the specified service quota does not exist."), None);
+        served.aws.fail("ServiceQuotasV20190624.GetAWSDefaultServiceQuota", 200, r#"{"Quota":{"QuotaCode":"L-1216C47A","Value":640.0}}"#, None);
+        let (_, said) = common::json(&home, &["accounts", "retrieve", "aws"]);
+        assert!(said["organization"]["policy"] == "p-example9" && said["organization"]["management_account"].is_null(), "{account}: {said}");
+        assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["target"] == "ServiceQuotasV20190624.GetAWSDefaultServiceQuota"), "AWS's default asked for");
+    }
+    served.aws.fail_none();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A copy of the runner image, with its source from the maker's list: rows of regions not written as AWS writes them
+/// left out; from the same continent's other region, never from the region itself.
+#[test]
+fn an_image_copy_comes_from_another_region_of_the_same_continent_of_those_the_makers_list_writes_as_aws_does() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let body = "### `ubuntu24-full-x64`\n\n| Region | AMI ID |\n| --- | --- |\n| US-EAST-1 | `ami-0123456789abcdef0` |\n| us_east_2 | `ami-0123456789abcdef1` |\n| ca-central-1 | `ami-0123456789abcdef2` |\n| ca-west-1 | `ami-0123456789abcdef3` |\n| us-east-1 | `ami-0123456789abcdef4` |\n";
+    let releases = serde_json::json!([{ "tag_name": "linux-20261006080844", "body": body }]).to_string();
+    served.github.answer_with("GET", "runner-images-for-aws/releases", 200, &[("content-type", "application/json")], &releases);
+    let o = common::superci(&home, &["images", "create", "ca-central-1", "--dry-run"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("ca-west-1") && said.contains("ami-0123456789abcdef3"), "{said}");
+    let o = common::superci(&home, &["images", "create", "eu-west-1", "--dry-run"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(said.contains("ca-central-1") && said.contains("ami-0123456789abcdef2"), "the first listed: {said}");
+    served.github.fail_none();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// One machine started from this computer (`superci debug launch`: no clock, no waiting), as AWS answers each step:
+/// with no network of the control plane's (its zones from the spot prices, or none), the best pool full, the others
+/// asked at once (refused for the rate of requests, refused outright, none with room, one machine given with no zone
+/// said), each pool alone after (refused for the rate too); few pools, asked one by one; no type at all.
+#[test]
+fn a_machine_started_from_this_computer_is_asked_of_aws_pool_by_pool_or_all_at_once_as_aws_answers() {
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let home = signed_in(&served);
+    let five = ["c8a.large", "c7a.large", "m8a.large", "m7a.large", "r8a.large"];
+    let offered = format!("<DescribeInstanceTypeOfferingsResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><instanceTypeOfferingSet>{}</instanceTypeOfferingSet></DescribeInstanceTypeOfferingsResponse>",
+        five.iter().map(|t| format!("<item><instanceType>{t}</instanceType><locationType>region</locationType><location>us-east-1</location></item>")).collect::<String>());
+    let prices = |types: &[&str]| format!("<DescribeSpotPriceHistoryResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><spotPriceHistorySet>{}</spotPriceHistorySet><nextToken/></DescribeSpotPriceHistoryResponse>",
+        types.iter().flat_map(|t| ["us-east-1a", "us-east-1b"].map(|z| format!("<item><instanceType>{t}</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>0.030000</spotPrice><timestamp>2026-10-15T10:00:00.000Z</timestamp><availabilityZone>{z}</availabilityZone></item>"))).collect::<String>());
+    let fleet = |inside: &str| format!("<CreateFleetResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><fleetId>fleet-0123456789abcdef0</fleetId>{inside}</CreateFleetResponse>");
+    let full = superci_testkit::ec2_error("InsufficientInstanceCapacity", "We currently do not have sufficient capacity in the Availability Zone you requested.");
+    let throttled = superci_testkit::ec2_error("RequestLimitExceeded", "Request limit exceeded.");
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let launch = |types: &str, rules: Vec<(&str, u16, String, Option<u32>)>| -> String {
+        served.aws.fail_none();
+        served.aws.fail("DescribeVpcs", 200, "<DescribeVpcsResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><vpcSet/></DescribeVpcsResponse>", None);
+        served.aws.fail("DescribeInstanceTypeOfferings", 200, &offered, None);
+        served.aws.fail("DeleteLaunchTemplate", 400, &superci_testkit::ec2_error("InvalidLaunchTemplateName.NotFoundException", "At least one of the launch templates specified in the request does not exist."), None);
+        for (action, status, answer, times) in &rules { served.aws.fail(action, *status, answer, *times) }
+        let (_, said) = common::json(&home, &["debug", "launch", "us-east-1", "spot", types]);
+        served.aws.fail_none();
+        said["answer"].as_str().unwrap_or_default().to_string()
+    };
+    let asked = |action: &str| served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains(&format!("Action={action}&"))).count();
+    let three = "c8a.large,c7a.large,m8a.large";
+    // Its zones from the prices; the others refused all at once for the rate, then each alone the same: no waiting here.
+    let fleets = asked("CreateFleet");
+    let said = launch(three, vec![("DescribeSpotPriceHistory", 200, prices(&["c8a.large", "c7a.large", "m8a.large"]), None), ("RunInstances", 400, full.clone(), Some(1)), ("CreateFleet", 503, throttled.clone(), None), ("RunInstances", 503, throttled.clone(), None)]);
+    assert!(said.starts_with("not started: RequestLimitExceeded"), "{said}");
+    assert_eq!(asked("CreateFleet"), fleets + 1);
+    // No prices (no zones): the others asked at once in no zone; refused outright, then each alone, the next started.
+    let said = launch(&five.join(","), vec![("DescribeSpotPriceHistory", 200, prices(&[]), None), ("RunInstances", 400, full.clone(), Some(1)),
+        ("CreateFleet", 400, superci_testkit::ec2_error("InvalidFleetConfiguration", "The fleet configuration is not valid."), None), ("RunInstances", 200, started.clone(), None)]);
+    assert!(said.starts_with("started "), "{said}");
+    // None with room, said of a pool without its zone and of one without its type; then one given, with no zone said.
+    let said = launch(&five.join(","), vec![("DescribeSpotPriceHistory", 200, prices(&[]), None), ("RunInstances", 400, full.clone(), None),
+        ("CreateFleet", 200, fleet("<errorSet><item><errorCode>InsufficientInstanceCapacity</errorCode><errorMessage>No room.</errorMessage><launchTemplateAndOverrides><overrides><instanceType>c7a.large</instanceType></overrides></launchTemplateAndOverrides></item><item><errorCode>UnfulfillableCapacity</errorCode><errorMessage>Not tried.</errorMessage></item></errorSet><fleetInstanceSet/>"), None)]);
+    assert!(said.starts_with("not started: InsufficientInstanceCapacity") && said.contains("c7a.large"), "{said}");
+    let said = launch(&five.join(","), vec![("DescribeSpotPriceHistory", 200, prices(&[]), None), ("RunInstances", 400, full.clone(), Some(1)),
+        ("CreateFleet", 200, fleet("<errorSet/><fleetInstanceSet><item><instanceIds><item>i-0123456789abcdef0</item></instanceIds><instanceType>m8a.large</instanceType><lifecycle>spot</lifecycle></item></fleetInstanceSet>"), None)]);
+    assert!(said.starts_with("started i-0123456789abcdef0 (m8a.large in )"), "{said}");
+    // One type in two zones: the second pool asked alone (too few to ask at once).
+    let fleets = asked("CreateFleet");
+    let said = launch("c8a.large", vec![("DescribeSpotPriceHistory", 200, prices(&["c8a.large"]), None), ("RunInstances", 400, full.clone(), Some(1)), ("RunInstances", 200, started.clone(), None)]);
+    assert!(said.starts_with("started ") && asked("CreateFleet") == fleets, "{said}");
+    // No type the region has: nothing asked.
+    let said = launch(",", vec![]);
+    assert!(said.starts_with("not started: no instance type given"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Jobs on AWS as its answers and the control plane's settings have it: its network with no subnet (the default
+/// network), a machine AWS started without saying its zone, a network of the account's own set by hand without a
+/// subnet or with an id that is none, GitHub giving a runner configuration that names no address of its or is no
+/// configuration, labels that size a GPU machine, a family's or an arm64 one past what one family has, a control plane
+/// whose address the cache's link cannot be made from; and a role AWS will not let the control plane take.
+#[test]
+fn aws_jobs_start_or_say_why_not_as_its_networks_githubs_runner_configurations_and_their_labels_have_it() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"max_cpu":128,"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    let started: String = include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap();
+    let job = |label: &str| -> serde_json::Value {
+        served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:"));
+        served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+        let (id, q) = served.github.queue(label, label, served.now_ms());
+        assert!(served.webhook(q) < 300, "{label}");
+        served.store.under(&format!("job:{id}"))[0].1.clone()
+    };
+    let script = || {
+        let asked = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()).unwrap();
+        let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+        use base64::Engine;
+        String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(data).unwrap()).to_string()
+    };
+    // Its network found with no subnet: the region's default network; AWS not saying the machine's zone.
+    let no_zone = started.split("<availabilityZone>").next().unwrap().to_string() + started.split("</availabilityZone>").nth(1).unwrap();
+    served.aws.fail("DescribeSubnets", 200, "<DescribeSubnetsResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><subnetSet/></DescribeSubnetsResponse>", None);
+    served.aws.fail("RunInstances", 200, &no_zone, None);
+    let j = job("superci");
+    assert!(j["state"] == "launched" && j["zone"].is_null() && j["usd_per_hour"].is_number(), "{j}");
+    assert!(!script().contains("SubnetId") && !served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).unwrap()["asked"].as_str().unwrap().contains("SubnetId"), "the default network");
+    served.aws.fail_none();
+    served.later(700_000);
+    served.aws.fail("RunInstances", 200, &started, None);
+    // A network of the account's own set by hand: without a subnet, or with what is no subnet's id.
+    for (networks, why) in [(r#"{"us-east-1":{"subnets":[],"security_groups":["sg-0123456789abcdef0"]}}"#, "a network of your own needs a subnet and a security group"),
+        (r#"{"us-east-1":{"subnets":["subnet-nope"],"security_groups":["sg-0123456789abcdef0"]}}"#, "subnet-nope is not a subnet or security group id")] {
+        served.aws.put(&format!("/superci/{PLANE}/AWS_NETWORKS"), networks);
+        let j = job("superci");
+        assert!(j["machine_id"].is_null() && j["error"].as_str().unwrap_or_default().contains(why), "{why}: {j}");
+    }
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/AWS_NETWORKS"));
+    // GitHub's runner configuration naming no address of GitHub's: nothing to reach first, on Linux and Windows.
+    use base64::Engine;
+    let b64 = |v: serde_json::Value| base64::engine::general_purpose::STANDARD.encode(v.to_string());
+    let config = |encoded: String| serde_json::json!({ "runner": { "id": 77, "name": "superci-runner-77", "os": "unknown", "status": "offline", "busy": false, "labels": [] }, "encoded_jit_config": encoded }).to_string();
+    served.github.answer_with("POST", "generate-jitconfig", 201, &[], &config(b64(serde_json::json!({ "runner": 77, ".runner": b64(serde_json::json!({ "AgentId": 77 })) }))));
+    let j = job("superci");
+    let s = script();
+    assert!(j["state"] == "launched" && !s.contains("for h in") && !s.contains("wait $g"), "{j}");
+    served.github.fail_none();
+    served.github.answer_with("POST", "generate-jitconfig", 201, &[], &config(b64(serde_json::json!({ "runner": 78, ".runner": b64(serde_json::json!({ "AgentId": 78 })) }))));
+    let j = job("superci/os=windows");
+    assert!(j["state"] == "launched" && !script().contains("foreach ($h in"), "{j}");
+    // One that is no configuration: no machine started with it.
+    for (n, label) in [(79, "superci"), (80, "superci/os=windows")] {
+        served.github.fail_none();
+        served.github.answer_with("POST", "generate-jitconfig", 201, &[], &serde_json::json!({ "runner": { "id": n, "name": format!("superci-runner-{n}") }, "encoded_jit_config": "not a configuration!" }).to_string());
+        let j = job(label);
+        assert!(j["machine_id"].is_null() && j["error"].as_str().unwrap_or_default().contains("invalid runner config"), "{label}: {j}");
+    }
+    served.github.fail_none();
+    // Labels sizing a machine: a T4 with more memory than its smaller sizes have, a family's with more than its
+    // smaller sizes have, arm64 with more CPUs than one family's sizes have.
+    for (label, kind) in [("superci/gpu=t4/cpu=8/ram=64", "g4dn.4xlarge"), ("superci/family=c8a/cpu=2/ram=16", "c8a.2xlarge"), ("superci/arch=arm64/cpu=96", "g.24xlarge")] {
+        let j = job(label);
+        let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str()).filter(|a| a.contains("Action=RunInstances")).filter_map(|a| url::form_urlencoded::parse(a.as_bytes()).find(|(k, _)| k == "InstanceType").map(|(_, v)| v.to_string())).collect();
+        assert!(asked.last().is_some_and(|a| a.ends_with(kind)) && j["machine_type"].as_str().is_some_and(|t| t.ends_with(kind)), "{label}: {:?} {j}", asked.last());
+    }
+    // An address of its own the cache's link cannot be made from: machines start without the cache.
+    *served.public.lock().unwrap() = Some("https://plane+acme.test".into());
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    for arch in ["x86_64"] { served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key(arch)), b"program") }
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::layers_key("x86_64")), b"program");
+    let j = job("superci/image=ubuntu26/docker-cache=true");
+    assert!(j["state"] == "launched" && !script().contains("/cache/"), "{j}");
+    served.aws.fail_none();
+    // A control plane outside AWS whose role AWS will not let it take: its job says so.
+    let outside = serve(|_| {});
+    outside.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": format!("arn:aws:iam::111111111111:role/superci-plane-{PLANE}"), "connected": true, "error": null }).to_string());
+    outside.connect_github();
+    outside.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    outside.github.answer_with("GET", "AssumeRoleWithWebIdentity", 403, &[("content-type", "text/xml")], &superci_testkit::ec2_error("AccessDenied", "Not authorized to perform sts:AssumeRoleWithWebIdentity"));
+    let (id, q) = outside.github.queue("superci", "superci", outside.now_ms());
+    assert!(outside.webhook(q) < 300);
+    let j = outside.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(j["machine_id"].is_null() && j["error"].as_str().unwrap_or_default().contains("AccessDenied"), "{j}");
+}
+
 #[test]
 fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

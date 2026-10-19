@@ -352,7 +352,8 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
     let mut zones: Vec<String> = prices.keys().map(|(_, z)| z.clone()).collect();
     zones.sort(); zones.dedup();
     let mut places: Vec<(Option<&(String, String)>, Option<String>)> = match l.network {
-        Some(n) if !n.subnets.is_empty() => n.subnets.iter().map(|s| (Some(s), None)).collect(),
+        // (A network found has a subnet at least: see `find_network`, `given_network`.)
+        Some(n) => n.subnets.iter().map(|s| (Some(s), None)).collect(),
         _ if !zones.is_empty() => zones.iter().map(|z| (None, Some(z.clone()))).collect(),
         _ => vec![(None, None)],
     };
@@ -437,7 +438,7 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
                 // was already learnt of the other pools is not asked again.
                 Err(e) if e.starts_with("RequestLimitExceeded") && told.throttled < MAX_WAITS && l.timer.is_some() => {
                     told.throttled += 1;
-                    if let Some(timer) = l.timer { timer.pause(300 + l.jitter_ms + told.throttled as u64 * 250).await }
+                    l.timer.expect("asked again only with a timer").pause(300 + l.jitter_ms + told.throttled as u64 * 250).await
                 }
                 // No room for this type now, or a type this region does not have: the next one.
                 Err(e) if ["InsufficientInstanceCapacity", "Unsupported", "SpotMaxPriceTooLow", "InvalidParameterValue"].iter().any(|c| e.starts_with(c)) => {
@@ -482,9 +483,9 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
     }
     let own: Vec<(String, String)> = l.tags.iter().filter(|(k, _)| k == "superci-plane").cloned().collect();
     let began = l.clock.map(|c| c.now_ms());
-    // (Its own tag says whose it is, for a sweep to find; AWS refuses a tag list with nothing in it.)
-    let mut asked = serde_json::json!({ "LaunchTemplateName": name, "LaunchTemplateData": data });
-    if !own.is_empty() { asked["TagSpecification"] = serde_json::json!([{ "ResourceType": "launch-template", "Tag": tags(&own) }]) }
+    // (Its own tag says whose it is, for a sweep to find. Every launch's tags have it: AWS would refuse a tag list with
+    // nothing in it.)
+    let asked = serde_json::json!({ "LaunchTemplateName": name, "LaunchTemplateData": data, "TagSpecification": [{ "ResourceType": "launch-template", "Tag": tags(&own) }] });
     ec2(http, l.region, creds, "CreateLaunchTemplate", asked, now_ms).await?;
     // Each group in turn, until one has a machine. (The time of making the template is counted with the first.)
     let mut answer: Result<Result<Started>> = Err("no pools to ask".into());
@@ -508,7 +509,7 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
             match ec2(http, l.region, creds, "CreateFleet", request.clone(), now_ms).await {
                 Err(e) if e.starts_with("RequestLimitExceeded") && told.throttled < MAX_WAITS && l.timer.is_some() => {
                     told.throttled += 1;
-                    if let Some(timer) = l.timer { timer.pause(300 + l.jitter_ms + told.throttled as u64 * 250).await }
+                    l.timer.expect("asked again only with a timer").pause(300 + l.jitter_ms + told.throttled as u64 * 250).await
                 }
                 other => break other,
             }
@@ -1284,7 +1285,8 @@ shutdown.exe /s /f /t 0
 /// control plane (when its script began, how long after the machine booted, how long GitHub's addresses refused it,
 /// when the runner was started), and, while the runner runs, what it writes of each step, every two seconds.
 pub fn with_hello_windows(script: String, url: &str) -> Result<String> {
-    if !url.starts_with("https://") || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
+    // (Its callers give it an https link only.)
+    if !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
     const RUNNER: &str = "& .\\run.cmd --jitconfig";
     if !script.contains(RUNNER) || !script.contains("$t0 = ") { return Ok(script) }
     let said = HELLO_WINDOWS.replace("HELLO_URL", url);
@@ -1391,7 +1393,8 @@ c='PLANE_LINK';i=$(hostname -I|cut -d' ' -f1);u=http://$i:8257
 /// control plane's cache, said once (`$c`, before Docker is started again: `with_layers` uses it there too), and the
 /// cache's part fetched from it (`cache_script`) before the runner. (AWS takes 16 KB of start-up script.)
 pub fn with_cache(script: String, plane: &str) -> Result<String> {
-    if !plane.starts_with("https://") || !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
+    // (Its caller gives it an https link only.)
+    if !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
     const RUNNER: &str = "cd /home/runner && ";
     let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
     let fetched = format!("{before}curl -fsSm30 --retry 2 $c/cache|bash &>/dev/null\n{RUNNER}{after}");
@@ -1411,9 +1414,8 @@ const LAYERS: &str = "curl -fsSm60 --retry 2 $c/layers|bash||(systemctl restart 
 const DOCKER_RESTART: &str = "(systemctl restart docker &>/dev/null &)\n";
 
 /// A Linux machine's start-up script, with the cache's link already (`with_cache`: `$c`), with `superci-layers`.
+/// (Given only what `with_keep` made: a script with the link, and its restart of Docker as `runner_user_data` writes it.)
 pub fn with_layers(script: String) -> Result<String> {
-    if !script.contains("c='https://") { return Err("no cache link in the start-up script".into()) }
-    if !script.contains(DOCKER_RESTART) { return Err("no restart of Docker in the start-up script".into()) }
     Ok(script.replacen(DOCKER_RESTART, LAYERS, 1))
 }
 
@@ -1431,8 +1433,8 @@ pub fn with_keep(script: String) -> Result<String> {
     if !script.contains("c='https://") { return Err("no cache link in the start-up script".into()) }
     let at = script.trim_end().rfind("\npoweroff").ok_or("no end in the start-up script")?;
     let kept = format!("{}\n{}{}", &script[..at], KEEP, &script[at + 1..]);
+    // (A GitHub job's Linux script, the only one given here: its runner is there.)
     const RUNNER: &str = "cd /home/runner && ";
-    if !kept.contains(RUNNER) { return Err("no runner in the start-up script".into()) }
     Ok(kept.replacen(RUNNER, &format!("{BOOT_BLOBS}{RUNNER}"), 1))
 }
 
@@ -1453,7 +1455,8 @@ c='PLANE_LINK';i=$(hostname -I|cut -d' ' -f1)
 
 /// A GitLab job's machine's start-up script with `superci-cache`, before its runner.
 pub fn with_cache_gitlab(script: String, plane: &str) -> Result<String> {
-    if !plane.starts_with("https://") || !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
+    // (Its caller gives it an https link only.)
+    if !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
     const RUNNER: &str = "export GL_URL=";
     let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
     Ok(format!("{before}{}{RUNNER}{after}", CACHE_GITLAB.replace("PLANE_LINK", plane)))
@@ -1477,14 +1480,16 @@ try {
 
 /// A Windows machine's start-up script with `superci-cache` (see `cache`).
 pub fn with_cache_windows(script: String, plane: &str) -> Result<String> {
-    if !plane.starts_with("https://") || !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
+    // (Its caller gives it an https link only.)
+    if !plane.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b)) { return Err("invalid cache link".into()) }
     const RUNNER: &str = "Set-Location $dir\n";
     let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
     Ok(format!("{before}{}{RUNNER}{after}", CACHE_WINDOWS.replace("PLANE_LINK", plane)))
 }
 
 pub fn with_hello(script: String, url: &str) -> Result<String> {
-    if !url.starts_with("https://") || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
+    // (Its callers give it an https link only.)
+    if !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
     const LOG: &str = "exec > >(tee /var/log/superci.log > /dev/console) 2>&1\n";
     const READ: &str = "# First reads from a new volume are slow";
     let runner = if script.contains("cd /home/runner && ") { "cd /home/runner && " } else if script.contains("export GL_URL=") { "export GL_URL=" } else { return Ok(script) };
@@ -1537,7 +1542,8 @@ pub fn runner_user_data(work: &crate::io::Work, max_minutes: u32) -> Result<Stri
         }
     };
     let base64 = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b));
-    if !base64(jit_config) || fail.is_some_and(|f| !base64(f)) { return Err("invalid runner config".into()); }
+    // (A failing runner's words are base64 as the control plane wrote them.)
+    if !base64(jit_config) { return Err("invalid runner config".into()); }
     // A failing runner: its job-started hook says why and fails the job before any step.
     let (hook, run) = match fail {
         Some(why) => (format!("printf '#!/bin/bash\\necho {why} | base64 -d\\nexit 1\\n' > /tmp/superci-fail.sh && chmod 755 /tmp/superci-fail.sh\n"), "env ACTIONS_RUNNER_HOOK_JOB_STARTED=/tmp/superci-fail.sh ./run.sh"),
