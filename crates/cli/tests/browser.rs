@@ -3470,6 +3470,67 @@ fn aws_jobs_start_or_say_why_not_as_its_networks_githubs_runner_configurations_a
     assert!(j["machine_id"].is_null() && j["error"].as_str().unwrap_or_default().contains("AccessDenied"), "{j}");
 }
 
+/// A region added with its network, as a real account answered but for each step changed: AWS refusing a route for
+/// a table it does not find (nothing more made, said), then two networks made at once (the other one kept, this one
+/// deleted), its gateway and route there already. Its network deleted again with no S3 endpoint in it, its bucket and
+/// one of its objects gone already; then with another control plane in the account that has no network of its own (the
+/// shared one kept for it).
+#[test]
+fn a_regions_network_is_made_and_deleted_as_aws_answers_each_step_and_the_shared_one_kept_for_another_control_plane() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let ec2 = |action: &str, inside: &str| format!("<{action}Response xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId>{inside}</{action}Response>");
+    let asked = |action: &str, part: &str| served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().unwrap_or_default().contains("eu-north-1") && a["asked"].as_str().unwrap_or_default().contains(&format!("Action={action}")) && a["asked"].as_str().unwrap_or_default().contains(part));
+    let add = |rules: &[(&str, u16, String, Option<u32>)]| {
+        served.aws.replaying(include_str!("../fixtures/aws/regions/add.jsonl"), &[("mixplane0001", PLANE)]);
+        served.aws.fail_none();
+        for (action, status, answer, times) in rules { served.aws.fail(action, *status, answer, *times) }
+        let o = common::superci(&home, &["runners", "update", "aws", "--regions=us-east-1,eu-north-1"]);
+        served.aws.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let (ok, said) = add(&[("CreateRoute|DestinationCidrBlock", 400, superci_testkit::ec2_error("InvalidRouteTableID.NotFound", "The routeTable ID 'rtb-1' does not exist"), None)]);
+    assert!(!ok && said.contains("InvalidRouteTableID.NotFound"), "{said}");
+    assert!(!served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_REGIONS" && v.contains("eu-north-1")), "not added");
+    // (The cache's program there already, of another build: put there again.)
+    let program = format!("superci-plane-{PLANE}-eu-north-1/{}", superci_core::cache::program_key("x86_64"));
+    served.github.put_object(&program, b"another build");
+    let (ok, said) = add(&[("DescribeVpcs|ec2.eu-north-1|tag%3Asuperci", 200, ec2("DescribeVpcs", "<vpcSet/>"), Some(2)),
+        ("CreateVpc", 200, ec2("CreateVpc", "<vpc><vpcId>vpc-0ffffffffffffffff</vpcId></vpc>"), Some(1)),
+        ("DescribeVpcs|ec2.eu-north-1|tag%3Asuperci", 200, ec2("DescribeVpcs", "<vpcSet><item><vpcId>vpc-00000000000000001</vpcId></item><item><vpcId>vpc-0ffffffffffffffff</vpcId></item></vpcSet>"), Some(1)),
+        ("AttachInternetGateway", 400, superci_testkit::ec2_error("Resource.AlreadyAssociated", "resource igw-1 is already attached to network vpc-00000000000000001"), None),
+        ("CreateRoute|DestinationCidrBlock", 400, superci_testkit::ec2_error("RouteAlreadyExists", "The route identified by 0.0.0.0/0 already exists."), None)]);
+    assert!(ok, "{said}");
+    assert!(served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_REGIONS" && v.contains("eu-north-1")), "added");
+    assert!(asked("DeleteVpc", "vpc-0ffffffffffffffff"), "the one made second deleted");
+    assert!(served.github.objects().iter().any(|(k, n)| *k == program && *n > 1000), "the program put again");
+    // Deleted: no endpoint to delete; the bucket, and one of what it kept, gone already as S3 answers.
+    let gone = |url: &str| serde_json::json!({ "method": "DELETE", "url": url, "target": "", "asked": "", "status": 404, "answer": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>" }).to_string();
+    let bucket = format!("https://superci-plane-{PLANE}-eu-north-1.s3.eu-north-1.amazonaws.com/");
+    let delete = |others: bool, rules: &[(&str, u16, String, Option<u32>)]| {
+        served.aws.replaying(include_str!("../fixtures/aws/regions/delete.jsonl"), &[("mixplane0001", PLANE)]);
+        served.aws.replaying(&[gone(&bucket), gone(&format!("{bucket}superci/cache-0.19.16-aarch64"))].join("\n"), &[]);
+        served.aws.fail_none();
+        if others { served.aws.fail("ListRoles", 200, "<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles><member><RoleName>superci-plane-otherplane02</RoleName><Description>SuperCI control plane https://other.example (Lambda, us-east-1, runs-on superci).</Description></member></Roles></ListRolesResult></ListRolesResponse>", None) }
+        for (action, status, answer, times) in rules { served.aws.fail(action, *status, answer, *times) }
+        let o = common::superci(&home, &["debug", "networks", "eu-north-1"]);
+        served.aws.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let before = served.aws.asked.lock().unwrap().len();
+    let (ok, said) = delete(false, &[("DescribeVpcEndpoints", 200, ec2("DescribeVpcEndpoints", "<vpcEndpointSet/>"), None)]);
+    assert!(ok && said.contains("deleted in eu-north-1"), "{said}");
+    assert!(!served.aws.asked.lock().unwrap()[before..].iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("Action=DeleteVpcEndpoints")), "no endpoint to delete");
+    // Another control plane in the account with no network of its own here: the shared one is its, and stays.
+    let before = served.aws.asked.lock().unwrap().len();
+    let (ok, said) = delete(true, &[("DescribeVpcs|otherplane02", 200, ec2("DescribeVpcs", "<vpcSet/>"), None)]);
+    assert!(ok && said.contains("deleted in eu-north-1"), "{said}");
+    assert!(served.aws.asked.lock().unwrap()[before..].iter().any(|a| a["asked"].as_str().unwrap_or_default().contains("otherplane02")), "the other control plane's network asked for");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_job_s_page_says_how_its_aws_machine_was_had_spot_after_a_full_pool_or_on_demand_as_aws_answered() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
