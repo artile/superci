@@ -36,7 +36,7 @@ pub struct Budgets<'a> {
 /// The budget of a control plane's AWS account, asked of AWS itself with a sign-in to that account.
 pub fn with<R>(creds: &Credentials, account: &str, plane_id: &str, f: impl FnOnce(&Budgets) -> R) -> R {
     let http = crate::aws::Blocking::new();
-    f(&Budgets { http: &http, creds, account, plane_id, pause: &|ms| std::thread::sleep(std::time::Duration::from_millis(ms)) })
+    f(&Budgets { http: &http, creds, account, plane_id, pause: &crate::aws::pause })
 }
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }

@@ -1622,3 +1622,801 @@ fn an_aws_sign_in_aws_will_not_renew_is_said_as_aws_refused_it() {
     }
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A recording made for the test kit (`SUPERCI_RECORD`) without `SUPERCI_RECORD_SIGN_INS` keeps no sign-in's
+/// exchange, whose tokens are real: AWS's renewal and Cloudflare's are left out, what the commands asked after them
+/// kept. One named where no file can be written is not made, and the command does its work all the same.
+#[test]
+fn a_recording_without_sign_ins_leaves_out_aws_and_cloudflare_renewals_and_one_that_cannot_be_written_is_skipped() {
+    let served = serve(|_| {});
+    served.aws.replaying(&[include_str!("../fixtures/aws/sign-in/renew.jsonl"), include_str!("../fixtures/cloudflare/sign-in/renew.jsonl")].concat(), &[]);
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["aws"]["creds"]["expires_at_ms"] = 0.into();
+    kept["aws"]["refresh_token"] = "example-refreshToken-1".into();
+    kept["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "example-access_token-0", "expires_at_ms": 0, "refresh": "example-refresh_token-1" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let record = home.join("recorded.jsonl");
+    for args in [&["debug", "iam", "ListRoles", "MaxItems=1000", "--json"][..], &["debug", "cloudflare", "GET", "/accounts"]] {
+        let o = common::command(&home).args(args).env("SUPERCI_RECORD", &record).output().unwrap();
+        assert!(o.status.success(), "{args:?}: {}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    }
+    // Both renewed (and what each gave kept), neither recorded.
+    let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!((kept["aws"]["refresh_token"].as_str(), kept["cloudflare"]["refresh"].as_str()), (Some("example-refreshToken-2"), Some("example-refresh_token-2")), "{kept}");
+    let recorded = std::fs::read_to_string(&record).unwrap();
+    assert!(recorded.contains("Action=ListRoles") && recorded.contains("/client/v4/accounts"), "{recorded}");
+    assert!(!recorded.contains("signin.aws.amazon.com") && !recorded.contains("/oauth2/token") && !recorded.contains("refreshToken"), "{recorded}");
+    // A folder in place of the file: nothing written, the answer given.
+    let o = common::command(&home).args(["debug", "iam", "ListRoles", "MaxItems=1000", "--json"]).env("SUPERCI_RECORD", home.join("workspaces")).output().unwrap();
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("ListRolesResponse"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS saying in each region, in place of an answer, that the credentials are over, however it words it (its code
+/// after another's words, its code in a message of its own, or no code at all): the look at the account renews the
+/// sign-in, and, AWS refusing that, says it ended with what to do.
+#[test]
+fn credentials_aws_says_are_over_however_it_words_it_end_the_look_at_the_account_with_a_sign_in_to_make_again() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["aws"]["refresh_token"] = "refresh-for-tests".into();
+    kept["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    let signed = kept.to_string();
+    for over in ["RequestExpired: Request has expired.", "<Error>ExpiredToken: the token is over</Error>", "The security token included in the request is expired"] {
+        std::fs::write(&file, &signed).unwrap();
+        served.aws.fail_none();
+        served.aws.fail("DescribeVpcs", 400, over, None);
+        let o = superci(&home, &["accounts", "retrieve", "aws"]);
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("SuperCI's AWS sign-in has ended") && said.contains("superci login aws"), "{over}: {said}");
+        // (Renewal asked for, and refused: the sign-in is no longer kept.)
+        assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/v1/token"))), "{over}");
+        assert!(serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap()).unwrap()["aws"].is_null(), "{over}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An account of AWS's new sign-up pinned to Stockholm is a project; the same account whose N. Virginia is refused
+/// by the sign-in's own permissions, not by its organization, is not one: it is restricted.
+#[test]
+fn an_account_kept_to_one_home_region_is_a_project_only_when_its_organization_refuses_n_virginia() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/project-activated/look.jsonl"), &[]);
+    let (code, v) = json(&home, &["accounts", "retrieve", "aws"]);
+    assert!(code == 0 && v["kind"]["project"]["region"] == "eu-north-1", "{v}");
+    served.aws.fail("DescribeVpcs|ec2.us-east-1", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: ec2:DescribeVpcs because no identity-based policy allows the ec2:DescribeVpcs action"), None);
+    let (code, v) = json(&home, &["accounts", "retrieve", "aws"]);
+    assert!(code == 0 && v["kind"] == "restricted" && v["allowed_regions"] == serde_json::json!(["eu-north-1"]), "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A region's network and cache bucket deleted where the account's organization refuses them: nothing of the control
+/// plane's can be there, so it is taken as done, EC2's refusal or S3's. The roles that say which control planes use
+/// the account are read page by page.
+#[test]
+fn a_network_and_cache_bucket_the_organization_keeps_out_are_taken_as_deleted_and_roles_are_read_page_by_page() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let scp = "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: ec2:DescribeInstances with an explicit deny in a service control policy: arn:aws:organizations::222222222222:policy/o-aaaaaaaaaa/service_control_policy/p-aaaaaaaa";
+    let first = r#"<ListRolesResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ListRolesResult><IsTruncated>true</IsTruncated><Marker>page-two</Marker><Roles><member><RoleName>superci-plane-otherplane02</RoleName><Description>Assumed by the SuperCI control plane https://superci.acme.workers.dev (OpenID Connect) to run GitHub Actions jobs.</Description></member></Roles></ListRolesResult></ListRolesResponse>"#;
+    served.aws.fail("ListRoles", 200, first, Some(1));
+    served.aws.fail("ec2.eu-west-2", 403, &superci_testkit::ec2_error("UnauthorizedOperation", scp), None);
+    let o = superci(&home, &["debug", "networks", "eu-west-2"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("deleted in eu-west-2"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let pages: Vec<String> = served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str().filter(|s| s.contains("Action=ListRoles")).map(str::to_string)).collect();
+    assert!(pages.len() == 2 && pages[1].contains("Marker=page-two"), "{pages:?}");
+    // Its network gone already, its bucket refused by S3 under the same policy.
+    served.aws.fail_none();
+    served.aws.fail("ec2.eu-west-2", 200, "<DescribeResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId></DescribeResponse>", None);
+    served.github.answer_with("GET", "?list-type=2", 403, &[("content-type", "application/xml")], &format!("<Error><Code>AccessDenied</Code><Message>User is not authorized to perform: s3:ListBucket with an explicit deny in a service control policy</Message></Error>"));
+    let o = superci(&home, &["debug", "networks", "eu-west-2"]);
+    served.github.fail_none();
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("deleted in eu-west-2"), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.contains("Action=DescribeInstances") && a["url"].as_str().is_some_and(|u| u.contains("eu-west-2")))));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane named by its address (SUPERCI_PLANE) on Modal: read with the key given, and said to be Modal's,
+/// known only by its address.
+#[test]
+fn a_control_plane_given_by_its_modal_address_is_read_and_said_to_be_modals() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    served.aws.workers.lock().unwrap().insert("acme--superci-plane-testplane0001.modal.run".into(), served.url.clone());
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let o = common::command(&home).env("SUPERCI_PLANE", "https://acme--superci-plane-testplane0001.modal.run").env("SUPERCI_KEY", &served.run_key).args(["status"]).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("Control plane Modal") && said.contains("https://acme--superci-plane-testplane0001.modal.run"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Playwright's lines that only begin as its first one does (no workers said, or none used) are no test's; and a
+/// failure's error runs on past lines that only look like the next failure's heading.
+#[test]
+fn playwrights_first_line_is_known_by_its_workers_and_a_failures_error_runs_past_headings_that_are_none() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let (job_id, q) = served.github.queue("e2e", "superci", served.now_ms());
+    served.webhook(q);
+    served.webhook(served.github.start(job_id));
+    let log = [
+        "Running 2 tests using 1 worker",
+        "Running the server first",
+        "Running 2 suites using 2 processes",
+        "  ✓  1 [chromium] › e2e/a.spec.ts:3:1 › logs in (1.0s)",
+        "  ✘  2 [chromium] › e2e/a.spec.ts:5:1 › breaks (1.0s)",
+        "  1) [chromium] › e2e/a.spec.ts:5:1 › breaks ───",
+        "    Error: expected ok",
+        "    ) [not a numbered failure]",
+        "    a) [nor this]",
+        "  1 failed",
+        "  1 passed (2.0s)",
+    ].iter().map(|l| format!("2026-10-15T10:00:01.0000000Z {l}")).collect::<Vec<_>>().join("\n");
+    served.webhook(served.github.finish(job_id, "failure", &log, served.now_ms()));
+    let said = String::from_utf8_lossy(&superci(&home, &["jobs", "retrieve", &job_id.to_string(), "--tests"]).stdout).into_owned();
+    assert!(said.contains("Tests: 1 failed, 1 passed (playwright)"), "{said}");
+    assert!(said.contains("Error: expected ok") && said.contains(") [not a numbered failure]") && said.contains("a) [nor this]") && !said.contains("Running the server first"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The AWS account's own budget, as AWS answers in states a real account was not caught in: at the limit and
+/// stopped, set again to the same limit (nothing lifted); lifted again with an action of another state beside it
+/// (only the one that ran is undone and reset); and its stop refused by AWS each time asked (said, after asking
+/// again a few times).
+#[test]
+fn the_aws_budget_set_again_at_its_limit_lifted_beside_another_action_and_refused_its_stop_is_said_as_aws_answered() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let budget = r#"{"Budget":{"BudgetName":"superci-testplane0001","BudgetLimit":{"Amount":"100.0","Unit":"USD"},"CalculatedSpend":{"ActualSpend":{"Amount":"101.5","Unit":"USD"}},"TimeUnit":"MONTHLY","BudgetType":"COST"}}"#;
+    let iam_ok = r#"<Response xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></Response>"#;
+    let asked = |target: &str| served.aws.asked.lock().unwrap().iter().filter(|a| a["target"] == format!("AWSBudgetServiceGateway.{target}").as_str()).count();
+    let run = |args: &[&str]| { let o = common::command(&home).args(args).env("SUPERCI_PAUSE_MS", "1").output().unwrap(); String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr) };
+    served.aws.fail("AWSBudgetServiceGateway.DescribeBudget", 200, budget, None);
+    served.aws.fail("AWSBudgetServiceGateway.DescribeBudgetActionsForBudget", 200, r#"{"Actions":[{"ActionId":"a1","Status":"EXECUTION_SUCCESS"},{"ActionId":"a2","Status":"STANDBY"}]}"#, None);
+    served.aws.fail("AWSBudgetServiceGateway.ExecuteBudgetAction", 200, "{}", None);
+    served.aws.fail("DetachRolePolicy", 200, iam_ok, None);
+    // At its limit and stopped, set to the same limit: as it was.
+    assert_eq!(run(&["debug", "budget", "set", "100", "ops@example.com", "stop"]).trim(), "set");
+    assert_eq!(asked("ExecuteBudgetAction") + asked("UpdateBudget"), 0);
+    // Lifted to be judged again: the action that ran undone and reset, the other left.
+    assert_eq!(run(&["debug", "budget", "lift", "again"]).trim(), "lifted");
+    let executed: Vec<String> = served.aws.asked.lock().unwrap().iter().filter(|a| a["target"] == "AWSBudgetServiceGateway.ExecuteBudgetAction").filter_map(|a| a["asked"].as_str().map(str::to_string)).collect();
+    assert!(executed.len() == 2 && executed.iter().all(|e| e.contains("\"a1\"")) && executed[0].contains("REVERSE_BUDGET_ACTION") && executed[1].contains("RESET_BUDGET_ACTION"), "{executed:?}");
+    // No action yet, and AWS refusing to make one each time: asked again, then said.
+    served.aws.fail_none();
+    served.aws.fail("AWSBudgetServiceGateway.DescribeBudget", 200, budget, None);
+    served.aws.fail("AWSBudgetServiceGateway.DescribeBudgetActionsForBudget", 200, r#"{"Actions":[]}"#, None);
+    for a in ["CreatePolicy", "CreateRole", "PutRolePolicy"] { served.aws.fail(a, 200, iam_ok, None) }
+    served.aws.fail("AWSBudgetServiceGateway.CreateBudgetAction", 400, &superci_testkit::json_error("AccessDeniedException", "User is not allowed to pass this role to AWS Budgets."), None);
+    let said = run(&["debug", "budget", "set", "100", "ops@example.com", "stop"]);
+    assert!(said.contains("refused or failed: AccessDeniedException: User is not allowed to pass this role"), "{said}");
+    assert_eq!(asked("CreateBudgetAction"), 9);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A job asked for by its run alone, when the run has two: which to say is asked for, with their names.
+#[test]
+fn a_job_asked_for_by_a_run_of_two_jobs_alone_asks_which_with_their_names() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let (tests, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    let (lint, q) = served.github.queue("lint", "superci", served.now_ms());
+    served.webhook(q);
+    let run = served.store.under(&format!("job:{tests}"))[0].1["run_id"].clone();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let k = format!("job:{lint}");
+        let mut j: serde_json::Value = serde_json::from_str(&m[&k]).unwrap();
+        j["run_id"] = run.clone();
+        m.insert(k, j.to_string());
+    }
+    let (code, v) = json(&home, &["jobs", "retrieve", &format!("--run={run}")]);
+    let e = v["error"].as_str().unwrap_or_default();
+    assert!(code == 2 && e.starts_with(&format!("Run {run} has several jobs: say which with --job=NAME")) && e.contains("tests") && e.contains("lint"), "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane from before a job's log and GitHub's deliveries could be read from it (it answers 404 there):
+/// each says which version it needs, and the command that updates it.
+#[test]
+fn a_control_plane_older_than_job_logs_and_deliveries_says_which_version_reads_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    let older = superci_testkit::without_routes(&served.url, &["/job/log", "/github/deliveries"]);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = older.clone().into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    served.webhook(served.github.start(id));
+    served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:01.0000000Z ok", served.now_ms()));
+    let (code, v) = json(&home, &["jobs", "retrieve", &id.to_string()]);
+    assert!(code == 1 && v["error"] == "Reading a job's log needs control plane 0.11.0 or newer: `superci planes update`.", "{v}");
+    let (code, v) = json(&home, &["deliveries", "list"]);
+    assert!(code == 1 && v["error"] == "This needs control plane 0.11.2 or newer: `superci planes update`.", "{v}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Two control planes in the workspace's clouds that each serve GitHub: each is live, and neither is "the" one in
+/// use (commands name theirs).
+#[test]
+fn two_control_planes_that_each_serve_github_are_both_listed_live_and_neither_in_use() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    other.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    // (Both kept as this workspace's: one moved to and serving GitHub there since.)
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (code, listed) = json(&home, &["planes", "list"]);
+    let planes = listed["control_planes"].as_array().cloned().unwrap_or_default();
+    let ours: Vec<&serde_json::Value> = planes.iter().filter(|p| ["testplane0001", "testplane0002"].contains(&p["id"].as_str().unwrap_or_default())).collect();
+    assert!(code == 0 && ours.len() == 2 && ours.iter().all(|p| p["live"] == true && p["in_use"] == false), "{listed}");
+    let said = String::from_utf8_lossy(&superci(&home, &["planes", "list"]).stdout).into_owned();
+    for id in ["testplane0001", "testplane0002"] { assert!(said.lines().any(|l| l.starts_with(id) && l.ends_with("  live")), "{said}") }
+    assert!(!said.contains("in use"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitLab connected with a token that reaches no project: said so, rather than an empty list.
+#[test]
+fn a_gitlab_token_that_reaches_no_project_is_said_to_reach_none() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    served.gitlab.reach_no_project(true);
+    let home = home(&served);
+    let o = superci(&home, &["projects", "list"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "No projects this token can reach.", "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    served.gitlab.reach_no_project(false);
+    let o = superci(&home, &["projects", "list"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("acme/app"), "{}", String::from_utf8_lossy(&o.stdout));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `--add` is for one more AWS account: asked of Cloudflare, signed in already, it says so and opens nothing.
+#[test]
+fn a_cloudflare_sign_in_asked_with_add_while_signed_in_there_says_so_and_opens_nothing() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let o = common::command(&home).args(["login", "cloudflare", "--add", "--no-browser"]).stdin(std::process::Stdio::null()).output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && said.starts_with("SuperCI is signed in on this computer:") && !said.contains("--add"), "{said}{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A secret a run from a computer used with that computer's own key (not a run key): listed as used by that
+/// computer, by its name.
+#[test]
+fn a_secret_used_by_a_run_from_a_computers_own_key_is_listed_as_used_by_that_computer() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let before: Vec<String> = served.aws.settings(superci_testkit::PLANE).into_iter().map(|(k, _)| k).collect();
+    let o = common::command(&home).args(["secrets", "create", "NPM_TOKEN", "--value-env=THE_TOKEN"]).env("THE_TOKEN", "s3cret").output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let setting = served.aws.settings(superci_testkit::PLANE).into_iter().map(|(k, _)| k).find(|k| !before.contains(k)).expect("the secret's setting");
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert(format!("sused:{setting}"), serde_json::json!({ "run_id": "123", "at_ms": now, "repository": "acme/app", "path": ".github/workflows/ci.yml", "ref": "refs/heads/main", "by": "mona-laptop", "run_key": false }).to_string());
+    let said = String::from_utf8_lossy(&superci(&home, &["secrets", "list"]).stdout).into_owned();
+    assert!(said.lines().any(|l| l.starts_with("NPM_TOKEN") && l.ends_with("used just now by mona-laptop")), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What is kept of a workspace once its last sign-in is over: nothing, with no control plane and key to read it
+/// with (an AWS sign-in AWS will not renew, alone or with a key and no control plane), nor after signing out of it.
+#[test]
+fn a_workspace_left_with_no_sign_in_and_no_control_plane_to_read_keeps_nothing() {
+    let account = superci_testkit::Aws::serve();
+    for with_key in [false, true] {
+        let home = common::aws_only(&account);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["aws"]["creds"]["expires_at_ms"] = 0.into();
+        kept["aws"]["refresh_token"] = "refresh-for-tests".into();
+        kept["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+        if with_key { kept["key"] = serde_json::json!({ "name": "DEVICE_KEY_4102444800_TEST", "value": "dashboard-key-for-tests-0001", "planes": [] }) }
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let o = superci(&home, &["accounts", "retrieve", "aws"]);
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.code() == Some(3) && said.contains("Sign in with AWS first."), "{with_key}: {said}");
+        assert!(!file.exists(), "{with_key}: {}", std::fs::read_to_string(&file).unwrap_or_default());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+    let home = common::aws_only(&account);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let o = superci(&home, &["logout"]);
+    assert!(o.status.success() && !file.exists(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The first workspace, never made on this computer, renamed from the dashboard: made under its new id; and
+/// another never made, forgotten: nothing to remove, and the dashboard goes back to the list.
+#[test]
+fn a_first_workspace_never_made_here_is_made_under_its_new_id_and_one_forgotten_without_a_folder_is_gone_all_the_same() {
+    let home = common::temp("no-workspace");
+    let (_board, link) = common::dashboard(&home);
+    let (status, to, _) = common::post(&link, "/workspaces/rename", &[("w", "default"), ("id", "main")]);
+    assert!(status == 303 && to == "/?p=settings&w=main" && home.join("workspaces/main").is_dir() && !home.join("workspaces/default").exists(), "{status} {to}");
+    drop(_board);
+    let home2 = common::temp("no-workspace");
+    let (_board, link) = common::dashboard(&home2);
+    let (status, to, _) = common::post(&link, "/workspaces/remove", &[("w", "default")]);
+    assert!(status == 303 && to == "/" && !home2.join("workspaces/default").exists(), "{status} {to}");
+    drop(_board);
+    for h in [home, home2] { let _ = std::fs::remove_dir_all(&h); }
+}
+
+/// One of Modal's calls answered as a recording has it (each answer protobuf, in base64): for what a real workspace
+/// was not caught answering.
+fn modal_answered(method: &str, answers: &[Vec<u8>]) -> String {
+    use base64::Engine;
+    let answers: Vec<String> = answers.iter().map(|a| base64::engine::general_purpose::STANDARD.encode(a)).collect();
+    serde_json::json!({ "method": "POST", "url": format!("https://api.modal.com/modal.client.ModalClient/{method}"), "target": "", "asked": "", "status": 200, "headers": [],
+        "answer": serde_json::json!({ "answers": answers }).to_string() }).to_string() + "\n"
+}
+
+/// A protobuf message's field: its number, and a number or bytes (a string, another message).
+enum Pb { N(u32, u64), B(u32, Vec<u8>) }
+
+fn pb(fields: &[Pb]) -> Vec<u8> {
+    let varint = |out: &mut Vec<u8>, mut n: u64| loop { let b = (n & 0x7f) as u8; n >>= 7; if n == 0 { out.push(b); break } out.push(b | 0x80) };
+    let mut out = vec![];
+    for f in fields {
+        match f {
+            Pb::N(k, n) => { varint(&mut out, (*k as u64) << 3); varint(&mut out, *n) }
+            Pb::B(k, b) => { varint(&mut out, ((*k as u64) << 3) | 2); varint(&mut out, b.len() as u64); out.extend(b) }
+        }
+    }
+    out
+}
+
+/// Modal's GenericResult: a status (1 done), what was raised, and the exit code.
+fn modal_result(status: u64, exception: &str, exitcode: u64) -> Vec<u8> { pb(&[Pb::N(1, status), Pb::B(2, exception.as_bytes().to_vec()), Pb::N(3, exitcode)]) }
+
+/// A Modal control plane deployed as Modal answered a real one, but where it did not: the setup image's build
+/// followed to its end and failed; `modal deploy` ending with an error (its log's last lines said, of the most
+/// read), or ending otherwise than done, or never; then deployed, the workspace's web address said by Modal. An id
+/// asked for that cannot be one is not taken.
+#[test]
+fn a_modal_deploy_says_how_modals_sandbox_ended_and_its_image_build_failed_and_goes_on_with_the_address_modal_gives() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let modal = superci_testkit::serve_as("mdplane00001", move |c| { let settings = aws.modal_plane_settings(); c.read_settings(&settings); c.own_cloud = "modal".into(); });
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00001.modal.run".into(), modal.url.clone());
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let deploy = |id: &str, answered: &[String]| {
+        served.aws.replaying(include_str!("../fixtures/modal/02-deploy.jsonl"), &[]);
+        served.aws.replaying(&answered.concat(), &[]);
+        let o = common::command(&home).args(["planes", "create", "modal"]).env("SUPERCI_NEW_PLANE_ID", id).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let image_built = modal_answered("ImageGetOrCreate", &[pb(&[Pb::B(1, b"im-built".to_vec()), Pb::B(2, modal_result(1, "", 0))])]);
+    // The image still building: followed until its build ends, failed.
+    let (ok, said) = deploy("short", &[
+        modal_answered("ImageGetOrCreate", &[pb(&[Pb::B(1, b"im-building".to_vec())])]),
+        modal_answered("ImageJoinStreaming", &[pb(&[Pb::B(3, b"entry-1".to_vec())]), pb(&[Pb::B(1, modal_result(2, "pip: no space left on device", 0))])]),
+    ]);
+    assert!(!ok && said.contains("Modal could not build the setup image: pip: no space left on device"), "{said}");
+    // `modal deploy` failed: the last lines of what it wrote (no more than so much read of it).
+    let logs: Vec<Vec<u8>> = (1..=60).map(|n| pb(&[Pb::B(2, pb(&[Pb::B(1, format!("line {n}\n").into_bytes())]))])).collect();
+    let (ok, said) = deploy("abcdefghijk-", &[image_built.clone(), modal_answered("SandboxWait", &[pb(&[Pb::B(1, modal_result(1, "", 3))])]), modal_answered("SandboxGetLogs", &logs)]);
+    assert!(!ok && said.contains("`modal deploy app.py` did not succeed (status 1, exit 3): line 43 / line 44 / line 45 / line 46 / line 47 / line 48 / line 49 / line 50") && !said.contains("line 51"), "{said}");
+    // Ended otherwise than done; and still running at the last wait.
+    let (ok, said) = deploy("", &[image_built.clone(), modal_answered("SandboxWait", &[pb(&[Pb::B(1, modal_result(2, "", 0))])])]);
+    assert!(!ok && said.contains("did not succeed (status 2, exit 0)"), "{said}");
+    let (ok, said) = deploy("", &[image_built.clone(), modal_answered("SandboxWait", &[vec![]])]);
+    assert!(!ok && said.contains("did not succeed (still running)"), "{said}");
+    assert_eq!(served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/SandboxWait"))).count(), 2 + 18);
+    // The ids asked for were none: each deploy made its own.
+    let created: Vec<String> = served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/DictGetOrCreate"))).filter_map(|a| a["asked"].as_str().map(str::to_string)).collect();
+    assert!(created.is_empty(), "{created:?}");
+    // Deployed, Modal saying the workspace's web addresses end in modal.run.
+    let env = modal_answered("EnvironmentGetOrCreate", &[pb(&[Pb::B(1, b"en-main".to_vec()), Pb::B(2, pb(&[Pb::B(1, b"main".to_vec()), Pb::B(2, pb(&[Pb::B(1, b"2025.06".to_vec()), Pb::B(2, b"modal.run".to_vec())]))]))])]);
+    let (ok, said) = deploy("mdplane00001", &[env, image_built, modal_answered("SandboxWait", &[pb(&[Pb::B(1, modal_result(1, "", 0))])])]);
+    assert!(ok && said.contains("The control plane is running: https://acmeorg--superci-plane-mdplane00001.modal.run (Modal · acmeorg)"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Modal token given by name that cannot go in a request's header as it is (not plain ASCII): left out of what is
+/// asked, and Modal's refusal said as Modal said it.
+#[test]
+fn a_modal_token_given_by_name_that_no_header_can_carry_is_left_out_and_modals_refusal_said() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/ended.jsonl"), &[]);
+    let o = common::command(&home).args(["planes", "create", "modal"]).env("SUPERCI_MODAL_TOKEN_ID", "ak-tökén").env("SUPERCI_MODAL_TOKEN_SECRET", "as-superciendedrecording00").output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("Token not found"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The answers a recording has for one call (its method, and its address ending so), in their order.
+fn recorded_answers(recording: &str, method: &str, url_end: &str) -> Vec<serde_json::Value> {
+    recording.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["method"] == method && r["url"].as_str().is_some_and(|u| u.ends_with(url_end))).collect()
+}
+
+/// Cloudflare's runners for a control plane in AWS, deployed as Cloudflare answered a real one but where it did
+/// not: a control plane that does not publish its keys yet is refused; Cloudflare refusing to prepare the image is
+/// said; then GitHub's registry and Cloudflare's asking for a token first, GitHub's index listing other platforms
+/// before the one containers run (at length), the image not visible at once and then still being prepared, the
+/// Worker's containers of one size from before (their application gone, one without an id left), and it is deployed.
+#[test]
+fn cloudflare_runners_are_deployed_through_registry_challenges_an_image_being_prepared_and_containers_from_before() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.workers.lock().unwrap().insert("superci-runners-testplane0001.acme.workers.dev".into(), served.url.clone());
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    let plain = kept.to_string();
+    let recording = include_str!("../fixtures/runners/03-cf-agent.jsonl").replace("awsplane0001", superci_testkit::PLANE).replace("http://new-plane.test", &served.url);
+    let run = |overlay: &[serde_json::Value]| {
+        served.aws.replaying(&recording, &[]);
+        if !overlay.is_empty() { served.aws.replaying(&overlay.iter().map(|v| v.to_string() + "\n").collect::<String>(), &[]) }
+        let o = common::command(&home).args(["runners", "create", "cloudflare"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        served.aws.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // A control plane from before it published its keys.
+    let mut older = kept.clone();
+    older["plane"]["Aws"]["url"] = superci_testkit::without_routes(&served.url, &["/.well-known/jwks.json"]).into();
+    std::fs::write(&file, older.to_string()).unwrap();
+    let (ok, said) = run(&[]);
+    assert!(!ok && said.contains("the control plane did not publish its keys"), "{said}");
+    std::fs::write(&file, &plain).unwrap();
+    // Cloudflare refusing to prepare the image.
+    let prepare = recorded_answers(&recording, "POST", "/containers/image-preparations")[0].clone();
+    let answered = |r: &serde_json::Value, status: u16, answer: serde_json::Value| { let mut r = r.clone(); r["status"] = status.into(); r["answer"] = answer.to_string().into(); r };
+    let (ok, said) = run(&[answered(&prepare, 400, serde_json::json!({ "success": false, "errors": [{ "code": 1000, "message": "image too large for this account" }], "result": null }))]);
+    assert!(!ok && said.contains("image too large for this account"), "{said}");
+    // Each registry asks for a token first (GitHub's with its service and scope, Cloudflare's with neither).
+    served.aws.fail_with_headers("actions-runner/manifests/latest", 401, &[("www-authenticate", "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\",scope=\"repository:actions/actions-runner:pull\"")], "", Some(1));
+    served.aws.fail_with_headers("superci-runner/manifests/gh-", 401, &[("www-authenticate", "Bearer realm=\"https://registry.cloudflare.com/token\"")], "", Some(1));
+    served.aws.fail("registry.cloudflare.com/token", 200, r#"{"token":"cloudflare-registry-token"}"#, Some(1));
+    // GitHub's index: Windows and Arm first, and long.
+    let index = recorded_answers(&recording, "GET", "/manifests/latest")[0].clone();
+    let mut list: serde_json::Value = serde_json::from_str(index["answer"].as_str().unwrap()).unwrap();
+    let amd64 = list["manifests"].as_array().unwrap().clone();
+    list["manifests"] = serde_json::json!([{ "digest": "sha256:1111", "platform": { "os": "windows", "architecture": "amd64" } }, { "digest": "sha256:2222", "platform": { "os": "linux", "architecture": "arm64" } }]);
+    list["manifests"].as_array_mut().unwrap().extend(amd64);
+    let long = list.to_string() + &" ".repeat(1_100_000);
+    // Not visible at once, then being prepared twice over; and the Worker's containers of one size from before.
+    let scripts = recorded_answers(&recording, "GET", "/workers/scripts");
+    let mut before: serde_json::Value = serde_json::from_str(scripts[1]["answer"].as_str().unwrap()).unwrap();
+    before["result"].as_array_mut().unwrap().push(serde_json::json!({ "id": format!("superci-runners-{}", superci_testkit::PLANE), "migration_tag": "v2" }));
+    let apps = recorded_answers(&recording, "GET", "/containers/applications");
+    let (ok, said) = run(&[
+        { let mut r = index.clone(); r["answer"] = long.clone().into(); r }, answered(&prepare, 400, serde_json::json!({ "success": false, "errors": [{ "code": 1, "message": "IMAGE_REGISTRY_DOESNT_CONTAIN_IMAGE" }], "result": null })),
+        answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), prepare.clone(),
+        scripts[0].clone(), answered(&scripts[1], 200, before),
+        answered(&apps[0], 200, serde_json::json!({ "success": true, "result": [{ "name": format!("superci-runners-{}", superci_testkit::PLANE) }] })), apps[0].clone(),
+    ]);
+    assert!(ok && said.contains("cloudflare runs jobs now."), "{said}");
+    assert!(said.contains("Cloudflare is preparing the runner image for its machines…") && said.matches("Cloudflare is preparing").count() == 1, "{said}");
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap_or_default(), a["url"].as_str().unwrap_or_default())).collect();
+    assert!(asked.iter().any(|a| a == "GET https://registry.cloudflare.com/token") && asked.iter().any(|a| a.starts_with("GET https://ghcr.io/token?service=ghcr.io&scope=")), "{asked:?}");
+    // (Its applications looked at for the one from before, which has no id to delete it by: left.)
+    assert!(asked.iter().filter(|a| a.starts_with("GET") && a.ends_with("/containers/applications")).count() == 2 && !asked.iter().any(|a| a.starts_with("DELETE") && a.contains("/containers/applications/")), "{asked:?}");
+    assert!(asked.iter().any(|a| a.contains("/manifests/sha256:660f7b9d")) && !asked.iter().any(|a| a.contains("/manifests/sha256:1111") || a.contains("/manifests/sha256:2222")), "{asked:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Cloudflare control plane, as Cloudflare answered a real one but where it did not: its address not given (asked
+/// again and again, then said); then deployed, its containers of one size from before going; deleted with
+/// Cloudflare failing to delete its Worker (said, nothing forgotten), then saying it is not there (taken as gone).
+#[test]
+fn a_cloudflare_control_plane_says_an_address_cloudflare_never_gave_drops_containers_from_before_and_is_deleted_once_its_worker_is_gone() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00001", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00001/CONTAINERS");
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let run = |recording: &str, overlay: &[serde_json::Value], args: &[&str]| {
+        served.aws.replaying(recording, &[]);
+        if !overlay.is_empty() { served.aws.replaying(&overlay.iter().map(|v| v.to_string() + "\n").collect::<String>(), &[]) }
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "cfplane00001").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let answered = |r: &serde_json::Value, method: &str, url_end: &str, status: u16, answer: serde_json::Value| {
+        let mut r = r.clone();
+        if !method.is_empty() { r["method"] = method.into() }
+        if !url_end.is_empty() { r["url"] = format!("https://api.cloudflare.com/client/v4/accounts/1111111111111111111111111111111a{url_end}").into() }
+        r["status"] = status.into(); r["answer"] = answer.to_string().into(); r
+    };
+    let deploy = include_str!("../fixtures/cloudflare/02-deploy.jsonl");
+    let subdomain = recorded_answers(deploy, "POST", "/workers/scripts/superci/subdomain")[0].clone();
+    let refused = serde_json::json!({ "success": false, "errors": [{ "code": 10013, "message": "workers.dev is not set up for this account yet" }], "result": null });
+    let (ok, said) = run(deploy, &[answered(&subdomain, "", "", 400, refused)], &["planes", "create", "cloudflare"]);
+    assert!(!ok && said.contains("workers.dev is not set up for this account yet"), "{said}");
+    assert_eq!(served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "POST" && a["url"].as_str().is_some_and(|u| u.ends_with("/superci/subdomain"))).count(), 10);
+    // Deployed, its containers of one size from before (their application, `superci-runners`) gone.
+    let scripts = recorded_answers(deploy, "GET", "/workers/scripts");
+    let mut before: serde_json::Value = serde_json::from_str(scripts[1]["answer"].as_str().unwrap()).unwrap();
+    before["result"].as_array_mut().unwrap().push(serde_json::json!({ "id": "superci", "migration_tag": "v2" }));
+    let (ok, said) = run(deploy, &[scripts[0].clone(), answered(&scripts[1], "", "", 200, before),
+        answered(&scripts[0], "GET", "/containers/applications", 200, serde_json::json!({ "success": true, "result": [{ "id": "00000000000000000000000000000009", "name": "superci-runners" }, { "id": "0000000000000000000000000000000a", "name": "another-app" }] })),
+        answered(&scripts[0], "DELETE", "/containers/applications/00000000000000000000000000000009", 200, serde_json::json!({ "success": true, "result": {} }))], &["planes", "create", "cloudflare"]);
+    assert!(ok && said.contains("The control plane is running: https://superci.acme.workers.dev (Cloudflare · Acme)"), "{said}");
+    let deleted: Vec<String> = served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "DELETE").filter_map(|a| a["url"].as_str().map(str::to_string)).collect();
+    assert!(deleted == ["https://api.cloudflare.com/client/v4/accounts/1111111111111111111111111111111a/containers/applications/00000000000000000000000000000009"], "{deleted:?}");
+    // Deleted: Cloudflare failing to delete its Worker, then saying there is none.
+    let delete = [include_str!("../fixtures/cloudflare/03-use.jsonl"), include_str!("../fixtures/cloudflare/07-delete.jsonl")].concat();
+    let worker = recorded_answers(&delete, "DELETE", "/workers/scripts/superci?force=true")[0].clone();
+    let (ok, said) = run(&delete, &[answered(&worker, "", "", 500, serde_json::json!({ "success": false, "errors": [{ "code": 10013, "message": "An unknown error has occurred" }], "result": null }))], &["planes", "delete", "cfplane00001", "--confirm"]);
+    assert!(!ok && said.contains("An unknown error has occurred"), "{said}");
+    let (ok, said) = run(&delete, &[answered(&worker, "", "", 404, serde_json::json!({ "success": false, "errors": [{ "code": 0, "message": "Worker Not Found" }], "result": null }))], &["planes", "delete", "cfplane00001", "--confirm"]);
+    assert!(ok && said.contains("Deleted Cloudflare · Acme."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An AWS control plane's deploy as AWS answered a real one, but where it did not: Lambda refusing to make the
+/// function or its converter for want of a role, until it refuses for another reason (said as it said it) or for
+/// as long as it is asked (said, the last refusal); and the function made but failed to update.
+#[test]
+fn an_aws_deploy_says_what_lambda_refused_of_the_function_and_its_converter_and_a_function_that_failed_to_update() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    let recording = include_str!("../fixtures/aws/planes/deploy.jsonl").replace("testplane0002", "deployplane1");
+    let deploy = |overlay: &[serde_json::Value]| {
+        account.replaying(&recording, &[]);
+        if !overlay.is_empty() { account.replaying(&overlay.iter().map(|v| v.to_string() + "\n").collect::<String>(), &[]) }
+        let o = common::command(&home).args(["planes", "create", "aws", "--region=us-east-1"]).env("SUPERCI_NEW_PLANE_ID", "deployplane1").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        account.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // (Lambda's refusal to make a function, as Lambda words it: the control plane's, or its converter's.)
+    let refuse = |which: &str, message: &str, times: Option<u32>| account.fail(&format!("2015-03-31/functions|\"Handler\"|{which}"), 400, &serde_json::json!({ "Type": "User", "message": message }).to_string(), times);
+    let creates = || account.asked.lock().unwrap().iter().filter(|a| a["method"] == "POST" && a["url"].as_str().is_some_and(|u| u.ends_with("/2015-03-31/functions"))).count();
+    let not_yet = "The role is still being made: try again in a few seconds.";
+    let other = "Unsupported architecture for provided.al2023 here.";
+    let cannot = "The role defined for the function cannot be assumed by Lambda.";
+    // A role not ready, then another refusal; then a role never assumed: the function's, then its converter's.
+    for (which, made_first) in [("SuperCI control plane", 0), ("layer store converter", 1)] {
+        refuse(which, not_yet, Some(1));
+        refuse(which, other, Some(1));
+        let (ok, said) = deploy(&[]);
+        assert!(!ok && said.contains(other), "{which}: {said}");
+        refuse(which, cannot, None);
+        let before = creates();
+        let (ok, said) = deploy(&[]);
+        assert!(!ok && said.contains(cannot) && creates() - before == 12 + made_first, "{which}: {} {said}", creates() - before);
+    }
+    // Made, and failed to update while it was still starting.
+    let mut config = recorded_answers(&recording, "GET", "/functions/superci-plane-deployplane1/configuration")[0].clone();
+    let mut v: serde_json::Value = serde_json::from_str(config["answer"].as_str().unwrap()).unwrap();
+    (v["State"], v["LastUpdateStatus"], v["LastUpdateStatusReason"]) = ("Pending".into(), "Failed".into(), "The code could not be unpacked.".into());
+    config["answer"] = v.to_string().into();
+    let (ok, said) = deploy(&[config]);
+    assert!(!ok && said.contains("the function failed to start:"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Before an AWS control plane is made in a region: the image jobs run on not there is said, and nothing is made;
+/// AWS not saying whether it is (an error of its own) is left to the deploy, which goes on.
+#[test]
+fn an_aws_deploy_into_a_region_without_the_image_is_refused_and_one_aws_did_not_say_goes_on() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    let recording = include_str!("../fixtures/aws/planes/deploy.jsonl").replace("testplane0002", "deployplane1");
+    let deploy = || {
+        account.replaying(&recording, &[]);
+        let o = common::command(&home).args(["planes", "create", "aws", "--region=us-east-1"]).env("SUPERCI_NEW_PLANE_ID", "deployplane1").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        account.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    account.fail("DescribeImages", 200, r#"<?xml version="1.0" encoding="UTF-8"?><DescribeImagesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>1</requestId><imagesSet/></DescribeImagesResponse>"#, None);
+    let (ok, said) = deploy();
+    assert!(!ok && said.contains("The image SuperCI's jobs run on is not in us-east-1 yet, so no job could start there. Choose another region.") && !said.contains("Creating its storage"), "{said}");
+    // AWS failing to say (once): the deploy goes on, to where Lambda refuses its function.
+    account.fail("DescribeImages", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred."), Some(1));
+    account.fail("2015-03-31/functions|\"Handler\"", 400, r#"{"Type":"User","message":"Unsupported architecture for provided.al2023 here."}"#, None);
+    let (ok, said) = deploy();
+    assert!(!ok && said.contains("Uploading it (a Lambda function)…") && said.contains("Unsupported architecture for provided.al2023 here."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS's runners for a control plane elsewhere: IAM refusing the identity provider they start machines through (not
+/// because it is there already) is said as IAM said it, and nothing more is asked.
+#[test]
+fn aws_runners_for_a_control_plane_elsewhere_say_iams_refusal_of_their_identity_provider() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": served.url, "plane_id": superci_testkit::PLANE, "label": "superci" } });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.fail("CreateOpenIDConnectProvider", 403, &superci_testkit::ec2_error("AccessDenied", "User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: iam:CreateOpenIDConnectProvider"), None);
+    let o = superci(&home, &["runners", "create", "aws", "--region=us-east-1"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("not authorized to perform: iam:CreateOpenIDConnectProvider"), "{said}");
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CreateRole&"))), "no role made after");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane with GitLab connected and no GitHub App: jobs can come and run, and the status says so.
+#[test]
+fn a_control_plane_with_gitlab_alone_and_runners_is_ready_for_jobs() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    let home = home(&served);
+    let (code, v) = json(&home, &["status"]);
+    assert!(code == 0 && v["control_plane"]["ready"] == true, "{v}");
+    let said = String::from_utf8_lossy(&superci(&home, &["status"]).stdout).into_owned();
+    assert!(said.contains("Jobs can run  yes"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SuperCI stopped from the CLI with another control plane in the workspace beside the one in use: one that serves
+/// nothing and answers goes with it, and so does one that had moved to the one in use (it only passed jobs on).
+#[test]
+fn leaving_deletes_another_control_plane_that_serves_nothing_or_had_moved_to_the_one_in_use() {
+    for moved in [false, true] {
+        let served = serve(|_| {});
+        served.connect_github();
+        let other = superci_testkit::serve_as("testplane0002", |_| {});
+        if moved { other.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!(served.url).to_string()); }
+        let home = common::signed_in(&served);
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+        for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } }]);
+        kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let o = common::command(&home).args(["leave", "--confirm"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(said.contains("SuperCI is stopped") && !said.contains("testplane0002 --confirm"), "{moved}: {said}");
+        // (Its settings gone from SSM, as its deletion removes them.)
+        assert!(served.aws.settings("testplane0002").is_empty(), "{moved}: {:?} {said}", served.aws.settings("testplane0002"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// What the control plane's AWS role lacks, read before it is given: a region its machines use with no network of
+/// its own is said among it.
+#[test]
+fn a_region_without_the_control_planes_own_network_is_said_among_what_its_role_lacks() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = common::signed_in(&served);
+    served.aws.fail("DescribeVpcs", 200, r#"<?xml version="1.0" encoding="UTF-8"?><DescribeVpcsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>1</requestId><vpcSet/></DescribeVpcsResponse>"#, None);
+    let o = superci(&home, &["planes", "allow", "--dry-run"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("A network of its own in each region its machines use"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The account's copy of the image of an older build than the newest published: `images update` copies the newer
+/// one in, as AWS answered a real copy, and says what happens to the older.
+#[test]
+fn an_older_build_of_the_accounts_copy_is_updated_with_the_newest_from_the_cli() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000")]);
+    let o = superci(&home, &["images", "update", "ca-central-1"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("into ca-central-1, from us-east-1") && said.contains("The older copy is removed once the new one is there"), "{said}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage")) && a["url"].as_str().is_some_and(|u| u.contains("ca-central-1"))));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A runner on a machine of a run from a computer deletes the message it took (as GitHub's runner does once it has
+/// it): answered, nothing more, and the job goes on to its end.
+#[test]
+fn a_runner_deleting_the_message_it_took_is_answered_and_its_job_goes_on() {
+    use superci_testkit::Runner;
+    use std::io::{Read, Write};
+    let served = serve(|_| {});
+    let dir = common::temp("message-deleted");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"])
+        .env("SUPERCI_HOME", dir.join(".cli")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_STAND_IN", &served.aws.url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let run = loop { if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    runner.take();
+    // (As the runner asks it: DELETE, on the message's address.)
+    let u = runner.at.trim_start_matches("http://");
+    let (host, rest) = u.split_once('/').unwrap();
+    let mut s = std::net::TcpStream::connect(host).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    s.write_all(format!("DELETE /{rest}/Message/1 HTTP/1.1\r\nhost: {host}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).unwrap();
+    let mut answer = String::new();
+    let _ = s.read_to_string(&mut answer);
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let step = "dddddddd-0000-0000-0000-000000000001";
+    runner.steps(&[(step, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+    assert_eq!(runner.finish("succeeded"), 200);
+    let _ = cli.wait_with_output();
+    let job = served.store.under("job:").into_iter().map(|(_, j)| j).find(|j| j["run_id"].to_string().trim_matches('"') == run).unwrap_or_default();
+    assert_eq!(job["conclusion"], "success", "{job}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A job's `timeout-minutes` given by an expression that indexes a list: read as the item it names.
+#[test]
+fn a_jobs_timeout_given_by_an_expression_indexing_a_list_is_the_item_it_names() {
+    let served = serve(|_| {});
+    let dir = common::temp("timeout-indexed");
+    common::played_steps(&served, &dir, "jobs:\n  tests:\n    runs-on: superci\n    timeout-minutes: ${{ fromJSON('[7, 30]')[1] }}\n    steps:\n      - run: make test\n", &[("Run make test", "succeeded")]);
+    let (_, run) = served.store.under("run:").into_iter().next().expect("the run");
+    assert_eq!(run["jobs"][0]["timeout_ms"], 1_800_000, "{run}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A move onto another control plane that serves GitHub of its own is refused: it is another CI.
+#[test]
+fn a_move_onto_a_control_plane_that_serves_github_of_its_own_is_refused() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    other.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let o = superci(&home, &["planes", "move", "testplane0002", "--plane=testplane0001"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("That control plane serves a code host of its own") && said.contains("Nothing has changed."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The GitHub App asked for an organization with a long name: its name cut, with a mark of the whole of it, to fit
+/// GitHub's limit.
+#[test]
+fn the_app_asked_for_an_organization_with_a_long_name_has_it_cut_with_a_mark_of_the_whole() {
+    let served = serve(|_| {});
+    let login = "a-very-long-organization";
+    served.github.answer_with("GET", &format!("/users/{login}"), 200, &[("content-type", "application/json")], &serde_json::json!({ "login": login, "id": 7, "type": "Organization" }).to_string());
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let (_board, link) = common::dashboard(&home);
+    let (status, _, page) = common::post(&link, "/github/start", &[("login", login)]);
+    let mark = &superci_core::crypto::sha256_hex(login.as_bytes())[..4];
+    assert!(status < 400 && page.replace("&quot;", "\"").contains(&format!("\"name\":\"SuperCI a-very-lon-{mark}\"")), "{status} {}", common::words(&page));
+    let _ = std::fs::remove_dir_all(&home);
+}

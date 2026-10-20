@@ -926,3 +926,29 @@ impl Served {
     /// Its own machines refused from now on, with what their cloud said (Modal's refusal, say); `None`: started again.
     pub fn machines_refuse(&self, said: Option<&str>) { *self.machines.1.lock().unwrap() = said.map(str::to_string) }
 }
+
+/// A control plane older than some of its routes: what is asked at `url` (a control plane served here) is passed on
+/// and answered as it answers, but for an address starting with one of `missing`, answered 404 as a version from
+/// before that route answers. Its own address, to keep in a workspace in place of `url`.
+pub fn without_routes(url: &str, missing: &[&str]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (to, missing) = (url.trim_start_matches("http://").to_string(), missing.iter().map(|m| m.to_string()).collect::<Vec<_>>());
+    std::thread::spawn(move || for stream in listener.incoming().flatten() {
+        let (to, missing) = (to.clone(), missing.clone());
+        std::thread::spawn(move || {
+            let Ok((method, target, headers, body)) = read(&stream) else { return };
+            if missing.iter().any(|m| target.starts_with(m.as_str())) { let _ = write(stream, 404, &[("content-type".into(), "text/plain".into())], b"Not found"); return }
+            let mut out = vec![];
+            if let Ok(mut s) = TcpStream::connect(&to) {
+                let extra: String = headers.iter().filter(|(k, _)| !["host", "content-length", "connection"].contains(&k.to_ascii_lowercase().as_str())).map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+                let _ = s.write_all(format!("{method} {target} HTTP/1.1\r\nhost: {to}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes());
+                let _ = s.write_all(&body);
+                let _ = s.read_to_end(&mut out);
+            }
+            let mut stream = stream;
+            let _ = stream.write_all(&out);
+        });
+    });
+    at
+}

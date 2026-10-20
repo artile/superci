@@ -2,7 +2,6 @@
 //! own table and parameters, write its logs, and start and stop its own tagged machines), a DynamoDB table, the Lambda
 //! function (embedded in this binary) with a public URL for GitHub's webhooks, and a schedule for the sweep. Secrets
 //! are SecureString parameters under /superci/<id>/ in SSM Parameter Store.
-use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -101,7 +100,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
     // Records with an end (`x`, seconds) are removed by DynamoDB itself. Only for tidying, so a refusal stops nothing.
     for _ in 0..30 {
         if ddb("DescribeTable", json!({ "TableName": name })).is_ok_and(|t| t["Table"]["TableStatus"] == "ACTIVE") { break }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        crate::aws::pause(1000);
     }
     let ttl = ddb("DescribeTimeToLive", json!({ "TableName": name })).ok();
     if !ttl.as_ref().is_some_and(|t| ["ENABLED", "ENABLING"].contains(&t["TimeToLiveDescription"]["TimeToLiveStatus"].as_str().unwrap_or(""))) {
@@ -127,7 +126,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
                 "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 60, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
                 "Tags": { "superci-plane": plane_id } }))) {
                 Ok(_) => { last.clear(); break }
-                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; std::thread::sleep(Duration::from_secs(3 + attempt)) }
+                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; crate::aws::pause((3 + attempt) * 1000) }
                 Err(e) => return Err(e),
             }
         }
@@ -184,7 +183,7 @@ fn deploy_converter(a: &Api, account_id: &str, region: &str, plane_id: &str, zip
         for attempt in 0..12 {
             match a.lambda("POST", "/2015-03-31/functions", Some(create.clone())) {
                 Ok(_) => { last.clear(); break }
-                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; std::thread::sleep(Duration::from_secs(3 + attempt)) }
+                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; crate::aws::pause((3 + attempt) * 1000) }
                 Err(e) => return Err(e),
             }
         }
@@ -201,7 +200,7 @@ pub fn delete(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> {
     delete_role(creds, region, plane_id)?;
     // The function's last lines can reach its log after the log was deleted, which makes the log anew (seen: a
     // log group left in an otherwise empty account). Deleted once more, a moment later.
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    crate::aws::pause(3000);
     ok_if(api(creds, region).target("logs", &format!("logs.{region}.amazonaws.com"), "Logs_20140328.DeleteLogGroup", "1.1", json!({ "logGroupName": format!("/aws/lambda/{}", name(plane_id)) })), &["ResourceNotFoundException"]).map(|_| ())
 }
 
@@ -258,7 +257,7 @@ fn wait_ready(a: &Api, name: &str) -> Result<()> {
         let (state, update) = (v["State"].as_str().unwrap_or(""), v["LastUpdateStatus"].as_str().unwrap_or(""));
         if state == "Active" && update != "InProgress" { return Ok(()) }
         if state == "Failed" || update == "Failed" { return Err(format!("the function failed to start: {}", v["StateReason"].as_str().or(v["LastUpdateStatusReason"].as_str()).unwrap_or(""))) }
-        std::thread::sleep(Duration::from_secs(2));
+        crate::aws::pause(2000);
     }
     Err("the function did not become ready".into())
 }

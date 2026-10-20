@@ -231,7 +231,7 @@ impl Cloudflare {
             for _ in 0..10 {
                 match self.json("POST", &format!("/accounts/{a}/containers/image-preparations"), json!({ "image": image })) {
                     // The registry can take a few seconds before a just-copied image is visible.
-                    Err(e) if e.contains("does not exist") || e.contains("DOESNT_CONTAIN") => std::thread::sleep(Duration::from_secs(3)),
+                    Err(e) if e.contains("does not exist") || e.contains("DOESNT_CONTAIN") => crate::aws::pause(3000),
                     r => { v = Some(r?); break }
                 }
             }
@@ -239,7 +239,7 @@ impl Cloudflare {
             match v["status"].as_str() {
                 Some("ready") => return Ok(image),
                 Some("error") => return Err(format!("Cloudflare could not prepare the runner image: {}", v["reason"].as_str().unwrap_or("no reason given"))),
-                _ => { if attempt % 6 == 0 { eprintln!("Cloudflare is preparing the runner image for its machines…") } std::thread::sleep(Duration::from_secs(5)) }
+                _ => { if attempt % 6 == 0 { eprintln!("Cloudflare is preparing the runner image for its machines…") } crate::aws::pause(5000) }
             }
         }
         Err("Cloudflare took over 10 minutes to prepare the runner image; try again later".into())
@@ -333,7 +333,7 @@ impl Cloudflare {
         for attempt in 0..10 {
             match self.json("POST", &format!("/accounts/{a}/workers/scripts/{name}/subdomain"), json!({ "enabled": true, "previews_enabled": false })) {
                 Ok(_) => { last.clear(); break }
-                Err(e) => { last = e; std::thread::sleep(Duration::from_secs(2 + attempt)) }
+                Err(e) => { last = e; crate::aws::pause((2 + attempt) * 1000) }
             }
         }
         if !last.is_empty() { return Err(last) }
