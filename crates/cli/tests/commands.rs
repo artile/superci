@@ -2227,3 +2227,27 @@ fn an_aws_deploy_says_what_lambda_refused_of_the_function_and_its_converter_and_
     assert!(!ok && said.contains("the function failed to start:"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Before an AWS control plane is made in a region: the image jobs run on not there is said, and nothing is made;
+/// AWS not saying whether it is (an error of its own) is left to the deploy, which goes on.
+#[test]
+fn an_aws_deploy_into_a_region_without_the_image_is_refused_and_one_aws_did_not_say_goes_on() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    let recording = include_str!("../fixtures/aws/planes/deploy.jsonl").replace("testplane0002", "deployplane1");
+    let deploy = || {
+        account.replaying(&recording, &[]);
+        let o = common::command(&home).args(["planes", "create", "aws", "--region=us-east-1"]).env("SUPERCI_NEW_PLANE_ID", "deployplane1").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        account.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    account.fail("DescribeImages", 200, r#"<?xml version="1.0" encoding="UTF-8"?><DescribeImagesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>1</requestId><imagesSet/></DescribeImagesResponse>"#, None);
+    let (ok, said) = deploy();
+    assert!(!ok && said.contains("The image SuperCI's jobs run on is not in us-east-1 yet, so no job could start there. Choose another region.") && !said.contains("Creating its storage"), "{said}");
+    // AWS failing to say (once): the deploy goes on, to where Lambda refuses its function.
+    account.fail("DescribeImages", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred."), Some(1));
+    account.fail("2015-03-31/functions|\"Handler\"", 400, r#"{"Type":"User","message":"Unsupported architecture for provided.al2023 here."}"#, None);
+    let (ok, said) = deploy();
+    assert!(!ok && said.contains("Uploading it (a Lambda function)…") && said.contains("Unsupported architecture for provided.al2023 here."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
