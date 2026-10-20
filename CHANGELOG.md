@@ -2,8 +2,8 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.19
-- A control plane asked for a job's log by an id that is no job's, or of a GitLab by a name that is none, answers 400 with what was wrong (it answered 500, as if it had failed itself).
+## 0.19.19 — 2026-10-21
+- A control plane asked for a job's log by an id that is no job's, or of a GitLab by a name that is none, answers 400 with what was wrong (it answered 500, as if it had failed itself). Update your control plane for it.
 - `superci jobs retrieve ID --out=FILE` of a GitLab job whose log is over 4 MB says the control plane gives only its last 4 MB, and that GitLab's page of the job has it whole. It said a newer control plane would give it whole, which none does for GitLab.
 - Remove from SuperCI only, when removing a runner provider in the dashboard, removes it from SuperCI only. The button's choice was lost as the dialog was sent, so it removed the provider in its cloud too, or asked to sign in there.
 - Settings keeps what is this computer's own while the workspace's control plane does not take this computer's key: its id, signing out, and removing the workspace when there are others. The page showed only why the key was not taken, so a workspace kept twice could not be removed there.
@@ -26,7 +26,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - No spot pool priced over the on-demand price of the cheapest machine that fits is asked for. Such pools are named on the job's page. Update your control plane for it.
 - A machine with more memory than asked for (r8a, r7a, r8g) is asked for only where no general machine has the memory with as many CPUs. For 64 CPUs that leaves m7a, m8a and the others, not r8a at twice their price. Update your control plane for it.
 - AWS jobs can get Intel's machines too (c8i, c7i, m8i, m7i), for more spot pools to choose from: in Ohio today, c8i.xlarge is the cheapest 4-CPU spot machine. Each of their CPUs counts a quarter slower than AMD's (it is half a core), so they are chosen when their price makes up for it. Update your control plane for it.
-- A job's page says why its spot machine is the one it got: its price, the cheaper first choice that had no machine, and what was not asked for its price.
+- A job's page says why its spot machine is the one it got: its price, the cheaper first choice that had no machine, and what was not asked for its price. Update your control plane for it.
 
 ## 0.19.18 — 2026-10-19
 - A change's note in the dashboard ("Removed Cloudflare. Left: …") is shown once its page has loaded. A page still loading took it, and it was not shown.
