@@ -2024,6 +2024,28 @@ fn github_enterprise_that_says_who_a_name_is_makes_the_app_for_it_as_it_said() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Modal signed in to again from the dashboard after its sign-in ended: what fails next is said as what it is, not
+/// as Modal's sign-in having ended.
+#[test]
+fn modal_signed_in_again_after_its_sign_in_ended_is_taken_as_signed_in() {
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["modal_ended"] = true.into();
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    let (status, _, page) = common::get(&link, "/connect/modal");
+    assert!(status == 200 && page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{status} {}", common::words(&page));
+    until("signed in", || !common::words(&common::part(&link, "/?p=add-runners&fragment=1").1).contains("Waiting for Modal"));
+    let (status, said) = common::part(&link, "/run/artifact?run=1&name=report");
+    let said = common::words(&said);
+    assert!(status >= 400 && !said.contains("Modal no longer accepts"), "{status} {said}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// An update whose version asks for nothing new, of a control plane whose role was found to lack only what lets it
 /// read: said as that many new read permissions in AWS.
 #[test]
