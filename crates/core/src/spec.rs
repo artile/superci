@@ -57,7 +57,7 @@ const HOW: &str = "A label says a machine as key=value pairs after its name, lik
 
 /// The AWS machine families a label may name: what a job's CPUs come from (compute, general, memory), AMD and arm64,
 /// and those with a local NVMe disk. Each with its memory for each CPU (GB).
-pub const FAMILIES: [(&str, u32); 24] = [("c8a", 2), ("c7a", 2), ("m8a", 4), ("m7a", 4), ("r8a", 8), ("r7a", 8), ("c8g", 2), ("c7g", 2), ("m8g", 4), ("m7g", 4), ("r8g", 8), ("r7g", 8),
+pub const FAMILIES: [(&str, u32); 28] = [("c8a", 2), ("c7a", 2), ("m8a", 4), ("m7a", 4), ("r8a", 8), ("r7a", 8), ("c8i", 2), ("c7i", 2), ("m8i", 4), ("m7i", 4), ("c8g", 2), ("c7g", 2), ("m8g", 4), ("m7g", 4), ("r8g", 8), ("r7g", 8),
     ("c8id", 2), ("c6id", 2), ("m8id", 4), ("m6id", 4), ("r8id", 8), ("r6id", 8), ("c8gd", 2), ("c7gd", 2), ("m8gd", 4), ("m7gd", 4), ("r8gd", 8), ("r7gd", 8)];
 
 /// What AWS includes with a disk at no extra price: MiB a second, and IOPS.
@@ -327,7 +327,7 @@ pub fn aws_family_sizes(family: &str) -> Vec<(u32, &'static str)> {
     const UP_TO_64: [(u32, &str); 7] = [(2, "large"), (4, "xlarge"), (8, "2xlarge"), (16, "4xlarge"), (32, "8xlarge"), (48, "12xlarge"), (64, "16xlarge")];
     let more: &[(u32, &'static str)] = match family {
         "c7g" | "m7g" | "r7g" | "c7gd" | "m7gd" | "r7gd" => &[],
-        "c7a" | "m7a" | "r7a" | "c8id" | "m8id" | "r8id" => &[(96, "24xlarge"), (128, "32xlarge"), (192, "48xlarge")],
+        "c7a" | "m7a" | "r7a" | "c8i" | "m8i" | "c8id" | "m8id" | "r8id" => &[(96, "24xlarge"), (128, "32xlarge"), (192, "48xlarge")],
         "c6id" | "m6id" | "r6id" => &[(96, "24xlarge"), (128, "32xlarge")],
         _ => &[(96, "24xlarge"), (192, "48xlarge")],
     };
@@ -357,18 +357,24 @@ pub fn aws_instance_types(s: &Spec) -> Vec<String> {
             Some(format!("{f}.{size}"))
         }).collect()
     }
-    let families = match (s.localdisk(), arm) {
-        (false, false) => [(2, ["c8a", "c7a"]), (4, ["m8a", "m7a"]), (8, ["r8a", "r7a"])],
-        (false, true) => [(2, ["c8g", "c7g"]), (4, ["m8g", "m7g"]), (8, ["r8g", "r7g"])],
-        (true, false) => [(2, ["c8id", "c6id"]), (4, ["m8id", "m6id"]), (8, ["r8id", "r6id"])],
-        (true, true) => [(2, ["c8gd", "c7gd"]), (4, ["m8gd", "m7gd"]), (8, ["r8gd", "r7gd"])],
+    // (x64: AMD's and Intel's, for more spot pools to choose from; Intel's are often the cheapest.)
+    let families: [(u32, &[&str]); 3] = match (s.localdisk(), arm) {
+        (false, false) => [(2, &["c8a", "c7a", "c8i", "c7i"]), (4, &["m8a", "m7a", "m8i", "m7i"]), (8, &["r8a", "r7a"])],
+        (false, true) => [(2, &["c8g", "c7g"]), (4, &["m8g", "m7g"]), (8, &["r8g", "r7g"])],
+        (true, false) => [(2, &["c8id", "c6id"]), (4, &["m8id", "m6id"]), (8, &["r8id", "r6id"])],
+        (true, true) => [(2, &["c8gd", "c7gd"]), (4, &["m8gd", "m7gd"]), (8, &["r8gd", "r7gd"])],
     };
     // (Each family at its own smallest size that fits: one may have a size another lacks.)
     for (per_cpu, families) in families {
-        for f in families {
+        for f in families.iter().copied() {
             if let Some((c, size)) = aws_family_sizes(f).into_iter().find(|(c, _)| *c >= cpu && c * per_cpu >= ram) { out.push((c, per_cpu, format!("{f}.{size}"))) }
         }
     }
+    // A memory family only where no other gives the memory asked for with as few CPUs: its spot price is often twice
+    // a general one's, and AWS, asked for pools by room, took r8a at three times c8a's price.
+    let fits_without = |c: u32| out.iter().any(|(oc, per_cpu, _)| *oc == c && *per_cpu < 8);
+    let keep: Vec<bool> = out.iter().map(|(c, per_cpu, _)| *per_cpu < 8 || !fits_without(*c)).collect();
+    let mut out: Vec<(u32, u32, String)> = out.into_iter().zip(keep).filter(|(_, k)| *k).map(|(o, _)| o).collect();
     // The fewest CPUs first (what is paid for), then the least memory.
     out.sort_by_key(|(c, per_cpu, _)| (*c, *per_cpu));
     out.into_iter().map(|(_, _, t)| t).collect()
@@ -562,9 +568,14 @@ mod tests {
         // Above 64 CPUs, each family's own sizes: 128 is c7a's (c8a has none), then 192; arm64 has no 7th-generation
         // size above 64, and none asks for a type that does not exist.
         let big = |l: &str| aws_instance_types(&Spec::parse(l, "superci").unwrap().unwrap());
-        assert_eq!(big("superci/cpu=128")[..3], ["m7a.32xlarge", "r7a.32xlarge", "m8a.48xlarge"].map(String::from));
+        // (r7a, with more memory than asked, only where no general family has the size: here m7a and m8i do.)
+        assert_eq!(big("superci/cpu=128")[..3], ["m7a.32xlarge", "m8i.32xlarge", "m8a.48xlarge"].map(String::from));
+        assert!(!big("superci/cpu=128").iter().any(|t| t == "r7a.32xlarge"), "{:?}", big("superci/cpu=128"));
+        // 64 CPUs and their memory: the general families, AMD's and Intel's, then compute ones large enough for the
+        // memory; no memory family beside them.
+        assert_eq!(big("superci/cpu=64"), ["m8a.16xlarge", "m7a.16xlarge", "m8i.16xlarge", "m7i.16xlarge", "c7a.32xlarge", "c8i.32xlarge", "c8a.48xlarge", "c7i.48xlarge"].map(String::from));
         assert_eq!(big("superci/cpu=128/family=c8a"), ["c8a.48xlarge"], "a family without the size: its next");
-        assert_eq!(big("superci/cpu=96/arch=arm64"), ["m8g.24xlarge", "r8g.24xlarge", "c8g.48xlarge"].map(String::from));
+        assert_eq!(big("superci/cpu=96/arch=arm64"), ["m8g.24xlarge", "c8g.48xlarge"].map(String::from));
         assert!(big("superci/cpu=192/scratch=localdisk").iter().all(|t| !t.starts_with("c6id") && !t.starts_with("m6id") && !t.starts_with("r6id")));
         assert_eq!((aws_type_cpus("c8a.48xlarge"), aws_type_cpus("c7a.32xlarge"), aws_type_cpus("m8g.large"), aws_type_cpus("c8a.metal-48xl"), aws_type_cpus("4cpu-12gb")), (Some(192), Some(128), Some(2), None, None));
         let t = aws_instance_types(&Spec { cpu: Some(8), ..Default::default() });

@@ -1058,7 +1058,22 @@ fn aws_machine(j: &serde_json::Value) -> Option<(String, String, String)> {
     };
     let market = if j["on_demand"] == true {
         match off_spot(j) { Some((why, _)) => format!("On-demand · {}", why.strip_prefix("On-demand: ").unwrap_or(&why)), None => "On-demand".to_string() }
-    } else if j["spot_again"] == true { "Spot · an on-demand machine did not fit your AWS account's on-demand limit".to_string() } else { "Spot".to_string() };
+    } else if j["spot_again"] == true { "Spot · an on-demand machine did not fit your AWS account's on-demand limit".to_string() } else {
+        // Why this one: its price, and the cheaper choice it was not, when that had no machine; and what was not asked
+        // for at all, priced over an on-demand machine.
+        let asks = j["asks"].as_array().cloned().unwrap_or_default();
+        let usd = |a: &serde_json::Value| a["usd"].as_f64().filter(|u| *u > 0.0);
+        let got = asks.iter().rev().find(|a| a["spot"] == true && a["said"] == "started").and_then(usd);
+        let first = asks.iter().find(|a| a["spot"] == true && a["said"] != "started" && a["pools"].as_u64().unwrap_or(0) == 0 && usd(a).is_some());
+        let mut said = vec!["Spot".to_string()];
+        if let Some(u) = got { said.push(format!("${u:.4} an hour")) }
+        if let (Some(f), Some(fu)) = (first, first.and_then(usd)) {
+            if got.is_none_or(|g| fu < g) { said.push(format!("its first choice, {} in {} at ${fu:.4}, had no machine", f["kind"].as_str().unwrap_or_default(), f["zone"].as_str().unwrap_or_default())) }
+        }
+        let out: Vec<&str> = j["priced_out"].as_array().into_iter().flatten().filter_map(|k| k.as_str()).collect();
+        if !out.is_empty() { said.push(format!("not asked, priced over an on-demand machine: {}", out.join(", "))) }
+        said.join(" · ")
+    };
     let region = j["region"].as_str().unwrap_or_default();
     let place = match (region, j["zone"].as_str().filter(|z| !z.is_empty())) {
         ("", _) => String::new(),
@@ -1812,14 +1827,17 @@ impl Dashboard {
         // Copying the image jobs run on into a region that lacks it: a press here (as `superci images create REGION`).
         let copy_into = |region: &str| format!(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="{}"><input type="hidden" name="region" value="{}"><input type="hidden" name="next"><button class="button secondary sm">Copy into {}</button></form>"#, esc(&account), esc(region), esc(&region_short(region)));
         // How the control plane in use starts machines in this account, by region: each of its AWS places (spot,
-        // on-demand) in its order there ("spot first", "spot when N. Virginia has none").
+        // on-demand) there: spot where a job costs least, the first favoured ("spot, favoured", "spot when cheaper");
+        // on-demand in its order ("on-demand first", "on-demand when N. Virginia has none").
         let mut in_use: Vec<(String, Vec<String>)> = vec![];
         if let Some(v) = v.filter(|v| v.aws_account().is_some_and(|(a, _)| a == account)) {
             for p in v.order().iter().filter(|p| !p.off && superci_core::plane::account_of(&p.cloud) == "aws") {
                 let what = if p.cloud == superci_core::plane::AWS_ON_DEMAND { "on-demand" } else { "spot" };
                 let regions = v.pool_regions(p);
                 for (i, r) in regions.iter().enumerate() {
-                    let said = if regions.len() == 1 { what.to_string() } else if i == 0 { format!("{what} first") } else { format!("{what} when {} has none", region_short(&regions[i - 1])) };
+                    // (Spot goes where a job costs least, the first favoured; on-demand in order.)
+                    let said = match (regions.len(), i, what) { (1, ..) => what.to_string(), (_, 0, "spot") => "spot, favoured".to_string(), (_, _, "spot") => "spot when cheaper".to_string(),
+                        (_, 0, _) => format!("{what} first"), _ => format!("{what} when {} has none", region_short(&regions[i - 1])) };
                     match in_use.iter_mut().find(|(x, _)| x == r) { Some((_, u)) => u.push(said), None => in_use.push((r.clone(), vec![said])) }
                 }
             }
@@ -5873,8 +5891,10 @@ fn regions_field(v: &PlaneView, p: &Pool, quotas: &HashMap<String, Result<u32>>,
             (n, None) => format!(" Your account may run up to {n} spot CPUs at once in these ({} of 4 CPU).", jobs_word(n / 4)),
         }
     };
-    let next = if spot { "when it has no spot machine left" } else { "when it has no room" };
-    format!(r#"<div class="field"><span>Regions</span><ol class="rg-list" data-regions>{rows}</ol><select class="rg-add" aria-label="Add a region" onchange="superciRegionAdd(this)"><option value="">+ Add a region…</option>{more}</select><small>Machines start in the first; {next}, in the next. Drag to reorder.{quota}{image_first}</small></div>"#)
+    // (Spot: where a job costs least, the first a little favoured. On-demand: in order.)
+    let how = if spot { "Spot machines start where a job costs least, the first region counted 15% cheaper (its cache is there); when one has no spot machine left, in the next." }
+        else { "Machines start in the first; when it has no room, in the next." };
+    format!(r#"<div class="field"><span>Regions</span><ol class="rg-list" data-regions>{rows}</ol><select class="rg-add" aria-label="Add a region" onchange="superciRegionAdd(this)"><option value="">+ Add a region…</option>{more}</select><small>{how} Drag to reorder.{quota}{image_first}</small></div>"#)
 }
 
 /// The places jobs go, in order: each starts a fresh runner per job; a job goes to the first that can run its machine
@@ -7688,8 +7708,8 @@ mod tests {
         let section = d.aws_account_section_for(Some(&view));
         preview("plane-aws-regions", &section);
         for said in [
-            r#"<li><span class="ar-name">N. Virginia<small>us-east-1</small></span><span class="ar-use">Spot first · on-demand</span><span class="ar-cpu">300 spot CPUs</span></li>"#,
-            r#"<li><span class="ar-name">Ohio<small>us-east-2</small></span><span class="ar-use">Spot when N. Virginia has none</span><span class="ar-cpu">32 spot CPUs</span></li>"#,
+            r#"<li><span class="ar-name">N. Virginia<small>us-east-1</small></span><span class="ar-use">Spot, favoured · on-demand</span><span class="ar-cpu">300 spot CPUs</span></li>"#,
+            r#"<li><span class="ar-name">Ohio<small>us-east-2</small></span><span class="ar-use">Spot when cheaper</span><span class="ar-cpu">32 spot CPUs</span></li>"#,
             r#"<span class="ar-use">Not used: the runner image is not here</span><span class="ar-cpu"></span><form method="post" action="/aws/image">"#,
             "<small>The other 8 are refused. By its AWS organization. AWS did not say for Frankfurt: Refresh asks again. <a href=\"https://superci.dev/docs/aws-accounts\"",
             "<dt>CPUs at once</dt><dd>332 spot · 192 on-demand<small>83 jobs of the default size at a time on spot, across N. Virginia, Ohio. On-demand: in N. Virginia.</small>",
@@ -7713,6 +7733,11 @@ mod tests {
         assert_eq!(aws_machine(&spot), Some(("r8a.16xlarge · 64 CPU · RAM disk".into(), "Spot".into(), "N. Virginia · us-east-1a".into())));
         let again = serde_json::json!({ "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "on_demand": true, "after_reclaim": true, "region": "us-east-2" });
         assert_eq!(aws_machine(&again), Some(("c8a.xlarge · 4 CPU".into(), "On-demand · run again after AWS took back its spot machine".into(), "Ohio · us-east-2".into())));
+        // Why this one: its price, the cheaper first choice that had no machine, and what was not asked for its price.
+        let why = serde_json::json!({ "cloud": "aws", "machine_type": "c8a.16xlarge", "cpu": 64, "region": "us-east-1", "zone": "us-east-1b", "priced_out": ["r7a.16xlarge"], "asks": [
+            { "kind": "m7a.16xlarge", "zone": "us-east-1a", "spot": true, "said": "InsufficientInstanceCapacity", "usd": 0.7339 },
+            { "kind": "c8a.16xlarge", "zone": "us-east-1b", "spot": true, "said": "started", "pools": 3, "usd": 0.9663 }] });
+        assert_eq!(aws_machine(&why).unwrap().1, "Spot · $0.9663 an hour · its first choice, m7a.16xlarge in us-east-1a at $0.7339, had no machine · not asked, priced over an on-demand machine: r7a.16xlarge");
         assert_eq!(aws_machine(&serde_json::json!({ "cloud": "aws" })), None);
         assert_eq!(aws_machine(&serde_json::json!({ "cloud": "cloudflare", "machine_type": "4cpu-12gb" })), None);
     }

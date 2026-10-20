@@ -201,7 +201,7 @@ impl Config {
             // RunsOn's public GitHub-compatible Ubuntu 24.04 image: its snapshot is warm, so machines start in seconds.
             image_owner: "135269210855".into(),
             image_name: "runs-on-v2.2-ubuntu24-full-x64-*".into(),
-            instance_types: vec!["c8a.xlarge".into(), "c7a.xlarge".into(), "m7a.xlarge".into()],
+            instance_types: ["c8a.xlarge", "m8a.xlarge", "c7a.xlarge", "m7a.xlarge", "c8i.xlarge", "m8i.xlarge", "c7i.xlarge", "m7i.xlarge"].map(String::from).to_vec(),
             machine: Spec::default(),
             secrets: Vec::new(),
         }
@@ -236,6 +236,8 @@ pub struct Cache {
     image: RefCell<HashMap<String, ((String, u32), u64)>>,
     /// Which of a set of machine types a region has, and until when that is taken as current.
     types: RefCell<HashMap<String, (Vec<String>, u64)>>,
+    /// What a job costs at least on spot in a region, for a set of types (see `spot_regions_by_cost`), and until when.
+    spot_best: RefCell<HashMap<String, (Option<f64>, u64)>>,
     /// What the GitHub App asks for and the GitLab token's scopes, and until when they are taken as current.
     app_permissions: RefCell<HashMap<u64, (serde_json::Value, u64)>>,
     /// Each App's address on GitHub as GitHub last said it (its owner may rename the App there).
@@ -310,6 +312,9 @@ pub struct Job {
     /// `MachineStart`) and given with it in the status, as `machine`.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub queued_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub asks: Vec<Ask>,
+    /// Machine types it could have had and was not asked for on spot: priced over an on-demand machine (see
+    /// `aws::Told::priced_out`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub priced_out: Vec<String>,
     /// How many times its start stopped with spot pools still to ask and went on with them a moment later (see
     /// `MORE_SPOT`); back to none once it has a machine.
     #[serde(default, skip_serializing_if = "is_zero")] pub spot_rounds: u32,
@@ -464,6 +469,10 @@ fn is_zero(n: &u32) -> bool { *n == 0 }
 
 /// Spot is paused for half an hour once AWS took back two machines within a quarter of an hour.
 const SPOT_PAUSE: (usize, u64, u64) = (2, 15 * 60_000, 30 * 60_000);
+
+/// How much cheaper the first of a place's spot regions counts when they are ranked by what a job costs (see
+/// `spot_regions_by_cost`): its cache and Docker layers are there, where another region reads them from afar.
+const HOME_FAVOUR: f64 = 0.15;
 
 /// The most an answer of the control plane's may be (bytes): AWS's function URLs answer 502 for one over six MB, and
 /// an AWS control plane hands its answers to Lambda in base64 (a third more), with their headers.
@@ -2173,6 +2182,32 @@ impl<'a> ControlPlane<'a> {
         if own.is_empty() { all } else { own }
     }
 
+    /// A place's spot regions, where a job costs least first (the spot price for the speed of the cheapest pool of
+    /// the types it may get there), the first of them counted `HOME_FAVOUR` cheaper. A region whose prices could not be
+    /// read goes after those whose could; the first keeps its place unless another's are known to be lower.
+    async fn spot_regions_by_cost(&self, a: &AwsConnection, place: &str, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<String> {
+        let regions = self.place_regions(a, place);
+        if regions.len() < 2 { return regions }
+        let mut scored = vec![];
+        for (i, r) in regions.iter().enumerate() {
+            // (Kept two minutes: a burst of jobs asks AWS once, and spot prices move by the hour.)
+            let key = format!("{r}/{os}/{}", types.join(","));
+            let kept = self.cache.spot_best.borrow().get(&key).filter(|(_, until)| *until > now).map(|(best, _)| *best);
+            let best = match kept {
+                Some(best) => best,
+                None => {
+                    let offered = self.offered(r, types, creds, now).await;
+                    let best = aws::cheapest_for_speed(self.http, r, creds, &offered, os, now).await;
+                    self.cache.spot_best.borrow_mut().insert(key, (best, now + 120_000));
+                    best
+                }
+            };
+            scored.push((match (i, best) { (0, Some(b)) => b * (1.0 - HOME_FAVOUR), (0, None) => 0.0, (_, Some(b)) => b, (_, None) => f64::MAX }, i, r.clone()));
+        }
+        scored.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        scored.into_iter().map(|(_, _, r)| r).collect()
+    }
+
     /// The current machine image in a region for a machine (Linux x64 or arm64, Linux with NVIDIA's drivers for GPUs,
     /// Windows), with its disk's size (looked up at most every six hours).
     async fn image(&self, region: &str, spec: &Spec, creds: &Credentials, now: u64) -> Result<(String, u32)> {
@@ -2966,7 +3001,9 @@ impl<'a> ControlPlane<'a> {
                         } else { user_data };
                         let mut launched = None;
                         // Its regions in order: the next when this one has no room (capacity or quota) for any of the types.
-                        for region in &self.place_regions(&a, &place) {
+                        // (Spot: the region where a job costs least first, the first counted a little cheaper.)
+                        let regions = if on_demand { self.place_regions(&a, &place) } else { self.spot_regions_by_cost(&a, &place, &types, spec.os(), &creds, now).await };
+                        for region in &regions {
                             if self.clock.now_ms().saturating_sub(began) > LAUNCH_BUDGET_MS { return Ok(Tried::OutOfTime) }
                             let said = |what: &str| format!("{region}{}: {what}", if on_demand { " on-demand" } else { "" });
                             let (image, image_gb) = match self.image(region, &spec, &creds, now).await { Ok(i) => i, Err(e) => { last = said(&e); continue } };
@@ -3025,6 +3062,7 @@ impl<'a> ControlPlane<'a> {
                             // Each request and its answer is kept with the job (the last two dozen).
                             let mut at = self.clock.now_ms().saturating_sub(job.at_ms).saturating_sub(told.asked.iter().map(|a| a.3).sum());
                             for (kind, zone, said, ms, pools, usd) in told.asked.drain(..) { job.asks.push(Ask { at, kind, zone, spot: !on_demand, said, ms, pools, usd }); at += ms }
+                            for kind in told.priced_out.drain(..) { if !job.priced_out.contains(&kind) { job.priced_out.push(kind) } }
                             if job.asks.len() > 24 { let over = job.asks.len() - 24; job.asks.drain(..over); }
                             // A zone AWS does not offer a type in is not asked for it again (for a day).
                             for (kind, zone, said) in &told.refused { if said == "Unsupported" && !zone.is_empty() { let _ = self.store.put(&unoffered_key(region, kind, zone), now.to_string()).await; } }

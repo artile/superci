@@ -331,6 +331,8 @@ fn machines_start_in_the_control_planes_own_network_cheapest_zone_first_else_the
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
     config.aws_regions = vec!["us-east-2".into()];
+    // (Three types, so that each pool's place in the order shows.)
+    config.instance_types = ["c8a.xlarge", "c7a.xlarge", "m7a.xlarge"].map(String::from).to_vec();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(webhook("queued", None)));
     let tried = launches(&clouds.0);
@@ -814,7 +816,7 @@ fn a_machine_type_the_region_does_not_have_is_not_asked_for_with_every_job() {
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
     (config.aws_own, config.aws_own_creds) = own_aws();
-    assert_eq!(config.instance_types, ["c8a.xlarge", "c7a.xlarge", "m7a.xlarge"]);
+    assert_eq!(config.instance_types, ["c8a.xlarge", "m8a.xlarge", "c7a.xlarge", "m7a.xlarge", "c8i.xlarge", "m8i.xlarge", "c7i.xlarge", "m7i.xlarge"]);
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(webhook("queued", None)));
     block_on(plane.handle(job_event("queued", 8, "acme/app", None)));
@@ -2652,10 +2654,12 @@ fn a_spot_machine_is_asked_for_where_it_costs_least_for_its_speed_and_never_wher
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     block_on(plane.handle(labelled("queued", 7, "acme/app", None, "superci/cpu=32")));
     let asked: Vec<(String, String)> = launches(&clouds.0).iter().filter(|l| field(l, "InstanceMarketOptions.MarketType") == "spot").map(|l| (field(l, "InstanceType").to_string(), field(l, "NetworkInterface.1.SubnetId").to_string())).collect();
-    // By the price for the speed: the newest at $0.60 is as $0.50 of the older; then the older ones by their price;
-    // the newest in its dearer zone ($0.80, as $0.667) before the older standard one at $0.70. Nothing in zone e.
-    assert_eq!(asked[..7], [("m8a.8xlarge", "subnet-a"), ("r7a.8xlarge", "subnet-a"), ("r7a.8xlarge", "subnet-b"), ("m8a.8xlarge", "subnet-b"), ("m7a.8xlarge", "subnet-a"), ("r8a.8xlarge", "subnet-a"), ("m7a.8xlarge", "subnet-b")]
+    // By the price for the speed: the newest at $0.60 is as $0.50 of the older; the newest in its dearer zone ($0.80,
+    // as $0.667) before the older one at $0.70. Nothing in zone e. The memory-heavy types are not asked: the general
+    // ones have the memory asked for with as many CPUs.
+    assert_eq!(asked[..4], [("m8a.8xlarge", "subnet-a"), ("m8a.8xlarge", "subnet-b"), ("m7a.8xlarge", "subnet-a"), ("m7a.8xlarge", "subnet-b")]
         .map(|(t, s)| (t.to_string(), s.to_string())), "{asked:?}");
+    assert!(!asked.iter().any(|(t, _)| t.starts_with('r')), "{asked:?}");
     // (After them, the larger types that would also fit, of which no price was known: in their own order.)
     assert!(asked.iter().all(|(t, subnet)| subnet != "subnet-e" || !prices.iter().any(|(p, ..)| p == t)), "{asked:?}");
 }
@@ -2760,6 +2764,8 @@ fn a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself()
     config.app = Some(app());
     config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     (config.aws_own, config.aws_own_creds) = own_aws();
+    // (The types it had then: the second, c7a, starts.)
+    config.instance_types = ["c8a.xlarge", "c7a.xlarge", "m7a.xlarge"].map(String::from).to_vec();
     let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
     store.0.borrow_mut().insert("plane_url".into(), format!("\"{PLANE_URL}\""));
@@ -5095,3 +5101,73 @@ fn a_fleet_refused_for_something_else_than_room_goes_on_with_the_pools_in_rounds
     assert_eq!(job(&store, 7)["state"].as_str(), Some("failed"));
 }
 
+
+/// A day's real prices for 64 CPUs (us-east-1, 20 October 2026): m7a the cheapest for a job, c8a close behind for its
+/// speed, m8a further off, r8a at nearly three times. The best pool alone has no machine: the request for many asks
+/// first only the pools within a quarter of what a job costs on it, so AWS, which weighs room before price, cannot
+/// pick r8a; the others come in a request of their own only when none of those has a machine. A pool priced over the
+/// cheapest type's on-demand price is not asked at all, and said.
+#[test]
+fn the_pools_asked_together_first_are_those_near_the_best_price_for_a_job_and_none_over_on_demand() {
+    use superci_core::aws::{run_instance, Launch, Told};
+    let (_, creds) = own_aws();
+    let creds = creds.unwrap();
+    let network = six_zones();
+    let tags = vec![("superci-plane".to_string(), PLANE_ID.to_string()), ("superci-job".to_string(), "7".to_string())];
+    let prices = [("m7a.16xlarge", "us-east-1a", 0.73), ("m7a.16xlarge", "us-east-1b", 0.80), ("c8a.16xlarge", "us-east-1a", 0.97), ("c8a.16xlarge", "us-east-1b", 1.00),
+        ("m8a.16xlarge", "us-east-1a", 1.13), ("r8a.16xlarge", "us-east-1a", 2.83), ("r8a.16xlarge", "us-east-1b", 2.90), ("r7a.16xlarge", "us-east-1a", 3.50)];
+    let none: &'static str = Box::leak(include_str!("fixtures/aws/fleet/none.xml").to_string().into_boxed_str());
+    let clouds = With(FakeClouds::default(), move |_: &Request, body: &str| {
+        let xml = |s: String| Some(Response::new(200, "text/xml", s));
+        if body.contains("Action=DescribeSpotPriceHistory") {
+            return xml(format!("<spotPriceHistorySet>{}</spotPriceHistorySet>", prices.iter().map(|(t, z, p)| format!("<item><instanceType>{t}</instanceType><availabilityZone>{z}</availabilityZone><spotPrice>{p}</spotPrice></item>")).collect::<String>()))
+        }
+        if body.contains("Action=RunInstances") { return Some(aws_refuses("InsufficientInstanceCapacity")) }
+        if body.contains("Action=CreateLaunchTemplate") { return xml(FLEET_TEMPLATE.to_string()) }
+        if body.contains("Action=CreateFleet") { return xml(none.to_string()) }
+        None
+    });
+    let types: Vec<String> = ["m7a.16xlarge", "c8a.16xlarge", "m8a.16xlarge", "r8a.16xlarge", "r7a.16xlarge"].map(String::from).to_vec();
+    let launch = Launch { region: "us-east-1", network: Some(&network), image: "ami-new", types: &types, user_data: "#!/bin/bash\n", disk_gb: 60, disk_mibs: 125, disk_iops: 3000, clock: Some(&FixedClock), skip: &[], tags: &tags,
+        spot: true, os: "linux", avoid: &[], timer: None, jitter_ms: 0, fleet: true, store_disk: None };
+    let mut told = Told::default();
+    let machine = block_on(run_instance(&clouds, &creds, &launch, 1_790_000_000_000, &mut told));
+    assert!(machine.is_err());
+    // The best for a job, by itself: m7a in zone a.
+    let alone = launches(&clouds.0);
+    assert_eq!((alone.len(), field(&alone[0], "InstanceType"), field(&alone[0], "NetworkInterface.1.SubnetId")), (1, "m7a.16xlarge".to_string(), "subnet-a".to_string()));
+    let fleets = calls_of(&clouds.0, "CreateFleet");
+    let pools = |f: &Vec<(String, String)>| f.iter().filter(|(n, _)| n.ends_with(".InstanceType")).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+    // Within a quarter of $0.73 a job: m7a in zone b ($0.80), c8a in both ($0.97 and $1.00, as $0.81 and $0.83 for its
+    // speed). Then the rest that is priced: m8a ($1.13, as $0.94) and r8a. r7a costs more than c8a would on-demand.
+    assert_eq!(pools(&fleets[0]), ["m7a.16xlarge", "c8a.16xlarge", "c8a.16xlarge"], "{fleets:?}");
+    assert_eq!(pools(&fleets[1])[..3], ["m8a.16xlarge", "r8a.16xlarge", "r8a.16xlarge"], "{fleets:?}");
+    assert!(fleets.iter().all(|f| !pools(f).iter().any(|t| t == "r7a.16xlarge")), "{fleets:?}");
+    assert_eq!(told.priced_out, ["r7a.16xlarge"]);
+}
+
+/// Two regions for spot machines: a job's machine is asked for first where it costs least, the first region counted
+/// 15% cheaper (its cache is there). Ohio at 60% of N. Virginia's price is asked first; at 90%, N. Virginia still is.
+#[test]
+fn spot_goes_first_to_the_region_where_a_job_costs_least_with_the_first_favoured() {
+    for (ohio, first) in [(0.6, "us-east-2"), (0.9, "us-east-1")] {
+        let clouds = With(FakeClouds::default(), move |r: &Request, body: &str| {
+            if !body.contains("Action=DescribeSpotPriceHistory") { return None }
+            let (region, zones) = if r.url.contains("us-east-2") { ("us-east-2", ["a", "b"]) } else { ("us-east-1", ["a", "b"]) };
+            let price = if region == "us-east-2" { 0.10 * ohio } else { 0.10 };
+            let items = ["c8a.xlarge", "m8a.xlarge"].iter().flat_map(|t| zones.map(|z| format!("<item><instanceType>{t}</instanceType><availabilityZone>{region}{z}</availabilityZone><spotPrice>{price}</spotPrice></item>"))).collect::<String>();
+            Some(Response::new(200, "text/xml", format!("<spotPriceHistorySet>{items}</spotPriceHistorySet>")))
+        });
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
+        config.instance_types = ["c8a.xlarge", "m8a.xlarge"].map(String::from).to_vec();
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(webhook("queued", None)));
+        let asked: Vec<String> = clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances")).map(|c| c.1.clone()).collect();
+        assert!(asked.first().is_some_and(|url| url.contains(first)), "Ohio at {ohio}: {asked:?}");
+        assert_eq!(job(&store, 7)["region"].as_str(), Some(first), "Ohio at {ohio}");
+    }
+}

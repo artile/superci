@@ -310,7 +310,9 @@ pub struct Told { pub refused: Vec<(String, String, String)>, pub throttled: u32
     pub fleet_refused: Option<String>,
     /// The launch template made for a request for many pools (see `fleet`), its one use over: to be removed by
     /// whoever asked (`delete_template`), once that is in nobody's way.
-    pub template_left: Option<String> }
+    pub template_left: Option<String>,
+    /// Machine types not asked for on spot: priced over what the cheapest of them costs on-demand.
+    pub priced_out: Vec<String> }
 
 /// The lowest current spot price (USD per hour) for a machine type in a region, across its zones.
 /// The price now in one zone (`zone`), or the lowest across the region's zones.
@@ -374,6 +376,14 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         let order = |t: &String| l.types.iter().position(|x| x == t).unwrap_or(usize::MAX);
         pools.sort_by(|(at, ap), (bt, bp)| worth(at, &zone_of(ap)).total_cmp(&worth(bt, &zone_of(bp))).then(order(at).cmp(&order(bt))).then(zone_of(ap).cmp(&zone_of(bp))));
         pools.sort_by_key(|(t, p)| { let z = zone_of(p); l.avoid.iter().any(|(at, az)| at == *t && *az == z) });
+        // Never more than the cheapest of these types costs on-demand: spot is for paying less, and a job is better
+        // off on an on-demand machine than on a spot one priced over it.
+        let cap = l.types.iter().filter_map(|t| on_demand_estimate(t)).fold(f64::MAX, f64::min);
+        let over = |t: &String, p: &(Option<&(String, String)>, Option<String>)| prices.get(&(t.clone(), zone_of(p))).is_some_and(|usd| *usd > cap);
+        for (t, p) in &pools { if over(t, p) && !told.priced_out.contains(*t) { told.priced_out.push((*t).clone()) } }
+        let before = pools.len();
+        pools.retain(|(t, p)| !over(t, p));
+        if pools.is_empty() && before > 0 { return Err(format!("InsufficientInstanceCapacity: every spot pool cost more than an on-demand machine (${cap:.3} an hour)")) }
     }
     // Not the pools that are not to be asked (see `Launch::skip`); with none left, that is no room, said as AWS says it.
     let all = pools.len();
@@ -388,15 +398,22 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         // room in. With few left, one by one is as quick.
         if at == 1 && l.spot && l.fleet && pools.len() - at >= FLEET_FROM {
             let rest: Vec<(String, Option<String>, String)> = pools[at..].iter().take(FLEET_MOST).map(|(t, p)| ((*t).clone(), p.0.map(|(_, id)| id.clone()), zone_of(*p))).collect();
-            // AWS goes by price and room, not speed or size, and a job is over sooner on a newer type and costs less
-            // on the size it asked for: the pools of that size and as fast as the first choice are asked first; then
-            // the slower ones of that size; larger sizes only when no pool of the size asked for has a machine (each
-            // a request of its own).
+            // AWS weighs a pool's room before its price, so it is asked first only among the pools within `BAND` of
+            // what a job costs on the best one (price for the speed; a larger size costs more, so it is out of the
+            // band unless it is a bargain); then the others priced. (Asked for all at once, AWS took r8a at three
+            // times what m7a would have cost.) Those with no price known come last, by what they are: as fast as the
+            // first choice and of its size first, then the slower ones of that size, then larger sizes.
+            let worth = |kind: &str, zone: &str| prices.get(&(kind.to_string(), zone.to_string())).map(|p| p / speed(kind));
+            let best = worth(pools[0].0, &zone_of(pools[0].1)).unwrap_or(f64::MAX);
             let (first, size) = (speed(pools[0].0), cpus(pools[0].0));
-            let tier = |kind: &str| (cpus(kind) > size) as u8 * 2 + (speed(kind) < first - 0.001) as u8;
+            let tier = |kind: &str, zone: &str| match worth(kind, zone) {
+                Some(w) if w <= best * BAND => 0u8,
+                Some(_) => 1,
+                None => 2 + (cpus(kind) > size) as u8 * 2 + (speed(kind) < first - 0.001) as u8,
+            };
             let mut groups: Vec<Vec<(String, Option<String>, String)>> = vec![];
-            for t in 0..4u8 {
-                let group: Vec<_> = rest.iter().filter(|(kind, ..)| tier(kind) == t).cloned().collect();
+            for t in 0..6u8 {
+                let group: Vec<_> = rest.iter().filter(|(kind, _, zone)| tier(kind, zone) == t).cloned().collect();
                 if !group.is_empty() { groups.push(group) }
             }
             match fleet(http, creds, l, &groups, now_ms, told).await {
@@ -452,6 +469,18 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
         }
     }
     Err(last)
+}
+
+/// How much more a job may cost on a spot pool than on the best one for it to be asked with the first request for
+/// many pools (see `run_instance`): a quarter.
+pub const BAND: f64 = 1.25;
+
+/// What a machine type costs on-demand, about (by its CPUs and its family's memory for each; see
+/// `on_demand_usd_per_hour`). None: a family not known here.
+pub fn on_demand_estimate(kind: &str) -> Option<f64> {
+    let per_cpu = crate::spec::FAMILIES.iter().find(|(f, _)| *f == kind.split('.').next().unwrap_or_default())?.1;
+    let cpu = cpus(kind);
+    (cpu > 0).then(|| on_demand_usd_per_hour(cpu, cpu * per_cpu))
 }
 
 /// With so many spot pools left after the first has no machine, they are asked in one request (see `fleet`).
@@ -589,11 +618,21 @@ pub fn cpus(kind: &str) -> u32 {
 /// costs, not what an hour costs: a job on a faster machine is over sooner. Each generation of a family is taken
 /// as a fifth faster than the last (AWS says "up to 30%" of M8a over M7a, and of Graviton4 over Graviton3; a job is
 /// rarely all CPU). By the number in the family's name: `m8a` 8, `c7g` 7, `m6id` 6. Only among the families a
-/// job's CPUs come from (c, m, r): a GPU family's number says which GPU it has, not how new it is.
+/// job's CPUs come from (c, m, r): a GPU family's number says which GPU it has, not how new it is. An Intel family
+/// (`c7i`, `m8i`, `c6id`) counts a quarter slower: each of its CPUs is half a core (hyperthreading), where AMD's
+/// (from the 7th generation) and Graviton's are a whole one.
 pub fn speed(kind: &str) -> f64 {
     if !kind.starts_with(['c', 'm', 'r']) { return 1.0 }
     let generation = kind.chars().find(|c| c.is_ascii_digit()).and_then(|c| c.to_digit(10)).unwrap_or(7) as i32;
-    1.2f64.powi(generation - 7)
+    let family = kind.split('.').next().unwrap_or_default();
+    let intel = family.trim_start_matches(|c: char| c.is_ascii_alphabetic()).trim_start_matches(|c: char| c.is_ascii_digit()).starts_with('i');
+    1.2f64.powi(generation - 7) * if intel { 0.75 } else { 1.0 }
+}
+
+/// What a job costs at least on spot in a region, as a spot price for the speed (see `speed`): of these machine types,
+/// in any of its zones. None: no price known there.
+pub async fn cheapest_for_speed(http: &dyn Http, region: &str, creds: &Credentials, types: &[String], os: &str, now_ms: u64) -> Option<f64> {
+    spot_prices(http, region, creds, types, os, now_ms).await.ok()?.into_iter().filter(|((t, _), _)| types.contains(t)).map(|((t, _), p)| p / speed(&t)).reduce(f64::min)
 }
 
 /// The spot price now of each of these machine types in each of a region's zones, by (type, zone). One request.
