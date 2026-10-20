@@ -8670,6 +8670,35 @@ fn a_regions_network_is_deleted_once_aws_no_longer_lists_the_machines_it_ended()
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A run from a computer whose later job waits for room past the day its run's records are kept: once there is room,
+/// no machine is started for a job there is nothing left of for its runner to take; the job fails saying so.
+#[test]
+fn a_run_from_a_computers_job_still_waiting_when_its_runs_records_go_gets_no_machine_and_fails_saying_why() {
+    let served = serve(|_| {});
+    let wf = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo a\n  b:\n    needs: a\n    runs-on: superci\n    steps:\n      - run: echo b\n";
+    let body = serde_json::json!({ "workflow": wf, "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main" });
+    let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send(body.to_string()).unwrap();
+    let said: serde_json::Value = r.body_mut().read_json().unwrap();
+    let run = said["run_id"].as_str().unwrap_or_else(|| panic!("{said}")).to_string();
+    let a = superci_testkit::Runner::of_job(&served, &run, "a").expect("a's runner");
+    assert_eq!(a.take(), 200);
+    // a ends most of a day on; b finds no room for its machine, and waits.
+    served.later(20 * 3_600_000);
+    served.machines_refuse(Some("no room"));
+    assert_eq!(a.finish("succeeded"), 200);
+    let b = || served.store.under("job:").into_iter().map(|(_, j)| j).find(|j| j["name"] == "b").expect("b's job");
+    assert!(b()["state"] == "waiting", "{}", b());
+    // The run's day is over: what it kept goes, b still waiting.
+    served.later(5 * 3_600_000);
+    served.upkeep();
+    assert!(served.store.under(&format!("run:{run}")).is_empty() && served.store.under("rjob:").is_empty() && b()["state"] == "waiting", "{}", b());
+    // Room again: no machine for b.
+    served.machines_refuse(None);
+    let machines = served.machines.0.lock().unwrap().len();
+    served.upkeep();
+    assert!(b()["state"] == "failed" && b()["error"].as_str().unwrap_or_default().contains("kept a day") && served.machines.0.lock().unwrap().len() == machines, "{}", b());
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

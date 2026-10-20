@@ -2837,11 +2837,18 @@ impl<'a> ControlPlane<'a> {
             let work = if job.provider == "local" {
                 // A run from a computer: its runner takes the job from this control plane, at its own address.
                 let token = job.local.clone().ok_or("a run from a computer without its address")?;
+                // (What its run kept goes after a day: a job still waiting then has nothing for a runner to take, and
+                // gets no machine. Not tried again.)
+                let Some(mut handed) = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await? else {
+                    job.cloud = String::new();
+                    return Err("its run from a computer is gone: what a run keeps is kept a day".into())
+                };
                 let jit = crate::runner_service::jit_config(&format!("{plane_url}/runner/{token}"), &name)?;
                 job.runner = Some(name.clone());
                 self.keep(&key, &*job).await?;
                 self.store.put_until(&format!("runner:{name}"), job.job_id.to_string(), self.clock.now_ms() + RUNNER_KEPT_MS).await?;
-                if let Some(mut handed) = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await? { handed.runner = name.clone(); put_json(self.store, &format!("rjob:{token}"), &handed).await? }
+                handed.runner = name.clone();
+                put_json(self.store, &format!("rjob:{token}"), &handed).await?;
                 Work::GitHub { jit }
             } else if gitlab {
                 let gl = self.gitlab_of(job).ok_or("its GitLab is not connected any more")?;
