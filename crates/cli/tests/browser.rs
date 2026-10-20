@@ -6892,6 +6892,70 @@ fn a_launch_template_left_by_a_request_for_many_pools_is_removed_after_the_answe
     assert_eq!(templates(), 1, "{:?}", served.store.under("aws:template:"));
 }
 
+/// AWS jobs as the order and AWS's answers have them: spot machines in the regions the order gives them; spot
+/// machines paused after AWS took two back, but the only place in the order, so a spot machine all the same; a pool
+/// AWS does not offer said without its zone, not noted, and a machine given of a family with its own disk that
+/// SuperCI does not know, its files not put there; the job's record changed by another request between two places.
+#[test]
+fn aws_jobs_go_by_the_orders_regions_spot_alone_paused_or_not_unknown_families_and_what_aws_said_of_each_pool() {
+    let served = aws_plane(r#"{"order":[{"cloud":"aws","max_jobs":100,"regions":["us-east-1"]},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    let started = aws_started();
+    served.aws.fail("RunInstances", 200, &started, Some(1));
+    let j = aws_job(&served, "regions", "superci");
+    assert!(j["state"] == "launched" && j["region"] == "us-east-1", "{j}");
+    // Two machines taken back lately: spot is paused, but AWS's spot machines are the only place.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]}"#);
+    let now = served.now_ms();
+    for (n, at) in [(1, now - 60_000), (2, now - 30_000)] { served.store.0.lock().unwrap().insert(format!("spot:interrupted:{at}:{n}"), at.to_string()); }
+    served.aws.fail("RunInstances", 200, &started, Some(1));
+    let j = aws_job(&served, "paused", "superci");
+    assert!(j["state"] == "launched" && j["on_demand"] != true, "{j}");
+    served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("spot:interrupted:"));
+    // Many pools asked at once, one of them not offered by AWS (no zone said), a machine given by another.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.later(700_000);
+    served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:") && k != "aws:no-fleet");
+    let full = superci_testkit::ec2_error("InsufficientInstanceCapacity", "We currently do not have sufficient capacity in the Availability Zone you requested.");
+    served.aws.fail("RunInstances", 400, &full, Some(1));
+    served.aws.fail("CreateFleet", 200, "<CreateFleetResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><fleetId>fleet-0123456789abcdef0</fleetId><errorSet><item><errorCode>Unsupported</errorCode><errorMessage>Not offered.</errorMessage><launchTemplateAndOverrides><overrides><instanceType>c7a.xlarge</instanceType></overrides></launchTemplateAndOverrides></item></errorSet><fleetInstanceSet><item><instanceIds><item>i-0123456789abcdef0</item></instanceIds><instanceType>z1d.large</instanceType><lifecycle>spot</lifecycle></item></fleetInstanceSet></CreateFleetResponse>", Some(1));
+    let (id, q) = served.github.queue("fleet", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let j = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(j["machine_id"] == "i-0123456789abcdef0" && j["machine_type"] == "z1d.large" && j["local_disk"] != true && served.store.under("aws:unoffered:").is_empty(), "{j} {:?}", served.store.under("aws:unoffered:"));
+    // The record changed by another request while AWS was asked for a spot machine: the next place is still tried.
+    served.aws.fail_none();
+    served.later(700_000);
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served.aws.fail("RunInstances|MarketType=spot", 400, &superci_testkit::ec2_error("InvalidParameterCombination", "Spot is not offered for this request."), None);
+    served.aws.fail("RunInstances", 200, &started, None);
+    let store = served.store.clone();
+    served.aws.during("RunInstances", move || {
+        let mut m = store.0.lock().unwrap();
+        let launching: Vec<(String, serde_json::Value)> = m.iter().filter(|(k, _)| k.starts_with("job:")).filter_map(|(k, v)| Some((k.clone(), serde_json::from_str::<serde_json::Value>(v).ok()?))).filter(|(_, j)| j["state"] == "launching").collect();
+        for (k, mut j) in launching { j["rev"] = (j["rev"].as_u64().unwrap_or(0) + 1).into(); j["began"] = true.into(); m.insert(k, j.to_string()); }
+    });
+    let (id, q) = served.github.queue("meanwhile", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let j = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(j["state"] == "launched" && j["on_demand"] == true && j["began"] == true, "{j}");
+}
+
+/// A job whose first place refuses it as it would any job (Modal: no GPUs without a payment method) and whose next,
+/// AWS's on-demand machines, fails otherwise: both said, AWS's not taken for the first's.
+#[test]
+fn a_job_its_first_place_refuses_and_aws_fails_otherwise_says_both() {
+    let served = aws_plane(r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws-on-demand"},{"cloud":"aws","off":true}]}"#);
+    served.machines_refuse(Some("Modal refused: GPUs need a payment method on the workspace"));
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("InvalidParameterValue", "The machine image is not valid."), None);
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let j = served.store.under(&format!("job:{id}"))[0].1.clone();
+    let said = j["error"].as_str().unwrap_or_default();
+    assert!(said.contains("Modal refused") && said.contains("InvalidParameterValue"), "{j}");
+    served.machines_refuse(None);
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
@@ -12038,6 +12102,48 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         assert!(!ok && said.contains("The working tree was not sent (the control plane said 500 to the working tree's end: not now)") && said.contains("was cancelled"), "{said}");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A job started again after AWS took back its spot machine is a new attempt of it: an artifact its first attempt
+    /// began is begun anew by it (as GitHub lets a new attempt keep its artifacts anew), where its first attempt could
+    /// not begin it twice.
+    #[test]
+    fn an_artifact_a_job_began_before_aws_took_back_its_machine_is_begun_anew_by_the_job_started_again() {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+            c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+        });
+        let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+        served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+        let dir = checkout();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        let first = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        let token_of = |r: &Runner| r.handed(&served)["resources"]["endpoints"][0]["authorization"]["parameters"]["AccessToken"].as_str().unwrap().to_string();
+        let machine = served.machines.0.lock().unwrap()[0].clone();
+        let link = "machine-cache-link-000000000002";
+        served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": machine }).to_string());
+        let begin = |token: &str| { let (s, _, b) = http("POST", &format!("{}/cache/{link}/artifact-begin", served.url), serde_json::json!({ "token": token, "name": "report" }).to_string().as_bytes()); (s, serde_json::from_slice::<serde_json::Value>(&b).unwrap_or_default()) };
+        let token = token_of(&first);
+        assert_eq!(begin(&token).1["ok"], true);
+        assert_eq!(begin(&token).0, 409, "the same attempt, twice");
+        // AWS takes its spot machine back; the job is started again.
+        first.take();
+        let key = served.store.under("job:").into_iter().map(|(k, _)| k).next().unwrap();
+        { let mut m = served.store.0.lock().unwrap(); let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap(); j["interrupted"] = true.into(); m.insert(key.clone(), j.to_string()); }
+        first.finish("failed");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let again = loop {
+            if let Some(r) = Runner::of_run(&served, &run).filter(|r| r.at != first.at) { break r }
+            assert!(std::time::Instant::now() < end, "not started again");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let (status, said) = begin(&token_of(&again));
+        assert!(status == 200 && said["ok"] == true, "{status} {said}");
+        let kept = served.store.under("artifact:").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+        assert!(kept.iter().any(|v| v["by"][0].as_str().is_some_and(|id| !key.ends_with(id))), "{kept:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

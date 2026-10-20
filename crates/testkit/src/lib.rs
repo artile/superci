@@ -49,12 +49,16 @@ impl Shared {
 }
 
 
-/// Machines: each starts at once, its runner given to the test to play (see `Runner`).
+/// Machines: each starts at once, its runner given to the test to play (see `Runner`); or, while the cloud refuses
+/// them (`Served::machines_refuse`), none, with what it said.
 #[derive(Clone, Default)]
-pub struct Machines(pub Arc<Mutex<Vec<String>>>);
+pub struct Machines(pub Arc<Mutex<Vec<String>>>, pub Arc<Mutex<Option<String>>>);
 #[async_trait(?Send)]
 impl Containers for Machines {
-    async fn start(&self, name: &str, _work: &Work, _max_minutes: u32, _size: superci_core::spec::Size) -> io::Result<String> { self.0.lock().unwrap().push(name.to_string()); Ok(format!("machine-{name}")) }
+    async fn start(&self, name: &str, _work: &Work, _max_minutes: u32, _size: superci_core::spec::Size) -> io::Result<String> {
+        if let Some(said) = self.1.lock().unwrap().clone() { return Err(said) }
+        self.0.lock().unwrap().push(name.to_string()); Ok(format!("machine-{name}"))
+    }
     async fn stop(&self, _id: &str) -> io::Result<()> { Ok(()) }
 }
 
@@ -916,4 +920,9 @@ impl Served {
         let _ = s.read_to_string(&mut out);
         out.split_once("\r\n\r\n").and_then(|(_, b)| serde_json::from_str::<Vec<Value>>(b).ok()).unwrap_or_default()
     }
+}
+
+impl Served {
+    /// Its own machines refused from now on, with what their cloud said (Modal's refusal, say); `None`: started again.
+    pub fn machines_refuse(&self, said: Option<&str>) { *self.machines.1.lock().unwrap() = said.map(str::to_string) }
 }
