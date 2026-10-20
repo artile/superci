@@ -127,7 +127,7 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
                 "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 60, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
                 "Tags": { "superci-plane": plane_id } }))) {
                 Ok(_) => { last.clear(); break }
-                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; std::thread::sleep(Duration::from_secs(3 + attempt)) }
+                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; crate::aws::pause((3 + attempt) * 1000) }
                 Err(e) => return Err(e),
             }
         }
@@ -184,7 +184,7 @@ fn deploy_converter(a: &Api, account_id: &str, region: &str, plane_id: &str, zip
         for attempt in 0..12 {
             match a.lambda("POST", "/2015-03-31/functions", Some(create.clone())) {
                 Ok(_) => { last.clear(); break }
-                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; std::thread::sleep(Duration::from_secs(3 + attempt)) }
+                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; crate::aws::pause((3 + attempt) * 1000) }
                 Err(e) => return Err(e),
             }
         }

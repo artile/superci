@@ -74,6 +74,14 @@ fn to_stand_in(mut r: Request) -> Request {
 /// An outside address, or (in a debug build with `SUPERCI_STAND_IN`) the stand-in's for it.
 pub fn stand_in(url: &str) -> String { superci_core::io::stand_in(url) }
 
+/// Waits `ms` before asking a cloud again what it may answer otherwise in a moment (a role just made, an image being
+/// prepared). In a debug build with `SUPERCI_PAUSE_MS=N`, N milliseconds instead: the tests', whose answers are in hand.
+pub fn pause(ms: u64) {
+    #[cfg(debug_assertions)]
+    let ms = std::env::var("SUPERCI_PAUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(ms);
+    std::thread::sleep(std::time::Duration::from_millis(ms))
+}
+
 /// How an error starts when AWS says a sign-in is over (see `Session::credentials`).
 pub const ENDED: &str = "Your AWS sign-in has ended";
 

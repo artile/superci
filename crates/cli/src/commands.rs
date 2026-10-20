@@ -856,7 +856,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let plane_id = view(&mut d)?.plane.plane_id().to_string();
             let (account, creds) = d.aws_account(args.get("account").unwrap_or_default())?;
             let http = crate::aws::Blocking::new();
-            let b = crate::aws_budget::Budgets { http: &http, creds: &creds, account: &account, plane_id: &plane_id, pause: &|ms| std::thread::sleep(std::time::Duration::from_millis(ms)) };
+            let b = crate::aws_budget::Budgets { http: &http, creds: &creds, account: &account, plane_id: &plane_id, pause: &crate::aws::pause };
             let said = match w(2) {
                 "set" => b.set(w(3).parse().map_err(|_| "set USD EMAIL [stop]")?, Some(w(4)).filter(|e| !e.is_empty()), w(5) == "stop").map(|_| "set".to_string()),
                 "lift" => b.lift(w(3) == "again").map(|_| "lifted".to_string()),
