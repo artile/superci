@@ -2334,6 +2334,207 @@ fn a_modal_control_plane_deleted_beside_the_one_in_use_takes_its_aws_network_and
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A Modal control plane from before its settings' new names updated, as Modal answered a real update: its old names
+/// taken out by name; and AWS's runners it has, in an account not signed in to, then in the one signed in to but not
+/// connected, given nothing more in AWS.
+#[test]
+fn a_modal_control_plane_from_before_the_new_names_is_updated_and_its_aws_runners_given_nothing_unless_connected() {
+    let served = serve(|_| {});
+    let aws = served.aws.clone();
+    let md = superci_testkit::serve_as("mdplane00003", move |c| { c.read_settings(&aws.modal_plane_settings()); c.own_cloud = "modal".into(); c.containers = false; });
+    served.aws.modal_settings.lock().unwrap().insert("DEVICE_KEY_4102444800_TEST".into(), served.key.clone());
+    // (It says it is of a version from before the new names, and AWS runners in an account, as set below.)
+    let runners = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+    let r = runners.clone();
+    let front = superci_testkit::front(&md.url, move |method, target, status, body| {
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return (status, body) };
+        match (method, target.split('?').next().unwrap_or_default()) {
+            ("GET", "/health") => v["version"] = "0.19.0".into(),
+            ("GET", "/status") => v["aws"] = r.lock().unwrap().clone(),
+            _ => return (status, body),
+        }
+        (status, v.to_string().into_bytes())
+    });
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00003.modal.run".into(), front);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    k["planes_more"] = serde_json::json!([{ "Modal": { "workspace": "acmeorg", "url": "https://acmeorg--superci-plane-mdplane00003.modal.run", "plane_id": "mdplane00003", "label": "superci" } }]);
+    k["key"]["planes"] = serde_json::json!([PLANE, "mdplane00003"]);
+    std::fs::write(&file, k.to_string()).unwrap();
+    served.aws.replaying(&std::fs::read_to_string(format!("{}/fixtures/update/06-update-md.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    until("both listed", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Modal · acmeorg"));
+    for aws in [serde_json::json!({ "account_id": "222222222222", "region": "us-east-1", "connected": true }), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "connected": false })] {
+        *runners.lock().unwrap() = aws.clone();
+        let (status, to, said) = common::post(&link, "/plane/update?c=mdplane00003", &[("plane", "mdplane00003")]);
+        assert!(status == 303, "{aws}: {status} {to} {}", common::words(&said));
+        until("updated", || { let p = common::words(&common::part(&link, "/?p=planes&c=mdplane00003&fragment=1").1); p.contains("Restarting with") || p.contains("Updated to") });
+    }
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.contains("superci-runner") && s.contains("PutRolePolicy"))), "nothing given in AWS");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Cloudflare control plane given its own containers, as Cloudflare answered a real one, that takes a moment to
+/// say so (without them first, then still with the launcher from before): waited for until it says both.
+#[test]
+fn a_cloudflare_control_plane_given_its_containers_is_waited_for_until_it_has_them_and_no_launcher() {
+    let account = superci_testkit::Aws::serve();
+    let acct = account.clone();
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| {
+        let settings = acct.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00003/CONTAINERS");
+    let looks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n = looks.clone();
+    let front = superci_testkit::front(&cf.url, move |method, target, status, body| {
+        if method != "GET" || target != "/status?light=1" { return (status, body) }
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return (status, body) };
+        match n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => v["containers"] = false.into(),
+            1 => v["launchers"] = serde_json::json!([{ "cloud": "cloudflare", "url": "https://superci-runners-cfplane00003.acme.workers.dev" }]),
+            _ => {}
+        }
+        (status, v.to_string().into_bytes())
+    });
+    account.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), front);
+    account.replaying(&std::fs::read_to_string(format!("{}/fixtures/update/03-cf-containers.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    let home = common::temp("cf-containers");
+    std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), serde_json::json!({
+        "key": { "name": "DEVICE_KEY_4102444800_TEST", "value": cf.key, "planes": ["cfplane00003"] },
+        "plane": { "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": "https://superci.acme.workers.dev", "plane_id": "cfplane00003", "label": "superci" } },
+        "cloudflare": { "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" },
+    }).to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    until("its runners", || common::words(&common::part(&link, "/?p=add-runners&fragment=1").1).contains("Cloudflare"));
+    let (status, to, said) = common::post(&link, "/runners/cloudflare", &[]);
+    assert!(status == 303, "{status} {to} {}", common::words(&said));
+    assert!(looks.load(std::sync::atomic::Ordering::SeqCst) >= 3, "{}", looks.load(std::sync::atomic::Ordering::SeqCst));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A move from a control plane whose export is not what one makes (a malicious or broken one: its routing no object,
+/// an App without an id, a GitLab connection whose id cannot be one, a setting that is no secret's): none of that is
+/// written into the new one; a further App it does give is waited for there, the first App being none. Afterwards
+/// the old one's page (named) still shows the new one, moved to.
+#[test]
+fn a_move_from_a_control_plane_whose_export_is_not_one_it_makes_carries_only_what_can_be_its_own() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let mut other = superci_testkit::GitHub::app();
+    other["id"] = 7.into();
+    other["owner"] = "other-org".into();
+    let given = other.clone();
+    let old = superci_testkit::front(&served.url, move |method, target, status, body| {
+        if method != "POST" || !target.starts_with("/move/export") || status != 200 { return (status, body) }
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return (status, body) };
+        v["routing"] = "not an object".into();
+        v["more_apps"] = serde_json::json!([given, { "slug": "an-app-without-an-id" }]);
+        v["more_gitlabs"] = serde_json::json!([{ "id": "Not An Id!", "url": "https://gitlab.example.com" }]);
+        v["secrets"] = serde_json::json!([["NOT_A_SECRET", "{\"value\":\"v\"}"]]);
+        (status, v.to_string().into_bytes())
+    });
+    *served.aws.plane_url.lock().unwrap() = old.clone();
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let home = signed_in(&served);
+    common::kept_at(&home, &old);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_MOVE_PAUSE_MS", "50")]);
+    until("both listed", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&new.url));
+    // Once its state is in: its status without its further Apps, a moment.
+    new.then_answer("/move/import", &[("/status", &["apps"])]);
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    until("the move over", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Moved"));
+    let names: Vec<String> = served.aws.settings("testplane0002").into_iter().map(|(k, _)| k).collect();
+    assert!(names.iter().any(|k| k == "GITHUB_APP_7") && !names.iter().any(|k| k.starts_with("GITLAB_") || k == "NOT_A_SECRET") && new.answers_to_come() == 0, "{names:?}");
+    let page = common::words(&common::part(&link, "/?p=planes&c=testplane0001&fragment=1").1);
+    assert!(page.contains(&new.url), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A move to a control plane that, a moment after the old one's App is written as its first, still lists that App
+/// among its further ones (as before it took the change): that one is not taken for an App the old one no longer
+/// has, and is not removed.
+#[test]
+fn a_move_does_not_remove_the_old_ones_app_from_a_new_control_plane_that_lists_it_late() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let first = superci_testkit::GitHub::app();
+    // A further App of its own, another organization's (it serves no code host itself).
+    let mut its = superci_testkit::GitHub::app();
+    (its["id"], its["owner"]) = (1000.into(), "other-org".into());
+    served.aws.put("/superci/testplane0002/GITHUB_APP_1000", &its.to_string());
+    // (Its first status after the App is written: from before it, the old one's App listed after that one.)
+    let late = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let l = late.clone();
+    served.aws.during("AmazonSSM.PutParameter|testplane0002/GITHUB_APP\"", move || l.store(true, std::sync::atomic::Ordering::SeqCst));
+    let (l, id) = (late.clone(), first["id"].clone());
+    let at = superci_testkit::front(&new.url, move |method, target, status, body| {
+        if method != "GET" || target != "/status" || !l.swap(false, std::sync::atomic::Ordering::SeqCst) { return (status, body) }
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return (status, body) };
+        v["apps"] = serde_json::json!([{ "id": 1000, "owner": "other-org" }, { "id": id, "owner": "acme" }]);
+        (status, v.to_string().into_bytes())
+    });
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": at, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &at)]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_MOVE_PAUSE_MS", "50")]);
+    until("both listed", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&at));
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    until("moved", || !served.store.under("moved_to").is_empty());
+    let asked = served.aws.asked.lock().unwrap().iter().filter(|a| a["target"] == "AmazonSSM.DeleteParameter" || a["target"] == "AmazonSSM.DeleteParameters").filter_map(|a| a["asked"].as_str().map(str::to_string)).collect::<Vec<_>>();
+    assert!(!late.load(std::sync::atomic::Ordering::SeqCst) && !asked.iter().any(|a| a.contains("GITHUB_APP_")), "{asked:?}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The control plane in use has AWS runners in an account other than the one signed in to: moving to a Cloudflare
+/// control plane says AWS's sign-in to that account is needed for them to come along.
+#[test]
+fn a_move_to_cloudflare_of_aws_runners_in_another_account_asks_for_that_sign_in() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("222222222222".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let cf = superci_testkit::serve_as("cfplane00001", |_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["planes_more"] = serde_json::json!([{ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": cf.url, "plane_id": "cfplane00001", "label": "superci" } }]);
+    k["key"]["planes"] = serde_json::json!([PLANE, "cfplane00001"]);
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    until("its move", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Move to Cloudflare"));
+    let page = common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    assert!(page.contains("Sign in with AWS To bring its runners along"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
