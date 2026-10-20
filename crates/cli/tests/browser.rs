@@ -2535,6 +2535,85 @@ fn a_move_to_cloudflare_of_aws_runners_in_another_account_asks_for_that_sign_in(
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Signed out while the control plane kept here is one only seen (where another moved, in a cloud not signed in to),
+/// beside one in the AWS account signed in to: each is asked to let go of the key (the seen one too), and nothing is
+/// kept on this computer.
+#[test]
+fn signing_out_with_a_kept_control_plane_only_seen_asks_each_to_let_go_and_keeps_nothing() {
+    let served = serve(|_| {});
+    let used = superci_testkit::serve_as("cfplane00001", |_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["planes_more"] = serde_json::json!([k["plane"].clone()]);
+    k["plane"] = serde_json::json!({ "Seen": { "url": used.url, "plane_id": "cfplane00001" } });
+    k["key"]["planes"] = serde_json::json!([PLANE, "cfplane00001"]);
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    until("both listed", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&used.url));
+    let (status, to, said) = common::post(&link, "/signout", &[]);
+    assert!(status == 303 && to == "/", "{status} {to} {}", common::words(&said));
+    assert!(!file.exists(), "{}", std::fs::read_to_string(&file).unwrap_or_default());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The sign-ins cannot be kept on this computer (where they are kept is taken by a folder): a sign-in still works
+/// for the session, and keeping it is tried again at the next change, said in the terminal once.
+#[test]
+fn a_sign_in_that_cannot_be_kept_still_works_and_is_tried_again() {
+    let served = serve(|_| {});
+    served.aws.replaying(&[include_str!("../fixtures/aws/sign-in/sign-in.jsonl"), include_str!("../fixtures/aws/sign-in/renew.jsonl")].concat(), &[]);
+    let home = common::temp("cannot-keep");
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    std::fs::create_dir_all(home.join("workspaces/default/sign-ins.json")).unwrap();
+    let (mut child, link) = dashboard(&home);
+    let (_, to, page) = common::post(&link, "/aws/signin", &[("next", ""), ("w", "default")]);
+    let at = if to.is_empty() { page } else { to };
+    let state = at.split("state=").nth(1).and_then(|r| r.split(['&', '"']).next()).expect("a state").to_string();
+    let (status, _, done) = common::get(&link, &format!("/oauth/callback?code=a-code-from-aws&state={state}"));
+    assert!(status < 400 && common::words(&done).contains("Signed in with AWS"), "{status} {}", common::words(&done));
+    let (status, to, _) = common::post(&link, "/aws/look", &[("next", "?p=plane")]);
+    assert!(status == 303 && to.starts_with("/?p=plane"), "{status} {to}");
+    assert!(home.join("workspaces/default/sign-ins.json").is_dir());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A secret given a new value on a Cloudflare control plane that keeps twelve others (as many as Cloudflare hands one):
+/// not refused, as one more would be.
+#[test]
+fn a_secret_updated_on_a_cloudflare_control_plane_with_twelve_others_is_not_refused() {
+    let account = superci_testkit::Aws::serve();
+    let acct = account.clone();
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| c.read_settings(&acct.worker_settings("superci")));
+    account.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    account.replaying(&std::fs::read_to_string(format!("{}/fixtures/update/03-cf-containers.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap(), &[]);
+    {
+        let mut kept = account.worker_secrets.lock().unwrap();
+        let secrets = kept.entry("superci".into()).or_default();
+        secrets.insert("DEVICE_KEY_4102444800_TEST".into(), cf.key.clone());
+        for n in 0..13 {
+            let (name, scope) = (format!("TOKEN_{n}"), superci_core::secrets::Scope::default());
+            let stored = superci_core::secrets::Stored { name: name.clone(), value: "v".into(), scope: scope.clone(), updated_ms: 1 };
+            secrets.insert(superci_core::secrets::setting(&name, &scope), serde_json::to_string(&stored).unwrap());
+        }
+    }
+    let home = common::temp("cf-secrets");
+    std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), serde_json::json!({
+        "key": { "name": "DEVICE_KEY_4102444800_TEST", "value": cf.key, "planes": ["cfplane00003"] },
+        "plane": { "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": "https://superci.acme.workers.dev", "plane_id": "cfplane00003", "label": "superci" } },
+        "cloudflare": { "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" },
+    }).to_string()).unwrap();
+    let (ok, said) = common::superci_in_time(&home, &["secrets", "update", "TOKEN_0", "--value-env=NEW_VALUE"], &[("NEW_VALUE", "w")], 60);
+    assert!(ok && said.contains("TOKEN_0 is kept for"), "{said}");
+    let (ok, said) = common::superci_in_time(&home, &["secrets", "create", "TOKEN_13", "--value-env=NEW_VALUE"], &[("NEW_VALUE", "w")], 60);
+    assert!(!ok && said.contains("12 secrets at most"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
