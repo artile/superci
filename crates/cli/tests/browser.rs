@@ -1310,6 +1310,54 @@ fn a_further_gitlab_connected_again_is_waited_for_at_its_address_and_gets_a_new_
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// What the pages show is read again in the background a few seconds on, and taken though one control plane kept
+/// here does not answer and another does not take this computer's key: a name given meanwhile is then shown.
+#[test]
+fn a_reading_made_in_the_background_is_taken_though_one_control_plane_is_down_and_another_not_keyed() {
+    let served = serve(|_| {});
+    let down = superci_testkit::serve_as("testplane0002", |_| {});
+    down.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let other = superci_testkit::serve_as("testplane0003", |_| {});
+    let home = home(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": down.url, "plane_id": "testplane0002", "label": "superci" } },
+        { "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0003", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    let planes = || common::words(&common::part(&link, "/?p=all&fragment=1").1);
+    until("the control planes read", || planes().contains("Not answering"));
+    served.aws.put(&format!("/superci/{PLANE}/NAME"), "Acme CI");
+    // (Read again once what was read is three seconds old: the page meanwhile shows what was read.)
+    std::thread::sleep(std::time::Duration::from_millis(3_200));
+    until("the name given meanwhile", || planes().contains("Acme CI"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A key kept here that ends within the day is not taken up again: the control plane is handed a new one (with the
+/// AWS sign-in), which is kept in its place.
+#[test]
+fn a_kept_key_that_ends_within_the_day_is_replaced_by_a_new_one_handed_to_the_control_plane() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let ending = format!("DEVICE_KEY_{}_TEST", served.now_ms() / 1000 + 3_600);
+    kept["key"]["name"] = ending.clone().into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.put(&format!("/superci/{PLANE}/{ending}"), &served.key);
+    let (mut child, link) = common::dashboard(&home);
+    until("the overview", || common::words(&common::part(&link, "/?p=overview&fragment=1").1).contains("Usage"));
+    let name = || serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap()).unwrap()["key"]["name"].as_str().unwrap_or_default().to_string();
+    until("a new key kept", || name() != ending);
+    let until_s: u64 = name().trim_start_matches("DEVICE_KEY_").split('_').next().unwrap().parse().unwrap();
+    assert!(until_s > served.now_ms() / 1000 + 7 * 86_400 && served.aws.settings(PLANE).iter().any(|(k, _)| *k == name()), "{}", name());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
