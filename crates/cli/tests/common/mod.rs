@@ -195,3 +195,25 @@ pub fn later(home: &std::path::Path, ms: u64) {
     let was: u64 = std::fs::read_to_string(&file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     std::fs::write(file, (was + ms).to_string()).unwrap();
 }
+
+/// The CLI run in `home`'s workspace with these settings of its own, ended if not over in `secs`: whether it did
+/// well, and what it said (out, then errors).
+pub fn superci_in_time(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)], secs: u64) -> (bool, String) {
+    let child = command(home).args(args).envs(envs.iter().copied()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    let out = match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(out) => out.unwrap(),
+        Err(_) => { let _ = Command::new("kill").args(["-9", &pid.to_string()]).status(); panic!("{args:?}: not over in {secs} s") }
+    };
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+}
+
+/// `home`'s workspace keeping its control plane at `url` in place of the one served (a server in front of it).
+pub fn kept_at(home: &std::path::Path, url: &str) {
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = url.into();
+    std::fs::write(file, kept.to_string()).unwrap();
+}

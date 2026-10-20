@@ -1638,6 +1638,179 @@ fn a_control_plane_found_that_moved_away_is_listed_above_setting_up_a_new_one() 
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A GitHub job's log from a control plane that gives no link to GitHub's file and only the end of its own: saved
+/// from the terminal it is said as cut short, not passed off as the whole; its raw log in the dashboard is the
+/// control plane's. An artifact named with dashes and dots downloads under that name.
+#[test]
+fn a_github_jobs_log_given_only_in_part_is_said_so_and_an_artifact_keeps_its_dashes_and_dots() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let (id, queued) = served.github.queue("test", "superci", served.now_ms());
+    assert_eq!(served.webhook(queued), 202);
+    assert_eq!(served.webhook(served.github.start(id)), 202);
+    assert_eq!(served.webhook(served.github.finish(id, "success", "2026-10-15T10:00:00.0000000Z all passed", served.now_ms())), 202);
+    let at = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let a = at.clone();
+    let plane = superci_testkit::front(&served.url, move |method, target, status, body| {
+        if method != "GET" { return (status, body) }
+        if target.starts_with("/job/log?") && target.ends_with("&link=1") { return (404, br#"{"error":"no link here"}"#.to_vec()) }
+        if target.starts_with("/job/log?") && target.ends_with("&bytes=4000000") { return (200, serde_json::json!({ "log": "the end of it", "truncated": true }).to_string().into_bytes()) }
+        if target.starts_with("/runs/1/artifacts?name=") { return (200, serde_json::json!({ "size": 2, "pieces": [{ "url": format!("{}/piece", a.lock().unwrap()), "size": 2 }] }).to_string().into_bytes()) }
+        if target == "/piece" { return (200, b"PK".to_vec()) }
+        (status, body)
+    });
+    *at.lock().unwrap() = plane.clone();
+    let home = home(&served);
+    common::kept_at(&home, &plane);
+    let out = home.join("job.log");
+    let (ok, said) = common::superci_in_time(&home, &["jobs", "retrieve", &id.to_string(), &format!("--out={}", out.display())], &[], 30);
+    assert!(!ok && said.contains("the control plane gave only the last 1 KB of its log (a newer control plane gives it whole)") && !out.exists(), "{said}");
+    let (mut child, link) = dashboard(&home);
+    let (base, key) = link.split_once("/?k=").unwrap();
+    let port = base.rsplit(':').next().unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
+    let ask = |path: &str| agent.get(&format!("{base}{path}")).header("cookie", &format!("superci_local_{port}={key}")).header("sec-fetch-site", "same-origin").call().unwrap();
+    let raw = ask(&format!("/job/raw?id={id}"));
+    let disposition = |r: &ureq::http::Response<ureq::Body>| r.headers().get("content-disposition").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    assert!(raw.status() == 200 && disposition(&raw).contains(&format!("job-{id}.log")), "{} {}", raw.status(), disposition(&raw));
+    let artifact = ask("/run/artifact?run=1&name=coverage-report.v2");
+    assert!(artifact.status() == 200 && disposition(&artifact).contains("\"coverage-report.v2.zip\""), "{} {}", artifact.status(), disposition(&artifact));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane that answers its status with a page of its own (no such route there), not a refusal of the key:
+/// a command reading it with the key alone says the key is not taken, as it would of an expired one.
+#[test]
+fn a_control_plane_answering_its_status_with_no_such_route_is_said_not_to_take_the_key() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    common::kept_at(&home, &superci_testkit::without_routes(&served.url, &["/status"]));
+    let (ok, said) = common::superci_in_time(&home, &["status"], &[], 30);
+    assert!(!ok && said.contains("The control plane does not take this computer's key (it expired or was replaced)."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Signed in, the control plane kept here saying it moved away is not taken as the one in use: it is looked for
+/// again in the account, and read as it is found.
+#[test]
+fn signed_in_a_control_plane_that_says_it_moved_away_is_looked_for_again() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!("https://superci.acme.workers.dev").to_string());
+    let asked = served.aws.asked.lock().unwrap().len();
+    let (_, said) = common::superci_in_time(&home, &["status", "--json"], &[], 60);
+    assert!(said.contains(PLANE), "{said}");
+    assert!(served.aws.asked.lock().unwrap()[asked..].iter().any(|a| a.to_string().contains("ListRoles") || a.to_string().contains("lambda")), "looked in the account");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Another account's AWS sign-in that AWS no longer renews, found as the clouds are looked in for a listing: left
+/// out, the one in hand kept.
+#[test]
+fn another_aws_accounts_sign_in_found_ended_as_control_planes_are_listed_is_left_out() {
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/sign-in/ended.jsonl"), &[]);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut other = k["aws"].clone();
+    (other["account_id"], other["who"]) = ("222222222222".into(), "arn:aws:sts::222222222222:assumed-role/Admin/someone".into());
+    (other["creds"]["expires_at_ms"], other["refresh_token"]) = (0.into(), "superci-ended-refresh-token-for-a-recording".into());
+    other["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    k["aws_more"] = serde_json::json!([other]);
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (ok, said) = common::superci_in_time(&home, &["planes", "list"], &[], 60);
+    assert!(ok && said.contains(PLANE), "{said}");
+    let k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert!(k["aws"]["account_id"] == "111111111111" && k["aws_more"].as_array().is_none_or(|m| m.is_empty()), "{k}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// With a Modal sign-in given by name for the dashboard's run, a page that fails says what failed, never that
+/// Modal's sign-in ended.
+#[test]
+fn a_page_that_fails_with_a_modal_sign_in_given_by_name_says_what_failed() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_MODAL_TOKEN_ID", "ak-given"), ("SUPERCI_MODAL_TOKEN_SECRET", "as-given")]);
+    let (status, said) = common::part(&link, "/run/artifact?run=1&name=report");
+    let said = common::words(&said);
+    assert!(status == 500 && said.contains("Something went wrong") && !said.contains("Modal"), "{status} {said}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS runners of the control plane's own account asked for while signed in to another AWS account only: refused,
+/// saying which account to sign in to.
+#[test]
+fn aws_runners_asked_for_while_signed_in_to_another_account_only_say_which_to_sign_in_to() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    (k["aws"]["account_id"], k["aws"]["who"]) = ("222222222222".into(), "arn:aws:sts::222222222222:assumed-role/Admin/someone".into());
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    let (status, _, said) = common::post(&link, "/runners/aws-own", &[]);
+    let said = common::words(&said);
+    assert!(status == 403 && said.contains("Sign in with AWS first") && said.contains("Sign in to account 111111111111."), "{status} {said}");
+    assert!(served.aws.settings(PLANE).iter().all(|(k, _)| k != "AWS_OWN"), "nothing changed");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The control plane's role read in the background: still being read 45 seconds on, AWS is said not to have answered
+/// in time; one read with credentials AWS calls expired is never shown: the sign-in is seen to, and the role is still
+/// being read.
+#[test]
+fn a_role_still_being_read_45_seconds_on_says_aws_did_not_answer_and_one_read_with_expired_credentials_is_not_shown() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let h = held.clone();
+    served.aws.during("GetRolePolicy", move || { let end = std::time::Instant::now() + std::time::Duration::from_secs(20); while h.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < end { std::thread::sleep(std::time::Duration::from_millis(50)) } });
+    let (mut child, link) = common::dashboard_in_time(&home, &[]);
+    let page = || common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    until("its role being read", || page().contains("Checking its role"));
+    common::later(&home, 46_000);
+    until("not answered in time", || page().contains("Not read: AWS did not answer in time"));
+    held.store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // Read with credentials AWS calls expired: not shown.
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.fail("GetRolePolicy", 400, "<ErrorResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><Error><Type>Sender</Type><Code>RequestExpired</Code><Message>Request has expired.</Message></Error><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ErrorResponse>", Some(1));
+    let (mut child, link) = dashboard(&home);
+    for _ in 0..12 {
+        let p = page_of(&link);
+        assert!(!p.contains("RequestExpired") && p.contains("Checking its role"), "{p}");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    fn page_of(link: &str) -> String { common::words(&common::part(link, "/?p=planes&fragment=1").1) }
+}
+
+/// An update whose version asks for nothing new, of a control plane whose role was found to lack only what lets it
+/// read: said as that many new read permissions in AWS.
+#[test]
+fn an_update_for_a_role_that_lacks_only_a_read_permission_says_it_asks_for_a_read_permission() {
+    let served = serve(|_| {});
+    let mut policy = superci_core::permissions::aws_runner_policy(superci_testkit::ACCOUNT, PLANE);
+    policy["Statement"].as_array_mut().unwrap().retain(|s| s["Sid"] != "Prices");
+    let encoded: String = url::form_urlencoded::byte_serialize(policy.to_string().as_bytes()).collect();
+    served.aws.fail("GetRolePolicy", 200, &format!("<GetRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><GetRolePolicyResult><PolicyName>runner-machines</PolicyName><RoleName>superci-plane-{PLANE}</RoleName><PolicyDocument>{encoded}</PolicyDocument></GetRolePolicyResult></GetRolePolicyResponse>"), None);
+    served.answer_as("0.18.0", &[]);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    until("the role read", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("1 permission to allow"));
+    until("said in the update", || common::words(&common::part(&link, "/?p=changes&fragment=1").1).contains("1 new read permission in AWS"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

@@ -1391,7 +1391,8 @@ impl Dashboard {
     fn key_refused(&self, v: &PlaneView) -> Option<String> {
         if !v.online || v.status.is_some() { return None }
         let said = cloudflare::refused(v.plane.url(), &self.status_key)?;
-        if v.version.is_some() && view::older(v.version.as_deref(), NAMES_SINCE) {
+        // (Online, it said a version: one from before versions were said reads as the first.)
+        if view::older(v.version.as_deref(), NAMES_SINCE) {
             return Some(format!("The control plane runs SuperCI {}, which reads this computer's key under its old name. Sign in again where it runs (`superci login`) so it is handed that way, or update the control plane (`superci planes update`).", v.version.as_deref().unwrap_or("of an older version")))
         }
         if said.starts_with(superci_core::plane::KEY_REFUSED) && view::older(Some(DASHBOARD_VERSION), v.version.as_deref().unwrap_or_default()) {
