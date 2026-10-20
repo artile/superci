@@ -2404,3 +2404,19 @@ fn a_move_onto_a_control_plane_that_serves_github_of_its_own_is_refused() {
     assert!(!o.status.success() && said.contains("That control plane serves a code host of its own") && said.contains("Nothing has changed."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The GitHub App asked for an organization with a long name: its name cut, with a mark of the whole of it, to fit
+/// GitHub's limit.
+#[test]
+fn the_app_asked_for_an_organization_with_a_long_name_has_it_cut_with_a_mark_of_the_whole() {
+    let served = serve(|_| {});
+    let login = "a-very-long-organization";
+    served.github.answer_with("GET", &format!("/users/{login}"), 200, &[("content-type", "application/json")], &serde_json::json!({ "login": login, "id": 7, "type": "Organization" }).to_string());
+    let home = home(&served);
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let (_board, link) = common::dashboard(&home);
+    let (status, _, page) = common::post(&link, "/github/start", &[("login", login)]);
+    let mark = &superci_core::crypto::sha256_hex(login.as_bytes())[..4];
+    assert!(status < 400 && page.replace("&quot;", "\"").contains(&format!("\"name\":\"SuperCI a-very-lon-{mark}\"")), "{status} {}", common::words(&page));
+    let _ = std::fs::remove_dir_all(&home);
+}
