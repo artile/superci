@@ -1112,6 +1112,87 @@ fn github_enterprise_on_a_control_plane_from_before_it_says_to_update_it_first()
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A move waits for the new control plane to have taken each thing given it (its App a moment after it, then its
+/// GitLab) and to have taken GitHub over (it says so a moment after the first claim); meanwhile another control plane
+/// with two jobs running is not deleted, nor after it the old one, two jobs running there.
+#[test]
+fn a_move_waits_for_the_new_control_plane_to_take_its_app_its_gitlab_and_github_and_one_with_jobs_running_is_not_deleted_meanwhile() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    // A third, serving nothing, two jobs of a run from a computer running there.
+    let third = superci_testkit::serve_as("testplane0003", |_| {});
+    for id in [91u64, 92] {
+        third.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 9, "repo": "acme/app", "state": "running", "cloud": "", "provider": "local",
+            "at_ms": third.now_ms() - 60_000, "installation_id": 0, "seen_in_progress": true }).to_string());
+    }
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } },
+        { "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": third.url, "plane_id": "testplane0003", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002", "testplane0003"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = common::dashboard(&home);
+    // Once its state is in: its status without the App, then without the GitLab; its first claim not yet GitHub's.
+    new.then_answer("/move/import", &[("/status", &["app"]), ("/status", &["gitlab"]), ("/move/claim", &["github"])]);
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    let (status, _, said) = common::post(&link, "/plane/delete", &[("plane", "testplane0003")]);
+    assert!(status == 409 && common::words(&said).contains("2 jobs are still running there"), "{status} {}", common::words(&said));
+    until("moved", || !served.store.under("moved_to").is_empty());
+    let has = |k: &str| served.aws.settings("testplane0002").into_iter().any(|(n, _)| n == k);
+    assert!(has("GITHUB_APP") && has("GITLAB") && new.answers_to_come() == 0, "{:?} {}", served.aws.settings("testplane0002").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), new.answers_to_come());
+    assert_eq!(third.store.under("job:").len(), 2);
+    // The move over, the old one (in use no more) with two jobs running there: not deleted either.
+    until("the move over", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Moved"));
+    for id in [93u64, 94] {
+        served.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 9, "repo": "acme/app", "state": "running", "cloud": "", "provider": "local",
+            "at_ms": served.now_ms() - 60_000, "installation_id": 0, "seen_in_progress": true }).to_string());
+    }
+    let (status, _, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
+    assert!(status == 409 && common::words(&said).contains("2 jobs are still running there"), "{status} {}", common::words(&said));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane whose status lists no labels answers to the one it was set up with: that one is its only label,
+/// not removed.
+#[test]
+fn a_control_plane_that_lists_no_labels_answers_to_its_own_and_it_is_not_removed() {
+    let served = serve(|_| {});
+    served.answer_as("", &["labels"]);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let (status, _, said) = common::post(&link, "/labels", &[("action", "remove"), ("label", "superci")]);
+    assert!(status == 409 && common::words(&said).contains("This is its only label"), "{status} {}", common::words(&said));
+    assert!(served.aws.settings(PLANE).iter().all(|(k, _)| k != "LABELS"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Stopped while it served only a further GitLab connection (no App, no first GitLab): its workflows are said to
+/// change back, and no App to delete.
+#[test]
+fn superci_stopped_while_only_a_further_gitlab_sent_it_jobs_says_to_change_its_workflows_back() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gextra"), r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gextra"}"#);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    let (status, _, said) = common::post(&link, "/plane/leave", &[("confirm", "superci")]);
+    let said = common::words(&said);
+    assert!(status == 200 && said.contains("SuperCI is stopped") && said.contains("Change runs-on: superci back") && !said.contains("GitHub App"), "{status} {said}");
+    assert!(served.aws.settings(PLANE).is_empty(), "{:?}", served.aws.settings(PLANE));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
