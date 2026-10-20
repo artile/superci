@@ -2731,9 +2731,9 @@ fn of_three_control_planes_two_live_the_one_that_serves_nothing_is_listed_neithe
 }
 
 /// A Cloudflare control plane deleted, Cloudflare saying its Worker is not there by its code alone (10007, in
-/// words that do not say "not found"): taken as gone.
+/// words that do not say "not found"), and IAM that the role its AWS runners had is not there: each taken as gone.
 #[test]
-fn a_cloudflare_control_plane_whose_worker_cloudflare_calls_missing_by_its_code_is_deleted() {
+fn a_cloudflare_control_plane_is_deleted_though_its_worker_and_its_aws_runners_role_are_gone_already() {
     let served = serve(|_| {});
     served.connect_github();
     let aws = served.aws.clone();
@@ -2760,8 +2760,12 @@ fn a_cloudflare_control_plane_whose_worker_cloudflare_calls_missing_by_its_code_
     let delete = [include_str!("../fixtures/cloudflare/03-use.jsonl"), include_str!("../fixtures/cloudflare/07-delete.jsonl")].concat();
     let mut worker = recorded_answers(&delete, "DELETE", "/workers/scripts/superci?force=true")[0].clone();
     (worker["status"], worker["answer"]) = (404.into(), serde_json::json!({ "success": false, "errors": [{ "code": 10007, "message": "This Worker does not exist on your account." }], "result": null }).to_string().into());
+    // (Its machines in the AWS account signed in to, through a role made for it.)
+    cf.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": "arn:aws:iam::111111111111:role/superci-plane-cfplane00001", "connected": true }).to_string());
+    served.aws.fail("DeleteRolePolicy", 404, &superci_testkit::ec2_error("NoSuchEntity", "The role with name superci-plane-cfplane00001 cannot be found."), None);
     let (ok, said) = run(&delete, &[worker], &["planes", "delete", "cfplane00001", "--confirm"]);
     assert!(ok && said.contains("Deleted Cloudflare · Acme."), "{said}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=DeleteRole&"))), "on past the policy gone already");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -2811,4 +2815,64 @@ fn a_working_tree_larger_than_a_control_plane_without_a_bucket_takes_is_said_and
     assert!(!ok && said.contains("The working tree is 0 MB packed; a run from a computer takes 0 MB at most."), "{said}");
     assert!(served.store.under("run:").is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Modal token given by name with a control character in it, which no header may carry: left out of the call
+/// (never sent cut or altered), and Modal's refusal of a call without it said.
+#[test]
+fn a_modal_token_given_by_name_with_a_control_character_is_left_out_and_modals_refusal_said() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/ended.jsonl"), &[]);
+    let o = common::command(&home).args(["planes", "create", "modal"]).env("SUPERCI_MODAL_TOKEN_ID", "ak-\u{1}token").env("SUPERCI_MODAL_TOKEN_SECRET", "as-superciendedrecording00").output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("Token not found"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitHub's runner image copied into the account's registry, one layer of it not there yet and larger than a chunk
+/// the upload goes in: sent in chunks, each where the registry says to go on, then the layer and the image put.
+#[test]
+fn a_layer_larger_than_a_chunk_is_copied_into_cloudflares_registry_a_chunk_at_a_time() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.workers.lock().unwrap().insert("superci-runners-testplane0001.acme.workers.dev".into(), served.url.clone());
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(&include_str!("../fixtures/runners/03-cf-agent.jsonl").replace("awsplane0001", superci_testkit::PLANE).replace("http://new-plane.test", &served.url), &[]);
+    // (The layer of 36 MB not there, the rest there; its upload's address moving on as the registry says.)
+    let reg = "registry.cloudflare.com/v2/1111111111111111111111111111111a/superci-runner";
+    let layer = "sha256:577f3edc6a403caf5e1d36050abf05a22e73f81491c49e95aef70ba7df131075";
+    let (at, at_more) = (format!("https://{reg}/blobs/uploads/u1"), format!("https://{reg}/blobs/uploads/u1?state=2"));
+    served.aws.fail_with_headers(&format!("{reg}/manifests/gh-"), 404, &[], "", Some(1));
+    served.aws.fail_with_headers("digest=sha256", 201, &[], "", None);
+    served.aws.fail_with_headers(&format!("{reg}/blobs/uploads/u1"), 202, &[("location", &at_more)], "", None);
+    served.aws.fail_with_headers(&format!("{reg}/blobs/uploads/"), 202, &[("location", &at)], "", None);
+    served.aws.fail_with_headers(&format!("{reg}/blobs/{layer}"), 404, &[], "", None);
+    served.aws.fail_with_headers(&format!("{reg}/blobs/sha256"), 200, &[], "", None);
+    // (GitHub sends it from its storage: a server of its own here, so the registry is asked while it is read.)
+    let storage = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let blob = format!("http://{}/blob", storage.local_addr().unwrap());
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        let Ok((mut s, _)) = storage.accept() else { return };
+        let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+        let mut line = String::new();
+        while r.read_line(&mut line).is_ok_and(|n| n > 2) { line.clear() }
+        let body = vec![b'x'; 33 * 1024 * 1024 + 1];
+        let _ = s.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes());
+        let _ = s.write_all(&body);
+    });
+    served.aws.fail_with_headers(&format!("actions-runner/blobs/{layer}"), 307, &[("location", &blob)], "", None);
+    served.aws.fail_with_headers(&format!("{reg}/manifests/gh-"), 201, &[], "", None);
+    let o = common::command(&home).args(["runners", "create", "cloudflare"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+    served.aws.fail_none();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("Runner image ready") && said.contains("cloudflare runs jobs now."), "{said}");
+    let chunks: Vec<String> = served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/blobs/uploads/u1") || u.ends_with("/blobs/uploads/u1?state=2"))).map(|a| a["url"].as_str().unwrap_or_default().to_string()).collect();
+    assert_eq!(chunks, [at, at_more], "two chunks, the second where the first said");
+    let _ = std::fs::remove_dir_all(&home);
 }
