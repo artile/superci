@@ -2060,3 +2060,75 @@ fn a_modal_token_given_by_name_that_no_header_can_carry_is_left_out_and_modals_r
     assert!(!o.status.success() && said.contains("Token not found"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The answers a recording has for one call (its method, and its address ending so), in their order.
+fn recorded_answers(recording: &str, method: &str, url_end: &str) -> Vec<serde_json::Value> {
+    recording.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter(|r| r["method"] == method && r["url"].as_str().is_some_and(|u| u.ends_with(url_end))).collect()
+}
+
+/// Cloudflare's runners for a control plane in AWS, deployed as Cloudflare answered a real one but where it did
+/// not: a control plane that does not publish its keys yet is refused; Cloudflare refusing to prepare the image is
+/// said; then GitHub's registry and Cloudflare's asking for a token first, GitHub's index listing other platforms
+/// before the one containers run (at length), the image not visible at once and then still being prepared, the
+/// Worker's containers of one size from before (their application gone, one without an id left), and it is deployed.
+#[test]
+fn cloudflare_runners_are_deployed_through_registry_challenges_an_image_being_prepared_and_containers_from_before() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.workers.lock().unwrap().insert("superci-runners-testplane0001.acme.workers.dev".into(), served.url.clone());
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    let plain = kept.to_string();
+    let recording = include_str!("../fixtures/runners/03-cf-agent.jsonl").replace("awsplane0001", superci_testkit::PLANE).replace("http://new-plane.test", &served.url);
+    let run = |overlay: &[serde_json::Value]| {
+        served.aws.replaying(&recording, &[]);
+        if !overlay.is_empty() { served.aws.replaying(&overlay.iter().map(|v| v.to_string() + "\n").collect::<String>(), &[]) }
+        let o = common::command(&home).args(["runners", "create", "cloudflare"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        served.aws.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // A control plane from before it published its keys.
+    let mut older = kept.clone();
+    older["plane"]["Aws"]["url"] = superci_testkit::without_routes(&served.url, &["/.well-known/jwks.json"]).into();
+    std::fs::write(&file, older.to_string()).unwrap();
+    let (ok, said) = run(&[]);
+    assert!(!ok && said.contains("the control plane did not publish its keys"), "{said}");
+    std::fs::write(&file, &plain).unwrap();
+    // Cloudflare refusing to prepare the image.
+    let prepare = recorded_answers(&recording, "POST", "/containers/image-preparations")[0].clone();
+    let answered = |r: &serde_json::Value, status: u16, answer: serde_json::Value| { let mut r = r.clone(); r["status"] = status.into(); r["answer"] = answer.to_string().into(); r };
+    let (ok, said) = run(&[answered(&prepare, 400, serde_json::json!({ "success": false, "errors": [{ "code": 1000, "message": "image too large for this account" }], "result": null }))]);
+    assert!(!ok && said.contains("image too large for this account"), "{said}");
+    // Each registry asks for a token first (GitHub's with its service and scope, Cloudflare's with neither).
+    served.aws.fail_with_headers("actions-runner/manifests/latest", 401, &[("www-authenticate", "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\",scope=\"repository:actions/actions-runner:pull\"")], "", Some(1));
+    served.aws.fail_with_headers("superci-runner/manifests/gh-", 401, &[("www-authenticate", "Bearer realm=\"https://registry.cloudflare.com/token\"")], "", Some(1));
+    served.aws.fail("registry.cloudflare.com/token", 200, r#"{"token":"cloudflare-registry-token"}"#, Some(1));
+    // GitHub's index: Windows and Arm first, and long.
+    let index = recorded_answers(&recording, "GET", "/manifests/latest")[0].clone();
+    let mut list: serde_json::Value = serde_json::from_str(index["answer"].as_str().unwrap()).unwrap();
+    let amd64 = list["manifests"].as_array().unwrap().clone();
+    list["manifests"] = serde_json::json!([{ "digest": "sha256:1111", "platform": { "os": "windows", "architecture": "amd64" } }, { "digest": "sha256:2222", "platform": { "os": "linux", "architecture": "arm64" } }]);
+    list["manifests"].as_array_mut().unwrap().extend(amd64);
+    let long = list.to_string() + &" ".repeat(1_100_000);
+    // Not visible at once, then being prepared twice over; and the Worker's containers of one size from before.
+    let scripts = recorded_answers(&recording, "GET", "/workers/scripts");
+    let mut before: serde_json::Value = serde_json::from_str(scripts[1]["answer"].as_str().unwrap()).unwrap();
+    before["result"].as_array_mut().unwrap().push(serde_json::json!({ "id": format!("superci-runners-{}", superci_testkit::PLANE), "migration_tag": "v2" }));
+    let apps = recorded_answers(&recording, "GET", "/containers/applications");
+    let (ok, said) = run(&[
+        { let mut r = index.clone(); r["answer"] = long.clone().into(); r }, answered(&prepare, 400, serde_json::json!({ "success": false, "errors": [{ "code": 1, "message": "IMAGE_REGISTRY_DOESNT_CONTAIN_IMAGE" }], "result": null })),
+        answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), answered(&prepare, 200, serde_json::json!({ "success": true, "result": { "status": "preparing" } })), prepare.clone(),
+        scripts[0].clone(), answered(&scripts[1], 200, before),
+        answered(&apps[0], 200, serde_json::json!({ "success": true, "result": [{ "name": format!("superci-runners-{}", superci_testkit::PLANE) }] })), apps[0].clone(),
+    ]);
+    assert!(ok && said.contains("cloudflare runs jobs now."), "{said}");
+    assert!(said.contains("Cloudflare is preparing the runner image for its machines…") && said.matches("Cloudflare is preparing").count() == 1, "{said}");
+    let asked: Vec<String> = served.aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["method"].as_str().unwrap_or_default(), a["url"].as_str().unwrap_or_default())).collect();
+    assert!(asked.iter().any(|a| a == "GET https://registry.cloudflare.com/token") && asked.iter().any(|a| a.starts_with("GET https://ghcr.io/token?service=ghcr.io&scope=")), "{asked:?}");
+    // (Its applications looked at for the one from before, which has no id to delete it by: left.)
+    assert!(asked.iter().filter(|a| a.starts_with("GET") && a.ends_with("/containers/applications")).count() == 2 && !asked.iter().any(|a| a.starts_with("DELETE") && a.contains("/containers/applications/")), "{asked:?}");
+    assert!(asked.iter().any(|a| a.contains("/manifests/sha256:660f7b9d")) && !asked.iter().any(|a| a.contains("/manifests/sha256:1111") || a.contains("/manifests/sha256:2222")), "{asked:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
