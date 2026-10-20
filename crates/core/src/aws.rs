@@ -1288,7 +1288,6 @@ pub fn with_hello_windows(script: String, url: &str) -> Result<String> {
     // (Its callers give it an https link only.)
     if !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
     const RUNNER: &str = "& .\\run.cmd --jitconfig";
-    if !script.contains(RUNNER) || !script.contains("$t0 = ") { return Ok(script) }
     let said = HELLO_WINDOWS.replace("HELLO_URL", url);
     let (before, after) = script.split_once(RUNNER).ok_or("no runner in the start-up script")?;
     Ok(format!("{before}{said}{RUNNER}{after}"))

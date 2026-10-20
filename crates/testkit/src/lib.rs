@@ -27,21 +27,37 @@ use serde_json::{json, Value};
 use superci_core::io::{self, Clock, Containers, Request, Store, Timer, Work};
 use superci_core::plane::{Cache, Config, ControlPlane};
 
-/// A store in memory, shared with the test.
+/// A store in memory, shared with the test; with what other requests write meanwhile (`Served::written_meanwhile`),
+/// and the records it refuses to write (`Served::store_refuses`).
 #[derive(Clone, Default)]
-pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>);
+pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(String, u32, Change)>>>, pub Arc<Mutex<Vec<String>>>);
+
+/// What another request writes over a record (`None`: takes it out), from what is there.
+pub type Change = Arc<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>;
 
 #[async_trait(?Send)]
 impl Store for Shared {
     async fn get(&self, k: &str) -> io::Result<Option<String>> { Ok(self.0.lock().unwrap().get(k).cloned()) }
-    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.0.lock().unwrap().insert(k.into(), v); Ok(()) }
-    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { let mut m = self.0.lock().unwrap(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
-    async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> { let mut m = self.0.lock().unwrap(); if m.get(k).map(String::as_str) != was { return Ok(false) } m.insert(k.into(), v); Ok(true) }
+    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.refused(k)?; self.0.lock().unwrap().insert(k.into(), v); Ok(()) }
+    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.refused(k)?; let mut m = self.0.lock().unwrap(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
+    async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> {
+        self.refused(k)?;
+        let meanwhile = { let mut w = self.1.lock().unwrap(); w.iter_mut().find(|(p, n, _)| *n > 0 && k.starts_with(p.as_str())).map(|e| { e.1 -= 1; e.2.clone() }) };
+        let mut m = self.0.lock().unwrap();
+        if let Some(change) = meanwhile { match change(m.get(k).map(String::as_str)) { Some(v) => { m.insert(k.into(), v); } None => { m.remove(k); } } }
+        if m.get(k).map(String::as_str) != was { return Ok(false) }
+        m.insert(k.into(), v); Ok(true)
+    }
     async fn delete(&self, k: &str) -> io::Result<()> { self.0.lock().unwrap().remove(k); Ok(()) }
     async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
 }
 
 impl Shared {
+    /// Its refusal of a write of `k`, when it refuses records under a prefix of `k` (see `Served::store_refuses`).
+    fn refused(&self, k: &str) -> io::Result<()> {
+        match self.2.lock().unwrap().iter().any(|p| k.starts_with(p.as_str())) { true => Err(format!("the store refused to write {k}")), false => Ok(()) }
+    }
+
     /// The records under `prefix`, as the test reads them.
     pub fn under(&self, prefix: &str) -> Vec<(String, Value)> {
         self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(prefix)).map(|(k, v)| (k.clone(), serde_json::from_str(v).unwrap_or(Value::String(v.clone())))).collect()
@@ -1000,5 +1016,21 @@ fn leave_out(v: &mut Value, path: &[&str]) {
         [last] => { if let Some(o) = v.as_object_mut() { o.remove(*last); } }
         ["*", rest @ ..] => match v { Value::Array(a) => a.iter_mut().for_each(|i| leave_out(i, rest)), Value::Object(o) => o.values_mut().for_each(|i| leave_out(i, rest)), _ => {} },
         [first, rest @ ..] => if let Some(i) = v.get_mut(*first) { leave_out(i, rest) },
+    }
+}
+
+impl Served {
+    /// Another request writes the record this control plane is about to write over (a key under `prefix`) just
+    /// before each of its next `times` writes over what it read (`Store::swap`): the record is then what `change` makes
+    /// of what was there (`None`: taken out), and the write finds it changed. (`change` must not reach the store.)
+    pub fn written_meanwhile(&self, prefix: &str, times: u32, change: impl Fn(Option<&str>) -> Option<String> + Send + Sync + 'static) {
+        self.store.1.lock().unwrap().push((prefix.to_string(), times, Arc::new(change)))
+    }
+
+    /// From now on the store refuses to write any record under `prefix` (as a store over its limit does); `None`:
+    /// writes everything again.
+    pub fn store_refuses(&self, prefix: Option<&str>) {
+        let mut r = self.store.2.lock().unwrap();
+        match prefix { Some(p) => r.push(p.to_string()), None => r.clear() }
     }
 }

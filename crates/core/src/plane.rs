@@ -1020,7 +1020,8 @@ pub const RUN_EVENT_BYTES: usize = 64 * 1024;
 /// A run from a computer's event, in its `github` context: its payload (`github.event`), and for a pull request its
 /// branches (`head_ref`, `base_ref`), as GitHub gives them.
 fn run_event(github: &mut serde_json::Value, run: &serde_json::Value) {
-    if run["event"].is_object() { github["event"] = run["event"].clone() }
+    // (Its record has one always, an object: see `create_run`.)
+    github["event"] = run["event"].clone();
     if run["event_name"] == "pull_request" {
         github["head_ref"] = run["event"]["pull_request"]["head"]["ref"].as_str().unwrap_or_default().into();
         github["base_ref"] = run["event"]["pull_request"]["base"]["ref"].as_str().unwrap_or_default().into();
@@ -2685,9 +2686,10 @@ impl<'a> ControlPlane<'a> {
             if done == budget { self.store.put("reindex-at", key).await?; return Ok(false) }
             let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
             let add = self.counting(&mut j);
-            if self.store.swap_until(&key, Some(&v), serde_json::to_string(&j).map_err(|e| e.to_string())?, Self::job_end(&j, now)).await? {
-                self.indexes(&key, &j, true, add).await?;
-            }
+            let wrote = self.store.swap_until(&key, Some(&v), serde_json::to_string(&j).map_err(|e| e.to_string())?, Self::job_end(&j, now)).await?;
+            // (Written meanwhile by another request, which counted it: indexed all the same, as only a first write
+            // makes its indexes.)
+            self.indexes(&key, &j, true, add.filter(|_| wrote)).await?;
             done += 1;
         }
         self.store.put(INDEXED, now.to_string()).await?;
@@ -4147,7 +4149,7 @@ impl<'a> ControlPlane<'a> {
         c.insert("github".into(), github);
         c.insert("vars".into(), vars.into());
         // (A called workflow's job: what its caller gives; else a manual start's.)
-        c.insert("inputs".into(), if job["inputs"].is_object() { job["inputs"].clone() } else if run["inputs"].is_object() { run["inputs"].clone() } else { serde_json::json!({}) });
+        c.insert("inputs".into(), if job["inputs"].is_object() { job["inputs"].clone() } else { run["inputs"].clone() });
         c.insert("matrix".into(), job["matrix"].clone());
         c.insert("strategy".into(), serde_json::json!({ "fail-fast": true, "job-index": job["index"], "job-total": job["total"], "max-parallel": job["total"] }));
         c.insert("needs".into(), serde_json::Value::Object(needs.clone()));
@@ -5055,8 +5057,8 @@ impl<'a> ControlPlane<'a> {
         if cache::add_machine(self.store, &token, &cache::Machine { region: region.to_string(), arch: arch.to_string(), until, runner: runner.to_string(), job: job.to_string() }).await.is_err() { return (user_data, false, false) }
         let link = format!("{plane_url}/cache/{token}");
         let with = if os == "windows" { aws::with_cache_windows(user_data.clone(), &link) } else if runner.starts_with("gl:") { aws::with_cache_gitlab(user_data.clone(), &link) } else { aws::with_cache(user_data.clone(), &link) }.unwrap_or(user_data);
-        // (GitHub's jobs only: GitLab's machines start Docker otherwise.)
-        let images = images && os == "linux" && !runner.starts_with("gl:") && !self.config.routing.cache.images_off && self.layers_ready(region, arch, creds, now).await;
+        // (GitHub's jobs only: GitLab's machines start Docker otherwise. `images` is a Linux machine's only: see `start`.)
+        let images = images && !runner.starts_with("gl:") && !self.config.routing.cache.images_off && self.layers_ready(region, arch, creds, now).await;
         let Some(Ok(kept)) = images.then(|| aws::with_keep(with.clone())) else { return (with, false, false) };
         match setup.then(|| aws::with_layers(kept.clone())) { Some(Ok(w)) => (w, true, true), _ => (kept, false, true) }
     }

@@ -31,6 +31,8 @@ struct Lab {
     no_project: bool,
     /// The token's user maintains no project (`maintains_none`).
     maintains_none: bool,
+    /// What each runner's token ends with (`runner_tokens_end_with`).
+    token_end: String,
 }
 
 #[derive(Clone, Default)]
@@ -181,7 +183,7 @@ impl GitLab {
                 let rid = 55_000_000 + lab.next;
                 let tags: Vec<String> = form.get("tag_list").map(|t| t.split(',').map(str::to_string).collect()).unwrap_or_default();
                 lab.runners.insert(rid, (tags, false));
-                ok(201, json!({ "id": rid, "token": format!("runner-token-for-tests-{rid}"), "token_expires_at": null }))
+                ok(201, json!({ "id": rid, "token": format!("runner-token-for-tests-{rid}{}", lab.token_end), "token_expires_at": null }))
             }
             ("PUT", ["runners", rid]) => {
                 let rid: u64 = rid.parse().ok()?;
@@ -205,4 +207,7 @@ impl GitLab {
     pub fn reach_no_project(&self, none: bool) { self.lab.lock().unwrap().no_project = none }
     /// From now on the token's user maintains no project: GitLab lists none to turn on.
     pub fn maintains_none(&self) { self.lab.lock().unwrap().maintains_none = true }
+    /// From now on each runner made is given a token that ends with `end` (one GitLab might give, of characters a
+    /// shell reads).
+    pub fn runner_tokens_end_with(&self, end: &str) { self.lab.lock().unwrap().token_end = end.to_string() }
 }

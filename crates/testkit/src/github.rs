@@ -59,6 +59,8 @@ struct Hub {
     meta: BTreeMap<String, Vec<(String, String)>>,
     /// The buckets made (`PUT` on a bucket's root).
     buckets: std::collections::BTreeSet<String>,
+    /// Answers given as they are to a method on exactly this path (see `answer_at`).
+    exact: Vec<(String, String, u16, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -509,6 +511,10 @@ impl GitHub {
     /// `f` run each time a call with this method is made to an address with `part` in it (of GitHub's, GitLab's, S3's,
     /// AWS's), before it is answered: what another request does meanwhile.
     pub fn during(&self, method: &str, part: &str, f: impl Fn() + Send + Sync + 'static) { self.during.lock().unwrap().push((method.to_string(), part.to_string(), Arc::new(f))) }
+
+    /// What a call with `method` to exactly this path (`/app`, not `/app/installations`) answers from now on: this
+    /// status, this body.
+    pub fn answer_at(&self, method: &str, path: &str, status: u16, body: &str) { self.hub.lock().unwrap().exact.push((method.into(), path.into(), status, body.into())) }
 }
 
 #[async_trait(?Send)]
@@ -522,6 +528,8 @@ impl Http for GitHub {
         self.asked.lock().unwrap().push(format!("{} {}", r.method, r.url));
         let failed = self.hub.lock().unwrap().failing.iter().find(|(m, part, ..)| *m == r.method && r.url.contains(part.as_str())).map(|(_, _, s, a)| (*s, a.clone()));
         if let Some((status, answer)) = failed { return Ok(Response::new(status, "application/json", answer)) }
+        let exact = url::Url::parse(&r.url).ok().and_then(|u| self.hub.lock().unwrap().exact.iter().find(|(m, p, ..)| *m == r.method && u.path() == p).map(|(_, _, s, b)| (*s, b.clone())));
+        if let Some((status, body)) = exact { return Ok(Response::new(status, "application/json", body)) }
         let scripted = self.hub.lock().unwrap().scripted.iter().find(|(m, part, ..)| *m == r.method && r.url.contains(part.as_str())).cloned();
         if let Some((_, _, status, headers, body)) = scripted {
             let mut res = Response::new(status, "application/json", body);

@@ -15,6 +15,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A secret taken out that the control plane still has half a minute later is said as that, as a new value not taken is. `superci secrets delete` and Settings said it was taken out, and runs went on getting it.
 - A control plane standing by for a move that was not finished, found in the account by a dashboard that did not know of it, is listed with the CI's control planes, where the move can be finished. It was listed as another CI, which nothing here could move to or delete.
 - The dashboard takes a port only when it is free on both of this computer's loopback addresses. Taken on one (another program on 127.0.0.1, as `wrangler login` has 8976), it started on the other alone, where a browser opening localhost could reach that program instead, Cloudflare's sign-in among them; and `superci dashboard` with SUPERCI_PORT named it in use only where IPv6 is off.
+- A job written by another request just as a control plane made the indexes of the jobs it kept from before them is listed among the newest jobs. It was left out of them, and of the dashboard's list of jobs, until its record went. Update your control plane for it.
 
 ## 0.19.18 — 2026-10-19
 - A change's note in the dashboard ("Removed Cloudflare. Left: …") is shown once its page has loaded. A page still loading took it, and it was not shown.
