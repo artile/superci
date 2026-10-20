@@ -1510,6 +1510,20 @@ fn a_control_plane_with_nothing_connected_lists_no_permissions() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A control plane from before its App asked for Actions (0.9.29): its update says it also asks for that one new
+/// permission in GitHub, beside AWS's.
+#[test]
+fn an_update_from_before_actions_says_it_asks_for_one_new_permission_in_github() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.answer_as("0.9.28", &[]);
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("its update", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Your control plane runs 0.9.28. Changelog It also asks for 5 new permissions in AWS, 1 new permission in GitHub."));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
