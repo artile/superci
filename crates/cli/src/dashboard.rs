@@ -3300,7 +3300,7 @@ impl Dashboard {
                 eprintln!("Deploying the Modal launcher (the first time builds a small image in your workspace)…");
                 let url = modal::deploy_runners(&session, plane.url(), plane.plane_id(), &keys)?;
                 // Its first answer can take a few seconds (a cold start).
-                for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(std::time::Duration::from_secs(3)) }
+                for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } aws::pause(3000) }
                 launchers.retain(|a| a.cloud != "modal");
                 launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
                 self.put_secret(&plane, "LAUNCHERS", &serde_json::to_string(&launchers).map_err(|e| e.to_string())?)?;
@@ -7081,7 +7081,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
                 _ => {
                     let keys: serde_json::Value = ureq::get(&crate::aws::stand_in(&format!("{}/.well-known/jwks.json", to.url()))).call().map_err(|e| e.to_string())?.body_mut().read_json().map_err(|e| e.to_string())?;
                     let url = modal::deploy_runners(w.modal.as_ref().ok_or("Sign in with Modal first.")?, to.url(), to.plane_id(), &keys)?;
-                    for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } std::thread::sleep(Duration::from_secs(3)) }
+                    for _ in 0..20 { if ureq::get(&crate::aws::stand_in(&format!("{url}/health"))).call().is_ok_and(|r| r.status() == 200) { break } aws::pause(3000) }
                     launchers.retain(|a| a.cloud != "modal");
                     launchers.push(superci_core::plane::Launcher { cloud: "modal".into(), url });
                 }
@@ -7097,7 +7097,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
                 w.put(to, "AWS_CONNECT", &serde_json::json!({ "region": region, "token": token }).to_string())?;
                 let report = serde_json::json!({ "token": token, "accountId": account, "region": region, "roleArn": role_arn });
                 let mut done = Err(String::new());
-                for _ in 0..12 { done = report_to_plane(to.url(), &report); if done.is_ok() { break } std::thread::sleep(Duration::from_secs(3)) }
+                for _ in 0..12 { done = report_to_plane(to.url(), &report); if done.is_ok() { break } aws::pause(3000) }
                 done.map_err(|e| format!("AWS runners: {e}"))?;
             },
             Carry::Cannot(p, why) => left.push(format!("{} runners stayed behind: {why}.", cloud_name(p))),
@@ -7160,7 +7160,7 @@ fn report_to_plane(plane_url: &str, report: &serde_json::Value) -> Result<()> {
         if r.status().as_u16() == 200 && v["connected"] == true { return Ok(()) }
         if r.status().as_u16() != 200 { return Err(format!("the control plane refused the connection: {text}")) }
         last = v["error"].as_str().unwrap_or("not connected").to_string();
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        aws::pause(5000);
     }
     Err(format!("the role exists but the control plane could not use it yet: {last}"))
 }
@@ -7170,14 +7170,14 @@ fn report_to_plane(plane_url: &str, report: &serde_json::Value) -> Result<()> {
 fn wait_for_version(url: &str, version: &str) {
     for _ in 0..60 {
         if cloudflare::health(url).is_some_and(|h| h["version"] == version) { return }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        aws::pause(2000);
     }
 }
 
 fn wait_online(url: &str) {
     for _ in 0..30 {
         if cloudflare::health(url).is_some() { return }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        aws::pause(2000);
     }
 }
 

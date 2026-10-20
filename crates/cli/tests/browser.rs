@@ -2064,6 +2064,276 @@ fn an_update_for_a_role_that_lacks_only_a_read_permission_says_it_asks_for_a_rea
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A change that fails while Modal's sign-in kept here has ended: said as what failed, not as Modal's sign-in.
+#[test]
+fn a_change_that_fails_while_modals_sign_in_has_ended_is_said_as_it_is() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["modal_ended"] = true.into();
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    let (status, _, said) = common::post(&link, "/plane/move", &[("plane", "nosuchplane1")]);
+    let said = common::words(&said);
+    assert!(status == 500 && said.contains("That control plane is not known here") && !said.contains("Modal"), "{status} {said}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS's runners connected to a control plane that does not take their role at first, then refuses the connection:
+/// asked again while it says it is not connected yet, and its refusal said.
+#[test]
+fn aws_runners_connected_to_a_control_plane_that_then_refuses_the_role_say_its_refusal() {
+    let served = serve(|_| {});
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n = asked.clone();
+    let plane = superci_testkit::front(&served.url, move |method, target, status, body| {
+        if method != "POST" || !target.starts_with("/aws/callback") { return (status, body) }
+        match n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => (200, br#"{"connected":false,"error":"the role is not there yet"}"#.to_vec()),
+            _ => (409, b"no AWS connection in progress".to_vec()),
+        }
+    });
+    // (Found in the account at the address in front of it too.)
+    *served.aws.plane_url.lock().unwrap() = plane.clone();
+    let home = signed_in(&served);
+    common::kept_at(&home, &plane);
+    // Its machines' network in the region and the two nearest, as AWS answered one; IAM taking the role.
+    let network: String = include_str!("../fixtures/aws/regions/add.jsonl").lines().filter(|l| !l.contains(".s3.")).map(|l| format!("{l}\n")).collect();
+    for r in ["eu-north-1", "eu-central-1", "eu-west-1"] { served.aws.replaying(&network, &[("mixplane0001", PLANE), ("eu-north-1", r)]) }
+    let iam_ok = r#"<Response xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></Response>"#;
+    served.aws.fail("CreateOpenIDConnectProvider", 409, r#"<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><Error><Type>Sender</Type><Code>EntityAlreadyExists</Code><Message>EntityAlreadyExists</Message></Error><RequestId>1</RequestId></ErrorResponse>"#, None);
+    for a in ["CreateRole", "UpdateAssumeRolePolicy", "PutRolePolicy", "CreateServiceLinkedRole"] { served.aws.fail(a, 200, iam_ok, None) }
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, _, said) = common::post(&link, "/aws/connect", &[("region", "eu-north-1")]);
+    let said = common::words(&said);
+    assert!(status == 500 && said.contains("the control plane refused the connection: no AWS connection in progress"), "{status} {said}");
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Several workspaces kept and none named: one not opened yet renamed to an id something else has there is
+/// refused, nothing changed; and once none is left on disk, a page that names none goes to the list.
+#[test]
+fn with_several_workspaces_a_rename_to_a_taken_id_is_refused_and_a_page_with_none_left_goes_to_the_list() {
+    let home = common::temp("several");
+    for w in ["alpha", "beta"] { std::fs::create_dir_all(home.join("workspaces").join(w)).unwrap() }
+    std::fs::write(home.join("workspaces/gamma"), "not a workspace").unwrap();
+    let (mut child, link) = common::dashboard_args(&home, &[], &[]);
+    let (status, _, said) = common::post(&link, "/workspaces/rename", &[("w", "beta"), ("id", "gamma")]);
+    assert!(status == 400 && common::words(&said).contains("There is a workspace with the id gamma already"), "{status} {}", common::words(&said));
+    assert!(home.join("workspaces/beta").is_dir());
+    for w in ["alpha", "beta"] { std::fs::remove_dir_all(home.join("workspaces").join(w)).unwrap() }
+    let (status, to, _) = common::get(&link, "/");
+    assert!((300..400).contains(&status) && to == "/workspaces", "{status} {to}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A key kept from before each control plane had one of its own, in a workspace whose clouds hold no control plane
+/// and that handed it to none: replaced by a key of this computer's at the first look.
+#[test]
+fn a_key_from_before_handed_to_no_control_plane_is_replaced_when_there_is_none() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["key"] = serde_json::json!({ "name": "DEVICE_KEY_4102444800_OLD", "value": "a-key-from-before-0001", "planes": [] });
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    let kept = || serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap_or_default()).unwrap_or_default();
+    until("the key replaced", || { common::part(&link, "/?p=plane&fragment=1"); kept()["key"]["value"].as_str().is_some_and(|v| v.starts_with("superci-folder-")) });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A key another SuperCI on this computer wrote while this one looked in AWS, ending within a day: not taken for
+/// the control plane that lacks this one's key, which is handed a new one.
+#[test]
+fn a_key_written_meanwhile_that_ends_within_a_day_is_not_taken_and_a_new_one_is_handed_over() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let soon = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
+    let write_soon = { let file = file.clone(); move || {
+        let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        k["key"] = serde_json::json!({ "name": format!("DEVICE_KEY_{soon}_SOON"), "value": "dashboard-key-for-tests-0001", "planes": [] });
+        std::fs::write(&file, k.to_string()).unwrap();
+    } };
+    // (None kept when it starts; written as AWS is looked in: after this one kept its own state, before it hands its
+    // key over.)
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k.as_object_mut().unwrap().remove("key");
+    std::fs::write(&file, k.to_string()).unwrap();
+    let once = std::sync::atomic::AtomicBool::new(false);
+    served.aws.during("ListRoles", move || if !once.swap(true, std::sync::atomic::Ordering::SeqCst) { write_soon() });
+    let (mut child, link) = dashboard(&home);
+    let keys = || served.aws.settings(PLANE).into_iter().filter(|(n, _)| n.starts_with("DEVICE_KEY_") && n != "DEVICE_KEY_4102444800_TEST").map(|(n, _)| n).collect::<Vec<_>>();
+    until("a new key handed over", || { common::part(&link, "/?p=overview&fragment=1"); keys().iter().any(|n| !n.ends_with("_SOON")) });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Sign-ins started in the terminal, done: one more AWS account beside the one there says AWS's; with no cloud
+/// named, two signed in by then (one taken from another terminal's sign-in) says neither.
+#[test]
+fn a_sign_in_from_the_terminal_says_the_cloud_it_was_for_or_none_when_two_came() {
+    use std::io::BufRead;
+    let started = |home: &std::path::Path, args: &[&str]| -> (std::process::Child, String) {
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut child = common::command(home).args(args).args(["--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { let _ = tx.send(l); });
+        let link = loop { let l = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("its link"); if let Some(w) = l.split_whitespace().find(|w| w.starts_with("http://localhost")) { break w.to_string() } };
+        (child, link)
+    };
+    let aws_sign_in = |link: &str| {
+        let (_, to, page) = common::post(link, "/aws/signin", &[("next", ""), ("w", "default")]);
+        let at = if to.is_empty() { page } else { to };
+        let state = at.split("state=").nth(1).and_then(|r| r.split(['&', '"']).next()).expect("a state").to_string();
+        let (status, _, done) = common::get(link, &format!("/oauth/callback?code=a-code-from-aws&state={state}"));
+        assert!(status < 400 && common::words(&done).contains("Signed in with AWS"), "{status} {}", common::words(&done));
+    };
+    let served = serve(|_| {});
+    served.aws.replaying(&[include_str!("../fixtures/aws/sign-in/sign-in.jsonl"), include_str!("../fixtures/aws/sign-in/renew.jsonl")].concat(), &[]);
+    // One more AWS account: done once it came.
+    let home = signed_in(&served);
+    let (mut child, link) = started(&home, &["login", "aws", "--add"]);
+    aws_sign_in(&link);
+    let page = common::words(&common::get(&link, "/").2);
+    assert!(page.contains("Signed in with AWS"), "{page}");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&home);
+    // Any cloud: Cloudflare signed in from another terminal meanwhile, then AWS here.
+    let home = common::temp("login-any");
+    std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+    let (mut child, link) = started(&home, &["login"]);
+    std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), serde_json::json!({ "cloudflare": { "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" } }).to_string()).unwrap();
+    aws_sign_in(&link);
+    let page = common::words(&common::get(&link, "/").2);
+    assert!(page.contains("Signed in SuperCI stays signed in") && !page.contains("Signed in with"), "{page}");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A dashboard on a computer where SuperCI keeps nothing (no home folder), given a Modal token for the run: the CI
+/// it finds there taken, read and named as it says, and its Settings without a workspace to rename.
+#[test]
+fn a_dashboard_that_keeps_nothing_takes_a_ci_found_with_a_modal_token_and_shows_its_settings() {
+    let account = superci_testkit::Aws::serve();
+    let acct = account.clone();
+    let md = superci_testkit::serve_as("mdplane00001", move |c| { c.read_settings(&acct.modal_plane_settings()); c.own_cloud = "modal".into(); });
+    md.connect_github();
+    account.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00001.modal.run".into(), md.url.clone());
+    account.replaying(include_str!("../fixtures/modal/03-use.jsonl"), &[]);
+    account.replaying(&[common::modal_answered("DictGetOrCreate", &[common::pb(&[common::Pb::B(1, b"di-settings".to_vec())])]), common::modal_answered("DictUpdate", &[common::pb(&[common::Pb::N(1, 1)])]), common::modal_answered("WorkspaceNameLookup", &[common::pb(&[common::Pb::B(2, b"acmeorg".to_vec())])])].concat(), &[]);
+    let home = common::temp("keeps-nothing");
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    let (mut child, link) = common::dashboard_args(&home, &["--workspace=default"], &[("SUPERCI_HOME", ""), ("HOME", ""), ("SUPERCI_MODAL_TOKEN_ID", "ak-modal-for-tests"), ("SUPERCI_MODAL_TOKEN_SECRET", "as-modal-for-tests")]);
+    until("the CI found", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Use this one"));
+    let (status, to, said) = common::post(&link, "/plane/join", &[("plane", "mdplane00001")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    let settings = || common::words(&common::part(&link, "/?p=settings&fragment=1").1);
+    until("its settings", || settings().contains("What your CI is called"));
+    assert!(!settings().contains("Its id: what --workspace takes"), "{}", settings());
+    assert!(!home.join("workspaces").exists());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Modal runners' month as Modal bills a workspace that was metered nothing yet but billed something (a plan's
+/// base fee): SuperCI's share of it said as nothing billed.
+#[test]
+fn modal_runners_month_with_nothing_metered_but_something_billed_says_no_share_billed() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners-testplane0001.modal.run"}]"#);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    use common::{modal_answered, pb, Pb};
+    served.aws.replaying(include_str!("../fixtures/modal/05-dashboard.jsonl"), &[]);
+    served.aws.replaying(&[modal_answered("WorkspaceBillingSummary", &[pb(&[Pb::B(3, b"0".to_vec()), Pb::B(4, b"2.50".to_vec())])]),
+        modal_answered("WorkspaceBillingReport", &[pb(&[Pb::B(1, b"ap-1".to_vec()), Pb::B(2, b"superci-runners-testplane0001".to_vec()), Pb::B(5, b"1.25".to_vec())])])].concat(), &[]);
+    let (mut child, link) = dashboard(&home);
+    until("its month", || common::words(&common::part(&link, "/?p=runners&fragment=1").1).contains("$1.25 this month · $0.00 billed"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Modal's launcher removed while signed in to Modal, the control plane taking the change: its app in Modal is
+/// stopped too, and nothing is said to be left.
+#[test]
+fn a_modal_launcher_removed_while_signed_in_to_modal_is_stopped_there_and_nothing_left() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/LAUNCHERS"), r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners-testplane0001.modal.run"}]"#);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/modal/07-delete.jsonl"), &[]);
+    let (mut child, link) = dashboard(&home);
+    let (status, to, said) = common::post(&link, "/runners/remove", &[("cloud", "modal")]);
+    assert!(status == 303 && to == "/?p=runners", "{status} {to} {}", common::words(&said));
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(page.contains("Removed Modal.") && !page.contains("Left:"), "{page}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/SandboxCreate"))), "its app stopped in a sandbox");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Modal control plane beside the one in use deleted, as it says it has a Modal launcher of its own (one written
+/// there by hand) and AWS runners in the account signed in to, with a budget there: its launcher is not taken for
+/// another's, and its AWS network and budget are removed with it.
+#[test]
+fn a_modal_control_plane_deleted_beside_the_one_in_use_takes_its_aws_network_and_budget_along() {
+    let served = serve(|_| {});
+    let aws = served.aws.clone();
+    let md = superci_testkit::serve_as("mdplane00001", move |c| { c.read_settings(&aws.modal_plane_settings()); c.own_cloud = "modal".into(); });
+    // (This computer's key in its settings, as a sign-in leaves it there.)
+    served.aws.modal_settings.lock().unwrap().insert("DEVICE_KEY_4102444800_TEST".into(), served.key.clone());
+    let front = superci_testkit::front(&md.url, |method, target, status, body| {
+        if method != "GET" || !target.starts_with("/status") { return (status, body) }
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else { return (status, body) };
+        v["launchers"] = serde_json::json!([{ "cloud": "modal", "url": "https://acmeorg--superci-runners-mdplane00001.modal.run" }]);
+        v["aws"] = serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "connected": true });
+        v["routing"]["aws_budget"] = serde_json::json!({ "monthly_usd": 100 });
+        (status, v.to_string().into_bytes())
+    });
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00001.modal.run".into(), front);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    k["planes_more"] = serde_json::json!([{ "Modal": { "workspace": "acmeorg", "url": "https://acmeorg--superci-plane-mdplane00001.modal.run", "plane_id": "mdplane00001", "label": "superci" } }]);
+    k["key"]["planes"] = serde_json::json!([PLANE, "mdplane00001"]);
+    std::fs::write(&file, k.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/modal/03-use.jsonl"), &[]);
+    let (mut child, link) = dashboard(&home);
+    until("both listed", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Modal · acmeorg"));
+    // (Its network: none left in any region, as EC2 answers that; its budget removed as AWS answered a real one.)
+    served.aws.replaying(include_str!("../fixtures/modal/07-delete.jsonl"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/budget/09-remove.jsonl"), &[("abcdefghijkl", "mdplane00001")]);
+    served.aws.fail("ec2.", 200, r#"<DescribeResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>1</requestId></DescribeResponse>"#, None);
+    let (status, to, said) = common::post(&link, "/plane/delete", &[("plane", "mdplane00001")]);
+    served.aws.fail_none();
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    let page = common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    assert!(page.contains("Deleted Modal · acmeorg.") && !page.contains("Left:"), "{page}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["target"] == "AWSBudgetServiceGateway.DeleteBudget"), "its budget deleted");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
