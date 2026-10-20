@@ -1993,6 +1993,37 @@ fn the_organizations_picture_is_kept_only_as_an_image_and_not_after_signing_out(
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The account section of a project of AWS's new sign-up, activated, whose one region lacks the image jobs run on:
+/// it works there only, and the copy comes first.
+#[test]
+fn an_activated_aws_project_whose_region_lacks_the_image_says_the_copy_comes_first() {
+    let account = superci_testkit::Aws::serve();
+    let none = r#"<?xml version="1.0" encoding="UTF-8"?><DescribeImagesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>00000000-0000-4000-8000-000000000001</requestId><imagesSet/></DescribeImagesResponse>"#;
+    account.fail("DescribeImages|ec2.eu-north-1", 200, none, None);
+    // (Asked whether it may run machines with Amazon's own image there, as it is.)
+    account.fail("AmazonSSM.GetParameter|ssm.eu-north-1", 200, r#"{"Parameter":{"Name":"/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64","Type":"String","Value":"ami-0123456789abcdef0","Version":1}}"#, None);
+    account.replaying(include_str!("../fixtures/aws/project-activated/look.jsonl"), &[]);
+    let home = common::aws_only(&account);
+    let (mut child, link) = common::dashboard(&home);
+    until("the account said", || { let p = common::words(&common::part(&link, "/?p=plane&fragment=1").1); p.contains("it works in Stockholm only. The image jobs run on is not there yet: copying it in comes first.") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitHub Enterprise that says who a name is (a public one): its App made for that organization there, as it said.
+#[test]
+fn github_enterprise_that_says_who_a_name_is_makes_the_app_for_it_as_it_said() {
+    let served = serve(|_| {});
+    served.github.answer_with("GET", "api.acme.ghe.com/users/Acme-Corp", 200, &[], r#"{"login":"acme-corp","type":"Organization"}"#);
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    until("the control plane", || common::words(&common::part(&link, "/?p=repos&fragment=1").1).contains("GitHub"));
+    let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "enterprise"), ("host", "acme.ghe.com"), ("login", "Acme-Corp")]);
+    assert!(status == 200 && form.contains("https://acme.ghe.com/organizations/acme-corp/settings/apps/new"), "{status} {}", common::words(&form));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// An update whose version asks for nothing new, of a control plane whose role was found to lack only what lets it
 /// read: said as that many new read permissions in AWS.
 #[test]
