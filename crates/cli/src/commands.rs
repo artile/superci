@@ -182,7 +182,8 @@ pub struct Done { pub said: Vec<String>, pub data: Value }
 pub const JOB_LINE: &str = "\u{1}";
 
 impl Done {
-    fn said(line: impl Into<String>) -> Done { let line = line.into(); let line = if line.is_empty() { "Done.".to_string() } else { line }; Done { data: json!({ "ok": true, "said": line }), said: vec![line] } }
+    /// (What a change said: each says something.)
+    fn said(line: impl Into<String>) -> Done { let line = line.into(); Done { data: json!({ "ok": true, "said": line }), said: vec![line] } }
 }
 
 /// The command a person runs first, when that is what an error asks for.
@@ -1231,8 +1232,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 ("modal", _) => ("/runners/modal", vec![]),
                 _ => ("/runners/cloudflare", args.get("account").map(|a| vec![field("account", a)]).unwrap_or_default()),
             };
-            let said = apply!(d, args, format!("let {cloud} run jobs for the control plane in use ({})", plane.place()), path, &fields);
-            Ok(Done::said(if said.is_empty() { format!("{cloud} runs jobs now.") } else { said }))
+            // (Done, it says nothing of its own.)
+            apply!(d, args, format!("let {cloud} run jobs for the control plane in use ({})", plane.place()), path, &fields);
+            Ok(Done::said(format!("{cloud} runs jobs now.")))
         }
         ("runners", "delete") => {
             let cloud = w(2);
@@ -1396,8 +1398,9 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let url = args.get("url").unwrap_or("https://gitlab.com");
             let mut d = ready()?;
             in_use(&d)?;
-            let said = apply!(d, args, format!("connect {url} with the token in {name}"), "/gitlab/connect", &[field("url", url), field("token", token), field("which", args.get("gitlab").unwrap_or_default())]);
-            Ok(Done::said(if said.is_empty() { "GitLab is connected. Its projects send jobs here once switched on: `superci projects list`, then `superci projects update PROJECT_ID --enabled=true`.".to_string() } else { said }))
+            // (Done, it says nothing of its own.)
+            apply!(d, args, format!("connect {url} with the token in {name}"), "/gitlab/connect", &[field("url", url), field("token", token), field("which", args.get("gitlab").unwrap_or_default())]);
+            Ok(Done::said("GitLab is connected. Its projects send jobs here once switched on: `superci projects list`, then `superci projects update PROJECT_ID --enabled=true`."))
         }
         ("projects", "list") => {
             let mut d = signed_in();

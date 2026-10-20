@@ -134,7 +134,8 @@ impl Client {
         crate::aws::record(&superci_core::io::Request::new("POST", &format!("{API}/modal.client.ModalClient/{method}")).with_body(format!("({asked} bytes)").into_bytes()), status, &[], answer.to_string().as_bytes());
     }
 
-    fn request<T>(&self, message: T, with_auth: bool) -> tonic::Request<T> {
+    /// (With the sign-in's token once it has one: every call after `AuthTokenGet`, which is asked before any other.)
+    fn request<T>(&self, message: T) -> tonic::Request<T> {
         let mut r = tonic::Request::new(message);
         let m = r.metadata_mut();
         let set = |m: &mut tonic::metadata::MetadataMap, k: &'static str, v: &str| { if let Ok(v) = MetadataValue::try_from(v) { m.insert(k, v); } };
@@ -146,7 +147,7 @@ impl Client {
             set(m, "x-modal-token-id", &s.token_id);
             set(m, "x-modal-token-secret", &s.token_secret);
         }
-        if with_auth { if let Some(t) = &self.auth_token { set(m, "x-modal-auth-token", t); } }
+        if let Some(t) = &self.auth_token { set(m, "x-modal-auth-token", t); }
         r
     }
 
@@ -158,7 +159,7 @@ impl Client {
         }
         #[cfg(debug_assertions)]
         let asked = message.encoded_len();
-        let req = self.request(message, authed);
+        let req = self.request(message);
         let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
         let mut grpc = tonic::client::Grpc::new(self.channel.clone().ok_or("Modal: no connection")?);
         let got: Result<R> = self.rt.block_on(async {
@@ -174,7 +175,7 @@ impl Client {
     fn stream<Q: prost::Message + Send + Sync + 'static, R: prost::Message + Default + Send + Sync + 'static>(&mut self, method: &'static str, message: Q, limit: usize) -> Result<Vec<R>> {
         #[cfg(debug_assertions)]
         let asked = message.encoded_len();
-        let req = self.request(message, true);
+        let req = self.request(message);
         let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
         let mut grpc = tonic::client::Grpc::new(self.channel.clone().ok_or("Modal: no connection")?);
         let got: Result<Vec<R>> = self.rt.block_on(async {

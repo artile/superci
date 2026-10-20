@@ -68,8 +68,9 @@ pub struct Key { pub name: String, pub value: String, pub planes: Vec<String> }
 
 impl Kept {
     pub fn signed_in(&self) -> bool { self.cloudflare.is_some() || self.aws.is_some() || !self.aws_more.is_empty() || self.modal.is_some() }
-    /// Worth keeping: a sign-in, or what is left of one AWS ended (the control plane and the key it is read with).
-    pub fn worth_keeping(&self) -> bool { self.signed_in() || ((self.aws_ended || self.cloudflare_ended || self.modal_ended) && self.key.is_some() && self.plane.is_some()) }
+    /// Worth keeping: a sign-in, or what is left of one that ended (the control plane, and the key it is read with:
+    /// what the dashboard keeps always has one).
+    pub fn worth_keeping(&self) -> bool { self.signed_in() || ((self.aws_ended || self.cloudflare_ended || self.modal_ended) && self.plane.is_some()) }
 }
 
 #[derive(Clone)]
@@ -164,9 +165,10 @@ pub fn last_opened(root: &std::path::Path) -> Option<String> {
     workspaces_in(root).into_iter().find(|w| *w == name)
 }
 
-/// Notes the workspace the dashboard shows now (see `last_opened`).
+/// Notes the workspace the dashboard shows now (see `last_opened`): one kept here, or the one it was started in, so
+/// its name is a workspace's id.
 pub fn note_opened(root: &std::path::Path, name: &str) {
-    if valid_id(name).is_ok() { let _ = write_private(&root.join("last-workspace"), name.as_bytes()); }
+    let _ = write_private(&root.join("last-workspace"), name.as_bytes());
 }
 
 /// Whether a workspace is kept under `root` (the first one is there before it keeps anything, when no other is).
