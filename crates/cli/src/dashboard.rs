@@ -2948,7 +2948,8 @@ impl Dashboard {
                 if let Some(d) = stopped.filter(|d| d.cloud == "aws") {
                     let value = |name: &str| d.form.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone()).unwrap_or_default();
                     let (region, plane, account) = (value("region"), value("plane"), d.place.strip_prefix("account ").and_then(|p| p.split(' ').next()).unwrap_or_default().to_string());
-                    if !plane.is_empty() && !region.is_empty() && self.hold_account(&account) {
+                    // (Its form always has both: an AWS deploy is started with its region and its id.)
+                    if self.hold_account(&account) {
                         if let Ok(creds) = self.aws_creds() {
                             let left = aws_plane::abandon(&creds, &region, &plane);
                             println!("POST /plane/start-over → what the stopped deploy made in AWS account {account} is removed{}", if left.is_empty() { String::new() } else { format!(", but for {}", left.join("; ")) });
