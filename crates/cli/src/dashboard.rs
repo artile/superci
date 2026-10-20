@@ -5229,13 +5229,13 @@ fn where_choices(name: &str, public: (&str, &str), own: (&str, &str), field: &st
 <div class="perm-field" data-own hidden>{field}</div>"#, public.0, public.1, own.0, own.1)
 }
 
-/// The organizations (and GitLabs) whose jobs a control plane runs, in words: "GitHub: acme, GitLab: gitlab.com".
+/// The organizations (and GitLabs) whose jobs a control plane runs, in words: "GitHub: acme, GitLab: gitlab.com". (Of
+/// one that serves a code host of its own: GitHub's or GitLab's.)
 fn serves(v: &PlaneView) -> String {
     let st = v.status.clone().unwrap_or_default();
     let mut what: Vec<String> = status_apps(&st).iter().filter_map(|a| a["owner"].as_str().map(|o| format!("GitHub: {o}"))).collect();
     what.extend(v.gitlabs().into_iter().map(|(_, url, _)| format!("GitLab: {}", url.trim_start_matches("https://"))));
-    if what.is_empty() && v.github { what.push("GitHub".into()) }
-    if what.is_empty() && v.gitlab { what.push("GitLab".into()) }
+    if what.is_empty() { what.push(if v.github { "GitHub" } else { "GitLab" }.into()) }
     what.join(", ")
 }
 
