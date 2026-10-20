@@ -1857,6 +1857,80 @@ fn a_workspace_whose_name_cannot_be_kept_still_names_its_control_plane() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// GitHub's App made where it is installed already (GitHub keeps the installation): Repositories says it is
+/// connected at once, not on its way; GitHub coming back from installing it twice is taken by this workspace both
+/// times.
+#[test]
+fn an_app_made_where_it_is_installed_already_is_said_connected_at_once() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = dashboard(&home);
+    let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "acme")]);
+    assert_eq!(status, 200, "{}", common::words(&form));
+    let state = form.split("state=").nth(1).unwrap().split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap().to_string();
+    assert_eq!(common::get(&link, &format!("/github/callback?code=a1b2c3d4e5f6&state={state}")).0, 303);
+    let (_, html) = common::part(&link, "/?p=repos&fragment=1");
+    assert!(!html.contains("Connecting GitHub") && common::words(&html).contains("Jobs from acme (all repositories) Connected"), "{}", common::words(&html));
+    for _ in 0..2 {
+        let (status, _, page) = common::get(&link, "/github/installed?installation_id=1&setup_action=install");
+        assert!(status < 400 && common::words(&page).contains("Installed on GitHub"), "{status} {}", common::words(&page));
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane from before it listed its Apps, its App's details not read: Repositories says the one App as
+/// its public state says it, connected while installed, else to install.
+#[test]
+fn a_control_plane_that_lists_no_apps_shows_its_one_app_installed_or_to_install() {
+    for (installed, shows) in [(true, "Connected"), (false, "exists; install it where your runners should take jobs")] {
+        let served = serve(|_| {});
+        if !installed { served.github.set_installed(false, true) }
+        served.connect_github();
+        served.answer_as("", &["apps", "app"]);
+        let home = home(&served);
+        let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+        until(shows, || { let r = common::words(&common::part(&link, "/?p=repos&fragment=1").1); r.contains(shows) && !r.contains("Another organization") });
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// A control plane to move to in the AWS account signed in to, the one in use in Cloudflare, not signed in to: its
+/// row asks for the sign-in the move needs, not a move.
+#[test]
+fn a_place_to_move_to_while_the_one_in_use_is_in_a_cloud_not_signed_in_to_asks_for_that_sign_in() {
+    let served = serve(|_| {});
+    let used = superci_testkit::serve_as("cfplane00001", |_| {});
+    used.connect_github();
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["planes_more"] = serde_json::json!([k["plane"].clone()]);
+    k["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": used.url, "plane_id": "cfplane00001", "label": "superci" } });
+    k["key"]["planes"] = serde_json::json!([PLANE, "cfplane00001"]);
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    until("its row", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&format!("AWS · 111111111111 · us-east-1 {} Sign in with Cloudflare", served.url)));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS runners of a control plane from before it said its regions or its account: their places in the order say
+/// what they start, and no region.
+#[test]
+fn aws_runners_of_a_control_plane_that_says_no_region_name_none() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.answer_as("", &["aws_regions", "aws"]);
+    let home = home(&served);
+    let (mut child, link) = dashboard(&home);
+    until("the order", || { let p = common::words(&common::part(&link, "/?p=runners&fragment=1").1); p.contains("Spot machines of any size · x64, arm64") && !p.contains("x64, arm64 ·") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// An update whose version asks for nothing new, of a control plane whose role was found to lack only what lets it
 /// read: said as that many new read permissions in AWS.
 #[test]

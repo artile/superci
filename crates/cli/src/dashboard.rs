@@ -5888,7 +5888,7 @@ fn clouds_card(v: &PlaneView, signed_in: &[&str]) -> String {
         dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{n}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="account"><input type="hidden" name="cloud" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div>{field}<div class="dlg-foot">{remove}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button>{save}</div></form></dialog>{}"#,
             esc(cloud), logo(cloud, 36), esc(&title), esc(&what), remove_dialog(v, cloud, n, signed_in)));
     }
-    if rows.is_empty() { return String::new() }
+    // (Shown beside the order, which has a place for each of these clouds: never without a row.)
     format!(r#"<section class="card"><div class="card-head"><h2>Clouds</h2></div><p class="note">The accounts your runners start machines in. Removing one deletes what SuperCI made there.</p><ol class="pools">{rows}</ol>{dialogs}</section>"#)
 }
 
