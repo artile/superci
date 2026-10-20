@@ -2040,11 +2040,6 @@ fn a_modal_deploy_says_how_modals_sandbox_ended_and_its_image_build_failed_and_g
     let env = modal_answered("EnvironmentGetOrCreate", &[pb(&[Pb::B(1, b"en-main".to_vec()), Pb::B(2, pb(&[Pb::B(1, b"main".to_vec()), Pb::B(2, pb(&[Pb::B(1, b"2025.06".to_vec()), Pb::B(2, b"modal.run".to_vec())]))]))])]);
     let (ok, said) = deploy("mdplane00001", &[env, image_built, modal_answered("SandboxWait", &[pb(&[Pb::B(1, modal_result(1, "", 0))])])]);
     assert!(ok && said.contains("The control plane is running: https://acmeorg--superci-plane-mdplane00001.modal.run (Modal · acmeorg)"), "{said}");
-    // Its settings written as Modal's client writes them: a long one in pickle's longer form.
-    served.aws.replaying(include_str!("../fixtures/modal/02-deploy.jsonl"), &[]);
-    served.aws.replaying(include_str!("../fixtures/modal/03-use.jsonl"), &[]);
-    let secret = |value: &str| { let o = common::command(&home).args(["secrets", "create", "LONG_ONE", "--value-env=V", "--plane=mdplane00001"]).env("V", value).output().unwrap(); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
-    let (ok, said) = secret(&"x".repeat(400));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -2188,5 +2183,47 @@ fn a_cloudflare_control_plane_says_an_address_cloudflare_never_gave_drops_contai
     assert!(!ok && said.contains("An unknown error has occurred"), "{said}");
     let (ok, said) = run(&delete, &[answered(&worker, "", "", 404, serde_json::json!({ "success": false, "errors": [{ "code": 0, "message": "Worker Not Found" }], "result": null }))], &["planes", "delete", "cfplane00001", "--confirm"]);
     assert!(ok && said.contains("Deleted Cloudflare · Acme."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An AWS control plane's deploy as AWS answered a real one, but where it did not: Lambda refusing to make the
+/// function or its converter for want of a role, until it refuses for another reason (said as it said it) or for
+/// as long as it is asked (said, the last refusal); and the function made but failed to update.
+#[test]
+fn an_aws_deploy_says_what_lambda_refused_of_the_function_and_its_converter_and_a_function_that_failed_to_update() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    let recording = include_str!("../fixtures/aws/planes/deploy.jsonl").replace("testplane0002", "deployplane1");
+    let deploy = |overlay: &[serde_json::Value]| {
+        account.replaying(&recording, &[]);
+        if !overlay.is_empty() { account.replaying(&overlay.iter().map(|v| v.to_string() + "\n").collect::<String>(), &[]) }
+        let o = common::command(&home).args(["planes", "create", "aws", "--region=us-east-1"]).env("SUPERCI_NEW_PLANE_ID", "deployplane1").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        account.fail_none();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    // (Lambda's refusal to make a function, as Lambda words it: the control plane's, or its converter's.)
+    let refuse = |which: &str, message: &str, times: Option<u32>| account.fail(&format!("2015-03-31/functions|\"Handler\"|{which}"), 400, &serde_json::json!({ "Type": "User", "message": message }).to_string(), times);
+    let creates = || account.asked.lock().unwrap().iter().filter(|a| a["method"] == "POST" && a["url"].as_str().is_some_and(|u| u.ends_with("/2015-03-31/functions"))).count();
+    let not_yet = "The role is still being made: try again in a few seconds.";
+    let other = "Unsupported architecture for provided.al2023 here.";
+    let cannot = "The role defined for the function cannot be assumed by Lambda.";
+    // A role not ready, then another refusal; then a role never assumed: the function's, then its converter's.
+    for (which, made_first) in [("SuperCI control plane", 0), ("layer store converter", 1)] {
+        refuse(which, not_yet, Some(1));
+        refuse(which, other, Some(1));
+        let (ok, said) = deploy(&[]);
+        assert!(!ok && said.contains(other), "{which}: {said}");
+        refuse(which, cannot, None);
+        let before = creates();
+        let (ok, said) = deploy(&[]);
+        assert!(!ok && said.contains(cannot) && creates() - before == 12 + made_first, "{which}: {} {said}", creates() - before);
+    }
+    // Made, and failed to update while it was still starting.
+    let mut config = recorded_answers(&recording, "GET", "/functions/superci-plane-deployplane1/configuration")[0].clone();
+    let mut v: serde_json::Value = serde_json::from_str(config["answer"].as_str().unwrap()).unwrap();
+    (v["State"], v["LastUpdateStatus"], v["LastUpdateStatusReason"]) = ("Pending".into(), "Failed".into(), "The code could not be unpacked.".into());
+    config["answer"] = v.to_string().into();
+    let (ok, said) = deploy(&[config]);
+    assert!(!ok && said.contains("the function failed to start:"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
