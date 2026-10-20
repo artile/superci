@@ -217,3 +217,43 @@ pub fn kept_at(home: &std::path::Path, url: &str) {
     kept["plane"]["Aws"]["url"] = url.into();
     std::fs::write(file, kept.to_string()).unwrap();
 }
+
+/// A dashboard on this computer for `home`, started as `superci dashboard` is with these arguments (none: no
+/// workspace named, as one started with several workspaces kept), and these settings of its own; its link.
+pub fn dashboard_args(home: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> (Dashboard, String) {
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let mut child = command(home).args([&["dashboard", "--no-browser"][..], args].concat()).env("SUPERCI_PORT", port.to_string()).envs(envs.iter().copied())
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
+    let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)).expect("the dashboard's link");
+    std::thread::spawn(move || lines.for_each(drop));
+    let errors = BufReader::new(child.stderr.take().unwrap()).lines().map_while(Result::ok);
+    std::thread::spawn(move || errors.for_each(|l| eprintln!("dashboard: {l}")));
+    (Dashboard(child), link)
+}
+
+/// One of Modal's calls answered as a recording has it (each answer protobuf, in base64): for what a real workspace
+/// was not caught answering.
+pub fn modal_answered(method: &str, answers: &[Vec<u8>]) -> String {
+    use base64::Engine;
+    let answers: Vec<String> = answers.iter().map(|a| base64::engine::general_purpose::STANDARD.encode(a)).collect();
+    serde_json::json!({ "method": "POST", "url": format!("https://api.modal.com/modal.client.ModalClient/{method}"), "target": "", "asked": "", "status": 200, "headers": [],
+        "answer": serde_json::json!({ "answers": answers }).to_string() }).to_string() + "\n"
+}
+
+/// A protobuf message's field: its number, and a number, a double or bytes (a string, another message).
+pub enum Pb { N(u32, u64), D(u32, f64), B(u32, Vec<u8>) }
+
+/// A protobuf message of these fields.
+pub fn pb(fields: &[Pb]) -> Vec<u8> {
+    let varint = |out: &mut Vec<u8>, mut n: u64| loop { let b = (n & 0x7f) as u8; n >>= 7; if n == 0 { out.push(b); break } out.push(b | 0x80) };
+    let mut out = vec![];
+    for f in fields {
+        match f {
+            Pb::N(k, n) => { varint(&mut out, (*k as u64) << 3); varint(&mut out, *n) }
+            Pb::D(k, d) => { varint(&mut out, ((*k as u64) << 3) | 1); out.extend(d.to_le_bytes()) }
+            Pb::B(k, b) => { varint(&mut out, ((*k as u64) << 3) | 2); varint(&mut out, b.len() as u64); out.extend(b) }
+        }
+    }
+    out
+}

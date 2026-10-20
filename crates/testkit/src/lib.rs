@@ -1034,3 +1034,32 @@ impl Served {
         match prefix { Some(p) => r.push(p.to_string()), None => r.clear() }
     }
 }
+
+/// A control plane too busy for some requests a while: what is asked at `url` (a control plane served here) is passed
+/// on and answered as it answers, but the first `times` requests whose address starts with `busy` are answered 503
+/// without reaching it (as a cloud answers while it is restarting it). Its own address, to keep in place of `url`.
+pub fn busy_for(url: &str, busy: &str, times: usize) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (to, busy, left) = (url.trim_start_matches("http://").to_string(), busy.to_string(), Arc::new(Mutex::new(times)));
+    std::thread::spawn(move || for stream in listener.incoming().flatten() {
+        let (to, busy, left) = (to.clone(), busy.clone(), left.clone());
+        std::thread::spawn(move || {
+            let Ok((method, target, headers, body)) = read(&stream) else { return };
+            if target.starts_with(busy.as_str()) {
+                let mut l = left.lock().unwrap();
+                if *l > 0 { *l -= 1; drop(l); let _ = write(stream, 503, &[("content-type".into(), "text/plain".into())], b"busy"); return }
+            }
+            let mut out = vec![];
+            if let Ok(mut s) = TcpStream::connect(&to) {
+                let extra: String = headers.iter().filter(|(k, _)| !["host", "content-length", "connection"].contains(&k.to_ascii_lowercase().as_str())).map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+                let _ = s.write_all(format!("{method} {target} HTTP/1.1\r\nhost: {to}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes());
+                let _ = s.write_all(&body);
+                let _ = s.read_to_end(&mut out);
+            }
+            let mut stream = stream;
+            let _ = stream.write_all(&out);
+        });
+    });
+    at
+}
