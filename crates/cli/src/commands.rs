@@ -182,8 +182,7 @@ pub struct Done { pub said: Vec<String>, pub data: Value }
 pub const JOB_LINE: &str = "\u{1}";
 
 impl Done {
-    /// (What a change said: each says something.)
-    fn said(line: impl Into<String>) -> Done { let line = line.into(); Done { data: json!({ "ok": true, "said": line }), said: vec![line] } }
+    fn said(line: impl Into<String>) -> Done { let line = line.into(); let line = if line.is_empty() { "Done.".to_string() } else { line }; Done { data: json!({ "ok": true, "said": line }), said: vec![line] } }
 }
 
 /// The command a person runs first, when that is what an error asks for.

@@ -37,7 +37,7 @@ fn main() {
         let (said, half, unconfirmed) = (e.said().to_string(), matches!(e, commands::Fail::Usage(_)), matches!(e, commands::Fail::Unconfirmed(_)));
         let needs = commands::needs(&said);
         if json {
-            match e { commands::Fail::Ended(_, mut data) => { data["needs"] = needs.into(); println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default()) }
+            match e { commands::Fail::Ended(_, mut data) => { if let Some(o) = data.as_object_mut() { o.insert("needs".into(), needs.into()); } println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default()) }
                 _ => println!("{}", serde_json::json!({ "ok": false, "error": said, "needs": needs })) }
         }
         else if half { eprintln!("superci: {said}\n\n{}", commands::help(topic)) }
