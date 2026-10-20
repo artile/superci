@@ -183,7 +183,7 @@ jobs:
           google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
           if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
           # shellcheck disable=SC2086
-          npx -y supercov@4.19.0 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
+          timeout 1500 cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
