@@ -1436,8 +1436,7 @@ impl Dashboard {
     pub fn create_key(&mut self, name: &str, days: u64, runs: bool) -> Result<(String, u64)> {
         let plane = self.plane()?;
         let name = name.to_ascii_uppercase();
-        // (One with no name is refused before: `superci keys create` needs one.)
-        if name.len() > 24 || !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) { return Err("A key's name is letters and digits, 24 at most (agent, ci2).".into()) }
+        if name.is_empty() || name.len() > 24 || !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) { return Err("A key's name is letters and digits, 24 at most (agent, ci2).".into()) }
         if !(1..=366).contains(&days) { return Err("A key lasts from 1 to 366 days.".into()) }
         let seen = view::plane_view(&plane, Some(&self.status_key));
         if view::older(seen.version.as_deref(), "0.11.0") { return Err("Update the control plane first: read keys need control plane 0.11.0 or newer (`superci planes update`).".into()) }
