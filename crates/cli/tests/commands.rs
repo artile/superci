@@ -2132,3 +2132,61 @@ fn cloudflare_runners_are_deployed_through_registry_challenges_an_image_being_pr
     assert!(asked.iter().any(|a| a.contains("/manifests/sha256:660f7b9d")) && !asked.iter().any(|a| a.contains("/manifests/sha256:1111") || a.contains("/manifests/sha256:2222")), "{asked:?}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A Cloudflare control plane, as Cloudflare answered a real one but where it did not: its address not given (asked
+/// again and again, then said); then deployed, its containers of one size from before going; deleted with
+/// Cloudflare failing to delete its Worker (said, nothing forgotten), then saying it is not there (taken as gone).
+#[test]
+fn a_cloudflare_control_plane_says_an_address_cloudflare_never_gave_drops_containers_from_before_and_is_deleted_once_its_worker_is_gone() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00001", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00001/CONTAINERS");
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let run = |recording: &str, overlay: &[serde_json::Value], args: &[&str]| {
+        served.aws.replaying(recording, &[]);
+        if !overlay.is_empty() { served.aws.replaying(&overlay.iter().map(|v| v.to_string() + "\n").collect::<String>(), &[]) }
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "cfplane00001").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let answered = |r: &serde_json::Value, method: &str, url_end: &str, status: u16, answer: serde_json::Value| {
+        let mut r = r.clone();
+        if !method.is_empty() { r["method"] = method.into() }
+        if !url_end.is_empty() { r["url"] = format!("https://api.cloudflare.com/client/v4/accounts/1111111111111111111111111111111a{url_end}").into() }
+        r["status"] = status.into(); r["answer"] = answer.to_string().into(); r
+    };
+    let deploy = include_str!("../fixtures/cloudflare/02-deploy.jsonl");
+    let subdomain = recorded_answers(deploy, "POST", "/workers/scripts/superci/subdomain")[0].clone();
+    let refused = serde_json::json!({ "success": false, "errors": [{ "code": 10013, "message": "workers.dev is not set up for this account yet" }], "result": null });
+    let (ok, said) = run(deploy, &[answered(&subdomain, "", "", 400, refused)], &["planes", "create", "cloudflare"]);
+    assert!(!ok && said.contains("workers.dev is not set up for this account yet"), "{said}");
+    assert_eq!(served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "POST" && a["url"].as_str().is_some_and(|u| u.ends_with("/superci/subdomain"))).count(), 10);
+    // Deployed, its containers of one size from before (their application, `superci-runners`) gone.
+    let scripts = recorded_answers(deploy, "GET", "/workers/scripts");
+    let mut before: serde_json::Value = serde_json::from_str(scripts[1]["answer"].as_str().unwrap()).unwrap();
+    before["result"].as_array_mut().unwrap().push(serde_json::json!({ "id": "superci", "migration_tag": "v2" }));
+    let (ok, said) = run(deploy, &[scripts[0].clone(), answered(&scripts[1], "", "", 200, before),
+        answered(&scripts[0], "GET", "/containers/applications", 200, serde_json::json!({ "success": true, "result": [{ "id": "00000000000000000000000000000009", "name": "superci-runners" }, { "id": "0000000000000000000000000000000a", "name": "another-app" }] })),
+        answered(&scripts[0], "DELETE", "/containers/applications/00000000000000000000000000000009", 200, serde_json::json!({ "success": true, "result": {} }))], &["planes", "create", "cloudflare"]);
+    assert!(ok && said.contains("The control plane is running: https://superci.acme.workers.dev (Cloudflare · Acme)"), "{said}");
+    let deleted: Vec<String> = served.aws.asked.lock().unwrap().iter().filter(|a| a["method"] == "DELETE").filter_map(|a| a["url"].as_str().map(str::to_string)).collect();
+    assert!(deleted == ["https://api.cloudflare.com/client/v4/accounts/1111111111111111111111111111111a/containers/applications/00000000000000000000000000000009"], "{deleted:?}");
+    // Deleted: Cloudflare failing to delete its Worker, then saying there is none.
+    let delete = [include_str!("../fixtures/cloudflare/03-use.jsonl"), include_str!("../fixtures/cloudflare/07-delete.jsonl")].concat();
+    let worker = recorded_answers(&delete, "DELETE", "/workers/scripts/superci?force=true")[0].clone();
+    let (ok, said) = run(&delete, &[answered(&worker, "", "", 500, serde_json::json!({ "success": false, "errors": [{ "code": 10013, "message": "An unknown error has occurred" }], "result": null }))], &["planes", "delete", "cfplane00001", "--confirm"]);
+    assert!(!ok && said.contains("An unknown error has occurred"), "{said}");
+    let (ok, said) = run(&delete, &[answered(&worker, "", "", 404, serde_json::json!({ "success": false, "errors": [{ "code": 0, "message": "Worker Not Found" }], "result": null }))], &["planes", "delete", "cfplane00001", "--confirm"]);
+    assert!(ok && said.contains("Deleted Cloudflare · Acme."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
