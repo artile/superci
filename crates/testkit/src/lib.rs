@@ -833,3 +833,87 @@ pub fn front(to: &str, answer: impl Fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8
     });
     url
 }
+
+/// A runtime's timer that leaves work for after the answer, as AWS's function does (`Timer::later`): each with the
+/// address of the request that left it (none for the upkeep's), kept until the test has it done (`Served::run_later`).
+#[derive(Clone, Default)]
+struct Deferring(Arc<Mutex<Vec<(Option<String>, String)>>>);
+#[async_trait(?Send)]
+impl Timer for Deferring {
+    async fn wake_in(&self, _ms: u64) -> io::Result<()> { Ok(()) }
+    fn later(&self, what: &str) -> bool { self.0.lock().unwrap().push((None, what.to_string())); true }
+}
+
+/// A control plane served as `serve` serves one, in a runtime that does some work after its answer (AWS's function:
+/// a queued job's machine is asked for once GitHub has its answer, a launch template removed after its request):
+/// that work is left until the test has it done (`Served::run_later`), as if it came a moment later.
+pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (store, machines, aws) = (Shared::default(), Machines::default(), Aws::serve());
+    *aws.plane_url.lock().unwrap() = url.clone();
+    let github = GitHub::default();
+    *aws.github.lock().unwrap() = Some(github.clone());
+    *github.aws.lock().unwrap() = Some(aws.clone());
+    let (key, run_key) = ("dashboard-key-for-tests-0001".to_string(), "superci_run_0123456789abcdef0123456789abcdef".to_string());
+    aws.put(&format!("/superci/{PLANE}/DEVICE_KEY_4102444800_TEST"), &key);
+    aws.put(&format!("/superci/{PLANE}/READ_KEY_4102444800_AGENT"), &format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes())));
+    aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "on");
+    let clock = Now::default();
+    let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let public: Arc<Mutex<Option<String>>> = Arc::default();
+    let (s, m, a, u, c, g, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone());
+    std::thread::spawn(move || {
+        let (cache, left) = (Cache::default(), Deferring::default());
+        block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
+        for stream in listener.incoming().flatten() {
+            if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
+            let mut config = Config::new(PLANE.to_string());
+            let settings = a.settings(PLANE);
+            config.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+            config.read_settings(&settings);
+            configure(&mut config);
+            let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &left, config: &config, cache: &cache, containers: Some(&m) };
+            let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
+            let Ok((method, target, headers, body)) = read(&stream) else { continue };
+            if target == "/__testkit/later" {
+                // (One thing done may leave another: each in its turn, with the address of what left it.)
+                let mut done = vec![];
+                loop {
+                    let next = { let mut l = left.0.lock().unwrap(); if l.is_empty() { None } else { Some(l.remove(0)) } };
+                    let Some((from, what)) = next else { break };
+                    let from = from.unwrap_or_default();
+                    let said = block_on(plane.later(&from, &what)).err();
+                    for item in left.0.lock().unwrap().iter_mut() { if item.0.is_none() { item.0 = Some(from.clone()) } }
+                    done.push(json!({ "what": what, "error": said }));
+                }
+                let _ = write(stream, 200, &[], Value::Array(done).to_string().as_bytes());
+                continue
+            }
+            let (from, res) = if target == "/__testkit/upkeep" {
+                (String::new(), match block_on(plane.alarm()) { Ok(()) => io::Response::new(200, "text/plain", "ok"), Err(e) => io::Response::new(500, "text/plain", e) })
+            } else {
+                let mut req = Request::new(&method, &format!("{base}{target}")).with_body(body);
+                for (k, v) in headers { req = req.with_header(&k, &v) }
+                (format!("{base}{target}"), block_on(plane.handle(req)))
+            };
+            for item in left.0.lock().unwrap().iter_mut() { if item.0.is_none() { item.0 = Some(from.clone()) } }
+            let _ = write(stream, res.status, &res.headers, &res.body);
+        }
+    });
+    let gitlab = github.gitlab.clone();
+    Served { plane: PLANE.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public }
+}
+
+impl Served {
+    /// The work a control plane served by `serve_deferring` left for after its answers, done now, each in its turn:
+    /// what each was, and the error it ended with, if any.
+    pub fn run_later(&self) -> Vec<Value> {
+        let host = self.url.trim_start_matches("http://");
+        let mut s = TcpStream::connect(host).unwrap();
+        s.write_all(format!("POST /__testkit/later HTTP/1.1\r\nhost: {host}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out.split_once("\r\n\r\n").and_then(|(_, b)| serde_json::from_str::<Vec<Value>>(b).ok()).unwrap_or_default()
+    }
+}

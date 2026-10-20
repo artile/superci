@@ -6825,6 +6825,73 @@ fn the_caches_tokens_signed_by_the_control_plane_but_never_given_out_so_are_refu
     }
 }
 
+/// A control plane in its own AWS account, in a runtime that does work after its answer (`serve_deferring`), its
+/// order AWS's spot then on-demand machines, as AWS answered Test.
+fn aws_plane_deferring() -> superci_testkit::Served {
+    let served = superci_testkit::serve_deferring(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    served
+}
+
+/// Where AWS's function answers GitHub first: a queued job's machine is asked for once GitHub has its answer, and
+/// not when, meanwhile, the job was cancelled, or got a machine or a runner by another request.
+#[test]
+fn a_queued_jobs_machine_is_asked_for_after_githubs_answer_unless_meanwhile_it_ended_or_got_one() {
+    let served = aws_plane_deferring();
+    served.aws.fail("RunInstances", 200, &aws_started(), None);
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    let record = |id: u64| served.store.under(&format!("job:{id}"))[0].1.clone();
+    let machines = || served.aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).count();
+    let queue = |name: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); assert!(served.webhook(q) < 300); id };
+    // Answered first, then asked for.
+    let first = queue("first");
+    assert!(record(first)["state"] == "launching" && record(first)["machine_id"].is_null() && machines() == 0, "{}", record(first));
+    let done = served.run_later();
+    assert!(done.len() == 1 && done[0]["error"].is_null() && record(first)["state"] == "launched" && record(first)["machine_id"].is_string(), "{done:?} {}", record(first));
+    // Cancelled meanwhile.
+    let asked = machines();
+    let cancelled = queue("cancelled");
+    assert!(served.webhook(served.github.cancel(cancelled, served.now_ms())) < 300);
+    served.run_later();
+    assert!(record(cancelled)["machine_id"].is_null() && machines() == asked, "{}", record(cancelled));
+    // A machine, or a runner, given it meanwhile.
+    for (name, field, value) in [("machine", "machine_id", "i-0meanwhile"), ("runner", "runner", "superci-meanwhile")] {
+        let id = queue(name);
+        let mut j = record(id);
+        j[field] = value.into();
+        served.store.0.lock().unwrap().insert(format!("job:{id}"), j.to_string());
+        served.run_later();
+        assert!(record(id)[field] == value && machines() == asked, "{name}: {}", record(id));
+    }
+}
+
+/// The launch template a request for many spot pools leaves is removed after the request at hand is answered; when
+/// AWS will not remove it, it is noted, for a sweep to try again.
+#[test]
+fn a_launch_template_left_by_a_request_for_many_pools_is_removed_after_the_answer_or_noted_when_aws_will_not() {
+    let served = aws_plane_deferring();
+    let templates = || served.store.under("aws:template:").len();
+    let (id, q) = served.github.queue("tests", "superci/cpu=2", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let done = served.run_later();
+    assert!(done.iter().any(|d| d["what"].as_str().is_some_and(|w| w.starts_with("template us-east-1 "))), "{done:?}");
+    let j = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(j["machine_id"].is_string() && templates() == 0, "{j} {:?}", served.store.under("aws:template:"));
+    // AWS will not remove the next: noted.
+    served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:"));
+    served.aws.fail("DeleteLaunchTemplate", 503, &superci_testkit::ec2_error("RequestLimitExceeded", "Request limit exceeded."), None);
+    served.later(700_000);
+    let (_, q) = served.github.queue("again", "superci/cpu=2", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    served.run_later();
+    assert_eq!(templates(), 1, "{:?}", served.store.under("aws:template:"));
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
@@ -11897,6 +11964,80 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         }
         assert_eq!(std::fs::read_to_string(out.join("a.txt")).unwrap(), "abc");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs from a checkout through a control plane that cannot have its machine wait for the tree (an older one: the
+    /// tree goes at once): what changed sent as a layer on a base kept before that said no time (one from before), the
+    /// whole tree refused by the bucket, a computer with no home to keep a base in; then one that can, which says no
+    /// to the tree's end; and what changed with a file removed, where gzip fails.
+    #[test]
+    fn a_working_tree_sent_at_once_where_the_machine_cannot_wait_keeps_its_base_and_says_what_failed() {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+            c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+        });
+        let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+        served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+        let big: String = (0..4000).map(|n| format!("line {n} of a file that stays as it is\n")).collect();
+        let dir = checkout_with(&[(".github/workflows/ci.yml", "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n"), ("big.txt", &big), ("small.txt", "one\n"), ("gone.txt", "soon gone\n")]);
+        let home = common::temp("runs-at-once");
+        // (`now`: the tree goes at once; `end`: what the control plane says to the tree's end.)
+        let (now, end) = (std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)), std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)));
+        let (n, e) = (now.clone(), end.clone());
+        let plane = superci_testkit::front(&served.url, move |method, target, status, body| {
+            if method == "POST" && target.starts_with("/runs/tree?") && target.contains("&sent=1") && e.load(std::sync::atomic::Ordering::SeqCst) > 0 { return (e.load(std::sync::atomic::Ordering::SeqCst), b"not now".to_vec()) }
+            if method == "POST" && target.starts_with("/runs/tree?") && n.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                if let Some(o) = v.as_object_mut() { o.remove("later"); }
+                return (status, v.to_string().into_bytes())
+            }
+            (status, body)
+        });
+        let run = |envs: &[(&str, &str)]| -> (bool, String) {
+            let mut c = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]);
+            c.env("SUPERCI_HOME", &home).env("SUPERCI_PLANE", &plane).envs(envs.iter().copied());
+            let o = c.output().unwrap();
+            (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+        };
+        let base_file = || std::fs::read_dir(home.join("trees")).unwrap().flatten().map(|e| e.path()).next().unwrap();
+        // The whole tree, at once: kept as the base.
+        let (ok, said) = run(&[]);
+        assert!(ok && said.contains("Sending the working tree ("), "{said}");
+        // A base kept by a version that kept no time: what changed, said without when.
+        let mut kept: serde_json::Value = serde_json::from_slice(&std::fs::read(base_file()).unwrap()).unwrap();
+        kept.as_object_mut().unwrap().remove("at_ms");
+        std::fs::write(base_file(), kept.to_string()).unwrap();
+        std::fs::write(dir.join("small.txt"), "two\n").unwrap();
+        let (ok, said) = run(&[]);
+        assert!(ok && said.contains("Sending what changed since this folder's last run: 1 file, 0 removed ("), "{said}");
+        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(base_file()).unwrap()).unwrap();
+        assert!(kept["layers"].as_array().is_some_and(|l| l.len() == 1) && kept["at_ms"].as_u64().is_some_and(|t| t > 0), "the layer kept on the base: {kept}");
+        // A file removed since, and gzip failing on this computer: nothing sent, said.
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("gzip"), "#!/bin/sh\ncat >/dev/null\nexit 1\n").unwrap();
+        { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(bin.join("gzip"), std::fs::Permissions::from_mode(0o755)).unwrap(); }
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+        let (ok, said) = run(&[("PATH", &path)]);
+        assert!(!ok && said.contains("gzip failed"), "{said}");
+        // No base kept (none on this computer): the whole tree, which the bucket refuses.
+        std::fs::remove_file(base_file()).unwrap();
+        served.github.refuse_puts(true);
+        let (ok, said) = run(&[]);
+        assert!(!ok && said.contains("the bucket said 403 to the working tree"), "{said}");
+        served.github.refuse_puts(false);
+        // A computer with no home of SuperCI's: sent, no base kept anywhere.
+        let (ok, said) = run(&[("SUPERCI_HOME", ""), ("HOME", ""), ("USERPROFILE", "")]);
+        assert!(ok && said.contains("Sending the working tree ("), "{said}");
+        assert!(!home.join("trees").exists() || std::fs::read_dir(home.join("trees")).unwrap().count() == 0, "no base kept");
+        // A control plane whose machine waits for the tree, which then says no to its end: the run cancelled.
+        now.store(false, std::sync::atomic::Ordering::SeqCst);
+        end.store(500, std::sync::atomic::Ordering::SeqCst);
+        let (ok, said) = run(&[]);
+        assert!(!ok && said.contains("The working tree was not sent (the control plane said 500 to the working tree's end: not now)") && said.contains("was cancelled"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 
