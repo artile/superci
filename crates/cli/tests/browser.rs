@@ -1477,6 +1477,39 @@ fn a_control_plane_in_a_cloud_not_signed_in_to_that_does_not_answer_asks_for_tha
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// GitLab connected with a token whose user maintains no project: its page says there is none to turn on, and why a
+/// project needs that role.
+#[test]
+fn a_gitlab_whose_token_maintains_no_project_says_there_is_none_to_turn_on() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    served.gitlab.maintains_none();
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("its page", || common::words(&common::part(&link, "/?p=gitlab&fragment=1").1).contains("No projects you maintain Turning a project on adds a webhook to it, which needs the Maintainer role."));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane seen from its address only, with nothing connected and no runners: Control plane lists no
+/// permissions (none is asked of any cloud or code host).
+#[test]
+fn a_control_plane_with_nothing_connected_lists_no_permissions() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = home(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Seen": { "url": served.url, "plane_id": PLANE } });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    until("its page", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Sign in with AWS In use"));
+    let page = common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    assert!(!page.contains("Permissions"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
