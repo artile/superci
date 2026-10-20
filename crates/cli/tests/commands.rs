@@ -2372,3 +2372,35 @@ fn a_runner_deleting_the_message_it_took_is_answered_and_its_job_goes_on() {
     assert_eq!(job["conclusion"], "success", "{job}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A job's `timeout-minutes` given by an expression that indexes a list: read as the item it names.
+#[test]
+fn a_jobs_timeout_given_by_an_expression_indexing_a_list_is_the_item_it_names() {
+    let served = serve(|_| {});
+    let dir = common::temp("timeout-indexed");
+    common::played_steps(&served, &dir, "jobs:\n  tests:\n    runs-on: superci\n    timeout-minutes: ${{ fromJSON('[7, 30]')[1] }}\n    steps:\n      - run: make test\n", &[("Run make test", "succeeded")]);
+    let (_, run) = served.store.under("run:").into_iter().next().expect("the run");
+    assert_eq!(run["jobs"][0]["timeout_ms"], 1_800_000, "{run}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A move onto another control plane that serves GitHub of its own is refused: it is another CI.
+#[test]
+fn a_move_onto_a_control_plane_that_serves_github_of_its_own_is_refused() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    other.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let o = superci(&home, &["planes", "move", "testplane0002", "--plane=testplane0001"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("That control plane serves a code host of its own") && said.contains("Nothing has changed."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
