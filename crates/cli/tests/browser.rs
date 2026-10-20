@@ -12306,6 +12306,66 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         let to = r.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         (r.status().as_u16(), to, r.body_mut().read_to_vec().unwrap_or_default())
     }
+
+    /// A run started with a run key whose name has what a scope's name may not: its jobs write to the cache as
+    /// `computer`, by their tokens and by their machines' tools alike.
+    #[test]
+    fn a_run_started_by_a_key_whose_name_no_scope_may_have_writes_to_the_cache_as_computer() {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+            c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+        });
+        let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+        served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+        let key = "superci_run_ffffffffffffffffffffffffffffffff";
+        served.aws.put(&format!("/superci/{}/READ_KEY_4102444800_MY_BOT+1", superci_testkit::PLANE), &format!("{}:runs", superci_core::crypto::sha256_hex(key.as_bytes())));
+        let dir = checkout();
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).env("SUPERCI_KEY", key).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let run = run_of(&served);
+        assert_eq!(served.store.under(&format!("run:{run}"))[0].1["by"], "MY_BOT+1");
+        let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+        use base64::Engine;
+        let token = runner.handed(&served)["resources"]["endpoints"][0]["authorization"]["parameters"]["AccessToken"].as_str().unwrap().to_string();
+        let claims: serde_json::Value = token.split('.').nth(1).and_then(|c| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(c).ok()).and_then(|c| serde_json::from_slice(&c).ok()).unwrap_or_default();
+        assert!(claims["ac"].as_str().unwrap_or_default().contains("refs/superci/computer"), "{claims}");
+        // Its machine's tools, by the machine's link.
+        let machine = served.machines.0.lock().unwrap()[0].clone();
+        let link = "machine-cache-link-000000000003";
+        served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": machine }).to_string());
+        let hash = "c".repeat(64);
+        let (status, _, begun) = http("POST", &format!("{}/cache/{link}/tool-begin", served.url), serde_json::json!({ "tool": "turbo", "hash": hash }).to_string().as_bytes());
+        assert!(status == 200 && String::from_utf8_lossy(&begun).contains("\"ok\":true"), "{status} {}", String::from_utf8_lossy(&begun));
+        let kept: Vec<String> = served.store.0.lock().unwrap().keys().filter(|k| k.contains(&hash)).cloned().collect();
+        assert!(kept.iter().any(|k| k.contains("superci/computer")), "{kept:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job's AWS machine named by the CI's name and the repository's, as names may have them: a run from a folder
+    /// with no GitHub remote, whose name has spaces and signs, in a CI named with a space.
+    #[test]
+    fn an_aws_machine_is_named_by_the_cis_name_and_the_repositorys_as_names_may_have_them() {
+        let served = serve(|c| {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+            c.set_name("Acme CI");
+        });
+        served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+        let dir = std::env::temp_dir().join(format!("superci-e2e-{}-my app+1", superci_core_free_id()));
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  tests:\n    runs-on: superci/cpu=2\n    steps:\n      - run: make test\n").unwrap();
+        for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+        let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+        assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        let job = loop {
+            if let Some((_, j)) = served.store.under("job:").into_iter().next().filter(|(_, j)| j["machine_id"].is_string() || j["state"] == "failed") { break j }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let named = served.aws.asked.lock().unwrap().iter().filter_map(|a| a["asked"].as_str()).filter(|a| a.contains("Action=RunInstances") || a.contains("Action=CreateFleet") || a.contains("Action=CreateLaunchTemplate"))
+            .flat_map(|a| url::form_urlencoded::parse(a.as_bytes()).map(|(_, v)| v.to_string()).collect::<Vec<_>>()).find(|v| v.starts_with("acme-ci-")).unwrap_or_default();
+        let id = job["job_id"].as_u64().map(|i| i.to_string()).unwrap_or_default();
+        assert!(named.starts_with("acme-ci-superci-e2e-") && named.ends_with(&format!("-myapp1-{id}")), "{named} {job}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The dashboard as its own page asks it (each page, sign-ins, what it is given, where it listens), each scenario
