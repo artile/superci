@@ -1193,6 +1193,83 @@ fn superci_stopped_while_only_a_further_gitlab_sent_it_jobs_says_to_change_its_w
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Runners with two jobs waiting for room: the jobs counted, the first one's reason said.
+#[test]
+fn runners_say_how_many_jobs_wait_for_room_and_why() {
+    let served = serve(|_| {});
+    let now = served.now_ms();
+    for id in [61u64, 62] {
+        served.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "state": "waiting", "error": "waiting: Cloudflare has no room for its container yet",
+            "cloud": "", "at_ms": now - 30_000 - id, "installation_id": 42, "seen_in_progress": false }).to_string());
+    }
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let runners = || common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    until("the jobs waiting", || runners().contains("Waiting 2 jobs · Cloudflare has no room for its container yet"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A job of a further GitLab connection's: its page and its log found by its id and its connection's name (another
+/// connection's job of the same id is another job).
+#[test]
+fn a_job_of_a_further_gitlab_connection_is_found_by_its_id_and_connection() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gextra"), r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gextra"}"#);
+    let now = served.now_ms();
+    // Its job 555, and the first connection's job of the same id.
+    for (key, gl, name) in [("job:glgextra-555", "gextra", "unit tests"), ("job:gl555", "", "lint")] {
+        served.store.0.lock().unwrap().insert(key.into(), serde_json::json!({ "job_id": 555, "run_id": 66, "repo": "acme/app", "name": name, "state": "done", "conclusion": "success",
+            "provider": "gitlab", "gitlab": gl, "project_id": superci_testkit::gitlab::PROJECT, "cloud": "", "at_ms": now - 120_000, "started_ms": now - 110_000, "ended_ms": now - 60_000, "installation_id": 0, "seen_in_progress": true }).to_string());
+    }
+    served.gitlab.trace(555, "Running with gitlab-runner\nunit tests passed\n");
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("its page", || { let p = common::words(&common::part(&link, "/?p=job&id=555&gl=gextra&fragment=1").1); p.contains("unit tests") && !p.contains("lint") });
+    let (status, view) = common::part(&link, "/job/view?id=555&gl=gextra");
+    assert!(status == 200 && view.contains("unit tests passed"), "{status} {view}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A secret last given to a run that a computer started with its own key: Settings says that computer, by its name.
+#[test]
+fn a_secret_last_given_to_a_run_a_computer_started_says_that_computer() {
+    let served = serve(|_| {});
+    let scope = superci_core::secrets::Scope::default();
+    let setting = superci_core::secrets::setting("EVERYWHERE", &scope);
+    let kept = superci_core::secrets::Stored { name: "EVERYWHERE".into(), value: "v".into(), scope, updated_ms: 1 };
+    served.aws.put(&format!("/superci/{PLANE}/{setting}"), &serde_json::to_string(&kept).unwrap());
+    // (As the control plane notes a use: the run, and the device that started it.)
+    served.store.0.lock().unwrap().insert(format!("sused:{setting}"), serde_json::json!({ "run_id": "7", "at_ms": served.now_ms() - 120_000, "repository": "acme/app", "path": ".github/workflows/ci.yml",
+        "ref": "refs/heads/main", "by": "Ada's MacBook", "run_key": false }).to_string());
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("its use", || { let p = common::words(&common::part(&link, "/?p=settings&fragment=1").1); p.contains("EVERYWHERE") && p.contains("started by Ada's MacBook") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS refusing a budget by its organization's policy without naming what it refused (as AWS words some of its
+/// refusals): said as the organization's rule, of "this", and nothing kept.
+#[test]
+fn a_refusal_by_the_aws_organization_that_names_no_action_is_said_plainly_and_changes_nothing() {
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    served.aws.fail("budgets.amazonaws.com", 400, &superci_testkit::json_error("AccessDeniedException", "User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to access this resource with an explicit deny in a service control policy"), Some(1));
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails"), ("email", "ops@example.com")]);
+    let said = common::words(&said);
+    assert!(status == 502 && said.contains("AWS refuses this for the whole account: the AWS organization the account is in does not allow it"), "{status} {said}");
+    let routing = served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default();
+    assert!(!routing.contains("account_usd") && !routing.contains("aws_budget"), "{routing}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
