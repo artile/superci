@@ -7129,6 +7129,40 @@ fn moving_here_takes_the_jobs_from_before_but_one_already_here_stays_as_it_is() 
     assert!(served.store.under("job:901")[0].1["name"] == "here" && served.store.under("job:902")[0].1["name"] == "from before");
 }
 
+/// AWS jobs whose machines cannot have what was set for them: a network of the account's own with a subnet but no
+/// security group, said; Docker's images kept from the start on a control plane whose address the cache's link
+/// cannot be made from, started without the cache or the layer store.
+#[test]
+fn aws_jobs_without_a_security_group_or_a_cache_link_say_so_or_start_without_the_layer_store() {
+    let served = aws_plane("");
+    served.aws.fail("RunInstances", 200, &aws_started(), None);
+    served.aws.put(&format!("/superci/{PLANE}/AWS_NETWORKS"), r#"{"us-east-1":{"subnets":["subnet-0123456789abcdef0"],"security_groups":[]}}"#);
+    let j = aws_job(&served, "no group", "superci");
+    assert!(j["machine_id"].is_null() && j["error"].as_str().unwrap_or_default().contains("a network of your own needs a subnet and a security group"), "{j}");
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{PLANE}/AWS_NETWORKS"));
+    served.later(700_000);
+    *served.public.lock().unwrap() = Some("https://plane+acme.test".into());
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::layers_key("x86_64")), b"program");
+    let j = aws_job(&served, "images", "superci/image=ubuntu26/docker-cache=true");
+    assert!(j["state"] == "launched" && j["layers"] != true && j["keeps"] != true, "{j}");
+}
+
+/// An AWS account's look where AWS will not say its quotas (its Service Quotas refused to the sign-in): the rest is
+/// said, its quotas not.
+#[test]
+fn an_aws_accounts_look_without_its_quotas_says_the_rest() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/classic/look.jsonl"), &[]);
+    served.aws.fail("ServiceQuotasV20190624.GetServiceQuota", 400, &superci_testkit::json_error("AccessDeniedException", "User is not authorized to perform: servicequotas:GetServiceQuota"), None);
+    let o = common::superci(&home, &["accounts", "retrieve", "aws"]);
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success() && text.contains("Kind          open: nothing SuperCI does is refused") && text.contains("At once       spot not known · on-demand not known"), "{text}{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
