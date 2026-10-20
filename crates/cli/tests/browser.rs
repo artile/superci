@@ -2614,6 +2614,100 @@ fn a_secret_updated_on_a_cloudflare_control_plane_with_twelve_others_is_not_refu
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A workspace's first control plane deployed to Modal, as Modal answered a real deploy, at an address that does not
+/// answer yet: waited for a while, then taken. It is named what the workspace is called (Acme), and not when the
+/// workspace is called SuperCI (every control plane is, by itself).
+#[test]
+fn a_first_modal_control_plane_is_named_as_the_workspace_unless_it_is_called_superci() {
+    for (named, given) in [("Acme", true), ("SuperCI", false)] {
+        let served = serve(|_| {});
+        served.aws.replaying(include_str!("../fixtures/modal/02-deploy.jsonl"), &[]);
+        let home = common::temp("first-modal");
+        std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+        std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+        std::fs::write(home.join("workspaces/default/sign-ins.json"), serde_json::json!({ "modal": { "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" } }).to_string()).unwrap();
+        std::fs::write(home.join("workspaces/default/workspace.json"), serde_json::json!({ "name": named, "hosts": [] }).to_string()).unwrap();
+        let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_NEW_PLANE_ID", "mdplane00001"), ("SUPERCI_PAUSE_MS", "1")]);
+        let (status, to, said) = common::post(&link, "/plane/modal", &[]);
+        assert!(status == 303 && to == "/?p=plane", "{named}: {status} {to} {}", common::words(&said));
+        until("taken", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Modal · acmeorg"));
+        let name_given = || served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/DictUpdate"))).count();
+        if given { until("named", || name_given() >= 2) } else { assert_eq!(name_given(), 1, "{named}") }
+        let _ = child.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// Modal's launcher deployed for an AWS control plane, as Modal answered a real one, its first answer slow to come
+/// (none here): asked for a while, then it is used; and the control plane then moved to another that has a Modal
+/// launcher already, Modal's coming along in its place.
+#[test]
+fn a_modal_launcher_not_answering_at_first_is_used_and_comes_along_to_a_control_plane_that_has_one() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    served.aws.put("/superci/testplane0002/CONTAINERS", "off");
+    served.aws.put("/superci/testplane0002/LAUNCHERS", r#"[{"cloud":"modal","url":"https://acmeorg--superci-runners-testplane0002.modal.run"}]"#);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    served.aws.replaying(include_str!("../fixtures/runners/04-modal-agent.jsonl"), &[("awsplane0001", PLANE)]);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "50")]);
+    let (status, to, said) = common::post(&link, "/runners/modal", &[]);
+    assert!(status == 303, "{status} {to} {}", common::words(&said));
+    let launchers = || served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
+    assert!(launchers().contains("\"cloud\":\"modal\""), "{}", launchers());
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    until("moved", || !served.store.under("moved_to").is_empty());
+    let theirs = served.aws.settings("testplane0002").into_iter().find(|(k, _)| k == "LAUNCHERS").map(|(_, v)| v).unwrap_or_default();
+    assert!(theirs.matches("\"cloud\":\"modal\"").count() == 1, "{theirs}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A move to a Cloudflare control plane of AWS runners whose role it refuses each time it is told it (it has no
+/// connection in progress, as it says): told again a while, then the move stops and says why; the switch is not made.
+#[test]
+fn a_move_to_cloudflare_whose_control_plane_refuses_the_aws_role_stops_and_says_why() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let account = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| c.read_settings(&account.worker_settings("superci")));
+    served.aws.worker_secrets.lock().unwrap().entry("superci".into()).or_default().insert("DEVICE_KEY_4102444800_TEST".into(), served.key.clone());
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    k["planes_more"] = serde_json::json!([{ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": "https://superci.acme.workers.dev", "plane_id": "cfplane00003", "label": "superci" } }]);
+    k["key"]["planes"] = serde_json::json!([PLANE, "cfplane00003"]);
+    std::fs::write(&file, k.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/update/03-cf-containers.jsonl"), &[]);
+    // Its machines' network in the region, as AWS answered one; IAM taking the role.
+    let network: String = include_str!("../fixtures/aws/regions/add.jsonl").lines().filter(|l| !l.contains(".s3.")).map(|l| format!("{l}\n")).collect();
+    served.aws.replaying(&network, &[("mixplane0001", "cfplane00003"), ("eu-north-1", "us-east-1")]);
+    let iam_ok = r#"<Response xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></Response>"#;
+    served.aws.fail("CreateOpenIDConnectProvider", 409, r#"<ErrorResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/"><Error><Type>Sender</Type><Code>EntityAlreadyExists</Code><Message>EntityAlreadyExists</Message></Error><RequestId>1</RequestId></ErrorResponse>"#, None);
+    for a in ["CreateRole", "UpdateAssumeRolePolicy", "PutRolePolicy", "CreateServiceLinkedRole"] { served.aws.fail(a, 200, iam_ok, None) }
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "50")]);
+    until("both listed", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Move to Cloudflare"));
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "cfplane00003")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    until("stopped", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("AWS runners: the control plane refused the connection"));
+    assert!(served.store.under("moved_to").is_empty());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
