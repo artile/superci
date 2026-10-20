@@ -1444,6 +1444,30 @@ fn github_made_and_not_installed_ten_minutes_on_is_no_longer_said_on_its_way() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A CI whose control plane is in a cloud not signed in to, and does not answer: its pages ask for that sign-in (what
+/// it has is seen through it), not say it is down; Control plane lists it in use, with that sign-in.
+#[test]
+fn a_control_plane_in_a_cloud_not_signed_in_to_that_does_not_answer_asks_for_that_sign_in() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let cf = superci_testkit::serve_as("cfplane00004", |_| {});
+    cf.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.replaying(include_str!("../fixtures/runners/10-cf-remove-aws.jsonl"), &[]);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Seen": { "url": "https://superci.acme.workers.dev", "plane_id": "cfplane00004" } });
+    kept["key"]["planes"] = serde_json::json!(["cfplane00004"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "0")]);
+    until("its runners page", || { let p = common::words(&common::part(&link, "/?p=runners&fragment=1").1); p.contains("Sign in with Cloudflare to see it") && !p.contains("not answering") });
+    // Control plane lists it, with that sign-in.
+    until("its control plane page", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("superci.acme.workers.dev Sign in with Cloudflare In use"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
