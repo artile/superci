@@ -1615,6 +1615,29 @@ fn an_accounts_copy_of_an_older_build_is_said_once_looked_at_and_the_newer_one_c
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A workspace with no control plane, signed in to an AWS account that has one which moved away (a CI's, by where it
+/// went): set up lists it found there, above setting up a new one; with none found, Control plane says there is none.
+#[test]
+fn a_control_plane_found_that_moved_away_is_listed_above_setting_up_a_new_one() {
+    let role = |name: &str, description: &str| format!("<member><Path>/</Path><RoleName>{name}</RoleName><RoleId>AROAEXAMPLE000000001</RoleId><Arn>arn:aws:iam::111111111111:role/{name}</Arn><CreateDate>2026-10-18T10:00:00Z</CreateDate><Description>{description}</Description><MaxSessionDuration>3600</MaxSessionDuration></member>");
+    let roles = |members: &[String]| format!("<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{}</Roles></ListRolesResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ResponseMetadata></ListRolesResponse>", members.concat());
+    let served = serve(|_| {});
+    served.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!("https://superci.acme.workers.dev").to_string());
+    // None found first.
+    let empty = superci_testkit::Aws::serve();
+    let home = common::aws_only(&empty);
+    let (mut child, link) = common::dashboard(&home);
+    until("none", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Control plane No control plane yet"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    served.aws.fail("ListRoles", 200, &roles(&[role(&format!("superci-plane-{PLANE}"), &format!("Runs the SuperCI control plane {} (Lambda, us-east-1, runs-on superci).", served.url))]), None);
+    let home = common::aws_only(&served.aws);
+    let (mut child, link) = common::dashboard(&home);
+    until("found", || { let p = common::words(&common::part(&link, "/?p=plane&fragment=1").1); p.contains("CIs in your signed-in accounts") && p.contains("A CI (testplane0001) AWS · 111111111111 · us-east-1 · runs-on superci") && p.contains("Use this one A new one") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
