@@ -3714,7 +3714,7 @@ fn a_jobs_page_says_each_step_of_its_start_and_its_runner_as_its_machine_said() 
         { "at": 1, "ms": 300, "kind": "m6a.2xlarge", "spot": true, "said": "started", "zone": "us-east-1d", "pools": 5 },
     ]);
     let asked = || "AWS gave a machine (no spot m8a.2xlarge in 2 zones; your account's limit refused spot m7a.2xlarge; AWS took no more requests for spot c7a.2xlarge; Unsupported spot c6a.2xlarge; \
-        no spot machine in 14 other pools; your account's limit refused 3 other pools; Unsupported for 2 other pools; no on-demand m8a.2xlarge; on-demand m6a.large in us-east-1c; m6a.2xlarge in us-east-1d, AWS's choice of 5 pools)".to_string();
+        no spot machine in 14 other pools; your account's limit refused 3 other pools; Unsupported for 2 other pools; no on-demand m8a.2xlarge; on-demand m6a.large in us-east-1c; spot m6a.2xlarge in us-east-1d, AWS's choice of 5 pools)".to_string();
     let aws = |more: serde_json::Value| { let mut m = serde_json::json!({ "cloud": "aws", "machine_id": "i-0a1b2c3d4e5f60718", "launched_ms": t + 3_000 }); for (k, v) in more.as_object().unwrap() { m[k] = v.clone() } m };
     for (more, said) in [
         // From GitHub, after a wait under the spot limit, every step its machine timed, and what its runner logged.
@@ -3722,7 +3722,7 @@ fn a_jobs_page_says_each_step_of_its_start_and_its_runner_as_its_machine_said() 
             "machine": { "script_ms": t + 20_000, "boot_s": 5.0, "read_ms": t + 22_000, "ready_ms": t + 25_000, "listening_ms": t + 40_000, "github_wait_s": 12, "log": "[RUNNER] waiting ... 30 s ..." } })),
             vec!["GitHub told SuperCI of the job", "waited for room under your AWS spot limit", "AWS gave a machine", "the machine was made and switched on", "it booted", "its disk and Docker were set up",
                 "the runner's files were read from the image (GitHub refused the first connection; reachable after 12 s)", "the runner started and reached GitHub", "GitHub gave it the job",
-                "What its runner logged while it was slow to reach GitHub", "[RUNNER] waiting ... 30 s ...", "8 CPU · m8a.2xlarge · 500 MiB/s disk · RAM disk · on-demand"]),
+                "What its runner logged while it was slow to reach GitHub", "[RUNNER] waiting ... 30 s ...", "m8a.2xlarge · 8 CPU · 500 MiB/s disk · RAM disk", "On-demand"]),
         // A run from a computer's: no read of the image timed; the control plane gave it the job.
         (aws(serde_json::json!({ "started_ms": t + 30_000, "machine_type": "c8a.xlarge", "disk_gb": 100, "disk_mibs": 300, "local_disk": true,
             "machine": { "script_ms": t + 20_000, "boot_s": 5.0, "ready_ms": t + 25_000, "listening_ms": t + 28_000, "log": "[RUNNER] retrying" } })),
@@ -9068,7 +9068,7 @@ fn a_jobs_log_whose_end_is_too_large_written_as_json_is_given_shorter_within_an_
     let mut r = ureq::get(&format!("{}/job/log?id={id}&bytes=4000000", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap();
     let body = r.body_mut().with_config().limit(64 << 20).read_to_string().unwrap();
     let said: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(body.len() <= 5_500_000 && said["truncated"] == true && said["log"].as_str().unwrap().ends_with("the end\n"), "{} bytes", body.len());
+    assert!(body.len() <= 4_200_000 && said["truncated"] == true && said["log"].as_str().unwrap().ends_with("the end\n"), "{} bytes", body.len());
 }
 
 /// GitLab's events as another request's doing meets them: a pending job another delivery of the same event claimed
@@ -9266,7 +9266,7 @@ fn a_jobs_log_too_large_as_json_is_cut_until_it_fits_and_with_a_shape_too_large_
     };
     let (size, said) = log("id=76&bytes=4000000");
     let text = said["log"].as_str().unwrap_or_default();
-    assert!(size <= 5_500_000 && said["truncated"] == true && said["bytes"] == 4_000_000 && !text.is_empty() && text.len() < 4_000_000, "{size} {}", text.len());
+    assert!(size <= 4_200_000 && said["truncated"] == true && said["bytes"] == 4_000_000 && !text.is_empty() && text.len() < 4_000_000, "{size} {}", text.len());
     // Its steps' shape, as its machine said it: one step named at length.
     let mut worker = b"[2026-10-15 10:00:00Z INFO Worker] Job message:\n".to_vec();
     worker.extend(serde_json::json!({ "steps": [{ "type": "action", "contextName": "s".repeat(6_000_000), "name": "build" }] }).to_string().as_bytes());
@@ -9274,7 +9274,7 @@ fn a_jobs_log_too_large_as_json_is_cut_until_it_fits_and_with_a_shape_too_large_
     assert!(status == 200 && !served.store.under("shape:76").is_empty());
     let (size, said) = log("id=76&bytes=4000000&steps=1");
     let text = said["log"].as_str().unwrap_or_default();
-    assert!(size > 5_500_000 && !text.is_empty() && text.len() <= 1_000 && said["shape"][0]["id"].as_str().is_some_and(|s| s.len() == 6_000_000), "{size} {}", text.len());
+    assert!(size > 4_200_000 && !text.is_empty() && text.len() <= 1_000 && said["shape"][0]["id"].as_str().is_some_and(|s| s.len() == 6_000_000), "{size} {}", text.len());
 }
 
 /// GitHub's answer for the App without the name of its address (its slug): the App is shown at the address it was
@@ -15543,10 +15543,10 @@ fn where_each_job_goes_by_the_order_its_limits_rules_and_labels_is_said_on_its_p
     let cases: Vec<Case> = vec![
         ("Cloudflare one job at a time", r#"{"order":[{"cloud":"cloudflare","max_jobs":1},{"cloud":"aws","off":true},{"cloud":"aws-on-demand","off":true}]}"#, false,
             vec![("superci", "Starting"), ("superci", "Cloudflare runs 1 at once")]),
-        ("a job too large for Cloudflare goes to AWS", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws"}]}"#, false, vec![("superci/cpu=8", "8 CPU · m8a.2xlarge"), ("superci", "4 CPU · 12 GB")]),
+        ("a job too large for Cloudflare goes to AWS", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws"}]}"#, false, vec![("superci/cpu=8", "m8a.2xlarge · 8 CPU"), ("superci", "4 CPU · 12 GB")]),
         ("a job only Cloudflare may run, too large for it", r#"{"order":[{"cloud":"cloudflare"},{"cloud":"aws"}]}"#, false, vec![("superci/provider=cloudflare/cpu=16", "Cloudflare")]),
         ("a rule sends the repository to Cloudflare", r#"{"order":[{"cloud":"aws"},{"cloud":"cloudflare"}],"rules":[{"repo":"acme/*","cloud":"cloudflare"}]}"#, false, vec![("superci", "4 CPU · 12 GB")]),
-        ("AWS spot past its month's limit: on-demand", r#"{"order":[{"cloud":"aws","monthly_usd":1.0},{"cloud":"cloudflare","off":true}]}"#, true, vec![("superci", "c8a.xlarge · on-demand")]),
+        ("AWS spot past its month's limit: on-demand", r#"{"order":[{"cloud":"aws","monthly_usd":1.0},{"cloud":"cloudflare","off":true}]}"#, true, vec![("superci", "c8a.xlarge · 4 CPU Spot or on-demand On-demand")]),
         ("past its limit with on-demand off: nowhere", r#"{"order":[{"cloud":"aws","monthly_usd":1.0},{"cloud":"aws-on-demand","off":true},{"cloud":"cloudflare","off":true}]}"#, true, vec![("superci", "Nowhere to run the default machine: AWS reached its $1 a month")]),
         ("the whole CI past its month's limit", r#"{"order":[{"cloud":"aws"}],"monthly_usd":1.0}"#, true, vec![("superci", "reached its limit")]),
         ("the whole CI past its day's limit", r#"{"order":[{"cloud":"aws"}],"daily_usd":1.0}"#, true, vec![("superci", "a day")]),

@@ -465,8 +465,9 @@ fn is_zero(n: &u32) -> bool { *n == 0 }
 /// Spot is paused for half an hour once AWS took back two machines within a quarter of an hour.
 const SPOT_PAUSE: (usize, u64, u64) = (2, 15 * 60_000, 30 * 60_000);
 
-/// The most an answer of the control plane's may be (bytes): AWS's function URLs answer 502 for one over six MB.
-const ANSWER_MAX: usize = 5_500_000;
+/// The most an answer of the control plane's may be (bytes): AWS's function URLs answer 502 for one over six MB, and
+/// an AWS control plane hands its answers to Lambda in base64 (a third more), with their headers.
+const ANSWER_MAX: usize = 4_200_000;
 
 /// Where the last `want` bytes of a log begin: at a line's start, when the cut falls inside one.
 fn tail_from(log: &[u8], want: usize) -> usize {

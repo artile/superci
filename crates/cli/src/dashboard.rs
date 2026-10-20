@@ -583,11 +583,14 @@ fn region_select_options(selected: &str, quotas: &HashMap<String, Result<u32>>, 
 }
 
 /// Why the AWS account in hand cannot run jobs in a region, in a few words (None: it can, or it has not been looked
-/// at): its organization or its sign-in does not allow the region, or the image jobs run on is not there.
+/// at): its organization or its sign-in does not allow the region, or the image jobs run on is not there. A region
+/// AWS gave no clear answer for (an error that is no refusal, as while a policy changes) is not taken as allowed,
+/// unless AWS answered for none (it could not be reached: nothing is known of any).
 fn region_unusable(look: Option<&aws::Look>, region: &str) -> Option<&'static str> {
     let look = look?;
     match look.regions.iter().find(|(r, _)| r == region) {
         Some((_, aws::Answer::Refused(r))) => Some(if matches!(r.by, superci_core::aws::By::Organization | superci_core::aws::By::OrganizationResources) { "not allowed by your AWS organization" } else { "not allowed for this sign-in" }),
+        Some((_, aws::Answer::Unknown(_))) if look.unanswered().is_none() => Some("AWS did not say: Refresh under Control plane"),
         _ if look.regions_without_image().contains(&region) => Some("copy the runner image in first"),
         _ => None,
     }
@@ -848,8 +851,8 @@ fn job_names(j: &serde_json::Value) -> (String, String) {
 /// Seconds in words, for a start's steps: "0.4 s", "36 s", "1m 12s".
 fn secs(ms: u64) -> String { if ms < 9_950 { format!("{:.1} s", ms as f64 / 1000.0) } else if ms < 60_000 { format!("{} s", (ms + 500) / 1000) } else { span(ms) } }
 
-/// What AWS was asked for a job's machine, in a few words: "no spot m8a.8xlarge in 6 zones; m7a.8xlarge in us-east-1a",
-/// or "no spot m8a.8xlarge; r8a.8xlarge in us-east-1d, AWS's choice of 14 pools".
+/// What AWS was asked for a job's machine, in a few words: "no spot m8a.8xlarge in 6 zones; spot m7a.8xlarge in us-east-1a",
+/// or "no spot m8a.8xlarge; spot r8a.8xlarge in us-east-1d, AWS's choice of 14 pools".
 fn asks_said(j: &serde_json::Value) -> String {
     let asks = j["asks"].as_array().cloned().unwrap_or_default();
     let mut said: Vec<String> = vec![];
@@ -861,14 +864,14 @@ fn asks_said(j: &serde_json::Value) -> String {
         // One request for any of several pools (see `Ask::pools`): what AWS chose among them, or that none had one.
         if let Some(pools) = a["pools"].as_u64().filter(|p| *p > 0) {
             said.push(match what {
-                "started" => format!("{kind}{}, AWS's choice of {pools} pools", a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default()),
+                "started" => format!("{market}{kind}{}, AWS's choice of {pools} pools", a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default()),
                 "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" => format!("your account's limit refused {pools} other pools"),
                 "InsufficientInstanceCapacity" => format!("no spot machine in {pools} other pools"),
                 other => format!("{other} for {pools} other pools"),
             });
             i += 1; continue
         }
-        if what == "started" { said.push(format!("{}{kind}{}", if spot { "" } else { market }, a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default())); i += 1; continue }
+        if what == "started" { said.push(format!("{market}{kind}{}", a["zone"].as_str().filter(|z| !z.is_empty()).map(|z| format!(" in {z}")).unwrap_or_default())); i += 1; continue }
         // The same answer for the same type, zone after zone: said once.
         let alike = asks[i..].iter().take_while(|b| b["kind"] == a["kind"] && b["spot"] == a["spot"] && b["said"] == a["said"]).count();
         let why = match what { "InsufficientInstanceCapacity" => "no", "MaxSpotInstanceCountExceeded" | "VcpuLimitExceeded" => "your account's limit refused", "RequestLimitExceeded" => "AWS took no more requests for", other => other };
@@ -1040,6 +1043,29 @@ fn runner_text(j: &serde_json::Value) -> (String, String) {
             (cloud.to_string(), size.unwrap_or_else(|| cloud_name(cloud).to_string()))
         }
     }
+}
+
+/// An AWS job's machine for its page, each in words of its own: the machine ("c8a.xlarge · 4 CPU · RAM disk"), how it
+/// was bought ("Spot", or "On-demand" and why), and where ("N. Virginia · us-east-1d"). None: not on an AWS machine
+/// (yet).
+fn aws_machine(j: &serde_json::Value) -> Option<(String, String, String)> {
+    if j["cloud"] != "aws" || j["machine_type"].as_str().is_none_or(str::is_empty) { return None }
+    // (The type first, then its CPUs and its disk as the jobs' list says them.)
+    let (kind, text) = (j["machine_type"].as_str().unwrap_or_default(), runner_text(j).1);
+    let machine = match j["cpu"].as_u64() {
+        Some(c) => format!("{kind} · {c} CPU{}", text.strip_prefix(&format!("{c} CPU · {kind}")).unwrap_or_default().trim_end_matches(" · on-demand")),
+        None => text.trim_end_matches(" · on-demand").to_string(),
+    };
+    let market = if j["on_demand"] == true {
+        match off_spot(j) { Some((why, _)) => format!("On-demand · {}", why.strip_prefix("On-demand: ").unwrap_or(&why)), None => "On-demand".to_string() }
+    } else if j["spot_again"] == true { "Spot · an on-demand machine did not fit your AWS account's on-demand limit".to_string() } else { "Spot".to_string() };
+    let region = j["region"].as_str().unwrap_or_default();
+    let place = match (region, j["zone"].as_str().filter(|z| !z.is_empty())) {
+        ("", _) => String::new(),
+        (r, Some(z)) => format!("{} · {z}", region_short(r)),
+        (r, None) => format!("{} · {r}", region_short(r)),
+    };
+    Some((machine, market, place))
 }
 
 /// Why a job that asked for a spot machine ran on an on-demand one (which costs about twice as much): what AWS said
@@ -1746,7 +1772,12 @@ impl Dashboard {
     /// allows of what SuperCI does there (its regions, spot and on-demand machines, how many CPUs at once, the image
     /// jobs run on), whose rule a refusal is, and where to ask AWS for more. For every account, restricted or not:
     /// what `superci accounts retrieve aws` says. Nothing until the account has been looked at.
-    fn aws_account_section(&self) -> String {
+    fn aws_account_section(&self) -> String { self.aws_account_section_for(None) }
+
+    /// As `aws_account_section`, beside a control plane whose machines start in this account: each region it may use
+    /// on a line of its own, with how the control plane's jobs use it (spot, on-demand, in which order), what AWS
+    /// lets it run there at once, and whether the image jobs run on is there.
+    fn aws_account_section_for(&self, v: Option<&PlaneView>) -> String {
         let (Some(account), Some(look)) = (self.aws.as_ref().map(|a| a.account_id.clone()), self.aws_look()) else { return String::new() };
         let names = |regions: &[&str]| regions.iter().map(|r| region_short(r)).collect::<Vec<_>>().join(", ");
         let whose = |a: &aws::Answer| match a {
@@ -1778,12 +1809,54 @@ impl Dashboard {
             }
         };
         let mut rows = vec![];
+        // Copying the image jobs run on into a region that lacks it: a press here (as `superci images create REGION`).
+        let copy_into = |region: &str| format!(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="{}"><input type="hidden" name="region" value="{}"><input type="hidden" name="next"><button class="button secondary sm">Copy into {}</button></form>"#, esc(&account), esc(region), esc(&region_short(region)));
+        // How the control plane in use starts machines in this account, by region: each of its AWS places (spot,
+        // on-demand) in its order there ("spot first", "spot when N. Virginia has none").
+        let mut in_use: Vec<(String, Vec<String>)> = vec![];
+        if let Some(v) = v.filter(|v| v.aws_account().is_some_and(|(a, _)| a == account)) {
+            for p in v.order().iter().filter(|p| !p.off && superci_core::plane::account_of(&p.cloud) == "aws") {
+                let what = if p.cloud == superci_core::plane::AWS_ON_DEMAND { "on-demand" } else { "spot" };
+                let regions = v.pool_regions(p);
+                for (i, r) in regions.iter().enumerate() {
+                    let said = if regions.len() == 1 { what.to_string() } else if i == 0 { format!("{what} first") } else { format!("{what} when {} has none", region_short(&regions[i - 1])) };
+                    match in_use.iter_mut().find(|(x, _)| x == r) { Some((_, u)) => u.push(said), None => in_use.push((r.clone(), vec![said])) }
+                }
+            }
+        }
+        // What AWS lets it run on spot at once in a region, as last asked.
+        let spot_cpus = |r: &str| match self.quotas.get(r) { Some(Ok(n)) => Some(*n), _ if look.asked_in.as_deref() == Some(r) => look.spot_cpus, _ => None };
+        let without_image = look.regions_without_image();
         // Regions: where it may work, and whose rule keeps it from the others.
         let refused: Vec<&(String, aws::Answer)> = look.regions.iter().filter(|(_, a)| matches!(a, aws::Answer::Refused(_))).collect();
-        rows.push(row("Regions", if allowed.is_empty() { "None of those SuperCI works in".to_string() } else if refused.is_empty() { format!("All {} SuperCI works in", allowed.len()) } else { esc(&names(&allowed)) },
-            match refused.first() { Some((_, a)) => esc(&format!("The other {} are refused. {}", refused.len(), whose(a))), None => String::new() },
-            // (Nothing has to be allowed for SuperCI to work: the guide is for whoever wants another region.)
-            if refused.iter().any(|(_, a)| a.by_organization().is_some()) { format!(r#"<a class="button secondary sm" href="{MORE_REGIONS_GUIDE}" target="_blank" rel="noopener">How to allow more ↗</a>"#) } else { String::new() }));
+        let unsaid: Vec<&str> = if look.unanswered().is_some() { vec![] } else { look.regions.iter().filter(|(_, a)| matches!(a, aws::Answer::Unknown(_))).map(|(r, _)| r.as_str()).collect() };
+        let value = if !in_use.is_empty() && !allowed.is_empty() {
+            // The ones it uses first (in their order), then the others it may use.
+            let mut listed: Vec<&str> = in_use.iter().map(|(r, _)| r.as_str()).collect();
+            // (Every region allowed: the ones it uses, and any the image is missing from; the rest said in a word.)
+            let others: Vec<&str> = allowed.iter().copied().filter(|r| !listed.contains(r) && (!refused.is_empty() || without_image.contains(r))).collect();
+            listed.extend(others);
+            let lines = listed.iter().map(|r| {
+                let uses = in_use.iter().find(|(x, _)| x == r).map(|(_, u)| u.join(" · ")).unwrap_or_default();
+                let (use_said, end) = if !allowed.contains(r) { (format!("{uses} · AWS refuses it now"), String::new()) }
+                    else if without_image.contains(r) { (if uses.is_empty() { "Not used: the runner image is not here".to_string() } else { format!("{uses} · the runner image is not here") }, copy_into(r)) }
+                    else if uses.is_empty() { ("Not used".to_string(), String::new()) } else { (uses, String::new()) };
+                let mut use_said = use_said; if let Some(c) = use_said.get(..1) { use_said = format!("{}{}", c.to_uppercase(), &use_said[1..]) }
+                let cpus = spot_cpus(r).filter(|_| allowed.contains(r) && !without_image.contains(r)).map(|n| format!("{n} spot CPUs")).unwrap_or_default();
+                format!(r#"<li><span class="ar-name">{}<small>{r}</small></span><span class="ar-use">{}</span><span class="ar-cpu">{cpus}</span>{end}</li>"#, esc(&region_short(r)), esc(&use_said))
+            }).collect::<String>();
+            format!(r#"<ul class="acct-regions">{lines}</ul>"#)
+        } else if allowed.is_empty() { "None of those SuperCI works in".to_string() } else if refused.is_empty() { format!("All {} SuperCI works in", allowed.len()) } else { esc(&names(&allowed)) };
+        let mut more = match refused.first() { Some((_, a)) => format!("The other {} are refused. {}", refused.len(), whose(a)),
+            None if value.starts_with("<ul") && unsaid.is_empty() => format!("All {} SuperCI works in are allowed: add more on Runners.", allowed.len()), None => String::new() };
+        if !unsaid.is_empty() { more = format!("{more} AWS did not say for {}: Refresh asks again.", names(&unsaid)).trim().to_string() }
+        // (Nothing has to be allowed for SuperCI to work: the guide is for whoever wants another region. Beside the
+        // regions' lines, a link under them, which leaves the lines the whole width.)
+        let guide = refused.iter().any(|(_, a)| a.by_organization().is_some());
+        let listed = value.starts_with("<ul");
+        let more = if guide && listed { format!(r#"{} <a href="{MORE_REGIONS_GUIDE}" target="_blank" rel="noopener">How to allow more ↗</a>"#, esc(&more)) } else { esc(&more) };
+        rows.push(row("Regions", value, more,
+            if guide && !listed { format!(r#"<a class="button secondary sm" href="{MORE_REGIONS_GUIDE}" target="_blank" rel="noopener">How to allow more ↗</a>"#) } else { String::new() }));
         // Spot and on-demand machines.
         let machines = |a: Option<&aws::Answer>, refused_means: &str| match a {
             Some(aws::Answer::Allowed) => ("Allowed".to_string(), String::new()),
@@ -1810,7 +1883,20 @@ impl Dashboard {
                 format!(r#"<details class="menu"><summary class="button secondary sm">Ask AWS for more <svg class="chev" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></svg></summary><div class="menu-pop">{}{}</div></details>"#,
                     item("Spot", look.spot_cpus, superci_core::aws::SPOT_CPU_QUOTA), item("On-demand", look.on_demand_cpus, superci_core::aws::ON_DEMAND_CPU_QUOTA))
             };
-            rows.push(row("CPUs at once", format!("{} on-demand · {} spot", n(look.on_demand_cpus), n(look.spot_cpus)), esc(&format!("{jobs}, in {}.", region_short(region))), ask));
+            // Beside a control plane whose spot machines start in several regions: what they allow together.
+            let spot_regions: Vec<&str> = in_use.iter().filter(|(_, u)| u.iter().any(|u| u.starts_with("spot"))).map(|(r, _)| r.as_str()).collect();
+            let together: Vec<u32> = spot_regions.iter().filter_map(|r| spot_cpus(r)).collect();
+            if !spot_refused && spot_regions.len() > 1 && together.len() == spot_regions.len() {
+                let total: u32 = together.iter().sum();
+                let item = |what: &str, r: &str, cpus: Option<u32>, code: &str| format!(r#"<a href="{}" target="_blank" rel="noopener">{what} CPUs in {} ↗<small>{} now</small></a>"#,
+                    esc(&superci_core::aws::quota_link(r, code)), region_short(r), n(cpus));
+                let items = spot_regions.iter().map(|r| item("Spot", r, spot_cpus(r), superci_core::aws::SPOT_CPU_QUOTA)).collect::<String>() + &item("On-demand", region, look.on_demand_cpus, superci_core::aws::ON_DEMAND_CPU_QUOTA);
+                let ask = format!(r#"<details class="menu"><summary class="button secondary sm">Ask AWS for more <svg class="chev" viewBox="0 0 24 24"><path d="M8 10l4 4 4-4"/></svg></summary><div class="menu-pop">{items}</div></details>"#);
+                rows.push(row("CPUs at once", format!("{total} spot · {} on-demand", n(look.on_demand_cpus)),
+                    esc(&format!("{} jobs of the default size at a time on spot, across {}. On-demand: in {}.", total / 4, names(&spot_regions), region_short(region))), ask));
+            } else {
+                rows.push(row("CPUs at once", format!("{} on-demand · {} spot", n(look.on_demand_cpus), n(look.spot_cpus)), esc(&format!("{jobs}, in {}.", region_short(region))), ask));
+            }
         }
         // The image jobs run on: where it is missing among the regions the account may use.
         let (usable, without) = (look.usable_regions(), look.regions_without_image());
@@ -1819,8 +1905,6 @@ impl Dashboard {
             // The account's own copy, of an older build than its maker's newest: said, with copying the new one in.
             let behind = self.aws_behind.get(&account).and_then(|b| b.first()).cloned();
             let being_copied = |r: &&str| copying.iter().any(|c| c == *r);
-            // Copying it into a region that lacks it: a press here (as `superci images create REGION`).
-            let copy_into = |region: &str| format!(r#"<form method="post" action="/aws/image"><input type="hidden" name="account" value="{}"><input type="hidden" name="region" value="{}"><input type="hidden" name="next"><button class="button secondary sm">Copy into {}</button></form>"#, esc(&account), esc(region), esc(&region_short(region)));
             let (more, end) = match (&behind, usable.is_empty()) {
                 // In none of its regions: nothing can run until it is copied in (setting up offers that first).
                 (_, true) if without.iter().any(being_copied) => ("It is being copied in: about ten minutes.".to_string(), String::new()),
@@ -1841,7 +1925,10 @@ impl Dashboard {
             };
             let value = if usable.is_empty() { format!("Not in {}", esc(&names(&without))) } else if without.is_empty() && usable.len() > 1 { "In every region it may use".to_string() }
                 else if usable.len() > 3 { format!("In {} of the {} regions it may use", usable.len(), allowed.len()) } else { format!("In {}", esc(&names(&usable))) };
-            rows.push(row("Runner image", value, more, if end.is_empty() { String::new() } else { format!(r#"<span class="acct-do">{end}</span>"#) }));
+            // (Beside a control plane, each region's line says where it is, with Copy where it is not: said here only
+            // when there is more to say, or nowhere to run.)
+            let said_by_regions = !in_use.is_empty() && behind.is_none() && !usable.is_empty() && !without.iter().any(being_copied);
+            if !said_by_regions { rows.push(row("Runner image", value, more, if end.is_empty() { String::new() } else { format!(r#"<span class="acct-do">{end}</span>"#) })) }
         }
         if let (Some(org), Some(managed)) = (&look.organization_id, look.management_account.as_deref().filter(|m| *m != account)) {
             rows.push(row("Organization", esc(org), esc(&format!("Managed from account {managed}: its policies are not this account's to read or change.")), String::new()));
@@ -3782,7 +3869,7 @@ mark();load()})();</script>"#;
             // The AWS pages say what the account may run in each region: asked again after ten minutes.
             let account = d.aws.as_ref().map(|a| a.account_id.clone());
             let stale = account.as_ref().is_some_and(|a| d.quotas_for.as_ref().is_none_or(|(b, at)| b != a || now_ms() > at + 600_000));
-            let quota_creds = if stale && ["add-runners", "runners"].contains(&section) { d.aws_creds().ok().zip(account.clone()) } else { None };
+            let quota_creds = if stale && ["add-runners", "runners", "planes"].contains(&section) { d.aws_creds().ok().zip(account.clone()) } else { None };
             // Where a control plane or runners are set up: what the account in hand allows (its regions, spot).
             // Not looked at yet: the page waits for the look (there is nothing to show of the account before it).
             // Looked at more than twenty seconds ago: looked at again beside the page, each time such a page is
@@ -4649,7 +4736,11 @@ mark();load()})();</script>"#;
         let facts = [
             row("Status", format!(r#"<span class="jt-state {kind}"><i></i>{word}</span>"#)),
             row("Run", run),
-            row("Runner", if runner.is_empty() { String::new() } else { format!("{}<span>{}</span>", logo(&runner_logo, 16), esc(&runner)) }),
+            // An AWS machine: what it is, how it was bought (spot, or on-demand and why), and where it ran.
+            match aws_machine(&j) {
+                Some((machine, market, place)) => [row("Machine", format!("{}<span>{}</span>", logo("aws", 16), esc(&machine))), row("Spot or on-demand", esc(&market)), row("Region", esc(&place))].concat(),
+                None => row("Runner", if runner.is_empty() { String::new() } else { format!("{}<span>{}</span>", logo(&runner_logo, 16), esc(&runner)) }),
+            },
             row("Time", duration(&j)),
             row("Cost", job_cost(&j).filter(|c| *c > 0.0).map(|c| cost_text(&j, c)).unwrap_or_default()),
             row("Queued", ago(j["at_ms"].as_u64().unwrap_or_default())),
@@ -5145,7 +5236,7 @@ mark();load()})();</script>"#;
         let (perms, perm_dialogs) = if v.online { self.permissions_card(v) } else { (String::new(), String::new()) };
         let dialogs = format!("{dialogs}{perm_dialogs}");
         format!(r#"{}{bar}{ended}<p class="note" style="margin:-4px 0 18px">GitHub and GitLab send their jobs to the control plane in use. To move it, set one up in another cloud and Move here: everything comes along.</p><div class="picks page">{rows}</div>{}{perms}{}{dialogs}"#,
-            if moving || self.deploy_running() { r#"<div data-refresh="2"></div>"# } else { "" }, self.aws_account_section(), self.found_card())
+            if moving || self.deploy_running() { r#"<div data-refresh="2"></div>"# } else { "" }, self.aws_account_section_for(Some(v)), self.found_card())
     }
 
     /// Move here's confirmation: what comes along, what needs a sign-in first, what stays; then Move.
@@ -7570,6 +7661,62 @@ mod tests {
         assert!(d.aws_account("333333333333").unwrap_err().contains("not signed in to account 333333333333"));
     }
 
+    /// An account its organization keeps to three regions, beside a control plane whose spot machines start in two of
+    /// them in turn: each region on a line of its own, saying how jobs use it and what AWS lets run there at once; the
+    /// spot CPUs together; the one without the image offered a copy on its line. A region AWS gave no clear answer
+    /// for is not offered as if allowed.
+    #[test]
+    fn several_regions_are_each_said_with_how_jobs_use_them() {
+        let mut d = Dashboard::new();
+        d.aws = Some(aws::Session::for_test("111111111111"));
+        let policy = |by| aws::Answer::Refused(superci_core::aws::Refusal { action: "ec2:DescribeVpcs".into(), by, policy: String::new() });
+        let look = aws::Look {
+            regions: REGIONS.iter().map(|r| (r.to_string(), match *r {
+                "us-east-1" | "us-east-2" | "eu-north-1" => aws::Answer::Allowed,
+                "eu-central-1" => aws::Answer::Unknown("RequestExpired".into()),
+                _ => policy(superci_core::aws::By::Organization),
+            })).collect(),
+            asked_in: Some("us-east-1".into()), spot: Some(aws::Answer::Allowed), on_demand: Some(aws::Answer::Allowed), spot_cpus: Some(300), on_demand_cpus: Some(192),
+            images: vec![("us-east-1".into(), Some(true)), ("us-east-2".into(), Some(true)), ("eu-north-1".into(), Some(false))], organization_id: None, management_account: None,
+        };
+        d.aws_looks.insert("111111111111".into(), (now_ms(), look.clone()));
+        d.quotas.insert("us-east-2".into(), Ok(32));
+        let plane = Plane::Aws { account_id: "111111111111".into(), region: "us-east-1".into(), url: "https://abc.lambda-url.us-east-1.on.aws".into(), plane_id: "abcdefabcdef".into(), label: "superci".into() };
+        let status = serde_json::json!({ "aws": { "account_id": "111111111111", "region": "us-east-1", "connected": true }, "aws_regions": ["us-east-1", "us-east-2"],
+            "routing": { "order": [{ "cloud": "aws", "regions": ["us-east-1", "us-east-2"] }, { "cloud": "aws-on-demand", "regions": ["us-east-1"] }] } });
+        let view = PlaneView { plane, online: true, github: true, installed: true, aws: true, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()), status: Some(status) };
+        let section = d.aws_account_section_for(Some(&view));
+        preview("plane-aws-regions", &section);
+        for said in [
+            r#"<li><span class="ar-name">N. Virginia<small>us-east-1</small></span><span class="ar-use">Spot first · on-demand</span><span class="ar-cpu">300 spot CPUs</span></li>"#,
+            r#"<li><span class="ar-name">Ohio<small>us-east-2</small></span><span class="ar-use">Spot when N. Virginia has none</span><span class="ar-cpu">32 spot CPUs</span></li>"#,
+            r#"<span class="ar-use">Not used: the runner image is not here</span><span class="ar-cpu"></span><form method="post" action="/aws/image">"#,
+            "<small>The other 8 are refused. By its AWS organization. AWS did not say for Frankfurt: Refresh asks again. <a href=\"https://superci.dev/docs/aws-accounts\"",
+            "<dt>CPUs at once</dt><dd>332 spot · 192 on-demand<small>83 jobs of the default size at a time on spot, across N. Virginia, Ohio. On-demand: in N. Virginia.</small>",
+            "Spot CPUs in Ohio ↗<small>32 now</small>",
+        ] { assert!(section.contains(said), "{said}\n\n{section}"); }
+        assert!(!section.contains("<dt>Runner image</dt>"), "each region's line says where the image is: {section}");
+        // Without a control plane beside it (setting one up), as before.
+        assert!(d.aws_account_section().contains("<dt>Regions</dt><dd>N. Virginia, Ohio, Stockholm<small>"));
+        // Frankfurt, which AWS answered with an error, is not offered; unless AWS answered for no region at all.
+        assert_eq!(region_unusable(Some(&look), "eu-central-1"), Some("AWS did not say: Refresh under Control plane"));
+        assert_eq!(region_unusable(Some(&look), "us-east-2"), None);
+        let silent = aws::Look { regions: REGIONS.iter().map(|r| (r.to_string(), aws::Answer::Unknown("timed out".into()))).collect(), ..look };
+        assert_eq!(region_unusable(Some(&silent), "eu-central-1"), None);
+    }
+
+    /// A job's page says its AWS machine in three plain parts: the machine, spot or on-demand (and why on-demand),
+    /// and where.
+    #[test]
+    fn an_aws_jobs_machine_is_said_as_what_how_bought_and_where() {
+        let spot = serde_json::json!({ "cloud": "aws", "machine_type": "r8a.16xlarge", "cpu": 64, "ramdisk": true, "region": "us-east-1", "zone": "us-east-1a" });
+        assert_eq!(aws_machine(&spot), Some(("r8a.16xlarge · 64 CPU · RAM disk".into(), "Spot".into(), "N. Virginia · us-east-1a".into())));
+        let again = serde_json::json!({ "cloud": "aws", "machine_type": "c8a.xlarge", "cpu": 4, "on_demand": true, "after_reclaim": true, "region": "us-east-2" });
+        assert_eq!(aws_machine(&again), Some(("c8a.xlarge · 4 CPU".into(), "On-demand · run again after AWS took back its spot machine".into(), "Ohio · us-east-2".into())));
+        assert_eq!(aws_machine(&serde_json::json!({ "cloud": "aws" })), None);
+        assert_eq!(aws_machine(&serde_json::json!({ "cloud": "cloudflare", "machine_type": "4cpu-12gb" })), None);
+    }
+
     #[test]
     fn an_organizations_picture_is_asked_for_at_the_start_and_once_a_day() {
         let mut d = Dashboard::new();
@@ -8736,7 +8883,7 @@ mod tests {
         assert_eq!(job_start_lines(&j), vec![
             "Its start: 1m from queued to running",
             "    2.0 s  GitHub told SuperCI of the job",
-            "    4.0 s  AWS gave a machine (no spot m8a.8xlarge in 3 zones; no spot r8a.8xlarge; m7a.8xlarge in us-east-1d)",
+            "    4.0 s  AWS gave a machine (no spot m8a.8xlarge in 3 zones; no spot r8a.8xlarge; spot m7a.8xlarge in us-east-1d)",
             "    6.0 s  the machine was made and switched on",
             "    6.6 s  it booted",
             "    1.0 s  its disk and Docker were set up",
@@ -8766,7 +8913,7 @@ mod tests {
         let mut many = j.clone();
         many["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), { "at": 800, "kind": "r8a.8xlarge", "zone": "us-east-1d", "spot": true, "said": "started", "ms": 2_900, "pools": 14 }]);
         many["machine_type"] = "r8a.8xlarge".into();
-        assert_eq!(job_start_lines(&many)[2], "    4.0 s  AWS gave a machine (no spot m8a.8xlarge; r8a.8xlarge in us-east-1d, AWS's choice of 14 pools)");
+        assert_eq!(job_start_lines(&many)[2], "    4.0 s  AWS gave a machine (no spot m8a.8xlarge; spot r8a.8xlarge in us-east-1d, AWS's choice of 14 pools)");
         assert_eq!(job_words(&many)["choice"], "Not the first choice: AWS had no spot m8a.8xlarge in us-east-1a");
         // None of them had one either: said once, and the job went on to an on-demand machine.
         many["asks"] = serde_json::json!([ask(0, "m8a.8xlarge", "us-east-1a", "InsufficientInstanceCapacity"), { "at": 800, "kind": "", "spot": true, "said": "InsufficientInstanceCapacity", "ms": 2_900, "pools": 14 },
