@@ -417,7 +417,14 @@ fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
-fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
+/// The dashboard's time. In a debug build, `SUPERCI_LATER` names a file holding how many milliseconds a test moved it
+/// on: what it does after minutes is tested without waiting them.
+fn now_ms() -> u64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    #[cfg(debug_assertions)]
+    if let Some(file) = std::env::var_os("SUPERCI_LATER") { return now + std::fs::read_to_string(file).ok().and_then(|ms| ms.trim().parse::<u64>().ok()).unwrap_or(0) }
+    now
+}
 
 /// The keys that only read, as a control plane's status lists them: each one's name and when it ends (ms).
 pub fn read_keys(status: &serde_json::Value) -> Vec<(String, u64)> {

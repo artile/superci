@@ -1358,6 +1358,92 @@ fn a_kept_key_that_ends_within_the_day_is_replaced_by_a_new_one_handed_to_the_co
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// An update uploaded whose control plane still answers as before ten minutes on is offered again (its cloud did not
+/// switch it over); one that answers as updated is said as updated for a little while, then no more.
+#[test]
+fn an_update_still_not_taken_ten_minutes_on_is_offered_again_and_one_taken_is_said_only_a_little_while() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &served.key);
+    *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    let (_child, link) = common::dashboard_in_time(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let page = || common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    until("the update offered", || page().contains("Update"));
+    common::post(&link, "/plane/update", &[("plane", PLANE)]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !page().contains("Updated to") { assert!(std::time::Instant::now() < end, "{}", page()); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    *served.aws.old_version.lock().unwrap() = Some("0.19.14".into());
+    until("restarting said", || page().contains("Restarting"));
+    // Ten minutes on, still the one before: to update again.
+    common::later(&home, 11 * 60_000);
+    until("offered again", || { let p = page(); p.contains("Update to ") && !p.contains("Restarting") });
+    // Answering as updated, past the little while it is said: nothing more about it.
+    *served.aws.old_version.lock().unwrap() = None;
+    until("nothing more said", || { let p = page(); !p.contains("Update to ") && !p.contains("Updated to") && !p.contains("Restarting") && p.contains("Control plane") });
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What AWS lets the account run in each region is asked again on the runners page once ten minutes have passed.
+#[test]
+fn what_aws_lets_the_account_run_is_asked_again_ten_minutes_on() {
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_in_time(&home, &[]);
+    let quotas = || served.aws.asked.lock().unwrap().iter().filter(|a| a["target"].as_str().is_some_and(|t| t.contains("ServiceQuotas"))).count();
+    let runners = || common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    until("the runners page", || runners().contains("Clouds") && quotas() > 0);
+    // (Its regions asked at once: all of them in before it is counted.)
+    let mut asked = quotas();
+    for _ in 0..20 { std::thread::sleep(std::time::Duration::from_millis(500)); if quotas() == asked { break } asked = quotas() }
+    common::later(&home, 11 * 60_000);
+    until("asked again", || { runners(); quotas() > asked });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An AWS sign-in begun and not back is said (what to do if AWS's page said "400 Bad Request") for ten minutes, then
+/// no more.
+#[test]
+fn an_aws_sign_in_not_back_is_said_for_ten_minutes_then_no_more() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    let (mut child, link) = common::dashboard_in_time(&home, &[]);
+    let overview = || common::words(&common::part(&link, "/?p=overview&fragment=1").1);
+    let (status, _, _) = common::get(&link, "/connect/aws");
+    assert!(status < 400, "{status}");
+    until("said", || overview().contains("Your AWS sign-in is not finished"));
+    common::later(&home, 11 * 60_000);
+    until("no more", || { let o = overview(); !o.contains("Your AWS sign-in is not finished") && o.contains("Usage") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitHub's App made and not installed ten minutes on: no longer said to be on its way (the page stops reading anew),
+/// the App left to install.
+#[test]
+fn github_made_and_not_installed_ten_minutes_on_is_no_longer_said_on_its_way() {
+    let served = serve(|_| {});
+    served.github.set_installed(false, true);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_in_time(&home, &[]);
+    let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "acme")]);
+    assert_eq!(status, 200, "{}", common::words(&form));
+    let state = form.split("state=").nth(1).unwrap().split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap().to_string();
+    let (status, _, _) = common::get(&link, &format!("/github/callback?code=a1b2c3d4e5f6&state={state}"));
+    assert_eq!(status, 303);
+    let (_, html) = common::part(&link, "/?p=overview&fragment=1");
+    assert!(common::words(&html).contains("Connecting GitHub") && html.contains("data-refresh="), "{}", common::words(&html));
+    common::later(&home, 11 * 60_000);
+    let (_, html) = common::part(&link, "/?p=overview&fragment=1");
+    assert!(!common::words(&html).contains("Connecting GitHub") && common::words(&html).contains("Your GitHub App is made; it still has to be installed"), "{}", common::words(&html));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
