@@ -6014,10 +6014,11 @@ fn jobs_from_before_their_indexes_and_run_counts_are_indexed_then_their_runs_cou
         for i in 0..160u64 { m.insert(format!("job:{}", 50_000 + i), job(50_000 + i, 900 + i / 2, now - 3_600_000)); }
         m.insert("job:60000".into(), job(60_000, 0, now - 3_600_000));
         m.insert("job:60001".into(), job(60_001, 7_777, now - 401 * 86_400_000));
-        // An hour of yesterday's that cost and ran no job.
+        // An hour of the day before yesterday's that cost and ran no job (not yesterday: the jobs below, an hour ago,
+        // are yesterday's just after midnight, and their day's record would replace it).
         let mut hours = vec![serde_json::json!({}); 24];
         hours[12] = serde_json::json!({ "jobs": 0, "usd": 1.5 });
-        m.insert(superci_core::plane::day_key(today - 1), serde_json::json!({ "hours": hours, "spend": { "aws": 1.5 } }).to_string());
+        m.insert(superci_core::plane::day_key(today - 2), serde_json::json!({ "hours": hours, "spend": { "aws": 1.5 } }).to_string());
         // (The jobs, as their day's totals hold them.)
         let at = now - 3_600_000;
         let mut hours = vec![serde_json::json!({}); 24];
