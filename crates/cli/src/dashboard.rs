@@ -6677,12 +6677,20 @@ impl Hub {
 fn github_picture(owner: &str) -> Option<String> {
     if !github::valid_login(owner) { return None }
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(4))).build().into();
-    let mut answer = agent.get(&format!("https://github.com/{owner}.png?size=96")).call().ok()?;
+    let mut answer = agent.get(&picture_at(&format!("https://github.com/{owner}.png?size=96"))).call().ok()?;
     if answer.status().as_u16() != 200 { return None }
     let kind = answer.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().split(';').next().unwrap_or_default().trim().to_string();
     if !["image/png", "image/jpeg", "image/gif", "image/webp"].contains(&kind.as_str()) { return None }
     let bytes = answer.body_mut().with_config().limit(300_000).read_to_vec().ok()?;
     Some(format!("data:{kind};base64,{}", superci_core::crypto::b64(&bytes)))
+}
+
+/// Where a picture on github.com is asked for: there; in a debug build with `SUPERCI_PICTURES_AT`, at that stand-in
+/// (as `aws::stand_in` sends the sites it knows), for a test to answer it.
+fn picture_at(url: &str) -> String {
+    #[cfg(debug_assertions)]
+    if let Some(at) = std::env::var("SUPERCI_PICTURES_AT").ok() { return format!("{}/{}", at.trim_end_matches('/'), url.trim_start_matches("https://")) }
+    url.to_string()
 }
 
 /// The mark at the top of the sidebar: the workspace's picture when it has one, SuperCI's own otherwise (which stays

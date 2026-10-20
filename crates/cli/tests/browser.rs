@@ -1931,6 +1931,68 @@ fn aws_runners_of_a_control_plane_that_says_no_region_name_none() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The organization's picture, as github.com gives it: none when it is not there or not an image (asked again ten
+/// minutes on), kept when it is; one that comes after the workspace was signed out is not kept. An App's owner that
+/// is no GitHub login is not asked for.
+#[test]
+fn the_organizations_picture_is_kept_only_as_an_image_and_not_after_signing_out() {
+    use std::io::{Read, Write};
+    use std::sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex};
+    // github.com's pictures as the test answers them (status, kind, bytes), each request counted, held while asked to.
+    let answer = Arc::new(Mutex::new((404u16, "text/html", "Not Found")));
+    let (asked, held) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let pictures = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (a, n, h) = (answer.clone(), asked.clone(), held.clone());
+    std::thread::spawn(move || for mut s in listener.incoming().flatten() {
+        let mut buf = [0u8; 2048];
+        let got = s.read(&mut buf).unwrap_or(0);
+        if !String::from_utf8_lossy(&buf[..got]).starts_with("GET /github.com/acme.png?size=96 ") { let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"); continue }
+        n.fetch_add(1, Ordering::SeqCst);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while h.load(Ordering::SeqCst) && std::time::Instant::now() < end { std::thread::sleep(std::time::Duration::from_millis(50)) }
+        let (status, kind, body) = *a.lock().unwrap();
+        let _ = s.write_all(format!("HTTP/1.1 {status} X\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes());
+    });
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = signed_in(&served);
+    let about = || serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(home.join("workspaces/default/workspace.json")).unwrap_or_default()).unwrap_or_default();
+    let (mut child, link) = common::dashboard_in_time(&home, &[("SUPERCI_PICTURES_AT", &pictures)]);
+    let page = || common::part(&link, "/?p=overview&fragment=1");
+    until("asked", || { page(); asked.load(Ordering::SeqCst) == 1 });
+    for (n, kind) in [(2, "text/html"), (3, "image/png")] {
+        *answer.lock().unwrap() = (200, kind, "a picture");
+        common::later(&home, 11 * 60_000);
+        until("asked again", || { page(); asked.load(Ordering::SeqCst) == n });
+    }
+    until("kept", || about()["picture"].as_str().is_some_and(|p| p.starts_with("data:image/png;base64,")));
+    // Asked again a day on, its answer held until the workspace is signed out.
+    held.store(true, Ordering::SeqCst);
+    *answer.lock().unwrap() = (200, "image/gif", "another picture");
+    common::later(&home, 25 * 3_600_000);
+    until("asked a day on", || { page(); asked.load(Ordering::SeqCst) == 4 });
+    assert_eq!(common::post(&link, "/signout", &[]).0, 303);
+    held.store(false, Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(about()["picture"].as_str().is_none_or(|p| !p.contains("image/gif")), "{}", about());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    // An App whose owner is no GitHub login: never asked for.
+    let served = serve(|_| {});
+    let mut app = superci_testkit::GitHub::app();
+    app["owner"] = "not_a_login".into();
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &app.to_string());
+    let home = signed_in(&served);
+    let before = asked.load(Ordering::SeqCst);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_PICTURES_AT", &pictures)]);
+    until("read", || common::words(&common::part(&link, "/?p=repos&fragment=1").1).contains("not_a_login"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(asked.load(Ordering::SeqCst), before);
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// An update whose version asks for nothing new, of a control plane whose role was found to lack only what lets it
 /// read: said as that many new read permissions in AWS.
 #[test]
