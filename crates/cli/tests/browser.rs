@@ -1561,6 +1561,42 @@ fn a_move_whose_new_control_plane_never_says_it_has_its_runners_or_github_says_s
     }
 }
 
+/// `superci connections create github` in its own tab: back from installing the App on GitHub, the tab says GitHub is
+/// connected (its page, and the part a page asks for: back to the terminal), and the command says so and ends.
+#[test]
+fn a_github_connection_made_in_its_own_tab_says_it_is_connected_there_and_in_the_terminal() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default", "--no-browser"]).env("SUPERCI_PORT", port.to_string())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    // (What it says, read for half a minute at most.)
+    let out = c.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { if tx.send(l).is_err() { break } });
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut said: Vec<String> = vec![];
+    let link = loop {
+        if let Some(l) = said.iter().find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)) { break l }
+        match rx.recv_timeout(end.saturating_duration_since(std::time::Instant::now())) { Ok(l) => said.push(l), Err(_) => { let _ = c.kill(); panic!("said {said:?}, no link") } }
+    };
+    // Back from GitHub, the App installed.
+    let (status, _, body) = common::get(&link, "/github/installed");
+    assert!(status == 200 && common::words(&body).contains("Installed on GitHub"), "{status} {}", common::words(&body));
+    // A page's live part asked for (a tab left open): back to the terminal. The tab's page: GitHub is connected.
+    let (status, page) = common::part(&link, "/?fragment=1");
+    assert!(status == 200 && common::words(&page).contains("Done. Back to your terminal"), "{status} {}", common::words(&page));
+    let (status, page) = common::part(&link, "/");
+    assert!(status == 200 && common::words(&page).contains("GitHub is connected Jobs with runs-on: superci in acme's repositories now run on your runners."), "{status} {}", common::words(&page));
+    // The command says so, and ends.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while c.try_wait().unwrap().is_none() { if std::time::Instant::now() > end { let _ = c.kill(); panic!("it did not end: {said:?}") } std::thread::sleep(std::time::Duration::from_millis(100)) }
+    while let Ok(l) = rx.recv_timeout(std::time::Duration::from_millis(500)) { said.push(l) }
+    assert!(said.iter().any(|l| l.contains("GitHub is connected for acme: its App is installed.")), "{said:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
