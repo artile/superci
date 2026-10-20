@@ -991,6 +991,127 @@ fn a_control_plane_standing_by_for_a_move_is_a_place_to_move_to_not_another_ci()
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A control plane from before its status said where AWS's machines start, its own networks, Cloudflare's location
+/// and the machines up in each cloud: its runners as it keeps them (no field for what it does not), the jobs up there
+/// counted from its list of jobs; a network given as not private is shown as given, and none given changes nothing.
+#[test]
+fn runners_of_a_control_plane_from_before_regions_networks_and_locations_show_only_what_it_keeps() {
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    let runners = || common::part(&link, "/?p=runners&fragment=1").1;
+    until("the runners page", || common::words(&runners()).contains("Clouds"));
+    // Its own network in us-east-1, not private (as AWS answered for the subnet and group): shown as given.
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-00000000000000001 sg-00000000000000001")]);
+    assert!(status < 400, "{status} {}", common::words(&said));
+    let kept = setting("AWS_NETWORKS").unwrap_or_default();
+    assert!(kept.contains("subnet-00000000000000001") && !kept.contains("private"), "{kept}");
+    let page = runners();
+    assert!(page.contains(">us-east-1 subnet-00000000000000001 sg-00000000000000001</textarea>") && page.contains("data-region=") && page.contains(r#"name="location""#), "{}", common::words(&page));
+
+    // From before: a job up on AWS and one ended there, as its list has them.
+    let now = served.now_ms();
+    for (id, state) in [(71u64, "running"), (72, "done")] {
+        served.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "cloud": "aws", "machine_id": format!("i-0{id}"),
+            "at_ms": now - 600_000, "installation_id": 42, "seen_in_progress": true, "began": true }).to_string());
+    }
+    served.answer_as("", &["aws_regions", "aws_networks", "cloudflare_location", "active"]);
+    until("the runners of one from before", || { let p = runners(); p.contains("1 job is running there") && !p.contains("data-region=") && !p.contains(r#"name="location""#) && !p.contains(r#"name="networks""#) && !p.contains(r#"name="image""#) });
+    // None given, to one that keeps none: nothing written.
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "")]);
+    assert!(status < 400 && setting("AWS_NETWORKS") == Some(kept), "{status} {}", common::words(&said));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Overview's usage as the control plane counts it: runs with their jobs, and what the code host would have charged
+/// when it is less than what they cost; from one that does not count runs, the jobs alone; from one that keeps no
+/// usage, the last day of its latest jobs, none of them in it.
+#[test]
+fn overview_says_runs_jobs_and_the_code_hosts_price_as_counted_and_from_older_control_planes_what_they_count() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let now = served.now_ms();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        // Two jobs of one run, two days ago; an hour ago, as the day's totals hold them, a run of two that cost more
+        // than GitHub's runners would have.
+        for id in [81u64, 82] {
+            m.insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 5, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "", "at_ms": now - 2 * 86_400_000,
+                "ended_ms": now - 2 * 86_400_000 + 1_000, "installation_id": 42, "seen_in_progress": true }).to_string());
+        }
+        let at = now - 3_600_000;
+        let mut hours = vec![serde_json::json!({}); 24];
+        hours[(at % 86_400_000 / 3_600_000) as usize] = serde_json::json!({ "runs": 1, "jobs": 2, "ran": 2, "usd": 2.0, "host_usd": 0.5 });
+        m.insert(superci_core::plane::day_key(at / 86_400_000), serde_json::json!({ "hours": hours, "spend": {} }).to_string());
+    }
+    // (Its jobs indexed and their runs counted, as its upkeep does: then it reads the days' totals.)
+    for _ in 0..4 { if served.store.under("runs-counted").is_empty() { served.upkeep() } }
+    assert!(!served.store.under("indexed").is_empty() && !served.store.under("runs-counted").is_empty());
+    let home = home(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let overview = || common::part(&link, "/?p=overview&fragment=1").1;
+    // (The first figure: its number, what it is, the line under it.)
+    let first = |o: &str| o.split(r#"<div class="kpi-num">"#).nth(1).map(|k| common::words(&format!("<div>{}", k.split("<svg").next().unwrap_or_default())) + " " + &common::words(k.split(r#"<div class="kpi-sub">"#).nth(1).unwrap_or_default().split("</div>").next().unwrap_or_default())).unwrap_or_default();
+    until("a run of two jobs, and GitHub's price", || { let o = overview(); first(&o) == "1 run 2 jobs" && common::words(&o).contains("GitHub: $0.50") && !o.contains("saved") });
+    // Runs not counted (before 0.19.6): its jobs.
+    served.answer_as("", &["usage.*.runs"]);
+    until("the jobs alone", || first(&overview()) == "2 jobs 2 ran");
+    // No usage kept (before 0.18.2): the last day of its latest jobs, and none of them is.
+    served.answer_as("", &["usage"]);
+    until("the last day's jobs, none", || { let o = overview(); o.contains("Last 24 hours") && o.contains("No jobs in the last day.") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Repositories from control planes that said less of their GitHub Apps: installations not said to be whose (each
+/// taken as every App's), and the one App of before several (a further one not shown); an organization added after the
+/// first, with a dash in its name, can be removed.
+#[test]
+fn repositories_show_github_apps_as_each_older_control_plane_says_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    // A further organization's App, as the dashboard leaves one.
+    let mut more = superci_testkit::GitHub::app();
+    (more["id"], more["owner"], more["slug"]) = (77.into(), "acme-corp".into(), "superci-acme-corp".into());
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_77"), &more.to_string());
+    let home = home(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let repos = || common::part(&link, "/?p=repos&fragment=1").1;
+    until("both organizations", || { let r = repos(); r.contains("Remove acme-corp?") && common::words(&r).contains("GitHub · acme-corp") });
+    // Installations not said to be whose: each App's.
+    served.answer_as("", &["installations.*.app"]);
+    until("the installations, each App's", || common::words(&repos()).matches("Jobs from acme (all repositories), acme (all repositories)").count() == 2);
+    until("their permissions", || { let p = common::words(&common::part(&link, "/?p=planes&fragment=1").1); p.contains("Permissions") && p.contains("acme-corp: ") });
+    // The one App, as before several.
+    served.answer_as("", &["apps"]);
+    until("the one App", || { let r = common::words(&repos()); r.contains("Jobs from acme (all repositories)") && !r.contains("acme-corp") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitHub Enterprise on a control plane from before it (0.9.34): said to update it first, nothing made; the name is
+/// looked up at that GitHub first, as GitHub answers for an organization there.
+#[test]
+fn github_enterprise_on_a_control_plane_from_before_it_says_to_update_it_first() {
+    let served = serve(|_| {});
+    *served.aws.old_version.lock().unwrap() = Some("0.9.30".into());
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("the control plane", || common::words(&common::part(&link, "/?p=repos&fragment=1").1).contains("GitHub"));
+    let (status, _, said) = common::post(&link, "/github/start", &[("gh-where", "enterprise"), ("host", "acme.ghe.com"), ("login", "acme")]);
+    let said = common::words(&said);
+    assert!(status == 409 && said.contains("Update the control plane first") && said.contains("GitHub Enterprise needs control plane 0.9.34 or newer"), "{status} {said}");
+    assert!(served.github.asked.lock().unwrap().iter().any(|a| a.contains("api.acme.ghe.com") && a.contains("/users/acme")), "{:?}", served.github.asked.lock().unwrap());
+    assert!(served.aws.settings(PLANE).iter().all(|(k, _)| !k.starts_with("GITHUB_APP")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

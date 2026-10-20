@@ -129,6 +129,13 @@ impl Served {
         let _ = s.read_to_string(&mut out);
         assert!(out.starts_with("HTTP/1.1 200"), "{out}");
     }
+
+    /// From now on it answers as an older version did, its key still taken: its health says `version` (empty: its own)
+    /// and its status is without each of `without`, a path of fields (`active`, `usage.*.runs`, `installations.*.app`:
+    /// `*` is each item of a list or each field of an object). `None` of it again with `answer_as("", &[])`.
+    pub fn answer_as(&self, version: &str, without: &[&str]) {
+        *self.aws.answers_as.lock().unwrap() = (!version.is_empty() || !without.is_empty()).then(|| (version.to_string(), without.iter().map(|w| w.to_string()).collect()));
+    }
 }
 
 /// The control plane's id, and the AWS account and region it is in.
@@ -176,7 +183,8 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let old = a.old_version.lock().unwrap().clone();
             let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
-            let _ = answer(&plane, &base, stream, old);
+            let like = a.answers_as.lock().unwrap().clone();
+            let _ = answer(&plane, &base, stream, old, like);
         }
     });
     let gitlab = github.gitlab.clone();
@@ -214,7 +222,7 @@ fn write(mut out: TcpStream, status: u16, headers: &[(String, String)], body: &[
 
 /// One request on its connection, answered by the control plane, then the connection closed.
 /// (One said to be of an older version answers as that version did.)
-fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<String>) -> std::io::Result<()> {
+fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<String>, like: Option<(String, Vec<String>)>) -> std::io::Result<()> {
     let (method, target, headers, body) = read(&stream)?;
     if target == "/__testkit/upkeep" {
         return match block_on(plane.alarm()) { Ok(()) => write(stream, 200, &[], b"ok"), Err(e) => write(stream, 500, &[], e.as_bytes()) };
@@ -236,6 +244,11 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<Strin
             v.to_string().into_bytes()
         }
         _ => res.body,
+    };
+    let body = match (like, target.split('?').next().unwrap_or_default(), serde_json::from_slice::<Value>(&body)) {
+        (Some((version, _)), "/health", Ok(mut v)) if !version.is_empty() => { v["version"] = json!(version); v.to_string().into_bytes() }
+        (Some((_, without)), "/status", Ok(mut v)) => { for path in &without { leave_out(&mut v, &path.split('.').collect::<Vec<_>>()) } v.to_string().into_bytes() }
+        _ => body,
     };
     write(stream, res.status, &res.headers, &body)
 }
@@ -312,6 +325,9 @@ pub struct Aws {
     pub failing_headers: Arc<Mutex<BTreeMap<String, Vec<(String, String)>>>>,
     /// What happens as an action is asked (`during`): time passing while AWS answers, a job's end arriving meanwhile.
     pub during: Arc<Mutex<Vec<(String, Arc<dyn Fn() + Send + Sync>)>>>,
+    /// The control plane answering as an older version does, its key taken as now (see `Served::answer_as`): the
+    /// version its health says (none: as it is), and what its status leaves out.
+    pub answers_as: Arc<Mutex<Option<(String, Vec<String>)>>>,
 }
 
 /// EC2's error answer (and IAM's, STS's: the query APIs'), as AWS documents it.
@@ -800,9 +816,20 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
             configure(&mut config);
             let plane = ControlPlane { store: &ending, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
-            let _ = answer(&plane, &base, stream, None);
+            let like = a.answers_as.lock().unwrap().clone();
+            let _ = answer(&plane, &base, stream, None, like);
         }
     });
     let gitlab = github.gitlab.clone();
     Served { plane: PLANE.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public }
+}
+
+/// A field taken out of `v` by its path (`*`: each item or field).
+fn leave_out(v: &mut Value, path: &[&str]) {
+    match path {
+        [] => {}
+        [last] => { if let Some(o) = v.as_object_mut() { o.remove(*last); } }
+        ["*", rest @ ..] => match v { Value::Array(a) => a.iter_mut().for_each(|i| leave_out(i, rest)), Value::Object(o) => o.values_mut().for_each(|i| leave_out(i, rest)), _ => {} },
+        [first, rest @ ..] => if let Some(i) = v.get_mut(*first) { leave_out(i, rest) },
+    }
 }
