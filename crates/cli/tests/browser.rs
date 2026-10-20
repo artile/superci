@@ -1270,6 +1270,46 @@ fn a_refusal_by_the_aws_organization_that_names_no_action_is_said_plainly_and_ch
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// What a change did is said once, on the first page that shows it: not lost to a page that has no place for it, nor
+/// to the whole page's frame; said, then not again.
+#[test]
+fn what_a_change_did_is_said_once_on_the_first_page_that_shows_it() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("the runners page", || common::words(&common::part(&link, "/?p=runners&fragment=1").1).contains("Cloudflare"));
+    let (status, to, said) = common::post(&link, "/runners/remove", &[("cloud", "cloudflare")]);
+    assert!(status == 303, "{status} {to} {}", common::words(&said));
+    until("Cloudflare taken out", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "CONTAINERS" && v == "off"));
+    assert!(!common::words(&common::part(&link, "/?p=overview&fragment=1").1).contains("Removed Cloudflare"));
+    assert!(!common::part(&link, "/?p=runners").1.contains("Removed Cloudflare"));
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(page.contains("Removed Cloudflare"), "{page}");
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(!page.contains("Removed Cloudflare"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A further GitLab connection given a new token: kept with a new webhook secret, once the control plane says that
+/// connection at its address (not yet, a moment after it was written).
+#[test]
+fn a_further_gitlab_connected_again_is_waited_for_at_its_address_and_gets_a_new_hook_secret() {
+    let served = serve(|_| {});
+    let given = r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gextra"}"#;
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gextra"), given);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    // (Its first status as it is; the next one, read as it takes the change, says that connection without its address.)
+    served.then_answer("", &[("/status", &[]), ("/status", &["gitlabs.*.url"])]);
+    let (status, to, said) = common::post(&link, "/gitlab/connect", &[("url", "https://gitlab.com/"), ("token", superci_testkit::gitlab::TOKEN), ("which", "gextra")]);
+    assert!(status == 303 && to.starts_with("/?p=gitlab&g=gextra"), "{status} {to} {}", common::words(&said));
+    let kept: serde_json::Value = serde_json::from_str(&served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "GITLAB_gextra").unwrap().1).unwrap();
+    assert!(kept["url"] == "https://gitlab.com" && kept["hook_secret"] != "a-hook-secret-for-tests" && served.answers_to_come() == 0, "{kept} {}", served.answers_to_come());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

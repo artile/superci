@@ -3889,8 +3889,8 @@ mark();load()})();</script>"#;
         let said_once = d.notice.take().map(|n| format!(r#"<div class="notice"><span>{}</span></div>"#, esc(&n))).unwrap_or_default();
         let html = format!("{said_once}{}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.others_ended_notice(), d.render(section, &views, last));
         let html = if look_again && !html.contains("data-refresh=") { format!(r#"<div data-refresh="2"></div>{html}"#) } else { html };
-        // A change's note is said once: once a page showed it (not a page still loading, which would lose it).
-        if let Some(f) = d.flash.clone() { if html.contains(&esc(&f)) && !html.contains("data-loading=") { d.flash = None } }
+        // A change's note is said once: once a page showed it (a page still loading has no place for it, and keeps it).
+        if let Some(f) = d.flash.clone() { if html.contains(&esc(&f)) { d.flash = None } }
         d.keep();
         html
     }
