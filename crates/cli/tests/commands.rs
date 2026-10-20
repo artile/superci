@@ -1966,3 +1966,97 @@ fn a_first_workspace_never_made_here_is_made_under_its_new_id_and_one_forgotten_
     drop(_board);
     for h in [home, home2] { let _ = std::fs::remove_dir_all(&h); }
 }
+
+/// One of Modal's calls answered as a recording has it (each answer protobuf, in base64): for what a real workspace
+/// was not caught answering.
+fn modal_answered(method: &str, answers: &[Vec<u8>]) -> String {
+    use base64::Engine;
+    let answers: Vec<String> = answers.iter().map(|a| base64::engine::general_purpose::STANDARD.encode(a)).collect();
+    serde_json::json!({ "method": "POST", "url": format!("https://api.modal.com/modal.client.ModalClient/{method}"), "target": "", "asked": "", "status": 200, "headers": [],
+        "answer": serde_json::json!({ "answers": answers }).to_string() }).to_string() + "\n"
+}
+
+/// A protobuf message's field: its number, and a number or bytes (a string, another message).
+enum Pb { N(u32, u64), B(u32, Vec<u8>) }
+
+fn pb(fields: &[Pb]) -> Vec<u8> {
+    let varint = |out: &mut Vec<u8>, mut n: u64| loop { let b = (n & 0x7f) as u8; n >>= 7; if n == 0 { out.push(b); break } out.push(b | 0x80) };
+    let mut out = vec![];
+    for f in fields {
+        match f {
+            Pb::N(k, n) => { varint(&mut out, (*k as u64) << 3); varint(&mut out, *n) }
+            Pb::B(k, b) => { varint(&mut out, ((*k as u64) << 3) | 2); varint(&mut out, b.len() as u64); out.extend(b) }
+        }
+    }
+    out
+}
+
+/// Modal's GenericResult: a status (1 done), what was raised, and the exit code.
+fn modal_result(status: u64, exception: &str, exitcode: u64) -> Vec<u8> { pb(&[Pb::N(1, status), Pb::B(2, exception.as_bytes().to_vec()), Pb::N(3, exitcode)]) }
+
+/// A Modal control plane deployed as Modal answered a real one, but where it did not: the setup image's build
+/// followed to its end and failed; `modal deploy` ending with an error (its log's last lines said, of the most
+/// read), or ending otherwise than done, or never; then deployed, the workspace's web address said by Modal. An id
+/// asked for that cannot be one is not taken.
+#[test]
+fn a_modal_deploy_says_how_modals_sandbox_ended_and_its_image_build_failed_and_goes_on_with_the_address_modal_gives() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let modal = superci_testkit::serve_as("mdplane00001", move |c| { let settings = aws.modal_plane_settings(); c.read_settings(&settings); c.own_cloud = "modal".into(); });
+    served.aws.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00001.modal.run".into(), modal.url.clone());
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let deploy = |id: &str, answered: &[String]| {
+        served.aws.replaying(include_str!("../fixtures/modal/02-deploy.jsonl"), &[]);
+        served.aws.replaying(&answered.concat(), &[]);
+        let o = common::command(&home).args(["planes", "create", "modal"]).env("SUPERCI_NEW_PLANE_ID", id).output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let image_built = modal_answered("ImageGetOrCreate", &[pb(&[Pb::B(1, b"im-built".to_vec()), Pb::B(2, modal_result(1, "", 0))])]);
+    // The image still building: followed until its build ends, failed.
+    let (ok, said) = deploy("short", &[
+        modal_answered("ImageGetOrCreate", &[pb(&[Pb::B(1, b"im-building".to_vec())])]),
+        modal_answered("ImageJoinStreaming", &[pb(&[Pb::B(3, b"entry-1".to_vec())]), pb(&[Pb::B(1, modal_result(2, "pip: no space left on device", 0))])]),
+    ]);
+    assert!(!ok && said.contains("Modal could not build the setup image: pip: no space left on device"), "{said}");
+    // `modal deploy` failed: the last lines of what it wrote (no more than so much read of it).
+    let logs: Vec<Vec<u8>> = (1..=60).map(|n| pb(&[Pb::B(2, pb(&[Pb::B(1, format!("line {n}\n").into_bytes())]))])).collect();
+    let (ok, said) = deploy("abcdefghijk-", &[image_built.clone(), modal_answered("SandboxWait", &[pb(&[Pb::B(1, modal_result(1, "", 3))])]), modal_answered("SandboxGetLogs", &logs)]);
+    assert!(!ok && said.contains("`modal deploy app.py` did not succeed (status 1, exit 3): line 43 / line 44 / line 45 / line 46 / line 47 / line 48 / line 49 / line 50") && !said.contains("line 51"), "{said}");
+    // Ended otherwise than done; and still running at the last wait.
+    let (ok, said) = deploy("", &[image_built.clone(), modal_answered("SandboxWait", &[pb(&[Pb::B(1, modal_result(2, "", 0))])])]);
+    assert!(!ok && said.contains("did not succeed (status 2, exit 0)"), "{said}");
+    let (ok, said) = deploy("", &[image_built.clone(), modal_answered("SandboxWait", &[vec![]])]);
+    assert!(!ok && said.contains("did not succeed (still running)"), "{said}");
+    assert_eq!(served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/SandboxWait"))).count(), 2 + 18);
+    // The ids asked for were none: each deploy made its own.
+    let created: Vec<String> = served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/DictGetOrCreate"))).filter_map(|a| a["asked"].as_str().map(str::to_string)).collect();
+    assert!(created.is_empty(), "{created:?}");
+    // Deployed, Modal saying the workspace's web addresses end in modal.run.
+    let env = modal_answered("EnvironmentGetOrCreate", &[pb(&[Pb::B(1, b"en-main".to_vec()), Pb::B(2, pb(&[Pb::B(1, b"main".to_vec()), Pb::B(2, pb(&[Pb::B(1, b"2025.06".to_vec()), Pb::B(2, b"modal.run".to_vec())]))]))])]);
+    let (ok, said) = deploy("mdplane00001", &[env, image_built, modal_answered("SandboxWait", &[pb(&[Pb::B(1, modal_result(1, "", 0))])])]);
+    assert!(ok && said.contains("The control plane is running: https://acmeorg--superci-plane-mdplane00001.modal.run (Modal · acmeorg)"), "{said}");
+    // Its settings written as Modal's client writes them: a long one in pickle's longer form.
+    served.aws.replaying(include_str!("../fixtures/modal/02-deploy.jsonl"), &[]);
+    served.aws.replaying(include_str!("../fixtures/modal/03-use.jsonl"), &[]);
+    let secret = |value: &str| { let o = common::command(&home).args(["secrets", "create", "LONG_ONE", "--value-env=V", "--plane=mdplane00001"]).env("V", value).output().unwrap(); (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (ok, said) = secret(&"x".repeat(400));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Modal token given by name that cannot go in a request's header as it is (not plain ASCII): left out of what is
+/// asked, and Modal's refusal said as Modal said it.
+#[test]
+fn a_modal_token_given_by_name_that_no_header_can_carry_is_left_out_and_modals_refusal_said() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/modal/sign-in/ended.jsonl"), &[]);
+    let o = common::command(&home).args(["planes", "create", "modal"]).env("SUPERCI_MODAL_TOKEN_ID", "ak-tökén").env("SUPERCI_MODAL_TOKEN_SECRET", "as-superciendedrecording00").output().unwrap();
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("Token not found"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
