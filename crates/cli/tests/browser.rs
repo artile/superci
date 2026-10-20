@@ -8699,6 +8699,81 @@ fn a_run_from_a_computers_job_still_waiting_when_its_runs_records_go_gets_no_mac
     assert!(b()["state"] == "failed" && b()["error"].as_str().unwrap_or_default().contains("kept a day") && served.machines.0.lock().unwrap().len() == machines, "{}", b());
 }
 
+/// A layer the store has that is not public, proposed again by a machine of a repository it is granted to already:
+/// the store has it, no upload asked for.
+#[test]
+fn a_private_layer_proposed_again_by_a_repository_granted_it_is_had_already() {
+    let (served, link, id) = layers_machine(true);
+    let ns = format!("gh{}", served.store.under(&format!("job:{id}"))[0].1["repo_id"].as_u64().expect("its repository's id"));
+    let (digest, now) = (format!("sha256:{}", "7".repeat(64)), served.now_ms());
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let hex = "7".repeat(64);
+        m.insert(format!("layer:us-east-1:{digest}"), serde_json::json!({ "size": 100, "diff_id": "", "erofs": { "key": format!("layers/{hex}.erofs"), "size": 1 }, "blob": { "key": format!("layers/{hex}.blob"), "size": 100 }, "made": now, "used": now }).to_string());
+        m.insert(format!("lgrant:{ns}:{digest}"), now.to_string());
+    }
+    let mut r = ureq::post(&format!("{}/cache/{link}/layers-propose", served.url)).send(serde_json::json!({ "layers": [{ "digest": digest, "size": 100 }] }).to_string()).unwrap();
+    let said: serde_json::Value = r.body_mut().read_json().unwrap();
+    assert_eq!(said["layers"][&digest]["do"], "have", "{said}");
+}
+
+/// A workspace signed in to Cloudflare alone, or Modal alone, whose cloud refuses the sign-in as the dashboard looks
+/// there: its control plane and key are kept beside the sign-in noted as ended (they still read the control plane).
+#[test]
+fn a_workspace_whose_only_sign_in_is_refused_keeps_its_control_plane_noting_the_sign_in_as_ended() {
+    let served = serve(|_| {});
+    let cf = serde_json::json!({ "access": "example-access_token-ended", "expires_at_ms": 4102444800000u64, "refresh": "example-refresh_token-ended" });
+    let modal = serde_json::json!({ "token_id": "ak-superciendedrecording00", "token_secret": "as-superciendedrecording00", "workspace": "acmeci" });
+    for (cloud, sign_in, recording, ended) in [("cloudflare", cf, include_str!("../fixtures/cloudflare/sign-in/ended.jsonl"), "cloudflare_ended"),
+        ("modal", modal, include_str!("../fixtures/modal/sign-in/ended.jsonl"), "modal_ended")] {
+        let home = home(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept[cloud] = sign_in;
+        std::fs::write(&file, kept.to_string()).unwrap();
+        std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+        served.aws.replaying(recording, &[]);
+        let (_child, link) = dashboard(&home);
+        let now = || serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap_or_default()).unwrap_or_default();
+        until("the sign-in noted as ended", || { common::part(&link, "/?p=planes&fragment=1"); now()[ended] == true });
+        let now = now();
+        assert!(now[cloud].is_null() && now["plane"]["Aws"]["plane_id"] == "testplane0001" && now["key"]["value"] == served.key.as_str(), "{cloud}: {now}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// A run from a computer moved on by a control plane whose store keeps records' ends beside them, while another
+/// request writes the run: written again over what is there then, what the other wrote kept.
+#[test]
+fn a_run_written_meanwhile_in_a_store_that_keeps_ends_is_moved_on_over_what_is_there_then() {
+    let served = superci_testkit::serve_with_ends(|_| {});
+    served.written_meanwhile("run:", 1, |v| v.map(|v| { let mut r: serde_json::Value = serde_json::from_str(v).unwrap(); r["meanwhile"] = true.into(); r.to_string() }));
+    let body = serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo a\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main" });
+    let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send(body.to_string()).unwrap();
+    let said: serde_json::Value = r.body_mut().read_json().unwrap();
+    let run = said["run_id"].as_str().unwrap_or_else(|| panic!("{said}")).to_string();
+    let record = served.store.under(&format!("run:{run}"))[0].1.clone();
+    assert!(record["meanwhile"] == true && record["jobs"][0]["state"] == "started" && served.store.under("job:").len() == 1, "{record}");
+}
+
+/// A run from a computer whose job's record the store refused as the job started (its runner's message kept),
+/// cancelled: the job ends with the run, with no record of it to end.
+#[test]
+fn a_run_whose_jobs_record_the_store_refused_is_cancelled_all_the_same() {
+    let served = serve(|_| {});
+    served.store_refuses(Some("job:"));
+    let body = serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo a\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main" });
+    let r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    served.store_refuses(None);
+    let (key, record) = served.store.under("run:").into_iter().next().expect("the run kept");
+    assert!(record["jobs"][0]["state"] == "started" && served.store.under("job:").is_empty() && served.store.under("rjob:").len() == 1, "{record}");
+    let run = key.trim_start_matches("run:");
+    let mut r = ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.key)).send_empty().unwrap();
+    let said: serde_json::Value = r.body_mut().read_json().unwrap();
+    assert!(said["cancelled"] == true && served.store.under("rjob:")[0].1["result"] == "cancelled" && served.store.under("job:").is_empty(), "{said}");
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
