@@ -2338,3 +2338,37 @@ fn an_older_build_of_the_accounts_copy_is_updated_with_the_newest_from_the_cli()
     assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage")) && a["url"].as_str().is_some_and(|u| u.contains("ca-central-1"))));
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A runner on a machine of a run from a computer deletes the message it took (as GitHub's runner does once it has
+/// it): answered, nothing more, and the job goes on to its end.
+#[test]
+fn a_runner_deleting_the_message_it_took_is_answered_and_its_job_goes_on() {
+    use superci_testkit::Runner;
+    use std::io::{Read, Write};
+    let served = serve(|_| {});
+    let dir = common::temp("message-deleted");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/ci.yml", "--quiet"])
+        .env("SUPERCI_HOME", dir.join(".cli")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_STAND_IN", &served.aws.url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let run = loop { if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+    runner.take();
+    // (As the runner asks it: DELETE, on the message's address.)
+    let u = runner.at.trim_start_matches("http://");
+    let (host, rest) = u.split_once('/').unwrap();
+    let mut s = std::net::TcpStream::connect(host).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    s.write_all(format!("DELETE /{rest}/Message/1 HTTP/1.1\r\nhost: {host}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).unwrap();
+    let mut answer = String::new();
+    let _ = s.read_to_string(&mut answer);
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let step = "dddddddd-0000-0000-0000-000000000001";
+    runner.steps(&[(step, "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+    assert_eq!(runner.finish("succeeded"), 200);
+    let _ = cli.wait_with_output();
+    let job = served.store.under("job:").into_iter().map(|(_, j)| j).find(|j| j["run_id"].to_string().trim_matches('"') == run).unwrap_or_default();
+    assert_eq!(job["conclusion"], "success", "{job}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
