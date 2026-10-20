@@ -2372,6 +2372,8 @@ fn a_modal_control_plane_from_before_the_new_names_is_updated_and_its_aws_runner
         assert!(status == 303, "{aws}: {status} {to} {}", common::words(&said));
         until("updated", || { let p = common::words(&common::part(&link, "/?p=planes&c=mdplane00003&fragment=1").1); p.contains("Restarting with") || p.contains("Updated to") });
     }
+    // (Still answering as before: read anew at each look, not shown from what was read.)
+    assert!(common::words(&common::part(&link, "/?p=planes&c=mdplane00003&fragment=1").1).contains("Restarting with"));
     assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.contains("superci-runner") && s.contains("PutRolePolicy"))), "nothing given in AWS");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
@@ -2961,6 +2963,38 @@ fn set_up_offers_no_second_control_plane_in_a_cloudflare_account_that_has_anothe
     let page = || common::words(&common::part(&link, "/?p=plane&fragment=1").1);
     until("found", || page().contains("CIs in your signed-in accounts"));
     assert!(page().contains("Use this one") && page().contains("Has your control plane"), "{}", page());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Signed in nowhere, the control plane kept here saying it moved away: a command still reads it with this computer's
+/// key (there is nothing to find the new one with), as it answers.
+#[test]
+fn signed_in_nowhere_a_control_plane_that_moved_away_is_still_read_with_the_key() {
+    let served = serve(|_| {});
+    served.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!("https://superci.acme.workers.dev").to_string());
+    let home = home(&served);
+    let (ok, said) = common::superci_in_time(&home, &["status"], &[], 30);
+    assert!(ok && said.contains(&served.url), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A workspace whose one control plane is only seen (where another moved, in a cloud not signed in to) takes a CI
+/// found in the AWS account signed in to: it looks after none it can change yet.
+#[test]
+fn a_workspace_with_only_a_seen_control_plane_takes_a_ci_found_in_its_aws_account() {
+    let served = serve(|_| {});
+    let seen = superci_testkit::serve_as("cfplane00001", |_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    k["plane"] = serde_json::json!({ "Seen": { "url": seen.url, "plane_id": "cfplane00001" } });
+    k["key"]["planes"] = serde_json::json!(["cfplane00001"]);
+    std::fs::write(&file, k.to_string()).unwrap();
+    let (mut child, link) = dashboard(&home);
+    until("found", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(PLANE));
+    let (status, to, said) = common::post(&link, "/plane/join", &[("plane", PLANE)]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
