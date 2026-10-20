@@ -1597,6 +1597,24 @@ fn a_github_connection_made_in_its_own_tab_says_it_is_connected_there_and_in_the
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The account's copy of the image jobs run on, of an older build than the newest published: once the account is
+/// looked at, said as behind; asked for the newer one, copied in beside it.
+#[test]
+fn an_accounts_copy_of_an_older_build_is_said_once_looked_at_and_the_newer_one_copied_in() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    // As AWS answered for a copy in Canada, here in N. Virginia (a region the account may use), of an older build.
+    account.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[("ca-central-1", "us-east-1")]);
+    account.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000"), ("ca-central-1", "us-east-1")]);
+    let (mut child, link) = common::dashboard(&home);
+    let copied = || account.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage")) && a["url"].as_str().is_some_and(|u| u.contains("us-east-1"))).count();
+    until("the copy said as behind", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Your copy in N. Virginia is the build of 1 January 2025. Its maker has one of"));
+    let (status, to, said) = common::post(&link, "/aws/image", &[("region", "us-east-1"), ("newer", "1")]);
+    assert!(status == 303 && to == "/?p=planes#aws-account" && copied() == 1, "{status} {to} {} {}", common::words(&said), copied());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
