@@ -2308,3 +2308,18 @@ fn leaving_deletes_another_control_plane_that_serves_nothing_or_had_moved_to_the
         let _ = std::fs::remove_dir_all(&home);
     }
 }
+
+/// What the control plane's AWS role lacks, read before it is given: a region its machines use with no network of
+/// its own is said among it.
+#[test]
+fn a_region_without_the_control_planes_own_network_is_said_among_what_its_role_lacks() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = common::signed_in(&served);
+    served.aws.fail("DescribeVpcs", 200, r#"<?xml version="1.0" encoding="UTF-8"?><DescribeVpcsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>1</requestId><vpcSet/></DescribeVpcsResponse>"#, None);
+    let o = superci(&home, &["planes", "allow", "--dry-run"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("A network of its own in each region its machines use"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
