@@ -6956,6 +6956,113 @@ fn a_job_its_first_place_refuses_and_aws_fails_otherwise_says_both() {
     served.machines_refuse(None);
 }
 
+/// Jobs GitHub never told of are asked for in the repositories that had a job here in the last day, ten of them, and
+/// in turns among the quieter ones (one past those ten, the eleventh of the day, among them); never in a GitLab
+/// project's, nor in one whose last job here is over two weeks old, while the jobs kept are not all indexed yet.
+#[test]
+fn jobs_github_never_told_of_are_asked_for_in_ten_of_the_days_repositories_and_in_turns_among_the_rest() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let now = served.now_ms();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for n in 0..11u64 {
+            let id = 500 + n;
+            m.insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": format!("acme/r{n:02}"), "state": "done", "label": "superci", "at_ms": now - 3_600_000 - n * 60_000, "installation_id": 42, "app_id": 1001, "ended_ms": now - 3_000_000, "cloud": "", "seen_in_progress": true }).to_string());
+        }
+        // (Many more from before, older than two weeks: not all indexed yet, the jobs kept are read themselves.)
+        for id in 9000..9150u64 { m.insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/old", "state": "done", "label": "superci", "at_ms": now - 20 * 86_400_000, "installation_id": 42, "ended_ms": now - 20 * 86_400_000, "cloud": "", "seen_in_progress": true }).to_string()); }
+        m.insert("job:glgl1-9".into(), serde_json::json!({ "job_id": 9, "run_id": 1, "repo": "acme/gitlab-project", "state": "done", "provider": "gitlab", "gitlab": "gl1", "label": "superci", "at_ms": now - 60_000, "installation_id": 42, "cloud": "", "seen_in_progress": true }).to_string());
+    }
+    served.upkeep();
+    let asked: Vec<String> = served.github.asked.lock().unwrap().iter().filter(|a| a.contains("/actions/runs")).cloned().collect();
+    for n in 0..11 { assert!(asked.iter().any(|a| a.contains(&format!("/repos/acme/r{n:02}/actions/runs"))), "r{n:02}: {asked:?}") }
+    assert!(!asked.iter().any(|a| a.contains("gitlab-project") || a.contains("acme/old")), "{asked:?}");
+}
+
+/// Jobs kept from before their day's totals were, counted once the indexes are built: each job in its hour, a run
+/// for each run among them, none for a job of no run.
+#[test]
+fn jobs_counted_once_indexed_count_their_runs_and_a_job_of_no_run_counts_none() {
+    let served = serve(|_| {});
+    let at = served.now_ms() - 3_600_000;
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (id, run) in [(601u64, 0u64), (602, 7), (603, 7)] {
+            m.insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": run, "repo": "acme/app", "state": "done", "label": "superci", "at_ms": at, "launched_ms": at, "ended_ms": at + 120_000, "installation_id": 42, "cloud": "cloudflare", "seen_in_progress": true, "began": true }).to_string());
+        }
+    }
+    served.upkeep();
+    let day = served.store.under(&superci_core::plane::day_key(at / 86_400_000))[0].1.clone();
+    let hour = &day["hours"][(at % 86_400_000 / 3_600_000) as usize];
+    assert!(hour["jobs"] == 3 && hour["runs"] == 1, "{day}");
+}
+
+/// A running GitHub job's pages as its machine sent them, read for its log: from the end of each, as much as is
+/// wanted (a page's earlier part left once its later one is that much), from the bucket or the store; a page the
+/// bucket lost, or one in a bucket of an AWS account no longer connected, left out; one the bucket refused, kept in
+/// the store instead.
+#[test]
+fn a_running_jobs_pages_are_read_from_the_bucket_or_the_store_as_far_as_wanted_and_what_cannot_be_is_left_out() {
+    let piece = |s: &str| superci_core::crypto::b64(s.as_bytes());
+    for connected in [true, false] {
+        let served = serve(move |c| if connected {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+        served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+        served.connect_github();
+        let (id, q) = served.github.queue("test", "superci", served.now_ms());
+        assert!(served.webhook(q) < 300 && served.webhook(served.github.start(id)) < 300);
+        // A page's start and its end (said to be two MB: the start is not wanted), a page the bucket no longer has, and
+        // one in the store.
+        served.github.put_object(&format!("{bucket}/live/{id}/a_1.log-0000000000000"), b"2026-10-15T10:00:01.0000000Z page start\n");
+        served.github.put_object(&format!("{bucket}/live/{id}/a_1.log-0000000000100"), b"2026-10-15T10:00:02.0000000Z page end\n");
+        {
+            let mut m = served.store.0.lock().unwrap();
+            m.insert(format!("glive:{id}:a_1.log:0000000000000"), "\"s3:us-east-1:40\"".into());
+            m.insert(format!("glive:{id}:a_1.log:0000000000100"), "\"s3:us-east-1:2000000\"".into());
+            m.insert(format!("glive:{id}:b_1.log:0000000000000"), "\"s3:us-east-1:30\"".into());
+            m.insert(format!("glive:{id}:c_1.log:0000000000000:000"), format!("\"{}\"", piece("2026-10-15T10:00:03.0000000Z from the store\n")));
+        }
+        let log: serde_json::Value = ureq::get(&format!("{}/job/log?id={id}", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap();
+        let text = log["log"].as_str().unwrap_or_default();
+        assert!(text.contains("from the store") && !text.contains("page start"), "{connected}: {log}");
+        assert_eq!(text.contains("page end"), connected, "{log}");
+        if !connected { continue }
+        // The bucket refusing a page its machine sends: kept in the store.
+        let hello = "machine-link-0123456789cd";
+        let runner = {
+            let key = format!("job:{id}");
+            let mut m = served.store.0.lock().unwrap();
+            let mut j: serde_json::Value = serde_json::from_str(&m[&key]).unwrap();
+            j["hello"] = hello.into();
+            m.insert(key, j.to_string());
+            j["runner"].as_str().unwrap().to_string()
+        };
+        served.github.refuse_puts(true);
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        assert_eq!(agent.post(&format!("{}/hello?runner={runner}&t={hello}&live=d_1.log&at=0", served.url)).send("2026-10-15T10:00:04.0000000Z refused\n").unwrap().status().as_u16(), 200);
+        assert!(!served.store.under(&format!("glive:{id}:d_1.log:0000000000000:")).is_empty(), "{:?}", served.store.under("glive:"));
+    }
+}
+
+/// A job's log asked for at its largest, whose end written as JSON would be over what an answer may be (its colours
+/// take six times their bytes): less of it, within an answer, said to be cut.
+#[test]
+fn a_jobs_log_whose_end_is_too_large_written_as_json_is_given_shorter_within_an_answer() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let (id, q) = served.github.queue("test", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300 && served.webhook(served.github.start(id)) < 300);
+    let log = format!("2026-10-15T10:00:00.0000000Z {}\n2026-10-15T10:00:01.0000000Z the end\n", "\u{1b}[0m".repeat(1_000_000));
+    assert!(served.webhook(served.github.finish(id, "success", &log, served.now_ms())) < 300);
+    let mut r = ureq::get(&format!("{}/job/log?id={id}&bytes=4000000", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap();
+    let body = r.body_mut().with_config().limit(64 << 20).read_to_string().unwrap();
+    let said: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(body.len() <= 5_500_000 && said["truncated"] == true && said["log"].as_str().unwrap().ends_with("the end\n"), "{} bytes", body.len());
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
@@ -12144,6 +12251,60 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         let kept = served.store.under("artifact:").into_iter().map(|(_, v)| v).collect::<Vec<_>>();
         assert!(kept.iter().any(|v| v["by"][0].as_str().is_some_and(|id| !key.ends_with(id))), "{kept:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run from a computer's step as its machine sent its pages, and a step's log in pieces in the bucket: read from
+    /// the bucket and the store, a piece the bucket lost left out; a step whose pages hold no whole line yet has none;
+    /// on a control plane whose AWS account is not connected, what is in the bucket is not read.
+    #[test]
+    fn a_run_s_step_pages_and_logs_in_pieces_are_read_from_the_bucket_and_the_store_and_what_cannot_be_is_left_out() {
+        let piece = |s: &str| format!("\"{}\"", superci_core::crypto::b64(s.as_bytes()));
+        for connected in [true, false] {
+            let served = serve(move |c| {
+                if connected { (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX })); }
+                c.routing.order = vec![superci_core::plane::Pool::of("cloudflare")];
+            });
+            let bucket = superci_core::cache::bucket(superci_testkit::PLANE, "us-east-1");
+            served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+            let dir = checkout();
+            let o = superci(&served, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml", "--detach"]).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            let run = run_of(&served);
+            let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } std::thread::sleep(std::time::Duration::from_millis(50)) };
+            runner.take();
+            let (a, b) = ("aaaaaaaa-0000-0000-0000-000000000001", "bbbbbbbb-0000-0000-0000-000000000002");
+            runner.steps(&[(a, "Run make", 1, "inProgress", None, None), (b, "Run make test", 2, "pending", None, None)]);
+            let job = served.store.under(&format!("run:{run}"))[0].1["jobs"][0].clone();
+            let (id, token) = (job["job_id"].as_str().unwrap().to_string(), job["token"].as_str().unwrap().to_string());
+            served.github.put_object(&format!("{bucket}/live/{id}/t_{a}_1.log-0000000000000"), b"2026-10-15T10:00:01.0000000Z from the bucket\n");
+            served.github.put_object(&format!("{bucket}/runs/{token}/log-0007-000"), b"2026-10-15T10:00:05.0000000Z log from the bucket\n");
+            {
+                let mut m = served.store.0.lock().unwrap();
+                m.insert(format!("glive:{id}:t_{a}_1.log:0000000000000"), "\"s3:us-east-1:46\"".into());
+                m.insert(format!("glive:{id}:t_{a}_1.log:0000000000100"), "\"s3:us-east-1:20\"".into());
+                m.insert(format!("glive:{id}:t_{a}_1.log:0000000000200:000"), piece("2026-10-15T10:00:02.0000000Z from the store\n"));
+                m.insert(format!("glive:{id}:t_{b}_1.log:0000000000000:000"), piece("2026-10-15T10:00:03.0000000Z half a li"));
+                m.insert(format!("rlog:{token}:0007:000"), "\"s3:us-east-1\"".into());
+                m.insert(format!("rlog:{token}:0007:001"), "\"s3:us-east-1\"".into());
+            }
+            let get = |path: &str| { let (s, _, b) = fetch_as(&served, &format!("{}{path}", served.url)); (s, String::from_utf8_lossy(&b).to_string()) };
+            let (status, pages) = get(&format!("/runs/{run}/log?job=0&step={a}"));
+            assert!(status == 200 && pages.contains("from the store") && pages.contains("from the bucket") == connected, "{connected}: {status} {pages}");
+            assert_eq!(get(&format!("/runs/{run}/log?job=0&step={b}")).0, 404, "no whole line yet");
+            let (_, log) = get(&format!("/runs/{run}/log?job=0&log=7"));
+            assert_eq!(log.contains("log from the bucket"), connected, "{log}");
+            let (_, whole) = get(&format!("/job/log?id={id}&steps=1"));
+            assert!(whole.contains("from the store"), "{whole}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A GET with the run key, as the CLI asks: status, where it leads, body.
+    fn fetch_as(served: &superci_testkit::Served, url: &str) -> (u16, String, Vec<u8>) {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
+        let mut r = agent.get(url).header("authorization", &format!("Bearer {}", served.run_key)).call().unwrap();
+        let to = r.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        (r.status().as_u16(), to, r.body_mut().read_to_vec().unwrap_or_default())
     }
 }
 
