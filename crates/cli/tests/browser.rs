@@ -991,6 +991,653 @@ fn a_control_plane_standing_by_for_a_move_is_a_place_to_move_to_not_another_ci()
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A control plane from before its status said where AWS's machines start, its own networks, Cloudflare's location
+/// and the machines up in each cloud: its runners as it keeps them (no field for what it does not), the jobs up there
+/// counted from its list of jobs; a network given as not private is shown as given, and none given changes nothing.
+#[test]
+fn runners_of_a_control_plane_from_before_regions_networks_and_locations_show_only_what_it_keeps() {
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let setting = |n: &str| served.aws.settings(PLANE).into_iter().find(|(k, _)| k == n).map(|(_, v)| v);
+    let runners = || common::part(&link, "/?p=runners&fragment=1").1;
+    until("the runners page", || common::words(&runners()).contains("Clouds"));
+    // Its own network in us-east-1, not private (as AWS answered for the subnet and group): shown as given.
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-00000000000000001 sg-00000000000000001")]);
+    assert!(status < 400, "{status} {}", common::words(&said));
+    let kept = setting("AWS_NETWORKS").unwrap_or_default();
+    assert!(kept.contains("subnet-00000000000000001") && !kept.contains("private"), "{kept}");
+    let page = runners();
+    assert!(page.contains(">us-east-1 subnet-00000000000000001 sg-00000000000000001</textarea>") && page.contains("data-region=") && page.contains(r#"name="location""#), "{}", common::words(&page));
+
+    // From before: a job up on AWS and one ended there, as its list has them.
+    let now = served.now_ms();
+    for (id, state) in [(71u64, "running"), (72, "done")] {
+        served.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "cloud": "aws", "machine_id": format!("i-0{id}"),
+            "at_ms": now - 600_000, "installation_id": 42, "seen_in_progress": true, "began": true }).to_string());
+    }
+    served.answer_as("", &["aws_regions", "aws_networks", "cloudflare_location", "active"]);
+    until("the runners of one from before", || { let p = runners(); p.contains("1 job is running there") && !p.contains("data-region=") && !p.contains(r#"name="location""#) && !p.contains(r#"name="networks""#) && !p.contains(r#"name="image""#) });
+    // None given, to one that keeps none: nothing written.
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account"), ("cloud", "aws"), ("networks", "")]);
+    assert!(status < 400 && setting("AWS_NETWORKS") == Some(kept), "{status} {}", common::words(&said));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Overview's usage as the control plane counts it: runs with their jobs, and what the code host would have charged
+/// when it is less than what they cost; from one that does not count runs, the jobs alone; from one that keeps no
+/// usage, the last day of its latest jobs, none of them in it.
+#[test]
+fn overview_says_runs_jobs_and_the_code_hosts_price_as_counted_and_from_older_control_planes_what_they_count() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let now = served.now_ms();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        // Two jobs of one run, two days ago; an hour ago, as the day's totals hold them, a run of two that cost more
+        // than GitHub's runners would have.
+        for id in [81u64, 82] {
+            m.insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 5, "repo": "acme/app", "state": "done", "conclusion": "success", "cloud": "", "at_ms": now - 2 * 86_400_000,
+                "ended_ms": now - 2 * 86_400_000 + 1_000, "installation_id": 42, "seen_in_progress": true }).to_string());
+        }
+        let at = now - 3_600_000;
+        let mut hours = vec![serde_json::json!({}); 24];
+        hours[(at % 86_400_000 / 3_600_000) as usize] = serde_json::json!({ "runs": 1, "jobs": 2, "ran": 2, "usd": 2.0, "host_usd": 0.5 });
+        m.insert(superci_core::plane::day_key(at / 86_400_000), serde_json::json!({ "hours": hours, "spend": {} }).to_string());
+    }
+    // (Its jobs indexed and their runs counted, as its upkeep does: then it reads the days' totals.)
+    for _ in 0..4 { if served.store.under("runs-counted").is_empty() { served.upkeep() } }
+    assert!(!served.store.under("indexed").is_empty() && !served.store.under("runs-counted").is_empty());
+    let home = home(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let overview = || common::part(&link, "/?p=overview&fragment=1").1;
+    // (The first figure: its number, what it is, the line under it.)
+    let first = |o: &str| o.split(r#"<div class="kpi-num">"#).nth(1).map(|k| common::words(&format!("<div>{}", k.split("<svg").next().unwrap_or_default())) + " " + &common::words(k.split(r#"<div class="kpi-sub">"#).nth(1).unwrap_or_default().split("</div>").next().unwrap_or_default())).unwrap_or_default();
+    until("a run of two jobs, and GitHub's price", || { let o = overview(); first(&o) == "1 run 2 jobs" && common::words(&o).contains("GitHub: $0.50") && !o.contains("saved") });
+    // Runs not counted (before 0.19.6): its jobs.
+    served.answer_as("", &["usage.*.runs"]);
+    until("the jobs alone", || first(&overview()) == "2 jobs 2 ran");
+    // No usage kept (before 0.18.2): the last day of its latest jobs, and none of them is.
+    served.answer_as("", &["usage"]);
+    until("the last day's jobs, none", || { let o = overview(); o.contains("Last 24 hours") && o.contains("No jobs in the last day.") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Repositories from control planes that said less of their GitHub Apps: installations not said to be whose (each
+/// taken as every App's), and the one App of before several (a further one not shown); an organization added after the
+/// first, with a dash in its name, can be removed.
+#[test]
+fn repositories_show_github_apps_as_each_older_control_plane_says_them() {
+    let served = serve(|_| {});
+    served.connect_github();
+    // A further organization's App, as the dashboard leaves one.
+    let mut more = superci_testkit::GitHub::app();
+    (more["id"], more["owner"], more["slug"]) = (77.into(), "acme-corp".into(), "superci-acme-corp".into());
+    served.aws.put(&format!("/superci/{PLANE}/GITHUB_APP_77"), &more.to_string());
+    let home = home(&served);
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let repos = || common::part(&link, "/?p=repos&fragment=1").1;
+    until("both organizations", || { let r = repos(); r.contains("Remove acme-corp?") && common::words(&r).contains("GitHub · acme-corp") });
+    // Installations not said to be whose: each App's.
+    served.answer_as("", &["installations.*.app"]);
+    until("the installations, each App's", || common::words(&repos()).matches("Jobs from acme (all repositories), acme (all repositories)").count() == 2);
+    until("their permissions", || { let p = common::words(&common::part(&link, "/?p=planes&fragment=1").1); p.contains("Permissions") && p.contains("acme-corp: ") });
+    // The one App, as before several.
+    served.answer_as("", &["apps"]);
+    until("the one App", || { let r = common::words(&repos()); r.contains("Jobs from acme (all repositories)") && !r.contains("acme-corp") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitHub Enterprise on a control plane from before it (0.9.34): said to update it first, nothing made; the name is
+/// looked up at that GitHub first, as GitHub answers for an organization there.
+#[test]
+fn github_enterprise_on_a_control_plane_from_before_it_says_to_update_it_first() {
+    let served = serve(|_| {});
+    *served.aws.old_version.lock().unwrap() = Some("0.9.30".into());
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("the control plane", || common::words(&common::part(&link, "/?p=repos&fragment=1").1).contains("GitHub"));
+    let (status, _, said) = common::post(&link, "/github/start", &[("gh-where", "enterprise"), ("host", "acme.ghe.com"), ("login", "acme")]);
+    let said = common::words(&said);
+    assert!(status == 409 && said.contains("Update the control plane first") && said.contains("GitHub Enterprise needs control plane 0.9.34 or newer"), "{status} {said}");
+    assert!(served.github.asked.lock().unwrap().iter().any(|a| a.contains("api.acme.ghe.com") && a.contains("/users/acme")), "{:?}", served.github.asked.lock().unwrap());
+    assert!(served.aws.settings(PLANE).iter().all(|(k, _)| !k.starts_with("GITHUB_APP")));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A move waits for the new control plane to have taken each thing given it (its App a moment after it, then its
+/// GitLab) and to have taken GitHub over (it says so a moment after the first claim); meanwhile another control plane
+/// with two jobs running is not deleted, nor after it the old one, two jobs running there.
+#[test]
+fn a_move_waits_for_the_new_control_plane_to_take_its_app_its_gitlab_and_github_and_one_with_jobs_running_is_not_deleted_meanwhile() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    // A third, serving nothing, two jobs of a run from a computer running there.
+    let third = superci_testkit::serve_as("testplane0003", |_| {});
+    for id in [91u64, 92] {
+        third.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 9, "repo": "acme/app", "state": "running", "cloud": "", "provider": "local",
+            "at_ms": third.now_ms() - 60_000, "installation_id": 0, "seen_in_progress": true }).to_string());
+    }
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } },
+        { "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": third.url, "plane_id": "testplane0003", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002", "testplane0003"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+    let (mut child, link) = common::dashboard(&home);
+    // Once its state is in: its status without the App, then without the GitLab; its first claim not yet GitHub's.
+    new.then_answer("/move/import", &[("/status", &["app"]), ("/status", &["gitlab"]), ("/move/claim", &["github"])]);
+    let (status, to, said) = common::post(&link, "/plane/move", &[("plane", "testplane0002")]);
+    assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+    let (status, _, said) = common::post(&link, "/plane/delete", &[("plane", "testplane0003")]);
+    assert!(status == 409 && common::words(&said).contains("2 jobs are still running there"), "{status} {}", common::words(&said));
+    until("moved", || !served.store.under("moved_to").is_empty());
+    let has = |k: &str| served.aws.settings("testplane0002").into_iter().any(|(n, _)| n == k);
+    assert!(has("GITHUB_APP") && has("GITLAB") && new.answers_to_come() == 0, "{:?} {}", served.aws.settings("testplane0002").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), new.answers_to_come());
+    assert_eq!(third.store.under("job:").len(), 2);
+    // The move over, the old one (in use no more) with two jobs running there: not deleted either.
+    until("the move over", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Moved"));
+    for id in [93u64, 94] {
+        served.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 9, "repo": "acme/app", "state": "running", "cloud": "", "provider": "local",
+            "at_ms": served.now_ms() - 60_000, "installation_id": 0, "seen_in_progress": true }).to_string());
+    }
+    let (status, _, said) = common::post(&link, "/plane/delete", &[("plane", PLANE)]);
+    assert!(status == 409 && common::words(&said).contains("2 jobs are still running there"), "{status} {}", common::words(&said));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane whose status lists no labels answers to the one it was set up with: that one is its only label,
+/// not removed.
+#[test]
+fn a_control_plane_that_lists_no_labels_answers_to_its_own_and_it_is_not_removed() {
+    let served = serve(|_| {});
+    served.answer_as("", &["labels"]);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let (status, _, said) = common::post(&link, "/labels", &[("action", "remove"), ("label", "superci")]);
+    assert!(status == 409 && common::words(&said).contains("This is its only label"), "{status} {}", common::words(&said));
+    assert!(served.aws.settings(PLANE).iter().all(|(k, _)| k != "LABELS"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Stopped while it served only a further GitLab connection (no App, no first GitLab): its workflows are said to
+/// change back, and no App to delete.
+#[test]
+fn superci_stopped_while_only_a_further_gitlab_sent_it_jobs_says_to_change_its_workflows_back() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gextra"), r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gextra"}"#);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    let (status, _, said) = common::post(&link, "/plane/leave", &[("confirm", "superci")]);
+    let said = common::words(&said);
+    assert!(status == 200 && said.contains("SuperCI is stopped") && said.contains("Change runs-on: superci back") && !said.contains("GitHub App"), "{status} {said}");
+    assert!(served.aws.settings(PLANE).is_empty(), "{:?}", served.aws.settings(PLANE));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Runners with two jobs waiting for room: the jobs counted, the first one's reason said.
+#[test]
+fn runners_say_how_many_jobs_wait_for_room_and_why() {
+    let served = serve(|_| {});
+    let now = served.now_ms();
+    for id in [61u64, 62] {
+        served.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "state": "waiting", "error": "waiting: Cloudflare has no room for its container yet",
+            "cloud": "", "at_ms": now - 30_000 - id, "installation_id": 42, "seen_in_progress": false }).to_string());
+    }
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    let runners = || common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    until("the jobs waiting", || runners().contains("Waiting 2 jobs · Cloudflare has no room for its container yet"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A job of a further GitLab connection's: its page and its log found by its id and its connection's name (another
+/// connection's job of the same id is another job).
+#[test]
+fn a_job_of_a_further_gitlab_connection_is_found_by_its_id_and_connection() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gextra"), r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gextra"}"#);
+    let now = served.now_ms();
+    // Its job 555, and the first connection's job of the same id.
+    for (key, gl, name) in [("job:glgextra-555", "gextra", "unit tests"), ("job:gl555", "", "lint")] {
+        served.store.0.lock().unwrap().insert(key.into(), serde_json::json!({ "job_id": 555, "run_id": 66, "repo": "acme/app", "name": name, "state": "done", "conclusion": "success",
+            "provider": "gitlab", "gitlab": gl, "project_id": superci_testkit::gitlab::PROJECT, "cloud": "", "at_ms": now - 120_000, "started_ms": now - 110_000, "ended_ms": now - 60_000, "installation_id": 0, "seen_in_progress": true }).to_string());
+    }
+    served.gitlab.trace(555, "Running with gitlab-runner\nunit tests passed\n");
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("its page", || { let p = common::words(&common::part(&link, "/?p=job&id=555&gl=gextra&fragment=1").1); p.contains("unit tests") && !p.contains("lint") });
+    let (status, view) = common::part(&link, "/job/view?id=555&gl=gextra");
+    assert!(status == 200 && view.contains("unit tests passed"), "{status} {view}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A secret last given to a run that a computer started with its own key: Settings says that computer, by its name.
+#[test]
+fn a_secret_last_given_to_a_run_a_computer_started_says_that_computer() {
+    let served = serve(|_| {});
+    let scope = superci_core::secrets::Scope::default();
+    let setting = superci_core::secrets::setting("EVERYWHERE", &scope);
+    let kept = superci_core::secrets::Stored { name: "EVERYWHERE".into(), value: "v".into(), scope, updated_ms: 1 };
+    served.aws.put(&format!("/superci/{PLANE}/{setting}"), &serde_json::to_string(&kept).unwrap());
+    // (As the control plane notes a use: the run, and the device that started it.)
+    served.store.0.lock().unwrap().insert(format!("sused:{setting}"), serde_json::json!({ "run_id": "7", "at_ms": served.now_ms() - 120_000, "repository": "acme/app", "path": ".github/workflows/ci.yml",
+        "ref": "refs/heads/main", "by": "Ada's MacBook", "run_key": false }).to_string());
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("its use", || { let p = common::words(&common::part(&link, "/?p=settings&fragment=1").1); p.contains("EVERYWHERE") && p.contains("started by Ada's MacBook") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS refusing a budget by its organization's policy without naming what it refused (as AWS words some of its
+/// refusals): said as the organization's rule, of "this", and nothing kept.
+#[test]
+fn a_refusal_by_the_aws_organization_that_names_no_action_is_said_plainly_and_changes_nothing() {
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    served.aws.fail("budgets.amazonaws.com", 400, &superci_testkit::json_error("AccessDeniedException", "User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to access this resource with an explicit deny in a service control policy"), Some(1));
+    let (status, _, said) = common::post(&link, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "40"), ("budget", "emails"), ("email", "ops@example.com")]);
+    let said = common::words(&said);
+    assert!(status == 502 && said.contains("AWS refuses this for the whole account: the AWS organization the account is in does not allow it"), "{status} {said}");
+    let routing = served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").map(|(_, v)| v).unwrap_or_default();
+    assert!(!routing.contains("account_usd") && !routing.contains("aws_budget"), "{routing}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What a change did is said once, on the first page that shows it: not lost to a page that has no place for it, nor
+/// to the whole page's frame; said, then not again.
+#[test]
+fn what_a_change_did_is_said_once_on_the_first_page_that_shows_it() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("the runners page", || common::words(&common::part(&link, "/?p=runners&fragment=1").1).contains("Cloudflare"));
+    let (status, to, said) = common::post(&link, "/runners/remove", &[("cloud", "cloudflare")]);
+    assert!(status == 303, "{status} {to} {}", common::words(&said));
+    until("Cloudflare taken out", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "CONTAINERS" && v == "off"));
+    assert!(!common::words(&common::part(&link, "/?p=overview&fragment=1").1).contains("Removed Cloudflare"));
+    assert!(!common::part(&link, "/?p=runners").1.contains("Removed Cloudflare"));
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(page.contains("Removed Cloudflare"), "{page}");
+    let page = common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    assert!(!page.contains("Removed Cloudflare"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A further GitLab connection given a new token: kept with a new webhook secret, once the control plane says that
+/// connection at its address (not yet, a moment after it was written).
+#[test]
+fn a_further_gitlab_connected_again_is_waited_for_at_its_address_and_gets_a_new_hook_secret() {
+    let served = serve(|_| {});
+    let given = r#"{"url":"https://gitlab.com","token":"gitlab-token-for-tests","hook_secret":"a-hook-secret-for-tests","id":"gextra"}"#;
+    served.aws.put(&format!("/superci/{PLANE}/GITLAB_gextra"), given);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard(&home);
+    // (Its first status as it is; the next one, read as it takes the change, says that connection without its address.)
+    served.then_answer("", &[("/status", &[]), ("/status", &["gitlabs.*.url"])]);
+    let (status, to, said) = common::post(&link, "/gitlab/connect", &[("url", "https://gitlab.com/"), ("token", superci_testkit::gitlab::TOKEN), ("which", "gextra")]);
+    assert!(status == 303 && to.starts_with("/?p=gitlab&g=gextra"), "{status} {to} {}", common::words(&said));
+    let kept: serde_json::Value = serde_json::from_str(&served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "GITLAB_gextra").unwrap().1).unwrap();
+    assert!(kept["url"] == "https://gitlab.com" && kept["hook_secret"] != "a-hook-secret-for-tests" && served.answers_to_come() == 0, "{kept} {}", served.answers_to_come());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What the pages show is read again in the background a few seconds on, and taken though one control plane kept
+/// here does not answer and another does not take this computer's key: a name given meanwhile is then shown.
+#[test]
+fn a_reading_made_in_the_background_is_taken_though_one_control_plane_is_down_and_another_not_keyed() {
+    let served = serve(|_| {});
+    let down = superci_testkit::serve_as("testplane0002", |_| {});
+    down.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let other = superci_testkit::serve_as("testplane0003", |_| {});
+    let home = home(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": down.url, "plane_id": "testplane0002", "label": "superci" } },
+        { "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0003", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    let planes = || common::words(&common::part(&link, "/?p=all&fragment=1").1);
+    until("the control planes read", || planes().contains("Not answering"));
+    served.aws.put(&format!("/superci/{PLANE}/NAME"), "Acme CI");
+    // (Read again once what was read is three seconds old: the page meanwhile shows what was read.)
+    std::thread::sleep(std::time::Duration::from_millis(3_200));
+    until("the name given meanwhile", || planes().contains("Acme CI"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A key kept here that ends within the day is not taken up again: the control plane is handed a new one (with the
+/// AWS sign-in), which is kept in its place.
+#[test]
+fn a_kept_key_that_ends_within_the_day_is_replaced_by_a_new_one_handed_to_the_control_plane() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let ending = format!("DEVICE_KEY_{}_TEST", served.now_ms() / 1000 + 3_600);
+    kept["key"]["name"] = ending.clone().into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.put(&format!("/superci/{PLANE}/{ending}"), &served.key);
+    let (mut child, link) = common::dashboard(&home);
+    until("the overview", || common::words(&common::part(&link, "/?p=overview&fragment=1").1).contains("Usage"));
+    let name = || serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap()).unwrap()["key"]["name"].as_str().unwrap_or_default().to_string();
+    until("a new key kept", || name() != ending);
+    let until_s: u64 = name().trim_start_matches("DEVICE_KEY_").split('_').next().unwrap().parse().unwrap();
+    assert!(until_s > served.now_ms() / 1000 + 7 * 86_400 && served.aws.settings(PLANE).iter().any(|(k, _)| *k == name()), "{}", name());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An update uploaded whose control plane still answers as before ten minutes on is offered again (its cloud did not
+/// switch it over); one that answers as updated is said as updated for a little while, then no more.
+#[test]
+fn an_update_still_not_taken_ten_minutes_on_is_offered_again_and_one_taken_is_said_only_a_little_while() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.put(&format!("/superci/{PLANE}/DASHBOARD_KEY_4102444800_TEST"), &served.key);
+    *served.aws.old_version.lock().unwrap() = Some("0.19.12".into());
+    let (_child, link) = common::dashboard_in_time(&home, &[("SUPERCI_VIEWS_S", "0")]);
+    let page = || common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    until("the update offered", || page().contains("Update"));
+    common::post(&link, "/plane/update", &[("plane", PLANE)]);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !page().contains("Updated to") { assert!(std::time::Instant::now() < end, "{}", page()); std::thread::sleep(std::time::Duration::from_millis(300)) }
+    *served.aws.old_version.lock().unwrap() = Some("0.19.14".into());
+    until("restarting said", || page().contains("Restarting"));
+    // Ten minutes on, still the one before: to update again.
+    common::later(&home, 11 * 60_000);
+    until("offered again", || { let p = page(); p.contains("Update to ") && !p.contains("Restarting") });
+    // Answering as updated, past the little while it is said: nothing more about it.
+    *served.aws.old_version.lock().unwrap() = None;
+    until("nothing more said", || { let p = page(); !p.contains("Update to ") && !p.contains("Updated to") && !p.contains("Restarting") && p.contains("Control plane") });
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What AWS lets the account run in each region is asked again on the runners page once ten minutes have passed, and
+/// at once of another account signed in to meanwhile.
+#[test]
+fn what_aws_lets_the_account_run_is_asked_again_ten_minutes_on_and_of_another_account_at_once() {
+    let served = serve(|c| {
+        c.containers = true;
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_in_time(&home, &[]);
+    let quotas = || served.aws.asked.lock().unwrap().iter().filter(|a| a["target"].as_str().is_some_and(|t| t.contains("ServiceQuotas"))).count();
+    let runners = || common::words(&common::part(&link, "/?p=runners&fragment=1").1);
+    until("the runners page", || runners().contains("Clouds") && quotas() > 0);
+    // (Its regions asked at once: all of them in before it is counted.)
+    let mut asked = quotas();
+    for _ in 0..20 { std::thread::sleep(std::time::Duration::from_millis(500)); if quotas() == asked { break } asked = quotas() }
+    common::later(&home, 11 * 60_000);
+    until("asked again", || { runners(); quotas() > asked });
+    // Signed in to another account meanwhile (another terminal's `superci login`): asked of that one at once.
+    let mut asked = quotas();
+    for _ in 0..20 { std::thread::sleep(std::time::Duration::from_millis(500)); if quotas() == asked { break } asked = quotas() }
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    (kept["aws"]["account_id"], kept["aws"]["who"]) = ("222222222222".into(), "arn:aws:sts::222222222222:assumed-role/Admin/someone".into());
+    std::fs::write(&file, kept.to_string()).unwrap();
+    until("asked of the other account", || { runners(); quotas() > asked });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An AWS sign-in begun and not back is said (what to do if AWS's page said "400 Bad Request") for ten minutes, then
+/// no more.
+#[test]
+fn an_aws_sign_in_not_back_is_said_for_ten_minutes_then_no_more() {
+    let served = serve(|_| {});
+    let home = home(&served);
+    let (mut child, link) = common::dashboard_in_time(&home, &[]);
+    let overview = || common::words(&common::part(&link, "/?p=overview&fragment=1").1);
+    let (status, _, _) = common::get(&link, "/connect/aws");
+    assert!(status < 400, "{status}");
+    until("said", || overview().contains("Your AWS sign-in is not finished"));
+    common::later(&home, 11 * 60_000);
+    until("no more", || { let o = overview(); !o.contains("Your AWS sign-in is not finished") && o.contains("Usage") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitHub's App made and not installed ten minutes on: no longer said to be on its way (the page stops reading anew),
+/// the App left to install.
+#[test]
+fn github_made_and_not_installed_ten_minutes_on_is_no_longer_said_on_its_way() {
+    let served = serve(|_| {});
+    served.github.set_installed(false, true);
+    let home = signed_in(&served);
+    let (mut child, link) = common::dashboard_in_time(&home, &[]);
+    let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "acme")]);
+    assert_eq!(status, 200, "{}", common::words(&form));
+    let state = form.split("state=").nth(1).unwrap().split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap().to_string();
+    let (status, _, _) = common::get(&link, &format!("/github/callback?code=a1b2c3d4e5f6&state={state}"));
+    assert_eq!(status, 303);
+    let (_, html) = common::part(&link, "/?p=overview&fragment=1");
+    assert!(common::words(&html).contains("Connecting GitHub") && html.contains("data-refresh="), "{}", common::words(&html));
+    common::later(&home, 11 * 60_000);
+    let (_, html) = common::part(&link, "/?p=overview&fragment=1");
+    assert!(!common::words(&html).contains("Connecting GitHub") && common::words(&html).contains("Your GitHub App is made; it still has to be installed"), "{}", common::words(&html));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A CI whose control plane is in a cloud not signed in to, and does not answer: its pages ask for that sign-in (what
+/// it has is seen through it), not say it is down; Control plane lists it in use, with that sign-in.
+#[test]
+fn a_control_plane_in_a_cloud_not_signed_in_to_that_does_not_answer_asks_for_that_sign_in() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let cf = superci_testkit::serve_as("cfplane00004", |_| {});
+    cf.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.replaying(include_str!("../fixtures/runners/10-cf-remove-aws.jsonl"), &[]);
+    let home = signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Seen": { "url": "https://superci.acme.workers.dev", "plane_id": "cfplane00004" } });
+    kept["key"]["planes"] = serde_json::json!(["cfplane00004"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard_with(&home, &[("SUPERCI_KEY_WAIT_S", "0")]);
+    until("its runners page", || { let p = common::words(&common::part(&link, "/?p=runners&fragment=1").1); p.contains("Sign in with Cloudflare to see it") && !p.contains("not answering") });
+    // Control plane lists it, with that sign-in.
+    until("its control plane page", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("superci.acme.workers.dev Sign in with Cloudflare In use"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// GitLab connected with a token whose user maintains no project: its page says there is none to turn on, and why a
+/// project needs that role.
+#[test]
+fn a_gitlab_whose_token_maintains_no_project_says_there_is_none_to_turn_on() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    served.gitlab.maintains_none();
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("its page", || common::words(&common::part(&link, "/?p=gitlab&fragment=1").1).contains("No projects you maintain Turning a project on adds a webhook to it, which needs the Maintainer role."));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane seen from its address only, with nothing connected and no runners: Control plane lists no
+/// permissions (none is asked of any cloud or code host).
+#[test]
+fn a_control_plane_with_nothing_connected_lists_no_permissions() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+    let home = home(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Seen": { "url": served.url, "plane_id": PLANE } });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (mut child, link) = common::dashboard(&home);
+    until("its page", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Sign in with AWS In use"));
+    let page = common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+    assert!(!page.contains("Permissions"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane from before its App asked for Actions (0.9.29): its update says it also asks for that one new
+/// permission in GitHub, beside AWS's.
+#[test]
+fn an_update_from_before_actions_says_it_asks_for_one_new_permission_in_github() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.answer_as("0.9.28", &[]);
+    let home = home(&served);
+    let (mut child, link) = common::dashboard(&home);
+    until("its update", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Your control plane runs 0.9.28. Changelog It also asks for 5 new permissions in AWS, 1 new permission in GitHub."));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `superci planes move` to a control plane that never says it has AWS's runners: moved, saying what may be missing
+/// for the next minutes; to one that never says it took GitHub over: not moved, saying the old one passes jobs on.
+#[test]
+fn a_move_whose_new_control_plane_never_says_it_has_its_runners_or_github_says_so() {
+    for case in ["runners", "github"] {
+        // The one in use: its own AWS account's machines (or GitHub's App); another beside it in that account.
+        let served = serve(move |c| if case == "runners" {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        if case == "github" { served.connect_github() }
+        served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+        let aws = served.aws.clone();
+        let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+        for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+        if case == "github" { new.then_answer("/move/import", &vec![("/move/claim", &["github"][..]); 40]) }
+        let home = signed_in(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+        kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+        std::fs::write(&file, kept.to_string()).unwrap();
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+        // (Its looks at the new one a moment apart, not two seconds; the command given a minute at most.)
+        let mut cli = common::command(&home).args(["planes", "move", "testplane0002"]).env("SUPERCI_MOVE_PAUSE_MS", "20")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while cli.try_wait().unwrap().is_none() { if std::time::Instant::now() > end { let _ = cli.kill(); panic!("{case}: the move did not end") } std::thread::sleep(std::time::Duration::from_millis(100)) }
+        let out = cli.wait_with_output().unwrap();
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        match case {
+            "runners" => assert!(out.status.success() && said.contains("Moved. Did not come along: The new control plane had not started with every runner provider yet"), "{said}"),
+            _ => assert!(!out.status.success() && said.contains("The new control plane has not taken GitHub over yet") && new.answers_to_come() < 40, "{said}"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// `superci connections create github` in its own tab: back from installing the App on GitHub, the tab says GitHub is
+/// connected (its page, and the part a page asks for: back to the terminal), and the command says so and ends.
+#[test]
+fn a_github_connection_made_in_its_own_tab_says_it_is_connected_there_and_in_the_terminal() {
+    use std::io::BufRead;
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default", "--no-browser"]).env("SUPERCI_PORT", port.to_string())
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    // (What it says, read for half a minute at most.)
+    let out = c.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { if tx.send(l).is_err() { break } });
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut said: Vec<String> = vec![];
+    let link = loop {
+        if let Some(l) = said.iter().find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string)) { break l }
+        match rx.recv_timeout(end.saturating_duration_since(std::time::Instant::now())) { Ok(l) => said.push(l), Err(_) => { let _ = c.kill(); panic!("said {said:?}, no link") } }
+    };
+    // Back from GitHub, the App installed.
+    let (status, _, body) = common::get(&link, "/github/installed");
+    assert!(status == 200 && common::words(&body).contains("Installed on GitHub"), "{status} {}", common::words(&body));
+    // A page's live part asked for (a tab left open): back to the terminal. The tab's page: GitHub is connected.
+    let (status, page) = common::part(&link, "/?fragment=1");
+    assert!(status == 200 && common::words(&page).contains("Done. Back to your terminal"), "{status} {}", common::words(&page));
+    let (status, page) = common::part(&link, "/");
+    assert!(status == 200 && common::words(&page).contains("GitHub is connected Jobs with runs-on: superci in acme's repositories now run on your runners."), "{status} {}", common::words(&page));
+    // The command says so, and ends.
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while c.try_wait().unwrap().is_none() { if std::time::Instant::now() > end { let _ = c.kill(); panic!("it did not end: {said:?}") } std::thread::sleep(std::time::Duration::from_millis(100)) }
+    while let Ok(l) = rx.recv_timeout(std::time::Duration::from_millis(500)) { said.push(l) }
+    assert!(said.iter().any(|l| l.contains("GitHub is connected for acme: its App is installed.")), "{said:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The account's copy of the image jobs run on, of an older build than the newest published: once the account is
+/// looked at, said as behind; asked for the newer one, copied in beside it.
+#[test]
+fn an_accounts_copy_of_an_older_build_is_said_once_looked_at_and_the_newer_one_copied_in() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    // As AWS answered for a copy in Canada, here in N. Virginia (a region the account may use), of an older build.
+    account.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[("ca-central-1", "us-east-1")]);
+    account.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000"), ("ca-central-1", "us-east-1")]);
+    let (mut child, link) = common::dashboard(&home);
+    let copied = || account.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage")) && a["url"].as_str().is_some_and(|u| u.contains("us-east-1"))).count();
+    until("the copy said as behind", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Your copy in N. Virginia is the build of 1 January 2025. Its maker has one of"));
+    let (status, to, said) = common::post(&link, "/aws/image", &[("region", "us-east-1"), ("newer", "1")]);
+    assert!(status == 303 && to == "/?p=planes#aws-account" && copied() == 1, "{status} {to} {} {}", common::words(&said), copied());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A workspace with no control plane, signed in to an AWS account that has one which moved away (a CI's, by where it
+/// went): set up lists it found there, above setting up a new one; with none found, Control plane says there is none.
+#[test]
+fn a_control_plane_found_that_moved_away_is_listed_above_setting_up_a_new_one() {
+    let role = |name: &str, description: &str| format!("<member><Path>/</Path><RoleName>{name}</RoleName><RoleId>AROAEXAMPLE000000001</RoleId><Arn>arn:aws:iam::111111111111:role/{name}</Arn><CreateDate>2026-10-18T10:00:00Z</CreateDate><Description>{description}</Description><MaxSessionDuration>3600</MaxSessionDuration></member>");
+    let roles = |members: &[String]| format!("<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{}</Roles></ListRolesResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ResponseMetadata></ListRolesResponse>", members.concat());
+    let served = serve(|_| {});
+    served.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!("https://superci.acme.workers.dev").to_string());
+    // None found first.
+    let empty = superci_testkit::Aws::serve();
+    let home = common::aws_only(&empty);
+    let (mut child, link) = common::dashboard(&home);
+    until("none", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Control plane No control plane yet"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    served.aws.fail("ListRoles", 200, &roles(&[role(&format!("superci-plane-{PLANE}"), &format!("Runs the SuperCI control plane {} (Lambda, us-east-1, runs-on superci).", served.url))]), None);
+    let home = common::aws_only(&served.aws);
+    let (mut child, link) = common::dashboard(&home);
+    until("found", || { let p = common::words(&common::part(&link, "/?p=plane&fragment=1").1); p.contains("CIs in your signed-in accounts") && p.contains("A CI (testplane0001) AWS · 111111111111 · us-east-1 · runs-on superci") && p.contains("Use this one A new one") });
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

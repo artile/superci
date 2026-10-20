@@ -29,6 +29,8 @@ struct Lab {
     scopes: Option<Vec<String>>,
     /// The token reaches no project (`reach_no_project`).
     no_project: bool,
+    /// The token's user maintains no project (`maintains_none`).
+    maintains_none: bool,
 }
 
 #[derive(Clone, Default)]
@@ -147,6 +149,7 @@ impl GitLab {
             ("GET", ["personal_access_tokens", "self"]) => ok(200, json!({ "id": 4, "name": "SuperCI", "revoked": false, "created_at": "2026-10-01T10:00:00.000Z", "description": "",
                 "scopes": lab.scopes.clone().unwrap_or_else(|| vec!["api".into(), "create_runner".into(), "manage_runner".into()]), "user_id": 1, "last_used_at": "2026-10-15T10:00:00.000Z", "active": true, "expires_at": "2027-10-01" })),
             ("GET", ["projects"]) if lab.no_project => ok(200, json!([])),
+            ("GET", ["projects"]) if lab.maintains_none => ok(200, json!([])),
             ("GET", ["projects"]) => {
                 let p = fixture("project");
                 ok(200, json!([{ "id": PROJECT, "description": p["description"], "name": "app", "name_with_namespace": "Acme / app", "path": "app", "path_with_namespace": PATH,
@@ -200,4 +203,6 @@ impl GitLab {
 
     /// From now on the token reaches no project (`false`: `acme/app` again), as GitLab lists them then: none.
     pub fn reach_no_project(&self, none: bool) { self.lab.lock().unwrap().no_project = none }
+    /// From now on the token's user maintains no project: GitLab lists none to turn on.
+    pub fn maintains_none(&self) { self.lab.lock().unwrap().maintains_none = true }
 }

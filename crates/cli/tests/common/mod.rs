@@ -182,3 +182,16 @@ pub fn aws_only(account: &superci_testkit::Aws) -> std::path::PathBuf {
     std::fs::write(home.join("aws-at"), &account.url).unwrap();
     home
 }
+
+/// A dashboard whose time the test moves on (`later`), with these settings of its own.
+pub fn dashboard_in_time(home: &std::path::Path, envs: &[(&str, &str)]) -> (Dashboard, String) {
+    let file = home.join("later-ms").display().to_string();
+    dashboard_with(home, &[&[("SUPERCI_LATER", file.as_str())][..], envs].concat())
+}
+
+/// That dashboard's time moved on by `ms`: what it does after minutes, without waiting them.
+pub fn later(home: &std::path::Path, ms: u64) {
+    let file = home.join("later-ms");
+    let was: u64 = std::fs::read_to_string(&file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    std::fs::write(file, (was + ms).to_string()).unwrap();
+}

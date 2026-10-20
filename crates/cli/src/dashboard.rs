@@ -417,7 +417,14 @@ fn timed<T>(what: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
-fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
+/// The dashboard's time. In a debug build, `SUPERCI_LATER` names a file holding how many milliseconds a test moved it
+/// on: what it does after minutes is tested without waiting them.
+fn now_ms() -> u64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    #[cfg(debug_assertions)]
+    if let Some(file) = std::env::var_os("SUPERCI_LATER") { return now + std::fs::read_to_string(file).ok().and_then(|ms| ms.trim().parse::<u64>().ok()).unwrap_or(0) }
+    now
+}
 
 /// The keys that only read, as a control plane's status lists them: each one's name and when it ends (ms).
 pub fn read_keys(status: &serde_json::Value) -> Vec<(String, u64)> {
@@ -1234,13 +1241,13 @@ impl Dashboard {
     }
 
     /// Why nothing is signed in to, for a command that needs a sign-in: one that ended says which and how to sign in
-    /// again.
+    /// again. (Asked only while nothing is signed in to: none of them was made again.)
     fn nowhere(&self) -> &'static str {
-        if self.aws_ended { AWS_ENDED } else if self.cf_ended && self.cf.is_none() { CF_ENDED } else if self.modal_ended && self.modal.is_none() { MODAL_ENDED } else { NOT_SIGNED_IN }
+        if self.aws_ended { AWS_ENDED } else if self.cf_ended { CF_ENDED } else if self.modal_ended { MODAL_ENDED } else { NOT_SIGNED_IN }
     }
 
-    /// Whether a sign-in kept here turned out to be over, and has not been made again.
-    fn any_ended(&self) -> bool { self.aws_ended || (self.cf_ended && self.cf.is_none()) || (self.modal_ended && self.modal.is_none()) }
+    /// Whether a sign-in kept here turned out to be over (asked only while nothing is signed in to).
+    fn any_ended(&self) -> bool { self.aws_ended || self.cf_ended || self.modal_ended }
 
     /// The sign-ins that are over and not made again, for a command to say once beside what it did: what they
     /// reach was not looked at.
@@ -2941,7 +2948,8 @@ impl Dashboard {
                 if let Some(d) = stopped.filter(|d| d.cloud == "aws") {
                     let value = |name: &str| d.form.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone()).unwrap_or_default();
                     let (region, plane, account) = (value("region"), value("plane"), d.place.strip_prefix("account ").and_then(|p| p.split(' ').next()).unwrap_or_default().to_string());
-                    if !plane.is_empty() && !region.is_empty() && self.hold_account(&account) {
+                    // (Its form always has both: an AWS deploy is started with its region and its id.)
+                    if self.hold_account(&account) {
                         if let Ok(creds) = self.aws_creds() {
                             let left = aws_plane::abandon(&creds, &region, &plane);
                             println!("POST /plane/start-over → what the stopped deploy made in AWS account {account} is removed{}", if left.is_empty() { String::new() } else { format!(", but for {}", left.join("; ")) });
@@ -3889,8 +3897,8 @@ mark();load()})();</script>"#;
         let said_once = d.notice.take().map(|n| format!(r#"<div class="notice"><span>{}</span></div>"#, esc(&n))).unwrap_or_default();
         let html = format!("{said_once}{}{}{}{}", d.aws_stuck(), d.aws_ended_notice(), d.others_ended_notice(), d.render(section, &views, last));
         let html = if look_again && !html.contains("data-refresh=") { format!(r#"<div data-refresh="2"></div>{html}"#) } else { html };
-        // A change's note is said once: once a page showed it (not a page still loading, which would lose it).
-        if let Some(f) = d.flash.clone() { if html.contains(&esc(&f)) && !html.contains("data-loading=") { d.flash = None } }
+        // A change's note is said once: once a page showed it (a page still loading has no place for it, and keeps it).
+        if let Some(f) = d.flash.clone() { if html.contains(&esc(&f)) { d.flash = None } }
         d.keep();
         html
     }
@@ -5221,13 +5229,13 @@ fn where_choices(name: &str, public: (&str, &str), own: (&str, &str), field: &st
 <div class="perm-field" data-own hidden>{field}</div>"#, public.0, public.1, own.0, own.1)
 }
 
-/// The organizations (and GitLabs) whose jobs a control plane runs, in words: "GitHub: acme, GitLab: gitlab.com".
+/// The organizations (and GitLabs) whose jobs a control plane runs, in words: "GitHub: acme, GitLab: gitlab.com". (Of
+/// one that serves a code host of its own: GitHub's or GitLab's.)
 fn serves(v: &PlaneView) -> String {
     let st = v.status.clone().unwrap_or_default();
     let mut what: Vec<String> = status_apps(&st).iter().filter_map(|a| a["owner"].as_str().map(|o| format!("GitHub: {o}"))).collect();
     what.extend(v.gitlabs().into_iter().map(|(_, url, _)| format!("GitLab: {}", url.trim_start_matches("https://"))));
-    if what.is_empty() && v.github { what.push("GitHub".into()) }
-    if what.is_empty() && v.gitlab { what.push("GitLab".into()) }
+    if what.is_empty() { what.push(if v.github { "GitHub" } else { "GitLab" }.into()) }
     what.join(", ")
 }
 
@@ -6962,6 +6970,14 @@ fn read_views(planes: &[(Plane, bool)], key: &str) -> Vec<PlaneView> {
     })
 }
 
+/// The pause between a move's looks at the new control plane (two seconds). In a debug build, `SUPERCI_MOVE_PAUSE_MS`
+/// sets it: a test of what a move says after its last look does not wait a minute or two for it.
+fn move_pause() {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("SUPERCI_MOVE_PAUSE_MS").ok().and_then(|v| v.parse::<u64>().ok()) { return std::thread::sleep(Duration::from_millis(ms)) }
+    std::thread::sleep(Duration::from_secs(2))
+}
+
 /// A move (see `/plane/move`): returns what stayed behind, in words.
 fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::Value, plan: &[Carry], cf_account: Option<String>, aws_account: Option<String>, step: &dyn Fn(usize)) -> Result<Vec<String>> {
     // 1. Settings and history, copied: the new one is on standby (not in use) until the switch.
@@ -7030,7 +7046,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     let all_apps = |s: &serde_json::Value| { let have: Vec<u64> = status_apps(s).iter().filter_map(|a| a["id"].as_u64()).collect(); coming.iter().all(|id| have.contains(id)) };
     for _ in 0..30 {
         if cloudflare::status(to.url(), key).is_some_and(|s| (!has_app || !s["app"].is_null()) && all_apps(&s) && (!has_gitlab || !s["gitlab"].is_null())) { break }
-        std::thread::sleep(Duration::from_secs(2));
+        move_pause();
     }
 
     // 2. The runner providers: the same clouds, started by the new one (the old one keeps its own).
@@ -7088,7 +7104,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     let mut ready = brought.is_empty();
     for _ in 0..60 {
         if ready { break }
-        std::thread::sleep(Duration::from_secs(2));
+        move_pause();
         ready = cloudflare::status_light(to.url(), key).is_some_and(|s| brought.iter().all(|c| provider_connected(&s, c)));
     }
     if !ready { left.push("The new control plane had not started with every runner provider yet: a job in the next minutes may find one missing.".into()) }
@@ -7100,7 +7116,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     for _ in 0..30 {
         claimed = cloudflare::plane_post(to.url(), key, "/move/claim", &serde_json::json!({ "from": from.url() }));
         if claimed.as_ref().is_ok_and(|c| !has_app || c["github"] == true) { break }
-        std::thread::sleep(Duration::from_secs(2));
+        move_pause();
     }
     match claimed {
         Ok(c) if !has_app || c["github"] == true => {
