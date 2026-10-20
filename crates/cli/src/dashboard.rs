@@ -1967,8 +1967,17 @@ impl Dashboard {
         let mut port = ports[0];
         for p in ports {
             port = p;
+            // Taken on either address, the port is taken: a browser's "localhost" could reach the other program there.
+            // (An address this computer has not, IPv6's where it is off: the other is enough.)
+            let mut bound = vec![];
             for addr in [format!("127.0.0.1:{p}"), format!("[::1]:{p}")] {
-                let Ok(listener) = TcpListener::bind(&addr) else { continue };
+                match TcpListener::bind(&addr) {
+                    Ok(listener) => bound.push(listener),
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => { bound.clear(); break }
+                    Err(_) => {}
+                }
+            }
+            for listener in bound {
                 listening += 1;
                 let tx = tx.clone();
                 std::thread::spawn(move || for s in listener.incoming().flatten() { if tx.send(s).is_err() { break } });
