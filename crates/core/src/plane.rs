@@ -232,8 +232,8 @@ pub struct Cache {
     installed: RefCell<Option<(bool, u64)>>,
     creds: RefCell<Option<Credentials>>,
     tokens: RefCell<HashMap<u64, (String, u64)>>,
-    /// The machine image per region and architecture, and until when it is taken as current.
-    image: RefCell<HashMap<String, (String, u64)>>,
+    /// The machine image per region and architecture (its id and its disk's size), and until when it is taken as current.
+    image: RefCell<HashMap<String, ((String, u32), u64)>>,
     /// Which of a set of machine types a region has, and until when that is taken as current.
     types: RefCell<HashMap<String, (Vec<String>, u64)>>,
     /// What the GitHub App asks for and the GitLab token's scopes, and until when they are taken as current.
@@ -760,6 +760,13 @@ const BUDGET_STOPPED_KEY: &str = "aws:budget-stopped";
 /// back, with when: the next jobs ask the other pools first.
 fn pool_key(region: &str, kind: &str, zone: &str) -> String { format!("aws:pool:{region}:{kind}:{zone}") }
 
+/// The machine type and zone a pool's note is kept under (`pool_key`, `unoffered_key`: its last two parts).
+fn pool_of(key: &str) -> (String, String) {
+    let mut parts = key.rsplitn(3, ':').map(str::to_string);
+    let zone = parts.next().unwrap_or_default();
+    (parts.next().unwrap_or_default(), zone)
+}
+
 /// The day (UTC) a moment is in, as the moment it began.
 pub fn day_start_ms(now_ms: u64) -> u64 { now_ms - now_ms % 86_400_000 }
 
@@ -1091,7 +1098,9 @@ impl RunKey {
 /// A run's job with its secrets taken out of what is kept of its message (its variables marked secret, its masks):
 /// once it has ended, nothing of them is kept.
 fn forget_secrets(handed: &mut crate::runner_service::HandedJob) {
-    if let Some(vars) = handed.message.get_mut("variables").and_then(|v| v.as_object_mut()) { vars.retain(|_, v| v["isSecret"] != true) }
+    // (Its variables are an object, as `job_message` makes them.)
+    let vars: serde_json::Map<String, serde_json::Value> = serde_json::from_value(handed.message["variables"].take()).unwrap_or_default();
+    handed.message["variables"] = vars.into_iter().filter(|(_, v)| v["isSecret"] != true).collect();
     handed.message["mask"] = serde_json::json!([]);
 }
 
@@ -1726,10 +1735,9 @@ impl<'a> ControlPlane<'a> {
         let hello_keys: Vec<String> = jobs.iter().map(|j| format!("hello:{}", job_key(j).trim_start_matches("job:"))).collect();
         let hellos: Vec<Option<serde_json::Value>> = self.store.get_many(&hello_keys).await.unwrap_or_default().into_iter().map(|v| v.and_then(|v| serde_json::from_str(&v).ok())).collect();
         let with_machines: Vec<serde_json::Value> = jobs.iter().enumerate().map(|(i, j)| {
-            let mut v = serde_json::to_value(j).unwrap_or_default();
-            if let Some(Some(m)) = hellos.get(i) { v["machine"] = m.clone() }
             // (Its link is the machine's alone.)
-            if let Some(o) = v.as_object_mut() { o.remove("hello"); }
+            let mut v = serde_json::to_value(Job { hello: None, ..j.clone() }).unwrap_or_default();
+            if let Some(Some(m)) = hellos.get(i) { v["machine"] = m.clone() }
             v
         }).collect();
         Ok(Response::json(&serde_json::json!({
@@ -2174,9 +2182,9 @@ impl<'a> ControlPlane<'a> {
             else if spec.gpu.is_some() { base.replace(&format!("-{ubuntu}-full-"), &format!("-{ubuntu}-gpu-")) }
             else if spec.arch() == "arm64" { base.replace("-x64-", "-arm64-") } else { base };
         let key = format!("{region}/{pattern}");
-        if let Some((id, _)) = self.cache.image.borrow().get(&key).filter(|(_, until)| *until > now) { if let Some((id, gb)) = id.split_once(' ') { return Ok((id.to_string(), gb.parse().unwrap_or(0))) } }
+        if let Some((image, _)) = self.cache.image.borrow().get(&key).filter(|(_, until)| *until > now) { return Ok(image.clone()) }
         let (id, gb) = aws::latest_image_sized(self.http, region, creds, &self.config.image_owner, &pattern, now).await?;
-        self.cache.image.borrow_mut().insert(key, (format!("{id} {gb}"), now + 6 * 3_600_000));
+        self.cache.image.borrow_mut().insert(key, ((id.clone(), gb), now + 6 * 3_600_000));
         Ok((id, gb))
     }
 
@@ -2198,10 +2206,9 @@ impl<'a> ControlPlane<'a> {
     /// not offer a type in (noted for a day).
     async fn pools_to_skip(&self, region: &str, spot: bool, now: u64) -> Vec<(String, String)> {
         let mut pools = vec![];
-        let pool = |key: &str| { let mut parts = key.rsplitn(3, ':'); match (parts.next(), parts.next()) { (Some(zone), Some(kind)) => Some((kind.to_string(), zone.to_string())), _ => None } };
-        if spot { for (key, at) in self.store.list(&format!("aws:pool:{region}:")).await.unwrap_or_default() { if at.parse::<u64>().is_ok_and(|at| now < at + 60_000) { pools.extend(pool(&key)) } } }
+        if spot { for (key, at) in self.store.list(&format!("aws:pool:{region}:")).await.unwrap_or_default() { if at.parse::<u64>().is_ok_and(|at| now < at + 60_000) { pools.push(pool_of(&key)) } } }
         for (key, at) in self.store.list(&format!("aws:unoffered:{region}:")).await.unwrap_or_default() {
-            if at.parse::<u64>().is_ok_and(|at| now < at + 86_400_000) { pools.extend(pool(&key)) } else { let _ = self.store.delete(&key).await; }
+            if at.parse::<u64>().is_ok_and(|at| now < at + 86_400_000) { pools.push(pool_of(&key)) } else { let _ = self.store.delete(&key).await; }
         }
         pools
     }
@@ -2209,10 +2216,7 @@ impl<'a> ControlPlane<'a> {
     async fn pools_to_avoid(&self, region: &str, now: u64) -> Vec<(String, String)> {
         let mut pools = vec![];
         for (key, at) in self.store.list(&format!("aws:pool:{region}:")).await.unwrap_or_default() {
-            if at.parse::<u64>().is_ok_and(|at| now < at + 900_000) {
-                let mut parts = key.rsplitn(3, ':');
-                if let (Some(zone), Some(kind)) = (parts.next(), parts.next()) { pools.push((kind.to_string(), zone.to_string())) }
-            } else { let _ = self.store.delete(&key).await; }
+            if at.parse::<u64>().is_ok_and(|at| now < at + 900_000) { pools.push(pool_of(&key)) } else { let _ = self.store.delete(&key).await; }
         }
         pools
     }
@@ -2301,8 +2305,9 @@ impl<'a> ControlPlane<'a> {
         Ok(n)
     }
 
-    /// Whether this control plane starts Cloudflare containers itself.
-    fn own_containers(&self) -> bool { self.config.containers && self.containers.is_some() }
+    /// Whether this control plane starts Cloudflare containers itself. (Set only where its runtime has them, a
+    /// Cloudflare or a Modal control plane's: an AWS one never sets `Config::containers`.)
+    fn own_containers(&self) -> bool { self.config.containers }
 
     /// Where a job's machine may go, by the order and limits set in the dashboard (see `Routing`): the places that can
     /// run it now, first to last. The job goes to the first; to the next when that one cannot start its machine.
@@ -2459,8 +2464,8 @@ impl<'a> ControlPlane<'a> {
                 let region = j.region.clone().unwrap_or(a.region.clone());
                 if let Ok(c) = self.aws_creds(plane_url, &a).await { let _ = aws::terminate_instance(self.http, &region, &c, id, self.clock.now_ms()).await; }
             }
-        } else if j.cloud == self.config.own_cloud && self.own_containers() {
-            if let Some(c) = self.containers { let _ = c.stop(id).await; }
+        } else if let Some(c) = self.containers.filter(|_| j.cloud == self.config.own_cloud && self.own_containers()) {
+            let _ = c.stop(id).await;
         } else if let Some(launcher) = self.config.launchers.iter().find(|a| a.cloud == j.cloud) {
             let _ = self.launcher_call(plane_url, launcher, "/stop", serde_json::json!({ "id": id })).await;
         }
@@ -2989,8 +2994,9 @@ impl<'a> ControlPlane<'a> {
                             let images = spec.os() == "linux" && spec.ubuntu(now) == "ubuntu26" && spec.docker_cache != Some(false);
                             let used = if images { get_json::<crate::layers::Images>(self.store, &crate::layers::images_key(&job.repo, &job.workflow, &job.name)).await.ok().flatten() } else { None };
                             // (A job whose own last run said nothing, or is gone: its repository's other jobs.)
-                            let setup = (images && spec.docker_cache == Some(true)) || crate::layers::plan(used.as_ref(), now) || (images && used.as_ref().is_none_or(|u| now.saturating_sub(u.at) >= crate::layers::PLAN_MS)
-                                && crate::layers::plan(get_json::<crate::layers::Images>(self.store, &crate::layers::repo_images_key(&job.repo)).await.ok().flatten().as_ref(), now));
+                            // (Only a job with images has a last run's word read: `used` is none for the others.)
+                            let setup = images && (spec.docker_cache == Some(true) || crate::layers::plan(used.as_ref(), now) || (used.as_ref().is_none_or(|u| now.saturating_sub(u.at) >= crate::layers::PLAN_MS)
+                                && crate::layers::plan(get_json::<crate::layers::Images>(self.store, &crate::layers::repo_images_key(&job.repo)).await.ok().flatten().as_ref(), now)));
                             // A job whose files are in memory or on its machine's own disk keeps the layers there
                             // too (the store's folder is bound there with Docker's): no disk of their own, which
                             // would be slower than either.
@@ -3022,8 +3028,9 @@ impl<'a> ControlPlane<'a> {
                             // A zone AWS does not offer a type in is not asked for it again (for a day).
                             for (kind, zone, said) in &told.refused { if said == "Unsupported" && !zone.is_empty() { let _ = self.store.put(&unoffered_key(region, kind, zone), now.to_string()).await; } }
                             // One request's worth of spot pools asked, none with a machine, and others left: the job
-                            // goes on with those in a moment (see `MORE_SPOT`), before any on-demand machine.
-                            let more = told.more && !on_demand && machine.as_ref().is_err_and(|e| aws::out_of_room(e)) && job.spot_rounds < 2;
+                            // goes on with those in a moment (see `MORE_SPOT`), before any on-demand machine. (Others left
+                            // is said only with no machine, and AWS's last word one of no room: see `aws::run_instance`.)
+                            let more = told.more && !on_demand && job.spot_rounds < 2;
                             // A spot pool with no machine now is remembered, for the jobs that come next.
                             if !on_demand { for (kind, zone, said) in &told.refused { if said == "InsufficientInstanceCapacity" && !zone.is_empty() { let _ = self.store.put(&pool_key(region, kind, zone), now.to_string()).await; } } }
                             // Still refused for the rate of requests after its waits: for a spot machine that is no
@@ -3183,7 +3190,8 @@ impl<'a> ControlPlane<'a> {
                         0 if tried_spot && !tried_on_demand && !answers.is_empty() => format!("{WAIT_FOR_SPOT}{}", answers.join("; ")),
                         // No spot machine now, and on-demand refused only for the account's limit: it waits for a
                         // spot machine likewise (an on-demand one is asked for each time too, should the limit have room).
-                        0 if tried_spot && on_demand_refused && on_demand_quota_only && !answers.is_empty() && spec.gpu.is_none() => format!("{WAIT_FOR_SPOT_AT_LIMIT}{}", answers.join("; ")),
+                        // (An on-demand refusal is among the answers: they are cleared only with a failure elsewhere.)
+                        0 if tried_spot && on_demand_refused && on_demand_quota_only && spec.gpu.is_none() => format!("{WAIT_FOR_SPOT_AT_LIMIT}{}", answers.join("; ")),
                         0 if answers.len() > 1 => format!("AWS had no room for it: {}", answers.join("; ")),
                         0 => last,
                         // One place, and it failed: what it said, as it said it.
@@ -4022,7 +4030,9 @@ impl<'a> ControlPlane<'a> {
                     j["off_spot"] = true.into();
                     // (Its first attempt, said with the run: its job, and why it is started again.)
                     j["restarted"] = serde_json::json!({ "job_id": j["job_id"].clone(), "why": "AWS took back its spot machine" });
-                    if let Some(o) = j.as_object_mut() { o.remove("job_id"); o.remove("token"); }
+                    let o = j.as_object_mut().expect("an object: its fields were just set");
+                    o.remove("job_id");
+                    o.remove("token");
                     changed = true;
                     continue
                 }
@@ -4428,9 +4438,8 @@ impl<'a> ControlPlane<'a> {
             // How its start went, once it is running: its record and what its machine said (see `MachineStart`).
             let mut start = serde_json::Value::Null;
             if let Some(r) = record.as_ref().filter(|r| r.started_ms.is_some()) {
-                start = serde_json::to_value(r).unwrap_or_default();
+                start = serde_json::to_value(Job { hello: None, local: None, ..r.clone() }).unwrap_or_default();
                 if let Some(m) = get_json::<serde_json::Value>(self.store, &format!("hello:{}", r.job_id)).await? { start["machine"] = m }
-                if let Some(o) = start.as_object_mut() { o.remove("hello"); o.remove("local"); }
             }
             out.push(serde_json::json!({ "start": start, "job_id": record.as_ref().map(|r| r.job_id.to_string()), "name": j["name"].as_str().or(j["key"].as_str()), "state": record.as_ref().map(|r| r.state.clone()).unwrap_or_else(|| j["state"].as_str().unwrap_or_default().to_string()),
                 "result": j["result"], "error": record.as_ref().and_then(|r| r.error.clone()), "machine": record.as_ref().and_then(|r| r.machine_type.clone()), "lines": lines, "next": next, "posts": posts, "steps": steps,
@@ -4527,14 +4536,14 @@ impl<'a> ControlPlane<'a> {
         if let Some(name) = runner.filter(|r| failing_runner(r)) { return self.failed_by_runner(name, job_id).await }
         // (Only with a runner of this control plane's: with none, it is none below.)
         let mut on_anothers = None;
-        if let Some(mut j) = self.by_runner(runner).await? {
+        if let (Some(name), Some(mut j)) = (runner, self.by_runner(runner).await?) {
             if j.job_id != job_id { on_anothers = Some(j.for_job.unwrap_or(j.job_id)) }
             // (One that keeps its job's images goes off by itself once it has: ended later only if it has not.)
             if j.keeps && j.cloud == "aws" {
                 self.store.put_until(&format!("keeping:{}", j.job_id), (self.clock.now_ms() + KEEPING_MS).to_string(), self.clock.now_ms() + 2 * KEEPING_MS).await?;
                 self.timer.wake_in(KEEPING_MS).await?;
             } else { self.stop_machine(plane_url, &j).await; }
-            if let Some(name) = runner { let _ = self.store.delete(&format!("runner:{name}")).await; }
+            let _ = self.store.delete(&format!("runner:{name}")).await;
             j.state = "done".into();
             if j.job_id == job_id { j.began = true; j.conclusion = ev.conclusion.clone() }
             j.ended_ms.get_or_insert(self.clock.now_ms());
@@ -5055,8 +5064,8 @@ impl<'a> ControlPlane<'a> {
     #[allow(clippy::too_many_arguments)]
     async fn with_cache(&self, user_data: String, region: &str, os: &str, arch: &str, images: bool, setup: bool, creds: &Credentials, plane_url: &str, runner: &str, job: &str, now: u64) -> (String, bool, bool) {
         // Which build of the program: by architecture, and Windows' of its own.
+        // (AWS runs Linux and Windows alone: its capacity refuses any other before a machine is asked for.)
         let arch = match (os, arch) { ("windows", _) => "x86_64-windows", (_, "arm64") => "aarch64", _ => "x86_64" };
-        if !["linux", "windows"].contains(&os) { return (user_data, false, false) }
         // (Turned off in the dashboard: jobs use GitHub's cache.)
         if self.config.routing.cache.off || !plane_url.starts_with("https://") || !self.cache_ready(region, arch, creds, now).await { return (user_data, false, false) }
         let token = crate::crypto::random_token(18);

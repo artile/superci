@@ -226,7 +226,7 @@ pub async fn begin(store: &dyn Store, access: &Access, key: &str, version: &str,
     let text = serde_json::to_string(&entry).map_err(|e| Refused::Bad(e.to_string()))?;
     if store.put_if_absent(&at, text.clone()).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
     let was = store.get(&at).await.map_err(Refused::Bad)?;
-    let stale = was.as_deref().and_then(|v| serde_json::from_str::<Entry>(v).ok()).is_some_and(|e| (!e.done && now.saturating_sub(e.made) > TAKEOVER_MS) || (e.done && too_old(&e, now)));
+    let stale = was.as_deref().and_then(|v| serde_json::from_str::<Entry>(v).ok()).is_some_and(|e| if e.done { too_old(&e, now) } else { now.saturating_sub(e.made) > TAKEOVER_MS });
     if stale && store.swap(&at, was.as_deref(), text).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
     Err(Refused::Exists)
 }

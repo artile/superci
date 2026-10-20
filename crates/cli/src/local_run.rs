@@ -669,7 +669,8 @@ fn unzip(path: &Path, dir: &Path) -> std::result::Result<usize, Unpack> {
             8 => miniz_oxide::inflate::decompress_to_vec(&data).map_err(|e| Unpack::Bad(format!("{name}: {e:?}")))?,
             m => return Err(Unpack::Bad(format!("{name} is packed in a way this does not know ({m})"))),
         };
-        if let Some(parent) = to.parent() { std::fs::create_dir_all(parent).map_err(|e| Unpack::Bad(e.to_string()))? }
+        // (A name joined to the folder: in a folder, that one or one inside it.)
+        std::fs::create_dir_all(to.parent().unwrap_or(dir)).map_err(|e| Unpack::Bad(e.to_string()))?;
         std::fs::write(&to, data).map_err(|e| Unpack::Bad(format!("{}: {e}", to.display())))?;
         files += 1;
     }

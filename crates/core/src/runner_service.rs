@@ -253,18 +253,15 @@ fn tar(files: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
-/// Gzip of these bytes, not compressed (stored blocks): what an action of a few kilobytes needs.
+/// Gzip of these bytes, not compressed (a stored block): what an action of a few kilobytes needs. (One block, the
+/// last, holds 64 kB: its one caller's tar, `checkout_tarball`'s, is a few kilobytes.)
 fn gzip_stored(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
-    // (Never empty: a tar is a kilobyte at least.)
-    let chunks: Vec<&[u8]> = data.chunks(65_535).collect();
-    for (i, c) in chunks.iter().enumerate() {
-        out.push(if i + 1 == chunks.len() { 1 } else { 0 });
-        let len = c.len() as u16;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(c);
-    }
+    let len = u16::try_from(data.len()).expect("an action of a few kilobytes");
+    out.push(1);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(data);
     out.extend_from_slice(&crc32(data).to_le_bytes());
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out

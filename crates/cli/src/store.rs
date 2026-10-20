@@ -208,9 +208,10 @@ impl Store {
     /// owner's alone.
     fn owners_alone(&self) {
         only_the_owner(&self.dir, 0o700);
-        let Some(all) = self.dir.parent().filter(|p| p.file_name().is_some_and(|n| n == "workspaces")) else { return };
+        // (A folder named `workspaces` is in one: SuperCI's.)
+        let Some((all, root)) = self.dir.parent().filter(|p| p.file_name().is_some_and(|n| n == "workspaces")).and_then(|all| Some((all, all.parent()?))) else { return };
         only_the_owner(all, 0o700);
-        if let Some(root) = all.parent() { only_the_owner(root, 0o700) }
+        only_the_owner(root, 0o700);
     }
 
     /// Forgets the workspace on this computer: its sign-ins and its folder. Nothing in any cloud is touched.
