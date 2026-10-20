@@ -6935,7 +6935,7 @@ fn respond_in(shared: &Arc<Mutex<Dashboard>>, req: &Req) -> Response {
 fn status_soon(plane_url: &str, key: &str) -> Option<serde_json::Value> {
     for i in 0..8 {
         if let Some(s) = cloudflare::status_light(plane_url, key) { return Some(s) }
-        if i < 7 { std::thread::sleep(Duration::from_millis(1500)) }
+        if i < 7 { aws::pause(1500) }
     }
     None
 }
