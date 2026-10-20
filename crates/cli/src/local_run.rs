@@ -116,6 +116,14 @@ fn logs_wait_s() -> u64 {
     60
 }
 
+/// What a run from a computer sends through the control plane at most, packed (bytes): `MOST`, or in a test what
+/// `SUPERCI_MOST_KB` says (a debug build), where a working tree of 150 MB would only slow the tests.
+fn most_through_plane() -> usize {
+    #[cfg(debug_assertions)]
+    if let Some(kb) = std::env::var("SUPERCI_MOST_KB").ok().and_then(|v| v.parse::<usize>().ok()) { return kb * 1000 }
+    MOST
+}
+
 /// How long a job's lines are waited for once it ended, or the run is over (seconds), before its end is said with
 /// what came: 15, or in a test what `SUPERCI_GIVE_UP_S` says (a debug build).
 fn give_up_s() -> u64 {
@@ -280,7 +288,7 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
     let name = format!("b{}", &superci_core::crypto::sha256_hex(serde_json::to_string(&now).unwrap_or_default().as_bytes())[..40]);
     let asked = if sent.is_some() { Value::Null } else { call("POST", &format!("/runs/tree?id={tree}&part=0&link=1&later=1&keep={name}"), vec![])? };
     let link = asked["url"].as_str().map(str::to_string);
-    let most = if link.is_some() || sent.is_some() { MOST_IN_BUCKET } else { MOST };
+    let most = if link.is_some() || sent.is_some() { MOST_IN_BUCKET } else { most_through_plane() };
     if packed.len() > most { return Err(format!("The working tree is {} MB packed; a run from a computer takes {} MB at most.", packed.len() / 1_000_000, most / 1_000_000)) }
     // Kept once what was sent is there: the whole tree as a new base, or the chain with this run's layer on it.
     let keep_base = |name: &str, now: &std::collections::BTreeMap<String, (String, u64)>| if let Some(at) = &kept_at {
@@ -763,11 +771,8 @@ impl Lines {
                     let anchor = self.anchor.get(id).copied().unwrap_or((1, 0));
                     out.extend(all.iter().skip(end_in(&all, anchor) as usize).map(|l| without_time(l).to_string()));
                 }
-                None if give_up => {
-                    let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held).into_iter().partition(|(step, _, _)| step.as_deref() == Some(id));
-                    self.held = rest;
-                    for (_, start, lines) in mine { for (k, line) in lines.into_iter().enumerate() { if start.is_none_or(|st| st + k as u64 > *shown) { out.push(line) } } }
-                }
+                // (What came of it as it went is out already: taken above.)
+                None if give_up => {}
                 None => return out,
             }
             self.done.insert(id.to_string());
