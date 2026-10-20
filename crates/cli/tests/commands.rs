@@ -2251,3 +2251,60 @@ fn an_aws_deploy_into_a_region_without_the_image_is_refused_and_one_aws_did_not_
     assert!(!ok && said.contains("Uploading it (a Lambda function)…") && said.contains("Unsupported architecture for provided.al2023 here."), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// AWS's runners for a control plane elsewhere: IAM refusing the identity provider they start machines through (not
+/// because it is there already) is said as IAM said it, and nothing more is asked.
+#[test]
+fn aws_runners_for_a_control_plane_elsewhere_say_iams_refusal_of_their_identity_provider() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": served.url, "plane_id": superci_testkit::PLANE, "label": "superci" } });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    served.aws.fail("CreateOpenIDConnectProvider", 403, &superci_testkit::ec2_error("AccessDenied", "User: arn:aws:sts::111111111111:assumed-role/Admin/someone is not authorized to perform: iam:CreateOpenIDConnectProvider"), None);
+    let o = superci(&home, &["runners", "create", "aws", "--region=us-east-1"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("not authorized to perform: iam:CreateOpenIDConnectProvider"), "{said}");
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CreateRole&"))), "no role made after");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane with GitLab connected and no GitHub App: jobs can come and run, and the status says so.
+#[test]
+fn a_control_plane_with_gitlab_alone_and_runners_is_ready_for_jobs() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    let home = home(&served);
+    let (code, v) = json(&home, &["status"]);
+    assert!(code == 0 && v["control_plane"]["ready"] == true, "{v}");
+    let said = String::from_utf8_lossy(&superci(&home, &["status"]).stdout).into_owned();
+    assert!(said.contains("Jobs can run  yes"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// SuperCI stopped from the CLI with another control plane in the workspace beside the one in use: one that serves
+/// nothing and answers goes with it, and so does one that had moved to the one in use (it only passed jobs on).
+#[test]
+fn leaving_deletes_another_control_plane_that_serves_nothing_or_had_moved_to_the_one_in_use() {
+    for moved in [false, true] {
+        let served = serve(|_| {});
+        served.connect_github();
+        let other = superci_testkit::serve_as("testplane0002", |_| {});
+        if moved { other.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!(served.url).to_string()); }
+        let home = common::signed_in(&served);
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+        for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } }]);
+        kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let o = common::command(&home).args(["leave", "--confirm"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(said.contains("SuperCI is stopped") && !said.contains("testplane0002 --confirm"), "{moved}: {said}");
+        // (Its settings gone from SSM, as its deletion removes them.)
+        assert!(served.aws.settings("testplane0002").is_empty(), "{moved}: {:?} {said}", served.aws.settings("testplane0002"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
