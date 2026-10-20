@@ -7063,6 +7063,72 @@ fn a_jobs_log_whose_end_is_too_large_written_as_json_is_given_shorter_within_an_
     assert!(body.len() <= 5_500_000 && said["truncated"] == true && said["log"].as_str().unwrap().ends_with("the end\n"), "{} bytes", body.len());
 }
 
+/// GitLab's events as another request's doing meets them: a pending job another delivery of the same event claimed
+/// while GitLab was asked about it is not started twice; a running job whose runner's record went while its runner
+/// was paused is still noted as running.
+#[test]
+fn gitlab_jobs_claimed_or_whose_runner_went_meanwhile_are_started_once_and_noted_as_running() {
+    let served = serve(|_| {});
+    served.connect_gitlab();
+    let (gid, pending) = served.gitlab.pending("gl-twice", &["superci"], served.now_ms());
+    let (store, key) = (served.store.clone(), format!("job:gl{gid}"));
+    let claimed = serde_json::json!({ "job_id": gid, "run_id": 1, "repo": "acme/app", "state": "launching", "provider": "gitlab", "label": "superci", "at_ms": served.now_ms(), "installation_id": 0, "cloud": "", "seen_in_progress": false, "name": "claimed by the other delivery" }).to_string();
+    served.github.during("GET", &format!("/projects/{}/jobs/{gid}", superci_testkit::gitlab::PROJECT), move || { store.0.lock().unwrap().insert(key.clone(), claimed.clone()); });
+    let machines = served.machines.0.lock().unwrap().len();
+    assert_eq!(served.gitlab_webhook(pending), 200);
+    assert!(served.store.under(&format!("job:gl{gid}"))[0].1["name"] == "claimed by the other delivery" && served.machines.0.lock().unwrap().len() == machines);
+    // Its runner's record gone while the runner was paused.
+    let (gid, pending) = served.gitlab.pending("gl-running", &["superci"], served.now_ms());
+    assert!(served.gitlab_webhook(pending) < 300);
+    let store = served.store.clone();
+    served.github.during("PUT", "/runners/", move || { store.0.lock().unwrap().retain(|k, _| !k.starts_with("glrunner:")); });
+    assert!(served.gitlab_webhook(served.gitlab.running(gid, served.now_ms())) < 300);
+    let j = served.store.under(&format!("job:gl{gid}"))[0].1.clone();
+    assert!(j["state"] == "running" && served.store.under("glrunner:").is_empty(), "{j}");
+}
+
+/// Jobs waiting for room tried again by the upkeep as each stands now: one cancelled by another request while the
+/// one before it was being started is left as it is.
+#[test]
+fn a_waiting_job_cancelled_while_the_upkeep_started_the_one_before_it_is_left_cancelled() {
+    let served = aws_plane("");
+    served.aws.fail("RunInstances", 200, &aws_started(), None);
+    let now = served.now_ms();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("aws:no-fleet".into(), now.to_string());
+        for id in [801u64, 802] {
+            m.insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": id, "repo": "acme/app", "state": "waiting", "label": "superci", "at_ms": now - 60_000, "installation_id": 42, "app_id": 1001, "cloud": "", "seen_in_progress": false, "name": "test", "workflow": "Build and Test" }).to_string());
+            m.insert(format!("live:{id}"), String::new());
+        }
+    }
+    let store = served.store.clone();
+    served.aws.during("RunInstances", move || {
+        let mut m = store.0.lock().unwrap();
+        let Some(mut j) = m.get("job:802").and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()) else { return };
+        if j["state"] != "waiting" { return }
+        (j["state"], j["ended_ms"], j["rev"]) = ("cancelled".into(), now.into(), (j["rev"].as_u64().unwrap_or(0) + 1).into());
+        m.insert("job:802".into(), j.to_string());
+    });
+    served.upkeep();
+    let state = |id: u64| served.store.under(&format!("job:{id}"))[0].1["state"].clone();
+    assert!(state(801) == "launched" && state(802) == "cancelled", "{} {}", state(801), state(802));
+}
+
+/// Moving here: the jobs of the control plane before taken in, but one already here stays as it is.
+#[test]
+fn moving_here_takes_the_jobs_from_before_but_one_already_here_stays_as_it_is() {
+    let served = serve(|c| c.move_token = Some("move-token-for-tests-00000001".into()));
+    let now = served.now_ms();
+    let job = |id: u64, name: &str| serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "done", "label": "superci", "at_ms": now - 60_000, "ended_ms": now - 30_000, "installation_id": 42, "cloud": "", "seen_in_progress": true, "name": name }).to_string();
+    served.store.0.lock().unwrap().insert("job:901".into(), job(901, "here"));
+    let mut r = ureq::post(&format!("{}/move/import", served.url)).header("authorization", &format!("Bearer {}", served.key)).header("x-move-token", "move-token-for-tests-00000001")
+        .send(serde_json::json!({ "state": [["job:901", job(901, "from before")], ["job:902", job(902, "from before")]] }).to_string()).unwrap();
+    let said: serde_json::Value = r.body_mut().read_json().unwrap();
+    assert_eq!(said["taken"], 1, "{said}");
+    assert!(served.store.under("job:901")[0].1["name"] == "here" && served.store.under("job:902")[0].1["name"] == "from before");
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };

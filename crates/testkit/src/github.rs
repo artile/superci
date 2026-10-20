@@ -63,7 +63,8 @@ struct Hub {
 
 #[derive(Clone, Default)]
 pub struct GitHub { hub: Arc<Mutex<Hub>>, pub asked: Arc<Mutex<Vec<String>>>, pub unanswered: Arc<Mutex<Vec<String>>>, /** gitlab.com, beside it. */ pub gitlab: crate::GitLab,
-    /** AWS's stand-in, for what a control plane asks of AWS (but S3, kept here). */ pub aws: Arc<Mutex<Option<crate::Aws>>> }
+    /** AWS's stand-in, for what a control plane asks of AWS (but S3, kept here). */ pub aws: Arc<Mutex<Option<crate::Aws>>>,
+    /** What happens as a call is made (`during`): another request's doing meanwhile. */ pub during: Arc<Mutex<Vec<(String, String, Arc<dyn Fn() + Send + Sync>)>>> }
 
 fn fixture(name: &str) -> Value {
     serde_json::from_str(match name {
@@ -504,11 +505,17 @@ impl GitHub {
             _ => None,
         }
     }
+
+    /// `f` run each time a call with this method is made to an address with `part` in it (of GitHub's, GitLab's, S3's,
+    /// AWS's), before it is answered: what another request does meanwhile.
+    pub fn during(&self, method: &str, part: &str, f: impl Fn() + Send + Sync + 'static) { self.during.lock().unwrap().push((method.to_string(), part.to_string(), Arc::new(f))) }
 }
 
 #[async_trait(?Send)]
 impl Http for GitHub {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let hooks: Vec<Arc<dyn Fn() + Send + Sync>> = self.during.lock().unwrap().iter().filter(|(m, part, _)| *m == r.method && r.url.contains(part.as_str())).map(|(_, _, f)| f.clone()).collect();
+        for f in hooks { f() }
         if let Some(answer) = self.gitlab.answer(&r) { return Ok(answer) }
         // Another control plane served on this computer (one moved to): asked as it is, as a deployed one would be.
         if r.url.starts_with("http://127.0.0.1:") { return Ok(local(&r)) }
