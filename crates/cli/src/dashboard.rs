@@ -1241,13 +1241,13 @@ impl Dashboard {
     }
 
     /// Why nothing is signed in to, for a command that needs a sign-in: one that ended says which and how to sign in
-    /// again.
+    /// again. (Asked only while nothing is signed in to: none of them was made again.)
     fn nowhere(&self) -> &'static str {
-        if self.aws_ended { AWS_ENDED } else if self.cf_ended && self.cf.is_none() { CF_ENDED } else if self.modal_ended && self.modal.is_none() { MODAL_ENDED } else { NOT_SIGNED_IN }
+        if self.aws_ended { AWS_ENDED } else if self.cf_ended { CF_ENDED } else if self.modal_ended { MODAL_ENDED } else { NOT_SIGNED_IN }
     }
 
-    /// Whether a sign-in kept here turned out to be over, and has not been made again.
-    fn any_ended(&self) -> bool { self.aws_ended || (self.cf_ended && self.cf.is_none()) || (self.modal_ended && self.modal.is_none()) }
+    /// Whether a sign-in kept here turned out to be over (asked only while nothing is signed in to).
+    fn any_ended(&self) -> bool { self.aws_ended || self.cf_ended || self.modal_ended }
 
     /// The sign-ins that are over and not made again, for a command to say once beside what it did: what they
     /// reach was not looked at.
