@@ -2323,3 +2323,18 @@ fn a_region_without_the_control_planes_own_network_is_said_among_what_its_role_l
     assert!(o.status.success() && said.contains("A network of its own in each region its machines use"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The account's copy of the image of an older build than the newest published: `images update` copies the newer
+/// one in, as AWS answered a real copy, and says what happens to the older.
+#[test]
+fn an_older_build_of_the_accounts_copy_is_updated_with_the_newest_from_the_cli() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[]);
+    served.aws.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000")]);
+    let o = superci(&home, &["images", "update", "ca-central-1"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("into ca-central-1, from us-east-1") && said.contains("The older copy is removed once the new one is there"), "{said}");
+    assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage")) && a["url"].as_str().is_some_and(|u| u.contains("ca-central-1"))));
+    let _ = std::fs::remove_dir_all(&home);
+}
