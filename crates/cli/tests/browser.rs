@@ -1384,9 +1384,10 @@ fn an_update_still_not_taken_ten_minutes_on_is_offered_again_and_one_taken_is_sa
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// What AWS lets the account run in each region is asked again on the runners page once ten minutes have passed.
+/// What AWS lets the account run in each region is asked again on the runners page once ten minutes have passed, and
+/// at once of another account signed in to meanwhile.
 #[test]
-fn what_aws_lets_the_account_run_is_asked_again_ten_minutes_on() {
+fn what_aws_lets_the_account_run_is_asked_again_ten_minutes_on_and_of_another_account_at_once() {
     let served = serve(|c| {
         c.containers = true;
         (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
@@ -1401,6 +1402,14 @@ fn what_aws_lets_the_account_run_is_asked_again_ten_minutes_on() {
     for _ in 0..20 { std::thread::sleep(std::time::Duration::from_millis(500)); if quotas() == asked { break } asked = quotas() }
     common::later(&home, 11 * 60_000);
     until("asked again", || { runners(); quotas() > asked });
+    // Signed in to another account meanwhile (another terminal's `superci login`): asked of that one at once.
+    let mut asked = quotas();
+    for _ in 0..20 { std::thread::sleep(std::time::Duration::from_millis(500)); if quotas() == asked { break } asked = quotas() }
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    (kept["aws"]["account_id"], kept["aws"]["who"]) = ("222222222222".into(), "arn:aws:sts::222222222222:assumed-role/Admin/someone".into());
+    std::fs::write(&file, kept.to_string()).unwrap();
+    until("asked of the other account", || { runners(); quotas() > asked });
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
