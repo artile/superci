@@ -806,3 +806,30 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let gitlab = github.gitlab.clone();
     Served { plane: PLANE.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public }
 }
+
+/// A server in front of `to` (a control plane, as a network or a control plane of another version stands between):
+/// each request forwarded as it came, and its answer given as `answer` makes it of the request (its method and target)
+/// and the answer (status and body). Its address. Each connection on its own thread.
+pub fn front(to: &str, answer: impl Fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) + Send + Sync + 'static) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (to, answer) = (to.trim_start_matches("http://").to_string(), Arc::new(answer));
+    std::thread::spawn(move || for stream in listener.incoming().flatten() {
+        let (to, answer) = (to.clone(), answer.clone());
+        std::thread::spawn(move || {
+            let Ok((method, target, headers, body)) = read(&stream) else { return };
+            let mut out = vec![];
+            if let Ok(mut s) = TcpStream::connect(&to) {
+                let extra: String = headers.iter().filter(|(k, _)| !["host", "content-length", "connection"].contains(&k.to_ascii_lowercase().as_str())).map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+                let _ = s.write_all(format!("{method} {target} HTTP/1.1\r\nhost: {to}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes());
+                let _ = s.write_all(&body);
+                let _ = s.read_to_end(&mut out);
+            }
+            let at = out.windows(4).position(|w| w == b"\r\n\r\n").map(|a| a + 4).unwrap_or(out.len());
+            let status = std::str::from_utf8(out.get(9..12).unwrap_or_default()).ok().and_then(|c| c.parse().ok()).unwrap_or(502);
+            let (status, body) = answer(&method, &target, status, out[at..].to_vec());
+            let _ = write(stream, status, &[("content-type".into(), "application/json".into())], &body);
+        });
+    });
+    url
+}

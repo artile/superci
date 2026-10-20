@@ -116,6 +116,21 @@ fn logs_wait_s() -> u64 {
     60
 }
 
+/// How long a job's lines are waited for once it ended, or the run is over (seconds), before its end is said with
+/// what came: 15, or in a test what `SUPERCI_GIVE_UP_S` says (a debug build).
+fn give_up_s() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("SUPERCI_GIVE_UP_S").ok().and_then(|v| v.parse().ok()) { return s }
+    15
+}
+
+/// How long a run is followed at most (seconds): six hours, or in a test what `SUPERCI_FOLLOW_S` says (a debug build).
+fn follow_s() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("SUPERCI_FOLLOW_S").ok().and_then(|v| v.parse().ok()) { return s }
+    6 * 3600
+}
+
 /// What this computer kept of a repository's last run on a control plane: the whole tree it sent once (`name`) and
 /// what each run since sent on top of it (`layers`), each file's hash as of that last run, and when it was.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -425,7 +440,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             // (Its end is said after its lines: once each step's are out, or 15 seconds after it ended at most.)
             let ended = j["result"].is_string() && state != "skipped";
             if ended && ended_at[i].is_none() { ended_at[i] = Some(std::time::Instant::now()) }
-            let give_up = ended_at[i].is_some_and(|t| t.elapsed().as_secs() > 15) || (st["over"] == true && over_at.is_some_and(|t| t.elapsed().as_secs() > 15));
+            let give_up = ended_at[i].is_some_and(|t| t.elapsed().as_secs() > give_up_s()) || (st["over"] == true && over_at.is_some_and(|t| t.elapsed().as_secs() > give_up_s()));
             let said_state = |say: &mut dyn FnMut(&str), state: String, last: &mut String| if !state.is_empty() && state != *last {
                 // Running: how its start went, in a line (where the time from sending it to its first step went).
                 let start = if state == "running" { start_line(&j["start"]) } else { String::new() };
@@ -550,7 +565,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             return Ok(Done { said: vec![said.clone()], data: json!({ "ok": ok, "error": if ok { Value::Null } else { said.into() }, "run_id": run, "result": result, "seconds": took, "usd": usd, "jobs": jobs.iter().map(|j| json!({ "name": j["name"], "job_id": j["job_id"], "result": j["result"], "machine": j["machine"], "usd": j["usd"], "took_ms": j["took_ms"],
                 "steps": j["steps"].as_array().into_iter().flatten().map(|s| json!({ "name": s["name"], "result": s["result"], "start": s["start"], "finish": s["finish"] })).collect::<Vec<_>>() })).collect::<Vec<_>>() }) })
         }
-        if began.elapsed().as_secs() > 6 * 3600 { return Err(format!("Still not over after six hours: `superci runs retrieve {run}`.")) }
+        if began.elapsed().as_secs() > follow_s() { return Err(format!("Still not over after six hours: `superci runs retrieve {run}`.")) }
     }
 }
 

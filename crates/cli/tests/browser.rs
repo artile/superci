@@ -6633,6 +6633,198 @@ fn the_upkeep_places_again_what_was_cut_off_and_forgets_machines_left_whatever_t
     assert!(!served.store.under("glrunner:66").is_empty(), "GitLab would not remove it: kept");
 }
 
+/// A control plane in its own AWS account, its order AWS's spot then on-demand machines (`order`: another), as AWS
+/// answered Test; and a job of `acme/app` queued with this name and label, its record as kept once it was placed.
+fn aws_plane(order: &str) -> superci_testkit::Served {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    let order = if order.is_empty() { r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"# } else { order };
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), order);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    served
+}
+
+/// AWS's answer to a machine started (as it answered Test).
+fn aws_started() -> String {
+    include_str!("../fixtures/aws/launch/on-demand.jsonl").lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["asked"].as_str().unwrap_or_default().contains("Action=RunInstances") && v["status"] == 200).map(|v| v["answer"].as_str().unwrap_or_default().to_string()).unwrap()
+}
+
+fn aws_job(served: &superci_testkit::Served, name: &str, label: &str) -> serde_json::Value {
+    served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("aws:pool:"));
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    let (id, q) = served.github.queue(name, label, served.now_ms());
+    assert!(served.webhook(q) < 300, "{label}");
+    served.store.under(&format!("job:{id}"))[0].1.clone()
+}
+
+/// A dashboard key kept with the others and not expired, but too short to be one of the dashboard's, opens nothing;
+/// the dashboard's own goes on opening what it did.
+#[test]
+fn a_dashboard_key_too_short_to_be_one_opens_nothing_though_it_is_kept_and_current() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{PLANE}/DEVICE_KEY_4102444800_A"), "short-key");
+    let status = |key: &str| ureq::get(&format!("{}/status", served.url)).header("authorization", &format!("Bearer {key}")).config().http_status_as_error(false).build().call().unwrap().status().as_u16();
+    assert_eq!(status("short-key"), 404);
+    assert_eq!(status(&served.key), 200);
+}
+
+/// A job asked of AWS (by its label, a repository's rule, or the default) where AWS is not connected is said to have
+/// no machine there; an account's limits for the month and the day with room left start a job on that account.
+#[test]
+fn jobs_named_for_aws_where_it_is_not_connected_say_so_and_account_limits_with_room_left_start_one() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let job = |label: &str| -> serde_json::Value {
+        let (id, q) = served.github.queue(label, label, served.now_ms());
+        assert!(served.webhook(q) < 300, "{label}");
+        served.store.under(&format!("job:{id}"))[0].1.clone()
+    };
+    let not_here = |j: &serde_json::Value| j["machine_id"].is_null() && j["state"] != "launched";
+    // By its label; by a rule for its repository; by the default.
+    let j = job("superci/provider=aws");
+    assert!(not_here(&j), "{j}");
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"rules":[{"repo":"acme/*","cloud":"aws"}]}"#);
+    let j = job("superci");
+    assert!(not_here(&j), "{j}");
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"default":"aws"}"#);
+    let j = job("superci");
+    assert!(not_here(&j), "{j}");
+    // Limits on its own account, with room left: started.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"account_usd":{"cloudflare":500},"account_daily_usd":{"cloudflare":50}}"#);
+    let j = job("superci");
+    assert!(j["state"] == "launched" && j["cloud"] == "cloudflare", "{j}");
+}
+
+/// AWS machines the sweep ends cost their zone's spot price for their time, and the disk the layer store has of its
+/// own only where it had one: not for a job whose files were in memory or on its machine's own disk.
+#[test]
+fn aws_machines_the_sweep_ends_cost_the_layer_stores_disk_only_where_it_had_a_disk_of_its_own() {
+    let served = aws_plane("");
+    let now = served.now_ms();
+    let price = "<DescribeSpotPriceHistoryResponse xmlns=\"http://ec2.amazonaws.com/doc/2016-11-15/\"><requestId>1</requestId><spotPriceHistorySet><item><instanceType>c8a.large</instanceType><productDescription>Linux/UNIX</productDescription><spotPrice>0.030000</spotPrice><timestamp>2026-01-01T00:00:00.000Z</timestamp><availabilityZone>us-east-1a</availabilityZone></item></spotPriceHistorySet><nextToken/></DescribeSpotPriceHistoryResponse>";
+    served.aws.fail("DescribeSpotPriceHistory", 200, price, None);
+    {
+        let mut m = served.store.0.lock().unwrap();
+        for (id, layers, ramdisk, local_disk) in [(71u64, false, false, false), (72, true, false, false), (73, true, true, false), (74, true, false, true)] {
+            m.insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": "orphan", "label": "superci", "cloud": "aws", "machine_id": format!("i-0{id}"), "region": "us-east-1",
+                "machine_type": "c8a.large", "zone": "us-east-1a", "at_ms": now - 3_600_000, "launched_ms": now - 3_600_000, "installation_id": 42, "seen_in_progress": true,
+                "layers": layers, "ramdisk": ramdisk, "local_disk": local_disk }).to_string());
+            m.insert(format!("live:{id}"), String::new());
+        }
+    }
+    served.upkeep();
+    let cost = |id: u64| { let j = served.store.under(&format!("job:{id}"))[0].1.clone(); assert!(j["state"] == "swept" && j["cost_from"] == "prices", "{j}"); j["cost_usd"].as_f64().unwrap() };
+    let (plain, own_disk, in_memory, local) = (cost(71), cost(72), cost(73), cost(74));
+    assert!(own_disk > plain + 0.0001, "{own_disk} {plain}");
+    assert!((in_memory - plain).abs() < 1e-9 && (local - plain).abs() < 1e-9, "{in_memory} {local} {plain}");
+}
+
+/// With the AWS budget's stop on, a machine AWS refuses by an explicit deny in the role's own policies is the budget
+/// stopping machines, and said so; one refused by the organization's policy, or for another reason, is not.
+#[test]
+fn with_the_aws_budgets_stop_on_only_an_explicit_deny_of_the_roles_own_policies_is_the_budget_stopping_machines() {
+    let served = aws_plane(r#"{"order":[{"cloud":"aws-on-demand"},{"cloud":"aws","off":true},{"cloud":"cloudflare","off":true}],"aws_budget":{"stop":true}}"#);
+    let refused = |answer: String, name: &str| -> serde_json::Value {
+        served.aws.fail_none();
+        served.aws.fail("RunInstances", 403, &answer, None);
+        served.later(700_000);
+        let j = aws_job(&served, name, "superci"); j
+    };
+    let deny = |by: &str| superci_testkit::ec2_error("UnauthorizedOperation", &format!("You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/superci-plane/plane is not authorized to perform: ec2:RunInstances on resource: arn:aws:ec2:us-east-1:111111111111:instance/* with an explicit deny in {by}"));
+    let j = refused(deny("an identity-based policy"), "own");
+    assert!(j["error"].as_str().unwrap_or_default().contains(superci_core::plane::BUDGET_STOPPED), "{j}");
+    let j = refused(deny("a service control policy"), "organization");
+    assert!(!j["error"].as_str().unwrap_or_default().contains(superci_core::plane::BUDGET_STOPPED), "{j}");
+    let j = refused(superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation."), "unsaid");
+    assert!(!j["error"].as_str().unwrap_or_default().contains(superci_core::plane::BUDGET_STOPPED), "{j}");
+}
+
+/// A machine of a job on Ubuntu 26.04 whose label says nothing of Docker's cache: the layer store set up at its start
+/// when its repository's last job that used images pulled enough, not when the job's own last run, lately, did not.
+/// With Docker's images not kept, a job that asks for them has no store, and a machine's link answers nothing of
+/// layers; the cache's page counts the layers kept.
+#[test]
+fn a_jobs_layer_store_is_set_up_by_its_own_last_run_or_else_its_repositorys_and_never_with_docker_images_not_kept() {
+    let served = aws_plane("");
+    let started = aws_started();
+    served.aws.fail("RunInstances", 200, &started, None);
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::layers_key("x86_64")), b"program");
+    let now = served.now_ms();
+    let images = |bytes: u64| serde_json::json!({ "served": 3, "served_bytes": bytes, "pulled": 0, "pulled_bytes": 0, "at": now }).to_string();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert(superci_core::layers::repo_images_key("acme/app"), images(2 << 30));
+        m.insert(superci_core::layers::images_key("acme/app", "Build and Test", "lint"), images(0));
+    }
+    let label = "superci/image=ubuntu26";
+    let lint = aws_job(&served, "lint", label);
+    assert!(lint["state"] == "launched" && lint["layers"] != true, "its own last run used none: {lint}");
+    let unit = aws_job(&served, "unit", label);
+    assert!(unit["state"] == "launched" && unit["layers"] == true, "its repository's did: {unit}");
+    // Docker's images not kept.
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}],"cache":{"images_off":true}}"#);
+    let e2e = aws_job(&served, "e2e", "superci/image=ubuntu26/docker-cache=true");
+    assert!(e2e["state"] == "launched" && e2e["layers"] != true, "{e2e}");
+    let asked = served.aws.asked.lock().unwrap().iter().rev().find(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).map(|a| a["asked"].as_str().unwrap().to_string()).unwrap();
+    let data: String = url::form_urlencoded::parse(asked.as_bytes()).find(|(k, _)| k == "UserData").map(|(_, v)| v.to_string()).unwrap();
+    use base64::Engine;
+    let script = String::from_utf8_lossy(&base64::engine::general_purpose::STANDARD.decode(data).unwrap()).to_string();
+    let link = script.split("plane.acme.test/cache/").nth(1).unwrap().split(|c: char| c == '\'' || c == '"' || c == '/' || c.is_whitespace()).next().unwrap().to_string();
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    assert_eq!(agent.get(&format!("{}/cache/{link}/layers.json", served.url)).call().unwrap().status().as_u16(), 404);
+    // The cache's page: the layers kept.
+    let hex = "1".repeat(64);
+    served.store.0.lock().unwrap().insert(format!("layer:us-east-1:sha256:{hex}"), serde_json::json!({ "size": 100, "diff_id": "", "erofs": { "key": format!("layers/{hex}.erofs"), "size": 50 }, "blob": { "key": format!("layers/{hex}.blob"), "size": 100 }, "made": now, "used": now }).to_string());
+    served.store.0.lock().unwrap().insert("layer:us-east-1:sha256:not-a-layer".into(), "\"no\"".into());
+    let caches: serde_json::Value = ureq::get(&format!("{}/caches", served.url)).header("authorization", &format!("Bearer {}", served.key)).call().unwrap().body_mut().read_json().unwrap();
+    assert!(caches["images"]["layers"] == 1 && caches["images"]["bytes"] == 150 && caches["images"]["on"] == false, "{caches}");
+}
+
+/// The layer store of a control plane whose AWS runners are not connected (any more): a machine's index without
+/// links, and nothing else of it.
+#[test]
+fn a_machines_layer_index_without_aws_connected_has_no_links_and_nothing_else_is_answered() {
+    let (served, link, _) = layers_machine(false);
+    served.store.0.lock().unwrap().insert("aws".into(), serde_json::json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": format!("arn:aws:iam::111111111111:role/superci-plane-{PLANE}"), "connected": false, "error": null }).to_string());
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    let mut r = agent.get(&format!("{}/cache/{link}/layers.json", served.url)).call().unwrap();
+    let index = r.body_mut().read_to_string().unwrap_or_default();
+    let index: serde_json::Value = serde_json::from_str(&index).unwrap_or_default();
+    assert!(r.status() == 200 && index["layers"] == serde_json::json!({}) && index["refresh"]["token"] == "", "{index}");
+    assert_eq!(agent.post(&format!("{}/cache/{link}/layers-links", served.url)).send("{}").unwrap().status().as_u16(), 404);
+}
+
+/// Tokens signed with the control plane's own key but not as it gives them to a run's jobs are refused by the cache:
+/// one without its repository's entries (or with a name it never gives); one with no run or job of digits is taken
+/// without them.
+#[test]
+fn the_caches_tokens_signed_by_the_control_plane_but_never_given_out_so_are_refused_or_taken_without_their_run() {
+    let (served, link, _) = layers_machine(true);
+    let agent = ureq::Agent::config_builder().http_status_as_error(false).build().new_agent();
+    assert_eq!(agent.get(&format!("{}/.well-known/jwks.json", served.url)).call().unwrap().status().as_u16(), 200);
+    let identity = served.store.under("identity")[0].1.clone();
+    let key: superci_core::crypto::SigningKeyStore = serde_json::from_value(identity["signing"].clone()).unwrap();
+    let lookup = |ns: &str, run: &str, scp: &str| -> (u16, serde_json::Value) {
+        let token = key.jwt(&serde_json::json!({ "iss": "https://plane.acme.test", "aud": "superci-cache", "exp": 4102444800u64, "ns": ns, "ac": r#"[{"Scope":"refs/heads/main","Permission":3}]"#, "run": run, "scp": scp })).unwrap();
+        let mut r = agent.post(&format!("{}/cache/{link}/lookup", served.url)).send(serde_json::json!({ "token": token, "key": "deps", "version": "1".repeat(64) }).to_string()).unwrap();
+        (r.status().as_u16(), serde_json::from_str(&r.body_mut().read_to_string().unwrap_or_default()).unwrap_or_default())
+    };
+    for ns in ["acme", "gh_1", "local-a.b"] {
+        let (status, said) = lookup(ns, "1", "Actions.Results:1:2");
+        assert!(status == 403 && said["why"] == "a token without its repository", "{ns}: {status} {said}");
+    }
+    for (run, scp) in [("", "Actions.Results:1:"), ("1a", "Actions.Results:1:2b"), ("1", "Actions.Results:1:2")] {
+        let (status, said) = lookup("gh1", run, scp);
+        assert!(status == 200 && said["hit"] == false, "{run} {scp}: {status} {said}");
+    }
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
@@ -11554,6 +11746,157 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
             let named: Vec<&str> = ac.as_array().into_iter().flatten().filter_map(|s| s["Scope"].as_str()).collect();
             assert_eq!(named, scopes, "{reference:?}: {claims}");
         }
+    }
+
+    /// The CLI run with `envs`, in `dir` (no checkout needed), reaching the control plane at `plane`: whether it
+    /// succeeded, and all it said; ended after `secs` at most.
+    fn within(served: &superci_testkit::Served, plane: &str, dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)], secs: u64) -> (bool, String) {
+        let child = Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", plane).env("SUPERCI_KEY", &served.run_key)
+            .env_remove("SUPERCI_LOGS_WAIT_S").env("SUPERCI_STAND_IN", &served.aws.url).envs(envs.iter().copied()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+        let out = match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(out) => out.unwrap(),
+            Err(_) => { let _ = Command::new("kill").args(["-9", &pid.to_string()]).status(); panic!("{args:?}: not over in {secs} s") }
+        };
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+    }
+
+    /// A run followed on a control plane of an older version (its lines as they come, no posts of steps), through
+    /// moments it answers that it is busy, or that it is asked too often: it is asked again, and said to be in touch
+    /// again; a job whose steps' lines cannot all come is ended with what came, once given up on.
+    #[test]
+    fn a_run_on_an_older_control_plane_is_followed_through_its_busy_moments_to_its_end() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plane = superci_testkit::front(&served.url, move |method, target, status, body| {
+            if method != "GET" || !target.starts_with("/runs/1?") { return (status, body) }
+            let answer = match n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => return (503, b"busy".to_vec()),
+                1 => return (429, b"asked too often".to_vec()),
+                2 => serde_json::json!({ "over": false, "jobs": [{ "name": "tests", "state": "running", "lines": ["first line"] }, { "name": "lint", "state": "running", "start": { "at_ms": 5 }, "posts": [], "steps": [] }] }),
+                _ => serde_json::json!({ "over": true, "result": "success", "jobs": [{ "name": "tests", "state": "done", "result": "success", "lines": ["last line"] },
+                    { "name": "lint", "state": "done", "result": "success", "posts": [], "steps": [{ "name": "Run lint", "order": 1, "state": "completed", "result": "succeeded" }] }] }),
+            };
+            (200, answer.to_string().into_bytes())
+        });
+        let (ok, said) = within(&served, &plane, &dir, &["runs", "wait", "1"], &[("SUPERCI_GIVE_UP_S", "1")], 60);
+        assert!(ok, "{said}");
+        for s in ["Out of touch with the control plane (the control plane said 503: busy)", "In touch with the control plane again", "first line", "last line", "[tests] Running", "[lint] Running", "The run ended: success"] { assert!(said.contains(s), "{s}: {said}") }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed run followed as its control plane gives it: a step's lines past a gap from what its machine sent of
+    /// them, another's from its log once it ended (only the line that is not empty, said as late), a log's line that
+    /// only looks timed kept whole, a machine other than the first choice said; the summary waits for a step's result
+    /// still to come, and a job whose lines never all come, or that never ended, is given up on.
+    #[test]
+    fn a_failed_runs_lines_come_from_its_machines_pages_and_its_logs_and_what_never_comes_is_given_up_on() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t = "2026-10-15T10:00:00.0000000Z";
+        let plane = superci_testkit::front(&served.url, move |method, target, status, body| {
+            if method != "GET" { return (status, body) }
+            let text = |s: &str| (200, s.as_bytes().to_vec());
+            match target.split_once("/runs/1/log?").map(|(_, q)| q) {
+                Some("job=0&log=1") => return text(&format!("{t} l1\n{t} l2\n{t} \n{t} l4")),
+                Some("job=0&log=2") => return text("2026-10-14T21:09:53 and then more words before Z after"),
+                Some("job=1&step=b1") => return text(&format!("{t} b one\n{t} b two\n{t} b three\n{t} b four")),
+                Some(_) => return (404, b"nothing here".to_vec()),
+                None => {}
+            }
+            if !target.starts_with("/runs/1?") { return (status, body) }
+            let first = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let posts = |p: serde_json::Value| if first { p } else { serde_json::json!([]) };
+            let answer = serde_json::json!({ "over": true, "result": "failure", "jobs": [
+                { "name": "build", "job_id": "11", "state": "done", "result": "failure", "start": { "keeps": true, "images": { "served": 1, "served_bytes": 1000 } },
+                    "posts": posts(serde_json::json!([{ "step": "a1", "start": 1, "lines": ["l1"] }, { "step": "a1", "start": 4, "lines": ["l4"] }])),
+                    "steps": [{ "id": "a1", "name": "Run make", "order": 1, "state": "completed", "result": "succeeded", "log": 1, "start": "2026-10-15T10:00:00Z" },
+                        { "id": "a2", "name": "Run make test", "order": 2, "state": "completed", "result": null, "log": 2, "start": "2026-10-15T10:00:01Z" }] },
+                { "name": "test", "job_id": "12", "state": "done", "result": "failure",
+                    "posts": posts(serde_json::json!([{ "step": "b1", "start": 1, "lines": ["b one"] }, { "step": "b1", "start": 5, "lines": ["b five"] }])),
+                    "steps": [{ "id": "b1", "name": "Run tests", "order": 1, "state": "completed", "result": null }, { "name": "Post tests", "order": 2, "state": "completed", "result": "failed" }] },
+                { "name": "later", "state": "running", "start": { "keeps": true, "machine_type": "c7a.large", "usd_per_hour": 0.05, "asks": [{ "kind": "c8a.large", "spot": true, "said": "InsufficientInstanceCapacity", "zone": "us-east-1a" }] },
+                    "posts": [], "steps": [{ "id": "c1", "name": "Run later", "order": 1, "state": "inProgress" }] }] });
+            (200, answer.to_string().into_bytes())
+        });
+        let (ok, said) = within(&served, &plane, &dir, &["runs", "wait", "1"], &[("SUPERCI_GIVE_UP_S", "1"), ("SUPERCI_LOGS_WAIT_S", "4")], 60);
+        assert!(!ok, "{said}");
+        for s in ["line 2 of this step, which came late:", "Not the first choice: AWS had no spot c8a.large in us-east-1a; it got c7a.large ($0.050 an hour).", "b two", "b five",
+            "2026-10-14T21:09:53 and then more words before Z after", "The run ended: failure"] { assert!(said.contains(s), "{s}: {said}") }
+        assert!(!said.contains("l3") && said.matches("l4").count() == 1, "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run followed for longer than a run is followed at most is left to go on, saying how to read it later.
+    #[test]
+    fn a_run_not_over_after_the_longest_it_is_followed_is_left_saying_how_to_read_it() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let plane = superci_testkit::front(&served.url, |method, target, status, body| {
+            if method == "GET" && target.starts_with("/runs/1?") { return (200, serde_json::json!({ "over": false, "jobs": [{ "name": "tests", "state": "launching", "posts": [], "steps": [] }] }).to_string().into_bytes()) }
+            (status, body)
+        });
+        let (ok, said) = within(&served, &plane, &dir, &["runs", "wait", "1"], &[("SUPERCI_FOLLOW_S", "1")], 30);
+        assert!(!ok && said.contains("Still not over after six hours: `superci runs retrieve 1`."), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run's artifacts asked of a control plane that has no such run (an answer of its own, or of another server in
+    /// front of it), or that fails; one fetched whose piece the bucket will not give, or whose zip is one this does not
+    /// unpack (over 4 GB, a directory cut short), is said, and what was fetched is not left behind.
+    #[test]
+    fn artifacts_a_control_plane_does_not_give_or_that_cannot_be_unpacked_are_said_and_what_was_fetched_is_not_left() {
+        let served = serve(|_| {});
+        let dir = checkout();
+        let zips: std::sync::Arc<std::sync::Mutex<Vec<u8>>> = Default::default();
+        let (z, list) = (zips.clone(), std::sync::Arc::new(std::sync::Mutex::new((404u16, String::new()))));
+        let l = list.clone();
+        let plane = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let p = plane.clone();
+        let url = superci_testkit::front(&served.url, move |method, target, status, body| {
+            if method != "GET" { return (status, body) }
+            if target == "/runs/1/artifacts" { let (s, b) = l.lock().unwrap().clone(); return (s, b.into_bytes()) }
+            if target.starts_with("/runs/1/artifacts?name=") { return (200, serde_json::json!({ "size": 3, "pieces": [{ "url": format!("{}/piece", p.lock().unwrap()), "size": 3 }] }).to_string().into_bytes()) }
+            if target == "/piece" { let b = z.lock().unwrap().clone(); return if b.is_empty() { (500, b"no".to_vec()) } else { (200, b) } }
+            (status, body)
+        });
+        *plane.lock().unwrap() = url.clone();
+        for (status, answer, says) in [(404, "", "No such run among this control plane's runs"), (404, "{\"error\":\"not here\"}", "No such run among this control plane's runs"),
+            (404, "<html>not found</html>", "No such run among this control plane's runs"), (500, "it broke", "the control plane said 500: it broke")] {
+            *list.lock().unwrap() = (status, answer.to_string());
+            let (ok, said) = within(&served, &url, &dir, &["artifacts", "list", "--run=1"], &[], 30);
+            assert!(!ok && said.contains(says), "{status} {answer}: {said}");
+        }
+        // A zip of one file, as upload-artifact makes one (stored), its sizes and directory as given.
+        let zip = |packed: u32, size: u32, count: u16, cd_at: Option<u32>| -> Vec<u8> {
+            let (name, data) = (b"a.txt".as_slice(), b"abc".as_slice());
+            let mut z = vec![0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            z.extend(3u32.to_le_bytes()); z.extend(3u32.to_le_bytes()); z.extend((name.len() as u16).to_le_bytes()); z.extend(0u16.to_le_bytes()); z.extend(name); z.extend(data);
+            let cd = z.len() as u32;
+            let mut c = vec![0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.extend(packed.to_le_bytes()); c.extend(size.to_le_bytes()); c.extend((name.len() as u16).to_le_bytes()); c.extend([0u8; 12]); c.extend(0u32.to_le_bytes()); c.extend(name);
+            let cd_size = c.len() as u32;
+            z.extend(c);
+            z.extend([0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]); z.extend(count.to_le_bytes()); z.extend(count.to_le_bytes()); z.extend(cd_size.to_le_bytes()); z.extend(cd_at.unwrap_or(cd).to_le_bytes()); z.extend(0u16.to_le_bytes());
+            z
+        };
+        let out = dir.join("got");
+        for (bytes, says) in [(vec![], "the bucket said 500 for a piece of report"), (zip(0xffff_ffff, 3, 1, None), "a file over 4 GB (zip64)"), (zip(3, 0xffff_ffff, 1, None), "a file over 4 GB (zip64)"),
+            (zip(3, 3, 1, Some(0xffff_ffff)), "it is over 4 GB (zip64)"), (zip(3, 3, 2, None), "a damaged directory"), (zip(3, 3, 1, None), "report (1 KB, 1 file) is in")] {
+            *zips.lock().unwrap() = bytes;
+            let (ok, said) = within(&served, &url, &dir, &["artifacts", "retrieve", "report", "--run=1", &format!("--out={}", out.display())], &[], 30);
+            assert!(said.contains(says), "{says}: {said}");
+            // (What was fetched is not left beside what it unpacked.)
+            let left: Vec<String> = std::fs::read_dir(&out).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
+            assert!(!left.iter().any(|f| f.starts_with('.')), "{says}: left {left:?}");
+            if !said.contains(" is in ") { assert!(!ok, "{says}: {said}") }
+        }
+        assert_eq!(std::fs::read_to_string(out.join("a.txt")).unwrap(), "abc");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
