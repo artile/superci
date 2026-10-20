@@ -7163,6 +7163,46 @@ fn an_aws_accounts_look_without_its_quotas_says_the_rest() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A job's start that took AWS longer than a start may in its first region is not taken on to the next region in the
+/// same request: it goes on later.
+#[test]
+fn a_start_that_took_aws_too_long_in_one_region_is_not_taken_on_to_the_next_in_the_same_request() {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        c.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws-on-demand"},{"cloud":"aws","off":true},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    served.aws.fail("RunInstances", 400, &superci_testkit::ec2_error("InsufficientInstanceCapacity", "We currently do not have sufficient capacity in the Availability Zone you requested."), None);
+    let tick = served.ticker();
+    served.aws.during("RunInstances", move || tick(20_000));
+    let j = aws_job(&served, "slow", "superci");
+    let asked_east2 = served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().unwrap_or_default().contains("us-east-2"));
+    assert!(j["machine_id"].is_null() && !asked_east2, "{j}");
+}
+
+/// A job still kept as running from before the month counts nothing in what the month spent: the CI's limit for the
+/// month, far below what it would cost, still lets a job start.
+#[test]
+fn a_job_kept_as_running_from_before_the_month_counts_nothing_against_its_limit() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.upkeep();
+    let now = served.now_ms();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert("job:778".into(), serde_json::json!({ "job_id": 778, "run_id": 1, "repo": "acme/app", "state": "running", "label": "superci", "at_ms": now - 60 * 86_400_000, "launched_ms": now - 60 * 86_400_000, "installation_id": 42, "cloud": "cloudflare", "seen_in_progress": true, "began": true, "usd_per_hour": 5.0 }).to_string());
+        m.insert("live:778".into(), String::new());
+    }
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"monthly_usd":1}"#);
+    let (id, q) = served.github.queue("test", "superci", served.now_ms());
+    assert!(served.webhook(q) < 300);
+    let j = served.store.under(&format!("job:{id}"))[0].1.clone();
+    assert!(j["state"] == "launched", "{j}");
+}
+
 #[test]
 fn jobs_the_sweep_ends_over_hours_and_days_are_said_on_their_pages_as_it_ended_them() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
@@ -12429,7 +12469,8 @@ jobs:\n  first:\n    runs-on: &on superci\n    env: *envs\n    steps:\n      - i
         let token = runner.handed(&served)["resources"]["endpoints"][0]["authorization"]["parameters"]["AccessToken"].as_str().unwrap().to_string();
         let claims: serde_json::Value = token.split('.').nth(1).and_then(|c| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(c).ok()).and_then(|c| serde_json::from_slice(&c).ok()).unwrap_or_default();
         assert!(claims["ac"].as_str().unwrap_or_default().contains("refs/superci/computer"), "{claims}");
-        // Its machine's tools, by the machine's link.
+        // Its machine's tools, by the machine's link (its run as one asked for by the API with no ref keeps it).
+        { let mut m = served.store.0.lock().unwrap(); let k = format!("run:{run}"); let mut r: serde_json::Value = serde_json::from_str(&m[&k]).unwrap(); r["ref"] = "".into(); m.insert(k, r.to_string()); }
         let machine = served.machines.0.lock().unwrap()[0].clone();
         let link = "machine-cache-link-000000000003";
         served.store.0.lock().unwrap().insert(format!("cachem:{link}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": machine }).to_string());
