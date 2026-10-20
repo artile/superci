@@ -1793,6 +1793,70 @@ fn a_role_still_being_read_45_seconds_on_says_aws_did_not_answer_and_one_read_wi
     fn page_of(link: &str) -> String { common::words(&common::part(link, "/?p=planes&fragment=1").1) }
 }
 
+/// The account's copy of the image of the newest build: a newer one asked for is not copied in (there is none), and
+/// the copy is never said as behind; a copy still on its way is not said as behind either.
+#[test]
+fn a_newer_image_asked_for_where_the_copy_is_the_newest_copies_nothing() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    account.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[("ca-central-1", "us-east-1")]);
+    account.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("ca-central-1", "us-east-1")]);
+    let (mut child, link) = common::dashboard(&home);
+    let copied = || account.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().is_some_and(|s| s.starts_with("Action=CopyImage"))).count();
+    until("the account looked at", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("N. Virginia"));
+    let (status, to, said) = common::post(&link, "/aws/image", &[("region", "us-east-1"), ("newer", "1")]);
+    assert!(status == 303 && to == "/?p=planes#aws-account" && copied() == 0, "{status} {to} {} {}", common::words(&said), copied());
+    assert!(!common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("Its maker has one of"));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    account.replaying(include_str!("../fixtures/aws/images/03-list-pending.jsonl"), &[("ca-central-1", "us-east-1")]);
+    let (mut child, link) = common::dashboard(&home);
+    until("the account looked at", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("N. Virginia"));
+    let page = common::words(&common::part(&link, "/?p=plane&fragment=1").1);
+    assert!(!page.contains("Its maker has one of"), "{page}");
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A first control plane set up in Cloudflare, from a workspace signed in to Cloudflare alone: its deploy goes on
+/// where a first one is set up, not in the list of control planes.
+#[test]
+fn a_first_control_plane_set_up_in_cloudflare_is_followed_where_a_first_one_is_set_up() {
+    let account = superci_testkit::Aws::serve();
+    account.replaying(include_str!("../fixtures/cloudflare/01-look.jsonl"), &[]);
+    let home = common::temp("cloudflare-only");
+    std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), serde_json::json!({ "cloudflare": { "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" } }).to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    let (mut child, link) = dashboard(&home);
+    let (status, to, said) = common::post(&link, "/plane/cloudflare", &[("account", "1111111111111111111111111111111a")]);
+    assert!(status == 303 && to == "/?p=plane", "{status} {to} {}", common::words(&said));
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A workspace whose file of what it is called cannot be written (a folder stands in its place): the control plane
+/// still takes each new name, though the workspace keeps none.
+#[test]
+fn a_workspace_whose_name_cannot_be_kept_still_names_its_control_plane() {
+    let served = serve(|_| {});
+    let home = signed_in(&served);
+    let ws = home.join("workspaces/default");
+    std::fs::create_dir_all(ws.join("workspace.json/in-the-way")).unwrap();
+    let (mut child, link) = dashboard(&home);
+    until("read", || common::words(&common::part(&link, "/?p=settings&fragment=1").1).contains("Largest machine"));
+    for name in ["Acme CI", "Initech CI"] {
+        let (status, _, said) = common::post(&link, "/name", &[("name", name)]);
+        assert!(status < 400, "{status} {}", common::words(&said));
+    }
+    until("named", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "NAME" && v == "Initech CI"));
+    assert!(ws.join("workspace.json").is_dir());
+    let _ = child.kill();
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// An update whose version asks for nothing new, of a control plane whose role was found to lack only what lets it
 /// read: said as that many new read permissions in AWS.
 #[test]
