@@ -6969,6 +6969,14 @@ fn read_views(planes: &[(Plane, bool)], key: &str) -> Vec<PlaneView> {
     })
 }
 
+/// The pause between a move's looks at the new control plane (two seconds). In a debug build, `SUPERCI_MOVE_PAUSE_MS`
+/// sets it: a test of what a move says after its last look does not wait a minute or two for it.
+fn move_pause() {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("SUPERCI_MOVE_PAUSE_MS").ok().and_then(|v| v.parse::<u64>().ok()) { return std::thread::sleep(Duration::from_millis(ms)) }
+    std::thread::sleep(Duration::from_secs(2))
+}
+
 /// A move (see `/plane/move`): returns what stayed behind, in words.
 fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::Value, plan: &[Carry], cf_account: Option<String>, aws_account: Option<String>, step: &dyn Fn(usize)) -> Result<Vec<String>> {
     // 1. Settings and history, copied: the new one is on standby (not in use) until the switch.
@@ -7037,7 +7045,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     let all_apps = |s: &serde_json::Value| { let have: Vec<u64> = status_apps(s).iter().filter_map(|a| a["id"].as_u64()).collect(); coming.iter().all(|id| have.contains(id)) };
     for _ in 0..30 {
         if cloudflare::status(to.url(), key).is_some_and(|s| (!has_app || !s["app"].is_null()) && all_apps(&s) && (!has_gitlab || !s["gitlab"].is_null())) { break }
-        std::thread::sleep(Duration::from_secs(2));
+        move_pause();
     }
 
     // 2. The runner providers: the same clouds, started by the new one (the old one keeps its own).
@@ -7095,7 +7103,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     let mut ready = brought.is_empty();
     for _ in 0..60 {
         if ready { break }
-        std::thread::sleep(Duration::from_secs(2));
+        move_pause();
         ready = cloudflare::status_light(to.url(), key).is_some_and(|s| brought.iter().all(|c| provider_connected(&s, c)));
     }
     if !ready { left.push("The new control plane had not started with every runner provider yet: a job in the next minutes may find one missing.".into()) }
@@ -7107,7 +7115,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
     for _ in 0..30 {
         claimed = cloudflare::plane_post(to.url(), key, "/move/claim", &serde_json::json!({ "from": from.url() }));
         if claimed.as_ref().is_ok_and(|c| !has_app || c["github"] == true) { break }
-        std::thread::sleep(Duration::from_secs(2));
+        move_pause();
     }
     match claimed {
         Ok(c) if !has_app || c["github"] == true => {

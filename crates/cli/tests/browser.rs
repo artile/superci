@@ -1524,6 +1524,43 @@ fn an_update_from_before_actions_says_it_asks_for_one_new_permission_in_github()
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// `superci planes move` to a control plane that never says it has AWS's runners: moved, saying what may be missing
+/// for the next minutes; to one that never says it took GitHub over: not moved, saying the old one passes jobs on.
+#[test]
+fn a_move_whose_new_control_plane_never_says_it_has_its_runners_or_github_says_so() {
+    for case in ["runners", "github"] {
+        // The one in use: its own AWS account's machines (or GitHub's App); another beside it in that account.
+        let served = serve(move |c| if case == "runners" {
+            (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+        });
+        if case == "github" { served.connect_github() }
+        served.aws.put(&format!("/superci/{PLANE}/CONTAINERS"), "off");
+        let aws = served.aws.clone();
+        let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+        for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+        if case == "github" { new.then_answer("/move/import", &vec![("/move/claim", &["github"][..]); 40]) }
+        let home = signed_in(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": new.url, "plane_id": "testplane0002", "label": "superci" } }]);
+        kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+        std::fs::write(&file, kept.to_string()).unwrap();
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &new.url)]);
+        // (Its looks at the new one a moment apart, not two seconds; the command given a minute at most.)
+        let mut cli = common::command(&home).args(["planes", "move", "testplane0002"]).env("SUPERCI_MOVE_PAUSE_MS", "20")
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while cli.try_wait().unwrap().is_none() { if std::time::Instant::now() > end { let _ = cli.kill(); panic!("{case}: the move did not end") } std::thread::sleep(std::time::Duration::from_millis(100)) }
+        let out = cli.wait_with_output().unwrap();
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        match case {
+            "runners" => assert!(out.status.success() && said.contains("Moved. Did not come along: The new control plane had not started with every runner provider yet"), "{said}"),
+            _ => assert!(!out.status.success() && said.contains("The new control plane has not taken GitHub over yet") && new.answers_to_come() < 40, "{said}"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
 #[test]
 fn a_jobs_log_is_read_in_steps_searched_and_shown_with_its_times() {
     let Some(mut b) = Browser::open(1300, 900) else { eprintln!("no Chrome here: skipped"); return };
