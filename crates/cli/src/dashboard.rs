@@ -1391,7 +1391,8 @@ impl Dashboard {
     fn key_refused(&self, v: &PlaneView) -> Option<String> {
         if !v.online || v.status.is_some() { return None }
         let said = cloudflare::refused(v.plane.url(), &self.status_key)?;
-        if v.version.is_some() && view::older(v.version.as_deref(), NAMES_SINCE) {
+        // (Online, it said a version: one from before versions were said reads as the first.)
+        if view::older(v.version.as_deref(), NAMES_SINCE) {
             return Some(format!("The control plane runs SuperCI {}, which reads this computer's key under its old name. Sign in again where it runs (`superci login`) so it is handed that way, or update the control plane (`superci planes update`).", v.version.as_deref().unwrap_or("of an older version")))
         }
         if said.starts_with(superci_core::plane::KEY_REFUSED) && view::older(Some(DASHBOARD_VERSION), v.version.as_deref().unwrap_or_default()) {
@@ -5887,7 +5888,7 @@ fn clouds_card(v: &PlaneView, signed_in: &[&str]) -> String {
         dialogs.push_str(&format!(r#"<dialog class="dlg" id="pool-{n}" onclick="if(event.target===this)this.close()"><form method="post" action="/routing" class="dlg-body"><input type="hidden" name="action" value="account"><input type="hidden" name="cloud" value="{}"><div class="dlg-head">{}<span><strong>{}</strong><small>{}</small></span>{close}</div>{field}<div class="dlg-foot">{remove}<button type="button" class="button secondary sm" onclick="this.closest('dialog').close()">Cancel</button>{save}</div></form></dialog>{}"#,
             esc(cloud), logo(cloud, 36), esc(&title), esc(&what), remove_dialog(v, cloud, n, signed_in)));
     }
-    if rows.is_empty() { return String::new() }
+    // (Shown beside the order, which has a place for each of these clouds: never without a row.)
     format!(r#"<section class="card"><div class="card-head"><h2>Clouds</h2></div><p class="note">The accounts your runners start machines in. Removing one deletes what SuperCI made there.</p><ol class="pools">{rows}</ol>{dialogs}</section>"#)
 }
 
@@ -6676,12 +6677,20 @@ impl Hub {
 fn github_picture(owner: &str) -> Option<String> {
     if !github::valid_login(owner) { return None }
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).timeout_global(Some(Duration::from_secs(4))).build().into();
-    let mut answer = agent.get(&format!("https://github.com/{owner}.png?size=96")).call().ok()?;
+    let mut answer = agent.get(&picture_at(&format!("https://github.com/{owner}.png?size=96"))).call().ok()?;
     if answer.status().as_u16() != 200 { return None }
     let kind = answer.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().split(';').next().unwrap_or_default().trim().to_string();
     if !["image/png", "image/jpeg", "image/gif", "image/webp"].contains(&kind.as_str()) { return None }
     let bytes = answer.body_mut().with_config().limit(300_000).read_to_vec().ok()?;
     Some(format!("data:{kind};base64,{}", superci_core::crypto::b64(&bytes)))
+}
+
+/// Where a picture on github.com is asked for: there; in a debug build with `SUPERCI_PICTURES_AT`, at that stand-in
+/// (as `aws::stand_in` sends the sites it knows), for a test to answer it.
+fn picture_at(url: &str) -> String {
+    #[cfg(debug_assertions)]
+    if let Some(at) = std::env::var("SUPERCI_PICTURES_AT").ok() { return format!("{}/{}", at.trim_end_matches('/'), url.trim_start_matches("https://")) }
+    url.to_string()
 }
 
 /// The mark at the top of the sidebar: the workspace's picture when it has one, SuperCI's own otherwise (which stays
