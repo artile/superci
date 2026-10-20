@@ -2420,3 +2420,395 @@ fn the_app_asked_for_an_organization_with_a_long_name_has_it_cut_with_a_mark_of_
     assert!(status < 400 && page.replace("&quot;", "\"").contains(&format!("\"name\":\"SuperCI a-very-lon-{mark}\"")), "{status} {}", common::words(&page));
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The CLI with a run key, in `dir`, reaching the control plane at `plane`: whether it succeeded, and all it said;
+/// ended after `secs` at most.
+fn keyed_within(served: &superci_testkit::Served, plane: &str, dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)], secs: u64) -> (bool, String) {
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(dir).args(args).env("SUPERCI_HOME", dir.join(".home")).env("SUPERCI_PLANE", plane).env("SUPERCI_KEY", &served.run_key)
+        .env_remove("SUPERCI_LOGS_WAIT_S").env("SUPERCI_STAND_IN", &served.aws.url).envs(envs.iter().copied()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    let out = match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(out) => out.unwrap(),
+        Err(_) => { let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status(); panic!("{args:?}: not over in {secs} s") }
+    };
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+}
+
+/// A run followed as its control plane gives it: a step's pages that hold nothing past what was out add nothing; a
+/// step never begun in a failed job is no result to wait for; a job running whose start's times say no step of it
+/// is said without one; a machine that keeps Docker's images and said nothing of them says nothing.
+#[test]
+fn a_run_followed_says_nothing_of_what_its_control_plane_gives_without_anything_in_it() {
+    let served = serve(|_| {});
+    let dir = common::temp("followed-empty");
+    let t = "2026-10-15T10:00:00.0000000Z";
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let plane = superci_testkit::front(&served.url, move |method, target, status, body| {
+        if method != "GET" { return (status, body) }
+        match target.split_once("/runs/1/log?").map(|(_, q)| q) {
+            Some("job=0&step=a1") => return (200, format!("{t} l1").into_bytes()),
+            Some("job=0&log=1") => return (200, format!("{t} l1\n{t} l2\n{t} l3\n{t} l4").into_bytes()),
+            Some(_) => return (404, b"nothing here".to_vec()),
+            None => {}
+        }
+        if !target.starts_with("/runs/1?") { return (status, body) }
+        let first = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+        let posts = |p: serde_json::Value| if first { p } else { serde_json::json!([]) };
+        let answer = serde_json::json!({ "over": !first, "result": if first { serde_json::Value::Null } else { "failure".into() }, "jobs": [
+            { "name": "build", "job_id": "11", "state": "done", "result": "failure", "start": { "keeps": true, "images": { "at": 1 } },
+                "posts": posts(serde_json::json!([{ "step": "a1", "start": 1, "lines": ["l1"] }, { "step": "a1", "start": 4, "lines": ["l4"] }])),
+                "steps": [{ "id": "a1", "name": "Run make", "order": 1, "state": "completed", "result": "failed", "log": 1, "start": "2026-10-15T10:00:00Z" },
+                    { "id": "a2", "name": "Run make test", "order": 2, "state": "pending", "result": null }] },
+            { "name": "later", "state": if first { "running" } else { "done" }, "result": if first { serde_json::Value::Null } else { "success".into() },
+                "start": { "at_ms": 1000, "launched_ms": 500, "machine_id": "i-1", "started_ms": 400 }, "posts": [], "steps": [] }] });
+        (200, answer.to_string().into_bytes())
+    });
+    let (ok, said) = keyed_within(&served, &plane, &dir, &["runs", "wait", "1"], &[("SUPERCI_GIVE_UP_S", "1"), ("SUPERCI_LOGS_WAIT_S", "4")], 60);
+    assert!(!ok && said.contains("The run ended: failure"), "{said}");
+    assert!(said.lines().any(|l| l.trim_end() == "[later] Running…") && !said.contains("Docker images"), "{said}");
+    assert!(said.matches("l1").count() == 1 && said.contains("l2"), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One call to Cloudflare's API asked with no body, as a change that takes none is asked: sent empty, and what
+/// Cloudflare (here, the test kit, which has no answer for it) said is said.
+#[test]
+fn a_call_to_cloudflares_api_that_changes_something_is_sent_with_no_body_when_given_none() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    for method in ["POST", "PUT"] {
+        let o = superci(&home, &["debug", "cloudflare", method, "/accounts/x/workers/scripts/superci/subdomain"]);
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.code().is_some_and(|c| c <= 1) && !said.contains("Sign in with Cloudflare first"), "{method}: {said}");
+        assert!(served.aws.asked.lock().unwrap().iter().any(|a| a["method"] == method && a["url"].as_str().is_some_and(|u| u.ends_with("/superci/subdomain"))), "{method}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane that fails to give a job's log or GitHub's deliveries (not for want of a newer version): said as
+/// it said it.
+#[test]
+fn a_control_plane_failing_to_give_a_jobs_log_or_githubs_deliveries_is_said_as_it_said_it() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = home(&served);
+    played(&served, &home.join("checkout"));
+    let front = superci_testkit::front(&served.url, |method, target, status, body| {
+        if method == "GET" && (target.starts_with("/job/log?") || target.starts_with("/github/deliveries")) { return (500, b"the store is down".to_vec()) }
+        (status, body)
+    });
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["plane"]["Aws"]["url"] = front.into();
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let (_, jobs) = json(&home, &["jobs", "list"]);
+    let id = jobs["jobs"][0]["id"].to_string();
+    for args in [&["jobs", "retrieve", &id][..], &["deliveries", "list"]] {
+        let o = superci(&home, args);
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success() && said.contains("500") && said.contains("the store is down") && !said.contains("planes update"), "{args:?}: {said}");
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A setting written to a Modal control plane, as Modal's client keeps a string: one of a few hundred bytes is
+/// written and taken; one past what a setting holds there (60 kB) is refused before anything is written.
+#[test]
+fn a_modal_control_planes_long_setting_is_written_and_one_past_what_it_holds_is_refused() {
+    let account = superci_testkit::Aws::serve();
+    let acct = account.clone();
+    let md = superci_testkit::serve_as("mdplane00005", move |c| { c.read_settings(&acct.modal_plane_settings()); c.own_cloud = "modal".into(); c.containers = true; });
+    // (Its key, among the settings it reads.)
+    account.modal_settings.lock().unwrap().insert("DEVICE_KEY_4102444800_TEST".into(), md.key.clone());
+    let home = common::temp("modal-long");
+    std::fs::create_dir_all(home.join("workspaces/default")).unwrap();
+    std::fs::write(home.join("workspaces/default/sign-ins.json"), serde_json::json!({
+        "modal": { "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" },
+        "key": { "name": "DEVICE_KEY_4102444800_TEST", "value": md.key, "planes": ["mdplane00005"] },
+        "plane": { "Modal": { "workspace": "acmeorg", "url": md.url, "plane_id": "mdplane00005", "label": "superci" } },
+    }).to_string()).unwrap();
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    account.replaying(include_str!("../fixtures/modal/03-use.jsonl"), &[]);
+    account.replaying(&[modal_answered("DictGetOrCreate", &[pb(&[Pb::B(1, b"di-settings".to_vec())])]), modal_answered("DictUpdate", &[pb(&[Pb::N(1, 1)])])].concat(), &[]);
+    let long = format!("acme/{}", "a".repeat(300));
+    let o = superci(&home, &["public_repos", "create", &long]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.success() && said.contains("may run here"), "{said}");
+    assert!(account.modal_plane_settings().iter().any(|(k, v)| k == "ROUTING" && v.contains(&long)), "{:?}", account.modal_plane_settings());
+    let longest = format!("acme/{}", "b".repeat(60_000));
+    let o = superci(&home, &["public_repos", "create", &longest]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && said.contains("a setting longer than 60 kB"), "{said}");
+    assert!(!account.modal_plane_settings().iter().any(|(_, v)| v.contains(&longest)));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A runner served a job here asking for its next message while the job runs: answered once the service has held
+/// it (as GitHub holds such a request), with none.
+#[test]
+fn a_runner_asking_for_a_message_while_its_job_runs_here_is_held_then_told_there_is_none() {
+    use superci_testkit::Runner;
+    let dir = common::temp("debug-runner-held");
+    let workflow = dir.join("ci.yml");
+    std::fs::write(&workflow, "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let root = format!("http://127.0.0.1:{port}/runner/rig");
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).env("SUPERCI_HOME", dir.join(".home"))
+        .args(["debug", "runner-service", workflow.to_str().unwrap(), "tests", &root, &port.to_string(), dir.join("jit").to_str().unwrap(), "--json"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() { assert!(std::time::Instant::now() < until, "it did not listen"); std::thread::sleep(std::time::Duration::from_millis(50)) }
+    let runner = Runner { at: format!("{root}/_apis/v1") };
+    runner.take();
+    let asked = std::time::Instant::now();
+    let (status, _) = runner.message();
+    assert!(status == 204 && asked.elapsed() >= std::time::Duration::from_secs(9), "{status} after {:?}", asked.elapsed());
+    runner.steps(&[("dddddddd-0000-0000-0000-000000000004", "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+    runner.finish("succeeded");
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    let out = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("the service ended").unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("the job ended: succeeded"), "{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `SUPERCI_RECORD` with `SUPERCI_RECORD_SIGN_INS=1`: a sign-in's renewal is recorded too (for fixtures of sign-ins).
+#[test]
+fn a_sign_ins_renewal_is_recorded_only_when_asked_for_too() {
+    let served = serve(|_| {});
+    served.aws.replaying(include_str!("../fixtures/aws/sign-in/ended.jsonl"), &[]);
+    for (asked, kept) in [(None, false), (Some("1"), true)] {
+        let home = common::signed_in(&served);
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut k: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        (k["aws"]["creds"]["expires_at_ms"], k["aws"]["refresh_token"], k["aws"]["dpop"]) = (0.into(), "superci-ended-refresh-token-for-a-recording".into(), serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap());
+        std::fs::write(&file, k.to_string()).unwrap();
+        let recording = home.join("recording.jsonl");
+        let mut c = common::command(&home);
+        c.env("SUPERCI_RECORD", &recording).args(["accounts", "retrieve", "aws", "--json"]);
+        if let Some(v) = asked { c.env("SUPERCI_RECORD_SIGN_INS", v); }
+        let o = c.output().unwrap();
+        let text = std::fs::read_to_string(&recording).unwrap_or_default();
+        assert_eq!(text.contains("signin.aws.amazon.com"), kept, "{asked:?}: {text} {}", String::from_utf8_lossy(&o.stdout));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// SuperCI stopped with another control plane beside the one in use that does not answer: left as it is, with the
+/// command that deletes it. Or with the machines' network AWS will not let the sign-in look at (its own policy, not
+/// the organization's): said as left too.
+#[test]
+fn leaving_leaves_a_control_plane_that_does_not_answer_and_a_network_the_sign_in_may_not_look_at() {
+    for down in [true, false] {
+        let served = serve(|_| {});
+        served.connect_github();
+        let other = superci_testkit::serve_as("testplane0002", |_| {});
+        let home = common::signed_in(&served);
+        // (Down, the other one is found in AWS as the recording has it; else the one in use is deleted as AWS answered
+        // the deletion of one, as it is called here.)
+        let replace: &[(&str, &str)] = if down { &[("http://new-plane.test", &other.url)] } else { &[("testplane0002", "testplane0001")] };
+        served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), replace);
+        for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+        let file = home.join("workspaces/default/sign-ins.json");
+        let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        if down {
+            kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } }]);
+            kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+            other.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            served.aws.fail("DescribeInstances", 403, &superci_testkit::ec2_error("UnauthorizedOperation", "You are not authorized to perform this operation. User: arn:aws:sts::111111111111:assumed-role/ReadOnly/someone is not authorized to perform: ec2:DescribeInstances because no identity-based policy allows the ec2:DescribeInstances action"), None);
+        }
+        std::fs::write(&file, kept.to_string()).unwrap();
+        let o = common::command(&home).args(["leave", "--confirm"]).env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+        assert!(said.contains("SuperCI is stopped"), "{said}");
+        if down { assert!(said.contains("did not answer and was left as it is (`superci planes delete testplane0002 --confirm` deletes it)"), "{said}") }
+        else { assert!(said.contains("Its machines' network in AWS (us-east-1: UnauthorizedOperation") && said.contains("no identity-based policy allows the ec2:DescribeInstances action"), "{said}") }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// A move back onto the control plane this one moved from (it still has its GitHub App): not refused as another
+/// CI's; on to what the move needs (here a sign-in for the runners that come along).
+#[test]
+fn a_move_back_onto_the_control_plane_this_one_moved_from_is_not_refused_as_another_cis() {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.aws.put(&format!("/superci/{}/LAUNCHERS", superci_testkit::PLANE), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#);
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    other.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+    other.store.0.lock().unwrap().insert("moved_to".into(), serde_json::json!(served.url).to_string());
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let o = superci(&home, &["planes", "move", "testplane0002", "--plane=testplane0001"]);
+    let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+    assert!(!said.contains("serves a code host of its own") && said.contains("Sign in with Cloudflare first"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A GitHub App made on GitHub Enterprise Cloud (a `.ghe.com` host), installed nowhere yet: installed from its
+/// host's own pages, as on github.com (not under /github-apps, as on a server of one's own).
+#[test]
+fn an_app_on_a_ghe_com_host_installed_nowhere_yet_is_installed_from_its_hosts_apps_page() {
+    let served = serve(|_| {});
+    let mut app = superci_testkit::GitHub::app();
+    app["host"] = "acme.ghe.com".into();
+    served.aws.put(&format!("/superci/{}/GITHUB_APP", superci_testkit::PLANE), &app.to_string());
+    served.github.set_installed(false, true);
+    let home = common::signed_in(&served);
+    let (_board, link) = common::dashboard(&home);
+    let want = "https://acme.ghe.com/apps/superci-acme/installations/new";
+    let page = (0..40).map(|_| { std::thread::sleep(std::time::Duration::from_millis(250)); common::part(&link, "/?p=repos&fragment=1").1 }).find(|p| p.contains("installations/new")).unwrap_or_default();
+    assert!(page.contains(want), "{}", common::words(&page));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A secret for workflows whose file a pattern names, the pattern opening a class it never closes (taken as the
+/// character itself): given to a run of a workflow so named, not to another starting the same way.
+#[test]
+fn a_secrets_workflow_pattern_with_an_unclosed_class_is_taken_as_the_character_itself() {
+    use superci_testkit::Runner;
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    for (name, pattern, value) in [("GIVEN", "[ci.yml", "given-value-1"), ("NOT_GIVEN", "[cd.yml", "other-value-2")] {
+        let o = common::command(&home).args(["secrets", "create", name, "--value-env=THE_VALUE", &format!("--workflow={pattern}")]).env("THE_VALUE", value).output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    }
+    let dir = common::temp("bracket-workflow");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/[ci.yml"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test ${{ secrets.GIVEN }} ${{ secrets.NOT_GIVEN }}\n").unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_superci")).current_dir(&dir).args(["runs", "create", "--workflow=.github/workflows/[ci.yml", "--quiet"])
+        .env("SUPERCI_HOME", dir.join(".cli")).env("SUPERCI_PLANE", &served.url).env("SUPERCI_KEY", &served.run_key).env("SUPERCI_STAND_IN", &served.aws.url).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let run = loop { if let Some((k, _)) = served.store.under("run:").into_iter().next() { break k.trim_start_matches("run:").to_string() } assert!(std::time::Instant::now() < until, "no run"); std::thread::sleep(std::time::Duration::from_millis(50)) };
+    let runner = loop { if let Some(r) = Runner::of_run(&served, &run) { break r } assert!(std::time::Instant::now() < until, "no runner"); std::thread::sleep(std::time::Duration::from_millis(50)) };
+    runner.take();
+    let handed = runner.handed(&served).to_string();
+    assert!(handed.contains("given-value-1") && !handed.contains("other-value-2"), "{handed}");
+    runner.steps(&[("dddddddd-0000-0000-0000-000000000001", "Run make test", 1, "completed", Some("succeeded"), Some(1))]);
+    runner.finish("succeeded");
+    let _ = cli.wait_with_output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Three control planes in the workspace's clouds, two serving GitHub each and one serving nothing: the two are
+/// each live, the third neither live nor in use.
+#[test]
+fn of_three_control_planes_two_live_the_one_that_serves_nothing_is_listed_neither_live_nor_in_use() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let other = superci_testkit::serve_as("testplane0002", |_| {});
+    other.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+    let third = superci_testkit::serve_as("testplane0003", |_| {});
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &other.url)]);
+    for (k, v) in other.aws.settings("testplane0002") { served.aws.put(&format!("/superci/testplane0002/{k}"), &v) }
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": other.url, "plane_id": "testplane0002", "label": "superci" } },
+        { "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": third.url, "plane_id": "testplane0003", "label": "superci" } }]);
+    kept["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002", "testplane0003"]);
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let said = String::from_utf8_lossy(&superci(&home, &["planes", "list"]).stdout).into_owned();
+    for id in ["testplane0001", "testplane0002"] { assert!(said.lines().any(|l| l.starts_with(id) && l.ends_with("  live")), "{said}") }
+    assert!(said.lines().any(|l| l.starts_with("testplane0003") && !l.ends_with("live") && !l.ends_with("in use")), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Cloudflare control plane deleted, Cloudflare saying its Worker is not there by its code alone (10007, in
+/// words that do not say "not found"): taken as gone.
+#[test]
+fn a_cloudflare_control_plane_whose_worker_cloudflare_calls_missing_by_its_code_is_deleted() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00001", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        if let Some((_, on)) = settings.iter().find(|(k, _)| k == "CONTAINERS") { c.containers = on == "on" }
+    });
+    cf.aws.params.lock().unwrap().remove("/superci/cfplane00001/CONTAINERS");
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    let home = common::signed_in(&served);
+    let file = home.join("workspaces/default/sign-ins.json");
+    let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    kept["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" });
+    std::fs::write(&file, kept.to_string()).unwrap();
+    let run = |recording: &str, overlay: &[serde_json::Value], args: &[&str]| {
+        served.aws.replaying(recording, &[]);
+        if !overlay.is_empty() { served.aws.replaying(&overlay.iter().map(|v| v.to_string() + "\n").collect::<String>(), &[]) }
+        let o = common::command(&home).args(args).env("SUPERCI_NEW_PLANE_ID", "cfplane00001").env("SUPERCI_PAUSE_MS", "1").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr))
+    };
+    let (ok, said) = run(include_str!("../fixtures/cloudflare/02-deploy.jsonl"), &[], &["planes", "create", "cloudflare"]);
+    assert!(ok && said.contains("The control plane is running"), "{said}");
+    let delete = [include_str!("../fixtures/cloudflare/03-use.jsonl"), include_str!("../fixtures/cloudflare/07-delete.jsonl")].concat();
+    let mut worker = recorded_answers(&delete, "DELETE", "/workers/scripts/superci?force=true")[0].clone();
+    (worker["status"], worker["answer"]) = (404.into(), serde_json::json!({ "success": false, "errors": [{ "code": 10007, "message": "This Worker does not exist on your account." }], "result": null }).to_string().into());
+    let (ok, said) = run(&delete, &[worker], &["planes", "delete", "cfplane00001", "--confirm"]);
+    assert!(ok && said.contains("Deleted Cloudflare · Acme."), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A Modal token given for one run (SUPERCI_MODAL_TOKEN_ID and _SECRET), a new workspace made to look after a CI
+/// it reaches: it is said to, its key handed over, and nothing of it is kept on this machine (what a sign-in given
+/// for a run reaches is that run's).
+#[test]
+fn a_workspace_given_a_ci_with_a_modal_token_for_the_run_alone_keeps_nothing_of_it() {
+    let account = superci_testkit::Aws::serve();
+    let acct = account.clone();
+    let md = superci_testkit::serve_as("mdplane00001", move |c| { c.read_settings(&acct.modal_plane_settings()); c.own_cloud = "modal".into(); });
+    account.workers.lock().unwrap().insert("acmeorg--superci-plane-mdplane00001.modal.run".into(), md.url.clone());
+    let home = common::temp("modal-given");
+    std::fs::write(home.join("aws-at"), &account.url).unwrap();
+    account.replaying(include_str!("../fixtures/modal/03-use.jsonl"), &[]);
+    account.replaying(&[modal_answered("DictGetOrCreate", &[pb(&[Pb::B(1, b"di-settings".to_vec())])]), modal_answered("DictUpdate", &[pb(&[Pb::N(1, 1)])])].concat(), &[]);
+    let given = |args: &[&str]| { let o = common::command(&home).args(args).env("SUPERCI_MODAL_TOKEN_ID", "ak-modal-for-tests").env("SUPERCI_MODAL_TOKEN_SECRET", "as-modal-for-tests").output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)) };
+    let (ok, said) = given(&["workspaces", "create", "Acme"]);
+    assert!(ok, "{said}");
+    let (ok, said) = given(&["workspaces", "update", "acme", "--plane=mdplane00001"]);
+    assert!(ok && said.contains("This workspace looks after Modal"), "{said}");
+    assert!(account.modal_plane_settings().iter().any(|(k, _)| k.starts_with("DEVICE_KEY_")), "{:?}", account.modal_plane_settings());
+    assert!(!home.join("workspaces/acme/sign-ins.json").exists(), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A working tree larger packed than a control plane without a bucket takes through itself: said, with how large
+/// it is, and no run is made.
+#[test]
+fn a_working_tree_larger_than_a_control_plane_without_a_bucket_takes_is_said_and_not_run() {
+    let served = serve(|_| {});
+    let plane = superci_testkit::front(&served.url, |method, target, status, body| {
+        // (No bucket: no link to put it in.)
+        if method == "POST" && target.starts_with("/runs/tree?") { return (200, b"{}".to_vec()) }
+        (status, body)
+    });
+    let dir = common::temp("large-tree");
+    std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    std::fs::write(dir.join(".github/workflows/ci.yml"), "jobs:\n  tests:\n    runs-on: superci\n    steps:\n      - run: make test\n").unwrap();
+    // (What does not pack smaller than it is.)
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let noise: Vec<u8> = (0..8_000).flat_map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x.to_le_bytes() }).collect();
+    std::fs::write(dir.join("noise.bin"), noise).unwrap();
+    for args in [&["init", "-q"][..], &["add", "-A"], &["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "t"]] { assert!(std::process::Command::new("git").current_dir(&dir).args(args).status().unwrap().success()) }
+    let (ok, said) = keyed_within(&served, &plane, &dir, &["runs", "create", "--workflow=.github/workflows/ci.yml"], &[("SUPERCI_MOST_KB", "32")], 60);
+    assert!(!ok && said.contains("The working tree is 0 MB packed; a run from a computer takes 0 MB at most."), "{said}");
+    assert!(served.store.under("run:").is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
