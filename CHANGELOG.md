@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.20
+- The spinner beside a step that takes more than one line ("Uploading the new functions (the control plane and its Docker image converter)", in an update) stays round, beside the step's first line. The step's text squeezed it into an oval.
+
 ## 0.19.19 — 2026-10-21
 - A control plane asked for a job's log by an id that is no job's, or of a GitLab by a name that is none, answers 400 with what was wrong (it answered 500, as if it had failed itself). Update your control plane for it.
 - `superci jobs retrieve ID --out=FILE` of a GitLab job whose log is over 4 MB says the control plane gives only its last 4 MB, and that GitLab's page of the job has it whole. It said a newer control plane would give it whole, which none does for GitLab.
