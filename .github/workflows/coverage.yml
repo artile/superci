@@ -178,6 +178,8 @@ jobs:
           # (A page waits longer under a coverage run, a few at a time.)
           SUPERCI_BROWSER_WAIT_S: "120"
           TESTS: ${{ matrix.tests }}
+          # (SuperCI's own code: the test kit the suites run on is not what they test.)
+          SUPERCOV_SOURCE_ROOTS: crates/cli/src,crates/core/src
         run: |
           # (Its tests skip themselves where there is no Chrome: a measure of skipped tests would say nothing.)
           google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
