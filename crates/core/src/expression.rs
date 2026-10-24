@@ -301,4 +301,81 @@ mod tests {
         assert!(holds("always()", &failed).unwrap() && holds("failure() && needs.build.result == 'success'", &failed).unwrap() && !holds("success()", &failed).unwrap());
         assert_eq!(interpolate("Test ${{ matrix.node }} on ${{ matrix.os }}", &c).unwrap(), "Test 20 on linux");
     }
+
+    fn eval_in(s: &str) -> Result<Value> {
+        let values = json!({ "a": { "B": 1, "list": [1, 2], "items": [{ "n": 1 }, { "n": 2 }, { "m": 3 }], "nested": [[1], { "k": 2 }, 3] }, "Upper": "kept" }).as_object().unwrap().clone();
+        evaluate(s, &Contexts { values: &values, status: Status::Cancelled })
+    }
+
+    #[test]
+    fn every_literal_and_token_reads_as_github_reads_it() {
+        let cases: &[(&str, Value)] = &[
+            ("null", Value::Null), ("true", json!(true)), ("false", json!(false)),
+            // JSON has no NaN or Infinity: both are null once read.
+            ("NaN", Value::Null), ("Infinity", Value::Null),
+            ("0x1F", json!(31.0)), ("-2", json!(-2.0)), ("1e-3", json!(0.001)), ("2E+2", json!(200.0)), ("1.5", json!(1.5)),
+            ("'it''s'", json!("it's")), ("''", json!("")), ("  'x'  ", json!("x")),
+            ("a.B", json!(1)), ("a.b", json!(1)), ("a['b']", json!(1)), ("a.list[1]", json!(2)), ("a.list[5]", Value::Null),
+            ("a.list.*", json!([1, 2])), ("a.list[*]", json!([1, 2])), ("a.*", json!([1, [{ "n": 1 }, { "n": 2 }, { "m": 3 }], [1, 2], [[1], { "k": 2 }, 3]])),
+            ("a.items.*.n", json!([1, 2])), ("a.nested.*.*", json!([1, 2])), ("'text'.*", json!([])), ("'text'.x", Value::Null),
+            ("Upper", json!("kept")), ("A.B", json!(1)), ("missing", Value::Null), ("under_score-dash", Value::Null),
+            ("(1)", json!(1.0)), ("!0", json!(true)), ("!!'x'", json!(true)), ("!fromJSON('[]')", json!(false)),
+            ("1 < 2", json!(true)), ("2 < 1", json!(false)), ("1 <= 1", json!(true)), ("2 <= 1", json!(false)),
+            ("2 > 1", json!(true)), ("1 > 2", json!(false)), ("1 >= 1", json!(true)), ("1 >= 2", json!(false)),
+            ("'a' < 'B'", json!(true)), ("'abc' < 1", json!(false)), ("fromJSON('[1]') < 2", json!(false)), ("null < 1", json!(true)),
+            ("true == 1", json!(true)), ("false == 0", json!(true)), ("'0x10' == 16", json!(true)), ("' ' == 0", json!(true)), ("null == null", json!(true)),
+            ("fromJSON('[1]') == fromJSON('[1]')", json!(true)), ("fromJSON('{}') != 1", json!(true)), ("'A' != 'a'", json!(false)),
+            ("0 && 1", json!(0.0)), ("1 && 2", json!(2.0)), ("0 || 'b'", json!("b")), ("'a' || 'b'", json!("a")),
+        ];
+        for (s, want) in cases { assert_eq!(eval_in(s).unwrap(), *want, "{s}"); }
+    }
+
+    #[test]
+    fn every_function_answers_as_github_answers() {
+        let cases: &[(&str, Value)] = &[
+            ("success()", json!(false)), ("failure()", json!(false)), ("cancelled()", json!(true)), ("always()", json!(true)),
+            ("contains('Hello', 'ELL')", json!(true)), ("contains(fromJSON('[1, 2]'), 3)", json!(false)),
+            ("startsWith('Hello', 'he')", json!(true)), ("endsWith('Hello', 'LO')", json!(true)), ("endsWith('Hello', 'x')", json!(false)),
+            ("join(a.list)", json!("1,2")), ("join('one', '-')", json!("one")), ("toJSON(a.list)", json!("[\n  1,\n  2\n]")),
+            ("fromJSON('{\"x\": 1}').x", json!(1)),
+            ("format('')", json!("")), ("format('{0} {1} {2}', true, 1.5, null)", json!("true 1.5 ")), ("format('a}b {{}}')", json!("a}b {}")),
+            ("format('{0}', 1e15)", json!("1000000000000000")), ("format('{0}', fromJSON('{\"k\": 1}'))", json!("{\n  \"k\": 1\n}")),
+            ("FORMAT('{0}', 'x')", json!("x")),
+        ];
+        for (s, want) in cases { assert_eq!(eval_in(s).unwrap(), *want, "{s}"); }
+    }
+
+    #[test]
+    fn every_malformed_expression_says_what_is_wrong() {
+        let cases: &[(&str, &str)] = &[
+            ("", "an expression ends too soon"), ("'open", "text not closed in 'open"), ("0xZZ", "not a number: 0xZZ"), ("1.2.3", "not a number: 1.2.3"),
+            ("a # b", "unexpected # in a # b"), ("(1", "expected RParen"), ("(", "an expression ends too soon"), (")", "unexpected RParen"),
+            ("a.", "unexpected None after a dot"), ("a.1", "unexpected Some(Num(1.0)) after a dot"), ("a[*", "expected RBracket"),
+            ("a[", "an expression ends too soon"), ("a[1", "expected RBracket"), ("!", "an expression ends too soon"),
+            ("1 ==", "an expression ends too soon"), ("f(1", "expected RParen"), ("f(", "an expression ends too soon"), ("1 2", "more than one expression in 1 2"),
+            ("nope()", "nope() is not a function an expression has here"), ("fromJSON('x')", "fromJSON: expected value at line 1 column 1"),
+            ("format('{0')", "format: { not closed"), ("format('{x}')", "format: not a number in {}"),
+        ];
+        for (s, want) in cases { assert_eq!(eval_in(s).unwrap_err(), *want, "{s}"); }
+    }
+
+    #[test]
+    fn an_error_inside_any_part_of_an_expression_is_the_whole_expressions_error() {
+        for s in ["nope().x", "a[nope()]", "nope().*.x", "a.*[nope()]", "nope().*.*", "nope().*", "!nope()", "nope() && 1", "1 && nope()",
+            "nope() || 1", "0 || nope()", "nope() == 1", "1 == nope()", "contains(nope())"] {
+            assert_eq!(eval_in(s).unwrap_err(), "nope() is not a function an expression has here", "{s}");
+        }
+    }
+
+    #[test]
+    fn a_condition_or_text_with_a_bad_expression_says_so() {
+        let values = ctx();
+        let c = Contexts { values: &values, status: Status::Success };
+        assert!(holds("${{ 'x' }}", &c).unwrap() && !holds("${{ '' }}", &c).unwrap());
+        assert_eq!(holds("${{ ( }}", &c).unwrap_err(), "an expression ends too soon");
+        assert_eq!(interpolate("", &c).unwrap(), "");
+        assert_eq!(interpolate("a ${{ 1", &c).unwrap_err(), "${{ not closed in a ${{ 1");
+        assert_eq!(interpolate("${{ nope() }}", &c).unwrap_err(), "nope() is not a function an expression has here");
+        assert!(truthy(&json!([])) && !truthy(&json!(0)));
+    }
 }

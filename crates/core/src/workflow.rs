@@ -145,11 +145,10 @@ fn text_token(text: &str, at: Value) -> Value {
     match parts.as_slice() {
         [(true, expr)] => { token["type"] = 3.into(); token["expr"] = expr.clone().into() }
         p if p.iter().any(|(is, _)| *is) => {
-            let (mut format, mut args) = (String::new(), vec![]);
-            for (is, s) in p {
-                if *is { format.push_str(&format!("{{{}}}", args.len())); args.push(s.clone()) }
-                else { format.push_str(&s.replace('\'', "''").replace('{', "{{").replace('}', "}}")) }
-            }
+            let mut args = vec![];
+            let format: String = p.iter().map(|(is, s)| {
+                if *is { args.push(s.clone()); format!("{{{}}}", args.len() - 1) } else { s.replace('\'', "''").replace('{', "{{").replace('}', "}}") }
+            }).collect();
             token["type"] = 3.into();
             token["expr"] = format!("format('{format}', {})", args.join(", ")).into();
         }
@@ -372,11 +371,11 @@ pub fn matrix_with(job: &Node, read: Reader) -> std::result::Result<Option<Vec<s
     let Some(node) = job.get("strategy").and_then(|s| s.get("matrix")) else { return Ok(None) };
     let Value::Object(m) = matrix_value(node, read)? else { return Err("the matrix is not a mapping".into()) };
     // (In the order its keys are written, as GitHub makes the combinations.)
-    let order: Vec<String> = match node { Node::Map { pairs, .. } => pairs.iter().filter_map(|(k, _)| k.text().map(str::to_string)).collect(), _ => m.keys().cloned().collect() };
+    // (Every key written is a key of what was read from it.)
+    let order: Vec<(&String, &Value)> = match node { Node::Map { pairs, .. } => pairs.iter().filter_map(|(k, _)| k.text()).filter_map(|k| m.get_key_value(k)).collect(), _ => m.iter().collect() };
     let mut combos: Vec<serde_json::Map<String, Value>> = vec![serde_json::Map::new()];
     let mut keys = vec![];
-    for key in &order {
-        let Some(v) = m.get(key) else { continue };
+    for (key, v) in order {
         if key == "include" || key == "exclude" { continue }
         let Value::Array(values) = v else { return Err(format!("the matrix's {key} is not a list")) };
         keys.push(key.clone());
@@ -562,5 +561,111 @@ mod tests {
         assert!(dispatch_inputs(&push, &[]).unwrap_err().contains("no `on: workflow_dispatch`"));
         let bare = parse("on: [push, workflow_dispatch]\njobs:\n  t:\n    runs-on: x\n    steps: [{run: x}]\n").unwrap();
         assert_eq!(dispatch_inputs(&bare, &[]).unwrap(), (serde_json::json!({}), serde_json::json!({})));
+        // Inputs with no default and none given: a boolean false, the others empty; an empty number and choice kept so.
+        let loose = parse("on:\n  workflow_dispatch:\n    inputs:\n      flag:\n        type: boolean\n      count:\n        type: number\n      pick:\n        type: choice\n        options: [a]\n      note:\n        required: false\n").unwrap();
+        assert_eq!(dispatch_inputs(&loose, &[]).unwrap().0, serde_json::json!({ "flag": false, "count": "", "pick": "", "note": "" }));
+        for (yaml, started) in [("on:\n  push:\n", false), ("name: x\n", false), ("true: workflow_dispatch\n", true)] {
+            assert_eq!(dispatch_inputs(&parse(yaml).unwrap(), &[]).is_ok(), started, "{yaml}");
+        }
+        assert!(dispatch_inputs(&parse("on: workflow_dispatch\n").unwrap(), &given(&[("x", "1")])).unwrap_err().contains("no input x (it has none)"));
+    }
+
+    #[test]
+    fn a_workflow_may_be_called_when_it_says_so_in_any_form() {
+        for (yaml, called) in [
+            ("on: workflow_call\n", true), ("on: push\n", false), ("on: [push, workflow_call]\n", true), ("on: [push]\n", false),
+            ("on:\n  workflow_call:\n    inputs: {}\n", true), ("on:\n  push:\n", false), ("name: x\n", false), ("true: workflow_call\n", true),
+        ] {
+            let w = parse(yaml).unwrap();
+            assert_eq!(callable(&w), called, "{yaml}");
+            assert_eq!(call_part(&w).is_some(), yaml.contains("inputs"), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn needs_is_one_name_a_list_or_nothing() {
+        for (yaml, want) in [("needs: a\n", vec!["a"]), ("needs: [a, b]\n", vec!["a", "b"]), ("name: x\n", vec![])] {
+            assert_eq!(needs(&parse(yaml).unwrap()), want, "{yaml}");
+        }
+    }
+
+    #[test]
+    fn nodes_answer_for_what_they_are_not_with_nothing() {
+        let w = parse("a: 1\nb: [x]\n").unwrap();
+        let (a, b) = (w.get("a").unwrap(), w.get("b").unwrap());
+        assert!(a.items().is_empty() && a.pairs().is_empty() && a.get("x").is_none() && b.text().is_none() && b.pairs().is_empty() && w.items().is_empty());
+        assert_eq!(parse("").unwrap_err(), "the workflow file is empty");
+        assert!(parse("a: [").unwrap_err().starts_with("the workflow file is not YAML: "));
+        // An alias of a list inside that same list: its anchor is not read yet.
+        assert_eq!(parse("a: &x [*x]\n").unwrap_err(), "line 1: an alias names no anchor before it");
+    }
+
+    #[test]
+    fn a_text_whose_expression_is_never_closed_or_has_a_lone_brace_is_read_as_github_reads_it() {
+        let t = |s: &str| text_token(s, json!({}));
+        assert_eq!(t("a ${{"), json!({ "type": 0, "lit": "a ${{" }));
+        assert_eq!(t("${{ a } b }}"), json!({ "type": 3, "expr": "a } b" }));
+        assert_eq!(t(""), json!({ "type": 0, "lit": "" }));
+    }
+
+    #[test]
+    fn a_question_about_the_job_is_one_only_when_it_stands_alone() {
+        let c = |s: &str| condition(&parse(&format!("if: \"{s}\"")).unwrap());
+        for (s, asks) in [("is_success()", false), ("a.failure()", false), ("xalways()", false), ("!cancelled()", true), ("success ()", true), ("1 && always()", true)] {
+            assert_eq!(c(s) == s, asks, "{s}");
+        }
+    }
+
+    #[test]
+    fn every_kind_of_step_is_written_as_github_writes_it() {
+        let read = |steps: &str| job_parts(&parse(&format!("jobs:\n  test:\n    runs-on: x\n    outputs:\n      v: x\n    steps:\n{steps}")).unwrap(), "ci.yml", "test", &mut String::new);
+        let ok = read(concat!(
+            "      - uses: ./local\n        with:\n          a: 1\n",
+            "      - uses: .\\win\n        with:\n",
+            "      - uses: docker://alpine\n        with:\n",
+            "      - uses: my_org/my_action/sub/dir@v1\n        continue-on-error: ${{ matrix.x }}\n        timeout-minutes: abc\n",
+            "      - uses: o/r@v2\n        continue-on-error: true\n        timeout-minutes: 10\n",
+        )).unwrap();
+        let s = &ok["steps"];
+        assert_eq!((s[0]["reference"]["path"].as_str(), s[0]["inputs"]["type"].as_u64(), s[0]["contextName"].as_str()), (Some("./local"), Some(2), Some("__self")));
+        assert_eq!((s[1]["reference"]["repositoryType"].as_str(), s[1].get("inputs"), s[1]["contextName"].as_str()), (Some("self"), None, Some("__self_2")));
+        assert_eq!((s[2]["reference"]["image"].as_str(), s[2].get("inputs")), (Some("alpine"), None));
+        assert_eq!((s[3]["reference"]["name"].as_str(), s[3]["reference"]["path"].as_str(), s[3]["contextName"].as_str()), (Some("my_org/my_action"), Some("sub/dir"), Some("__my_org_my_action")));
+        assert_eq!((s[3]["continueOnError"]["type"].as_u64(), s[3]["continueOnError"]["expr"].as_str(), s[3]["timeoutInMinutes"]["lit"].as_str()), (Some(3), Some("matrix.x"), Some("abc")));
+        assert_eq!((s[4]["continueOnError"]["bool"].as_bool(), s[4]["timeoutInMinutes"]["num"].as_f64()), (Some(true), Some(10.0)));
+        assert_eq!(ok["jobOutputs"]["type"].as_u64(), Some(2));
+        for (steps, said) in [
+            ("      - uses: actions/checkout\n", "line 7: `uses: actions/checkout` names no version (owner/name@version)"),
+            ("      - uses: alone@v1\n", "line 7: `uses: alone@v1` is not owner/name@version"),
+            ("      - wait: a\n        run: x\n", "line 7: a step that has `wait` runs nothing itself"),
+            ("      - cancel: a\n        uses: o/r@v1\n", "line 7: a step that has `cancel` runs nothing itself"),
+            ("      - parallel:\n          - name: x\n", "line 8: a step has `run`, `uses`, `parallel`, `wait`, `wait-all` or `cancel`"),
+        ] {
+            assert_eq!(read(steps).err().as_deref(), Some(said), "{steps}");
+        }
+        let w = parse("jobs:\n  a:\n    runs-on: x\n").unwrap();
+        assert_eq!(job_parts(&w, "ci.yml", "b", &mut String::new).unwrap_err(), "ci.yml has no job named b");
+        assert_eq!(job_parts(&w, "ci.yml", "a", &mut String::new).unwrap_err(), "the job a in ci.yml has no steps (a job that calls another workflow is not run here yet)");
+    }
+
+    #[test]
+    fn every_matrix_value_and_every_malformed_matrix_is_read_as_github_reads_it() {
+        let m = |body: &str| matrix(&parse(&format!("strategy:\n  matrix:\n{body}")).unwrap());
+        let shown = |body: &str| serde_json::to_string(&m(body).unwrap().unwrap()).unwrap();
+        assert_eq!(shown("    v: ['20', false, null, ~, '', x]\n"), r#"[{"v":"20"},{"v":false},{"v":null},{"v":null},{"v":""},{"v":"x"}]"#);
+        assert_eq!(shown("    v: [\"\", ]\n    w: [{ a: 1 }]\n"), r#"[{"v":"","w":{"a":1.0}}]"#);
+        assert_eq!(shown("    {}\n"), "[]");
+        assert_eq!(shown("    include:\n      - os: linux\n"), r#"[{"os":"linux"}]"#);
+        assert_eq!(shown("    os: [a, b]\n    include:\n      - {}\n    exclude:\n"), r#"[{"os":"a"},{"os":"b"}]"#);
+        for (body, said) in [
+            ("    - a\n", "the matrix is not a mapping"),
+            ("    os: linux\n", "the matrix's os is not a list"),
+            ("    os: [a]\n    exclude: x\n", "the matrix's exclude is not a list"),
+            ("    os: [a]\n    include: 3\n", "the matrix's include is not a list"),
+            ("    os:\n      - ${{ x }}\n", "line 4: a matrix made by an expression is read once the jobs it needs have ended"),
+            ("    os:\n      a: ${{ x }}\n", "line 4: a matrix made by an expression is read once the jobs it needs have ended"),
+        ] {
+            assert_eq!(m(body).unwrap_err(), said, "{body}");
+        }
     }
 }
