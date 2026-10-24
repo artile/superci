@@ -4656,7 +4656,8 @@ impl<'a> ControlPlane<'a> {
         let _ = self.reindex(150).await;
         // (And the runs of jobs counted before runs were, once the indexes are there.)
         if self.indexed().await { let _ = self.recount_runs(150).await; }
-        let kept: Vec<(String, String)> = self.live_jobs().await?.into_iter().map(|(k, j)| (k, serde_json::to_string(&j).unwrap_or_default())).collect();        // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
+        let kept: Vec<(String, String)> = self.live_jobs().await?.into_iter().map(|(k, j)| (k, serde_json::to_string(&j).unwrap_or_default())).collect();
+        // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
         let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);
         for (_, v) in &kept {
