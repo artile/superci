@@ -4,6 +4,10 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 
 ## 0.19.20
 - The spinner beside a step that takes more than one line ("Uploading the new functions (the control plane and its Docker image converter)", in an update) stays round, beside the step's first line. The step's text squeezed it into an oval.
+- A job whose runner said it had ended, in a request the control plane could not finish (its store or a call failing midway), is ended when the runner says so again, and its machine stopped. It stayed running, its machine paid for until its time was up, because the runner's second word said nothing new. The same for a runner saying it took its job. Update your control plane for it.
+- A GitHub job's end that the control plane could not keep is kept when GitHub sends the event again. Its runner was forgotten before the end was kept, so the event sent again found no job. Update your control plane for it.
+- A job of a run from a computer whose start failed midway is started again by the control plane's upkeep. It stayed "started" with nothing started, and the run never ended. Update your control plane for it.
+- A run from a computer refused when it is created leaves nothing behind. Its record was kept, and the upkeep started the run anyway after `superci runs create` had said it failed. Update your control plane for it.
 
 ## 0.19.19 — 2026-10-21
 - A control plane asked for a job's log by an id that is no job's, or of a GitLab by a name that is none, answers 400 with what was wrong (it answered 500, as if it had failed itself). Update your control plane for it.
