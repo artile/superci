@@ -3999,8 +3999,21 @@ impl<'a> ControlPlane<'a> {
             "event_name": r.event_name, "event": if r.event.is_object() { r.event } else { serde_json::json!({}) }, "inputs": if r.inputs.is_object() { r.inputs } else { serde_json::json!({}) }, "secrets": r.secrets, "stored": stored, "vars": r.vars, "tree": r.tree, "parts": r.parts, "layered": r.layered, "by": key.as_ref().map(|k| k.name.clone()), "jobs": instances, "called": r.called,
             "cache": { "ns": ns, "default_branch": default_branch } });
         put_json(self.store, &format!("run:{run_id}"), &run).await?;
-        if let Err(e) = self.advance_run(plane_url, run_id).await { return Ok(Response::text(400, &e)) }
-        let run = get_json::<serde_json::Value>(self.store, &format!("run:{run_id}")).await?.unwrap_or_default();
+        if let Err(e) = self.advance_run(plane_url, run_id).await {
+            // Refused only with nothing of it under way: then nothing is left for the upkeep to start later. A job
+            // already started (its record written) goes on, and the run with it: the upkeep starts the rest.
+            let kept = get_json::<serde_json::Value>(self.store, &format!("run:{run_id}")).await.ok().flatten().unwrap_or_default();
+            let mut under_way = false;
+            for id in kept["jobs"].as_array().into_iter().flatten().filter_map(|j| j["job_id"].as_str()) {
+                under_way |= !matches!(self.store.get(&format!("job:{id}")).await, Ok(None));
+            }
+            if !under_way {
+                let _ = self.store.delete(&format!("run:{run_id}")).await;
+                return Ok(Response::text(400, &e))
+            }
+        }
+        // (Read again for the jobs it was given names to; as written, when the store does not answer: the run is under way.)
+        let run = get_json::<serde_json::Value>(self.store, &format!("run:{run_id}")).await.ok().flatten().unwrap_or(run);
         // (`cache_own`: its repository is none GitHub knows here, so its cache is apart from what GitHub's jobs saved.)
         Ok(Response::json(&serde_json::json!({ "run_id": run_id.to_string(), "jobs": run["jobs"].as_array().map(|j| j.iter().map(|j| j["name"].clone()).collect::<Vec<_>>()).unwrap_or_default(), "missing_secrets": missing, "cache_own": ns.starts_with("local-") })))
     }
@@ -4173,12 +4186,35 @@ impl<'a> ControlPlane<'a> {
             let secrets: Vec<(String, String)> = serde_json::from_value(run["secrets"].clone()).unwrap_or_default();
             run["jobs"] = serde_json::Value::Array(jobs.clone());
             if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
-            for i in start { self.start_instance(plane_url, run_id, &run, &jobs[i], &secrets, &wf).await? }
+            for i in start {
+                if let Err(e) = self.start_instance(plane_url, run_id, &run, &jobs[i], &secrets, &wf).await {
+                    self.unreserve(&key, &jobs[i]).await;
+                    return Err(e)
+                }
+            }
             // (All over: its working tree goes now, not after a day.)
             if let Some(tree) = run["tree"].as_str().filter(|_| jobs.iter().all(|j| j["state"] == "done")) { self.forget_tree(plane_url, tree).await? }
             return Ok(())
         }
         Err("the run kept changing while it was moved on".into())
+    }
+
+    /// A job of a run reserved to start whose start failed before its record was written (a call or the store failed
+    /// midway): pending again in the run's record, so that the upkeep, moving the run on, starts it again. (With a
+    /// record, the job is the upkeep's to start, as any job left launching; nothing is changed.)
+    async fn unreserve(&self, key: &str, inst: &serde_json::Value) {
+        let (Some(id), Some(token)) = (inst["job_id"].as_str(), inst["token"].as_str()) else { return };
+        if !matches!(self.store.get(&format!("job:{id}")).await, Ok(None)) { return }
+        // (What its runner was to be handed goes, its secrets with it: the job is handed anew when started again.)
+        let _ = self.store.delete(&format!("rjob:{token}")).await;
+        for _ in 0..4 {
+            let Ok(Some(was)) = self.store.get(key).await else { return };
+            let Ok(mut run) = serde_json::from_str::<serde_json::Value>(&was) else { return };
+            let Some(j) = run["jobs"].as_array_mut().into_iter().flatten().find(|j| j["token"] == token && j["state"] == "started") else { return };
+            j["state"] = "pending".into();
+            if let Some(o) = j.as_object_mut() { o.remove("job_id"); o.remove("token"); }
+            if !matches!(self.store.swap(key, Some(&was), run.to_string()).await, Ok(false)) { return }
+        }
     }
 
     /// The contexts a job of a run from a computer is read with: `github`, `vars`, `inputs`, its `matrix`, its
@@ -4534,9 +4570,15 @@ impl<'a> ControlPlane<'a> {
         let full = url[url::Position::BeforePath..].to_string();
         let path = full.trim_start_matches(&format!("/runner/{token}")).to_string();
         let res = crate::runner_service::answer(self.store, token, req, &path).await?;
-        let after = get_json::<crate::runner_service::HandedJob>(self.store, &key).await?.unwrap_or_default();
-        if !before.taken && after.taken { self.started(plane_url, after.job_id, Some(&after.runner)).await? }
-        if before.result.is_none() {
+        let mut after = get_json::<crate::runner_service::HandedJob>(self.store, &key).await?.unwrap_or_default();
+        // (Noted until it has been, not only as the runner first says it: a request that failed after the runner's
+        // word was kept would leave the job running forever, as the runner, asking again, says nothing new.)
+        if after.taken && !after.noted_taken {
+            self.started(plane_url, after.job_id, Some(&after.runner)).await?;
+            after.noted_taken = true;
+            if after.result.is_none() || after.noted_end { put_json(self.store, &key, &after).await? }
+        }
+        if !after.noted_end {
             if let Some(result) = &after.result {
                 let conclusion = match result.as_str() { "succeeded" => "success", "failed" => "failure", "canceled" | "cancelled" => "cancelled", other => other }.to_string();
                 if let Some(job) = get_json::<Job>(self.store, &format!("job:{}", after.job_id)).await? {
@@ -4549,6 +4591,7 @@ impl<'a> ControlPlane<'a> {
                 // (Its secrets go with the job: nothing of them is kept once it has ended.)
                 let mut done = after.clone();
                 forget_secrets(&mut done);
+                done.noted_end = true;
                 put_json(self.store, &key, &done).await?;
             }
         }
@@ -4570,7 +4613,6 @@ impl<'a> ControlPlane<'a> {
                 self.store.put_until(&format!("keeping:{}", j.job_id), (self.clock.now_ms() + KEEPING_MS).to_string(), self.clock.now_ms() + 2 * KEEPING_MS).await?;
                 self.timer.wake_in(KEEPING_MS).await?;
             } else { self.stop_machine(plane_url, &j).await; }
-            let _ = self.store.delete(&format!("runner:{name}")).await;
             j.state = "done".into();
             if j.job_id == job_id { j.began = true; j.conclusion = ev.conclusion.clone() }
             j.ended_ms.get_or_insert(self.clock.now_ms());
@@ -4590,6 +4632,8 @@ impl<'a> ControlPlane<'a> {
             }
             self.settle(plane_url, &mut j).await;
             self.keep(&format!("job:{}", j.job_id), &j).await?;
+            // (Its runner forgotten only once the job's end is kept: the same end said again finds the job by it.)
+            let _ = self.store.delete(&format!("runner:{name}")).await;
             if j.job_id == job_id { return Ok(()); }
         }
         if let Some(mut own) = get_json::<Job>(self.store, &format!("job:{job_id}")).await? {

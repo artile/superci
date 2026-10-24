@@ -43,6 +43,10 @@ pub struct HandedJob {
     /// Asked to stop (its run was cancelled), and whether its runner has been told: GitHub's message for it, once.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub cancel: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub cancel_told: bool,
+    /// Whether the control plane has noted that its runner took it, and how it ended (its job's record, the run
+    /// moved on): a request that failed midway leaves these unset, and the runner's next call notes them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub noted_taken: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub noted_end: bool,
 }
 
 /// How long a cancelled job's steps have to stop (as GitHub gives them), before its runner ends them.

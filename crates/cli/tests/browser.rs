@@ -9705,9 +9705,15 @@ fn a_run_whose_jobs_record_the_store_refused_is_cancelled_all_the_same() {
     let r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).config().http_status_as_error(false).build().send(body.to_string()).unwrap();
     assert_eq!(r.status().as_u16(), 400);
     served.store_refuses(None);
-    let (key, record) = served.store.under("run:").into_iter().next().expect("the run kept");
-    assert!(record["jobs"][0]["state"] == "started" && served.store.under("job:").is_empty() && served.store.under("rjob:").len() == 1, "{record}");
-    let run = key.trim_start_matches("run:");
+    // Refused with nothing under way: nothing of it kept, for the upkeep to start later.
+    assert!(served.store.under("run:").is_empty() && served.store.under("job:").is_empty() && served.store.under("rjob:").is_empty(), "{:?}", served.store.under("run:"));
+    // One whose job's record went all the same (as a start whose undoing failed too leaves it): cancelled.
+    let mut r = ureq::post(&format!("{}/runs", served.url)).header("authorization", &format!("Bearer {}", served.run_key)).send(body.to_string()).unwrap();
+    let run = r.body_mut().read_json::<serde_json::Value>().unwrap()["run_id"].as_str().unwrap().to_string();
+    served.store.0.lock().unwrap().retain(|k, _| !k.starts_with("job:"));
+    let record = served.store.under(&format!("run:{run}"))[0].1.clone();
+    assert!(record["jobs"][0]["state"] == "started" && served.store.under("rjob:").len() == 1, "{record}");
+    let run = run.as_str();
     let mut r = ureq::post(&format!("{}/runs/{run}/cancel", served.url)).header("authorization", &format!("Bearer {}", served.key)).send_empty().unwrap();
     let said: serde_json::Value = r.body_mut().read_json().unwrap();
     assert!(said["cancelled"] == true && served.store.under("rjob:")[0].1["result"] == "cancelled" && served.store.under("job:").is_empty(), "{said}");
