@@ -1859,7 +1859,8 @@ impl Dashboard {
                 let (use_said, end) = if !allowed.contains(r) { (format!("{uses} · AWS refuses it now"), String::new()) }
                     else if without_image.contains(r) { (if uses.is_empty() { "Not used: the runner image is not here".to_string() } else { format!("{uses} · the runner image is not here") }, copy_into(r)) }
                     else if uses.is_empty() { ("Not used".to_string(), String::new()) } else { (uses, String::new()) };
-                let mut use_said = use_said; if let Some(c) = use_said.get(..1) { use_said = format!("{}{}", c.to_uppercase(), &use_said[1..]) }
+                // (Never empty, and begun with a plain letter: each way above says something.)
+                let use_said = format!("{}{}", use_said[..1].to_uppercase(), &use_said[1..]);
                 let cpus = spot_cpus(r).filter(|_| allowed.contains(r) && !without_image.contains(r)).map(|n| format!("{n} spot CPUs")).unwrap_or_default();
                 format!(r#"<li><span class="ar-name">{}<small>{r}</small></span><span class="ar-use">{}</span><span class="ar-cpu">{cpus}</span>{end}</li>"#, esc(&region_short(r)), esc(&use_said))
             }).collect::<String>();
