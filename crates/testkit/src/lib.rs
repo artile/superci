@@ -40,13 +40,12 @@ impl Store for Shared {
     async fn get(&self, k: &str) -> io::Result<Option<String>> { Ok(self.0.lock().unwrap().get(k).cloned()) }
     async fn put(&self, k: &str, v: String) -> io::Result<()> { self.refused(k)?; self.0.lock().unwrap().insert(k.into(), v); Ok(()) }
     async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.refused(k)?; let mut m = self.0.lock().unwrap(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
+    // (Read, then written, as a Durable Object's store does: a control plane served here answers one request at a time.)
     async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> {
         self.refused(k)?;
         let meanwhile = { let mut w = self.1.lock().unwrap(); w.iter_mut().find(|(p, n, _)| *n > 0 && k.starts_with(p.as_str())).map(|e| { e.1 -= 1; e.2.clone() }) };
-        let mut m = self.0.lock().unwrap();
-        if let Some(change) = meanwhile { match change(m.get(k).map(String::as_str)) { Some(v) => { m.insert(k.into(), v); } None => { m.remove(k); } } }
-        if m.get(k).map(String::as_str) != was { return Ok(false) }
-        m.insert(k.into(), v); Ok(true)
+        if let Some(change) = meanwhile { let mut m = self.0.lock().unwrap(); match change(m.get(k).map(String::as_str)) { Some(v) => { m.insert(k.into(), v); } None => { m.remove(k); } } }
+        io::swap_in_two_steps(self, k, was, v).await
     }
     async fn delete(&self, k: &str) -> io::Result<()> { self.0.lock().unwrap().remove(k); Ok(()) }
     async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }

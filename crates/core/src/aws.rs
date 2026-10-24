@@ -1271,9 +1271,7 @@ const SPOT_WATCH_WINDOWS: &str = r#"Start-Job -ScriptBlock {
 /// A machine's start-up script for an operating system ("linux" or "windows"; see `runner_user_data`). `notice`: for
 /// a spot machine running a GitHub job, where it says that AWS is taking it back.
 pub fn runner_user_data_for(work: &crate::io::Work, max_minutes: u32, os: &str, notice: Option<&str>) -> Result<String> {
-    // (A control plane on this computer, as tests serve one, in debug builds.)
-    let loopback = cfg!(debug_assertions) && notice.is_some_and(|url| url.starts_with("http://127.0.0.1:"));
-    if notice.is_some_and(|url| !(url.starts_with("https://") || loopback) || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b))) { return Err("invalid notice link".into()) }
+    if notice.is_some_and(|url| !(url.starts_with("https://") || crate::io::local_test_address(url)) || !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b))) { return Err("invalid notice link".into()) }
     if os != "windows" {
         let script = runner_user_data(work, max_minutes)?;
         // Before the runner starts. GitHub's runner stops its job on an interrupt; GitLab's on being ended (the job
@@ -1530,8 +1528,8 @@ pub fn with_hello(script: String, url: &str) -> Result<String> {
     if !url.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-?=&".contains(&b)) { return Err("invalid hello link".into()) }
     const LOG: &str = "exec > >(tee /var/log/superci.log > /dev/console) 2>&1\n";
     const READ: &str = "# First reads from a new volume are slow";
-    let runner = if script.contains("cd /home/runner && ") { "cd /home/runner && " } else if script.contains("export GL_URL=") { "export GL_URL=" } else { return Ok(script) };
-    if !script.contains(LOG) || !script.contains(GROW_ROOT) { return Ok(script) }
+    // (Its caller gives it a GitHub or GitLab job's script only, never a failing runner's: see `runner_user_data`.)
+    let runner = if script.contains("cd /home/runner && ") { "cd /home/runner && " } else { "export GL_URL=" };
     let said = HELLO.replace("HELLO_URL", url);
     let script = script.replacen(LOG, &format!("{LOG}superci_t0=$(date +%s%3N); superci_up=$(cut -d' ' -f1 /proc/uptime)\n"), 1).replacen(READ, &format!("superci_t1=$(date +%s%3N)\n{READ}"), 1);
     let (before, after) = script.split_once(runner).ok_or("no runner in the start-up script")?;
@@ -1869,7 +1867,7 @@ mod tests {
         // (And what its runner logged, when the runner was slow to listen: after it listens, and only then.)
         assert!(hello.find("&listening=$superci_t3").unwrap() < hello.find("&log=runner").unwrap() && hello.contains("-gt 10000") && hello.contains("/home/runner/_diag/Runner_*.log") && !hello.contains("HELLO_URL"), "{hello}");
         assert!(hello.find("superci_t0=").unwrap() < hello.find("growpart").unwrap() && hello.find("&listening=").unwrap() < hello.find("./run.sh").unwrap());
-        assert!(with_hello(script.clone(), "https://x/'; reboot; '").is_err() && with_hello(failing.clone(), "https://plane.example/hello?t=a").unwrap() == failing);
+        assert!(with_hello(script.clone(), "https://x/'; reboot; '").is_err());
         assert!(with_hello(gl.clone(), "https://plane.example/hello?gl=g-1&t=tokentokentokentoken").unwrap().contains("&ready=$superci_t2"));
         // The disk's speed above what AWS includes is in the price of the hour: 1,000 MiB a second and 4,000 IOPS on
         // 60 GB, where a GB is $0.08 a month, add $0.055.

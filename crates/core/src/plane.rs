@@ -553,7 +553,7 @@ pub struct Hour {
 }
 
 impl Hour {
-    fn add(&mut self, o: &Hour) {
+    pub fn add(&mut self, o: &Hour) {
         (self.runs, self.jobs, self.ran, self.not_ran, self.ms, self.billed) = (self.runs + o.runs, self.jobs + o.jobs, self.ran + o.ran, self.not_ran + o.not_ran, self.ms + o.ms, self.billed + o.billed);
         (self.usd, self.host_usd) = (self.usd + o.usd, self.host_usd + o.host_usd);
         self.waits.extend_from_slice(&o.waits);
@@ -919,14 +919,14 @@ pub fn gitlab_usd_per_minute(cpu: u32) -> f64 {
 /// The periods usage is told for: a day (by the hour), a week and 30 days (by the day).
 pub const USAGE_PERIODS: [(&str, u64, usize); 3] = [("day", 3_600_000, 24), ("week", 86_400_000, 7), ("month", 86_400_000, 30)];
 
+/// A run's mark, once one of its jobs is counted: its code host (and connection), repository, run and attempt.
+fn run_mark(j: &Job) -> String { format!("counted-run:{}:{}:{}:{}:{}", j.provider, j.gitlab, j.repo, j.run_id, j.attempt.unwrap_or(0)) }
+
 /// What jobs used in a period up to now, and what the code host's own runners would have charged for them: how many
 /// were queued, ran and did not run, their machines' minutes and the billed minutes (each job rounded up to a whole
 /// minute, as GitHub and GitLab bill), what they cost and what the code host would have, how long they waited for a
 /// machine; and the same for each hour or day of it, the oldest first. From each hour's totals (by the hour since
 /// the epoch, see `hour_of`).
-/// A run's mark, once one of its jobs is counted: its code host (and connection), repository, run and attempt.
-fn run_mark(j: &Job) -> String { format!("counted-run:{}:{}:{}:{}:{}", j.provider, j.gitlab, j.repo, j.run_id, j.attempt.unwrap_or(0)) }
-
 pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms: u64, steps: usize) -> serde_json::Value {
     let (first, last) = ((now.saturating_sub(step_ms * steps as u64)) / 3_600_000 + 1, now / 3_600_000);
     let mut buckets = vec![Hour::default(); steps];
@@ -947,19 +947,6 @@ pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms
     })
 }
 
-/// The same from the jobs themselves.
-pub fn usage(jobs: &[Job], host_price: impl Fn(&Job) -> f64, now: u64, step_ms: u64, steps: usize) -> serde_json::Value {
-    let mut hours: std::collections::BTreeMap<u64, Hour> = std::collections::BTreeMap::new();
-    let mut sorted: Vec<&Job> = jobs.iter().filter(|j| j.at_ms <= now).collect();
-    sorted.sort_by_key(|j| j.at_ms);
-    let mut seen = std::collections::HashSet::new();
-    for j in sorted {
-        let (hour, mut h) = hour_of(j, host_price(j), now);
-        if j.run_id > 0 && seen.insert(run_mark(j)) { h.runs = 1 }
-        hours.entry(hour).or_default().add(&h)
-    }
-    usage_of(&hours, now, step_ms, steps)
-}
 
 /// What a cloud's machines can be (the clouds this control plane starts machines in).
 fn capacity_of(cloud: &str) -> Capacity {
@@ -1315,7 +1302,7 @@ impl<'a> ControlPlane<'a> {
             ("POST", "/move/away") if self.dashboard(&req) => {
                 let to = serde_json::from_slice::<serde_json::Value>(&req.body).unwrap_or_default()["to"].as_str().unwrap_or_default().to_string();
                 // (One on this computer too, in a debug build: the tests'.)
-                if !(to.starts_with("https://") || (cfg!(debug_assertions) && to.starts_with("http://127.0.0.1:"))) { return Ok(Response::text(400, "where to?")) }
+                if !(to.starts_with("https://") || crate::io::local_test_address(&to)) { return Ok(Response::text(400, "where to?")) }
                 put_json(self.store, "moved_to", &to).await?;
                 Ok(Response::json(&serde_json::json!({ "moved_to": to })))
             }
@@ -4323,7 +4310,8 @@ impl<'a> ControlPlane<'a> {
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, layered: run["layered"] == true, at_ms: now, job_id, ..Default::default() }).await?;
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), no_spot: inst["off_spot"] == true, ..Default::default() };
-        if !self.store.put_if_absent(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(()) }
+        // (Its id is new, and the job is this request's alone: taken in the run's record, written over what was read.)
+        self.store.put(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await?;
         self.indexes(&job_key(&job), &job, true, None).await?;
         self.start_soon(plane_url, &mut job).await
     }
@@ -4668,8 +4656,7 @@ impl<'a> ControlPlane<'a> {
         let _ = self.reindex(150).await;
         // (And the runs of jobs counted before runs were, once the indexes are there.)
         if self.indexed().await { let _ = self.recount_runs(150).await; }
-        let kept: Vec<(String, String)> = self.live_jobs().await?.into_iter().map(|(k, j)| (k, serde_json::to_string(&j).unwrap_or_default())).collect();
-        // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
+        let kept: Vec<(String, String)> = self.live_jobs().await?.into_iter().map(|(k, j)| (k, serde_json::to_string(&j).unwrap_or_default())).collect();        // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
         let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);
         for (_, v) in &kept {

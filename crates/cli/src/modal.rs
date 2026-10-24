@@ -105,20 +105,21 @@ impl Session {
     }
 }
 
-/// In a debug build with `SUPERCI_STAND_IN`, calls go there instead, over gRPC as to Modal (the test kit's, which
-/// answers as a recording has it): the same calls, without TLS.
+/// Where Modal's API is reached: in a debug build with `SUPERCI_STAND_IN`, there instead, over gRPC as to Modal (the
+/// test kit's, which answers as a recording has it): the same calls, without TLS.
+#[cfg(debug_assertions)]
+fn api() -> String { std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()).unwrap_or_else(|| API.to_string()) }
+#[cfg(not(debug_assertions))]
+fn api() -> String { API.to_string() }
+
 struct Client { rt: tokio::runtime::Runtime, channel: Option<Channel>, session: Option<Session>, auth_token: Option<String> }
 
 impl Client {
     fn new(session: Option<Session>) -> Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-        #[cfg(debug_assertions)]
-        if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
-            let channel = rt.block_on(async { Endpoint::from_shared(at).map_err(|e| e.to_string())?.timeout(Duration::from_secs(30)).connect().await.map_err(|e| format!("Modal: {e}")) })?;
-            return Ok(Client { rt, channel: Some(channel), session, auth_token: None })
-        }
+        // (TLS for an https address, Modal's; the test kit's is http, and none is used for it.)
         let channel = rt.block_on(async {
-            Endpoint::from_static(API).tls_config(ClientTlsConfig::new().with_webpki_roots()).map_err(|e| e.to_string())?
+            Endpoint::from_shared(api()).map_err(|e| e.to_string())?.tls_config(ClientTlsConfig::new().with_webpki_roots()).map_err(|e| e.to_string())?
                 .timeout(Duration::from_secs(90)).connect().await.map_err(|e| format!("Modal: {e}"))
         })?;
         Ok(Client { rt, channel: Some(channel), session, auth_token: None })

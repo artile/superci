@@ -182,7 +182,8 @@ pub struct Done { pub said: Vec<String>, pub data: Value }
 pub const JOB_LINE: &str = "\u{1}";
 
 impl Done {
-    fn said(line: impl Into<String>) -> Done { let line = line.into(); let line = if line.is_empty() { "Done.".to_string() } else { line }; Done { data: json!({ "ok": true, "said": line }), said: vec![line] } }
+    /// (Each caller has a line to say: a command that changes something says what changed.)
+    fn said(line: impl Into<String>) -> Done { let line = line.into(); Done { data: json!({ "ok": true, "said": line }), said: vec![line] } }
 }
 
 /// The command a person runs first, when that is what an error asks for.
@@ -1020,26 +1021,23 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
         ("accounts", "retrieve") => {
             if w(2) != "aws" { return usage("Say which cloud's: `superci accounts retrieve aws` (the look is at AWS accounts; other clouds have nothing to look for yet).") }
             let mut d = signed_in();
-            let (account, who, look) = d.look_at_aws(args.get("account").unwrap_or_default())?;
+            let (account, who, look, creds) = d.look_at_aws(args.get("account").unwrap_or_default())?;
             let mut said = aws_look_lines(&account, &who, &look);
             // (And what SuperCI lets it spend, when its control plane is the one in use here.)
             let plane = d.current().ok().flatten().filter(|v| v.status.as_ref().is_some_and(|s| s["aws"]["account_id"].as_str() == Some(account.as_str())));
             let mut limits = plane.as_ref().map(|v| { let (lines, data) = other_limits(v); said.push(String::new()); said.extend(lines.into_iter().filter(|l| !l.contains("superci runners update"))); data["aws_account"].clone() });
             // Its budget in AWS counts AWS's own bill, hours behind SuperCI's estimate: its emails follow that count.
             if let (Some(v), Some(l)) = (plane.as_ref(), limits.as_mut().filter(|l| !l["aws_budget"].is_null())) {
-                if let Ok((_, creds)) = d.aws_account(&account) {
-                    if let Ok(Some(found)) = crate::aws_budget::with(&creds, &account, v.plane.plane_id(), |b| b.found()) {
-                        said.push(format!("  AWS has counted ${:.2} of its {} so far: its own bill, hours behind SuperCI's estimate. Its emails go at 80% and 100% of that count.", found.spent, superci_core::plane::dollars(found.amount)));
-                        l["aws_counted_usd"] = json!(found.spent);
-                    }
+                if let Ok(Some(found)) = crate::aws_budget::with(&creds, &account, v.plane.plane_id(), |b| b.found()) {
+                    said.push(format!("  AWS has counted ${:.2} of its {} so far: its own bill, hours behind SuperCI's estimate. Its emails go at 80% and 100% of that count.", found.spent, superci_core::plane::dollars(found.amount)));
+                    l["aws_counted_usd"] = json!(found.spent);
                 }
             }
             Ok(Done { said, data: json!({ "cloud": "aws", "id": account, "signed_in_as": who, "kind": look.kind(), "allowed_regions": look.allowed_regions(), "organization": look.organization().map(|r| json!({ "management_account": r.management_account(), "policy": r.policy_id() })), "allows": look, "limits": limits }) })
         }
         ("images", "list") => {
             let mut d = signed_in();
-            let (account, _, look) = d.look_at_aws(args.get("account").unwrap_or_default())?;
-            let (_, creds) = d.aws_account(&account)?;
+            let (account, _, look, creds) = d.look_at_aws(args.get("account").unwrap_or_default())?;
             let mut rows = vec![];
             for (region, there) in &look.images {
                 // (A copy that a newer one replaced goes, now that the newer one is there.)

@@ -99,13 +99,7 @@ pub struct SigningKeyStore {
 
 impl SigningKeyStore {
     pub fn generate() -> Self {
-        let mut seed = [0u8; 32];
-        let key = loop {
-            getrandom::getrandom(&mut seed).expect("randomness");
-            if let Ok(k) = SigningKey::from_slice(&seed) {
-                break k;
-            }
-        };
+        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
         let public = key.verifying_key().to_encoded_point(false);
         SigningKeyStore { private_b64: b64(&key.to_bytes()), kid: sha256_hex(public.as_bytes())[..16].to_string() }
     }
@@ -150,13 +144,10 @@ pub fn verify_es256_jwt(token: &str, jwk: &serde_json::Value, now_secs: u64) -> 
     use p256::ecdsa::VerifyingKey;
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 { return Err("not a JWT".into()); }
-    let header: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    if header["alg"] != "ES256" { return Err("not ES256".into()); }
+    // (Whatever its header says, it is checked as ES256: a key that signs only ES256 tokens signed it, or nothing did.)
     let coord = |k: &str| URL_SAFE_NO_PAD.decode(jwk[k].as_str().unwrap_or_default()).map_err(|e| e.to_string());
-    let (x, y) = (coord("x")?, coord("y")?);
-    if x.len() != 32 || y.len() != 32 { return Err("bad key".into()); }
-    let point = p256::EncodedPoint::from_affine_coordinates(x.as_slice().into(), y.as_slice().into(), false);
-    let key = VerifyingKey::from_encoded_point(&point).map_err(|e| e.to_string())?;
+    // (The key's point, uncompressed: one whose coordinates are not 32 bytes each is no point.)
+    let key = VerifyingKey::from_sec1_bytes(&[&[4u8][..], &coord("x")?, &coord("y")?].concat()).map_err(|_| "bad key".to_string())?;
     let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     key.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).map_err(|_| "bad signature".to_string())?;
     let claims: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -200,6 +191,7 @@ mod tests {
         assert_eq!(verify_es256_jwt(&token, &jwk, 3_000).unwrap_err(), "expired");
         let other = SigningKeyStore::generate().public_jwk().unwrap();
         assert_eq!(verify_es256_jwt(&token, &other, 1_000).unwrap_err(), "bad signature");
+        assert_eq!(verify_es256_jwt(&token, &serde_json::json!({ "x": "AQAB", "y": jwk["y"] }), 1_000).unwrap_err(), "bad key");
         let mut forged: Vec<&str> = token.split('.').collect();
         let claims = URL_SAFE_NO_PAD.encode(br#"{"iss":"https://p","aud":"https://evil","exp":2000}"#);
         forged[1] = &claims;

@@ -94,7 +94,8 @@ pub fn app_manifest(plane_url: &str, owner: &Owner, called: &str, label: &str) -
 /// for the same account (one from before, never deleted there): GitHub then says so on the page where the App is
 /// created, and another name typed there does as well (the App is known here by its id).
 pub fn app_name(called: &str, login: &str) -> String {
-    let brand = if called.is_empty() { "SuperCI" } else { called };
+    // (`called` is the CI's name: SuperCI unless named.)
+    let brand = called;
     // A long login is cut, with a mark of the whole of it (two organizations may begin alike).
     let login = if login.len() > 15 { format!("{}-{}", login.chars().take(10).collect::<String>(), &crate::crypto::sha256_hex(login.to_ascii_lowercase().as_bytes())[..4]) } else { login.to_string() };
     let brand: String = brand.chars().take(33usize.saturating_sub(login.chars().count())).collect();
@@ -456,7 +457,7 @@ mod tests {
         // A long login is cut with a mark of the whole of it; the name is 34 characters at most, whatever the CI is called.
         assert_eq!(user["name"], format!("Acme CI a-very-lon-{}", &crate::crypto::sha256_hex(b"a-very-long-user-name-that-goes-on-and-on")[..4]));
         assert_eq!(app_name("A CI With A Very Long Name", "a-very-long-user-name-that-goes-on-and-on").chars().count(), 34);
-        assert_eq!((app_name("", "acme").as_str(), app_name("Acme CI", "acme").as_str()), ("SuperCI acme", "Acme CI acme"));
+        assert_eq!((app_name("SuperCI", "acme").as_str(), app_name("Acme CI", "acme").as_str()), ("SuperCI acme", "Acme CI acme"));
         assert_eq!(manifest_target(None, &Owner { org: true, login: "o".into() }, "s1"), "https://github.com/organizations/o/settings/apps/new?state=s1");
         assert_eq!(manifest_target(None, &Owner { org: false, login: "u".into() }, "s1"), "https://github.com/settings/apps/new?state=s1");
     }

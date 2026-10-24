@@ -2393,7 +2393,7 @@ fn a_control_plane_is_called_what_it_is_named_where_people_read_it() {
     let why = job(&store, 31)["error"].as_str().unwrap_or_default().to_string();
     assert!(why.contains("the AcmeCI dashboard") && !why.contains("SuperCI"), "{why}");
     let named = |called: &str| superci_core::github::app_manifest(PLANE_URL, &superci_core::github::Owner { org: true, login: "acme".into() }, called, "superci")["name"].as_str().unwrap().to_string();
-    assert_eq!((named("AcmeCI").as_str(), named("SuperCI").as_str(), named("").as_str()), ("AcmeCI acme", "SuperCI acme", "SuperCI acme"));
+    assert_eq!((named("AcmeCI").as_str(), named("SuperCI").as_str()), ("AcmeCI acme", "SuperCI acme"));
     config.set_name("SuperCI");
     assert!(config.name.is_none());
 
@@ -4653,7 +4653,13 @@ fn a_working_tree_goes_to_the_control_planes_bucket_in_one_and_its_checkout_is_s
 
 #[test]
 fn usage_counts_every_job_of_a_period_its_minutes_and_what_the_code_host_would_have_charged() {
-    use superci_core::plane::{usage, Job};
+    use superci_core::plane::{hour_of, usage_of, Hour, Job};
+    // (Each job's hour added up, as the control plane adds them; these jobs are of no run.)
+    let usage = |jobs: &[Job], price: &dyn Fn(&Job) -> f64, now: u64, step_ms: u64, steps: usize| {
+        let mut hours: std::collections::BTreeMap<u64, Hour> = std::collections::BTreeMap::new();
+        for j in jobs.iter().filter(|j| j.at_ms <= now) { let (hour, h) = hour_of(j, price(j), now); hours.entry(hour).or_default().add(&h) }
+        usage_of(&hours, now, step_ms, steps)
+    };
     let now = 100 * 86_400_000u64;
     let job = |at_ago: u64, ran_s: Option<u64>, state: &str, usd: f64, provider: &str| Job { job_id: at_ago, at_ms: now - at_ago, state: state.into(), provider: provider.into(), cost_usd: Some(usd),
         started_ms: ran_s.map(|_| now - at_ago + 10_000), ended_ms: ran_s.map(|s| now - at_ago + 10_000 + s * 1000), ..Default::default() };
@@ -4665,7 +4671,7 @@ fn usage_counts_every_job_of_a_period_its_minutes_and_what_the_code_host_would_h
         job(40 * 86_400_000, Some(600), "done", 0.05, ""),    // forty days ago: in none
     ];
     let price = |j: &Job| if j.provider == "gitlab" { 0.01 } else { 0.006 };
-    let day = usage(&jobs, price, now, 3_600_000, 24);
+    let day = usage(&jobs, &price, now, 3_600_000, 24);
     assert_eq!((day["jobs"].as_u64(), day["ran"].as_u64(), day["not_ran"].as_u64(), day["billed_minutes"].as_u64()), (Some(3), Some(2), Some(1), Some(3)));
     assert_eq!(day["machine_minutes"].as_f64(), Some(1.5));
     assert!((day["usd"].as_f64().unwrap() - 0.03).abs() < 1e-9 && (day["host_usd"].as_f64().unwrap() - (2.0 * 0.006 + 0.01)).abs() < 1e-9, "{day}");
@@ -4673,9 +4679,9 @@ fn usage_counts_every_job_of_a_period_its_minutes_and_what_the_code_host_would_h
     // By the hour, the oldest first (the last is this hour: a job an hour ago is in the one before).
     let steps = day["steps"].as_array().unwrap();
     assert_eq!((steps.len(), steps[22]["ran"].as_u64(), steps[18]["ran"].as_u64(), steps[21]["not_ran"].as_u64()), (24, Some(1), Some(1), Some(1)));
-    let week = usage(&jobs, price, now, 86_400_000, 7);
+    let week = usage(&jobs, &price, now, 86_400_000, 7);
     assert_eq!((week["jobs"].as_u64(), week["billed_minutes"].as_u64(), week["steps"].as_array().unwrap().len()), (Some(4), Some(13), 7));
-    assert_eq!(usage(&jobs, price, now, 86_400_000, 30)["jobs"].as_u64(), Some(4));
+    assert_eq!(usage(&jobs, &price, now, 86_400_000, 30)["jobs"].as_u64(), Some(4));
 }
 
 #[test]

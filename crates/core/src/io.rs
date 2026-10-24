@@ -94,10 +94,7 @@ pub trait Store {
     /// Writes only when the key holds `was` (nothing: when it is new); whether it wrote. Atomic where requests run
     /// in parallel and the runtime can make it so (a job's record is written only over what was read of it); the
     /// two steps one after the other where it cannot.
-    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> Result<bool> {
-        if self.get(key).await?.as_deref() != was { return Ok(false) }
-        self.put(key, value).await.map(|_| true)
-    }
+    async fn swap(&self, key: &str, was: Option<&str>, value: String) -> Result<bool> { swap_in_two_steps(self, key, was, value).await }
     async fn delete(&self, key: &str) -> Result<()>;
     /// Every record whose key begins with `prefix`, by key. The prefix names a kind (`job:`), or part of one.
     async fn list(&self, prefix: &str) -> Result<Vec<(String, String)>>;
@@ -122,6 +119,13 @@ pub trait Store {
     /// Moves records kept in an earlier layout of this store into its own, at most `budget` of them; whether none
     /// is left (most stores have only the one layout).
     async fn migrate(&self, budget: usize) -> Result<bool> { let _ = budget; Ok(true) }
+}
+
+/// `Store::swap` as two steps, read then written, for a store that has no write over what was read (one request at a
+/// time: a Durable Object's, a Modal Dict's).
+pub async fn swap_in_two_steps<S: Store + ?Sized>(store: &S, key: &str, was: Option<&str>, value: String) -> Result<bool> {
+    if store.get(key).await?.as_deref() != was { return Ok(false) }
+    store.put(key, value).await.map(|_| true)
 }
 
 /// Ends for a store that has none of its own (a Durable Object's, a Modal Dict): each record given an end has it
@@ -259,6 +263,12 @@ pub fn form(body: &[u8]) -> Vec<(String, String)> {
 pub fn field<'a>(fields: &'a [(String, String)], name: &str) -> &'a str {
     fields.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).unwrap_or("")
 }
+
+/// A control plane on this computer, as tests serve one: an address taken as an https one in a debug build only.
+#[cfg(debug_assertions)]
+pub fn local_test_address(url: &str) -> bool { url.starts_with("http://127.0.0.1:") }
+#[cfg(not(debug_assertions))]
+pub fn local_test_address(_: &str) -> bool { false }
 
 /// An outside address, or, in a debug build with `SUPERCI_STAND_IN=URL`, the stand-in's for it (`superci_testkit`'s,
 /// as `URL/<the host>/<path>`): AWS, GitHub's API (and GitHub Enterprise Cloud's, `*.ghe.com`), where GitHub keeps logs, gitlab.com, Cloudflare's API and Modal's launchers (Modal's own API,

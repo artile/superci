@@ -1756,8 +1756,9 @@ impl Dashboard {
     /// The AWS accounts signed in to, each with who is signed in.
     pub fn aws_accounts_signed_in(&self) -> Vec<(String, String)> { self.aws_accounts().into_iter().map(|a| (a.account_id, a.who)).collect() }
 
-    /// What an AWS account signed in to allows (see `aws::Look`): the one named, or the only one.
-    pub fn look_at_aws(&mut self, account: &str) -> Result<(String, String, aws::Look)> {
+    /// What an AWS account signed in to allows (see `aws::Look`): the one named, or the only one; with the
+    /// credentials it was looked at with.
+    pub fn look_at_aws(&mut self, account: &str) -> Result<(String, String, aws::Look, superci_core::aws::Credentials)> {
         let (account, creds) = self.aws_account(account)?;
         let who = self.aws.as_ref().map(|a| a.who.clone()).unwrap_or_default();
         let look = aws::look_at(&creds);
@@ -1767,9 +1768,10 @@ impl Dashboard {
             // (Gone only when AWS ended its sign-in.)
             if self.aws.is_none() { return Err(AWS_ENDED.into()) }
             let (account, creds) = self.aws_account(&account)?;
-            return Ok((account, who, aws::look_at(&creds)))
+            let look = aws::look_at(&creds);
+            return Ok((account, who, look, creds))
         }
-        Ok((account, who, look))
+        Ok((account, who, look, creds))
     }
 
     /// An AWS account signed in to (the one named, or the only one), taken in hand, with its credentials.
@@ -2358,7 +2360,7 @@ impl Dashboard {
             self.found.retain(|p| !matches!(p, Plane::Aws { account_id: a, .. } if *a == account_id));
             for f in found {
                 // (Only over HTTPS; and in a debug build, a test's control plane on this computer.)
-                if !(f.url.starts_with("https://") || (cfg!(debug_assertions) && f.url.starts_with("http://127.0.0.1:"))) { continue }
+                if !(f.url.starts_with("https://") || superci_core::io::local_test_address(&f.url)) { continue }
                 if f.lambda.is_some() { there.push(f.plane_id.clone()) }
                 let found = match f.lambda {
                     Some((region, label)) => Plane::Aws { account_id: account_id.clone(), region, url: f.url, plane_id: f.plane_id, label },

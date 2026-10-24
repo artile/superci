@@ -37,7 +37,8 @@ fn main() {
         let (said, half, unconfirmed) = (e.said().to_string(), matches!(e, commands::Fail::Usage(_)), matches!(e, commands::Fail::Unconfirmed(_)));
         let needs = commands::needs(&said);
         if json {
-            match e { commands::Fail::Ended(_, mut data) => { if let Some(o) = data.as_object_mut() { o.insert("needs".into(), needs.into()); } println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default()) }
+            // (A command that ended badly answered an object, with "ok": false.)
+            match e { commands::Fail::Ended(_, mut data) => { data["needs"] = needs.into(); println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default()) }
                 _ => println!("{}", serde_json::json!({ "ok": false, "error": said, "needs": needs })) }
         }
         else if half { eprintln!("superci: {said}\n\n{}", commands::help(topic)) }
@@ -66,7 +67,8 @@ fn main() {
     match result {
         Ok(done) if json => {
             let mut data = done.data;
-            if !steps.is_empty() { if let Some(o) = data.as_object_mut() { o.insert("steps".into(), steps.into()); } }
+            // (Every command that says steps answers an object.)
+            if !steps.is_empty() { data["steps"] = steps.into() }
             println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default())
         }
         Ok(done) => for line in done.said { println!("{line}") },
