@@ -5543,14 +5543,18 @@ fn needs_text(needs: &[(&str, superci_core::permissions::Need)]) -> String {
     by.iter().map(|(cloud, k, writes)| format!("{k} new {}permission{} in {}", if *writes { "" } else { "read " }, if *k == 1 { "" } else { "s" }, provider_name(cloud))).collect::<Vec<_>>().join(", ")
 }
 
-fn provider_name(provider: &str) -> &str {
-    match provider {
-        "aws" => "AWS", "cloudflare" => "Cloudflare", "modal" => "Modal", "googlecloud" => "Google Cloud", "azure" => "Azure", "hetzner" => "Hetzner",
-        "digitalocean" => "DigitalOcean", "flydotio" => "Fly.io", "kubernetes" => "Kubernetes", "vercel" => "Vercel", "netlify" => "Netlify", "deno" => "Deno Deploy",
-        "github" => "GitHub", "gitlab" => "GitLab", "bitbucket" => "Bitbucket", "forgejo" => "Forgejo", "gitea" => "Gitea", "azuredevops" => "Azure DevOps",
-        "machine" => "Your own computer", "render" => "Render", "railway" => "Railway", "scaleway" => "Scaleway", "vultr" => "Vultr", "akamai" => "Akamai (Linode)", other => other,
-    }
-}
+/// Each provider and code host the dashboard names, as people call it.
+const PROVIDER_NAMES: [(&str, &str); 24] = [
+    ("aws", "AWS"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), ("googlecloud", "Google Cloud"), ("azure", "Azure"), ("hetzner", "Hetzner"),
+    ("digitalocean", "DigitalOcean"), ("flydotio", "Fly.io"), ("kubernetes", "Kubernetes"), ("vercel", "Vercel"), ("netlify", "Netlify"), ("deno", "Deno Deploy"),
+    ("github", "GitHub"), ("gitlab", "GitLab"), ("bitbucket", "Bitbucket"), ("forgejo", "Forgejo"), ("gitea", "Gitea"), ("azuredevops", "Azure DevOps"),
+    ("machine", "Your own computer"), ("render", "Render"), ("railway", "Railway"), ("scaleway", "Scaleway"), ("vultr", "Vultr"), ("akamai", "Akamai (Linode)"),
+];
+
+/// A name from a table of (id, name), or the id itself when the table has none for it.
+fn named<'a>(table: &[(&str, &'static str)], id: &'a str) -> &'a str { table.iter().find(|(k, _)| *k == id).map_or(id, |(_, name)| *name) }
+
+fn provider_name(provider: &str) -> &str { named(&PROVIDER_NAMES, provider) }
 
 
 /// One provider in a list (the connect screen's look): logo, name, what it is, and on the right its state or its action.
@@ -5691,17 +5695,19 @@ fn last_good_ms() -> u64 {
     60_000
 }
 
-fn section_title(section: &str) -> &'static str {
-    match section {
-        "plane" => "Set up a control plane", "planes" => "Control plane", "changes" => "Changelog", "add-runners" => "Add a provider", "runners" => "Runners",
-        "workflows" => "Workflows", "settings" => "Settings", "all" => "Control planes", "jobs" => "Jobs", "runs" => "Runs", "job" => "Job", "run" => "Run", "repos" => "Repositories", "gitlab" => "GitLab", _ => "Overview",
-    }
-}
+/// Each section's title (any other: the overview).
+const SECTION_TITLES: [(&str, &str); 14] = [
+    ("plane", "Set up a control plane"), ("planes", "Control plane"), ("changes", "Changelog"), ("add-runners", "Add a provider"), ("runners", "Runners"),
+    ("workflows", "Workflows"), ("settings", "Settings"), ("all", "Control planes"), ("jobs", "Jobs"), ("runs", "Runs"), ("job", "Job"), ("run", "Run"), ("repos", "Repositories"), ("gitlab", "GitLab"),
+];
+
+fn section_title(section: &str) -> &'static str { SECTION_TITLES.iter().find(|(k, _)| *k == section).map_or("Overview", |(_, title)| *title) }
 
 
-fn cloud_name(cloud: &str) -> &str {
-    match cloud { "aws" => "AWS", AWS_ON_DEMAND => "AWS on-demand", "cloudflare" => "Cloudflare", "modal" => "Modal", "machine" => "Your computer", other => other }
-}
+/// Each place a job can run, as the dashboard names it.
+const CLOUD_NAMES: [(&str, &str); 5] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal"), ("machine", "Your computer")];
+
+fn cloud_name(cloud: &str) -> &str { named(&CLOUD_NAMES, cloud) }
 
 /// A control plane older than this dashboard, for the sidebar on every page: the versions, a link to what is new, and
 /// its Update button.
@@ -9397,5 +9403,21 @@ mod tests {
         next.sign_out().unwrap();
         assert!(!store.path().exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn every_provider_section_and_cloud_has_its_name_and_any_other_is_said_as_it_is() {
+        for (table, name) in [(&PROVIDER_NAMES[..], provider_name as fn(&str) -> &str), (&CLOUD_NAMES[..], cloud_name)] {
+            for (id, want) in table { assert_eq!(name(id), *want, "{id}") }
+            assert_eq!(name("elsewhere"), "elsewhere");
+        }
+        for (id, title) in SECTION_TITLES { assert_eq!(section_title(id), title, "{id}") }
+        assert_eq!((section_title(""), section_title("nowhere")), ("Overview", "Overview"));
+        assert_eq!((cloud_name(AWS_ON_DEMAND), provider_name("machine"), cloud_name("machine")), ("AWS on-demand", "Your own computer", "Your computer"));
     }
 }

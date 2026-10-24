@@ -40,10 +40,7 @@ fn shaped(steps: Vec<Step>, shape: &[Value]) -> Vec<(Step, Value)> {
     let names: std::collections::HashMap<String, String> = shape.iter().zip(&steps[from..]).filter_map(|(sh, st)| Some((sh["id"].as_str()?.to_string(), st.name.clone()))).collect();
     let mut out: Vec<(Step, Value)> = vec![];
     let mut held: Vec<(Step, Value)> = vec![];
-    let mut steps: Vec<Option<Step>> = steps.into_iter().map(Some).collect();
-    let n = steps.len();
-    for i in 0..n {
-        let Some(step) = steps[i].take() else { continue };
+    for (i, step) in steps.into_iter().enumerate() {
         if !(from..from + shape.len()).contains(&i) { out.push((step, Value::Null)); continue }
         let sh = &shape[i - from];
         let mut v = json!({});
@@ -249,9 +246,8 @@ fn line(raw: &str) -> Line {
     let (time, rest) = split_time(raw);
     let rest = gitlab_text(rest);
     let time = time.unwrap_or_default().to_string();
-    for (mark, kind) in [("##[group]", "g"), ("##[error]", "e"), ("##[warning]", "w"), ("##[notice]", "n"), ("[command]", "c")] {
-        if let Some(text) = rest.strip_prefix(mark) { return (time, kind, ansi_html(text)) }
-    }
+    const MARKS: [(&str, &str); 5] = [("##[group]", "g"), ("##[error]", "e"), ("##[warning]", "w"), ("##[notice]", "n"), ("[command]", "c")];
+    if let Some((kind, text)) = MARKS.iter().find_map(|(mark, kind)| rest.strip_prefix(mark).map(|text| (*kind, text))) { return (time, kind, ansi_html(text)) }
     if rest.starts_with("##[endgroup]") { return (time, "x", String::new()) }
     let kind = if rest.starts_with("ERROR: ") { "e" } else if rest.starts_with("WARNING: ") { "w" } else { "" };
     (time, kind, ansi_html(rest))
@@ -427,5 +423,142 @@ mod tests {
         let got = json!({ "steps": [{ "name": "Run make", "state": "completed", "result": "succeeded", "text": "2026-10-14T21:09:53.1Z ok" }, { "name": "Run deploy", "state": "inProgress", "result": null, "text": "going" }] });
         let v = view(&json!({ "provider": "local" }), &got, true);
         assert_eq!((v["steps"][0]["state"].as_str(), v["steps"][0]["lines"][0][2].as_str(), v["steps"][1]["state"].as_str()), (Some("success"), Some("ok"), Some("running")));
+    }
+
+    #[test]
+    fn every_state_a_step_can_be_in_is_shown_as_github_shows_it() {
+        let local: Vec<Value> = [(None, Some("succeeded")), (None, Some("failed")), (None, Some("skipped")), (None, Some("cancelled")), (None, Some("canceled")), (Some("inProgress"), None), (Some("completed"), None), (Some("pending"), None)]
+            .iter().map(|(state, result)| json!({ "state": state, "result": result, "start": "2026-10-14T21:09:50Z", "finish": "2026-10-14T21:09:53Z" })).collect();
+        let v = view(&json!({ "provider": "local" }), &json!({ "steps": local }), false);
+        let states: Vec<&str> = v["steps"].as_array().unwrap().iter().map(|s| s["state"].as_str().unwrap()).collect();
+        assert_eq!(states, ["success", "failure", "skipped", "cancelled", "cancelled", "running", "success", "pending"]);
+        assert_eq!((v["steps"][0]["ms"].as_u64(), v["steps"][0]["name"].as_str()), (Some(3000), Some("Step")));
+        let github: Vec<Value> = [("completed", "success"), ("completed", "skipped"), ("completed", "cancelled"), ("completed", "failure"), ("in_progress", ""), ("queued", "")]
+            .iter().map(|(status, conclusion)| json!({ "status": status, "conclusion": if conclusion.is_empty() { Value::Null } else { json!(conclusion) } })).collect();
+        let v = view(&json!({ "provider": "" }), &json!({ "steps": github, "log": "" }), true);
+        let states: Vec<&str> = v["steps"].as_array().unwrap().iter().map(|s| s["state"].as_str().unwrap()).collect();
+        assert_eq!(states, ["success", "skipped", "cancelled", "failure", "running", "pending"]);
+    }
+
+    #[test]
+    fn a_job_of_githubs_without_steps_shows_its_log_whole_or_nothing() {
+        assert_eq!(view(&json!({}), &json!({ "log": " \n" }), false)["steps"], json!([]));
+        let v = view(&json!({}), &json!({ "log": "a\n##[warning]b\n##[endgroup]\n[command]c\n##[notice]d\nWARNING: e" }), false);
+        assert_eq!(v["steps"][0]["name"], "Log");
+        let kinds: Vec<&str> = v["steps"][0]["lines"].as_array().unwrap().iter().map(|l| l[1].as_str().unwrap()).collect();
+        assert_eq!((kinds, v["warnings"].as_u64()), (vec!["", "w", "x", "c", "n", "w"], Some(2)));
+        // A post step begins at its own cleanup line; a line seconds after the next step began goes to it.
+        let got = json!({ "steps": [
+            { "name": "Run a", "started_at": "2026-10-14T21:09:50Z" }, { "name": "Post Run a", "started_at": "2026-10-14T21:09:52Z" }, { "name": "Run b", "started_at": "2026-10-14T21:09:54Z" }],
+            "log": "2026-10-14T21:09:52.1Z still a\n2026-10-14T21:09:52.2Z Post job cleanup.\nno time\n2026-10-14T21:09:59.0Z long after" });
+        let v = view(&json!({}), &got, false);
+        let counts: Vec<usize> = v["steps"].as_array().unwrap().iter().map(|s| s["lines"].as_array().unwrap().len()).collect();
+        assert_eq!(counts, [1, 2, 1]);
+    }
+
+    #[test]
+    fn gitlabs_sections_within_sections_and_headings_on_their_own_line_are_read() {
+        let log = "before\n\
+                   \u{1b}[0Ksection_start:100:outer\r\u{1b}[0KOuter\n\
+                   \u{1b}[0Ksection_start:101:inner\r\u{1b}[0KInner\n\
+                   inside\n\
+                   \u{1b}[0Ksection_end:102:inner\r\u{1b}[0K\n\
+                   \u{1b}[0Ksection_end:105:outer\r\u{1b}[0K\n\
+                   section_start:200:bare_name\r\n\
+                   \u{1b}[0K\n\
+                   section_start:201:nested\r\n\
+                   section_end:x:nested\r\n\
+                   section_end:bad\r\n\
+                   section_end:300:extra\r\n\
+                   trailing";
+        let v = view(&json!({ "provider": "gitlab", "conclusion": "success" }), &json!({ "log": log }), false);
+        let names: Vec<(&str, Option<u64>)> = v["steps"].as_array().unwrap().iter().map(|s| (s["name"].as_str().unwrap(), s["ms"].as_u64())).collect();
+        // (A section with no heading is named by its id; one whose end has no time ended as it began; an end with no
+        // section open ends the step after the last.)
+        assert_eq!(names, [("Started", None), ("Outer", Some(5000)), ("bare name", Some(0)), ("Ended", Some(100_000))]);
+        assert_eq!(v["steps"][1]["lines"][0], json!(["", "g", "Inner"]));
+        // A heading on the line after its section's start names it.
+        let v = view(&json!({ "provider": "gitlab" }), &json!({ "log": "section_start:1:x\r\nHeading\nline" }), false);
+        assert_eq!((v["steps"][0]["name"].as_str(), v["steps"][0]["lines"][0][2].as_str()), (Some("Heading"), Some("line")));
+        // Still going: the section not ended is running, and nothing is a failure.
+        let v = view(&json!({ "provider": "gitlab", "conclusion": "failure" }), &json!({ "log": "section_start:1:a\r\u{1b}[0KA\nline" }), true);
+        assert_eq!((v["steps"][0]["name"].as_str(), v["steps"][0]["state"].as_str()), (Some("A"), Some("running")));
+        // Failed with nothing written: no step to mark.
+        assert_eq!(view(&json!({ "provider": "gitlab", "conclusion": "failure" }), &json!({ "log": "" }), false)["steps"], json!([]));
+    }
+
+    #[test]
+    fn times_and_colours_are_read_only_where_they_are_whole() {
+        assert_eq!((seconds("2026-01-15T00:00:00Z"), seconds("2026-02-01T00:00:00Z")), (Some(1_768_435_200), Some(1_769_904_000)));
+        for t in ["2026-10-14", "2026-1x-14T21:09:53Z", "x026-10-14T21:09:53Z", "2026-10-14T21:09:5xZ", "1969-12-31T23:59:59Z"] { assert_eq!(seconds(t), None, "{t}") }
+        assert_eq!(strip_controls("a\r\u{1b}x\u{1b}[2Kb\u{1b}["), "a\u{1b}xb");
+        for (raw, html) in [
+            ("\u{1b}[1;31mX\u{1b}[0m", r#"<span class="ab a31">X</span>"#), ("\u{1b}[92mopen", r#"<span class="a92">open</span>"#), ("\u{1b}[2Kmoved\u{1b}[", "moved"),
+            ("\u{1b}x&<>\"\r\u{7}\t", "x&amp;&lt;&gt;&quot;\t"), ("\u{1b}[44;;mplain", "plain"), ("", ""),
+        ] {
+            assert_eq!(ansi_html(raw), html, "{raw:?}");
+        }
+    }
+
+    /// A zip of stored files, each with its packing method as written.
+    fn zip(files: &[(&str, &[u8], u16)]) -> Vec<u8> {
+        let (mut data, mut dir) = (vec![], vec![]);
+        for (name, body, method) in files {
+            let at = data.len() as u32;
+            data.extend([0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0]);
+            data.extend(method.to_le_bytes());
+            data.extend([0; 8]);
+            data.extend((body.len() as u32).to_le_bytes());
+            data.extend((body.len() as u32).to_le_bytes());
+            data.extend((name.len() as u16).to_le_bytes());
+            data.extend([0, 0]);
+            data.extend(name.as_bytes());
+            data.extend(*body);
+            dir.extend([0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0]);
+            dir.extend(method.to_le_bytes());
+            dir.extend([0; 8]);
+            dir.extend((body.len() as u32).to_le_bytes());
+            dir.extend((body.len() as u32).to_le_bytes());
+            dir.extend((name.len() as u16).to_le_bytes());
+            dir.extend([0; 12]);
+            dir.extend(at.to_le_bytes());
+            dir.extend(name.as_bytes());
+        }
+        let (dir_at, dir_len) = (data.len() as u32, dir.len() as u32);
+        data.extend(dir);
+        data.extend([0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]);
+        data.extend((files.len() as u16).to_le_bytes());
+        data.extend((files.len() as u16).to_le_bytes());
+        data.extend(dir_len.to_le_bytes());
+        data.extend(dir_at.to_le_bytes());
+        data.extend([0, 0]);
+        data
+    }
+
+    #[test]
+    fn a_zips_files_are_read_and_a_damaged_one_says_where() {
+        let good = zip(&[("job_x/1_Set up.txt", b"\xef\xbb\xbfone", 0), ("job_x/notes.txt", b"n", 0), ("job_x/_x.txt", b"n", 0), ("other/2_x.txt", b"two", 0)]);
+        assert_eq!(step_logs(&good, "job\\x"), Some(json!({ "1": "one" })));
+        assert_eq!(step_logs(&good, "job/x"), Some(json!({ "1": "one" })), "a slash either way is the folder's _");
+        assert_eq!(step_logs(&zip(&[]), "job"), None);
+        assert_eq!(zip_files(&zip(&[("a", b"x", 12)])).unwrap_err(), "packed as 12");
+        assert!(zip_files(&zip(&[("a", b"\xff\xff", 8)])).is_err());
+        let mut damaged = good.clone();
+        let at = good.windows(4).position(|w| w == [0x50, 0x4b, 0x01, 0x02]).unwrap();
+        damaged[at] = 0;
+        assert_eq!(zip_files(&damaged).unwrap_err(), "a damaged directory");
+        // Its directory said to be where the data ends, or a file's name or body beyond it: cut short.
+        let one = zip(&[("a", b"x", 0)]);
+        let (end, dir) = (one.len() - 22, one.windows(4).position(|w| w == [0x50, 0x4b, 0x01, 0x02]).unwrap());
+        let mut beyond = one.clone();
+        beyond[end + 16..end + 20].copy_from_slice(&(end as u32 - 2).to_le_bytes());
+        assert_eq!(zip_files(&beyond).unwrap_err(), "a damaged directory");
+        let mut long_name = one.clone();
+        long_name[dir + 28..dir + 30].copy_from_slice(&500u16.to_le_bytes());
+        assert_eq!(zip_files(&long_name).unwrap_err(), "cut short");
+        let mut long_body = one.clone();
+        long_body[dir + 20..dir + 24].copy_from_slice(&500u32.to_le_bytes());
+        assert_eq!(zip_files(&long_body).unwrap_err(), "cut short");
+        assert_eq!(zip_files(b"PK\x05\x06").unwrap_err(), "not a zip");
     }
 }

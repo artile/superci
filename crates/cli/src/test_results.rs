@@ -165,9 +165,10 @@ pub fn read(log: &str) -> Tests {
     t
 }
 
-fn runner_name(r: &str) -> &'static str {
-    match r { "vitest" => "Vitest", "jest" => "Jest", "playwright" => "Playwright", "pytest" => "pytest", "cargo" => "cargo test", "go" => "go test", _ => "A test runner" }
-}
+/// Each test runner read here, as people call it.
+const RUNNER_NAMES: [(&str, &str); 6] = [("vitest", "Vitest"), ("jest", "Jest"), ("playwright", "Playwright"), ("pytest", "pytest"), ("cargo", "cargo test"), ("go", "go test")];
+
+fn runner_name(r: &str) -> &'static str { RUNNER_NAMES.iter().find(|(id, _)| *id == r).map_or("A test runner", |(_, name)| *name) }
 
 /// A line of Playwright's list of tests as they end (`  ✓  3 [chromium] › e2e/a.spec.ts:4:3 › logs in (2.1s)`): its
 /// mark, the test's name (with its project) and its file.
@@ -548,5 +549,57 @@ mod tests {
         assert!(long.failures[0].error.ends_with("- line 30"), "{}", long.failures[0].error);
         // (Playwright's own project in front of a line is no process's mark.)
         assert_eq!(marked("[chromium] › a.spec.ts:1:1 › x"), ("", "[chromium] › a.spec.ts:1:1 › x"));
+    }
+
+    #[test]
+    fn every_runner_is_called_by_its_name_when_it_ran_no_tests() {
+        for (id, name) in RUNNER_NAMES { assert_eq!(runner_name(id), name) }
+        assert_eq!(runner_name("mocha"), "A test runner");
+        for (log, note) in [("Tests:  0 total", "Jest ran no tests."), (" Tests  0 passed (0)", "Vitest ran no tests."), ("== 0 passed in 0.1s ==", "pytest ran no tests."),
+            ("test result: ok. 0 passed; 0 failed", "cargo test ran no tests.")] {
+            assert_eq!(read(log).notes, [note], "{log}");
+        }
+    }
+
+    #[test]
+    fn an_empty_log_and_lines_cut_short_are_read_as_nothing() {
+        assert_eq!(read(""), Tests::default());
+        // A colour code cut off at the line's end; GitLab's stream mark with a space.
+        assert_eq!((plain("ok\u{1b}["), plain("01O hello")), ("ok".to_string(), "hello".to_string()));
+        assert_eq!(error_after(&["a".to_string()], 1, |_| false), "");
+        assert_eq!(count("", "passed"), 0);
+    }
+
+    #[test]
+    fn every_runners_word_that_nothing_matched_is_known() {
+        for (line, runner) in [("No test files found.", "vitest"), ("No test suite found in file a.test.ts", "vitest"), ("ERROR: not found: tests/a.py::b", "pytest"), ("No tests found, exiting with code 1", "jest")] {
+            assert_eq!(none_matched(line).map(|(r, _)| r), Some(runner), "{line}");
+        }
+        assert_eq!(none_matched("All good"), None);
+    }
+
+    #[test]
+    fn a_playwright_list_line_that_is_not_one_is_not_taken_for_a_test() {
+        for line in ["✓ [chromium › a.ts:1:1 › t", "✓ [chromium] › a.ts:1:1", "✓ a.ts:x › t", "✓ a.ts › t", "x a.ts:1:1 › t"] {
+            assert_eq!(listed(line), None, "{line}");
+        }
+        // Only a time or a retry's mark is taken off a title; anything else in brackets is the title's.
+        for (line, title, retry) in [("✓ a.ts:1:1 › t (retry #x)", "t (retry #x)", false), ("✓ a.ts:1:1 › t (retry #)", "t (retry #)", false), ("✓ a.ts:1:1 › t (.5s)", "t (.5s)", false),
+            ("✓ a.ts:1:1 › t (1a s)", "t (1a s)", false), ("✓ a.ts:1:1 › t ()", "t ()", false), ("✓ a.ts:1:1 › t (retry #2) (1.5h)", "t", true)] {
+            assert_eq!(listed(line).map(|(_, n, _, r)| (n, r)), Some((title.to_string(), retry)), "{line}");
+        }
+    }
+
+    #[test]
+    fn at_most_so_many_failures_and_tests_are_kept_from_all_processes_together() {
+        let many = |mark: &str, from: usize| -> String { (from..from + 150).map(|n| format!("[{mark}] FAILED t.py::t{n} - x\n")).collect() };
+        let t = read(&format!("{}{}", many("a", 0), many("b", 150)));
+        assert_eq!((t.failures.len(), t.failed, t.by_process.len()), (MOST, 300, 2));
+        let listed = |mark: &str, outcome: char| -> String { format!("[{mark}] Running 150 tests using 1 worker\n{}", (0..150).map(|n| format!("[{mark}]   {outcome} {n} e2e/{mark}.spec.ts:{n}:1 › t\n")).collect::<String>()) };
+        let t = read(&format!("{}{}", listed("a", '✘'), listed("b", '✘')));
+        assert_eq!((t.ran.len(), t.failed_as_expected_tests.len(), t.failed_as_expected), (MOST, MOST, 300));
+        // A process that ran no runner is no process of the counts; Playwright's skipped ones counted as skipped.
+        let t = read("[web] listening on 3000\n[a] Running 1 test using 1 worker\n[a]   2 skipped\n[b] test result: ok. 1 passed");
+        assert_eq!((t.skipped, t.by_process.iter().map(|p| p.mark.as_str()).collect::<Vec<_>>()), (2, vec!["[a]", "[b]"]));
     }
 }

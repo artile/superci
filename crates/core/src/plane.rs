@@ -687,9 +687,10 @@ const SPOT_NOT_ALLOWED_KEY: &str = "aws:spot-not-allowed";
 /// How a job fails when AWS lets the account run no GPU machines (followed by the quota to raise).
 const NO_GPU_QUOTA: &str = "AWS lets this account run no GPU machines yet: ask AWS for more in Service Quotas, ";
 
-pub fn cloud_name(cloud: &str) -> &str {
-    match cloud { "aws" => "AWS", AWS_ON_DEMAND => "AWS on-demand", "cloudflare" => "Cloudflare", "modal" => "Modal", c => c }
-}
+pub fn cloud_name(cloud: &str) -> &str { CLOUD_NAMES.iter().find(|(id, _)| *id == cloud).map_or(cloud, |(_, name)| *name) }
+
+/// Each cloud a job's machine can be in, as people read it.
+pub const CLOUD_NAMES: [(&str, &str); 4] = [("aws", "AWS"), (AWS_ON_DEMAND, "AWS on-demand"), ("cloudflare", "Cloudflare"), ("modal", "Modal")];
 
 /// AWS's on-demand machines, as a place of their own in the order (`aws` there is its spot machines): when no region
 /// has a spot machine for a job, the job goes to the next place in the order that can run it, which may be this one.
@@ -5545,6 +5546,12 @@ mod price_tests {
         assert_eq!((github_usd_per_minute(2, false), github_usd_per_minute(33, false), github_usd_per_minute(65, false)), (0.006, 0.162, 0.252));
         assert_eq!((github_usd_per_minute(3, true), github_usd_per_minute(33, true), github_windows_usd_per_minute(64)), (0.008, 0.098, 0.322));
         assert_eq!((gitlab_usd_per_minute(0), gitlab_usd_per_minute(16), gitlab_usd_per_minute(96)), (0.01, 0.06, 0.24));
+    }
+
+    #[test]
+    fn every_cloud_has_its_name_and_any_other_is_said_as_it_is() {
+        for (id, name) in CLOUD_NAMES { assert_eq!(cloud_name(id), name) }
+        assert_eq!((cloud_name("aws"), cloud_name(AWS_ON_DEMAND), cloud_name("machine")), ("AWS", "AWS on-demand", "machine"));
     }
 
     #[test]
