@@ -1146,11 +1146,12 @@ fn a_move_waits_for_the_new_control_plane_to_take_its_app_its_gitlab_and_github_
     let (status, _, said) = common::post(&link, "/plane/delete", &[("plane", "testplane0003")]);
     assert!(status == 409 && common::words(&said).contains("2 jobs are still running there"), "{status} {}", common::words(&said));
     until("moved", || !served.store.under("moved_to").is_empty());
+    assert_eq!(third.store.under("job:").len(), 2);
+    // (The old one says it moved before the new one's first claim: what the new one took is looked at once the move is over.)
+    until("the move over", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Moved"));
     let has = |k: &str| served.aws.settings("testplane0002").into_iter().any(|(n, _)| n == k);
     assert!(has("GITHUB_APP") && has("GITLAB") && new.answers_to_come() == 0, "{:?} {}", served.aws.settings("testplane0002").iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), new.answers_to_come());
-    assert_eq!(third.store.under("job:").len(), 2);
-    // The move over, the old one (in use no more) with two jobs running there: not deleted either.
-    until("the move over", || common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains("Moved"));
+    // The old one (in use no more) with two jobs running there: not deleted either.
     for id in [93u64, 94] {
         served.store.0.lock().unwrap().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 9, "repo": "acme/app", "state": "running", "cloud": "", "provider": "local",
             "at_ms": served.now_ms() - 60_000, "installation_id": 0, "seen_in_progress": true }).to_string());
