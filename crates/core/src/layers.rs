@@ -231,7 +231,7 @@ impl ControlPlane<'_> {
     /// The repository of a machine's job (none yet, or one SuperCI keeps no cache for: public layers only), and the
     /// layers it was granted.
     async fn layer_reader(&self, machine: &cache::Machine) -> Result<(Option<String>, HashSet<String>)> {
-        let Ok(access) = self.machine_access(machine).await else { return Ok((None, HashSet::new())) };
+        let Ok(Ok(access)) = self.machine_access(machine).await else { return Ok((None, HashSet::new())) };
         let prefix = format!("lgrant:{}:", access.ns);
         let granted = self.store.list(&prefix).await?.into_iter().map(|(k, _)| k[prefix.len()..].to_string()).collect();
         Ok((Some(access.ns), granted))

@@ -5191,12 +5191,13 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// What the job on a machine may do in the cache, asked without a token (see `cache::branch_access`): a GitHub
-    /// job's, by what GitHub said of it; a run from a computer's, as its token would say it.
-    pub(crate) async fn machine_access(&self, machine: &cache::Machine) -> Result<cache::Access> {
+    /// job's, by what GitHub said of it; a run from a computer's, as its token would say it. Refused, why (inside); a
+    /// store or a cloud that failed meanwhile, outside (the machine asks again).
+    pub(crate) async fn machine_access(&self, machine: &cache::Machine) -> Result<std::result::Result<cache::Access, String>> {
         // A GitLab machine: the job its runner took, as GitLab said when it began (none yet: nothing to write).
         if let Some(local) = machine.runner.strip_prefix("gl:") {
             let at = format!("glrunner:{local}");
-            let mut runner = get_json::<serde_json::Value>(self.store, &at).await?.ok_or("its runner is not kept")?;
+            let Some(mut runner) = get_json::<serde_json::Value>(self.store, &at).await? else { return Ok(Err("its runner is not kept".into())) };
             // GitLab's word of the job it took has not come (or not yet): GitLab is asked which job the runner runs.
             if runner["running"].is_null() {
                 let id = runner["id"].as_u64().unwrap_or_default();
@@ -5208,24 +5209,24 @@ impl<'a> ControlPlane<'a> {
                 }
             }
             let r = &runner["running"];
-            let (Some(project), Some(git_ref)) = (r["project_id"].as_u64(), r["ref"].as_str()) else { return Err("its job has not begun".into()) };
+            let (Some(project), Some(git_ref)) = (r["project_id"].as_u64(), r["ref"].as_str()) else { return Ok(Err("its job has not begun".into())) };
             let connection = runner["gitlab"].as_str().unwrap_or_default();
             let ns = cache::gitlab_ns(connection, project);
             if let Some(path) = r["project"].as_str().filter(|p| !p.is_empty()) { let _ = self.store.put_if_absent(&format!("cachename:{ns}"), path.to_string()).await; }
-            return cache::ref_access(&ns, &if r["tag"] == true { format!("refs/tags/{git_ref}") } else { format!("refs/heads/{git_ref}") }, r["default_branch"].as_str().unwrap_or_default())
-                .ok_or_else(|| "a branch SuperCI does not keep".to_string())
+            return Ok(cache::ref_access(&ns, &if r["tag"] == true { format!("refs/tags/{git_ref}") } else { format!("refs/heads/{git_ref}") }, r["default_branch"].as_str().unwrap_or_default())
+                .ok_or_else(|| "a branch SuperCI does not keep".to_string()))
         }
         // (After its job too, when its runner's record is gone: what a machine keeps is offered then.)
-        let job = self.job_of_machine(machine).await?.ok_or("no job on this machine")?;
+        let Some(job) = self.job_of_machine(machine).await? else { return Ok(Err("no job on this machine".into())) };
         if job.provider == "local" {
-            let run = get_json::<serde_json::Value>(self.store, &format!("run:{}", job.run_id)).await?.ok_or("its run is not kept")?;
+            let Some(run) = get_json::<serde_json::Value>(self.store, &format!("run:{}", job.run_id)).await? else { return Ok(Err("its run is not kept".into())) };
             let who = run["by"].as_str().filter(|b| !b.is_empty() && b.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))).unwrap_or("computer");
             let claims = cache::local_claims(run["cache"]["ns"].as_str().unwrap_or_default(), who, run["ref"].as_str().unwrap_or("refs/heads/main"), run["cache"]["default_branch"].as_str().unwrap_or("main"), &job.run_id.to_string(), &job.job_id.to_string());
-            return cache::local_access(&claims)
+            return Ok(cache::local_access(&claims))
         }
-        if !job.provider.is_empty() { return Err("not a GitHub job".into()) }
-        let (Some(repo), Some(branch)) = (job.repo_id, job.branch.as_deref()) else { return Err("GitHub did not say the job's repository and branch".into()) };
-        cache::branch_access(repo, branch, job.default_branch.as_deref().unwrap_or_default()).ok_or_else(|| "a branch SuperCI does not keep".to_string())
+        if !job.provider.is_empty() { return Ok(Err("not a GitHub job".into())) }
+        let (Some(repo), Some(branch)) = (job.repo_id, job.branch.as_deref()) else { return Ok(Err("GitHub did not say the job's repository and branch".into())) };
+        Ok(cache::branch_access(repo, branch, job.default_branch.as_deref().unwrap_or_default()).ok_or_else(|| "a branch SuperCI does not keep".to_string()))
     }
 
     /// GitHub's keys for its jobs' tokens: kept a day, and fetched again for a key not among them (once a minute at most).
@@ -5245,20 +5246,24 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// What a job's token lets it do in the cache: GitHub's own token (signed with GitHub's keys), or one this control
-    /// plane gave a run from a computer (signed with its own).
-    async fn cache_access(&self, token: &str, plane_url: &str, now: u64) -> Result<cache::Access> {
+    /// plane gave a run from a computer (signed with its own). Refused, why (inside); its keys not read meanwhile,
+    /// outside (the machine asks again).
+    async fn cache_access(&self, token: &str, plane_url: &str, now: u64) -> Result<std::result::Result<cache::Access, String>> {
         use base64::Engine;
-        let header: serde_json::Value = token.split('.').next().and_then(|h| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(h.trim_end_matches('=')).ok())
-            .and_then(|h| serde_json::from_slice(&h).ok()).ok_or("not a job's token")?;
+        let Some(header) = token.split('.').next().and_then(|h| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(h.trim_end_matches('=')).ok())
+            .and_then(|h| serde_json::from_slice::<serde_json::Value>(&h).ok()) else { return Ok(Err("not a job's token".into())) };
         if header["alg"] == "ES256" {
-            let claims = crate::crypto::verify_es256_jwt(token, &self.identity().await?.signing.public_jwk()?, now / 1000)?;
-            if claims["iss"] != plane_url || claims["aud"] != "superci-cache" { return Err("not this control plane's token".into()) }
-            return cache::local_access(&claims)
+            let jwk = self.identity().await?.signing.public_jwk()?;
+            return Ok(crate::crypto::verify_es256_jwt(token, &jwk, now / 1000).and_then(|claims| {
+                if claims["iss"] != plane_url || claims["aud"] != "superci-cache" { return Err("not this control plane's token".into()) }
+                cache::local_access(&claims)
+            }))
         }
         let keys = self.github_keys(header["kid"].as_str().unwrap_or_default(), now).await?;
-        let claims = crate::crypto::verify_rs256_jwt(token, &keys, now / 1000)?;
-        if claims["iss"] != "https://token.actions.githubusercontent.com" { return Err("not a GitHub job's token".into()) }
-        cache::github_access(&claims)
+        Ok(crate::crypto::verify_rs256_jwt(token, &keys, now / 1000).and_then(|claims| {
+            if claims["iss"] != "https://token.actions.githubusercontent.com" { return Err("not a GitHub job's token".into()) }
+            cache::github_access(&claims)
+        }))
     }
 
     /// `GET /cache/<machine's link>/program`: on to this version's `superci-cache` for the machine, in its region's
@@ -5286,7 +5291,7 @@ impl<'a> ControlPlane<'a> {
         // The tools on the machine with no token of GitHub's (Turbo, Nx, Bazel): what the job on it may (see
         // `machine_access`); everything else, with the job's own token.
         let access = if what.starts_with("tool-") { self.machine_access(&machine).await } else { self.cache_access(body["token"].as_str().unwrap_or_default(), plane_url, now).await };
-        let access = match access { Ok(a) => a, Err(e) => return refuse(&e) };
+        let access = match access? { Ok(a) => a, Err(e) => return refuse(&e) };
         let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return refuse("this control plane has no AWS account") };
         let creds = self.aws_creds(plane_url, &a).await?;
         let (key, version) = (body["key"].as_str().unwrap_or_default(), body["version"].as_str().unwrap_or_default());
