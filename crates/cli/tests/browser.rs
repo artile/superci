@@ -6839,9 +6839,10 @@ fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there(
     until("forgotten", || served.aws.settings(PLANE).iter().any(|(k, v)| k == "AWS_RUNNERS" && v == "off"));
     let routing: serde_json::Value = serde_json::from_str(&served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").unwrap().1).unwrap();
     assert!(routing["order"].as_array().unwrap().iter().all(|p| p["cloud"] != "aws" && p["cloud"] != "aws-on-demand") && routing["rules"].as_array().unwrap().is_empty() && routing["aws_budget"].is_null(), "{routing}");
-    // Said on the page, with what could not be deleted there (AWS answering nothing): its role, its budget.
-    b.goto(&format!("{link}&p=runners"));
-    b.wait(&format!("{} && {}", page_shows("Removed AWS. Left:"), page_shows("its budget in AWS")));
+    // Said on the next page, with what could not be deleted there (AWS answering nothing): its role, its budget.
+    // (Read once, as the page's own first look reads it: a page that reads itself again shows it only until then.)
+    let (status, page) = common::part(&link, "/?p=runners&fragment=1");
+    assert!(status == 200 && page.contains("Removed AWS. Left:") && page.contains("its budget in AWS"), "{status}: {page}");
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
