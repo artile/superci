@@ -53,6 +53,8 @@ struct Hub {
     /// and the deliveries asked to be sent again.
     deliveries: Vec<Value>,
     attempts: Vec<u64>,
+    /// How many of those a test has sent again (`to_send_again`).
+    resent: usize,
     /// S3's objects, by bucket and key (`bucket/key`), as the control plane's buckets keep them.
     objects: BTreeMap<String, Vec<u8>>,
     /// Each object's headers S3 keeps with it (`x-amz-meta-*`, its checksum), given back on a HEAD.
@@ -152,6 +154,20 @@ impl GitHub {
 
     /// The deliveries asked to be sent again.
     pub fn redelivered(&self) -> Vec<u64> { self.hub.lock().unwrap().attempts.clone() }
+
+    /// The deliveries asked to be sent again since this was last asked, each as GitHub sends it again (its payload,
+    /// signed): for a test to deliver, as GitHub does.
+    pub fn to_send_again(&self) -> Vec<(Vec<u8>, String)> {
+        let mut h = self.hub.lock().unwrap();
+        let asked: Vec<u64> = h.attempts[h.resent..].to_vec();
+        h.resent = h.attempts.len();
+        let payloads: Vec<Value> = asked.iter().filter_map(|id| h.deliveries.iter().find(|d| d["id"] == *id).map(|d| d["request"]["payload"].clone())).collect();
+        drop(h);
+        payloads.iter().map(|p| self.signed(p)).collect()
+    }
+
+    /// The runners registered here (by the control plane), by name.
+    pub fn runner_names(&self) -> Vec<String> { self.hub.lock().unwrap().runners.values().cloned().collect() }
 
     /// An object taken out of its bucket (as the bucket's own rule removes old ones).
     pub fn remove_object(&self, key: &str) { self.hub.lock().unwrap().objects.remove(key); }
@@ -522,6 +538,23 @@ impl Http for GitHub {
     async fn send(&self, r: Request) -> io::Result<Response> {
         let hooks: Vec<Arc<dyn Fn() + Send + Sync>> = self.during.lock().unwrap().iter().filter(|(m, part, _)| *m == r.method && r.url.contains(part.as_str())).map(|(_, _, f)| f.clone()).collect();
         for f in hooks { f() }
+        // (Counted for a sweep, which may fail it: answered with its service's error, or its connection dropped.)
+        let faults = self.aws.lock().unwrap().as_ref().map(|a| a.faults.clone());
+        if let Some(faults) = faults {
+            let target = r.header("x-amz-target").unwrap_or_default().to_string();
+            let doing = crate::action(&target, &String::from_utf8_lossy(&r.body));
+            match faults.call(format!("{} {} {doing}", r.method, r.url).trim_end().to_string()) {
+                Some(true) => return Err(format!("{} {}: the connection closed before an answer", r.method, r.url)),
+                Some(false) => {
+                    let (status, headers, body) = crate::sweep::failed_answer(&r.url, &target);
+                    let mut res = Response::new(status, "application/json", body);
+                    res.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+                    for (k, v) in headers { res = res.with_header(&k, &v) }
+                    return Ok(res)
+                }
+                None => {}
+            }
+        }
         if let Some(answer) = self.gitlab.answer(&r) { return Ok(answer) }
         // Another control plane served on this computer (one moved to): asked as it is, as a deployed one would be.
         if r.url.starts_with("http://127.0.0.1:") { return Ok(local(&r)) }

@@ -11,6 +11,8 @@ pub use gitlab::GitLab;
 pub mod cloudflare;
 #[cfg(unix)]
 pub use cloudflare::{serve_cloudflare, CloudflarePlane};
+pub mod sweep;
+pub use sweep::{sweep, Fault, Faults, Outcome};
 #[cfg(unix)]
 mod browser;
 #[cfg(unix)]
@@ -28,27 +30,33 @@ use superci_core::io::{self, Clock, Containers, Request, Store, Timer, Work};
 use superci_core::plane::{Cache, Config, ControlPlane};
 
 /// A store in memory, shared with the test; with what other requests write meanwhile (`Served::written_meanwhile`),
-/// and the records it refuses to write (`Served::store_refuses`).
+/// the records it refuses to write (`Served::store_refuses`), and its operations counted, one of them failing when a
+/// sweep says so (`Faults`).
 #[derive(Clone, Default)]
-pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(String, u32, Change)>>>, pub Arc<Mutex<Vec<String>>>);
+pub struct Shared(pub Arc<Mutex<BTreeMap<String, String>>>, pub Arc<Mutex<Vec<(String, u32, Change)>>>, pub Arc<Mutex<Vec<String>>>, pub Faults);
 
 /// What another request writes over a record (`None`: takes it out), from what is there.
 pub type Change = Arc<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>;
 
 #[async_trait(?Send)]
 impl Store for Shared {
-    async fn get(&self, k: &str) -> io::Result<Option<String>> { Ok(self.0.lock().unwrap().get(k).cloned()) }
-    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.refused(k)?; self.0.lock().unwrap().insert(k.into(), v); Ok(()) }
-    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.refused(k)?; let mut m = self.0.lock().unwrap(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
+    async fn get(&self, k: &str) -> io::Result<Option<String>> { self.3.op(format!("get {k}"))?; Ok(self.0.lock().unwrap().get(k).cloned()) }
+    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.3.op(format!("put {k}"))?; self.refused(k)?; self.0.lock().unwrap().insert(k.into(), v); Ok(()) }
+    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.3.op(format!("put_if_absent {k}"))?; self.refused(k)?; let mut m = self.0.lock().unwrap(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
     // (Read, then written, as a Durable Object's store does: a control plane served here answers one request at a time.)
     async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> {
+        self.3.op(format!("swap {k}"))?;
         self.refused(k)?;
         let meanwhile = { let mut w = self.1.lock().unwrap(); w.iter_mut().find(|(p, n, _)| *n > 0 && k.starts_with(p.as_str())).map(|e| { e.1 -= 1; e.2.clone() }) };
         if let Some(change) = meanwhile { let mut m = self.0.lock().unwrap(); match change(m.get(k).map(String::as_str)) { Some(v) => { m.insert(k.into(), v); } None => { m.remove(k); } } }
-        io::swap_in_two_steps(self, k, was, v).await
+        // (Its two steps, read then written, counted as the one operation.)
+        let mut m = self.0.lock().unwrap();
+        if m.get(k).map(String::as_str) != was { return Ok(false) }
+        m.insert(k.into(), v);
+        Ok(true)
     }
-    async fn delete(&self, k: &str) -> io::Result<()> { self.0.lock().unwrap().remove(k); Ok(()) }
-    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
+    async fn delete(&self, k: &str) -> io::Result<()> { self.3.op(format!("delete {k}"))?; self.0.lock().unwrap().remove(k); Ok(()) }
+    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { self.3.op(format!("list {p}"))?; Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
 }
 
 impl Shared {
@@ -65,16 +73,18 @@ impl Shared {
 
 
 /// Machines: each starts at once, its runner given to the test to play (see `Runner`); or, while the cloud refuses
-/// them (`Served::machines_refuse`), none, with what it said.
+/// them (`Served::machines_refuse`), none, with what it said; the machines stopped, by id. Each start and stop is a
+/// call a sweep counts.
 #[derive(Clone, Default)]
-pub struct Machines(pub Arc<Mutex<Vec<String>>>, pub Arc<Mutex<Option<String>>>);
+pub struct Machines(pub Arc<Mutex<Vec<String>>>, pub Arc<Mutex<Option<String>>>, pub Faults, pub Arc<Mutex<Vec<String>>>);
 #[async_trait(?Send)]
 impl Containers for Machines {
     async fn start(&self, name: &str, _work: &Work, _max_minutes: u32, _size: superci_core::spec::Size) -> io::Result<String> {
+        if self.2.call(format!("start machine {name}")).is_some() { return Err("the cloud did not answer: an internal error".into()) }
         if let Some(said) = self.1.lock().unwrap().clone() { return Err(said) }
         self.0.lock().unwrap().push(name.to_string()); Ok(format!("machine-{name}"))
     }
-    async fn stop(&self, _id: &str) -> io::Result<()> { Ok(()) }
+    async fn stop(&self, id: &str) -> io::Result<()> { if self.2.call(format!("stop machine {id}")).is_some() { return Err("the cloud did not answer: an internal error".into()) } self.3.lock().unwrap().push(id.to_string()); Ok(()) }
 }
 
 fn system_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
@@ -163,6 +173,34 @@ impl Served {
         *self.aws.answers_next.lock().unwrap() = ((!after.is_empty()).then(|| after.to_string()), next.iter().map(|(p, w)| (p.to_string(), w.iter().map(|w| w.to_string()).collect())).collect());
     }
 
+    /// What its stand-ins, store and machines counted, and the fault armed (see `sweep`).
+    pub fn faults(&self) -> &Faults { &self.aws.faults }
+
+    /// Counting starts now, with `fault` armed (a scenario of a `sweep` calls this once set up).
+    pub fn arm(&self, fault: Fault) { self.aws.faults.arm(fault) }
+
+    /// The calls answered since `arm` (AWS's, GitHub's, GitLab's, Cloudflare's, Modal's, its machines').
+    pub fn calls(&self) -> Vec<String> { self.aws.faults.calls() }
+
+    /// Its store's operations since `arm`.
+    pub fn store_ops(&self) -> Vec<String> { self.aws.faults.store_ops() }
+
+    /// The k-th call from now answered with its service's error.
+    pub fn fail_call(&self, k: usize) { self.aws.faults.fail_call(k) }
+
+    /// The k-th store operation from now not answered.
+    pub fn fail_store_op(&self, k: usize) { self.aws.faults.fail_store_op(k) }
+
+    /// Its upkeep, as `upkeep`, whatever it answers: its status and what it said.
+    pub fn try_upkeep(&self) -> (u16, String) {
+        let host = self.url.trim_start_matches("http://");
+        let Ok(mut s) = TcpStream::connect(host) else { return (0, String::new()) };
+        let _ = s.write_all(format!("POST /__testkit/upkeep HTTP/1.1\r\nhost: {host}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes());
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        (out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0), out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+    }
+
     /// How many of those answers are still to be given.
     pub fn answers_to_come(&self) -> usize { self.aws.answers_next.lock().unwrap().1.len() }
 }
@@ -179,7 +217,8 @@ pub fn serve(configure: impl Fn(&mut Config) + Send + 'static) -> Served { serve
 pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (store, machines, aws) = (Shared::default(), Machines::default(), Aws::serve());
+    let aws = Aws::serve();
+    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
@@ -193,9 +232,10 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let public: Arc<Mutex<Option<String>>> = Arc::default();
     let (s, m, a, u, c, g, id, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), plane.to_string(), down.clone(), public.clone());
+    // (Written before it answers anything: before a sweep's counting starts.)
+    block_on(store.put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
         let cache = Cache::default();
-        block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
         for stream in listener.incoming().flatten() {
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
             let mut config = Config::new(id.clone());
@@ -212,7 +252,8 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
             let plane = ControlPlane { store: &s, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let old = a.old_version.lock().unwrap().clone();
             let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
-            let _ = answer(&plane, &base, stream, old, &a);
+            // (A panic is kept, the connection closed unanswered, and the next request answered.)
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| answer(&plane, &base, stream, old, &a))) { a.faults.panicked(p) }
         }
     });
     let gitlab = github.gitlab.clone();
@@ -252,8 +293,11 @@ fn write(mut out: TcpStream, status: u16, headers: &[(String, String)], body: &[
 /// (One said to be of an older version answers as that version did.)
 fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<String>, aws: &Aws) -> std::io::Result<()> {
     let (method, target, headers, body) = read(&stream)?;
+    aws.faults.asking(format!("{method} {target}"));
     if target == "/__testkit/upkeep" {
-        return match block_on(plane.alarm()) { Ok(()) => write(stream, 200, &[], b"ok"), Err(e) => write(stream, 500, &[], e.as_bytes()) };
+        let (status, said) = match block_on(plane.alarm()) { Ok(()) => (200, "ok".to_string()), Err(e) => (500, e) };
+        aws.faults.answered(status, said.as_bytes());
+        return write(stream, status, &[], said.as_bytes());
     }
     let mut req = Request::new(&method, &format!("{base}{target}")).with_body(body);
     for (k, v) in headers { req = req.with_header(&k, &v) }
@@ -290,6 +334,7 @@ fn answer(plane: &ControlPlane, base: &str, stream: TcpStream, old: Option<Strin
         (Some(without), Ok(mut v)) => { for path in &without { leave_out(&mut v, &path.split('.').collect::<Vec<_>>()) } v.to_string().into_bytes() }
         _ => body,
     };
+    aws.faults.answered(res.status, &body);
     write(stream, res.status, &res.headers, &body)
 }
 
@@ -371,6 +416,9 @@ pub struct Aws {
     /// Answers given once each without some of their fields, once a request to a path was answered (see
     /// `Served::then_answer`): that path (none: from now on), and each answer's path and the fields it leaves out.
     pub answers_next: Arc<Mutex<(Option<String>, Vec<(String, Vec<String>)>)>>,
+    /// Every call answered here (and by GitHub's stand-in, the control plane's store and machines) counted, one of
+    /// them failing when a sweep says so; what the control plane answered.
+    pub faults: Faults,
 }
 
 /// EC2's error answer (and IAM's, STS's: the query APIs'), as AWS documents it.
@@ -382,7 +430,7 @@ pub fn ec2_error(code: &str, message: &str) -> String {
 pub fn json_error(kind: &str, message: &str) -> String { json!({ "__type": kind, "message": message }).to_string() }
 
 /// What a request asks AWS to do: its target (JSON APIs) or its Action (query APIs).
-fn action(target: &str, asked: &str) -> String {
+pub(crate) fn action(target: &str, asked: &str) -> String {
     if !target.is_empty() { return target.to_string() }
     asked.split('&').find_map(|kv| kv.strip_prefix("Action=")).unwrap_or_default().to_string()
 }
@@ -395,6 +443,8 @@ impl Aws {
         let b64 = base64::engine::general_purpose::STANDARD;
         let url = format!("https://api.modal.com/modal.client.ModalClient/{method}");
         let asked = b64.encode(message);
+        // (A sweep's fault: Modal's own status for an internal error.)
+        if self.faults.call(format!("POST {url}")).is_some() { return (vec![], Some((13, "internal error".to_string()))) }
         // (What a Modal settings Dict is given, kept: a Modal control plane served here reads it.)
         if method == "DictUpdate" { for (k, v) in modal_entries(message) { self.modal_settings.lock().unwrap().insert(k, v); } }
         let (status, _, answer) = self.replay("POST", &url, "", &asked).unwrap_or_else(|| {
@@ -463,6 +513,19 @@ impl Aws {
             let Ok((method, target, headers, body)) = read(&stream) else { continue };
             let header = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).unwrap_or_default();
             let host = target.split('/').nth(1).unwrap_or_default().to_string();
+            // (Counted here, but what goes on to GitHub's stand-in, which counts it.)
+            let s3_recorded = host.contains(".s3.") && a.recorded.lock().unwrap().iter().any(|r| r["url"] == format!("https:/{target}").as_str() && r["method"] == method.as_str());
+            let to_github = ((!host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com")) || host.contains(".s3."))
+                && !["api.cloudflare.com", "dash.cloudflare.com", "registry.cloudflare.com", "ghcr.io"].contains(&host.as_str()) && !a.workers.lock().unwrap().contains_key(&host) && !s3_recorded;
+            if !to_github {
+                let url = format!("https:/{target}");
+                let doing = action(&header("x-amz-target"), &String::from_utf8_lossy(&body));
+                match a.faults.call(format!("{method} {url} {doing}").trim_end().to_string()) {
+                    Some(true) => { drop(stream); continue }
+                    Some(false) => { let (status, said, answer) = sweep::failed_answer(&url, &header("x-amz-target")); let _ = write(stream, status, &said, answer.as_bytes()); continue }
+                    None => {}
+                }
+            }
             // Cloudflare's API and its container registry, GitHub's (where its runner image is), and Modal's API (its
             // calls as the CLI sends them to a stand-in), as a recording has them (what is not there is unanswered).
             if ["api.cloudflare.com", "dash.cloudflare.com", "registry.cloudflare.com", "ghcr.io"].contains(&host.as_str()) {
@@ -523,7 +586,8 @@ impl Aws {
                 let gh = a.github.lock().unwrap().clone().unwrap_or_default();
                 let mut req = Request::new(&method, &format!("https:/{target}")).with_body(body);
                 for (k, v) in &headers { if !k.eq_ignore_ascii_case("host") { req = req.with_header(k, v) } }
-                let res = block_on(superci_core::io::Http::send(&gh, req)).unwrap();
+                // (A call GitHub's stand-in drops is dropped here too.)
+                let Ok(res) = block_on(superci_core::io::Http::send(&gh, req)) else { drop(stream); continue };
                 let _ = write(stream, res.status, &res.headers, &res.body);
                 continue;
             }
@@ -833,7 +897,8 @@ impl Runner {
 pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (store, machines, aws) = (Shared::default(), Machines::default(), Aws::serve());
+    let aws = Aws::serve();
+    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
@@ -846,10 +911,10 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let public: Arc<Mutex<Option<String>>> = Arc::default();
     let (s, m, a, u, c, g, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone());
+    block_on(io::Ending(store.clone()).put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
         let cache = Cache::default();
         let ending = io::Ending(s);
-        block_on(ending.put("plane_url", format!("\"{u}\""))).unwrap();
         for stream in listener.incoming().flatten() {
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
             let mut config = Config::new(PLANE.to_string());
@@ -859,7 +924,7 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
             configure(&mut config);
             let plane = ControlPlane { store: &ending, http: &g, clock: &c, timer: &NoTimer, config: &config, cache: &cache, containers: Some(&m) };
             let base = pb.lock().unwrap().clone().unwrap_or_else(|| u.clone());
-            let _ = answer(&plane, &base, stream, None, &a);
+            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| answer(&plane, &base, stream, None, &a))) { a.faults.panicked(p) }
         }
     });
     let gitlab = github.gitlab.clone();
@@ -909,7 +974,8 @@ impl Timer for Deferring {
 pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Served {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (store, machines, aws) = (Shared::default(), Machines::default(), Aws::serve());
+    let aws = Aws::serve();
+    let (store, machines) = (Shared(Default::default(), Default::default(), Default::default(), aws.faults.clone()), Machines(Default::default(), Default::default(), aws.faults.clone(), Default::default()));
     *aws.plane_url.lock().unwrap() = url.clone();
     let github = GitHub::default();
     *aws.github.lock().unwrap() = Some(github.clone());
@@ -922,9 +988,9 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let public: Arc<Mutex<Option<String>>> = Arc::default();
     let (s, m, a, u, c, g, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone());
+    block_on(store.put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
         let (cache, left) = (Cache::default(), Deferring::default());
-        block_on(s.put("plane_url", format!("\"{u}\""))).unwrap();
         for stream in listener.incoming().flatten() {
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
             let mut config = Config::new(PLANE.to_string());
