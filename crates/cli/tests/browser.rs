@@ -6831,6 +6831,8 @@ fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there(
     let (mut child, link) = dashboard(&home);
     b.goto(&format!("{link}&p=runners"));
     b.wait(&shows("Runner providers"));
+    // (Sent from a page that does not read the dashboard again by itself: what it says is for the next page.)
+    b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
     let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "aws")]);
     assert!(got < 400, "{got} {text}");
     // Forgotten: out of the order (on-demand with it), its rule and default gone, its budget too.
@@ -6838,6 +6840,7 @@ fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there(
     let routing: serde_json::Value = serde_json::from_str(&served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").unwrap().1).unwrap();
     assert!(routing["order"].as_array().unwrap().iter().all(|p| p["cloud"] != "aws" && p["cloud"] != "aws-on-demand") && routing["rules"].as_array().unwrap().is_empty() && routing["aws_budget"].is_null(), "{routing}");
     // Said on the page, with what could not be deleted there (AWS answering nothing): its role, its budget.
+    b.goto(&format!("{link}&p=runners"));
     b.wait(&format!("{} && {}", page_shows("Removed AWS. Left:"), page_shows("its budget in AWS")));
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);

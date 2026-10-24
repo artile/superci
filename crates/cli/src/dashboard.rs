@@ -53,8 +53,6 @@ pub struct Dashboard {
     /// SuperCI's folder on this machine, where its sign-ins are kept (none: nothing is kept), what was last written
     /// there, the control plane in use as kept (for commands, before any cloud was asked), and whether writing failed.
     store: Option<Store>,
-    /// The workspace's name as this dashboard's addresses carry it (`w`). Empty: the one pages without it are of.
-    w: String,
     /// Its name always, the first's too: what the addresses it hands out for coming back carry, since a request that
     /// names no workspace is refused once several are kept (see `back_url`).
     named: String,
@@ -1147,7 +1145,7 @@ impl Dashboard {
         let cf = std::env::var("SUPERCI_CLOUDFLARE_TOKEN").ok().filter(|t| !t.trim().is_empty()).map(|t| cloudflare::Session::from_token(&t));
         let modal = modal::Session::from_env();
         Dashboard { key: random_token(24), base: format!("http://localhost:{}", oauth_port()), planes: vec![], selected: 0, looked_cf: false, looked_aws: false, looked_modal: false,
-            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, w: String::new(), named: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
+            status_key: folder_key(), status_secret: format!("DEVICE_KEY_{}_{}", now_ms() / 1000 + 12 * 3600, superci_core::crypto::random_id(6).to_uppercase()), keyed: HashSet::new(), cf_given: cf.is_some(), modal_given: modal.is_some(), store: None, named: String::new(), about: Default::default(), picture_asked_ms: 0, picture_owner: String::new(), kept_as: String::new(), kept_plane: None, found: vec![], found_about: HashMap::new(), owners_written: HashMap::new(), hello_sent: HashSet::new(), keep_failed: false, aws_ended: false, cf_ended: false, modal_ended: false, unanswered: vec![], aws_came: false, adding: false, aws_others: vec![], task: None, commanding: false, preloaded: None, notice: None, cf, cf_pending: None, cf_accounts: vec![], aws: None, aws_pending: None, aws_asked_ms: 0, gitlab_shown: String::new(), job_shown: Default::default(), run_shown: Default::default(), modal, modal_pending: None, return_to: String::new(), show_setup: false,
             manifest_state: None, github_for: None, github_expected: None, deploying: Arc::new(Mutex::new(None)), deployed: Arc::new(Mutex::new(false)), deployed_to: Arc::new(Mutex::new(None)), moving: Arc::new(Mutex::new(None)), updating: Arc::new(Mutex::new(None)), quotas: HashMap::new(), quotas_for: None, aws_looks: HashMap::new(), aws_copying: HashMap::new(), aws_looking: Default::default(), aws_behind: HashMap::new(), budget_lifted: HashMap::new(), seen: HashMap::new(), flash: None, views: None, refreshing: false, measured_at: 0, measuring: false, cf_month: None, modal_month: None, aws_missing: Arc::new(Mutex::new(HashMap::new())), answered: HashSet::new(), first_asked: HashMap::new(), last_good: HashMap::new() }
     }
 
@@ -1726,7 +1724,7 @@ impl Dashboard {
     fn back_url(&self, query: &str) -> String {
         let query = query.trim_start_matches('/');
         let named = query.trim_start_matches('?').split('&').any(|kv| kv.starts_with("w="));
-        let w = if self.w.is_empty() { &self.named } else { &self.w };
+        let w = &self.named;
         if w.is_empty() || named { return format!("{}/{query}", self.base) }
         format!("{}/{query}{}w={w}", self.base, if query.is_empty() { "?" } else { "&" })
     }
@@ -6719,11 +6717,10 @@ impl Hub {
 
     /// A workspace's dashboard: the one made for it before, or a new one from what it keeps.
     fn board(&self, name: &str) -> Arc<Mutex<Dashboard>> {
-        let first = self.first();
         let mut boards = lock(&self.boards);
         if let Some(b) = boards.get(name) { return b.clone() }
         let mut d = Dashboard::signed_in(self.root.as_ref().map(|r| Store::under(r, name)));
-        (d.key, d.base, d.w, d.named) = (self.key.clone(), self.base.clone(), if first.as_deref() == Some(name) { String::new() } else { name.to_string() }, name.to_string());
+        (d.key, d.base, d.named) = (self.key.clone(), self.base.clone(), name.to_string());
         let b = Arc::new(Mutex::new(d));
         boards.insert(name.to_string(), b.clone());
         b
@@ -6771,7 +6768,7 @@ impl Hub {
             return Err(e)
         }
         if let Some(b) = board {
-            { let mut d = lock(&b); d.store = Some(Store::under(root, &to)); d.named = to.clone(); if !d.w.is_empty() { d.w = to.clone() } }
+            { let mut d = lock(&b); d.store = Some(Store::under(root, &to)); d.named = to.clone(); }
             lock(&self.boards).insert(to.clone(), b);
         }
         let mut first = lock(&self.first);
@@ -7390,7 +7387,7 @@ mod tests {
         lock(&hub.board("acme")).task = None;
         // Each has its own dashboard, from its own folder: nothing of acme is in globex.
         assert_eq!(lock(&hub.board("acme")).signed_in_as().as_deref(), Some("Modal workspace acme-team"));
-        assert!(lock(&hub.board("globex")).signed_in_as().is_none() && lock(&hub.board("globex")).w == "globex" && lock(&hub.board("acme")).w.is_empty());
+        assert!(lock(&hub.board("globex")).signed_in_as().is_none() && lock(&hub.board("globex")).named == "globex");
         // Globex's page is the first screen of a new SuperCI, with the switcher's rows: both workspaces, this one
         // marked, acme by its name with its organization's picture, and making a new one.
         let (status, _, page) = ask("GET", "/", &[("w", "globex"), ("fragment", "1")], "");
@@ -7782,7 +7779,7 @@ mod tests {
         // Back from a sign-in elsewhere: to this workspace's page, as its address was.
         let mut d = Dashboard::new();
         assert_eq!((d.back_url(""), d.back_url("?p=repos")), ("http://localhost:8976/".to_string(), "http://localhost:8976/?p=repos".to_string()));
-        d.w = "acme".into();
+        d.named = "acme".into();
         assert_eq!((d.back_url(""), d.back_url("?p=repos"), d.back_url("?p=repos&w=acme&c=abc")), ("http://localhost:8976/?w=acme".to_string(), "http://localhost:8976/?p=repos&w=acme".to_string(), "http://localhost:8976/?p=repos&w=acme&c=abc".to_string()));
         assert_eq!((safe_return("?w=acme&p=add-runners&c=abc123"), safe_return("?p=repos"), safe_return("//evil.example"), safe_return("?p=x&next=https://evil.example")), ("?w=acme&p=add-runners&c=abc123".to_string(), "?p=repos".to_string(), String::new(), String::new()));
     }
