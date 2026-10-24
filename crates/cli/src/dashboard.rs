@@ -20,7 +20,7 @@ use superci_core::plane::AUDIENCE;
 use superci_core::io::Response;
 use superci_core::plane::{AwsBudget, Pool, Routing, Rule, AWS_ON_DEMAND, MAX_CPU, MAX_JOB_MINUTES};
 use superci_core::spec::{Capacity, Spec};
-use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, REGIONS};
+use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, region_short, REGIONS};
 
 use crate::aws;
 use crate::aws_plane;
@@ -611,15 +611,6 @@ pub fn plain_refusal(e: &str) -> Option<String> {
         By::Session => format!("This AWS sign-in's session does not allow {what}{region}. Sign in again: `superci login aws`."),
         By::Resource | By::Unsaid => return None,
     })
-}
-
-/// A region's short name: "N. Virginia" for us-east-1.
-fn region_short(region: &str) -> String {
-    match region {
-        "us-east-1" => "N. Virginia", "us-east-2" => "Ohio", "us-west-2" => "Oregon", "ca-central-1" => "Canada", "eu-west-1" => "Ireland", "eu-west-2" => "London",
-        "eu-central-1" => "Frankfurt", "eu-north-1" => "Stockholm", "ap-south-1" => "Mumbai", "ap-northeast-1" => "Tokyo", "ap-southeast-1" => "Singapore", "ap-southeast-2" => "Sydney",
-        other => other,
-    }.to_string()
 }
 
 /// What an account's spot quota in a region means in jobs, and where to ask for more when it is low.

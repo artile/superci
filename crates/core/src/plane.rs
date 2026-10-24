@@ -609,11 +609,13 @@ pub const CLOUDFLARE_JOBS_AT_ONCE: u32 = 20;
 /// rates: $0.00003942 a core-second, $0.00000667 a GiB-second (held to its size, it is billed exactly that).
 pub fn modal_usd_per_hour(cpu: u32, ram_gb: u32) -> f64 { (cpu as f64 / 2.0 * 0.00003942 + ram_gb as f64 * 0.00000667) * 3600.0 }
 
-/// A Modal GPU's price per hour (Modal's per-second list prices; A100: the 40 GB one).
+/// Modal's per-second list price of each GPU (A100: the 40 GB one).
+pub const MODAL_GPU_USD_PER_SECOND: [(&str, f64); 8] = [("t4", 0.000164), ("l4", 0.000222), ("a10g", 0.000306), ("l40s", 0.000542), ("a100", 0.000583),
+    ("h100", 0.001097), ("h200", 0.001261), ("b200", 0.001736)];
+
+/// A Modal GPU's price per hour (none, or one Modal does not have: nothing).
 pub fn modal_gpu_usd_per_hour(gpu: Option<&str>) -> f64 {
-    let per_second = match gpu { Some("t4") => 0.000164, Some("l4") => 0.000222, Some("a10g") => 0.000306, Some("l40s") => 0.000542, Some("a100") => 0.000583,
-        Some("h100") => 0.001097, Some("h200") => 0.001261, Some("b200") => 0.001736, _ => 0.0 };
-    per_second * 3600.0
+    MODAL_GPU_USD_PER_SECOND.iter().find(|(g, _)| gpu == Some(*g)).map_or(0.0, |(_, per_second)| per_second * 3600.0)
 }
 
 /// A container or sandbox as the dashboard names it: "4cpu-16gb", "2cpu-8gb-t4".
@@ -899,21 +901,27 @@ pub fn job_usd(j: &Job, now_ms: u64) -> f64 {
 
 /// GitHub's price per minute for its hosted Linux runner with this many CPUs (2 and fewer: the standard runner), x64 or
 /// arm64 (GitHub's prices from January 2026; each job is rounded up to whole minutes).
-pub fn github_usd_per_minute(cpu: u32, arm64: bool) -> f64 {
-    if arm64 { return match cpu { 0..=2 => 0.005, 3..=4 => 0.008, 5..=8 => 0.014, 9..=16 => 0.026, 17..=32 => 0.050, _ => 0.098 } }
-    match cpu { 0..=2 => 0.006, 3..=4 => 0.012, 5..=8 => 0.022, 9..=16 => 0.042, 17..=32 => 0.082, 33..=64 => 0.162, _ => 0.252 }
-}
+pub fn github_usd_per_minute(cpu: u32, arm64: bool) -> f64 { by_cpu(if arm64 { &GITHUB_ARM64_USD_PER_MINUTE } else { &GITHUB_X64_USD_PER_MINUTE }, cpu) }
 
-/// GitHub's price per minute for its hosted Windows runner with this many CPUs (from GitHub's price list).
-pub fn github_windows_usd_per_minute(cpu: u32) -> f64 {
-    match cpu { 0..=2 => 0.010, 3..=4 => 0.022, 5..=8 => 0.042, 9..=16 => 0.082, 17..=32 => 0.162, _ => 0.322 }
-}
+/// A price by CPUs, from a table of (most CPUs, price) by size; its last row is for any number more.
+fn by_cpu(table: &[(u32, f64)], cpu: u32) -> f64 { table[table.partition_point(|(most, _)| *most < cpu)].1 }
+
+/// GitHub's hosted Linux runners' prices per minute by CPUs, x64 and arm64.
+pub const GITHUB_X64_USD_PER_MINUTE: [(u32, f64); 7] = [(2, 0.006), (4, 0.012), (8, 0.022), (16, 0.042), (32, 0.082), (64, 0.162), (u32::MAX, 0.252)];
+pub const GITHUB_ARM64_USD_PER_MINUTE: [(u32, f64); 6] = [(2, 0.005), (4, 0.008), (8, 0.014), (16, 0.026), (32, 0.050), (u32::MAX, 0.098)];
+/// GitHub's hosted Windows runners' prices per minute by CPUs (from GitHub's price list).
+pub const GITHUB_WINDOWS_USD_PER_MINUTE: [(u32, f64); 6] = [(2, 0.010), (4, 0.022), (8, 0.042), (16, 0.082), (32, 0.162), (u32::MAX, 0.322)];
+/// GitLab.com's compute minutes counted for each minute of its hosted runners, by CPUs.
+pub const GITLAB_MINUTES_PER_MINUTE: [(u32, f64); 6] = [(2, 1.0), (4, 2.0), (8, 3.0), (16, 6.0), (32, 12.0), (u32::MAX, 24.0)];
+
+/// GitHub's price per minute for its hosted Windows runner with this many CPUs.
+pub fn github_windows_usd_per_minute(cpu: u32) -> f64 { by_cpu(&GITHUB_WINDOWS_USD_PER_MINUTE, cpu) }
 
 /// GitLab.com's price per minute for its hosted runner of this many CPUs: compute minutes by the runner's size (one
 /// a minute on the small one of 2 CPUs, two on the medium of 4, three on the large of 8, six on 16, twelve on 32),
 /// each $10 for 1,000 bought beyond a plan's.
 pub fn gitlab_usd_per_minute(cpu: u32) -> f64 {
-    0.01 * match cpu { 0..=2 => 1.0, 3..=4 => 2.0, 5..=8 => 3.0, 9..=16 => 6.0, 17..=32 => 12.0, _ => 24.0 }
+    0.01 * by_cpu(&GITLAB_MINUTES_PER_MINUTE, cpu)
 }
 
 /// The periods usage is told for: a day (by the hour), a week and 30 days (by the day).
@@ -5513,4 +5521,36 @@ fn tree_object(tree: &str, part: u32) -> String { format!("runs/{tree}/{part:05}
 /// A tree's part as kept (`region|object`; the region alone before bases were kept).
 fn tree_place(kept: &str, tree: &str, part: u32) -> (String, String) {
     match kept.split_once('|') { Some((region, object)) => (region.to_string(), object.to_string()), None => (kept.to_string(), tree_object(tree, part)) }
+}
+
+#[cfg(test)]
+mod price_tests {
+    use super::*;
+
+    #[test]
+    fn every_size_band_of_every_price_table_holds_from_its_first_cpu_to_its_last() {
+        let tables: [(&[(u32, f64)], fn(u32) -> f64); 4] = [
+            (&GITHUB_X64_USD_PER_MINUTE, |c| github_usd_per_minute(c, false)), (&GITHUB_ARM64_USD_PER_MINUTE, |c| github_usd_per_minute(c, true)),
+            (&GITHUB_WINDOWS_USD_PER_MINUTE, github_windows_usd_per_minute), (&GITLAB_MINUTES_PER_MINUTE, |c| gitlab_usd_per_minute(c) / 0.01),
+        ];
+        for (table, price) in tables {
+            let mut first = 0;
+            for (most, want) in table {
+                assert_eq!((price(first), price(*most)), (*want, *want), "{first}..={most}");
+                first = most.saturating_add(1);
+            }
+            assert_eq!(table.last().map(|r| r.0), Some(u32::MAX), "the last band is for any number more");
+        }
+        // As GitHub and GitLab list them.
+        assert_eq!((github_usd_per_minute(2, false), github_usd_per_minute(33, false), github_usd_per_minute(65, false)), (0.006, 0.162, 0.252));
+        assert_eq!((github_usd_per_minute(3, true), github_usd_per_minute(33, true), github_windows_usd_per_minute(64)), (0.008, 0.098, 0.322));
+        assert_eq!((gitlab_usd_per_minute(0), gitlab_usd_per_minute(16), gitlab_usd_per_minute(96)), (0.01, 0.06, 0.24));
+    }
+
+    #[test]
+    fn every_gpu_a_job_may_ask_for_has_its_modal_price_and_anything_else_costs_nothing() {
+        assert_eq!(MODAL_GPU_USD_PER_SECOND.map(|(g, _)| g), crate::spec::GPUS);
+        for (gpu, per_second) in MODAL_GPU_USD_PER_SECOND { assert_eq!(modal_gpu_usd_per_hour(Some(gpu)), per_second * 3600.0, "{gpu}") }
+        assert_eq!((modal_gpu_usd_per_hour(Some("a10g")), modal_gpu_usd_per_hour(None), modal_gpu_usd_per_hour(Some("v100"))), (0.000306 * 3600.0, 0.0, 0.0));
+    }
 }

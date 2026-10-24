@@ -29,28 +29,32 @@ pub const AWS_RUNNER: &[Need] = &[
     Need { id: "CacheBucket", what: "Read, write and remove what is in its own cache buckets (superci-plane-<id>-<region>)", why: "Jobs' caches are kept in your account, in the region their machines run in: it signs a job's links to what it may read and write, and removes what is old.", since: "0.18.0", writes: true },
 ];
 
+/// How each of `AWS_RUNNER`'s permissions is written as an IAM statement (its action, resource and condition), in the
+/// same order: `arn` makes an EC2 resource's ARN in the account.
+type Statement = fn(arn: &dyn Fn(&str) -> String, plane_id: &str) -> (Value, Value, Option<Value>);
+const AWS_STATEMENTS: [(&str, Statement); AWS_RUNNER.len()] = [
+    ("LaunchOnlyTaggedMachines", |arn, plane_id| ("ec2:RunInstances".into(), arn("instance/*").into(), Some(json!({ "StringEquals": { "aws:RequestTag/superci-plane": plane_id } })))),
+    ("WhatAMachineIsMadeOf", |arn, _| ("ec2:RunInstances".into(), json!(["arn:aws:ec2:*::image/*", arn("volume/*"), arn("network-interface/*"), arn("security-group/*"), arn("subnet/*"), arn("spot-instances-request/*")]), None)),
+    ("TagOnLaunch", |arn, _| ("ec2:CreateTags".into(), arn("*/*").into(), Some(json!({ "StringEquals": { "ec2:CreateAction": "RunInstances" } })))),
+    ("StopOnlyItsOwnMachines", |arn, plane_id| ("ec2:TerminateInstances".into(), arn("instance/*").into(), Some(json!({ "StringEquals": { "aws:ResourceTag/superci-plane": plane_id } })))),
+    ("Read", |_, _| (json!(["ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeInstanceTypeOfferings", "ec2:DescribeSpotPriceHistory", "ec2:DescribeRegions"]), "*".into(), None)),
+    ("Prices", |_, _| ("pricing:GetProducts".into(), "*".into(), None)),
+    ("MachineTraffic", |_, _| ("cloudwatch:GetMetricStatistics".into(), "*".into(), None)),
+    ("ReadNetwork", |_, _| (json!(["ec2:DescribeVpcs", "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups"]), "*".into(), None)),
+    ("SpotServiceRole", |_, _| ("iam:CreateServiceLinkedRole".into(), "*".into(), Some(json!({ "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } })))),
+    // (A fleet starts nothing by itself: its machine is started with the permissions above, tagged as they ask.)
+    ("AskSpotPoolsAtOnce", |_, _| ("ec2:CreateFleet".into(), "*".into(), None)),
+    ("MakeLaunchTemplates", |arn, plane_id| ("ec2:CreateLaunchTemplate".into(), arn("launch-template/*").into(), Some(json!({ "StringEquals": { "aws:RequestTag/superci-plane": plane_id } })))),
+    ("UseItsOwnLaunchTemplates", |arn, plane_id| (json!(["ec2:RunInstances", "ec2:DeleteLaunchTemplate"]), arn("launch-template/*").into(), Some(json!({ "StringEquals": { "aws:ResourceTag/superci-plane": plane_id } })))),
+    ("TagLaunchTemplates", |arn, _| ("ec2:CreateTags".into(), arn("*/*").into(), Some(json!({ "StringEquals": { "ec2:CreateAction": ["CreateLaunchTemplate", "CreateFleet"] } })))),
+    // Objects only, in its own buckets (a bucket is made and removed by the dashboard, with your sign-in).
+    ("CacheBucket", |_, plane_id| (json!(["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]), format!("arn:aws:s3:::superci-plane-{plane_id}-*/*").into(), None)),
+];
+
 /// One of `AWS_RUNNER`'s statements, for this account and control plane.
-fn aws_statement(id: &str, account_id: &str, plane_id: &str) -> Value {
+fn aws_statement((id, made): &(&str, Statement), account_id: &str, plane_id: &str) -> Value {
     let arn = |r: &str| format!("arn:aws:ec2:*:{account_id}:{r}");
-    let (action, resource, condition): (Value, Value, Option<Value>) = match id {
-        "LaunchOnlyTaggedMachines" => ("ec2:RunInstances".into(), arn("instance/*").into(), Some(json!({ "StringEquals": { "aws:RequestTag/superci-plane": plane_id } }))),
-        "WhatAMachineIsMadeOf" => ("ec2:RunInstances".into(), json!(["arn:aws:ec2:*::image/*", arn("volume/*"), arn("network-interface/*"), arn("security-group/*"), arn("subnet/*"), arn("spot-instances-request/*")]), None),
-        "TagOnLaunch" => ("ec2:CreateTags".into(), arn("*/*").into(), Some(json!({ "StringEquals": { "ec2:CreateAction": "RunInstances" } }))),
-        "StopOnlyItsOwnMachines" => ("ec2:TerminateInstances".into(), arn("instance/*").into(), Some(json!({ "StringEquals": { "aws:ResourceTag/superci-plane": plane_id } }))),
-        "Read" => (json!(["ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeInstanceTypeOfferings", "ec2:DescribeSpotPriceHistory", "ec2:DescribeRegions"]), "*".into(), None),
-        "Prices" => ("pricing:GetProducts".into(), "*".into(), None),
-        "MachineTraffic" => ("cloudwatch:GetMetricStatistics".into(), "*".into(), None),
-        "ReadNetwork" => (json!(["ec2:DescribeVpcs", "ec2:DescribeSubnets", "ec2:DescribeSecurityGroups"]), "*".into(), None),
-        "SpotServiceRole" => ("iam:CreateServiceLinkedRole".into(), "*".into(), Some(json!({ "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } }))),
-        // (A fleet starts nothing by itself: its machine is started with the permissions above, tagged as they ask.)
-        "AskSpotPoolsAtOnce" => ("ec2:CreateFleet".into(), "*".into(), None),
-        "MakeLaunchTemplates" => ("ec2:CreateLaunchTemplate".into(), arn("launch-template/*").into(), Some(json!({ "StringEquals": { "aws:RequestTag/superci-plane": plane_id } }))),
-        "UseItsOwnLaunchTemplates" => (json!(["ec2:RunInstances", "ec2:DeleteLaunchTemplate"]), arn("launch-template/*").into(), Some(json!({ "StringEquals": { "aws:ResourceTag/superci-plane": plane_id } }))),
-        "TagLaunchTemplates" => ("ec2:CreateTags".into(), arn("*/*").into(), Some(json!({ "StringEquals": { "ec2:CreateAction": ["CreateLaunchTemplate", "CreateFleet"] } }))),
-        // Objects only, in its own buckets (a bucket is made and removed by the dashboard, with your sign-in).
-        "CacheBucket" => (json!(["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]), format!("arn:aws:s3:::superci-plane-{plane_id}-*/*").into(), None),
-        _ => unreachable!("an AWS permission without its statement: {id}"),
-    };
+    let (action, resource, condition) = made(&arn, plane_id);
     let mut s = json!({ "Sid": id, "Effect": "Allow", "Action": action, "Resource": resource });
     if let Some(c) = condition { s["Condition"] = c }
     s
@@ -58,17 +62,17 @@ fn aws_statement(id: &str, account_id: &str, plane_id: &str) -> Value {
 
 /// The runner role's policy: launch and stop machines tagged with this control plane, and read what that needs.
 pub fn aws_runner_policy(account_id: &str, plane_id: &str) -> Value {
-    json!({ "Version": "2012-10-17", "Statement": AWS_RUNNER.iter().map(|n| aws_statement(n.id, account_id, plane_id)).collect::<Vec<_>>() })
+    json!({ "Version": "2012-10-17", "Statement": AWS_STATEMENTS.iter().map(|s| aws_statement(s, account_id, plane_id)).collect::<Vec<_>>() })
 }
 
 /// What a runner role's policy (as IAM gives it back; None: the role has none) lacks or has otherwise than this version
 /// asks: those entries, oldest first.
 pub fn aws_runner_missing(have: Option<&Value>, account_id: &str, plane_id: &str) -> Vec<&'static Need> {
     let statements: Vec<&Value> = have.and_then(|p| p["Statement"].as_array()).map(|s| s.iter().collect()).unwrap_or_default();
-    AWS_RUNNER.iter().filter(|n| {
-        let want = aws_statement(n.id, account_id, plane_id);
+    AWS_RUNNER.iter().zip(&AWS_STATEMENTS).filter(|(n, made)| {
+        let want = aws_statement(made, account_id, plane_id);
         !statements.iter().any(|s| s["Sid"] == n.id && same_statement(s, &want))
-    }).collect()
+    }).map(|(n, _)| n).collect()
 }
 
 /// Not a permission but made with them, by the dashboard with the account's sign-in (the role cannot make networks):
@@ -154,6 +158,20 @@ mod tests {
         // Another control plane's policy is not this one's.
         assert_eq!(aws_runner_missing(Some(&full), "123456789012", "other").len(), 5, "its five statements naming the control plane");
         assert_eq!(aws_runner_missing(None, "123456789012", "abc").len(), AWS_RUNNER.len());
+    }
+
+    #[test]
+    fn every_aws_permission_has_its_own_statement_in_its_place() {
+        let policy = aws_runner_policy("123456789012", "abc");
+        let statements = policy["Statement"].as_array().unwrap();
+        for ((need, (id, _)), s) in AWS_RUNNER.iter().zip(&AWS_STATEMENTS).zip(statements) {
+            assert_eq!((need.id, s["Sid"].as_str()), (*id, Some(*id)));
+            assert_eq!(s["Effect"], "Allow");
+        }
+        // Those that name the control plane name this one; every EC2 resource is in this account.
+        let text = policy.to_string();
+        assert_eq!(text.matches("\"abc\"").count() + text.matches("superci-plane-abc-").count(), 5);
+        assert!(!text.contains("arn:aws:ec2:*:*:") && text.contains("arn:aws:ec2:*:123456789012:instance/*"));
     }
 
     #[test]

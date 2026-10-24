@@ -464,29 +464,42 @@ pub fn manifest_form(target: &str, manifest: &serde_json::Value) -> Response {
 <script>document.getElementById('f').submit()</script>"#, esc(target), esc(&manifest.to_string())))
 }
 
-/// Regions the setup page offers for AWS.
-pub const REGIONS: [&str; 12] = ["us-east-1", "us-east-2", "us-west-2", "ca-central-1", "eu-west-1", "eu-west-2", "eu-central-1", "eu-north-1", "ap-south-1", "ap-northeast-1", "ap-southeast-1", "ap-southeast-2"];
+/// A region the setup page offers for AWS: its id, its name as AWS's console writes it, its short name, and the
+/// regions to fall back to from it, nearest first (when it has no spot capacity left).
+pub struct Region { pub id: &'static str, pub name: &'static str, pub short: &'static str, pub nearby: &'static [&'static str] }
 
-/// A region's name as AWS's console writes it.
-pub fn region_name(region: &str) -> &'static str {
-    match region {
-        "us-east-1" => "US East (N. Virginia)", "us-east-2" => "US East (Ohio)", "us-west-2" => "US West (Oregon)", "ca-central-1" => "Canada (Central)",
-        "eu-west-1" => "Europe (Ireland)", "eu-west-2" => "Europe (London)", "eu-central-1" => "Europe (Frankfurt)", "eu-north-1" => "Europe (Stockholm)",
-        "ap-south-1" => "Asia Pacific (Mumbai)", "ap-northeast-1" => "Asia Pacific (Tokyo)", "ap-southeast-1" => "Asia Pacific (Singapore)", "ap-southeast-2" => "Asia Pacific (Sydney)",
-        _ => "",
-    }
-}
+pub const AWS_REGIONS: [Region; 12] = [
+    Region { id: "us-east-1", name: "US East (N. Virginia)", short: "N. Virginia", nearby: &["us-east-2", "us-west-2"] },
+    Region { id: "us-east-2", name: "US East (Ohio)", short: "Ohio", nearby: &["us-east-1", "us-west-2"] },
+    Region { id: "us-west-2", name: "US West (Oregon)", short: "Oregon", nearby: &["us-east-2", "us-east-1"] },
+    Region { id: "ca-central-1", name: "Canada (Central)", short: "Canada", nearby: &["us-east-1", "us-east-2"] },
+    Region { id: "eu-west-1", name: "Europe (Ireland)", short: "Ireland", nearby: &["eu-west-2", "eu-central-1"] },
+    Region { id: "eu-west-2", name: "Europe (London)", short: "London", nearby: &["eu-west-1", "eu-central-1"] },
+    Region { id: "eu-central-1", name: "Europe (Frankfurt)", short: "Frankfurt", nearby: &["eu-west-1", "eu-north-1"] },
+    Region { id: "eu-north-1", name: "Europe (Stockholm)", short: "Stockholm", nearby: &["eu-central-1", "eu-west-1"] },
+    Region { id: "ap-south-1", name: "Asia Pacific (Mumbai)", short: "Mumbai", nearby: &["ap-southeast-1"] },
+    Region { id: "ap-northeast-1", name: "Asia Pacific (Tokyo)", short: "Tokyo", nearby: &["ap-southeast-1"] },
+    Region { id: "ap-southeast-1", name: "Asia Pacific (Singapore)", short: "Singapore", nearby: &["ap-northeast-1", "ap-southeast-2"] },
+    Region { id: "ap-southeast-2", name: "Asia Pacific (Sydney)", short: "Sydney", nearby: &["ap-southeast-1"] },
+];
+
+/// Regions the setup page offers for AWS, by id.
+pub const REGIONS: [&str; 12] = {
+    let (mut ids, mut i) = ([""; 12], 0);
+    while i < ids.len() { ids[i] = AWS_REGIONS[i].id; i += 1 }
+    ids
+};
+
+fn aws_region(id: &str) -> Option<&'static Region> { AWS_REGIONS.iter().find(|r| r.id == id) }
+
+/// A region's name as AWS's console writes it (one not offered: nothing).
+pub fn region_name(region: &str) -> &'static str { aws_region(region).map_or("", |r| r.name) }
+
+/// A region's short name: "N. Virginia" for us-east-1 (one not offered: its id).
+pub fn region_short(region: &str) -> String { aws_region(region).map_or(region, |r| r.short).to_string() }
 
 /// The regions to fall back to from one, nearest first (when it has no spot capacity left).
-pub fn nearby_regions(region: &str) -> &'static [&'static str] {
-    match region {
-        "us-east-1" => &["us-east-2", "us-west-2"], "us-east-2" => &["us-east-1", "us-west-2"], "us-west-2" => &["us-east-2", "us-east-1"],
-        "ca-central-1" => &["us-east-1", "us-east-2"], "eu-west-1" => &["eu-west-2", "eu-central-1"], "eu-west-2" => &["eu-west-1", "eu-central-1"],
-        "eu-central-1" => &["eu-west-1", "eu-north-1"], "eu-north-1" => &["eu-central-1", "eu-west-1"], "ap-south-1" => &["ap-southeast-1"],
-        "ap-northeast-1" => &["ap-southeast-1"], "ap-southeast-1" => &["ap-northeast-1", "ap-southeast-2"], "ap-southeast-2" => &["ap-southeast-1"],
-        _ => &[],
-    }
-}
+pub fn nearby_regions(region: &str) -> &'static [&'static str] { aws_region(region).map_or(&[], |r| r.nearby) }
 
 #[cfg(test)]
 mod tests {
@@ -495,5 +508,17 @@ mod tests {
     #[test]
     fn escaping() {
         assert_eq!(esc(r#"<a href="x">&'"#), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;");
+    }
+
+    #[test]
+    fn every_region_offered_has_its_names_and_falls_back_only_to_regions_offered() {
+        assert_eq!(REGIONS.len(), AWS_REGIONS.len());
+        for (id, r) in REGIONS.iter().zip(&AWS_REGIONS) {
+            assert_eq!((*id, region_name(id), region_short(id), nearby_regions(id)), (r.id, r.name, r.short.to_string(), r.nearby));
+            assert!(r.name.contains(r.short) || r.short == "Canada", "{id}");
+            assert!(!r.nearby.is_empty() && r.nearby.iter().all(|n| REGIONS.contains(n) && n != id), "{id}");
+        }
+        assert_eq!((region_name("us-east-1"), region_short("eu-north-1"), nearby_regions("ap-south-1")), ("US East (N. Virginia)", "Stockholm".to_string(), &["ap-southeast-1"][..]));
+        assert_eq!((region_name("mars-1"), region_short("mars-1"), nearby_regions("mars-1")), ("", "mars-1".to_string(), &[][..]));
     }
 }

@@ -123,13 +123,14 @@ impl Spec {
         let pairs = label.strip_prefix(&base)?.strip_prefix('/')?;
         let mut s = Spec::default();
         let mut said: Vec<&str> = vec![];
-        for pair in pairs.split('/') {
-            let Some((key, value)) = pair.split_once('=') else { return Some(Err(format!("“{pair}” in runs-on: {label} is not a key=value. {HOW}"))) };
-            if said.contains(&key) { return Some(Err(format!("{key} is said twice in runs-on: {label}"))) }
+        // (A label has at least one pair after its slash, if an empty one.)
+        let set = pairs.split('/').try_for_each(|pair| {
+            let Some((key, value)) = pair.split_once('=') else { return Err(format!("“{pair}” in runs-on: {label} is not a key=value. {HOW}")) };
+            if said.contains(&key) { return Err(format!("{key} is said twice in runs-on: {label}")) }
             said.push(key);
-            if let Err(e) = s.set(key, value) { return Some(Err(format!("{e} (runs-on: {label})"))) }
-        }
-        Some(s.check().map(|_| s).map_err(|e| format!("{e} (runs-on: {label})")))
+            s.set(key, value).map_err(|e| format!("{e} (runs-on: {label})"))
+        });
+        Some(set.and_then(|_| s.check().map_err(|e| format!("{e} (runs-on: {label})"))).map(|_| s))
     }
 
     /// One key of a machine set to a value, as a label or `superci machine update` says it.
@@ -345,8 +346,8 @@ pub fn aws_instance_types(s: &Spec) -> Vec<String> {
     if let Some(gpu) = s.gpu.as_deref() { return aws_gpu_types(gpu, s) }
     let arm = s.arch() == "arm64";
     let cpu = s.cpu.unwrap_or(4);
-    let ram = s.ram().unwrap_or(if s.cpu.is_none() { 8 } else { cpu * 4 });
-    let mut out = vec![];
+    // (No memory only when no CPUs are asked for either: the standard machine's.)
+    let ram = s.ram().unwrap_or(8);
     // (With a local NVMe disk, when asked for: the families that have one.)
     // Only the families a label names, when it names any: each at the smallest size with the CPUs asked for, and
     // the memory asked for or what the family gives (a compute family has half a general one's).
@@ -365,11 +366,9 @@ pub fn aws_instance_types(s: &Spec) -> Vec<String> {
         (true, true) => [(2, &["c8gd", "c7gd"]), (4, &["m8gd", "m7gd"]), (8, &["r8gd", "r7gd"])],
     };
     // (Each family at its own smallest size that fits: one may have a size another lacks.)
-    for (per_cpu, families) in families {
-        for f in families.iter().copied() {
-            if let Some((c, size)) = aws_family_sizes(f).into_iter().find(|(c, _)| *c >= cpu && c * per_cpu >= ram) { out.push((c, per_cpu, format!("{f}.{size}"))) }
-        }
-    }
+    let out: Vec<(u32, u32, String)> = families.iter().flat_map(|(per_cpu, families)| families.iter().filter_map(move |f| {
+        aws_family_sizes(f).into_iter().find(|(c, _)| *c >= cpu && c * per_cpu >= ram).map(|(c, size)| (c, *per_cpu, format!("{f}.{size}")))
+    })).collect();
     // A memory family only where no other gives the memory asked for with as few CPUs: its spot price is often twice
     // a general one's, and AWS, asked for pools by room, took r8a at three times c8a's price.
     let fits_without = |c: u32| out.iter().any(|(oc, per_cpu, _)| *oc == c && *per_cpu < 8);
@@ -586,7 +585,59 @@ mod tests {
         assert_eq!(t[0], "c8a.4xlarge");
         assert!(t.contains(&"m7a.4xlarge".to_string()));
     }
+
+    #[test]
+    fn every_family_has_its_sizes_from_2_cpus_to_its_largest() {
+        let largest = |f: &str| match f { "c7g" | "m7g" | "r7g" | "c7gd" | "m7gd" | "r7gd" => 64, "c6id" | "m6id" | "r6id" => 128, _ => 192 };
+        for (f, _) in FAMILIES {
+            let sizes = aws_family_sizes(f);
+            assert_eq!((sizes.first().copied(), sizes.last().map(|s| s.0)), (Some((2, "large")), Some(largest(f))), "{f}");
+            assert!(sizes.iter().all(|(c, size)| aws_type_cpus(&format!("{f}.{size}")) == Some(*c)), "{f}");
+            assert_eq!(sizes.iter().any(|(c, _)| *c == 128), ["c7a", "m7a", "r7a", "c8i", "m8i", "c8id", "m8id", "r8id", "c6id", "m6id", "r6id"].contains(&f), "{f}");
+        }
+        assert_eq!((aws_type_cpus("t3.medium"), aws_type_cpus("c8a.xlarge"), aws_type_cpus("c8a.bigxlarge")), (Some(1), Some(4), None));
+    }
+
+    #[test]
+    fn every_key_says_what_it_takes_when_given_what_it_does_not() {
+        let err = |label: &str| Spec::parse(label, "superci").unwrap().unwrap_err();
+        for (label, said) in [
+            ("superci/ram=0", "ram is GB of memory from 1 to 1536, not “0”"), ("superci/disk=16001", "disk is GB of disk from 1 to 16000, not “16001”"),
+            ("superci/os=bsd", "os is linux or windows or macos, not “bsd”"), ("superci/provider=gcp", "provider is aws or cloudflare or modal, not “gcp”"),
+            ("superci/gpu=v100", "gpu is any, or one of t4, l4, a10g, l40s, a100, h100, h200, b200, not “v100”"),
+        ] {
+            assert_eq!(err(label), format!("{said} (runs-on: {label})"));
+        }
+        for os in OS_NAMES.map(|(id, _)| id) { assert!(Spec::parse(&format!("superci/os={os}"), "superci").unwrap().is_ok(), "{os}") }
+        assert_eq!(OS_NAMES.map(|(id, _)| os_name(id)), ["Linux", "Windows", "macOS"]);
+        assert_eq!(os_name("plan9"), "plan9");
+        // A family and the architecture it is: together when they agree.
+        assert!(Spec::parse("superci/arch=arm64/family=m8g", "superci").unwrap().is_ok() && Spec::parse("superci/arch=x64/family=m8a", "superci").unwrap().is_ok());
+    }
+
+    #[test]
+    fn every_part_of_a_machine_is_described() {
+        let s = Spec::parse("superci/ram=16/image=ubuntu24/gpu=any/docker-cache=true/disk-speed=125/provider=modal", "superci").unwrap();
+        assert_eq!(s.unwrap_err(), "the Docker image cache is on Ubuntu 26.04 machines (image=ubuntu26), and the label says image=ubuntu24 (runs-on: superci/ram=16/image=ubuntu24/gpu=any/docker-cache=true/disk-speed=125/provider=modal)");
+        let s = Spec { ram_gb: Some(16), os: Some("linux".into()), image: Some("ubuntu24".into()), gpu: Some("any".into()), docker_cache: Some(true), disk_mibs: Some(DISK_MIBS_INCLUDED), cloud: Some("modal".into()), ..Default::default() };
+        assert_eq!(s.describe(), "16 GB, Linux, Ubuntu 24.04, a GPU, Docker image cache from the start, standard disk speed, only modal");
+        assert_eq!(Spec { image: Some("ubuntu26".into()), ..Default::default() }.describe(), "Ubuntu 26.04");
+    }
+
+    #[test]
+    fn a_local_disk_or_a_gpu_is_refused_where_there_is_none() {
+        let s = |label: &str| Spec::parse(label, "superci").unwrap().unwrap();
+        assert_eq!(Capacity::cloudflare().refuses(&s("superci/scratch=localdisk")), Some("no machines with a local disk to ask for".into()));
+        assert_eq!(Capacity::cloudflare().refuses(&s("superci/scratch=ramdisk")), Some("no RAM disk".into()));
+        assert_eq!(Capacity::aws().refuses(&s("superci/scratch=localdisk/gpu=t4")), Some("no GPU machines with a local disk to ask for".into()));
+        // A family SuperCI does not know, or one without a size with the CPUs asked for, gives no machine type.
+        assert!(aws_instance_types(&Spec { families: vec!["z9".into()], ..Default::default() }).is_empty());
+        assert!(aws_instance_types(&Spec { cpu: Some(500), families: vec!["m8a".into()], ..Default::default() }).is_empty());
+    }
 }
 
-/// An operating system as people write it: Linux, Windows, macOS.
-pub fn os_name(os: &str) -> &str { match os { "linux" => "Linux", "windows" => "Windows", "macos" => "macOS", o => o } }
+/// The operating systems a label may name, each as people write it.
+pub const OS_NAMES: [(&str, &str); 3] = [("linux", "Linux"), ("windows", "Windows"), ("macos", "macOS")];
+
+/// An operating system as people write it: Linux, Windows, macOS (another: as it is).
+pub fn os_name(os: &str) -> &str { OS_NAMES.iter().find(|(id, _)| *id == os).map_or(os, |(_, name)| *name) }
