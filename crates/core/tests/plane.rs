@@ -3054,13 +3054,19 @@ fn a_job_run_again_after_a_reclaim_goes_back_on_spot_when_the_on_demand_limit_ca
     sweep_after(130_000);
     assert!(job(&store, 10)["error"].as_str().unwrap().starts_with("waiting: starting its machine failed, trying again (Your AWS account's limits do not let this machine start"), "{}", job(&store, 10)["error"]);
 
-    // Asked on a spot machine again already, its label asking for no spot machine: the limits are what is said.
+    // Asked on a spot machine again already, its label asking for no spot machine: the limits are what is said (job
+    // 12's machine ended a moment ago: AWS still counts it).
     full.set(false);
+    store.0.borrow_mut().insert("job:12".into(), serde_json::json!({ "job_id": 12, "run_id": 3, "repo": "acme/app", "state": "done", "at_ms": clock.0.get(), "installation_id": 42, "cloud": "aws",
+        "machine_id": "i-12", "seen_in_progress": true, "ended_ms": clock.0.get() + 20_000 }).to_string());
+    store.0.borrow_mut().insert("live:12".into(), String::new());
+    // (Job 10, still up, out of the way.)
+    store.0.borrow_mut().remove("live:10");
     store.0.borrow_mut().insert("job:11".into(), serde_json::json!({ "job_id": 11, "run_id": 3, "repo": "acme/app", "state": "waiting", "at_ms": clock.0.get(), "installation_id": 42, "app_id": 99,
         "cloud": "", "seen_in_progress": false, "label": "superci/spot=false", "spot_again": true }).to_string());
     store.0.borrow_mut().insert("live:11".into(), String::new());
     sweep_after(30_000);
-    assert!(job(&store, 11)["error"].as_str().is_some_and(|e| e.contains("limit of running CPUs")), "{}", job(&store, 11));
+    assert!(job(&store, 11)["error"].as_str().is_some_and(|e| e.contains("AWS still counts a machine")), "{}", job(&store, 11));
 }
 
 #[test]
@@ -5852,6 +5858,7 @@ fn a_machine_whose_region_makes_no_address_is_said_so_at_each_link_and_what_it_s
     let v = "a1b2c3";
     // Each link to its region's bucket cannot be made: the program, an entry's pieces to write and to read, a tool's.
     assert_eq!(block_on(plane.handle(get(&format!("/cache/{bad}/program")))).status, 500);
+    assert_eq!(block_on(plane.handle(get(&format!("/cache/{bad}/layers-program")))).status, 500);
     assert_eq!(call(bad, "begin", serde_json::json!({ "token": main, "key": "deps-1", "version": v })).0, 200);
     assert_eq!(call(bad, "sign", serde_json::json!({ "token": main, "key": "deps-1", "version": v, "names": ["b0"] })).0, 500);
     // (Pieces it says that are no name and size are passed over.)
@@ -6221,6 +6228,9 @@ fn a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after
     let r: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{id}")]).unwrap();
     let (token, job_id) = (r["jobs"][0]["token"].as_str().unwrap().to_string(), r["jobs"][0]["job_id"].as_str().unwrap().to_string());
     assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/superci/tree?part=0"))).status, 302);
+    store.0.borrow_mut().insert(format!("rtree-s3:{tree}:00001"), "us east-1|runs/x/00001".into());
+    assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/superci/tree?part=1"))).status, 500);
+    assert_eq!(json(&run(key(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id={tree}&part=2")))))["stored"], 0);
     assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/runner/{token}/_apis/v1/Logfiles/p/1")).with_body("a whole log\n")).status, 200);
     assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/runner/{token}/_apis/v1/Logfiles/p/1")).with_body("and more\n")).status, 200);
     assert_eq!(run(key(get(&format!("/runs/{id}/log?job=0&log=1")))).body_text(), "a whole log\nand more\n");
@@ -6530,13 +6540,18 @@ fn logs_and_trees_kept_in_a_bucket_this_control_plane_can_no_longer_reach_are_pa
         m.insert("rjob:tok-0123456789abcdef".into(), serde_json::json!({ "message": {}, "job_id": 9, "at_ms": t, "steps": [{ "type": "Task", "id": step, "name": "Going", "order": 1, "state": "inProgress" }, { "type": "Task", "id": "s2", "name": "Done", "order": 2, "log": 2, "state": "completed" }] }).to_string());
         m.insert("rlog:tok-0123456789abcdef:0002:0000".into(), "s3:us-east-1".into());
         m.insert("rlog:tok-0123456789abcdef:0003:0000".into(), "s3:us east-1".into());
-        // A page its machine sent of the step going, partly: no whole line yet.
+        // A page its machine sent of the step going, partly: no whole line yet; one in the bucket.
         m.insert(format!("glive:9:tl_{step}_1.log:0000000000000:000"), STANDARD.encode("2026-10-16T21:18:46.0000000Z no end"));
+        m.insert("glive:9:tl_job_1.log:0000000000000".into(), "s3:us-east-1:5".into());
     }
     assert_eq!(block_on(plane.handle(key(get("/runs/41/log?job=0&log=2")))).body.len(), 0, "in a bucket it cannot read: nothing");
     let steps = json(&block_on(plane.handle(key(get("/job/log?id=9&steps")))));
     assert_eq!(steps["steps"].as_array().map(|s| s.len()), Some(2), "{steps}");
     assert_eq!(json(&block_on(plane.handle(key(get("/job/log?id=9&link")))))["urls"], serde_json::Value::Null);
+    // Its steps not said yet: its log is the lines its runner sent.
+    store.0.borrow_mut().entry("rjob:tok-0123456789abcdef".into()).and_modify(|v| { let mut h: serde_json::Value = serde_json::from_str(v).unwrap(); h["steps"] = serde_json::json!([]); *v = h.to_string() });
+    store.0.borrow_mut().insert("rline:tok-0123456789abcdef:1790000000000001".into(), serde_json::json!({ "step": "s", "lines": ["sent as it went"] }).to_string());
+    assert!(json(&block_on(plane.handle(key(get("/job/log?id=9")))))["log"].as_str().is_some_and(|l| l.contains("sent as it went")));
     // A tree kept in the bucket, in the old way (its region alone), gone after a day though AWS cannot be asked.
     store.0.borrow_mut().insert("rtree-s3:tree-0123456789abcdef:00000".into(), "us-east-1".into());
     store.0.borrow_mut().insert("rtree-at:tree-0123456789abcdef".into(), t.to_string());
@@ -6725,6 +6740,40 @@ fn launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_no
     assert!(job(&store, 5)["fail_pending"].is_string(), "{}", job(&store, 5));
 }
 
+#[test]
+fn a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said() {
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://api.github.com/repos/acme/app").then(|| Response::new(200, "application/json", r#"{"default_branch":"main"}"#)));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let new_run = |workflow: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1")
+        .with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string())));
+    // A repository GitHub says no id of: its cache is the run's own; an environment named as it is, with no secrets kept.
+    let r = new_run("jobs:\n  a:\n    runs-on: superci\n    environment: production\n    steps:\n      - run: echo\n");
+    assert_eq!(json(&r)["cache_own"], true, "{}", r.body_text());
+    // The control plane's signing key damaged: no token for a job's cache, so the job does not start.
+    store.0.borrow_mut().insert("identity".into(), serde_json::json!({ "signing": { "private_b64": "!!", "kid": "k" } }).to_string());
+    assert_eq!(new_run("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n").status, 400);
+}
+
+#[test]
+fn a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let failing = format!("superci-{PLANE_ID}-1-x");
+    store.0.borrow_mut().insert("job:1".into(), serde_json::json!({ "job_id": 1, "run_id": 3, "repo": "acme/app", "state": "failed", "at_ms": t, "installation_id": 42, "cloud": "", "seen_in_progress": false, "failed_fast": true, "error": "nowhere to run it" }).to_string());
+    store.0.borrow_mut().insert(format!("runner:{failing}"), "1".into());
+    store.0.borrow_mut().insert("job:2".into(), serde_json::json!({ "job_id": 2, "run_id": 3, "repo": "acme/app", "state": "waiting", "at_ms": t, "installation_id": 42, "cloud": "", "seen_in_progress": false }).to_string());
+    block_on(plane.handle(job_event("completed", 2, "acme/app", Some(&failing))));
+    assert_eq!((job(&store, 2)["state"].as_str(), job(&store, 1)["fail_pending"].as_str()), (Some("failed"), Some("nowhere to run it")));
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6885,7 +6934,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_job_claimed_as_the_store_fails_to_index_it_is_claimed_again_and_gets_its_machine,
         a_runs_cancelling_passes_over_what_its_record_lacks_and_a_runner_that_ends_before_it_takes_its_job_is_heard,
         machines_whose_jobs_went_elsewhere_hand_themselves_on_or_end_as_github_and_gitlab_say,
-        launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not
+        launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not,
+        a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
+        a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
