@@ -5626,6 +5626,9 @@ fn a_runs_called_workflows_and_expressions_are_read_as_github_reads_them() {
         assert_eq!(states(&r), ["a (x-1)=started"]);
         let r = run("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    strategy:\n      matrix: ${{ fromJSON('{\"v\":[]}') }}\n", serde_json::json!({}));
         assert_eq!(states(&r), ["a (its matrix has no combinations)=done:failure"]);
+        // A job of its own in an environment an expression names as no text (a number): named as its text.
+        let r = run("jobs:\n  a:\n    runs-on: superci\n    environment: ${{ 1 }}\n    steps:\n      - run: echo\n", serde_json::json!({}));
+        assert_eq!(states(&r), ["a=started"]);
     });
 }
 
@@ -6395,6 +6398,11 @@ fn a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_
     // The run gone: a tool on its machine reads nothing.
     store.0.borrow_mut().remove("run:41");
     assert_eq!(call(good, "tool-get", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 403);
+    // Its artifact of no pieces taken out at the next sweep, with nothing to delete from the bucket.
+    store.0.borrow_mut().insert("artifact:41:bare".into(), serde_json::json!({ "id": "b", "region": "us-east-1", "made": t, "done": true }).to_string());
+    store.0.borrow_mut().insert("cache-swept".into(), "0".into());
+    block_on(plane.alarm()).unwrap();
+    assert!(!store.0.borrow().contains_key("artifact:41:bare"));
 }
 
 /// What a runner sends for a run's job, as a real one sent it (`fixtures/runner`): up to `upto` of its requests (all:

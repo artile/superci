@@ -293,6 +293,14 @@ fn the_dashboard_and_a_task_open_in_the_browser_and_a_port_taken_is_said_as_it_s
         let _ = c.kill();
         let _ = c.wait();
     }
+    // Without SUPERCI_BROWSER, a debug build (the tests') opens nothing, and says it opens all the same.
+    let _ = std::fs::remove_file(&opened);
+    let mut c = common::command(&home).args(["dashboard", "--workspace=default"]).env("SUPERCI_PORT", free().to_string()).env_remove("SUPERCI_BROWSER").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    assert!(first(&mut c, "It is opening in your browser").join("\n").contains("It is opening in your browser"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = c.kill();
+    let _ = c.wait();
+    assert!(handed().is_empty(), "{}", handed());
     // Cloudflare's own port, asked for by name and taken: said as taken (no other is tried).
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = taken.local_addr().unwrap().port().to_string();
@@ -10598,6 +10606,12 @@ fn the_aws_account_card_says_what_each_kind_of_account_allows_and_whose_rule_a_r
         b.wait("document.getElementById('aws-account') && !document.body.innerText.includes('Asking AWS')");
         let card = b.eval("document.getElementById('aws-account').nextElementSibling.innerText").as_str().unwrap_or_default().to_string();
         for said in says { assert!(card.contains(said), "{what}: no {said:?} in\n{card}") }
+        // (And the command that reads the account says it in its own words.)
+        if what == "its organization's management account" {
+            let o = common::command(&home).args(["accounts", "retrieve", "aws"]).output().unwrap();
+            let out = String::from_utf8_lossy(&o.stdout);
+            assert!(out.contains("Organization  o-example001, managed from this account"), "{out}");
+        }
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -15188,6 +15202,13 @@ mod dashboard_suite_in_browser {
         // The browser opens the sign-in: to Modal's page, its flow made.
         let (_, _, page) = common::get(&link, "/connect/modal");
         assert!(page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{}", words(&page));
+        // The tab, open meanwhile, asks Modal itself as its page is read, until the sign-in is approved there.
+        let asked = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut tab = String::new();
+        while std::time::Instant::now() < asked && !tab.contains("Signed in with Modal") && !matches!(child.try_wait(), Ok(Some(_))) {
+            tab = common::get(&link, "/").2;
+        }
+        assert!(tab.contains("Signed in with Modal"), "{}", words(&tab));
         // Approved there: the command says so and ends.
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut said = vec![];

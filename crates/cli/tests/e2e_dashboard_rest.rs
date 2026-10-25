@@ -768,12 +768,21 @@ fn an_update_of_a_control_plane_in_cloudflare_gives_its_aws_role_what_it_asks_fo
     served.aws.replaying(include_str!("../fixtures/update/05-update-cf.jsonl"), &[("http://new-plane.test", &cf.url)]);
     // (Its role, as AWS answered for a control plane in Cloudflare.)
     served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &cf.url)]);
+    cf.store.0.lock().unwrap().insert("denied:aws:ec2:RunInstances".into(), r#"{"at":1}"#.into());
+    // (Its address as Cloudflare gives it after the deploy, served here.)
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     let (status, said) = sent(&link, "/plane/update", &[("plane", "cfplane00003")]);
     assert!(status == 303, "{status} {said}");
     let given = || served.aws.asked.lock().unwrap().iter().any(|a| a["status"] == 200 && a["asked"].as_str().is_some_and(|s| s.contains("PutRolePolicy")));
     until("its role given what it asks for", given);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // (Then the control plane is told its role has it: what it noted AWS refusing goes.)
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !cf.store.under("denied:aws:").is_empty() {
+        let last: Vec<String> = served.aws.asked.lock().unwrap().iter().rev().take(6).map(|a| format!("{} {} {}", a["status"], a["url"], a["asked"].as_str().unwrap_or_default().chars().take(80).collect::<String>())).collect();
+        assert!(std::time::Instant::now() < end, "never told: {last:#?}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -797,12 +806,15 @@ fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_k
         k["cloudflare"] = cloudflare_signed_in();
     });
     served.aws.replaying(include_str!("../fixtures/move/03-cf-containers.jsonl"), &[]);
-    served.aws.fail("/secrets|LAUNCHERS", 500, CF_FAILED, None);
+    // (Its launchers' setting refused; the deploy's upload, which names them too, taken.)
+    served.aws.fail("scripts/superci/secrets|LAUNCHERS", 500, CF_FAILED, None);
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     // (Its key handed as a page is first read.)
     until("its key handed", || { common::part(&link, "/?p=runners&fragment=1"); served.aws.worker_settings("superci").iter().any(|(k, _)| k.starts_with("DEVICE_KEY_")) });
     let (status, said) = sent(&link, "/runners/cloudflare", &[]);
     assert!(status >= 400 && said.contains("Internal server error"), "{status} {said}");
+    // (Refused at the launcher's place given up: its containers were switched on before it.)
+    assert!(served.aws.worker_settings("superci").iter().any(|(k, v)| k == "CONTAINERS" && v == "on"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

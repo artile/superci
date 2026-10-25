@@ -587,7 +587,7 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
 /// The runner image's copies made, made anew from a newer build, and removed, as AWS answered a real account, with
 /// each of AWS's and GitHub's answers failing in turn.
 #[test]
-fn the_runner_images_copies_hold_with_each_call_failing() {
+fn the_runner_images_copies_hold_with_each_call_and_store_operation_failing() {
     let _one = one_at_a_time();
     let fixture = |name: &str| std::fs::read_to_string(format!("{}/fixtures/aws/images/{name}.jsonl", env!("CARGO_MANIFEST_DIR"))).unwrap();
     // (A copy of an older build than the newest: an update copies the newest in, as the copy at first did.)

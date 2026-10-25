@@ -2905,3 +2905,16 @@ fn every_command_with_no_control_plane_yet_says_to_set_one_up() {
     assert!(account.params.lock().unwrap().is_empty(), "nothing was made");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `superci planes allow`, signed in to the control plane's AWS account: its role given what this version asks for,
+/// and said.
+#[test]
+fn a_control_planes_aws_role_is_given_what_this_version_asks_for() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    // (IAM takes the policy, as it answers PutRolePolicy.)
+    served.aws.fail("PutRolePolicy", 200, "<PutRolePolicyResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ResponseMetadata><RequestId>1</RequestId></ResponseMetadata></PutRolePolicyResponse>", None);
+    let (code, v) = json(&home, &["planes", "allow"]);
+    assert!(code == 0 && v["said"].as_str().unwrap_or_default().contains("Its AWS role has what this version asks for."), "{code} {v}");
+    let _ = std::fs::remove_dir_all(&home);
+}
