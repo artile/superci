@@ -12,6 +12,9 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A Docker layer a machine uploaded is kept when the control plane fails partway through taking it (its store, or S3 checking the upload): its record stays until the layer is being converted, and a conversion is noted before it is asked for. Such a layer was lost, or left "being converted" until it timed out, and the next job pulled it again. Update your control plane for it.
 - A command that names a control plane (`--plane=ID`) acts on it after another was in use in the same workspace. It was refused as "not among the control planes here" once a command had read the other one.
 - Removing AWS runners from a control plane that no longer knows any AWS account says it is done. It asked to sign in to an account with no number.
+- A job the control plane took as its store failed to index it is let go, to be taken again. It was left for nothing to look after. Update your control plane for it.
+- A control plane from before 0.19.0 building its jobs' indexes a part at a time indexes the job each part ends at, and counts its run. That job was passed over. Update your control plane for it.
+- Whether the GitHub App is installed is not kept while there is no App yet. A dashboard that asked before the App was made saw it not installed for a minute after it was. Update your control plane for it.
 
 ## 0.19.19 — 2026-10-21
 - A control plane asked for a job's log by an id that is no job's, or of a GitLab by a name that is none, answers 400 with what was wrong (it answered 500, as if it had failed itself). Update your control plane for it.
