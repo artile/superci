@@ -140,6 +140,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: tests
+      # (The layer store's tests make EROFS files as the converter does, and serve them as root.)
+      - name: mkfs.erofs
+        run: sudo apt-get install -y -qq erofs-utils >/dev/null
       - name: Part ${{ matrix.part }} of the tests
         run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --partition count:${{ matrix.part }}/4 --no-fail-fast
 

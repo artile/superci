@@ -36,15 +36,23 @@ fn start(name: &str, index: Option<&serde_json::Value>) -> Service {
     let dir = std::env::temp_dir().join(format!("superci-layers-service-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let socket = dir.join("layers.sock");
     if let Some(i) = index { std::fs::write(dir.join("index.json"), i.to_string()).unwrap() }
+    let socket = dir.join("layers.sock");
+    Service { child: launch(&dir), dir, socket }
+}
+
+/// The program on `dir`'s folders, once its socket is there (what it says, to `dir/log`, after what it said before).
+fn launch(dir: &std::path::Path) -> Child {
+    let socket = dir.join("layers.sock");
+    let _ = std::fs::remove_file(&socket);
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_superci-layers"))
         .args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", socket.display()),
             format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("no-containerd.sock").display()), "--parallel=4".into(), "--sync-remove".into()])
-        .stderr(std::fs::File::create(dir.join("log")).unwrap()).spawn().unwrap();
+        .stderr(log).spawn().unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     while !socket.exists() { assert!(Instant::now() < until, "it did not answer: {}", std::fs::read_to_string(dir.join("log")).unwrap_or_default()); std::thread::sleep(Duration::from_millis(20)) }
-    Service { child, dir, socket }
+    child
 }
 
 impl Service {
@@ -468,4 +476,158 @@ async fn layers_the_last_run_used_are_fetched_as_the_store_starts() {
     while !s.log().contains("1 layers' files (0 MB) fetched ahead in") { assert!(Instant::now() < until, "{}", s.log()); tokio::time::sleep(Duration::from_millis(50)).await }
     let asked = p.lock().unwrap().asked.clone();
     assert!(asked.iter().any(|a| a.starts_with(&format!("GET /files/{used}.erofs"))) && !asked.iter().any(|a| a == "POST /links"), "{asked:?}");
+}
+
+/// A layer's EROFS file made as SuperCI's converter makes it (mkfs.erofs from its tar), where there is one.
+fn erofs_of(tar: &[u8]) -> Option<Vec<u8>> {
+    let mkfs = std::env::var("SUPERCI_MKFS_EROFS").unwrap_or_else(|_| "mkfs.erofs".into());
+    let out = std::env::temp_dir().join(format!("superci-layers-erofs-{}-{}", std::process::id(), digest(tar)[7..19].to_string()));
+    let mut c = Command::new(mkfs).args(["--tar=f", "--aufs", "-zlz4hc", "-Enoinline_data", "-T0", "--mkfs-time"]).arg(&out).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok()?;
+    c.stdin.take()?.write_all(tar).ok()?;
+    if !c.wait().ok()?.success() { return None }
+    let b = std::fs::read(&out).ok();
+    let _ = std::fs::remove_file(&out);
+    b
+}
+
+/// A tar of one file, as a layer's blob is.
+fn tar_of(name: &str, body: &[u8]) -> Vec<u8> {
+    let dir = std::env::temp_dir().join(format!("superci-layers-tar-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(name), body).unwrap();
+    let out = Command::new("tar").args(["-C", dir.to_str().unwrap(), "--owner=0", "--group=0", "-cf", "-", name]).output().unwrap().stdout;
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// How what needs root runs: as it is, when this is root; through `sudo -n` where there is one without a password; not
+/// at all elsewhere (Linux only).
+fn as_root() -> Option<Vec<&'static str>> {
+    if !cfg!(target_os = "linux") { return None }
+    if unsafe { libc::geteuid() } == 0 { return Some(vec![]) }
+    Command::new("sudo").args(["-n", "true"]).status().ok().filter(|s| s.success()).map(|_| vec!["sudo", "-n"])
+}
+
+/// `program` as root: through sudo, a coverage tool's settings given on its command line (sudo keeps only some of the
+/// environment, whatever it is asked).
+fn rooted(prefix: &[&str], program: &str) -> Command {
+    let mut c = Command::new(prefix.first().copied().unwrap_or(program));
+    if !prefix.is_empty() { c.args(&prefix[1..]).arg("env").args(std::env::vars().filter(|(k, _)| k.starts_with("SUPERCOV_")).map(|(k, v)| format!("{k}={v}"))).arg(program); }
+    c
+}
+
+/// A socket made by root opened to the test.
+fn open_socket(prefix: &[&str], socket: &std::path::Path) {
+    let until = Instant::now() + Duration::from_secs(20);
+    while !socket.exists() { assert!(Instant::now() < until, "{} not made", socket.display()); std::thread::sleep(Duration::from_millis(20)) }
+    assert!(rooted(prefix, "chmod").arg("666").arg(socket).status().unwrap().success());
+}
+
+/// The program as root on `dir`'s folders (containerd's socket at `containerd`), its socket opened to the test.
+fn launch_rooted(prefix: &[&str], dir: &std::path::Path, containerd: &std::path::Path) -> Child {
+    let socket = dir.join("layers.sock");
+    let _ = rooted(prefix, "rm").arg("-f").arg(&socket).status();
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")).unwrap();
+    let child = rooted(prefix, env!("CARGO_BIN_EXE_superci-layers"))
+        .args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", socket.display()),
+            format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", containerd.display()), "--parallel=4".into(), "--sync-remove".into()])
+        .stderr(log).spawn().unwrap();
+    open_socket(prefix, &socket);
+    child
+}
+
+/// A containerd of the test's own, as root on `dir`'s folders, where there is one, with the program as its content
+/// store (as `setup` makes a machine's): its socket.
+fn own_containerd(prefix: &[&str], dir: &std::path::Path) -> Option<(Child, std::path::PathBuf)> {
+    if !Command::new("containerd").arg("--version").output().is_ok_and(|o| o.status.success()) { return None }
+    let socket = dir.join("containerd.sock");
+    let config = superci_layers::setup::containerd_config("version = 2\n").unwrap().replace("/run/superci-layers.sock", dir.join("layers.sock").to_str().unwrap());
+    std::fs::write(dir.join("containerd.toml"), config).unwrap();
+    let child = rooted(prefix, "containerd").args(["--config".as_ref(), dir.join("containerd.toml").as_os_str(), "--address".as_ref(), socket.as_os_str(),
+        "--root".as_ref(), dir.join("containerd-root").as_os_str(), "--state".as_ref(), dir.join("containerd-state").as_os_str()])
+        .stdout(std::process::Stdio::null()).stderr(std::fs::File::create(dir.join("containerd.log")).unwrap()).spawn().ok()?;
+    open_socket(prefix, &socket);
+    Some((child, socket))
+}
+
+fn stop(prefix: &[&str], child: &mut Child) {
+    // (Through sudo, the signal is relayed to the program.)
+    let _ = rooted(prefix, "kill").args(["-TERM", &child.id().to_string()]).status();
+    let _ = child.wait();
+}
+
+/// A layer from the store served as root on Linux: its file mounted, the snapshot committed, containerd told it exists
+/// in the namespace that pulled it (a containerd of the test's own, where there is one); its blob read whole from the
+/// store when asked for; the service restarted, the snapshot mounted again (its file fetched again when gone; let go
+/// when the index no longer has the layer either); removed, its file taken away.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
+    let Some(prefix) = as_root() else { eprintln!("not root on Linux (and no sudo): skipped"); return };
+    let tar = tar_of("hello", b"from the store");
+    let Some(erofs) = erofs_of(&tar) else { eprintln!("no mkfs.erofs here: skipped"); return };
+    let d = digest(&tar);
+    let (p, at) = plane([(format!("{d}.erofs"), erofs.clone()), (format!("{d}.blob"), tar.clone())].into_iter().collect());
+    let index = serde_json::json!({ "layers": { &d: { "size": tar.len(), "erofs": { "url": format!("{at}/files/{d}.erofs"), "size": erofs.len() }, "blob": { "url": format!("{at}/files/{d}.blob") } } }, "refresh": { "url": format!("{at}/links"), "token": "" } });
+    // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself, which tmpfs is not.)
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("superci-layers-served-{}", std::process::id()));
+    let _ = rooted(&prefix, "rm").arg("-rf").arg(&dir).status();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
+    let containerd = own_containerd(&prefix, &dir);
+    let csock = containerd.as_ref().map(|(_, s)| s.clone()).unwrap_or(dir.join("no-containerd.sock"));
+    let mut child = launch_rooted(&prefix, &dir, &csock);
+    let log = || std::fs::read_to_string(dir.join("log")).unwrap_or_default();
+    let ch = superci_layers::client::channel(&dir.join("layers.sock")).await.unwrap();
+    let mut snap = sapi::snapshots_client::SnapshotsClient::new(ch.clone());
+    let layer = sapi::PrepareSnapshotRequest { key: "moby/1/extract-1".into(), labels: [("containerd.io/snapshot.ref".to_string(), "chain-1".to_string()),
+        ("containerd.io/snapshot/cri.layer-digest".to_string(), d.clone()), ("containerd.io/snapshot/cri.image-layers".to_string(), d.clone())].into_iter().collect(), ..Default::default() };
+    assert_eq!(snap.prepare(layer.clone()).await.unwrap_err().code(), Code::AlreadyExists, "{}", log());
+    assert!(log().contains(&format!("{d} from the store in")), "{}", log());
+    // Made known in its namespace, in containerd.
+    if let Some((_, csock)) = &containerd {
+        let mut c = capi::content_client::ContentClient::new(superci_layers::client::channel(csock).await.unwrap());
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut r = tonic::Request::new(capi::InfoRequest { digest: d.clone() });
+            r.metadata_mut().insert("containerd-namespace", "moby".parse().unwrap());
+            if c.info(r).await.is_ok() { break }
+            assert!(Instant::now() < until, "{}\n{}", log(), std::fs::read_to_string(dir.join("containerd.log")).unwrap_or_default());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    // Asked again (another pull of it): found served.
+    let mut again = layer.clone();
+    again.key = "moby/1/extract-2".into();
+    assert_eq!(snap.prepare(again).await.unwrap_err().code(), Code::AlreadyExists);
+    // A container's layer on it: the served file's folder below it.
+    let top = snap.prepare(sapi::PrepareSnapshotRequest { key: "moby/1/top".into(), parent: "moby/1/extract-1/superci-layers".into(), ..Default::default() }).await.unwrap().into_inner().mounts;
+    assert!(top[0].options.iter().any(|o| o.starts_with("lowerdir=")), "{top:?}");
+    // Its blob, asked for (as `docker save` asks): its size from the index, its bytes from the store.
+    let mut c = capi::content_client::ContentClient::new(ch);
+    assert_eq!(c.info(capi::InfoRequest { digest: d.clone() }).await.unwrap().into_inner().info.unwrap().size, tar.len() as i64);
+    assert_eq!(read_all(&mut c, &d, 0, 0).await.unwrap(), tar);
+    assert!(p.lock().unwrap().asked.iter().any(|a| a.starts_with(&format!("GET /files/{d}.blob"))));
+    // Restarted: mounted again from its file; with its file gone, fetched again; with the index not having it either,
+    // let go, said why.
+    let files = dir.join("root/files");
+    let file = std::fs::read_dir(&files).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "erofs")).expect("its file kept");
+    for (gone, index) in [(false, index.clone()), (true, index.clone()), (true, serde_json::json!({ "layers": {} }))] {
+        stop(&prefix, &mut child);
+        let mounted = std::fs::read_to_string("/proc/self/mounts").unwrap().lines().filter(|l| l.contains(dir.to_str().unwrap()) && l.contains(" erofs ")).map(|l| l.split(' ').nth(1).unwrap().to_string()).collect::<Vec<_>>();
+        for m in &mounted { let _ = rooted(&prefix, "umount").args(["-l", m]).status(); }
+        if gone { let _ = rooted(&prefix, "rm").arg("-f").arg(&file).status(); }
+        std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
+        child = launch_rooted(&prefix, &dir, &csock);
+    }
+    assert!(log().contains("could not be mounted again: its file is gone and the index has no such layer"), "{}", log());
+    // Removed: let go, its file taken away.
+    let mut snap = sapi::snapshots_client::SnapshotsClient::new(superci_layers::client::channel(&dir.join("layers.sock")).await.unwrap());
+    snap.remove(sapi::RemoveSnapshotRequest { key: "moby/1/top".into(), ..Default::default() }).await.unwrap();
+    snap.remove(sapi::RemoveSnapshotRequest { key: "moby/1/extract-1/superci-layers".into(), ..Default::default() }).await.unwrap();
+    snap.cleanup(sapi::CleanupRequest::default()).await.unwrap();
+    stop(&prefix, &mut child);
+    if let Some((mut c, _)) = containerd { stop(&prefix, &mut c) }
+    let _ = rooted(&prefix, "umount").args(["-R", "-l"]).arg(&dir).status();
+    let _ = rooted(&prefix, "rm").arg("-rf").arg(&dir).status();
 }

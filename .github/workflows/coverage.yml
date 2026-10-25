@@ -195,6 +195,14 @@ jobs:
           uname -r
           grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
           sudo modprobe erofs && grep erofs /proc/filesystems
+      # (The layer store's tests make EROFS files as the converter does, and serve them as root; containerd's own suites
+      # are run against it with Go.)
+      - name: mkfs.erofs
+        run: sudo apt-get install -y -qq erofs-utils >/dev/null
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: crates/layers/conformance/go.mod
+          cache-dependency-path: crates/layers/conformance/go.sum
       # (One run: its share of the tests and its sixth of every sweep's faults together. The faults change nothing for
       # the other tests, and a run of the sweeps alone would leave out what only some tests build.)
       - name: Part ${{ matrix.part }} of the tests and slice ${{ matrix.part }} of every sweep's faults, measured
