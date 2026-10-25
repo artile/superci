@@ -202,6 +202,13 @@ pub fn sweep(name: &str, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept { 
 /// (`Faults::calm`) where it looks at what is left.
 pub fn sweep_with_outages(name: &str, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept { swept(name, true, scenario) }
 
+/// Which slice of a sweep's faults this run makes (`SUPERCI_SWEEP_SLICE=k/n`, k from 1): all of them unless said.
+pub fn slice() -> (usize, usize) {
+    let said = std::env::var("SUPERCI_SWEEP_SLICE").unwrap_or_default();
+    let (k, n) = said.split_once('/').and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?))).unwrap_or((1, 1));
+    if n == 0 || k == 0 || k > n { (1, 1) } else { (k, n) }
+}
+
 fn swept(name: &str, outages: bool, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept {
     let started = std::time::Instant::now();
     let clean = run(&scenario, Fault::None);
@@ -219,6 +226,9 @@ fn swept(name: &str, outages: bool, scenario: impl Fn(Fault) -> Outcome + Sync) 
             for k in 1..=ops.len() { faults.push(Fault::StoreDown(k)) }
         }
     }
+    // (A slice of them, `SUPERCI_SWEEP_SLICE=k/n`: every n-th from the k-th, so n machines share every sweep evenly.)
+    let (k, n) = slice();
+    let mut faults: Vec<Fault> = faults.into_iter().enumerate().filter(|(i, _)| i % n == k - 1).map(|(_, f)| f).collect();
     // (One of them alone, said in full, to look into it: `SUPERCI_SWEEP_ONLY=store:109`, `call:41`, `dropped:41`,
     // `outage:41`, `down:109`.)
     let only = std::env::var("SUPERCI_SWEEP_ONLY").ok();

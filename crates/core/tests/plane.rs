@@ -6946,6 +6946,11 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
     assert!(missing.is_empty(), "tests not in the sweep: {missing:?}");
     if std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() != Some("1") { return }
     panics_noted();
+    let slice = {
+        let said = std::env::var("SUPERCI_SWEEP_SLICE").unwrap_or_default();
+        let (k, n) = said.split_once('/').and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?))).unwrap_or((1, 1));
+        if n == 0 || k == 0 || k > n { (1, 1) } else { (k, n) }
+    };
     let next = std::sync::Mutex::new(0usize);
     let found: std::sync::Mutex<Vec<String>> = Default::default();
     let runs = std::sync::atomic::AtomicUsize::new(0);
@@ -6957,7 +6962,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
             let (clean, (calls, ops, swaps)) = (run_faulted(test, None, usize::MAX), faults::off());
             if let Some(p) = clean { found.lock().unwrap().push(format!("{name}, clean: {p}")); continue }
             use faults::Fault::*;
-            let plan = (1..=calls).flat_map(|k| [Call(k), Dropped(k), CallsFrom(k)]).chain((1..=ops).flat_map(|k| [Op(k), OpsFrom(k)])).chain((1..=swaps).map(SwapsLoseFrom));
+            // (A slice of them, as the CLI's sweeps take one: `SUPERCI_SWEEP_SLICE=k/n`, every n-th from the k-th.)
+            let plan = (1..=calls).flat_map(|k| [Call(k), Dropped(k), CallsFrom(k)]).chain((1..=ops).flat_map(|k| [Op(k), OpsFrom(k)])).chain((1..=swaps).map(SwapsLoseFrom))
+                .enumerate().filter(|(i, _)| i % slice.1 == slice.0 - 1).map(|(_, f)| f);
             for fault in plan {
                 runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(p) = run_faulted(test, Some(fault), 4 * (calls + ops) + 1_000).filter(|p| p.starts_with("the control plane")) {

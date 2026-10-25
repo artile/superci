@@ -31,8 +31,8 @@ env:
     target/x86_64-pc-windows-gnu/release/superci-cache.exe
 
 jobs:
-  # Everything built once: the programs the binary carries (kept between runs while their sources stay), the tests,
-  # compiled into one archive the test jobs run from without compiling again, and what a release needs checked.
+  # Everything built once: the programs the binary carries (kept between runs while their sources stay) and the tests,
+  # compiled into one archive the test jobs run from without compiling again.
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -86,6 +86,32 @@ jobs:
           path: |
             tests.tar.zst
             ${{ env.PROGRAMS }}
+
+  # What a release needs, checked beside the tests (from the programs the build made): the program for Windows, the
+  # crates as crates.io would get them, the installer.
+  release-checks:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
       - name: The program for Windows builds
         run: cargo zigbuild --release --target x86_64-pc-windows-gnu -p superci
       - name: The crates pack and build as crates.io would get them
@@ -117,7 +143,8 @@ jobs:
         run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --partition count:${{ matrix.part }}/4 --no-fail-fast
 
   # Each sweep again with each of its calls and store operations failing in turn, and the core's control plane tests
-  # likewise (in process), in four parts side by side.
+  # likewise (in process): six machines side by side, each making every sweep's n-th fault from its own (a sweep can
+  # take longer than all the others together, so its faults are shared out, not the sweeps).
   sweeps:
     needs: build
     runs-on: ubuntu-latest
@@ -125,9 +152,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        part: [1, 2, 3, 4, 5, 6]
     env:
       SUPERCI_SWEEP_FAULTS: "1"
+      SUPERCI_SWEEP_SLICE: ${{ matrix.part }}/6
     steps:
       - uses: actions/checkout@v6
       - uses: taiki-e/install-action@v2
@@ -136,8 +164,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: tests
-      - name: Part ${{ matrix.part }} of the sweeps, every call and store operation failing in turn
-        run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --partition count:${{ matrix.part }}/4 --no-fail-fast -E 'binary(~sweep_) | (package(superci-core) & binary(=plane) & test(every_test_here))'
+      - name: Slice ${{ matrix.part }} of every sweep's faults
+        run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --no-fail-fast -E 'binary(~sweep_) | (package(superci-core) & binary(=plane) & test(every_test_here))'
 
   # superci-layers against containerd's own conformance suites for snapshotters and content stores (as root: the
   # snapshotter suite mounts overlays), directly and through containerd's metadata layer.
