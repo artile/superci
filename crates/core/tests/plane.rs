@@ -14,22 +14,35 @@ use superci_core::github::App;
 use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool, Routing, Rule};
 use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer};
 
+/// The store: kept in memory. `1`: what another request does meanwhile, run before each operation (its name and
+/// key), as a test sets it (see `meddling`).
 #[derive(Default)]
-struct Mem(RefCell<BTreeMap<String, String>>);
+struct Mem(RefCell<BTreeMap<String, String>>, Meddle);
+type Meddler = Box<dyn FnMut(&str, &str, &mut BTreeMap<String, String>)>;
+#[derive(Default)]
+struct Meddle(RefCell<Option<Meddler>>);
+impl Mem {
+    fn meddling(&self, f: impl FnMut(&str, &str, &mut BTreeMap<String, String>) + 'static) { *self.1 .0.borrow_mut() = Some(Box::new(f)) }
+    fn before(&self, op: &str, k: &str) -> io::Result<()> {
+        faults::op()?;
+        if let Some(f) = self.1 .0.borrow_mut().as_mut() { f(op, k, &mut self.0.borrow_mut()) }
+        Ok(())
+    }
+}
 #[async_trait(?Send)]
 impl Store for Mem {
-    async fn get(&self, k: &str) -> io::Result<Option<String>> { faults::op()?; Ok(self.0.borrow().get(k).cloned()) }
-    async fn put(&self, k: &str, v: String) -> io::Result<()> { faults::op()?; self.0.borrow_mut().insert(k.into(), v); Ok(()) }
-    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { faults::op()?; let mut m = self.0.borrow_mut(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
+    async fn get(&self, k: &str) -> io::Result<Option<String>> { self.before("get", k)?; Ok(self.0.borrow().get(k).cloned()) }
+    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.before("put", k)?; self.0.borrow_mut().insert(k.into(), v); Ok(()) }
+    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { self.before("put_if_absent", k)?; let mut m = self.0.borrow_mut(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
     async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> {
-        faults::op()?;
+        self.before("swap", k)?;
         let mut m = self.0.borrow_mut();
         if m.get(k).map(String::as_str) != was || faults::swaps_lose() { return Ok(false) }
         m.insert(k.into(), v);
         Ok(true)
     }
-    async fn delete(&self, k: &str) -> io::Result<()> { faults::op()?; self.0.borrow_mut().remove(k); Ok(()) }
-    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { faults::op()?; Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
+    async fn delete(&self, k: &str) -> io::Result<()> { self.before("delete", k)?; self.0.borrow_mut().remove(k); Ok(()) }
+    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { self.before("list", p)?; Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
 }
 
 /// Faults for the sweep at the end of this file (`every_test_here_holds_with_each_call_and_store_operation_failing`):
@@ -5590,6 +5603,107 @@ fn a_damaged_or_gone_run_record_is_left_as_it_is_and_says_why_where_it_is_moved_
     assert!(!store.0.borrow().contains_key("run-error:1"));
 }
 
+#[test]
+fn what_a_run_from_a_computer_is_asked_for_that_it_does_not_have_is_said_as_that() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    // A run of one job and its working tree, on a control plane with nowhere to run it: its job fails, its record stays.
+    let tree = "tree-0123456789abcdef";
+    let made = run(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "tree": tree, "parts": 1 }).to_string())));
+    assert_eq!(made.status, 200, "{}", made.body_text());
+    let id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let record = || -> serde_json::Value { serde_json::from_str(&store.0.borrow()[&format!("run:{id}")]).unwrap() };
+    let token = record()["jobs"][0]["token"].as_str().unwrap().to_string();
+    let ask = |method: &str, path: &str| run(key(Request::new(method, &format!("{PLANE_URL}{path}"))));
+    // Its working tree: a part with nothing kept is empty; a piece that is no base64, or a part in a bucket of an AWS
+    // account this control plane does not have, is said.
+    let part = || run(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/superci/tree?part=0")));
+    assert_eq!((part().status, part().body.len()), (200, 0));
+    store.0.borrow_mut().insert(format!("rtree:{tree}:00000:000"), "!!".into());
+    assert_eq!(part().status, 500);
+    store.0.borrow_mut().insert(format!("rtree-s3:{tree}:00000"), "us-east-1|runs/x/00000".into());
+    assert_eq!(part().status, 409);
+    // Lines from a runner of no job here; lines that say no step (the step is the address's).
+    let lines = |t: &str| run(Request::new("POST", &format!("{PLANE_URL}/runner/{t}/_apis/distributedtask/hubs/Actions/plans/p/TimeLineWebConsoleLog/t/0a1b2c3d")).with_body(r#"{"value":["a line"]}"#));
+    assert_eq!(lines("no-such-runner-0123456789").status, 404);
+    assert_eq!(lines(&token).status, 200);
+    assert!(store.0.borrow().iter().any(|(k, v)| k.starts_with(&format!("rline:{token}:")) && v.contains("0a1b2c3d")));
+    // Its log, its artifacts, its status, its cancelling: of a run that is none, of a job that is none, of a step whose
+    // lines are asked for.
+    for path in ["/runs/x/log", "/runs/x/artifacts", "/runs/x", "/runs/x/cancel"] { assert_eq!(ask(if path.ends_with("cancel") { "POST" } else { "GET" }, path).status, 404, "{path}") }
+    assert_eq!(ask("GET", &format!("/runs/{id}/log?job=5&step=0a1b2c3d")).status, 404);
+    assert_eq!(ask("GET", &format!("/runs/{id}/log")).status, 400);
+    assert_eq!(ask("GET", &format!("/runs/{id}/log?job=5&log=1")).status, 404);
+    assert_eq!(ask("GET", &format!("/runs/{id}/log?job=0&step=0a1b2c3d&lines=1")).body_text(), "a line");
+    store.0.borrow_mut().entry(format!("run:{id}")).and_modify(|v| { let mut r: serde_json::Value = serde_json::from_str(v).unwrap(); r["jobs"][0].as_object_mut().unwrap().remove("token"); *v = r.to_string() });
+    assert_eq!(ask("GET", &format!("/runs/{id}/log?job=0&step=0a1b2c3d&lines=1")).status, 404, "a job with no runner's link has no lines");
+    // An artifact asked of a control plane with no AWS account.
+    store.0.borrow_mut().insert(format!("artifact:{id}:out"), serde_json::json!({ "id": "e1", "region": "us-east-1", "pieces": [["p00000", 5]], "size": 5, "made": 1, "done": true }).to_string());
+    let a = ask("GET", &format!("/runs/{id}/artifacts?name=out"));
+    assert_eq!((a.status, a.body_text()), (409, "this control plane has no AWS account".to_string()));
+    // A run kept without its jobs, or damaged.
+    store.0.borrow_mut().insert("run:77".into(), serde_json::json!({ "at_ms": 1_790_000_000_000u64 }).to_string());
+    assert_eq!(json(&ask("GET", "/runs/77"))["jobs"], serde_json::json!([]));
+    assert_eq!(json(&ask("POST", "/runs/77/cancel"))["cancelled"], true);
+    store.0.borrow_mut().insert("run:78".into(), "not a run".into());
+    assert_eq!(ask("POST", "/runs/78/cancel").status, 500);
+}
+
+/// A run of one job asked for on a control plane in AWS, with `meddle` doing what another request does meanwhile (see
+/// `Mem::meddling`): what it answered, and its store.
+fn run_meddled(workflow: &str, meddle: impl FnMut(&str, &str, &mut BTreeMap<String, String>) + 'static) -> (Response, Mem) {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    store.meddling(meddle);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let r = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1")
+        .with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string())));
+    (r, store)
+}
+
+#[test]
+fn a_run_taken_away_or_changed_by_another_request_while_it_is_moved_on_is_left_to_that_one() {
+    let one = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n";
+    // Gone (the upkeep removed it) as its first job was to start: nothing more is done of it.
+    let (r, store) = run_meddled(one, |op, k, m| if op == "swap" && k.starts_with("run:") { m.remove(k); });
+    assert_eq!(r.status, 200, "{}", r.body_text());
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("job:")), "no job started");
+    // A job whose start failed (its machine cannot be read), as another request takes the run away, damages it, ends
+    // the job, or keeps writing it: its start is not given back to the run, or given back once it can be.
+    let bad = "jobs:\n  a:\n    runs-on: superci/cpu=${{ ) }}\n    steps:\n      - run: echo\n";
+    let after_its_runner_went = |f: fn(&mut serde_json::Value) -> Option<String>| {
+        let gone = std::rc::Rc::new(std::cell::Cell::new(false));
+        run_meddled(bad, move |op, k, m| {
+            if op == "delete" && k.starts_with("rjob:") { gone.set(true) }
+            if gone.get() && (op == "get" || op == "swap") && k.starts_with("run:") {
+                let mut run: serde_json::Value = m.get(k).and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
+                match f(&mut run) { Some(v) => { m.insert(k.to_string(), v); } None => { m.remove(k); } }
+            }
+        })
+    };
+    for f in [(|_: &mut serde_json::Value| None) as fn(&mut serde_json::Value) -> Option<String>, |_| Some("not a run".into()),
+        |r| { r["jobs"][0]["state"] = "done".into(); Some(r.to_string()) }, |r| { r["changed"] = (r["changed"].as_u64().unwrap_or(0) + 1).into(); Some(r.to_string()) }] {
+        let (r, _) = after_its_runner_went(f);
+        assert!(r.status == 400 && r.body_text().contains("unexpected RParen"), "{} {}", r.status, r.body_text());
+    }
+    // Its cancelling, as the run is taken away: nothing here.
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    store.0.borrow_mut().insert("run:9".into(), serde_json::json!({ "at_ms": 1_790_000_000_000u64, "jobs": [{ "key": "a", "state": "pending" }] }).to_string());
+    store.meddling(|op, k, m| if op == "swap" && k == "run:9" { m.remove(k); });
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    assert_eq!(block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs/9/cancel")).with_header("authorization", "Bearer dashboard-session-key-1"))).status, 404);
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -5724,7 +5838,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         many_jobs_kept_before_their_indexes_are_indexed_and_counted_over_several_sweeps_and_damaged_ones_are_passed_over,
         a_runs_jobs_that_cannot_be_read_or_called_are_refused_saying_why,
         a_runs_called_workflows_and_expressions_are_read_as_github_reads_them,
-        a_damaged_or_gone_run_record_is_left_as_it_is_and_says_why_where_it_is_moved_on
+        a_damaged_or_gone_run_record_is_left_as_it_is_and_says_why_where_it_is_moved_on,
+        what_a_run_from_a_computer_is_asked_for_that_it_does_not_have_is_said_as_that,
+        a_run_taken_away_or_changed_by_another_request_while_it_is_moved_on_is_left_to_that_one
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
