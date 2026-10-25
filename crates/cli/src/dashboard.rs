@@ -2112,10 +2112,10 @@ impl Dashboard {
         let link = format!("{}/?k={}", self.base, self.key);
         println!("{}: {link}", match &self.task { Some(Task::Login(_)) => "Sign in with your cloud here (on this machine only)", Some(Task::GitHub { .. }) => "Create the GitHub App and choose its repositories here (on this machine only)", None => "SuperCI dashboard (on this machine only)" });
         if self.task.is_some() {
-            if open_browser { let _ = open::that(&link); }
+            if open_browser { open_link(&link) }
         } else if open_browser {
             println!("It is opening in your browser. Ctrl-C stops it; your runners keep working without it.");
-            let _ = open::that(&link);
+            open_link(&link);
         } else {
             println!("Ctrl-C stops it; your runners keep working without it.");
         }
@@ -6797,6 +6797,17 @@ impl Hub {
         if first.as_deref() == Some(name) || left.len() < 2 { *first = match left.as_slice() { [] => Some(crate::store::FIRST.to_string()), [only] => Some(only.clone()), _ => None } }
         Ok(match left.as_slice() { [only] => format!("/?w={only}&c="), [] => "/".to_string(), _ => "/workspaces".to_string() })
     }
+}
+
+/// The dashboard's page opened in the browser.
+#[cfg(not(debug_assertions))]
+fn open_link(link: &str) { let _ = open::that(link); }
+
+/// In a debug build, as the tests run it, only with the program SUPERCI_BROWSER names, and otherwise not at all: a test
+/// never opens a real browser (macOS's opener is no program a test can put first on the PATH).
+#[cfg(debug_assertions)]
+fn open_link(link: &str) {
+    if let Some(browser) = std::env::var_os("SUPERCI_BROWSER") { let _ = std::process::Command::new(browser).arg(link).status(); }
 }
 
 /// A GitHub organization's (or person's) picture, as github.com serves it to anyone: small, and as a `data:` address,

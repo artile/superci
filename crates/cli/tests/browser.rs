@@ -262,7 +262,7 @@ fn the_dashboard_and_a_task_open_in_the_browser_and_a_port_taken_is_said_as_it_s
     let served = serve(|_| {});
     served.connect_github();
     let home = signed_in(&served);
-    // A browser that notes what it is handed.
+    // A browser that notes what it is handed (SUPERCI_BROWSER: a debug build opens nothing else).
     let bin = common::temp("browser");
     let opened = bin.join("opened");
     std::fs::write(bin.join("xdg-open"), format!("#!/bin/sh\necho \"$1\" >> {}\n", opened.display())).unwrap();
@@ -285,7 +285,7 @@ fn the_dashboard_and_a_task_open_in_the_browser_and_a_port_taken_is_said_as_it_s
     // (The dashboard says its link, then that it opens; a task says its link alone.)
     for (args, says) in [(&["dashboard", "--workspace=default"][..], "It is opening in your browser"), (&["connections", "create", "github", "acme", "--workspace=default"], "Create the GitHub App and choose its repositories here")] {
         let _ = std::fs::remove_file(&opened);
-        let mut c = common::command(&home).args(args).env("SUPERCI_PORT", free().to_string()).env("PATH", &bin).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let mut c = common::command(&home).args(args).env("SUPERCI_PORT", free().to_string()).env("SUPERCI_BROWSER", bin.join("xdg-open")).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
         let said = first(&mut c, says).join("\n");
         let link = said.split_whitespace().find(|w| w.starts_with("http://localhost")).unwrap().to_string();
         until("the browser handed its link", || handed().contains(&link));
@@ -6840,9 +6840,16 @@ fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there(
     let routing: serde_json::Value = serde_json::from_str(&served.aws.settings(PLANE).into_iter().find(|(k, _)| k == "ROUTING").unwrap().1).unwrap();
     assert!(routing["order"].as_array().unwrap().iter().all(|p| p["cloud"] != "aws" && p["cloud"] != "aws-on-demand") && routing["rules"].as_array().unwrap().is_empty() && routing["aws_budget"].is_null(), "{routing}");
     // Said on the next page, with what could not be deleted there (AWS answering nothing): its role, its budget.
-    // (Read once, as the page's own first look reads it: a page that reads itself again shows it only until then.)
-    let (status, page) = common::part(&link, "/?p=runners&fragment=1");
-    assert!(status == 200 && page.contains("Removed AWS. Left:") && page.contains("its budget in AWS"), "{status}: {page}");
+    // (Read by this test alone, as the page's own look reads it: kept until a read takes it, and set only once what
+    // the removal tried in AWS has ended, which with AWS answering nothing takes its time on a slow runner.)
+    let said = std::cell::RefCell::new(String::new());
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while !said.borrow().contains("Removed AWS. Left:") {
+        assert!(std::time::Instant::now() < end, "never said: {}", said.borrow());
+        *said.borrow_mut() = common::part(&link, "/?p=runners&fragment=1").1;
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(said.borrow().contains("its budget in AWS"), "{}", said.borrow());
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
 }
