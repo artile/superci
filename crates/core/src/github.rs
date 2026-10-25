@@ -122,6 +122,11 @@ async fn gh(http: &dyn Http, api: &str, method: &str, path: &str, token: &str, b
     serde_json::from_slice(&r.body).map_err(|e| format!("GitHub {path}: {e}"))
 }
 
+/// A call made with the App's own key (a JWT of it, good for minutes).
+async fn as_app(http: &dyn Http, app: &App, method: &str, path: &str, now_ms: u64, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
+    gh(http, &app.api(), method, path, &app_jwt(app, now_ms)?, body).await
+}
+
 pub fn app_jwt(app: &App, now_ms: u64) -> Result<String> {
     let iat = now_ms / 1000 - 60;
     rs256_jwt(&serde_json::json!({ "iat": iat, "exp": iat + 540, "iss": app.id.to_string() }), &app.pem)
@@ -138,7 +143,7 @@ pub struct Installation {
 }
 
 pub async fn installations(http: &dyn Http, app: &App, now_ms: u64) -> Result<Vec<Installation>> {
-    let r = gh(http, &app.api(), "GET", "/app/installations", &app_jwt(app, now_ms)?, None).await?;
+    let r = as_app(http, app, "GET", "/app/installations", now_ms, None).await?;
     Ok(r.as_array().map(|a| a.iter().map(|i| Installation {
         id: i["id"].as_u64().unwrap_or_default(),
         account: i["account"]["login"].as_str().unwrap_or_default().to_string(),
@@ -149,29 +154,25 @@ pub async fn installations(http: &dyn Http, app: &App, now_ms: u64) -> Result<Ve
 
 /// The public repositories an installation can see (its jobs come only from repositories it is installed on).
 pub async fn public_repositories(http: &dyn Http, api: &str, token: &str) -> Result<Vec<String>> {
-    let mut out = vec![];
-    for page in 1..=10 {
+    // (Ten pages at most: a thousand repositories.)
+    let (mut out, mut page) = (vec![], 0);
+    loop {
+        page += 1;
         let r = gh(http, api, "GET", &format!("/installation/repositories?per_page=100&page={page}"), token, None).await?;
         let repos = r["repositories"].as_array().cloned().unwrap_or_default();
         out.extend(repos.iter().filter(|x| x["private"] == false).filter_map(|x| x["full_name"].as_str().map(str::to_string)));
-        if repos.len() < 100 { break }
+        if repos.len() < 100 || page == 10 { return Ok(out) }
     }
-    Ok(out)
-}
-
-/// The permissions the App asks for (as set in its settings; each installation accepts them).
-pub async fn app_permissions(http: &dyn Http, app: &App, now_ms: u64) -> Result<serde_json::Value> {
-    Ok(app_now(http, app, now_ms).await?["permissions"].clone())
 }
 
 /// The App as GitHub has it now: what it asks for, and its name and address (`slug`), which its owner can change on
 /// GitHub at any time.
 pub async fn app_now(http: &dyn Http, app: &App, now_ms: u64) -> Result<serde_json::Value> {
-    gh(http, &app.api(), "GET", "/app", &app_jwt(app, now_ms)?, None).await
+    as_app(http, app, "GET", "/app", now_ms, None).await
 }
 
 pub async fn installation_token(http: &dyn Http, app: &App, installation_id: u64, now_ms: u64) -> Result<String> {
-    let r = gh(http, &app.api(), "POST", &format!("/app/installations/{installation_id}/access_tokens"), &app_jwt(app, now_ms)?, Some(serde_json::json!({}))).await?;
+    let r = as_app(http, app, "POST", &format!("/app/installations/{installation_id}/access_tokens"), now_ms, Some(serde_json::json!({}))).await?;
     r["token"].as_str().map(str::to_string).ok_or_else(|| "installation token missing".into())
 }
 
@@ -228,7 +229,7 @@ pub async fn jit_config(http: &dyn Http, api: &str, token: &str, owner: &Owner, 
 
 /// Webhook deliveries that failed recently (the runtime was restarting, or timed out): their ids, for redelivery.
 pub async fn failed_deliveries(http: &dyn Http, app: &App, since_ms: u64, now_ms: u64) -> Result<Vec<(u64, String)>> {
-    let r = gh(http, &app.api(), "GET", "/app/hook/deliveries?per_page=100", &app_jwt(app, now_ms)?, None).await?;
+    let r = as_app(http, app, "GET", "/app/hook/deliveries?per_page=100", now_ms, None).await?;
     Ok(r.as_array().into_iter().flatten().filter(|d| {
         let code = d["status_code"].as_u64().unwrap_or(0);
         let at = d["delivered_at"].as_str().and_then(crate::aws::parse_iso_ms).unwrap_or(0);
@@ -240,14 +241,19 @@ pub async fn failed_deliveries(http: &dyn Http, app: &App, since_ms: u64, now_ms
 /// event would have carried it, and whether the repository is private. `started_too`: also the waiting jobs of runs
 /// of which another job has started.
 pub async fn waiting_jobs(http: &dyn Http, api: &str, token: &str, repo: &str, started_too: bool) -> Result<Vec<(serde_json::Value, bool)>> {
+    let mut out = waiting_in(http, api, token, repo, "queued").await?;
+    if started_too { out.extend(waiting_in(http, api, token, repo, "in_progress").await?) }
+    Ok(out)
+}
+
+/// The jobs that wait for a runner in a repository's runs of a status.
+async fn waiting_in(http: &dyn Http, api: &str, token: &str, repo: &str, status: &str) -> Result<Vec<(serde_json::Value, bool)>> {
     let mut out = vec![];
-    for status in if started_too { &["queued", "in_progress"][..] } else { &["queued"][..] } {
-        let runs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs?status={status}&per_page=10"), token, None).await?;
-        for run in runs["workflow_runs"].as_array().into_iter().flatten() {
-            let Some(id) = run["id"].as_u64() else { continue };
-            let jobs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{id}/jobs?per_page=50"), token, None).await?;
-            for job in jobs["jobs"].as_array().into_iter().flatten().filter(|j| j["status"] == "queued") { out.push((job.clone(), run["repository"]["private"] == true)) }
-        }
+    let runs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs?status={status}&per_page=10"), token, None).await?;
+    for run in runs["workflow_runs"].as_array().into_iter().flatten() {
+        let Some(id) = run["id"].as_u64() else { continue };
+        let jobs = gh(http, api, "GET", &format!("/repos/{repo}/actions/runs/{id}/jobs?per_page=50"), token, None).await?;
+        out.extend(jobs["jobs"].as_array().into_iter().flatten().filter(|j| j["status"] == "queued").map(|job| (job.clone(), run["repository"]["private"] == true)));
     }
     Ok(out)
 }
@@ -256,16 +262,15 @@ pub async fn waiting_jobs(http: &dyn Http, api: &str, token: &str, repo: &str, s
 /// it answered from (the status), and whether it was a second sending. With `id`: one of them whole, with the address
 /// it was sent to and what was answered.
 pub async fn deliveries(http: &dyn Http, app: &App, id: Option<u64>, now_ms: u64) -> Result<serde_json::Value> {
-    let jwt = app_jwt(app, now_ms)?;
     match id {
         Some(id) => {
-            let d = gh(http, &app.api(), "GET", &format!("/app/hook/deliveries/{id}"), &jwt, None).await?;
+            let d = as_app(http, app, "GET", &format!("/app/hook/deliveries/{id}"), now_ms, None).await?;
             let job = &d["request"]["payload"]["workflow_job"];
             Ok(serde_json::json!({ "id": d["id"], "event": d["event"], "action": d["action"], "delivered_at": d["delivered_at"], "status": d["status"], "status_code": d["status_code"], "redelivery": d["redelivery"], "duration": d["duration"],
                 "url": d["url"], "job": job["id"], "job_name": job["name"], "labels": job["labels"], "answer": d["response"]["payload"].as_str().map(|p| p.chars().take(600).collect::<String>()) }))
         }
         None => {
-            let list = gh(http, &app.api(), "GET", "/app/hook/deliveries?per_page=100", &jwt, None).await?;
+            let list = as_app(http, app, "GET", "/app/hook/deliveries?per_page=100", now_ms, None).await?;
             Ok(serde_json::Value::Array(list.as_array().into_iter().flatten().map(|d| serde_json::json!({ "id": d["id"], "event": d["event"], "action": d["action"], "delivered_at": d["delivered_at"], "status": d["status"], "status_code": d["status_code"], "redelivery": d["redelivery"], "duration": d["duration"] })).collect()))
         }
     }
@@ -273,16 +278,16 @@ pub async fn deliveries(http: &dyn Http, app: &App, id: Option<u64>, now_ms: u64
 
 /// Points the App's webhook at a control plane (moving to another one keeps the App and its installations).
 pub async fn set_webhook_url(http: &dyn Http, app: &App, url: &str, now_ms: u64) -> Result<()> {
-    gh(http, &app.api(), "PATCH", "/app/hook/config", &app_jwt(app, now_ms)?, Some(serde_json::json!({ "url": url, "content_type": "json" }))).await.map(|_| ())
+    as_app(http, app, "PATCH", "/app/hook/config", now_ms, Some(serde_json::json!({ "url": url, "content_type": "json" }))).await.map(|_| ())
 }
 
 /// Removes the App from an account it is installed on (stopping SuperCI: its jobs no longer come).
 pub async fn delete_installation(http: &dyn Http, app: &App, installation_id: u64, now_ms: u64) -> Result<()> {
-    gh(http, &app.api(), "DELETE", &format!("/app/installations/{installation_id}"), &app_jwt(app, now_ms)?, None).await.map(|_| ())
+    as_app(http, app, "DELETE", &format!("/app/installations/{installation_id}"), now_ms, None).await.map(|_| ())
 }
 
 pub async fn redeliver(http: &dyn Http, app: &App, delivery_id: u64, now_ms: u64) -> Result<()> {
-    gh(http, &app.api(), "POST", &format!("/app/hook/deliveries/{delivery_id}/attempts"), &app_jwt(app, now_ms)?, None).await.map(|_| ())
+    as_app(http, app, "POST", &format!("/app/hook/deliveries/{delivery_id}/attempts"), now_ms, None).await.map(|_| ())
 }
 
 /// A workflow run's status at GitHub ("queued", "in_progress", "completed").
@@ -401,7 +406,7 @@ pub fn our_job_among(payload: &serde_json::Value, bases: &[String], owner_login:
     let job = payload.get("workflow_job")?;
     let repo = payload["repository"]["full_name"].as_str()?;
     let installation_id = payload["installation"]["id"].as_u64()?;
-    if !repo.split('/').next()?.eq_ignore_ascii_case(owner_login) { return None; }
+    if !repo.split('/').next().unwrap_or_default().eq_ignore_ascii_case(owner_login) { return None; }
     let labels: Vec<&str> = job["labels"].as_array()?.iter().filter_map(|l| l.as_str()).collect();
     let mut ours = labels.iter().filter_map(|l| Spec::parse_among(l, bases).map(|s| (l.to_string(), s)));
     let (label, spec) = ours.next()?;
@@ -495,5 +500,64 @@ mod tests {
         assert!(our_job(&event(serde_json::json!(["superci", "superci/cpu=8"]), "acme/app"), "superci", "acme").is_none());
         assert!(our_job(&event(serde_json::json!(["superci"]), "other/app"), "superci", "acme").is_none());
         assert!(valid_login("acme-corp") && !valid_login("-x") && !valid_login("a b") && !valid_login(""));
+    }
+
+    /// GitHub as a test has it answer each request: an answer, or a connection that failed.
+    struct Answers(fn(&Request) -> Result<crate::io::Response>);
+    #[async_trait::async_trait(?Send)]
+    impl Http for Answers {
+        async fn send(&self, r: Request) -> Result<crate::io::Response> { (self.0)(&r) }
+    }
+    fn answer(status: u16, body: serde_json::Value) -> Result<crate::io::Response> { Ok(crate::io::Response::new(status, "application/json", body.to_string())) }
+    fn run<T>(f: impl std::future::Future<Output = T>) -> T { futures::executor::block_on(f) }
+    const API: &str = "https://api.github.com";
+
+    #[test]
+    fn what_github_answers_amiss_is_said_as_that() {
+        use rsa::pkcs1::EncodeRsaPrivateKey;
+        let app = |pem: String| App { id: 1, slug: "a".into(), pem, webhook_secret: "s".into(), owner: "acme".into(), owner_is_org: true, host: None };
+        // An App whose key is none signs nothing; an answer that is no JSON; a token that is not in it.
+        assert!(run(installations(&Answers(|_| answer(200, serde_json::json!([]))), &app("not a key".into()), 1_790_000_000_000)).is_err());
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap().to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap().to_string();
+        let real = app(key);
+        assert!(run(installations(&Answers(|_| Ok(crate::io::Response::new(200, "application/json", "not json"))), &real, 1_790_000_000_000)).unwrap_err().starts_with("GitHub /app/installations: "));
+        assert_eq!(run(installation_token(&Answers(|_| answer(201, serde_json::json!({}))), &real, 42, 1_790_000_000_000)).unwrap_err(), "installation token missing");
+        // Deliveries without their ids are passed over.
+        let failed = run(failed_deliveries(&Answers(|_| answer(200, serde_json::json!([{ "event": "workflow_job", "status_code": 502, "delivered_at": "2026-09-21T00:00:00Z" }, { "id": 5, "event": "workflow_job", "status_code": 502, "delivered_at": "2026-09-21T00:00:00Z" }]))), &real, 0, 1_790_000_000_000)).unwrap();
+        assert!(failed.is_empty());
+        // A job's log: not reached, none yet, refused, or moved without saying where.
+        let gone = |r: fn(&Request) -> Result<crate::io::Response>| run(job_log(&Answers(r), API, "t", "acme/app", 7));
+        assert!(gone(|_| Err("connection reset".into())).is_err());
+        assert!(gone(|_| answer(404, serde_json::json!({}))).unwrap_err().contains("no log for it yet"));
+        assert!(gone(|_| Ok(crate::io::Response::new(302, "text/plain", ""))).unwrap_err().contains("did not say where"));
+        let link = |r: fn(&Request) -> Result<crate::io::Response>| run(job_log_link(&Answers(r), API, "t", "acme/app", 7));
+        assert!(link(|_| answer(404, serde_json::json!({}))).unwrap_err().contains("no log for it yet"));
+        assert_eq!(link(|_| answer(500, serde_json::json!({}))).unwrap_err(), "GitHub would not give its log: 500");
+        assert!(link(|_| Ok(crate::io::Response::new(302, "text/plain", ""))).unwrap_err().contains("did not say where"));
+        // A runner made with no configuration; a job with no status.
+        assert_eq!(run(jit_config(&Answers(|_| answer(201, serde_json::json!({}))), API, "t", &Owner { org: true, login: "acme".into() }, "acme/app", "r", &["superci"], "/w")).unwrap_err(), "no runner config");
+        assert_eq!(run(job_state(&Answers(|_| answer(200, serde_json::json!({}))), API, "t", "acme/app", 7)).unwrap_err(), "no job status");
+    }
+
+    #[test]
+    fn a_repositorys_waiting_jobs_and_public_repositories_are_read_page_after_page() {
+        // A run listed without its id; a run with no job waiting.
+        let waiting = run(waiting_jobs(&Answers(|r| if r.url.contains("/runs?") { answer(200, serde_json::json!({ "workflow_runs": [{ "name": "no id" }, { "id": 9 }] })) } else { answer(200, serde_json::json!({ "jobs": [{ "id": 1, "status": "in_progress" }] })) }), API, "t", "acme/app", true)).unwrap();
+        assert!(waiting.is_empty());
+        // A thousand repositories at most, a hundred a page; fewer, the last page.
+        let full = run(public_repositories(&Answers(|_| answer(200, serde_json::json!({ "repositories": vec![serde_json::json!({ "full_name": "acme/x", "private": false }); 100] }))), API, "t")).unwrap();
+        assert_eq!(full.len(), 1000);
+        assert_eq!(run(public_repositories(&Answers(|_| answer(200, serde_json::json!({ "repositories": [{ "full_name": "acme/x", "private": false }, { "full_name": "acme/y", "private": true }] }))), API, "t")).unwrap(), ["acme/x"]);
+    }
+
+    #[test]
+    fn an_event_missing_what_a_job_has_is_none_of_ours() {
+        let full = serde_json::json!({ "action": "queued", "workflow_job": { "id": 7, "labels": ["superci"] }, "repository": { "full_name": "acme/app" }, "installation": { "id": 42 } });
+        assert!(our_job(&full, "superci", "acme").is_some());
+        for (at, field) in [(None, "workflow_job"), (Some("repository"), "full_name"), (None, "installation"), (Some("workflow_job"), "labels"), (None, "action"), (Some("workflow_job"), "id")] {
+            let mut e = full.clone();
+            match at { Some(a) => { e[a].as_object_mut().unwrap().remove(field); } None => { e.as_object_mut().unwrap().remove(field); } }
+            assert!(our_job(&e, "superci", "acme").is_none(), "{at:?} {field}");
+        }
     }
 }
