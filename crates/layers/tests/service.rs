@@ -695,8 +695,13 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     let tar = tar_of("hello", b"from the store");
     let Some(erofs) = erofs_of(&tar) else { eprintln!("no mkfs.erofs here: skipped"); return };
     let d = digest(&tar);
-    let (p, at) = plane([(format!("{d}.erofs"), erofs.clone()), (format!("{d}.blob"), tar.clone())].into_iter().collect());
-    let index = serde_json::json!({ "layers": { &d: { "size": tar.len(), "erofs": { "url": format!("{at}/files/{d}.erofs"), "size": erofs.len() }, "blob": { "url": format!("{at}/files/{d}.blob") } } }, "refresh": { "url": format!("{at}/links"), "token": "" } });
+    // (A second layer of the image, fetched ahead as the last run used it, and a third the store has, fetched ahead too.)
+    let (tar2, tar3) = (tar_of("second", b"the image's other layer"), tar_of("third", b"another"));
+    let (erofs2, erofs3) = (erofs_of(&tar2).unwrap(), erofs_of(&tar3).unwrap());
+    let (d2, d3) = (digest(&tar2), digest(&tar3));
+    let (p, at) = plane([(format!("{d}.erofs"), erofs.clone()), (format!("{d}.blob"), tar.clone()), (format!("{d2}.erofs"), erofs2.clone()), (format!("{d3}.erofs"), erofs3.clone())].into_iter().collect());
+    let entry = |d: &str, size: usize, erofs: &[u8], ahead: bool| serde_json::json!({ "size": size, "erofs": { "url": format!("{at}/files/{d}.erofs"), "size": erofs.len() }, "blob": { "url": format!("{at}/files/{d}.blob") }, "ahead": ahead, "usage": { "size": 4096, "inodes": 2 } });
+    let index = serde_json::json!({ "layers": { &d: entry(&d, tar.len(), &erofs, false), &d2: entry(&d2, tar2.len(), &erofs2, true), &d3: entry(&d3, tar3.len(), &erofs3, true) }, "refresh": { "url": format!("{at}/links"), "token": "" } });
     // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself, which tmpfs is not.)
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("superci-layers-served-{}", std::process::id()));
     let _ = rooted(&prefix, "rm").arg("-rf").arg(&dir).status();
@@ -709,7 +714,7 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     let ch = connect(&dir.join("layers.sock")).await;
     let mut snap = sapi::snapshots_client::SnapshotsClient::new(ch.clone());
     let layer = sapi::PrepareSnapshotRequest { key: "moby/1/extract-1".into(), labels: [("containerd.io/snapshot.ref".to_string(), "chain-1".to_string()),
-        ("containerd.io/snapshot/cri.layer-digest".to_string(), d.clone()), ("containerd.io/snapshot/cri.image-layers".to_string(), d.clone())].into_iter().collect(), ..Default::default() };
+        ("containerd.io/snapshot/cri.layer-digest".to_string(), d.clone()), ("containerd.io/snapshot/cri.image-layers".to_string(), format!("{d},,{d2},sha256:{}", "9".repeat(64)))].into_iter().collect(), ..Default::default() };
     assert_eq!(snap.prepare(layer.clone()).await.unwrap_err().code(), Code::AlreadyExists, "{}", log());
     assert!(log().contains(&format!("{d} from the store in")), "{}", log());
     // Made known in its namespace, in containerd.
@@ -724,6 +729,13 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+    // One of an image whose layers are not named, under a key of no namespace: served, nothing made known.
+    let mut bare = layer.clone();
+    bare.key = "/extract-3".into();
+    bare.labels.remove("containerd.io/snapshot/cri.image-layers");
+    bare.labels.insert("containerd.io/snapshot.ref".into(), "chain-3".into());
+    bare.labels.insert("containerd.io/snapshot/cri.layer-digest".into(), d3.clone());
+    assert_eq!(snap.prepare(bare).await.unwrap_err().code(), Code::AlreadyExists, "{}", log());
     // Asked again (another pull of it): found served.
     let mut again = layer.clone();
     again.key = "moby/1/extract-2".into();
@@ -736,15 +748,27 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     assert_eq!(c.info(capi::InfoRequest { digest: d.clone() }).await.unwrap().into_inner().info.unwrap().size, tar.len() as i64);
     assert_eq!(read_all(&mut c, &d, 0, 0).await.unwrap(), tar);
     assert!(p.lock().unwrap().asked.iter().any(|a| a.starts_with(&format!("GET /files/{d}.blob"))));
+    // A blob neither kept nor served: not found.
+    assert_eq!(c.info(capi::InfoRequest { digest: digest(b"nobody's") }).await.unwrap_err().code(), Code::NotFound);
+    assert_eq!(read_all(&mut c, &digest(b"nobody's"), 0, 0).await.unwrap_err().code(), Code::NotFound);
     // Restarted: mounted again from its file; with its file gone, fetched again; with the index not having it either,
     // let go, said why.
     // (Named by its layer: the folder is root's own.)
     let file = dir.join("root/files").join(format!("{}.erofs", &d[7..]));
-    for (gone, index) in [(false, index.clone()), (true, index.clone()), (true, serde_json::json!({ "layers": {} }))] {
+    // (Restarted mounted as it was; then unmounted, from its file; its file gone (fetched again); its file not an EROFS
+    // file (not mounted, said); gone and the store not giving it (said); gone, and the index not having it.)
+    stop(&prefix, &mut child);
+    child = launch_rooted(&prefix, &dir, &csock);
+    for (step, index) in [("", index.clone()), ("gone", index.clone()), ("garbage", index.clone()), ("unfetchable", index.clone()), ("gone", serde_json::json!({ "layers": {} }))] {
         stop(&prefix, &mut child);
         let mounted = std::fs::read_to_string("/proc/self/mounts").unwrap().lines().filter(|l| l.contains(dir.to_str().unwrap()) && l.contains(" erofs ")).map(|l| l.split(' ').nth(1).unwrap().to_string()).collect::<Vec<_>>();
         for m in &mounted { let _ = rooted(&prefix, "umount").args(["-l", m]).status(); }
-        if gone { let _ = rooted(&prefix, "rm").arg("-f").arg(&file).status(); }
+        match step {
+            "gone" => { let _ = rooted(&prefix, "rm").arg("-f").arg(&file).status(); }
+            "garbage" => { let _ = rooted(&prefix, "sh").args(["-c", &format!("echo garbage > {}", file.display())]).status(); }
+            "unfetchable" => { let _ = rooted(&prefix, "rm").arg("-f").arg(&file).status(); p.lock().unwrap().files.remove(&format!("{d}.erofs")); }
+            _ => {}
+        }
         std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
         child = launch_rooted(&prefix, &dir, &csock);
     }

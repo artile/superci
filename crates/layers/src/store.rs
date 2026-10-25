@@ -352,7 +352,7 @@ impl StoreSide {
     fn prune_files(&self) {
         let used: std::collections::HashSet<String> = self.served.lock().unwrap().values().map(|s| s.digest.clone()).collect();
         let kept: std::collections::HashSet<String> = self.erofs.lock().unwrap().keys().cloned().collect();
-        let Ok(entries) = std::fs::read_dir(&self.files) else { return };
+        let Ok(entries) = crate::faults::check(std::fs::read_dir(&self.files)) else { return };
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let hex = name.split('.').next().unwrap_or_default();

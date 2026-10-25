@@ -231,6 +231,9 @@ fn tar_of(name: &str, body: &[u8]) -> Vec<u8> {
 /// The served scenario's service as root on `dir` (`fault`, if any), its socket opened to the test; `None` when a fault
 /// as it starts ended it (said, not by a panic).
 fn start_rooted(prefix: &[&str], dir: &std::path::Path, fault: Option<usize>, count: &std::path::Path) -> Option<Child> {
+    // (Each start counts its steps in a file of its own: a fault is counted from a program's start.)
+    static STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let count = &count.with_extension(STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst).to_string());
     let socket = dir.join("layers.sock");
     let _ = Command::new(prefix.first().copied().unwrap_or("rm")).args(if prefix.is_empty() { vec![] } else { prefix[1..].iter().map(|s| s.to_string()).chain(["rm".to_string()]).collect() }).args(["-f".as_ref(), socket.as_os_str()]).status();
     let mut env = vec![("SUPERCI_LAYERS_FAULTS".to_string(), count.display().to_string())];
@@ -238,7 +241,7 @@ fn start_rooted(prefix: &[&str], dir: &std::path::Path, fault: Option<usize>, co
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")).unwrap();
     let mut child = rooted(prefix, env!("CARGO_BIN_EXE_superci-layers"), &env)
         .args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", socket.display()),
-            format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("none.sock").display()), "--parallel=2".into()])
+            format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("containerd.sock").display()), "--parallel=2".into()])
         .stderr(log).spawn().unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     while !socket.exists() {
@@ -286,7 +289,25 @@ async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Chi
     let mut s = sapi::snapshots_client::SnapshotsClient::new(ch);
     for k in ["moby/0/top", "moby/1/top", "moby/0/a/superci-layers", "moby/1/a/superci-layers"] { let _ = step("remove", s.remove(sapi::RemoveSnapshotRequest { key: k.into(), ..Default::default() })).await?; }
     let _ = step("cleanup", s.cleanup(sapi::CleanupRequest::default())).await?;
+    // Restarted once more: what a removal under a fault left is put right.
+    stop_rooted(prefix, child);
+    if let Some(next) = start_rooted(prefix, dir, fault, count) { *child = next }
     Ok(())
+}
+
+/// A containerd of the test's own as root on `dir`, the program its content store (as `setup` makes a machine's),
+/// where there is one.
+fn own_containerd(prefix: &[&str], dir: &std::path::Path) -> Option<Child> {
+    if !Command::new("containerd").arg("--version").output().is_ok_and(|o| o.status.success()) { return None }
+    let config = superci_layers::setup::containerd_config("version = 2\n").unwrap().replace("/run/superci-layers.sock", dir.join("layers.sock").to_str().unwrap());
+    std::fs::write(dir.join("containerd.toml"), config).unwrap();
+    let mut c = Command::new(prefix.first().copied().unwrap_or("containerd"));
+    if !prefix.is_empty() { c.args(&prefix[1..]).arg("containerd"); }
+    let child = c.args(["--config".as_ref(), dir.join("containerd.toml").as_os_str(), "--address".as_ref(), dir.join("containerd.sock").as_os_str(), "--root".as_ref(), dir.join("containerd-root").as_os_str(), "--state".as_ref(), dir.join("containerd-state").as_os_str()])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok()?;
+    let until = Instant::now() + Duration::from_secs(20);
+    while !dir.join("containerd.sock").exists() { assert!(Instant::now() < until, "containerd did not start"); std::thread::sleep(Duration::from_millis(20)) }
+    Some(child)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -304,12 +325,14 @@ async fn the_served_store_holds_with_each_call_and_store_operation_failing() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
         let count = dir.join("count");
+        let mut containerd = own_containerd(&prefix, &dir);
         let done = match start_rooted(&prefix, &dir, fault, &count) {
             None => Ok(()),
             Some(mut child) => { let r = served_scenario(&prefix, &dir, &mut child, fault, &count, &d).await; stop_rooted(&prefix, &mut child); r }
         };
+        if let Some(c) = &mut containerd { stop_rooted(&prefix, c) }
         let log = std::fs::read_to_string(dir.join("log")).unwrap_or_default();
-        let steps: usize = std::fs::read_to_string(&count).unwrap_or_default().trim().parse().unwrap_or(0);
+        let steps: usize = std::fs::read_dir(&dir).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("count.")).map(|e| std::fs::read_to_string(e.path()).unwrap_or_default().trim().parse().unwrap_or(0)).max().unwrap_or(0);
         let mut clean = Command::new(prefix.first().copied().unwrap_or("sh"));
         if !prefix.is_empty() { clean.args(&prefix[1..]).arg("sh"); }
         // (Each mount under the folder: one there is not unmounted with the folder, which is no mount itself.)
