@@ -49,6 +49,7 @@ fn every_change_that_needs_aws_says_so_while_aws_does_not_renew_its_sign_in() {
     let networks = "us-east-1 subnet-0123456789abcdef0 sg-0123456789abcdef0";
     for (path, fields) in [
         ("/runners/aws-own", &[][..]),
+        ("/name", &[("name", "Acme CI")]),
         ("/runners/remove", &[("cloud", "aws"), ("stop", "on")]),
         ("/plane/aws", &[("region", "us-east-1")]),
         ("/aws/image", &[("region", "us-east-1")]),
@@ -97,6 +98,8 @@ fn until(what: &str, holds: impl Fn() -> bool) {
 fn every_change_that_needs_cloudflare_says_so_while_cloudflare_does_not_renew_its_sign_in() {
     let served = serve(|_| {});
     served.connect_github();
+    // (Its runners a launcher's in Cloudflare, not containers of its own.)
+    served.aws.params.lock().unwrap().remove(&format!("/superci/{}/CONTAINERS", superci_testkit::PLANE));
     let home = common::signed_in(&served);
     as_cloudflare(&home, &served);
     beside(&home, serde_json::json!([{ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci-other", "url": "http://127.0.0.1:9", "plane_id": "cfplane00009", "label": "superci" } }]));
@@ -201,5 +204,170 @@ fn sign_ins_that_modal_does_not_start_or_cloudflare_does_not_finish_say_why() {
     served.aws.fail("dash.cloudflare.com/oauth2/token", 500, r#"{"error":"server_error"}"#, None);
     let (status, _, said) = ask("GET", &format!("/oauth/callback?code=a-code-from-cloudflare&state={state}"));
     assert!(status >= 400 && common::words(&said).contains("server_error"), "{status} {}", common::words(&said));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A server that answers every request with these bytes and closes: a site that answers as it should not.
+fn answering_with(bytes: &'static [u8]) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || for mut s in listener.incoming().flatten() {
+        use std::io::{Read, Write};
+        let mut buf = [0u8; 4096];
+        let _ = s.read(&mut buf);
+        let _ = s.write_all(bytes);
+    });
+    url
+}
+
+/// A workspace whose control plane is the served one kept as Cloudflare's, signed in to Cloudflare only (what it
+/// writes goes to the Worker's secrets, which that control plane does not read).
+fn cloudflare_only(served: &Served) -> std::path::PathBuf {
+    let home = common::signed_in(served);
+    as_cloudflare(&home, served);
+    kept_as(&home, |k| { k.as_object_mut().unwrap().remove("aws"); k["cloudflare"] = cloudflare_signed_in(); });
+    home
+}
+
+/// A change written to the Worker's secrets of a control plane that reads its settings elsewhere: never shown, so
+/// said as not taken (its own network, its regions, Cloudflare's location and image); and its containers that cannot
+/// be switched off say so, its settings for runs going nowhere.
+#[test]
+fn a_change_the_control_plane_does_not_show_is_said_as_not_taken() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = cloudflare_only(&served);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0"), ("SUPERCI_PAUSE_MS", "1")]);
+    for fields in [
+        &[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-0123456789abcdef0 sg-0123456789abcdef0")][..],
+        &[("action", "pool"), ("cloud", "aws"), ("region_0", "eu-north-1")],
+        &[("action", "pool"), ("cloud", "cloudflare"), ("location", "weur")],
+        &[("action", "account"), ("cloud", "cloudflare"), ("image", "https://images.example.com/full")],
+    ] {
+        let (status, said) = sent(&link, "/routing", fields);
+        assert!(status >= 400 && said.contains("did not show it within twenty seconds"), "{fields:?}: {status} {said}");
+    }
+    served.aws.fail("/secrets|\"CONTAINERS\"", 500, CF_FAILED, None);
+    let (status, said) = sent(&link, "/runners/remove", &[("cloud", "cloudflare"), ("stop", "on")]);
+    assert!(status >= 400 && said.contains("Internal server error"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Stopping SuperCI beside another CI and a control plane that serves nothing: the other CI goes on, and so does the
+/// one that serves nothing (it may be that CI's to move to). Beside one alone that cannot be deleted: said.
+#[test]
+fn leaving_beside_another_ci_leaves_it_and_says_what_could_not_go() {
+    for beside_a_ci in [true, false] {
+        let served = serve(|_| {});
+        served.connect_github();
+        // (Another CI: GitHub's App connected, as its settings say.)
+        served.aws.put("/superci/testplane0002/GITHUB_APP", &superci_testkit::GitHub::app().to_string());
+        let aws = served.aws.clone();
+        let ci = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+        let spare = superci_testkit::serve_as("testplane0003", |_| {});
+        let home = common::signed_in(&served);
+        let at = |url: &str, id: &str| serde_json::json!({ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": url, "plane_id": id, "label": "superci" } });
+        let mut more = vec![at(&spare.url, "testplane0003")];
+        if beside_a_ci { more.push(at(&ci.url, "testplane0002")) }
+        beside(&home, serde_json::Value::Array(more));
+        // (From its page, as kept: a command looks in the account first, where the test kit lists none of these.)
+        let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+        let (_, said) = sent(&link, "/plane/leave?c=testplane0001", &[("confirm", "superci")]);
+        if beside_a_ci { assert!(said.contains("That control plane is stopped") && said.contains("serves a code host of its own"), "{said}") }
+        // (Neither could be deleted here: the test kit's AWS does not answer for their schedules.)
+        else { assert!(said.contains("SuperCI is stopped") && said.matches("has no answer").count() == 2, "{said}") }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// GitHub's App made again for the organization connected already, while the control plane's cloud will not keep
+/// it; one made for another organization; and one whose control plane is gone when GitHub comes back.
+#[test]
+fn an_app_made_on_github_that_cannot_be_kept_says_so() {
+    let served = serve(|_| {});
+    served.connect_github();
+    let home = common::signed_in(&served);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0"), ("SUPERCI_PAUSE_MS", "1")]);
+    let made = || {
+        let (status, _, form) = common::post(&link, "/github/start", &[("gh-where", "public"), ("host", ""), ("login", "acme")]);
+        assert_eq!(status, 200, "{}", common::words(&form));
+        let state = form.split("state=").nth(1).unwrap().split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap().to_string();
+        state
+    };
+    let back = |state: &str| { let (status, _, said) = common::get(&link, &format!("/github/callback?code=a1b2c3d4e5f6&state={state}")); (status, common::words(&said)) };
+    served.aws.fail("AmazonSSM.PutParameter|GITHUB_APP", 500, &superci_testkit::json_error("InternalServerError", "An internal error occurred. Try again."), None);
+    let (status, said) = back(&made());
+    assert!(status >= 400 && said.contains("internal error"), "the first one's place: {status} {said}");
+    // Another organization's, beside it.
+    let app = superci_testkit::GitHub::app();
+    served.github.answer_with("POST", "api.github.com/app-manifests/", 201, &[], &serde_json::json!({ "id": 3003, "slug": "superci-globex", "owner": { "login": "globex", "id": 9920, "type": "Organization" },
+        "name": "SuperCI globex", "html_url": "https://github.com/apps/superci-globex", "events": ["workflow_job"], "webhook_secret": app["webhook_secret"], "pem": app["pem"] }).to_string());
+    let (status, said) = back(&made());
+    assert!(status >= 400 && said.contains("internal error"), "beside it: {status} {said}");
+    served.aws.fail_none();
+    // Signed out meanwhile: no control plane to keep it in.
+    let state = made();
+    assert_eq!(common::post(&link, "/signout", &[]).0, 303);
+    let (status, said) = back(&state);
+    assert!(status >= 400 && said.contains("no control plane yet"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The workspace's picture, which GitHub does not give (no answer, or one cut short): left out, the page as it was.
+#[test]
+fn a_picture_github_does_not_give_is_left_out() {
+    for pictures in ["http://127.0.0.1:9".to_string(), answering_with(b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 1000\r\nconnection: close\r\n\r\nshort")] {
+        let served = serve(|_| {});
+        served.connect_github();
+        let home = common::signed_in(&served);
+        let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PICTURES_AT", pictures.as_str())]);
+        for _ in 0..3 { assert_eq!(common::part(&link, "/?p=overview&fragment=1").0, 200); std::thread::sleep(std::time::Duration::from_millis(300)) }
+        let about: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/workspace.json")).unwrap_or_default()).unwrap_or_default();
+        assert!(about["picture"].as_str().is_none_or(str::is_empty), "{about}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// `superci dashboard` opens its page in the browser; asked for a port that is Cloudflare's own and taken, it says so.
+#[test]
+fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    // A browser that notes what it is handed (macOS's `open`, Linux's `xdg-open`).
+    let bin = common::temp("browser");
+    let opened = bin.join("opened");
+    for name in ["open", "xdg-open"] {
+        std::fs::write(bin.join(name), format!("#!/bin/sh\necho \"$1\" >> {}\n", opened.display())).unwrap();
+        std::fs::set_permissions(bin.join(name), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string();
+    let mut c = common::command(&home).args(["dashboard", "--workspace=default"]).env("SUPERCI_PORT", &port).env("PATH", &bin).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
+    let mut said = String::new();
+    while !said.contains("It is opening in your browser") { let mut l = String::new(); if std::io::BufRead::read_line(&mut out, &mut l).unwrap_or(0) == 0 { break } said.push_str(&l) }
+    let _ = c.kill();
+    let _ = c.wait();
+    assert!(said.contains("It is opening in your browser"), "{said}");
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port().to_string();
+    let o = common::command(&home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", &port).env("SUPERCI_OAUTH_PORT", &port).output().unwrap();
+    assert!(!o.status.success() && String::from_utf8_lossy(&o.stderr).contains(&format!("port {port} is in use")), "{}", String::from_utf8_lossy(&o.stderr));
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
+/// A read key made while the control plane answers to anyone and not with its status: said as not answering.
+#[test]
+fn a_key_is_not_made_while_the_control_plane_does_not_give_its_status() {
+    let served = serve(|_| {});
+    let plane = superci_testkit::front(&served.url, |method, target, status, body| {
+        if method == "GET" && target.starts_with("/status") { return (500, br#"{"error":"busy"}"#.to_vec()) }
+        (status, body)
+    });
+    *served.aws.plane_url.lock().unwrap() = plane.clone();
+    let home = common::signed_in(&served);
+    common::kept_at(&home, &plane);
+    let (ok, said) = common::superci_in_time(&home, &["keys", "create", "agent"], &[("SUPERCI_PAUSE_MS", "1")], 60);
+    assert!(!ok && said.contains("The control plane did not answer"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
