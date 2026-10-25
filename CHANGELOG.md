@@ -8,6 +8,8 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A GitHub job's end that the control plane could not keep is kept when GitHub sends the event again. Its runner was forgotten before the end was kept, so the event sent again found no job. Update your control plane for it.
 - A job of a run from a computer whose start failed midway is started again by the control plane's upkeep. It stayed "started" with nothing started, and the run never ended. Update your control plane for it.
 - A run from a computer refused when it is created leaves nothing behind. Its record was kept, and the upkeep started the run anyway after `superci runs create` had said it failed. Update your control plane for it.
+- A job's cache or artifact is not lost to a passing failure: the control plane failing to read the job's token for a moment (its store, or GitHub's keys) is answered as a failure the machine asks again, not as a refusal it takes as final. Update your control plane for it.
+- A Docker layer a machine uploaded is kept when the control plane fails partway through taking it (its store, or S3 checking the upload): its record stays until the layer is being converted, and a conversion is noted before it is asked for. Such a layer was lost, or left "being converted" until it timed out, and the next job pulled it again. Update your control plane for it.
 
 ## 0.19.19 — 2026-10-21
 - A control plane asked for a job's log by an id that is no job's, or of a GitLab by a name that is none, answers 400 with what was wrong (it answered 500, as if it had failed itself). Update your control plane for it.
