@@ -107,7 +107,7 @@ fn start(fault: Option<usize>, count: &std::path::Path, at: &str, stored: &str) 
 async fn step<T>(what: &str, f: impl std::future::Future<Output = T>) -> Result<T, String> { tokio::time::timeout(Duration::from_secs(20), f).await.map_err(|_| format!("{what}: no answer within 20 s")) }
 
 /// The scenario: what containerd asks of the content store and the snapshots, a stored layer used, `keep` after.
-async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, stored: &str) -> Result<(), String> {
+async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, stored: &str, fault: Option<usize>) -> Result<(), String> {
     use capi::WriteAction::*;
     let Ok(channel) = step("connect", superci_layers::client::channel(socket)).await? else { return Ok(()) };
     let mut c = capi::content_client::ContentClient::new(channel.clone());
@@ -132,6 +132,7 @@ async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, sto
     let d512 = format!("sha512:{}", sha2::Sha512::digest(&big).iter().map(|x| format!("{x:02x}")).collect::<String>());
     let _ = step("rehash", async { let mut a = c.write(tokio_stream::iter(vec![msg(Write, "r5", 0, "", 0, &big), msg(Commit, "r5", big.len() as i64, &d512, big.len() as i64, b"")])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
     let _ = step("labels whole", c.update(capi::UpdateRequest { info: Some(capi::Info { digest: d512.clone(), labels: [("a".to_string(), "1".to_string())].into_iter().collect(), ..Default::default() }), update_mask: None })).await?;
+    let _ = step("labels none", c.update(capi::UpdateRequest { info: Some(capi::Info { digest: d512.clone(), labels: HashMap::new(), ..Default::default() }), update_mask: None })).await?;
     let _ = step("statuses", c.list_statuses(capi::ListStatusesRequest { filters: vec![] })).await?;
     let _ = step("abort", c.abort(capi::AbortRequest { r#ref: "r2".into() })).await?;
     let _ = step("delete", c.delete(capi::DeleteContentRequest { digest: d.clone() })).await?;
@@ -155,8 +156,12 @@ async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, sto
     let pulled = b"a pulled layer".repeat(50);
     let _ = step("pull", async { let mut a = c.write(tokio_stream::iter(vec![msg(Commit, "pull-1", pulled.len() as i64, &digest(&pulled), 0, &pulled)])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
     let _ = step("pulled layer", s.prepare(layer("moby/2/extract-2", &digest(&pulled)))).await?;
-    let keep = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", socket.display()),
-        format!("--content={}", dir.join("content").display()), format!("--index={}", dir.join("index.json").display()), "--most=20".into()]).output().unwrap();
+    let mut keep = Command::new(env!("CARGO_BIN_EXE_superci-layers"));
+    keep.args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", socket.display()),
+        format!("--content={}", dir.join("content").display()), format!("--index={}", dir.join("index.json").display()), "--most=20".into()]);
+    // (Under the same fault, counted from its own start.)
+    if let Some(k) = fault { keep.env("SUPERCI_LAYERS_FAULT", k.to_string()); }
+    let keep = keep.output().unwrap();
     if String::from_utf8_lossy(&keep.stderr).contains("panicked") { return Err(format!("keep panicked: {}", String::from_utf8_lossy(&keep.stderr))) }
     Ok(())
 }
@@ -168,7 +173,7 @@ async fn the_service_holds_with_each_call_and_store_operation_failing() {
     let count = std::env::temp_dir().join(format!("superci-layers-sweep-count-{}", std::process::id()));
     let (run, socket) = start(None, &count, &at, &stored).expect("the clean run starts");
     let dir = run.dir.clone();
-    scenario(&socket, &dir, &at, &stored).await.unwrap();
+    scenario(&socket, &dir, &at, &stored, None).await.unwrap();
     let (log, panicked) = run.stop();
     assert!(!panicked, "{log}");
     let steps: usize = std::fs::read_to_string(&count).unwrap_or_default().trim().parse().unwrap_or(0);
@@ -182,7 +187,7 @@ async fn the_service_holds_with_each_call_and_store_operation_failing() {
         let faulted = std::env::temp_dir().join(format!("superci-layers-sweep-count-{}-{k}", std::process::id()));
         let Some((run, socket)) = start(Some(k), &faulted, &at, &stored) else { continue };
         let dir = run.dir.clone();
-        let done = scenario(&socket, &dir, &at, &stored).await;
+        let done = scenario(&socket, &dir, &at, &stored, Some(k)).await;
         let (log, panicked) = run.stop();
         if panicked || done.is_err() { broke.push(format!("step {k}: {done:?}\n{}", log.lines().rev().take(8).collect::<Vec<_>>().join("\n"))) }
         let _ = std::fs::remove_file(&faulted);
@@ -289,9 +294,9 @@ async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Chi
     let mut s = sapi::snapshots_client::SnapshotsClient::new(ch);
     for k in ["moby/0/top", "moby/1/top", "moby/0/a/superci-layers", "moby/1/a/superci-layers"] { let _ = step("remove", s.remove(sapi::RemoveSnapshotRequest { key: k.into(), ..Default::default() })).await?; }
     let _ = step("cleanup", s.cleanup(sapi::CleanupRequest::default())).await?;
-    // Restarted once more: what a removal under a fault left is put right.
+    // Restarted once more, with no fault: what a removal under one left is put right.
     stop_rooted(prefix, child);
-    if let Some(next) = start_rooted(prefix, dir, fault, count) { *child = next }
+    if let Some(next) = start_rooted(prefix, dir, None, count) { *child = next }
     Ok(())
 }
 
