@@ -317,6 +317,21 @@ async fn its_snapshots_are_containerds_overlay() {
     for k in ["ns/1/b", "ns/1/v", "ns/1/base"] { c.remove(sapi::RemoveSnapshotRequest { key: k.into(), ..Default::default() }).await.unwrap(); }
     assert_eq!(c.stat(sapi::StatSnapshotRequest { key: "ns/1/base".into(), ..Default::default() }).await.unwrap_err().code(), Code::NotFound);
     c.cleanup(sapi::CleanupRequest::default()).await.unwrap();
+    // A snapshot for a container in a user namespace: its files owned by the namespace's root (as root; otherwise that
+    // ownership is refused); mappings written amiss, or without the namespace's root, refused.
+    let mapped = |key: &str, uid: &str, gid: Option<&str>| {
+        let mut labels: HashMap<String, String> = [("containerd.io/snapshot/uidmapping".to_string(), uid.to_string())].into_iter().collect();
+        if let Some(g) = gid { labels.insert("containerd.io/snapshot/gidmapping".into(), g.into()); }
+        sapi::PrepareSnapshotRequest { key: key.into(), labels, ..Default::default() }
+    };
+    let root = unsafe { libc::geteuid() } == 0;
+    match c.prepare(mapped("ns/2/mapped", "0:100000:65536", Some("+0: 100000: 65536"))).await {
+        Ok(m) => { use std::os::unix::fs::MetadataExt; assert!(root); assert_eq!(std::fs::metadata(&m.into_inner().mounts[0].source).unwrap().uid(), 100000) }
+        Err(e) => assert!(!root && e.message().contains("failed to chown"), "{e:?}"),
+    }
+    for (i, (uid, gid)) in [("a:b", None), ("0:1", None), ("0:1:", None), ("0:-1:5", None), ("0:4294967295:1", None), ("1:5:10", None), ("0:5:1", Some("1:5:10"))].into_iter().enumerate() {
+        assert!(c.prepare(mapped(&format!("ns/2/bad{i}"), uid, gid)).await.is_err(), "{uid} {gid:?}");
+    }
 }
 
 /// SuperCI's store and control plane for the test, on one port: files by ranges (`/files/…`), links to a layer's

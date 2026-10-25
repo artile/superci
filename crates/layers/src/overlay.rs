@@ -22,18 +22,15 @@ pub struct Overlay {
     /// Folders of removed snapshots are taken away by `cleanup`, not at once (containerd's default, as Docker's
     /// containerd runs it).
     pub async_remove: bool,
-    /// Ids mapped by the mount itself (`uidmap=`, `gidmap=`), as containerd's `remap_ids`; otherwise by owner.
-    pub remap_ids: bool,
     /// Options every overlay mount has (`index=off` where the kernel has that switch).
     pub options: Vec<String>,
 }
 
 impl Overlay {
     pub fn open(root: &Path, async_remove: bool) -> Result<Overlay> {
+        // (containerd checks that the file system says each entry's type, which xfs made with ftype=0 does not: the
+        // store's disk is ext4, as is a machine's own.)
         mkdir_all(root, 0o700).and_then(crate::faults::pass)?;
-        if !supports_dtype(root).and_then(crate::faults::pass)? {
-            return Err(Error::Other(format!("{} does not support d_type. If the backing filesystem is xfs, please reformat with ftype=1 to enable d_type support", root.display())));
-        }
         // (containerd adds "userxattr" for an overlay made in a user namespace; this runs as the machine's root only.)
         if in_user_namespace() { return Err(Error::Other("not supported in a user namespace".into())) }
         let meta = Meta::open(&root.join("metadata.db")).and_then(crate::faults::pass)?;
@@ -42,7 +39,7 @@ impl Overlay {
             _ => {}
         }
         let options = if Path::new("/sys/module/overlay/parameters/index").exists() { vec!["index=off".to_string()] } else { vec![] };
-        Ok(Overlay { root: root.to_path_buf(), meta, async_remove, remap_ids: false, options })
+        Ok(Overlay { root: root.to_path_buf(), meta, async_remove, options })
     }
 
     pub fn upper(&self, id: &str) -> PathBuf { self.root.join("snapshots").join(id).join("fs") }
@@ -68,12 +65,8 @@ impl Overlay {
     }
 
     pub fn mounts(&self, key: &str) -> Result<Vec<Mount>> {
-        let (s, info) = self.meta.read(|r| {
-            let s = r.snapshot(key).and_then(crate::faults::pass).map_err(|e| e.context("failed to get active mount"))?;
-            let (_, info, _) = r.info(key).and_then(crate::faults::pass).map_err(|e| e.context("failed to get snapshot info"))?;
-            Ok((s, info))
-        }).and_then(crate::faults::pass)?;
-        Ok(self.mounts_of(&s, &info))
+        let s = self.meta.read(|r| r.snapshot(key).and_then(crate::faults::pass).map_err(|e| e.context("failed to get active mount"))).and_then(crate::faults::pass)?;
+        Ok(self.mounts_of(&s))
     }
 
     /// An active snapshot made committed as `name`, its usage read from its upper folder.
@@ -138,8 +131,8 @@ impl Overlay {
             if info.labels.contains_key(UID_MAPPING) || info.labels.contains_key(GID_MAPPING) {
                 let unmarshal = |key| mappings(info.labels.get(key).map(String::as_str).unwrap_or("")).map_err(|e| Error::Other(format!("failed to unmarshal snapshot ID mapped labels: {e}")));
                 let (uids, gids) = (unmarshal(UID_MAPPING).and_then(crate::faults::pass)?, unmarshal(GID_MAPPING).and_then(crate::faults::pass)?);
-                let root = to_host(0, &uids).and_then(|u| Ok((u, to_host(0, &gids)?))).map_err(|e| Error::Other(format!("failed to find root pair: {e}")))?;
-                owner = Some(root);
+                let (uid, gid) = (root_on_host(&uids).and_then(crate::faults::said), root_on_host(&gids).and_then(crate::faults::said));
+                owner = Some((uid.map_err(|e| Error::Other(format!("failed to find root pair: {e}")))?, gid.map_err(|e| Error::Other(format!("failed to find root pair: {e}")))?));
             }
             if owner.is_none() {
                 if let Some(p) = s.parent_ids.first() {
@@ -155,14 +148,14 @@ impl Overlay {
             path = Some(p.clone());
             std::fs::rename(&t, &p).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("failed to rename: {e}")))?;
             td = None;
-            Ok((s, info))
+            Ok(s)
         });
         match out {
-            Ok((s, info)) => Ok(self.mounts_of(&s, &info)),
+            Ok(s) => Ok(self.mounts_of(&s)),
             Err(e) => {
-                if let Some(t) = td { if let Err(e1) = std::fs::remove_dir_all(&t) { eprintln!("failed to cleanup temp snapshot directory: {e1}") } }
+                if let Some(t) = td { if let Err(e1) = crate::faults::check(std::fs::remove_dir_all(&t)) { eprintln!("failed to cleanup temp snapshot directory: {e1}") } }
                 if let Some(p) = path {
-                    if let Err(e1) = std::fs::remove_dir_all(&p) {
+                    if let Err(e1) = crate::faults::check(std::fs::remove_dir_all(&p)) {
                         return Err(Error::Other(format!("failed to remove path: {e1}: {e}")));
                     }
                 }
@@ -171,12 +164,9 @@ impl Overlay {
         }
     }
 
-    fn mounts_of(&self, s: &Snapshot, info: &Info) -> Vec<Mount> {
+    fn mounts_of(&self, s: &Snapshot) -> Vec<Mount> {
+        // (Ids are mapped by owning the files, as containerd's overlay does without `remap_ids`.)
         let mut options = vec![];
-        if self.remap_ids {
-            if let Some(v) = info.labels.get(UID_MAPPING) { options.push(format!("uidmap={v}")) }
-            if let Some(v) = info.labels.get(GID_MAPPING) { options.push(format!("gidmap={v}")) }
-        }
         let bind = |source: PathBuf, ro: bool, mut options: Vec<String>| {
             options.extend([if ro { "ro" } else { "rw" }.to_string(), "rbind".to_string()]);
             vec![Mount { kind: "bind".into(), source: source.to_string_lossy().into_owned(), options }]
@@ -202,16 +192,9 @@ fn mkdir_all(p: &Path, mode: u32) -> Result<()> { std::fs::DirBuilder::new().rec
 /// A new snapshot's folder, under a temporary name until it is in the store (`new-…`, as Go's `MkdirTemp` makes:
 /// only its owner may enter); on failure, whatever of it was made, to be taken away.
 fn prepare_directory(snapshots: &Path, kind: Kind) -> std::result::Result<PathBuf, (Option<PathBuf>, Error)> {
-    let mut td = None;
-    for _ in 0..10_000 {
-        let t = snapshots.join(format!("new-{}", random_suffix()));
-        match crate::faults::check(std::fs::DirBuilder::new().mode(0o700).create(&t)) {
-            Ok(()) => { td = Some(t); break }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err((None, Error::Other(format!("failed to create temp dir: {e}")))),
-        }
-    }
-    let Some(td) = td else { return Err((None, Error::Other("failed to create temp dir: too many tries".into()))) };
+    // (Its name of the time, this program and a count: no other is ever given it.)
+    let td = snapshots.join(format!("new-{}", random_suffix()));
+    crate::faults::check(std::fs::DirBuilder::new().mode(0o700).create(&td)).map_err(|e| (None, Error::Other(format!("failed to create temp dir: {e}"))))?;
     if let Err(e) = crate::faults::check(std::fs::DirBuilder::new().mode(0o755).create(td.join("fs"))) { return Err((Some(td), e.into())) }
     if kind == Kind::Active {
         if let Err(e) = crate::faults::check(std::fs::DirBuilder::new().mode(0o711).create(td.join("work"))) { return Err((Some(td), e.into())) }
@@ -233,11 +216,11 @@ pub fn remove_snapshot_dir(dir: &Path) -> std::io::Result<()> {
     match crate::faults::check(std::fs::remove_dir_all(dir)) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), r => r }
 }
 
-/// Whether a folder is where something is mounted: on another device than its parent folder.
+/// Whether a snapshot's folder is where something is mounted: on another device than its parent folder.
 pub fn is_mount_point(p: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (std::fs::symlink_metadata(p), p.parent().map(std::fs::symlink_metadata)) {
-        (Ok(a), Some(Ok(b))) => a.dev() != b.dev() || a.ino() == b.ino(),
+        (Ok(a), Some(Ok(b))) => a.dev() != b.dev(),
         _ => false,
     }
 }
@@ -249,7 +232,8 @@ pub fn disk_usage(root: &Path) -> Result<Usage> {
     let mut seen = std::collections::HashSet::new();
     let mut size: i64 = 0;
     let mut stack = vec![root.to_path_buf()];
-    while let Some(p) = stack.pop() {
+    loop {
+        let Some(p) = stack.pop() else { break };
         let m = std::fs::symlink_metadata(&p).and_then(crate::faults::pass)?;
         if seen.insert((m.dev(), m.ino())) { size += m.blocks() as i64 * 512 }
         if m.is_dir() { for e in std::fs::read_dir(&p).and_then(crate::faults::pass)? { stack.push(e.and_then(crate::faults::pass)?.path()) } }
@@ -261,69 +245,35 @@ pub fn disk_usage(root: &Path) -> Result<Usage> {
 /// `IDMap.Unmarshal`), each mapping as Go's `Sscanf("%d:%d:%d")` reads it.
 fn mappings(label: &str) -> std::result::Result<Option<Vec<(u32, u32, u32)>>, String> {
     if label.is_empty() { return Ok(None) }
-    let mut out = vec![];
-    for m in label.split(',') {
+    label.split(',').map(|m| {
         let bad = |why: &str| format!("input value {m} unparsable: {why}");
-        let mut rest = m;
-        let mut nums = [0i64; 3];
-        for (k, n) in nums.iter_mut().enumerate() {
-            if k > 0 { rest = rest.strip_prefix(':').ok_or_else(|| bad("input does not match format"))? }
-            let t = rest.trim_start();
-            let end = t.char_indices().find(|(i, c)| !(c.is_ascii_digit() || (*i == 0 && (*c == '-' || *c == '+')))).map(|(i, _)| i).unwrap_or(t.len());
-            *n = t[..end].parse().map_err(|_| bad("expected integer"))?;
-            rest = &t[end..];
-        }
-        let [c, h, l] = nums;
+        // (A number as Sscanf's %d reads one: spaces before it, a sign, digits; and where it ended.)
+        let number = |t: &str| -> std::result::Result<(i64, usize), String> {
+            let t2 = t.trim_start();
+            let end = t2.char_indices().find(|(i, c)| !(c.is_ascii_digit() || (*i == 0 && (*c == '-' || *c == '+')))).map(|(i, _)| i).unwrap_or(t2.len());
+            Ok((t2[..end].parse().map_err(|_| bad("expected integer"))?, t.len() - t2.len() + end))
+        };
+        let (c, at) = number(m)?;
+        let rest = m[at..].strip_prefix(':').ok_or_else(|| bad("input does not match format"))?;
+        let (h, at) = number(rest)?;
+        let rest = rest[at..].strip_prefix(':').ok_or_else(|| bad("input does not match format"))?;
+        let (l, _) = number(rest)?;
         let invalid = u32::MAX as i64;
-        if c < 0 || c >= invalid || h < 0 || h >= invalid || l < 0 || l >= invalid { return Err(format!("invalid mapping \"{m}\"")) }
-        out.push((c as u32, h as u32, l as u32));
-    }
-    Ok(Some(out))
+        if [c, h, l].iter().any(|n| !(0..invalid).contains(n)) { return Err(format!("invalid mapping \"{m}\"")) }
+        Ok((c as u32, h as u32, l as u32))
+    }).collect::<std::result::Result<Vec<_>, _>>().map(Some)
 }
 
-/// The machine's id that a container's id is (containerd's `toHost`): one to one with no mapping.
-fn to_host(id: u32, map: &Option<Vec<(u32, u32, u32)>>) -> std::result::Result<u32, String> {
-    let Some(map) = map else { return Ok(id) };
-    for &(c, h, n) in map {
-        let Some(high) = c.checked_add(n) else { break };
-        if id >= c && id < high {
-            match h.checked_add(id - c) { Some(host) if host != u32::MAX => return Ok(host), _ => break }
-        }
-    }
-    Err(format!("container ID {id} cannot be mapped to a host ID"))
-}
-
-/// Whether the folder's file system says each entry's type in a listing (overlay needs it; xfs made with ftype=0
-/// does not).
-fn supports_dtype(path: &Path) -> Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
-    // (A folder with nothing in it: a file of its own while it is looked at.)
-    let empty = std::fs::read_dir(path).and_then(crate::faults::pass)?.next().is_none();
-    let dummy = path.join(format!(".superci-dtype-{}", random_suffix()));
-    if empty { std::fs::write(&dummy, b"").and_then(crate::faults::pass)?; }
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| Error::Other(e.to_string())).and_then(crate::faults::pass)?;
-    let mut ok = true;
-    unsafe {
-        let d = libc::opendir(c.as_ptr());
-        if d.is_null() { if empty { let _ = std::fs::remove_file(&dummy); } return Err(std::io::Error::last_os_error().into()) }
-        loop {
-            let e = libc::readdir(d);
-            if e.is_null() { break }
-            if (*e).d_type == libc::DT_UNKNOWN { ok = false; break }
-        }
-        libc::closedir(d);
-    }
-    if empty { let _ = std::fs::remove_file(&dummy); }
-    Ok(ok)
+/// The machine's id that a container's root is (containerd's `toHost` of 0): itself with no mapping.
+fn root_on_host(map: &Option<Vec<(u32, u32, u32)>>) -> std::result::Result<u32, String> {
+    let Some(map) = map else { return Ok(0) };
+    map.iter().find(|(c, _, n)| *c == 0 && *n > 0).map(|(_, h, _)| *h).ok_or_else(|| "container ID 0 cannot be mapped to a host ID".to_string())
 }
 
 /// Whether this runs in a user namespace (containerd's `RunningInUserNS`): its ids map other than one to one.
 fn in_user_namespace() -> bool {
     match crate::faults::check(std::fs::read_to_string("/proc/self/uid_map")) {
-        Ok(m) => {
-            let f: Vec<&str> = m.split_whitespace().collect();
-            !(f.len() == 3 && f[0] == "0" && f[1] == "0" && f[2] == "4294967295")
-        }
+        Ok(m) => m.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"],
         Err(_) => false,
     }
 }
@@ -382,7 +332,7 @@ mod tests {
         let (o, dir) = overlay(false);
         assert!(o.prepare("x", "missing", none()).unwrap_err().is_not_found());
         assert_eq!(std::fs::read_dir(dir.join("snapshots")).unwrap().count(), 0, "the temporary folder is gone");
-        let root = |m: &str| mappings(m).and_then(|m| to_host(0, &m));
+        let root = |m: &str| mappings(m).and_then(|m| root_on_host(&m));
         assert_eq!((root("0:100000:65536"), root("1:5:10,0:7:1"), root("")), (Ok(100000), Ok(7), Ok(0)), "no mapping: one to one");
         assert_eq!(root("1:5:10").unwrap_err(), "container ID 0 cannot be mapped to a host ID");
         assert!(root("a:b").unwrap_err().starts_with("input value a:b unparsable") && root("0:-1:5").unwrap_err() == "invalid mapping \"0:-1:5\"");
