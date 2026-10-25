@@ -1857,12 +1857,13 @@ impl Dashboard {
             for p in v.order().iter().filter(|p| !p.off && superci_core::plane::account_of(&p.cloud) == "aws") {
                 let what = if p.cloud == superci_core::plane::AWS_ON_DEMAND { "on-demand" } else { "spot" };
                 let regions = v.pool_regions(p);
-                for (i, r) in regions.iter().enumerate() {
+                // (Never none: a pool with none of its own goes to all of the control plane's, at least its own region.)
+                regions.iter().enumerate().for_each(|(i, r)| {
                     // (Spot goes where a job costs least, the first favoured; on-demand in order.)
                     let said = match (regions.len(), i, what) { (1, ..) => what.to_string(), (_, 0, "spot") => "spot, favoured".to_string(), (_, _, "spot") => "spot when cheaper".to_string(),
                         (_, 0, _) => format!("{what} first"), _ => format!("{what} when {} has none", region_short(&regions[i - 1])) };
                     match in_use.iter_mut().find(|(x, _)| x == r) { Some((_, u)) => u.push(said), None => in_use.push((r.clone(), vec![said])) }
-                }
+                });
             }
         }
         // What AWS lets it run on spot at once in a region, as last asked.
@@ -9785,7 +9786,7 @@ mod rest_tests {
     #[test]
     fn changes_to_a_control_plane_elsewhere_go_by_what_it_says() {
         // Its AWS account as its status says it: not signed in to it, AWS's permissions and budget are not changed.
-        let mut d = modal_answering(serde_json::json!({ "aws": { "account_id": "222222222222" }, "routing": {}, "account_limits": true, "daily_limits": true }));
+        let mut d = modal_answering(serde_json::json!({ "aws": { "account_id": "222222222222" }, "routing": { "public_repos": ["acme/*"] }, "account_limits": true, "daily_limits": true }));
         let r = send(&mut d, "/permissions/aws", &[("plane", "p2")]).unwrap();
         assert!(r.status == 403 && words_of(&r).contains("Sign in to account 222222222222"), "{}", words_of(&r));
         let r = send(&mut d, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "100"), ("budget", "emails")]).unwrap();
@@ -10020,5 +10021,66 @@ mod rest_tests {
         assert_eq!(status, 404, "a control plane not kept here: {said}");
         assert_eq!(hub.remove("globex").unwrap(), "/?w=acme&c=");
         assert_eq!(hub.first().as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn on_demand_regions_are_said_in_their_order_beside_spots() {
+        let mut d = Dashboard::new();
+        d.aws = Some(aws::Session::for_test_until("111111111111", u64::MAX));
+        let look = aws::Look { regions: REGIONS.iter().map(|r| (r.to_string(), aws::Answer::Allowed)).collect(), asked_in: Some("us-east-1".into()), spot: Some(aws::Answer::Allowed), on_demand: Some(aws::Answer::Allowed),
+            spot_cpus: Some(96), on_demand_cpus: Some(64), images: vec![], organization_id: None, management_account: None };
+        d.aws_looks.insert("111111111111".into(), (now_ms(), look));
+        let status = serde_json::json!({ "aws": { "account_id": "111111111111", "region": "us-east-1", "connected": true }, "aws_regions": ["us-east-1", "us-east-2", "us-west-2"],
+            "routing": { "order": [{ "cloud": "aws", "regions": ["us-east-1", "us-east-2", "us-west-2"] }, { "cloud": "aws-on-demand", "regions": ["us-east-2", "us-west-2"] }] } });
+        let v = PlaneView { aws: true, ..seen_as(Plane::Aws { account_id: "111111111111".into(), region: "us-east-1".into(), url: NOWHERE.into(), plane_id: "p0".into(), label: "superci".into() }, status) };
+        let section = plain(&d.aws_account_section_for(Some(&v)));
+        assert!(section.contains("Spot when cheaper · on-demand first") && section.contains("Spot when cheaper · on-demand when Ohio has none"), "{section}");
+    }
+
+    #[test]
+    fn rarer_states_of_keys_runs_machines_caches_and_places_are_said() {
+        let mut d = Dashboard::new();
+        // Keys ending today and in some days; one used by a run key.
+        let keys = plain(&d.keys_card(Some(&serde_json::json!({ "read": [{ "name": "TODAY", "until_ms": now_ms() + 3_600_000 }, { "name": "LATER", "until_ms": now_ms() + 5 * 86_400_000 + 60_000, "runs": true }] }))));
+        assert!(keys.contains("ends today") && keys.contains("5 more days") && keys.contains("Run key"), "{keys}");
+        let card = plain(&secrets_card(Some(&serde_json::json!({ "now_ms": 120_000, "secrets": [{ "name": "NPM_TOKEN", "said": "every run", "updated_ms": 1, "used": { "at_ms": 60_000, "by": "AGENT", "run_key": true } }] }))));
+        assert!(card.contains("started by the key agent"), "{card}");
+        // Runs that passed, failed and were cancelled.
+        for (state, word) in [("done", "Passed"), ("failed", "Failed"), ("cancelled", "Cancelled")] {
+            d.run_shown = ("acme/web".into(), "7".into(), String::new());
+            let mut job = serde_json::json!({ "job_id": 1, "run_id": 7, "repo": "acme/web", "state": state, "at_ms": now_ms(), "name": "test" });
+            if state == "done" { job["conclusion"] = "success".into() }
+            let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [job] }));
+            assert!(d.run_page(Some(&v)).contains(word), "{state}");
+        }
+        // A disk at a speed of its own; a week's usage with none.
+        let card = plain(&machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "machine": { "disk_mibs": 500 } }))).0);
+        assert!(card.contains("500 MiB/s disk"), "{card}");
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [], "usage": { "day": { "jobs": 0 } } }));
+        assert!(plain(&overview_cards(&v, &[serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": 1 })], "day")).contains("No jobs in the last 24 hours"));
+        // Docker's images kept, and Cloudflare's place where its location is not said.
+        let v = PlaneView { aws: true, ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "routing": {} })) };
+        assert!(plain(&cache_card(&v, Some(&serde_json::json!({ "now_ms": 1, "repos": [], "images": { "layers": 3, "bytes": 2_000_000 } })))).contains("3 layers kept now (2.0 MB)."));
+        let v = seen_as(cf_plane("p1", NOWHERE), serde_json::json!({ "cloudflare_location": null, "containers": true, "routing": { "order": [{ "cloud": "cloudflare" }] } }));
+        assert!(pools_card(&v, &HashMap::new(), None, None, None).contains(r#"<option value="enam" selected>"#));
+        // What GitHub's App asks for anew of a control plane from before versions were said.
+        let first = PlaneView { version: Some("0.0.1".into()), ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "gitlab": { "url": "https://gitlab.com" } })) };
+        assert!(new_needs(&first, &[]).iter().any(|(cloud, _)| *cloud == "gitlab"));
+    }
+
+    #[test]
+    fn a_workspace_renamed_from_where_none_is_named_is_the_first_and_forgetting_them_leaves_the_rest_listed() {
+        let f = Folder::new("hub-forget");
+        for w in ["acme", "globex", "initech"] { Store::under(&f.0, w).make().unwrap() }
+        let hub = hub_at(Some(f.0.clone()), Some("acme"));
+        let (status, said) = ask(&hub, "/workspaces/rename", "id=umbrella");
+        assert!(status < 400, "{status} {said}");
+        assert_eq!(hub.first().as_deref(), Some("umbrella"));
+        // The first forgotten with two left: none is first; then the rest, to none.
+        assert_eq!(hub.remove("umbrella").unwrap(), "/workspaces");
+        assert_eq!(hub.first(), None);
+        assert_eq!(hub.remove("globex").unwrap(), "/?w=initech&c=");
+        assert_eq!(hub.remove("initech").unwrap(), "/");
+        assert_eq!(hub.first().as_deref(), Some(crate::store::FIRST));
     }
 }
