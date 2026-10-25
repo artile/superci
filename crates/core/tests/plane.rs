@@ -6417,6 +6417,57 @@ fn a_gpu_job_refused_spot_for_the_accounts_limit_with_on_demand_turned_off_says_
     assert!(e.contains("L-3819A6DF") && !e.contains("L-DB2E81BA"), "{e}");
 }
 
+#[test]
+fn logs_and_trees_kept_in_a_bucket_this_control_plane_can_no_longer_reach_are_passed_over_or_said() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(t));
+    let mut config = Config::new(PLANE_ID.into());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    // A run's job: a step's log in the bucket (no AWS account connected now) and one in the store; a step still going.
+    let step = "0a1b2c3d-0000-0000-0000-000000000000";
+    {
+        let mut m = store.0.borrow_mut();
+        m.insert("run:41".into(), serde_json::json!({ "at_ms": t, "jobs": [{ "key": "a", "state": "started", "job_id": "9", "token": "tok-0123456789abcdef" }] }).to_string());
+        m.insert("job:9".into(), serde_json::json!({ "job_id": 9, "run_id": 41, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 0, "cloud": "aws", "seen_in_progress": true, "provider": "local", "local": "tok-0123456789abcdef" }).to_string());
+        m.insert("rjob:tok-0123456789abcdef".into(), serde_json::json!({ "message": {}, "job_id": 9, "at_ms": t, "steps": [{ "type": "Task", "id": step, "name": "Going", "order": 1, "state": "inProgress" }, { "type": "Task", "id": "s2", "name": "Done", "order": 2, "log": 2, "state": "completed" }] }).to_string());
+        m.insert("rlog:tok-0123456789abcdef:0002:0000".into(), "s3:us-east-1".into());
+        m.insert("rlog:tok-0123456789abcdef:0003:0000".into(), "s3:us east-1".into());
+        // A page its machine sent of the step going, partly: no whole line yet.
+        m.insert(format!("glive:9:tl_{step}_1.log:0000000000000:000"), STANDARD.encode("2026-10-16T21:18:46.0000000Z no end"));
+    }
+    assert_eq!(block_on(plane.handle(key(get("/runs/41/log?job=0&log=2")))).body.len(), 0, "in a bucket it cannot read: nothing");
+    let steps = json(&block_on(plane.handle(key(get("/job/log?id=9&steps")))));
+    assert_eq!(steps["steps"].as_array().map(|s| s.len()), Some(2), "{steps}");
+    assert_eq!(json(&block_on(plane.handle(key(get("/job/log?id=9&link")))))["urls"], serde_json::Value::Null);
+    // A tree kept in the bucket, in the old way (its region alone), gone after a day though AWS cannot be asked.
+    store.0.borrow_mut().insert("rtree-s3:tree-0123456789abcdef:00000".into(), "us-east-1".into());
+    store.0.borrow_mut().insert("rtree-at:tree-0123456789abcdef".into(), t.to_string());
+    clock.0.set(t + 2 * 86_400_000);
+    block_on(plane.alarm()).unwrap();
+    assert!(!store.0.borrow().contains_key("rtree-s3:tree-0123456789abcdef:00000"));
+}
+
+#[test]
+fn a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_as_they_are() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    store.0.borrow_mut().insert("job:7".into(), serde_json::json!({ "job_id": 7, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+    // Two pages: one with lines whose times are no times (the same line in both), one with no whole line.
+    let odd = "2026-1X-16T21:18:46.0000000Z odd time\n";
+    store.0.borrow_mut().insert("glive:7:tl_a_1.log:0000000000000:000".into(), STANDARD.encode(odd));
+    store.0.borrow_mut().insert("glive:7:tl_b_1.log:0000000000000:000".into(), STANDARD.encode(format!("{odd}{odd}")));
+    store.0.borrow_mut().insert("glive:7:tl_c_1.log:0000000000000:000".into(), STANDARD.encode("2026-10-16T21:18:46.0000000Z cut"));
+    let log = json(&block_on(plane.handle(get("/job/log?id=7").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    assert!(log["log"].as_str().is_some_and(|l| l.contains("odd time") && !l.contains(" cut")), "{log}");
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6571,7 +6622,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_is_there,
         a_runs_jobs_end_as_their_runners_say_or_when_they_run_out_of_time_or_are_cancelled,
         a_role_aws_will_not_let_this_control_plane_take_leaves_what_needs_it_undone_or_estimated,
-        a_gpu_job_refused_spot_for_the_accounts_limit_with_on_demand_turned_off_says_which_limit_to_raise
+        a_gpu_job_refused_spot_for_the_accounts_limit_with_on_demand_turned_off_says_which_limit_to_raise,
+        logs_and_trees_kept_in_a_bucket_this_control_plane_can_no_longer_reach_are_passed_over_or_said,
+        a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_as_they_are
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
