@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(m.read(|r| r.snapshot("c")).unwrap(), c);
         assert!(matches!(m.read(|r| r.snapshot("a")), Err(Error::FailedPrecondition(_))));
         // Taken twice; a parent with children stays; children first.
-        assert!(m.write(|w| w.create(Kind::Active, "c", "", BTreeMap::new())).unwrap_err().is_already_exists());
+        assert!(m.write(|w| w.create(Kind::Active, "c", "", BTreeMap::new())).unwrap_err().to_string().ends_with("already exists"));
         assert_eq!(m.write(|w| w.remove("a")).unwrap_err(), Error::FailedPrecondition("cannot remove snapshot with child".into()));
         assert_eq!(m.write(|w| w.remove("c")).unwrap(), ("3".to_string(), Kind::View));
         m.write(|w| w.remove("b")).unwrap();

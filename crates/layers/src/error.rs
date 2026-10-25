@@ -10,9 +10,6 @@ pub enum Error {
     FailedPrecondition(String),
     InvalidArgument(String),
     Unavailable(String),
-    OutOfRange(String),
-    DataLoss(String),
-    Unimplemented(String),
     /// Anything else (a file that could not be read, a mount that failed): gRPC's Unknown, as containerd sends it.
     Other(String),
 }
@@ -22,22 +19,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
     /// The same kind of error, its message after `what` ("failed to remove snapshot x: …").
     pub fn context(self, what: impl fmt::Display) -> Error {
-        let w = |m: String| format!("{what}: {m}");
+        // (An error with nothing of its own to say says only what it is about.)
+        let w = |m: String| if m.is_empty() { what.to_string() } else { format!("{what}: {m}") };
         match self {
             Error::NotFound(m) => Error::NotFound(w(m)),
             Error::AlreadyExists(m) => Error::AlreadyExists(w(m)),
             Error::FailedPrecondition(m) => Error::FailedPrecondition(w(m)),
             Error::InvalidArgument(m) => Error::InvalidArgument(w(m)),
             Error::Unavailable(m) => Error::Unavailable(w(m)),
-            Error::OutOfRange(m) => Error::OutOfRange(w(m)),
-            Error::DataLoss(m) => Error::DataLoss(w(m)),
-            Error::Unimplemented(m) => Error::Unimplemented(w(m)),
             Error::Other(m) => Error::Other(w(m)),
         }
     }
 
     pub fn is_not_found(&self) -> bool { matches!(self, Error::NotFound(_)) }
-    pub fn is_already_exists(&self) -> bool { matches!(self, Error::AlreadyExists(_)) }
 }
 
 impl fmt::Display for Error {
@@ -48,12 +42,9 @@ impl fmt::Display for Error {
             Error::FailedPrecondition(m) => (m, "failed precondition"),
             Error::InvalidArgument(m) => (m, "invalid argument"),
             Error::Unavailable(m) => (m, "unavailable"),
-            Error::OutOfRange(m) => (m, "out of range"),
-            Error::DataLoss(m) => (m, "data loss"),
-            Error::Unimplemented(m) => (m, "not implemented"),
             Error::Other(m) => return f.write_str(m),
         };
-        if m.is_empty() { f.write_str(kind) } else { write!(f, "{m}: {kind}") }
+        write!(f, "{m}: {kind}")
     }
 }
 
@@ -70,9 +61,6 @@ impl From<Error> for tonic::Status {
             Error::FailedPrecondition(_) => Code::FailedPrecondition,
             Error::InvalidArgument(_) => Code::InvalidArgument,
             Error::Unavailable(_) => Code::Unavailable,
-            Error::OutOfRange(_) => Code::OutOfRange,
-            Error::DataLoss(_) => Code::DataLoss,
-            Error::Unimplemented(_) => Code::Unimplemented,
             Error::Other(_) => Code::Unknown,
         };
         tonic::Status::new(code, e.to_string())

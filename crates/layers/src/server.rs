@@ -317,9 +317,8 @@ fn write_session(l: &Layers, mut stream: tonic::Streaming<capi::WriteContentRequ
                     msg.offset = 0;
                 }
                 if !req.data.is_empty() {
-                    let n = wr.write(&req.data).and_then(crate::faults::pass).map_err(Status::from)?;
-                    if n != req.data.len() { return Err(Status::data_loss(format!("wrote {n} of {} bytes", req.data.len()))) }
-                    msg.offset += n as i64;
+                    // (Written whole, or an error.)
+                    msg.offset += wr.write(&req.data).and_then(crate::faults::pass).map_err(Status::from)? as i64;
                 }
                 if action == capi::WriteAction::Commit {
                     let labels = (!req.labels.is_empty()).then(|| sorted(std::mem::take(&mut req.labels)));

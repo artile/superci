@@ -348,12 +348,11 @@ impl Writer<'_> {
 
     pub fn write(&mut self, b: &[u8]) -> Result<usize> {
         let Some(fp) = self.fp.as_mut() else { return Err(Error::FailedPrecondition("cannot write on closed writer".into())) };
-        let r = fp.write(b);
-        let n = *r.as_ref().unwrap_or(&0);
-        self.hasher.update(&b[..n]);
+        fp.write_all(b).and_then(crate::faults::pass)?;
+        self.hasher.update(b);
         self.offset += b.len() as i64;
         self.updated = crate::meta::now();
-        r.map_err(Into::into)
+        Ok(b.len())
     }
 
     /// Back to nothing written (containerd's store truncates only to nothing).
@@ -588,11 +587,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(s.blob_path(&d)).unwrap().permissions().mode() & 0o222, 0, "read-only once in the store");
         assert!(s.status("r1").unwrap_err().is_not_found(), "its ingest gone");
-        assert!(s.writer("r2", 0, Some(&d)).err().unwrap().is_already_exists());
+        assert!(s.writer("r2", 0, Some(&d)).err().unwrap().to_string().ends_with("already exists"));
         // Another write of the same bytes, with no digest said: already there at its commit.
         let mut w = s.writer("r3", 0, None).unwrap();
         w.write(data).unwrap();
-        assert!(w.commit(0, None, None).unwrap_err().is_already_exists());
+        assert!(w.commit(0, None, None).unwrap_err().to_string().ends_with("already exists"));
         let mut w = s.writer("r4", 0, None).unwrap();
         w.write(b"other").unwrap();
         assert!(matches!(w.commit(0, Some(&d), None), Err(Error::FailedPrecondition(m)) if m.starts_with("unexpected commit digest")));
