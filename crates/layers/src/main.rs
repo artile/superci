@@ -112,8 +112,8 @@ fn main() {
         let index = index::Index::load(&a.index).unwrap_or_else(|e| { eprintln!("superci-layers: the index is not read, nothing comes from the store: {e}"); index::Index::default() });
         eprintln!("superci-layers: {} layers in the store's index", index.layers.len());
         let files = a.files.clone().unwrap_or_else(|| a.root.join("files"));
-        let options = store::Options { files, db: a.root.join("store.db"), index, containerd: Some(a.containerd.clone()), parallel: a.parallel, layers_at_once: a.layers };
-        store::Layers::open(overlay, content, Some(options))
+        let options = store::Options { files, db: a.root.join("store.db"), index, containerd: a.containerd.clone(), parallel: a.parallel, layers_at_once: a.layers };
+        store::Layers::open(overlay, content, options)
     };
     let layers = match open() { Ok(l) => Arc::new(l), Err(e) => { eprintln!("superci-layers: {e}"); std::process::exit(1) } };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("a runtime");

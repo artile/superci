@@ -38,7 +38,7 @@ struct Served { digest: String, file: String, size: u64 }
 pub struct Layers {
     pub overlay: Overlay,
     pub content: Store,
-    pub store: Option<StoreSide>,
+    pub store: StoreSide,
 }
 
 /// What serving from the store takes.
@@ -55,7 +55,7 @@ pub struct StoreSide {
     /// Ranges of one file fetched at once.
     pub parallel: usize,
     agent: ureq::Agent,
-    containerd: Option<Containerd>,
+    containerd: Containerd,
     started: Nanos,
     pub stats: Stats,
 }
@@ -63,15 +63,14 @@ pub struct StoreSide {
 #[derive(Default)]
 pub struct Stats { pub served: AtomicU64, pub pulled: AtomicU64, pub fell_back: AtomicU64, pub bytes: AtomicU64, pub blobs_read: AtomicU64 }
 
-pub struct Options { pub files: PathBuf, pub db: PathBuf, pub index: Index, pub containerd: Option<PathBuf>, pub parallel: usize, pub layers_at_once: usize }
+pub struct Options { pub files: PathBuf, pub db: PathBuf, pub index: Index, pub containerd: PathBuf, pub parallel: usize, pub layers_at_once: usize }
 
 fn other(e: impl std::fmt::Display) -> Error { Error::Other(e.to_string()) }
 
 impl Layers {
     /// The layers as they were left: each snapshot served from the store mounted again if it is not (a restart
     /// of this service leaves them mounted; a restart of the machine does not), files no snapshot uses taken away.
-    pub fn open(overlay: Overlay, content: Store, store: Option<Options>) -> Result<Layers> {
-        let Some(o) = store else { return Ok(Layers { overlay, content, store: None }) };
+    pub fn open(overlay: Overlay, content: Store, o: Options) -> Result<Layers> {
         std::fs::create_dir_all(&o.files).and_then(crate::faults::pass)?;
         let database = redb::Database::create(&o.db).and_then(crate::faults::pass).map_err(db)?;
         let tx = database.begin_write().map_err(db).and_then(crate::faults::pass)?;
@@ -81,16 +80,16 @@ impl Layers {
             index: RwLock::new(o.index), files: o.files, db: database, served: Mutex::new(HashMap::new()),
             erofs: Mutex::new(HashMap::new()), blobs: Mutex::new(HashMap::new()), targets: Mutex::new(HashMap::new()),
             at_once: tokio::sync::Semaphore::new(o.layers_at_once.max(1)), parallel: o.parallel.max(1), agent: crate::fetch::agent(),
-            containerd: o.containerd.map(Containerd::new), started: crate::meta::now(), stats: Stats::default(),
+            containerd: Containerd::new(o.containerd), started: crate::meta::now(), stats: Stats::default(),
 
         };
-        let l = Layers { overlay, content, store: Some(side) };
+        let l = Layers { overlay, content, store: side };
         l.recover().and_then(crate::faults::pass)?;
         Ok(l)
     }
 
     fn recover(&self) -> Result<()> {
-        let Some(st) = &self.store else { return Ok(()) };
+        let st = &self.store;
         let ids = self.overlay.meta.read(|r| r.ids()).and_then(crate::faults::pass)?;
         let tx = st.db.begin_read().map_err(db).and_then(crate::faults::pass)?;
         let t = tx.open_table(MOUNTS).map_err(db).and_then(crate::faults::pass)?;
@@ -131,7 +130,7 @@ impl Layers {
 
     /// The layer served from the store, or `None` to make the snapshot as containerd's own does.
     async fn serve(self: Arc<Self>, key: &str, parent: &str, labels: &BTreeMap<String, String>) -> Option<Error> {
-        let st = self.store.as_ref()?;
+        let st = &self.store;
         let (target, digest) = (labels.get(REF)?, labels.get(LAYER_DIGEST)?);
         let Some(layer) = st.index.read().unwrap().get(digest).cloned() else {
             st.stats.pulled.fetch_add(1, Ordering::Relaxed);
@@ -150,7 +149,7 @@ impl Layers {
         // (Links for the image's layers the index has, asked for at once: the first of its layers to come.)
         let image: Vec<String> = labels.get(IMAGE_LAYERS).map(|all| all.split(',').filter(|d| !d.is_empty()).map(str::to_string).collect()).unwrap_or_default();
         let unlinked: Vec<String> = { let i = st.index.read().unwrap(); image.iter().chain([digest]).filter(|d| i.get(d).is_some_and(|l| l.erofs.url.is_empty())).cloned().collect() };
-        if !unlinked.is_empty() { let l = self.clone(); let _ = tokio::task::spawn_blocking(move || l.store.as_ref().unwrap().refresh_many(&unlinked)).await; }
+        if !unlinked.is_empty() { let l = self.clone(); let _ = tokio::task::spawn_blocking(move || l.store.refresh_many(&unlinked)).await; }
         let layer = st.index.read().unwrap().get(digest).cloned().unwrap_or(layer);
         if let Some(all) = labels.get(IMAGE_LAYERS) {
             for d in all.split(',').filter(|d| !d.is_empty() && *d != digest) {
@@ -172,10 +171,10 @@ impl Layers {
                 eprintln!("superci-layers: {digest} from the store in {:.2} s", began.elapsed().as_secs_f64());
                 // (Made known in its namespace beside this answer, never before it: containerd may be waiting on
                 // this answer while holding what that needs.)
-                if let (Some(ns), Some(_)) = (key.split('/').next().filter(|n| !n.is_empty()), &st.containerd) {
+                if let Some(ns) = key.split('/').next().filter(|n| !n.is_empty()) {
                     let (l, ns, d, size) = (self.clone(), ns.to_string(), digest.clone(), layer.size as i64);
                     tokio::spawn(async move {
-                        if let Err(e) = l.store.as_ref().unwrap().containerd.as_ref().unwrap().register(&ns, &d, size).await { eprintln!("superci-layers: {d} not made known in {ns}: {e}") }
+                        if let Err(e) = l.store.containerd.register(&ns, &d, size).await { eprintln!("superci-layers: {d} not made known in {ns}: {e}") }
                     });
                 }
                 Some(Error::AlreadyExists(format!("target snapshot {target:?}")))
@@ -187,7 +186,7 @@ impl Layers {
     /// The snapshot of a served layer: made active, its file mounted on its folder, committed; undone on failure.
     #[allow(clippy::too_many_arguments)]
     fn serve_snapshot(&self, key: &str, parent: &str, labels: BTreeMap<String, String>, digest: &str, file: &std::path::Path, size: u64, usage: Option<Usage>) -> Result<()> {
-        let st = self.store.as_ref().unwrap();
+        let st = &self.store;
         self.overlay.prepare(key, parent, labels.clone()).and_then(crate::faults::pass)?;
         let (id, _, _) = self.overlay.meta.read(|r| r.info(key)).and_then(crate::faults::pass)?;
         let upper = self.overlay.upper(&id);
@@ -218,7 +217,7 @@ impl Layers {
     /// Served snapshots no longer in the store forgotten (their blobs no longer present), their files taken away
     /// (a file still mounted stays readable to the kernel until its folder is unmounted).
     fn forget_removed(&self) -> Result<()> {
-        let Some(st) = &self.store else { return Ok(()) };
+        let st = &self.store;
         let ids = self.overlay.meta.read(|r| r.ids()).and_then(crate::faults::pass)?;
         let gone: Vec<String> = st.served.lock().unwrap().keys().filter(|id| !ids.contains_key(*id)).cloned().collect();
         for id in gone { st.forget(&id).and_then(crate::faults::pass)? }
@@ -229,8 +228,8 @@ impl Layers {
     /// A blob's info: the content store's, or a served layer's.
     pub fn content_info(&self, d: &Digest) -> Result<crate::content::Info> {
         match self.content.info(d) {
-            Err(e) if e.is_not_found() => match self.store.as_ref().and_then(|st| st.served_size(&d.to_string())) {
-                Some(size) => { let t = self.store.as_ref().unwrap().started; Ok(crate::content::Info { digest: d.to_string(), size: size as i64, created: t, updated: t, labels: BTreeMap::new() }) }
+            Err(e) if e.is_not_found() => match self.store.served_size(&d.to_string()) {
+                Some(size) => { let t = self.store.started; Ok(crate::content::Info { digest: d.to_string(), size: size as i64, created: t, updated: t, labels: BTreeMap::new() }) }
                 None => Err(e),
             },
             r => r,
@@ -243,7 +242,7 @@ impl Layers {
         let dd = d.clone();
         match tokio::task::spawn_blocking(move || l.content.open_blob(&dd)).await.map_err(other).and_then(crate::faults::pass)? {
             Err(e) if e.is_not_found() => {
-                let Some(st) = &self.store else { return Err(e) };
+                let st = &self.store;
                 if st.served_size(&d.to_string()).is_none() { return Err(e) }
                 self.clone().fetch_blob(&d).await.map_err(Error::Other).and_then(crate::faults::pass)?;
                 let l = self.clone();
@@ -254,17 +253,17 @@ impl Layers {
     }
 
     async fn fetch_blob(self: Arc<Self>, d: &Digest) -> std::result::Result<(), String> {
-        let st = self.store.as_ref().unwrap();
+        let st = &self.store;
         let key = d.to_string();
         let cell = st.blobs.lock().unwrap().entry(key.clone()).or_default().clone();
         let l = self.clone();
         let r = cell.get_or_init(|| async move {
-            let st = l.store.as_ref().unwrap();
+            let st = &l.store;
             let size = st.served_size(&key).ok_or("not served")?;
             let _turn = st.at_once.acquire().await.map_err(|e| e.to_string())?;
             let (l2, key2) = (l.clone(), key.clone());
             tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
-                let st = l2.store.as_ref().unwrap();
+                let st = &l2.store;
                 let d = Digest::parse(&key2).map_err(|e| e.to_string())?;
                 let tmp = l2.content.fetch_dir().map_err(|e| e.to_string())?.join(&d.hex);
                 let link = IndexLink { st, digest: key2.clone(), erofs: false };
@@ -284,16 +283,16 @@ impl Layers {
 
     /// A layer's EROFS file on this machine's disk, fetched once (each layer once, however many ask, a few at once).
     async fn erofs(self: Arc<Self>, digest: &str, layer: &Layer) -> std::result::Result<PathBuf, String> {
-        let st = self.store.as_ref().unwrap();
+        let st = &self.store;
         let cell = st.erofs.lock().unwrap().entry(digest.to_string()).or_default().clone();
         let l = self.clone();
         cell.get_or_init(|| async move {
-            let st = l.store.as_ref().unwrap();
+            let st = &l.store;
             let file = st.files.join(format!("{}.erofs", digest.split_once(':').map(|(_, h)| h).unwrap_or(digest)));
             if std::fs::metadata(&file).is_ok_and(|m| m.len() == layer.erofs.size) { return Ok(file) }
             let _turn = st.at_once.acquire().await.map_err(|e| e.to_string())?;
             let (l2, d, layer, f) = (l.clone(), digest.to_string(), layer.clone(), file.clone());
-            tokio::task::spawn_blocking(move || l2.store.as_ref().unwrap().fetch_erofs_blocking(&d, &layer, &f)).await.map_err(|e| e.to_string())??;
+            tokio::task::spawn_blocking(move || l2.store.fetch_erofs_blocking(&d, &layer, &f)).await.map_err(|e| e.to_string())??;
             Ok(file)
         }).await.clone()
     }
@@ -301,7 +300,7 @@ impl Layers {
     /// The files of the layers the job's last run used (`ahead`), fetched now, a few at once, before Docker asks for
     /// them: its pull then finds them here (one that asks meanwhile waits for the same fetch).
     pub fn fetch_ahead(self: &Arc<Self>) {
-        let Some(st) = &self.store else { return };
+        let st = &self.store;
         let ahead: Vec<(String, Layer)> = st.index.read().unwrap().layers.iter().filter(|(_, l)| l.ahead).map(|(d, l)| (d.clone(), l.clone())).collect();
         if ahead.is_empty() { return }
         let (n, bytes) = (ahead.len(), ahead.iter().map(|(_, l)| l.erofs.size).sum::<u64>());
@@ -318,7 +317,7 @@ impl Layers {
 
     /// The layers SuperCI's store has, read again (the machine's start writes it, then says so with SIGHUP).
     pub fn reload(&self, index: Index) {
-        if let Some(st) = &self.store { *st.index.write().unwrap() = index }
+        *self.store.index.write().unwrap() = index
     }
 }
 
@@ -389,7 +388,6 @@ impl StoreSide {
         digests.first().is_some_and(|d| index.layers.get(d).is_some_and(|l| !l.erofs.url.is_empty()))
     }
 
-    pub fn containerd(&self) -> Option<&Containerd> { self.containerd.as_ref() }
 }
 
 /// Says how long asking for links took, however the asking ends.
@@ -408,5 +406,3 @@ impl crate::fetch::Link for IndexLink<'_> {
     fn refresh(&self) -> bool { self.st.refresh(&self.digest) }
 }
 
-/// Whether a snapshot is one served from the store.
-pub fn is_served(l: &Layers, id: &str) -> bool { l.store.as_ref().is_some_and(|st| st.served.lock().unwrap().contains_key(id)) }

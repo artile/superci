@@ -149,7 +149,7 @@ fn plane(p: Arc<Mutex<Plane>>) -> String {
 /// from), named by an image's manifest as containerd's records name its layers.
 async fn pulled(socket: &std::path::Path, blobs: &[Vec<u8>], extra: &[(&str, &str)]) {
     let mut c = capi::content_client::ContentClient::new(superci_layers::client::channel(socket).await.unwrap());
-    let mut write = |data: Vec<u8>, labels: HashMap<String, String>| { let mut c = c.clone(); async move {
+    let write = |data: Vec<u8>, labels: HashMap<String, String>| { let mut c = c.clone(); async move {
         let d = digest(&data);
         let m = capi::WriteContentRequest { action: capi::WriteAction::Commit as i32, r#ref: d.clone(), total: data.len() as i64, expected: d, offset: 0, data, labels };
         let mut a = c.write(tokio_stream::iter(vec![m])).await.unwrap().into_inner();
