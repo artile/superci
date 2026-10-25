@@ -610,8 +610,8 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     assert!(p.lock().unwrap().asked.iter().any(|a| a.starts_with(&format!("GET /files/{d}.blob"))));
     // Restarted: mounted again from its file; with its file gone, fetched again; with the index not having it either,
     // let go, said why.
-    let files = dir.join("root/files");
-    let file = std::fs::read_dir(&files).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|e| e == "erofs")).expect("its file kept");
+    // (Named by its layer: the folder is root's own.)
+    let file = dir.join("root/files").join(format!("{}.erofs", &d[7..]));
     for (gone, index) in [(false, index.clone()), (true, index.clone()), (true, serde_json::json!({ "layers": {} }))] {
         stop(&prefix, &mut child);
         let mounted = std::fs::read_to_string("/proc/self/mounts").unwrap().lines().filter(|l| l.contains(dir.to_str().unwrap()) && l.contains(" erofs ")).map(|l| l.split(' ').nth(1).unwrap().to_string()).collect::<Vec<_>>();

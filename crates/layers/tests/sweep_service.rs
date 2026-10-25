@@ -189,3 +189,141 @@ async fn the_service_holds_with_each_call_and_store_operation_failing() {
     }
     assert!(broke.is_empty(), "{} of {steps} faults broke it:\n{}", broke.len(), broke.join("\n\n"));
 }
+
+/// How what needs root runs: as it is, when this is root; through `sudo -n` where there is one without a password;
+/// not at all elsewhere (Linux only).
+fn as_root() -> Option<Vec<&'static str>> {
+    if !cfg!(target_os = "linux") { return None }
+    if unsafe { libc::geteuid() } == 0 { return Some(vec![]) }
+    Command::new("sudo").args(["-n", "true"]).status().ok().filter(|s| s.success()).map(|_| vec!["sudo", "-n"])
+}
+
+/// `program` as root, with `env` (through sudo, on its command line, a coverage tool's settings too).
+fn rooted(prefix: &[&str], program: &str, env: &[(String, String)]) -> Command {
+    let mut c = Command::new(prefix.first().copied().unwrap_or("env"));
+    if !prefix.is_empty() { c.args(&prefix[1..]).arg("env"); }
+    c.args(std::env::vars().filter(|(k, _)| k.starts_with("SUPERCOV_")).chain(env.iter().cloned()).map(|(k, v)| format!("{k}={v}"))).arg(program);
+    c
+}
+
+/// A layer's EROFS file made from its tar, where there is mkfs.erofs.
+fn erofs_of(tar: &[u8]) -> Option<Vec<u8>> {
+    let out = std::env::temp_dir().join(format!("superci-layers-sweep-erofs-{}", std::process::id()));
+    let mut c = Command::new("mkfs.erofs").args(["--tar=f", "--aufs", "-zlz4hc", "-Enoinline_data", "-T0", "--mkfs-time"]).arg(&out).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok()?;
+    c.stdin.take()?.write_all(tar).ok()?;
+    if !c.wait().ok()?.success() { return None }
+    let b = std::fs::read(&out).ok();
+    let _ = std::fs::remove_file(&out);
+    b
+}
+
+/// A tar of one file, as a layer's blob is.
+fn tar_of(name: &str, body: &[u8]) -> Vec<u8> {
+    let dir = std::env::temp_dir().join(format!("superci-layers-sweep-tar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(name), body).unwrap();
+    let out = Command::new("tar").args(["-C", dir.to_str().unwrap(), "--owner=0", "--group=0", "-cf", "-", name]).output().unwrap().stdout;
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// The served scenario's service as root on `dir` (`fault`, if any), its socket opened to the test; `None` when a fault
+/// as it starts ended it (said, not by a panic).
+fn start_rooted(prefix: &[&str], dir: &std::path::Path, fault: Option<usize>, count: &std::path::Path) -> Option<Child> {
+    let socket = dir.join("layers.sock");
+    let _ = Command::new(prefix.first().copied().unwrap_or("rm")).args(if prefix.is_empty() { vec![] } else { prefix[1..].iter().map(|s| s.to_string()).chain(["rm".to_string()]).collect() }).args(["-f".as_ref(), socket.as_os_str()]).status();
+    let mut env = vec![("SUPERCI_LAYERS_FAULTS".to_string(), count.display().to_string())];
+    if let Some(k) = fault { env.push(("SUPERCI_LAYERS_FAULT".into(), k.to_string())) }
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")).unwrap();
+    let mut child = rooted(prefix, env!("CARGO_BIN_EXE_superci-layers"), &env)
+        .args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", socket.display()),
+            format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("none.sock").display()), "--parallel=2".into()])
+        .stderr(log).spawn().unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    while !socket.exists() {
+        if let Ok(Some(_)) = child.try_wait() { return None }
+        assert!(Instant::now() < until, "{fault:?}: it did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let chmod = |p: &std::path::Path| { let mut c = Command::new(prefix.first().copied().unwrap_or("chmod")); if !prefix.is_empty() { c.args(&prefix[1..]).arg("chmod"); } c.arg("666").arg(p).status().unwrap(); };
+    chmod(&socket);
+    Some(child)
+}
+
+fn stop_rooted(prefix: &[&str], child: &mut Child) {
+    let mut c = Command::new(prefix.first().copied().unwrap_or("kill"));
+    if !prefix.is_empty() { c.args(&prefix[1..]).arg("kill"); }
+    let _ = c.args(["-TERM", &child.id().to_string()]).status();
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until { if let Ok(Some(_)) = child.try_wait() { return } std::thread::sleep(Duration::from_millis(20)) }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The served scenario: a stored layer served (and asked again), one on it, its blob read; restarted; the layer asked
+/// for under another name (its file there already); all removed, cleaned up.
+async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Child, fault: Option<usize>, count: &std::path::Path, d: &str) -> Result<(), String> {
+    let socket = dir.join("layers.sock");
+    let layer = |key: &str, chain: &str| sapi::PrepareSnapshotRequest { key: key.into(), labels: [("containerd.io/snapshot.ref".to_string(), chain.to_string()),
+        ("containerd.io/snapshot/cri.layer-digest".to_string(), d.to_string()), ("containerd.io/snapshot/cri.image-layers".to_string(), format!(",{d},sha256:{}", "e".repeat(64)))].into_iter().collect(), ..Default::default() };
+    for round in 0..2 {
+        let Ok(ch) = step("connect", superci_layers::client::channel(&socket)).await? else { return Ok(()) };
+        let mut s = sapi::snapshots_client::SnapshotsClient::new(ch.clone());
+        let mut c = capi::content_client::ContentClient::new(ch);
+        let _ = step("served", s.prepare(layer(&format!("moby/{round}/a"), &format!("chain-{round}")))).await?;
+        let _ = step("again", s.prepare(layer(&format!("moby/{round}/b"), &format!("chain-{round}")))).await?;
+        let _ = step("on it", s.prepare(sapi::PrepareSnapshotRequest { key: format!("moby/{round}/top"), parent: format!("moby/{round}/a/superci-layers"), ..Default::default() })).await?;
+        let _ = step("blob", async { let mut r = c.read(capi::ReadContentRequest { digest: d.to_string(), offset: 0, size: 0 }).await?.into_inner(); while r.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+        let _ = step("info", c.info(capi::InfoRequest { digest: d.to_string() })).await?;
+        if round == 0 {
+            stop_rooted(prefix, child);
+            let Some(next) = start_rooted(prefix, dir, fault, count) else { return Ok(()) };
+            *child = next;
+        }
+    }
+    let ch = step("connect", superci_layers::client::channel(&socket)).await?.map_err(|e| e.to_string())?;
+    let mut s = sapi::snapshots_client::SnapshotsClient::new(ch);
+    for k in ["moby/0/top", "moby/1/top", "moby/0/a/superci-layers", "moby/1/a/superci-layers"] { let _ = step("remove", s.remove(sapi::RemoveSnapshotRequest { key: k.into(), ..Default::default() })).await?; }
+    let _ = step("cleanup", s.cleanup(sapi::CleanupRequest::default())).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_served_store_holds_with_each_call_and_store_operation_failing() {
+    let Some(prefix) = as_root() else { eprintln!("not root on Linux (and no sudo): skipped"); return };
+    let tar = tar_of("hello", b"from the store");
+    let Some(erofs) = erofs_of(&tar) else { eprintln!("no mkfs.erofs here: skipped"); return };
+    let d = digest(&tar);
+    let at = plane([(format!("{d}.erofs"), erofs.clone()), (format!("{d}.blob"), tar.clone())].into_iter().collect());
+    let index = serde_json::json!({ "layers": { &d: { "size": tar.len(), "erofs": { "url": format!("{at}/files/{d}.erofs"), "size": erofs.len() }, "blob": { "url": format!("{at}/files/{d}.blob") }, "usage": { "size": 4096, "inodes": 3 }, "ahead": true } } });
+    let run = |fault: Option<usize>| { let (prefix, index, d) = (prefix.clone(), index.clone(), d.clone()); async move {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself.)
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sl-served-sweep-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
+        let count = dir.join("count");
+        let done = match start_rooted(&prefix, &dir, fault, &count) {
+            None => Ok(()),
+            Some(mut child) => { let r = served_scenario(&prefix, &dir, &mut child, fault, &count, &d).await; stop_rooted(&prefix, &mut child); r }
+        };
+        let log = std::fs::read_to_string(dir.join("log")).unwrap_or_default();
+        let steps: usize = std::fs::read_to_string(&count).unwrap_or_default().trim().parse().unwrap_or(0);
+        let mut clean = Command::new(prefix.first().copied().unwrap_or("sh"));
+        if !prefix.is_empty() { clean.args(&prefix[1..]).arg("sh"); }
+        let _ = clean.args(["-c", &format!("umount -R -l {0} 2>/dev/null; rm -rf {0}", dir.display())]).status();
+        (done, log, steps)
+    } };
+    let (done, log, steps) = run(None).await;
+    assert!(done.is_ok() && !log.contains("panicked") && log.contains("from the store in"), "{done:?}\n{log}");
+    if std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() != Some("1") { return }
+    let said = std::env::var("SUPERCI_SWEEP_SLICE").unwrap_or_default();
+    let (k0, n) = said.split_once('/').and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?))).filter(|(k, n)| *k >= 1 && k <= n).unwrap_or((1, 1));
+    let mut broke = vec![];
+    for k in (1..=steps).filter(|k| (k - 1) % n == k0 - 1) {
+        let (done, log, _) = run(Some(k)).await;
+        if done.is_err() || log.contains("panicked") { broke.push(format!("step {k}: {done:?}\n{}", log.lines().rev().take(8).collect::<Vec<_>>().join("\n"))) }
+    }
+    assert!(broke.is_empty(), "{} of {steps} faults broke it:\n{}", broke.len(), broke.join("\n\n"));
+}
