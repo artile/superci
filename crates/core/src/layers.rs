@@ -231,7 +231,7 @@ impl ControlPlane<'_> {
     /// The repository of a machine's job (none yet, or one SuperCI keeps no cache for: public layers only), and the
     /// layers it was granted.
     async fn layer_reader(&self, machine: &cache::Machine) -> Result<(Option<String>, HashSet<String>)> {
-        let Ok(Ok(access)) = self.machine_access(machine).await else { return Ok((None, HashSet::new())) };
+        let Ok(access) = self.machine_access(machine).await? else { return Ok((None, HashSet::new())) };
         let prefix = format!("lgrant:{}:", access.ns);
         let granted = self.store.list(&prefix).await?.into_iter().map(|(k, _)| k[prefix.len()..].to_string()).collect();
         Ok((Some(access.ns), granted))
@@ -297,18 +297,16 @@ impl ControlPlane<'_> {
     /// counts the region's conversions under way. Whether it is converting (else queued).
     async fn convert_or_queue(&self, region: &str, digest: &str, w: Wanted, converting: &mut usize, now: u64) -> Result<bool> {
         if *converting < AT_ONCE {
+            // (Its record first: a converter given a layer with no record of it here would be heard of by none.)
+            let c = Converting { at: now, size: w.size, public: w.public.clone() };
+            self.store.put_until(&converting_key(region, digest), crate::io::json(&c), now + CONVERT_MS * 2).await?;
             // (A converter that refuses the call: queued, as when it has enough at once.)
             match self.convert(region, digest, w.size, w.source.clone(), now).await {
-                Ok(()) => {
-                    let c = Converting { at: now, size: w.size, public: w.public };
-                    self.store.put_until(&converting_key(region, digest), serde_json::to_string(&c).map_err(|e| e.to_string())?, now + CONVERT_MS * 2).await?;
-                    *converting += 1;
-                    return Ok(true)
-                }
-                Err(e) => { let _ = self.store.put("layers-convert-error", e).await; }
+                Ok(()) => { *converting += 1; return Ok(true) }
+                Err(e) => { let _ = self.store.delete(&converting_key(region, digest)).await; let _ = self.store.put("layers-convert-error", e).await; }
             }
         }
-        self.store.put_until(&wanted_key(region, digest), serde_json::to_string(&w).map_err(|e| e.to_string())?, now + WANTED_MS).await?;
+        self.store.put_until(&wanted_key(region, digest), crate::io::json(&w), now + WANTED_MS).await?;
         Ok(false)
     }
 
@@ -380,22 +378,25 @@ impl ControlPlane<'_> {
         // (S3 took it only with that SHA-256, as the link said; asked again all the same.)
         let head = aws::s3(self.http, "HEAD", &url, &up.region, creds, vec![], &[("x-amz-checksum-mode", "ENABLED")], now).await?;
         let sum = crate::crypto::b64(&(0..32).map(|i| u8::from_str_radix(&up.digest[7 + 2 * i..9 + 2 * i], 16).unwrap_or(0)).collect::<Vec<u8>>());
+        if head.status >= 500 { return Err(format!("S3 did not say what was uploaded ({})", head.status)) }
         if head.status != 200 { return Ok(Response::text(409, "nothing was uploaded there")) }
         if head.header("content-length").and_then(|l| l.parse::<u64>().ok()) != Some(up.size) || head.header("x-amz-checksum-sha256") != Some(sum.as_str()) {
             let _ = aws::s3(self.http, "DELETE", &url, &up.region, creds, vec![], &[], now).await;
             return Ok(Response::text(409, "not that layer"))
         }
-        self.store.delete(&format!("lup:{id}")).await?;
         self.store.put_until(&grant_key(&up.ns, &up.digest), now.to_string(), now + cache::MAX_AGE_DAYS as u64 * 86_400_000).await?;
         let has = get_json::<Layer>(self.store, &layer_key(&up.region, &up.digest)).await?.is_some_and(|l| l.current(now));
         let under_way = self.store.get(&converting_key(&up.region, &up.digest)).await?.is_some() || self.store.get(&wanted_key(&up.region, &up.digest)).await?.is_some();
         if has || under_way {
+            let _ = self.store.delete(&format!("lup:{id}")).await;
             let _ = aws::s3(self.http, "DELETE", &url, &up.region, creds, vec![], &[], now).await;
             return Ok(Response::json(&json!({ "do": "granted" })))
         }
         // Converted now, or once there is room (the staged blob stays a day).
         let mut converting = self.store.list(&format!("lconv:{}:", up.region)).await?.len();
         self.convert_or_queue(&up.region, &up.digest, Wanted { at: now, size: up.size, source: json!({ "key": up.key }), public: up.public }, &mut converting, now).await?;
+        // (Its record ends by itself too: one not taken out now is not asked again, the layer under way.)
+        let _ = self.store.delete(&format!("lup:{id}")).await;
         Ok(Response::json(&json!({ "do": "converting" })))
     }
 
@@ -464,8 +465,8 @@ impl ControlPlane<'_> {
                     }
                 }
             }
-            let _ = aws::s3(self.http, "DELETE", &url, region, &creds, vec![], &[], now).await;
             self.store.delete(&k).await?;
+            let _ = aws::s3(self.http, "DELETE", &url, region, &creds, vec![], &[], now).await;
         }
         // The queue, oldest first, as far as each region has room.
         let mut queued: Vec<(String, String, Wanted)> = wanted.into_iter().filter_map(|(k, v)| {
@@ -477,8 +478,8 @@ impl ControlPlane<'_> {
         for (region, digest, w) in queued {
             let converting = match room.get_mut(&region) { Some(n) => n, None => { let n = self.store.list(&format!("lconv:{region}:")).await?.len(); room.entry(region.clone()).or_insert(n) } };
             if *converting >= AT_ONCE { continue }
-            self.store.delete(&wanted_key(&region, &digest)).await?;
             if !self.convert_or_queue(&region, &digest, w, converting, now).await? { break }
+            self.store.delete(&wanted_key(&region, &digest)).await?;
         }
         if hour { self.store.put("layers-swept", now.to_string()).await?; self.layers_upkeep(&creds, now).await?; }
         Ok(())

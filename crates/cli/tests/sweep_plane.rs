@@ -4,7 +4,7 @@
 //! machine taken back). Whatever fails, nothing panics, no error is answered without saying what failed, and once
 //! time passes and the upkeep runs clean nothing is left stuck.
 use serde_json::{json, Value};
-use superci_testkit::{serve, sweep, Fault, Outcome, Served};
+use superci_testkit::{serve, sweep, Fault, Outcome, Served, PLANE};
 
 /// One sweep at a time: each runs eight side by side already, and more would use up this computer's ports.
 fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
@@ -25,7 +25,7 @@ fn settle(served: &Served) {
 
 /// A request to the control plane, whatever it answers: its status and body.
 fn ask(served: &Served, method: &str, path: &str, auth: Option<&str>, body: Option<Value>) -> (u16, String) {
-    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build().into();
     let url = format!("{}{path}", served.url);
     let answered = match (method, body) {
         ("GET", _) => { let mut r = agent.get(&url); if let Some(a) = auth { r = r.header("authorization", &format!("Bearer {a}")) } r.call() }
@@ -239,4 +239,79 @@ fn run_artifacts(fault: Fault) -> Outcome {
 fn a_runs_artifacts_hold_with_each_call_and_store_operation_failing() {
     let _one = one_at_a_time();
     sweep("a run's artifacts", run_artifacts);
+}
+
+/// A control plane on AWS (its converter there, its own credentials), its programs in its bucket, and a machine of its
+/// own with the cache's link, a GitHub job on it that keeps Docker's images: the control plane and the link.
+fn layers_plane() -> (Served, String) {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::program_key("x86_64")), b"program");
+    served.github.put_object(&format!("{bucket}/{}", superci_core::cache::layers_key("x86_64")), b"program");
+    let link = "machine-cache-link-000000000031".to_string();
+    let now = served.now_ms();
+    {
+        let mut m = served.store.0.lock().unwrap();
+        m.insert(format!("cachem:{link}"), json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner", "job": "job:5002" }).to_string());
+        m.insert("job:5002".into(), json!({ "job_id": 5002, "run_id": 1, "repo": "acme/app", "repo_id": 197814629, "branch": "main", "default_branch": "main", "state": "running", "at_ms": now,
+            "installation_id": 42, "cloud": "aws", "seen_in_progress": true, "name": "test", "workflow": "CI", "label": "superci/docker-cache=true" }).to_string());
+    }
+    (served, link)
+}
+
+/// The layer store as a machine uses it: its index and links, a layer it pulled proposed, uploaded and converted, what
+/// its job had said after it, its programs; the upkeep, until the converter's word is read, and a month on.
+fn layer_store(fault: Fault) -> Outcome {
+    let (served, link) = layers_plane();
+    let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    let now = served.now_ms();
+    // A public layer the store has.
+    served.store.0.lock().unwrap().insert(format!("layer:us-east-1:{}", digest('1')), json!({ "size": 100, "diff_id": "", "erofs": { "key": format!("layers/{}.erofs", "1".repeat(64)), "size": 1 },
+        "blob": { "key": format!("layers/{}.blob", "1".repeat(64)), "size": 100 }, "made": now, "used": now - 2 * 86_400_000, "public": { "registry": "docker.io", "repository": "library/node", "checked": now } }).to_string());
+    // What the converter will say of the layer the machine uploads (read once it has been given it).
+    let bucket = superci_core::cache::bucket(PLANE, "us-east-1");
+    let hex = "6".repeat(64);
+    served.github.put_object(&format!("{bucket}/layers/done/{hex}.json"), json!({ "digest": digest('6'), "diff_id": "sha256:diff", "erofs": { "key": format!("layers/{hex}.erofs"), "size": 1 }, "blob": { "key": format!("layers/{hex}.blob"), "size": 500 } }).to_string().as_bytes());
+    served.arm(fault);
+    let (call, again) = (|what: &str, body: Value| cache_call(&served, &link, what, body), |what: &str, body: Value| cache_call_again(&served, &link, what, body));
+    for what in ["layers", "layers.json", "layers-program", "program", "cache"] { let _ = ask(&served, "GET", &format!("/cache/{link}/{what}"), None, None); }
+    let _ = again("layers-links", json!({ "digests": [digest('1')] }));
+    // A layer it pulled that the store lacks: proposed, put at the link given, said uploaded.
+    let proposed = again("layers-propose", json!({ "layers": [{ "digest": digest('6'), "size": 500 }, { "digest": digest('1'), "size": 100 }] }));
+    let a = proposed.1["layers"][digest('6')].clone();
+    let mut uploaded = None;
+    if let (Some(url), Some(sum)) = (a["url"].as_str(), a["headers"]["x-amz-checksum-sha256"].as_str()) {
+        served.github.put_at(url, &[0u8; 500], &[("x-amz-checksum-sha256", sum)]);
+        uploaded = Some(again("layers-uploaded", json!({ "id": a["id"] })));
+    }
+    // What its job had, said after it.
+    let _ = again("layers-kept", json!({ "pulled": 2, "pulled_bytes": 600, "served_digests": [digest('1')], "used": [digest('1'), digest('6')] }));
+    // The upkeep reads what the converter said (an upkeep that failed is followed by others).
+    for _ in 0..3 { served.later(61_000); served.try_upkeep(); }
+    let had = record(&served, &format!("layer:us-east-1:{}", digest('6')));
+    let (converting, queued) = (served.store.under("lconv:"), served.store.under("lwant:"));
+    a_month_on(&served);
+    let out = Outcome::new(served);
+    refusals_say_why(&out);
+    // Each layer kept has both its files, as the converter made them.
+    out.check(had.as_ref().is_none_or(|l| l["erofs"]["key"].as_str().is_some_and(|k| !k.is_empty()) && l["blob"]["key"].as_str().is_some_and(|k| !k.is_empty())), || format!("a layer kept without its files: {had:?}"));
+    // Said uploaded and taken (converting): kept once the converter's word is read, nothing left under way.
+    let taken = uploaded.as_ref().is_some_and(|u| u.0 == 200);
+    out.check(!taken || (had.is_some() && converting.is_empty() && queued.is_empty()), || format!("uploaded ({uploaded:?}), and not kept ({had:?}) or left under way ({converting:?} {queued:?})"));
+    // Uploaded, yet refused for good: a layer a machine gave is lost.
+    out.check(uploaded.as_ref().is_none_or(|u| u.0 == 200 || u.0 >= 500), || format!("an upload refused: {uploaded:?}"));
+    // A month on, both layers are past their time.
+    let left: Vec<String> = out.served.store.under("layer:").into_iter().map(|(k, _)| k).collect();
+    out.check(left.is_empty(), || format!("layers kept past their time: {left:?}"));
+    if fault == Fault::None { out.check(taken && had.is_some(), || format!("the clean run did not go through: {proposed:?} {uploaded:?}")) }
+    out
+}
+
+#[test]
+fn the_layer_store_holds_with_each_call_and_store_operation_failing() {
+    let _one = one_at_a_time();
+    sweep("the layer store", layer_store);
 }

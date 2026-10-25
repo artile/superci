@@ -252,7 +252,13 @@ pub async fn get_json<T: serde::de::DeserializeOwned>(store: &dyn Store, key: &s
 }
 
 pub async fn put_json<T: serde::Serialize>(store: &dyn Store, key: &str, value: &T) -> Result<()> {
-    store.put(key, serde_json::to_string(value).map_err(|e| e.to_string())?).await
+    store.put(key, json(value)).await
+}
+
+/// One of SuperCI's own records as JSON text: its fields are strings, numbers, lists and maps keyed by strings, which
+/// serde_json always writes.
+pub fn json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("SuperCI's records are always JSON")
 }
 
 /// application/x-www-form-urlencoded fields.
