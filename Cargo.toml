@@ -33,3 +33,11 @@ codegen-units = 1
 opt-level = 3
 [profile.dev.package.rsa]
 opt-level = 3
+# And these hash and unpack a control plane's code as it is uploaded (megabytes each deploy): unoptimized, a deploy
+# the tests sweep takes seconds of it.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.base64]
+opt-level = 3

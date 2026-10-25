@@ -524,7 +524,7 @@ const NAMES_SINCE: &str = "0.19.13";
 /// Which device a key just handed is on, for the CI's Keys (a command's key as a dashboard's): said once the control
 /// plane takes it, a moment after it is written.
 fn say_device(url: &str, key: &str) {
-    for _ in 0..3 { if cloudflare::plane_post(url, key, "/keys/hello", &serde_json::json!({ "device": computer_name() })).is_ok() { return } std::thread::sleep(Duration::from_millis(1000)) }
+    for _ in 0..3 { if cloudflare::plane_post(url, key, "/keys/hello", &serde_json::json!({ "device": computer_name() })).is_ok() { return } aws::pause(1000) }
 }
 
 /// Whether the control plane at this address is from before `NAMES_SINCE`.
@@ -1378,7 +1378,7 @@ impl Dashboard {
                 self.keep();
                 return ended
             }
-            std::thread::sleep(Duration::from_millis(400));
+            aws::pause(400);
         }
     }
 
@@ -1398,7 +1398,12 @@ impl Dashboard {
         };
         let kept = known.filter(|p| self.keyed.contains(p.plane_id()));
         // (One that says it moved away is no longer the one in use: found again below.)
-        if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some() && (v.moved_to.is_none() || only_reading)) { return Ok(Some(v)) }
+        if let Some(v) = kept.as_ref().map(|p| view::plane_view(p, Some(&self.status_key))).filter(|v| v.status.is_some() && (v.moved_to.is_none() || only_reading)) {
+            // (The one named is the one a change then acts on: selected, as one found again below is. Else a change
+            // to it after another was in use is refused as naming none here.)
+            if let Some(i) = self.planes.iter().position(|p| p.plane_id() == v.plane.plane_id()) { self.select(i) }
+            return Ok(Some(v))
+        }
         // Nothing to find it again with: as it answers now (not at all, or without taking the key any more).
         if only_reading {
             let Some(p) = self.kept_plane.clone() else { return Err(self.nowhere().into()) };
@@ -1417,7 +1422,7 @@ impl Dashboard {
         self.select(i);
         let mut v = view::plane_view(&p, Some(&self.status_key));
         // Just handed the key: its whole status, once it takes it (a few tries).
-        for _ in 0..8 { if !v.online || v.status.is_some() || !self.keyed.contains(p.plane_id()) { break } std::thread::sleep(Duration::from_millis(1500)); v.status = cloudflare::status(p.url(), &self.status_key) }
+        for _ in 0..8 { if !v.online || v.status.is_some() || !self.keyed.contains(p.plane_id()) { break } aws::pause(1500); v.status = cloudflare::status(p.url(), &self.status_key) }
         self.keep();
         if let Some(why) = self.key_refused(&v) { return Err(why) }
         Ok(Some(v))
@@ -2762,6 +2767,9 @@ impl Dashboard {
                 let own = status["own_cloud"].as_str().unwrap_or(match &plane { Plane::Modal { .. } => "modal", _ => "cloudflare" }).to_string();
                 let own_containers = own == cloud && status["containers"] == true;
                 let account = match &plane { Plane::Aws { account_id, .. } => Some(account_id.clone()), _ => status["aws"]["account_id"].as_str().map(str::to_string) };
+                // (AWS in no account it knows of, removed already: nothing there to sign in to or delete.)
+                let nowhere = cloud == "aws" && account.is_none();
+                let only = only || nowhere;
                 // Signed in where its part is, before anything changes.
                 if !only {
                     let signed_in = match cloud.as_str() {
@@ -2818,6 +2826,7 @@ impl Dashboard {
                     // A control plane that has not taken the change yet may still start a runner there: its part is
                     // left until it has (nothing is half-deleted under a running job).
                     (_, false) if !forgotten && !own_containers => left.push(format!("its part in {name}: the control plane had not taken the change yet. Add {name} again and remove it in a moment")),
+                    ("aws", true) if nowhere => {}
                     ("aws", true) => left.push(format!("in AWS account {}: the role superci-plane-{id}{}, and its machines' network (none cost anything; add AWS again and remove it while signed in to delete them)",
                         account.as_deref().unwrap_or(""), if matches!(plane, Plane::Aws { .. }) { "'s machines policy" } else { " and its identity provider" })),
                     (_, _) if own_containers => {}
@@ -7123,7 +7132,7 @@ fn move_plane(w: &Writer, key: &str, from: &Plane, to: &Plane, old: serde_json::
         for _ in 0..45 {
             match cloudflare::plane_move_call(plane.url(), key, token, path, &body)? {
                 (200, v) => return Ok(v),
-                (403, _) | (404, _) | (500..=599, _) => std::thread::sleep(Duration::from_secs(2)),
+                (403, _) | (404, _) | (500..=599, _) => aws::pause(2000),
                 (s, v) => return Err(format!("{} answered {s}: {v}", plane.url())),
             }
         }

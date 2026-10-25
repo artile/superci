@@ -112,11 +112,11 @@ pub struct Served { pub plane: String, pub url: String, pub store: Shared, pub m
 /// Servers that end when this is dropped: each told to stop, then reached once, so that one waiting for a connection
 /// sees it. (A sweep serves thousands of control planes in one test program: left on, their threads would pass what
 /// a program may have.)
-pub struct Ends { stops: Vec<Arc<std::sync::atomic::AtomicBool>>, at: Vec<String> }
+pub struct Ends { stops: Vec<Arc<std::sync::atomic::AtomicBool>>, at: Vec<String>, github: Arc<Mutex<Option<GitHub>>> }
 
 impl Ends {
     fn of(plane: &Arc<std::sync::atomic::AtomicBool>, url: &str, aws: &Aws) -> Ends {
-        Ends { stops: vec![plane.clone(), aws.stop.clone()], at: [url, aws.url.as_str()].iter().map(|u| u.trim_start_matches("http://").to_string()).collect() }
+        Ends { stops: vec![plane.clone(), aws.stop.clone()], at: [url, aws.url.as_str()].iter().map(|u| u.trim_start_matches("http://").to_string()).collect(), github: aws.github.clone() }
     }
 }
 
@@ -124,6 +124,9 @@ impl Drop for Ends {
     fn drop(&mut self) {
         for s in &self.stops { s.store(true, std::sync::atomic::Ordering::SeqCst) }
         for a in &self.at { let _ = TcpStream::connect(a); }
+        // (AWS's stand-in and GitHub's hold each other: let go, or neither is ever freed, with all the answers each
+        // kept.)
+        if let Some(g) = self.github.lock().unwrap().take() { g.aws.lock().unwrap().take(); }
     }
 }
 
@@ -725,10 +728,13 @@ impl Aws {
         // (Of those, the ones asked most alike, by the names of what was asked: a spot request's answer for a spot
         // request, an on-demand one's for an on-demand one.)
         let names = |a: &str| -> std::collections::BTreeSet<String> { a.split('&').filter_map(|kv| kv.split('=').next()).map(|k| k.chars().filter(|c| !c.is_ascii_digit()).collect()).collect() };
-        let want = names(asked);
-        let alike = |r: &&Value| names(r["asked"].as_str().unwrap_or_default()).intersection(&want).count() as i64 - names(r["asked"].as_str().unwrap_or_default()).symmetric_difference(&want).count() as i64;
-        let best = same.iter().map(alike).max().unwrap_or(0);
-        let same: Vec<&Value> = if asked.contains('&') { same.into_iter().filter(|r| alike(r) == best).collect() } else { same };
+        // (Only a query's: a JSON body is one name, and a control plane's code uploaded is megabytes of it.)
+        let same: Vec<&Value> = if asked.contains('&') {
+            let want = names(asked);
+            let alike = |r: &&Value| { let n = names(r["asked"].as_str().unwrap_or_default()); n.intersection(&want).count() as i64 - n.symmetric_difference(&want).count() as i64 };
+            let best = same.iter().map(alike).max().unwrap_or(0);
+            same.into_iter().filter(|r| alike(r) == best).collect()
+        } else { same };
         // (Counted apart for each kind of the same call: a renewal's answers in their order, a first sign-in's in theirs.)
         let kind = same.first().map(|r| names(r["asked"].as_str().unwrap_or_default()).into_iter().collect::<Vec<_>>().join(",")).unwrap_or_default();
         let key = format!("{method} {url} {target} {} {kind}", action(target, asked));
