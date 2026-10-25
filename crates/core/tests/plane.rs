@@ -4081,18 +4081,29 @@ impl Http for WithCache {
     }
 }
 
+/// GitHub's key for its jobs' tokens (one for every test: making it is slow), as GitHub lists it.
+fn github_jobs_key() -> (&'static rsa::RsaPrivateKey, serde_json::Value) {
+    use rsa::traits::PublicKeyParts;
+    static KEY: std::sync::OnceLock<rsa::RsaPrivateKey> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap());
+    let b = |v: &[u8]| URL_SAFE_NO_PAD.encode(v);
+    (key, serde_json::json!({ "keys": [{ "kty": "RSA", "kid": "gh1", "alg": "RS256", "n": b(&key.n().to_bytes_be()), "e": b(&key.e().to_bytes_be()) }] }))
+}
+
+/// A job's token as GitHub signs it: its cache scopes (`ac`) in a repository.
+fn github_job_token(ac: &str, repo: &str) -> String {
+    use rsa::signature::{SignatureEncoding, Signer};
+    let b = |v: &[u8]| URL_SAFE_NO_PAD.encode(v);
+    let claims = serde_json::json!({ "iss": "https://token.actions.githubusercontent.com", "ac": ac, "acsl": "10", "repository_id": repo, "run_id": "9", "nbf": 1_789_999_000, "exp": 1_790_020_000 });
+    let unsigned = format!("{}.{}", b(br#"{"alg":"RS256","kid":"gh1","typ":"JWT"}"#), b(claims.to_string().as_bytes()));
+    format!("{unsigned}.{}", b(&rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(github_jobs_key().0.clone()).sign(unsigned.as_bytes()).to_vec()))
+}
+
 #[test]
 fn a_machine_keeps_githubs_cache_in_its_regions_bucket_as_its_jobs_token_allows() {
-    use rsa::signature::{SignatureEncoding, Signer};
-    use rsa::traits::PublicKeyParts;
-    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+    let (_, keys) = github_jobs_key();
+    let github_token = github_job_token;
     let b = |v: &[u8]| URL_SAFE_NO_PAD.encode(v);
-    let keys = serde_json::json!({ "keys": [{ "kty": "RSA", "kid": "gh1", "alg": "RS256", "n": b(&key.n().to_bytes_be()), "e": b(&key.e().to_bytes_be()) }] });
-    let github_token = |ac: &str, repo: &str| {
-        let claims = serde_json::json!({ "iss": "https://token.actions.githubusercontent.com", "ac": ac, "acsl": "10", "repository_id": repo, "run_id": "9", "nbf": 1_789_999_000, "exp": 1_790_020_000 });
-        let unsigned = format!("{}.{}", b(br#"{"alg":"RS256","kid":"gh1","typ":"JWT"}"#), b(claims.to_string().as_bytes()));
-        format!("{unsigned}.{}", b(&rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(key.clone()).sign(unsigned.as_bytes()).to_vec()))
-    };
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let http = WithCache { clouds: FakeClouds::default(), keys };
     let mut config = Config::new(PLANE_ID.into());
@@ -5782,6 +5793,73 @@ fn just_after_a_move_here_the_upkeep_comes_back_within_the_minute_and_looks_for_
     assert_eq!(clouds.calls.borrow().iter().filter(|c| c.1.contains("/repos/acme/app/actions/runs?status=queued")).count(), 1);
 }
 
+/// A machine's link to the cache, kept as `superci-cache`'s start gives it, for job 5001 of acme/app (GitHub's
+/// repository 77) on its branch main, in `region`.
+fn cache_machine(store: &Mem, link: &str, region: &str) {
+    let mut m = store.0.borrow_mut();
+    m.insert(format!("cachem:{link}"), serde_json::json!({ "region": region, "arch": "x86_64", "until": u64::MAX / 4, "runner": "a-runner", "job": "job:5001" }).to_string());
+    m.insert("job:5001".into(), serde_json::json!({ "job_id": 5001, "run_id": 1, "repo": "acme/app", "repo_id": 77, "branch": "main", "default_branch": "main", "state": "running", "at_ms": 1_790_000_000_000u64,
+        "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+}
+
+#[test]
+fn a_machine_whose_region_makes_no_address_is_said_so_at_each_link_and_what_it_sends_amiss_is_passed_over() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithCache { clouds: FakeClouds::default(), keys: github_jobs_key().1 };
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let (bad, good) = ("machine-cache-link-0000000000bad", "machine-cache-link-000000000good");
+    cache_machine(&store, bad, "us east-1");
+    cache_machine(&store, good, "us-east-1");
+    let call = |link: &str, what: &str, body: serde_json::Value| { let r = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/{what}")).with_body(body.to_string()))); (r.status, r.body_text()) };
+    let main = github_job_token(r#"[{"Scope":"refs/heads/main","Permission":3}]"#, "77");
+    let v = "a1b2c3";
+    // Each link to its region's bucket cannot be made: the program, an entry's pieces to write and to read, a tool's.
+    assert_eq!(block_on(plane.handle(get(&format!("/cache/{bad}/program")))).status, 500);
+    assert_eq!(call(bad, "begin", serde_json::json!({ "token": main, "key": "deps-1", "version": v })).0, 200);
+    assert_eq!(call(bad, "sign", serde_json::json!({ "token": main, "key": "deps-1", "version": v, "names": ["b0"] })).0, 500);
+    // (Pieces it says that are no name and size are passed over.)
+    let (status, said) = call(bad, "finish", serde_json::json!({ "token": main, "key": "deps-1", "version": v, "pieces": [["b0", "ten"], [1, 2], ["b1", 5]] }));
+    assert_eq!((status, said.contains("\"size\":5")), (200, true), "{said}");
+    assert_eq!(call(bad, "lookup", serde_json::json!({ "token": main, "key": "deps-1", "version": v })).0, 500);
+    assert_eq!(call(bad, "tool-begin", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 500);
+    assert_eq!(call(bad, "tool-sign", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "names": ["p00001"] })).0, 500);
+    assert_eq!(call(bad, "tool-finish", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "pieces": [["p00000", 5], [1, 2]] })).0, 200);
+    assert_eq!(call(bad, "tool-get", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 500);
+    // A job that may only read the cache saves nothing; a body that is no JSON is said.
+    let reader = github_job_token(r#"[{"Scope":"refs/heads/main","Permission":1}]"#, "77");
+    assert_eq!(call(good, "begin", serde_json::json!({ "token": reader, "key": "deps-2", "version": v })).0, 403);
+    let r = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/cache/{good}/lookup")).with_body("not json")));
+    assert!(r.status == 500 && r.body_text().starts_with("not JSON"));
+    // A path of the layer store's it does not know.
+    assert_eq!(block_on(plane.handle(get(&format!("/cache/{good}/more/layers")))).status, 404);
+}
+
+#[test]
+fn githubs_keys_that_are_no_json_or_a_damaged_signing_key_leave_a_jobs_token_unread_saying_why() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = With(FakeClouds::default(), |r: &Request, _: &str| (r.url == "https://token.actions.githubusercontent.com/.well-known/jwks").then(|| Response::new(200, "application/json", "not json")));
+    let mut config = Config::new(PLANE_ID.into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let link = "machine-cache-link-000000000good";
+    cache_machine(&store, link, "us-east-1");
+    let lookup = |token: &str| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/lookup")).with_body(serde_json::json!({ "token": token, "key": "k", "version": "v1" }).to_string())));
+    let r = lookup(&github_job_token("[]", "77"));
+    assert!(r.status == 500 && r.body_text().starts_with("GitHub's keys"), "{}", r.body_text());
+    // A token of this control plane's (ES256), its signing key damaged.
+    store.0.borrow_mut().insert("identity".into(), serde_json::json!({ "signing": { "private_b64": "!!", "kid": "k" } }).to_string());
+    let es256 = format!("{}.e30.sig", URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256"}"#));
+    assert_eq!(lookup(&es256).status, 500);
+    // With no AWS account, no program to send a machine to.
+    let (store, config) = (Mem::default(), Config::new(PLANE_ID.into()));
+    cache_machine(&store, link, "us-east-1");
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    assert_eq!(block_on(plane.handle(get(&format!("/cache/{link}/program")))).status, 404);
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -5920,7 +5998,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         what_a_run_from_a_computer_is_asked_for_that_it_does_not_have_is_said_as_that,
         a_run_taken_away_or_changed_by_another_request_while_it_is_moved_on_is_left_to_that_one,
         the_upkeep_ends_what_waited_too_long_or_was_cut_off_and_lets_go_of_failing_runners_github_no_longer_wants,
-        just_after_a_move_here_the_upkeep_comes_back_within_the_minute_and_looks_for_jobs_github_did_not_tell_of
+        just_after_a_move_here_the_upkeep_comes_back_within_the_minute_and_looks_for_jobs_github_did_not_tell_of,
+        a_machine_whose_region_makes_no_address_is_said_so_at_each_link_and_what_it_sends_amiss_is_passed_over,
+        githubs_keys_that_are_no_json_or_a_damaged_signing_key_leave_a_jobs_token_unread_saying_why
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

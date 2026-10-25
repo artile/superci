@@ -5351,9 +5351,10 @@ impl<'a> ControlPlane<'a> {
                     }
                     "tool-begin" => match cache::begin(self.store, &access, hash, tool, &machine.region, now).await {
                         Ok((_, entry)) => Ok(Response::json(&serde_json::json!({ "ok": true, "url": link("PUT", &entry.region, &format!("{}/p00000", entry.prefix(&access.ns)))? }))),
-                        Err(cache::Refused::Exists) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": "exists" })).with_status(409)),
-                        Err(cache::Refused::NoWrite) => refuse("this job may only read the cache"),
                         Err(cache::Refused::Bad(e)) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": e })).with_status(400)),
+                        // (Else it exists: a tool writes in its job's own scope, which it may always write, see
+                        // `machine_access`.)
+                        Err(_) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": "exists" })).with_status(409)),
                     },
                     _ => {
                         let Some((at, entry)) = cache::begun(self.store, &access, hash, tool).await? else { return Ok(Response::json(&serde_json::json!({ "ok": false, "why": "no entry being saved" })).with_status(404)) };
@@ -5381,9 +5382,9 @@ impl<'a> ControlPlane<'a> {
                 match what {
                     "artifact-begin" => match cache::begin_artifact(self.store, &run, name, &machine.region, self.artifact_keeper(&access).await?, now).await {
                         Ok(_) => Ok(Response::json(&serde_json::json!({ "ok": true }))),
-                        Err(cache::Refused::Exists) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": "an artifact of this name exists in the run" })).with_status(409)),
                         Err(cache::Refused::Bad(e)) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": e })).with_status(400)),
-                        Err(cache::Refused::NoWrite) => refuse("this job may not keep artifacts"),
+                        // (Its only other refusal: any job of a run may keep artifacts.)
+                        Err(_) => Ok(Response::json(&serde_json::json!({ "ok": false, "why": "an artifact of this name exists in the run" })).with_status(409)),
                     },
                     "artifact-sign" => {
                         let Some((_, entry)) = cache::artifact(self.store, &run, name, false).await? else { return missing() };
