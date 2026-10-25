@@ -3625,7 +3625,9 @@ impl<'a> ControlPlane<'a> {
                 let chain: Vec<&str> = chain.split(',').collect();
                 // (Never empty: a split gives one name at least, and an empty one is none.)
                 if chain.len() > 16 || !chain.iter().all(|n| named(&n.to_string())) { return Ok(Response::text(400, "say which base and layers")) }
-                for (i, name) in chain.iter().enumerate() {
+                let mut each = chain.iter().enumerate();
+                loop {
+                    let Some((i, name)) = each.next() else { break };
                     let kept = format!("bases/{name}.tar.gz");
                     let there = aws::s3(self.http, "HEAD", &aws::s3_url(&bucket, &region, &kept), &region, &creds, vec![], &[], now).await.is_ok_and(|r| r.status == 200);
                     if !there { return Ok(Response::json(&serde_json::json!({ "url": null, "base": false }))) }
@@ -3665,10 +3667,11 @@ impl<'a> ControlPlane<'a> {
     async fn tree_bucket(&self, plane_url: &str, now: u64) -> Result<Option<(String, Credentials)>> {
         let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(None) };
         let creds = self.aws_creds(plane_url, &a).await?;
-        for region in self.aws_regions(&a) {
+        let mut regions = self.aws_regions(&a).into_iter();
+        loop {
+            let Some(region) = regions.next() else { return Ok(None) };
             if self.cache_ready(&region, "x86_64", &creds, now).await { return Ok(Some((region, creds))) }
         }
-        Ok(None)
     }
 
     /// A run's working tree, gone: its pieces in the store, and its parts in the bucket.
@@ -3678,7 +3681,9 @@ impl<'a> ControlPlane<'a> {
         if !in_bucket.is_empty() {
             let now = self.clock.now_ms();
             let creds = match self.aws_connection().await?.filter(|a| a.connected) { Some(a) => Some(self.aws_creds(plane_url, &a).await?), None => None };
-            for (k, kept) in in_bucket {
+            let mut in_bucket = in_bucket.into_iter();
+            loop {
+                let Some((k, kept)) = in_bucket.next() else { break };
                 let (region, object) = tree_place(kept.trim_matches('"'), tree, k.rsplit(':').next().and_then(|p| p.parse::<u32>().ok()).unwrap_or(0));
                 // (A base stays for later runs' trees; the bucket removes it in time.)
                 if let (Some(creds), true) = (&creds, object.starts_with("runs/")) { let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &object), &region, creds, vec![], &[], now).await; }
@@ -3693,25 +3698,29 @@ impl<'a> ControlPlane<'a> {
     /// A log a run's job sent (`n`, the runner's number for it), whole: its pieces in order, from the store or the
     /// bucket.
     async fn log_text(&self, token: &str, n: u64) -> Result<Vec<u8>> {
-        use base64::Engine;
-        let mut out = vec![];
-        let mut creds = None;
+        let (mut out, mut creds) = (vec![], None);
         for (k, v) in self.store.list(&format!("rlog:{token}:{n:04}:")).await? {
-            match v.trim_matches('"').strip_prefix("s3:") {
-                Some(region) => {
-                    if creds.is_none() {
-                        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
-                        if let Some(a) = self.aws_connection().await?.filter(|a| a.connected) { creds = Some(self.aws_creds(&plane_url, &a).await?) }
-                    }
-                    let Some(c) = &creds else { continue };
-                    let seq = k.rsplit(':').next().unwrap_or("0000");
-                    let got = aws::s3(self.http, "GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &format!("runs/{token}/log-{n:04}-{seq}")), region, c, vec![], &[], self.clock.now_ms()).await?;
-                    if got.status < 300 { out.extend(got.body) }
-                }
-                None => out.extend(base64::engine::general_purpose::STANDARD.decode(v.trim_matches('"')).map_err(|e| e.to_string())?),
-            }
+            let seq = k.rsplit(':').next().unwrap_or("0000");
+            if let Some(b) = self.piece(&v, &format!("runs/{token}/log-{n:04}-{seq}"), &mut creds).await? { out.extend(b) }
         }
         Ok(out)
+    }
+
+    /// A piece of a log as it is kept: in the store (base64), or in the bucket (`s3:<region>`, then its size, for a
+    /// page), under `object`, read with the role's sign-in (asked for once, kept in `creds`). None when the bucket
+    /// does not give it, or no AWS account is connected to read it with.
+    async fn piece(&self, kept: &str, object: &str, creds: &mut Option<Option<Credentials>>) -> Result<Option<Vec<u8>>> {
+        use base64::Engine;
+        let kept = kept.trim_matches('"');
+        let Some(r) = kept.strip_prefix("s3:") else { return base64::engine::general_purpose::STANDARD.decode(kept).map(Some).map_err(|e| e.to_string()) };
+        let region = r.split(':').next().unwrap_or_default();
+        if creds.is_none() {
+            let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
+            *creds = Some(match self.aws_connection().await?.filter(|a| a.connected) { Some(a) => Some(self.aws_creds(&plane_url, &a).await?), None => None });
+        }
+        let Some(Some(c)) = creds else { return Ok(None) };
+        let got = aws::s3(self.http, "GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, object), region, c, vec![], &[], self.clock.now_ms()).await?;
+        Ok((got.status < 300).then_some(got.body))
     }
 
     /// A post of a job's lines from its runner (see `runner_service::feed`), kept under when it came (to the
@@ -3753,26 +3762,13 @@ impl<'a> ControlPlane<'a> {
     /// What a job's runner has written so far of one step (its pages: `<timeline>_<step>_<n>.log`), as the step's log
     /// will be: none, when its machine sent none.
     async fn step_pages(&self, id: &str, step: &str) -> Result<Option<String>> {
-        use base64::Engine;
         if step.is_empty() || !step.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') { return Ok(None) }
         let marks: Vec<(String, String)> = self.store.list(&format!("glive:{id}:")).await?.into_iter().filter(|(k, _)| k.contains(&format!("_{step}_"))).collect();
         if marks.is_empty() { return Ok(None) }
-        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
-        let mut creds = None;
-        let mut out = vec![];
-        for (k, v) in &marks {
-            let rest = k.strip_prefix(&format!("glive:{id}:")).unwrap_or_default();
-            match v.trim_matches('"').strip_prefix("s3:") {
-                Some(r) => {
-                    let region = r.split(':').next().unwrap_or_default();
-                    if creds.is_none() { if let Some(a) = self.aws_connection().await?.filter(|a| a.connected) { creds = Some(self.aws_creds(&plane_url, &a).await?) } }
-                    let Some(c) = &creds else { continue };
-                    let (file, at) = (rest.split(':').next().unwrap_or_default(), rest.split(':').nth(1).unwrap_or_default());
-                    let got = aws::s3(self.http, "GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &format!("live/{id}/{file}-{at}")), region, c, vec![], &[], self.clock.now_ms()).await?;
-                    if got.status < 300 { out.extend(got.body) }
-                }
-                None => out.extend(base64::engine::general_purpose::STANDARD.decode(v.trim_matches('"')).map_err(|e| e.to_string())?),
-            }
+        let (mut creds, mut out, mut marks) = (None, vec![], marks.into_iter());
+        loop {
+            let Some((k, v)) = marks.next() else { break };
+            if let Some(b) = self.piece(&v, &live_object(id, &k), &mut creds).await? { out.extend(b) }
         }
         // (Only whole lines: the last may still be being written.)
         let text = String::from_utf8_lossy(&out).into_owned();
@@ -3782,7 +3778,6 @@ impl<'a> ControlPlane<'a> {
     /// What a GitHub job's runner wrote as it went, its last `want` bytes or so: each page in order (by the time its
     /// first line was written), its pieces one after another.
     async fn live_log(&self, id: &str, want: usize) -> Result<Vec<u8>> {
-        use base64::Engine;
         let marks = self.store.list(&format!("glive:{id}:")).await?;
         let size = |v: &str| v.trim_matches('"').strip_prefix("s3:").and_then(|r| r.rsplit(':').next()).and_then(|n| n.parse::<usize>().ok()).unwrap_or(v.len() * 3 / 4);
         // From the end of each page, as much as is wanted (the pages' keys go by their names, not their times: the
@@ -3794,23 +3789,11 @@ impl<'a> ControlPlane<'a> {
             let t = totals.entry(file_of(k)).or_insert(0);
             if *t < want { *t += size(v); chosen[i] = true }
         }
-        let plane_url = get_json::<String>(self.store, "plane_url").await?.unwrap_or_default();
         let mut creds = None;
         let mut pages: Vec<(String, Vec<u8>)> = vec![];
         for (k, v) in marks.iter().zip(&chosen).filter(|(_, c)| **c).map(|(m, _)| m) {
-            let rest = k.strip_prefix(&format!("glive:{id}:")).unwrap_or_default();
-            let file = rest.split(':').next().unwrap_or_default().to_string();
-            let bytes = match v.trim_matches('"').strip_prefix("s3:") {
-                Some(r) => {
-                    let region = r.split(':').next().unwrap_or_default();
-                    if creds.is_none() { if let Some(a) = self.aws_connection().await?.filter(|a| a.connected) { creds = Some(self.aws_creds(&plane_url, &a).await?) } }
-                    let Some(c) = &creds else { continue };
-                    let at = rest.split(':').nth(1).unwrap_or_default();
-                    let got = aws::s3(self.http, "GET", &aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &format!("live/{id}/{file}-{at}")), region, c, vec![], &[], self.clock.now_ms()).await?;
-                    if got.status < 300 { got.body } else { continue }
-                }
-                None => base64::engine::general_purpose::STANDARD.decode(v.trim_matches('"')).map_err(|e| e.to_string())?,
-            };
+            let file = file_of(k);
+            let Some(bytes) = self.piece(v, &live_object(id, k), &mut creds).await? else { continue };
             match pages.iter_mut().find(|(f, _)| *f == file) { Some((_, b)) => b.extend(bytes), None => pages.push((file, bytes)) }
         }
         // Every line in the order it was written (each begins with its time), once: the runner writes a step's lines to
@@ -3872,7 +3855,7 @@ impl<'a> ControlPlane<'a> {
         steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
         let posts: Vec<(Option<String>, Vec<String>)> = self.store.list(&format!("rline:{token}:")).await?.into_iter().map(|(_, v)| { let (step, _, lines) = crate::runner_service::feed(&v); (step, lines) }).collect();
         let mut out = vec![];
-        let job_id = get_json::<crate::runner_service::HandedJob>(self.store, &format!("rjob:{token}")).await?.map(|h| h.job_id).unwrap_or(0);
+        let job_id = handed.job_id;
         for s in steps {
             let text = match s["log"].as_u64() {
                 Some(n) => String::from_utf8_lossy(&self.log_text(token, n).await?).into_owned(),
@@ -5524,6 +5507,14 @@ fn local_id() -> u64 {
 /// A launcher's request with what the machine runs (its runner's settings), added to what it is asked for.
 fn with_work(body: serde_json::Value, work: &Work) -> serde_json::Value {
     work.json().as_object().into_iter().flatten().fold(body, |mut body, (k, v)| { body[k] = v.clone(); body })
+}
+
+/// Where a page a GitHub job's runner wrote as it went is kept in the bucket, by its mark in the store
+/// (`glive:<job>:<page>:<where in it>`).
+fn live_object(id: &str, mark: &str) -> String {
+    let mut rest = mark.strip_prefix(&format!("glive:{id}:")).unwrap_or_default().split(':');
+    let (file, at) = (rest.next().unwrap_or_default(), rest.next().unwrap_or_default());
+    format!("live/{id}/{file}-{at}")
 }
 
 /// Where a part of a run's working tree is kept in the bucket.
