@@ -64,11 +64,11 @@ pub fn sources<'a>(labels: impl IntoIterator<Item = (&'a String, &'a String)>) -
 async fn infos(socket: &Path) -> Result<BTreeMap<String, (u64, HashMap<String, String>)>, String> {
     let ch = channel(socket).await.and_then(crate::faults::said)?;
     let mut req = tonic::Request::new(capi::ListContentRequest { filters: vec![] });
-    req.metadata_mut().insert("containerd-namespace", NAMESPACE.parse().map_err(|_| "namespace")?);
+    req.metadata_mut().insert("containerd-namespace", tonic::metadata::MetadataValue::from_static(NAMESPACE));
     let mut stream = capi::content_client::ContentClient::new(ch).list(req).await.and_then(crate::faults::pass).map_err(|e| e.message().to_string())?.into_inner();
     let mut out = BTreeMap::new();
     while let Some(r) = stream.message().await.and_then(crate::faults::pass).map_err(|e| e.message().to_string())? {
-        for i in r.info { out.insert(i.digest, (i.size.max(0) as u64, i.labels.into_iter().collect())); }
+        out.extend(r.info.into_iter().map(|i| (i.digest, (i.size.max(0) as u64, i.labels.into_iter().collect()))));
     }
     Ok(out)
 }
@@ -86,7 +86,7 @@ pub struct Done { pub served: u64, pub served_bytes: u64, pub pulled: u64, pub p
 /// The keep (see the module); 0 whatever happened (a machine's end never waits on it beyond `most`).
 pub fn keep(o: &Options) -> i32 {
     let began = Instant::now();
-    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() { Ok(r) => r, Err(e) => { eprintln!("superci-layers keep: {e}"); return 0 } };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a runtime");
     let agent = crate::fetch::agent();
     let infos = match rt.block_on(infos(&o.socket)) {
         Ok(i) => i,

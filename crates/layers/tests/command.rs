@@ -248,10 +248,30 @@ async fn keep_says_what_was_kept_whatever_the_control_plane_answers() {
         let o = keep(&at, &s2.1, &[]);
         assert!(o.status.success() && String::from_utf8_lossy(&o.stderr).contains("superci-layers keep: saying what"), "{}", String::from_utf8_lossy(&o.stderr));
     }
-    // A content store with nothing pulled: nothing offered, said once.
+    // A content store with nothing pulled (switched in): nothing offered, said once.
     let s3 = serve(&folder("keep3"), &[], &[]);
+    std::fs::write(s3.1.join("state"), "on: Docker answered on it").unwrap();
     p.lock().unwrap().kept = Answer::Json(200, serde_json::json!({}));
     let before = p.lock().unwrap().reports.len();
     assert!(keep(&at, &s3.1, &[]).status.success());
     assert_eq!(p.lock().unwrap().reports.len(), before + 1);
+    // Not switched in, a layer the store has pulled as Docker pulls (had, not offered); the offer answered with no
+    // layers, or with what is not JSON; an upload with no headers to a link out of reach.
+    let dir4 = folder("keep4");
+    std::fs::write(dir4.join("index.json"), serde_json::json!({ "layers": { digest(&blobs[0]): { "size": blobs[0].len(), "erofs": { "size": 1 }, "blob": {} } } }).to_string()).unwrap();
+    std::fs::write(dir4.join("state"), "off: the kernel does not mount an EROFS file").unwrap();
+    let s4 = serve(&dir4, &[], &[]);
+    pulled(&s4.socket(), &blobs, &[]).await;
+    let gone = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+    let answers: serde_json::Map<String, serde_json::Value> = blobs[1..].iter().map(|b| (digest(b), serde_json::json!({ "do": "upload", "url": format!("http://127.0.0.1:{gone}/up"), "id": 1 }))).collect();
+    for propose in [serde_json::json!({ "layers": {}, "uploaded": format!("{at}/uploaded") }), serde_json::json!({ "layers": answers, "uploaded": format!("{at}/uploaded") })] {
+        p.lock().unwrap().propose = Some(Answer::Json(200, propose));
+        assert!(keep(&at, &dir4, &[]).status.success());
+        let last = p.lock().unwrap().reports.last().cloned().unwrap();
+        assert_eq!(last["had"].as_u64(), Some(1), "{last}");
+    }
+    assert!(p.lock().unwrap().reports.last().unwrap()["failed"].as_u64().unwrap() >= 1);
+    // (An offer answered 200 with what is not JSON.)
+    let raw_plane = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); let at = format!("http://{}", l.local_addr().unwrap()); std::thread::spawn(move || for mut c in l.incoming().flatten() { let mut b = [0u8; 4096]; let _ = c.read(&mut b); let _ = c.write_all(b"HTTP/1.1 200 X\r\ncontent-length: 8\r\nconnection: close\r\n\r\nnot json"); }); at };
+    assert!(keep(&raw_plane, &dir4, &[]).status.success());
 }
