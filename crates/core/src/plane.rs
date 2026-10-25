@@ -2578,7 +2578,7 @@ impl<'a> ControlPlane<'a> {
             return Ok(self.store.list("job:").await?.into_iter().filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).filter(|(_, j)| needs_care(j, now)).collect())
         }
         // (The jobs themselves, read at once: an index says only which.)
-        let keys: Vec<String> = self.store.list("live:").await?.into_iter().filter_map(|(k, _)| Some(format!("job:{}", k.strip_prefix("live:")?))).collect();
+        let keys: Vec<String> = self.store.list("live:").await?.into_iter().map(|(k, _)| format!("job:{}", &k["live:".len()..])).collect();
         Ok(keys.iter().cloned().zip(self.store.get_many(&keys).await?).filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v?).ok()?))).collect())
     }
 
@@ -2590,7 +2590,8 @@ impl<'a> ControlPlane<'a> {
             all.truncate(n);
             return Ok(all)
         }
-        let keys: Vec<String> = self.store.list_last("recent:", n).await?.into_iter().rev().filter_map(|(k, _)| Some(format!("job:{}", k.splitn(3, ':').nth(2)?))).collect();
+        // (`recent:<when>:<id>`.)
+        let keys: Vec<String> = self.store.list_last("recent:", n).await?.into_iter().rev().map(|(k, _)| format!("job:{}", k.splitn(3, ':').nth(2).unwrap_or_default())).collect();
         Ok(self.store.get_many(&keys).await?.into_iter().flatten().filter_map(|v| serde_json::from_str(&v).ok()).collect())
     }
 
@@ -2611,8 +2612,8 @@ impl<'a> ControlPlane<'a> {
             return Ok((hours, spend))
         }
         let keys: Vec<String> = (today - days..=today).map(day_key).collect();
-        for (day, v) in (today - days..=today).zip(self.store.get_many(&keys).await?) {
-            let Some(d) = v.and_then(|v| serde_json::from_str::<Day>(&v).ok()) else { continue };
+        let kept = (today - days..=today).zip(self.store.get_many(&keys).await?).filter_map(|(day, v)| v.and_then(|v| serde_json::from_str::<Day>(&v).ok()).map(|d| (day, d)));
+        for (day, d) in kept {
             for (i, h) in d.hours.iter().enumerate() { if h.jobs > 0 || h.usd != 0.0 { hours.entry(day * 24 + i as u64).or_insert_with(Hour::default).add(h) } }
             let s = spend.entry(day).or_default();
             for (place, usd) in d.spend { *s.entry(place).or_insert(0.0) += usd }
@@ -2707,14 +2708,14 @@ impl<'a> ControlPlane<'a> {
         Ok(())
     }
 
-    /// Builds the jobs' indexes from the jobs kept before them, `budget` jobs at a time (where it got to is kept);
+    /// Builds the jobs' indexes from the jobs kept before them, `budget` jobs at a time (the first one not done yet is kept, to go on from);
     /// whether they are complete.
     async fn reindex(&self, budget: usize) -> Result<bool> {
         if self.indexed().await { return Ok(true) }
         let now = self.clock.now_ms();
         let after = self.store.get("reindex-at").await?.unwrap_or_default();
         let mut done = 0;
-        for (key, v) in self.store.list("job:").await?.into_iter().filter(|(k, _)| *k > after) {
+        for (key, v) in self.store.list("job:").await?.into_iter().filter(|(k, _)| *k >= after) {
             if done == budget { self.store.put("reindex-at", key).await?; return Ok(false) }
             let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
             let add = self.counting(&mut j);
@@ -2730,13 +2731,13 @@ impl<'a> ControlPlane<'a> {
         Ok(true)
     }
 
-    /// Counts the runs of jobs counted before runs were (0.19.6), `budget` jobs at a time (where it got to is kept),
+    /// Counts the runs of jobs counted before runs were (0.19.6), `budget` jobs at a time (the first one not done yet is kept, to go on from),
     /// once: each run once, by the same mark its jobs counted from now on use, in the hour of its first job.
     async fn recount_runs(&self, budget: usize) -> Result<bool> {
         if self.store.get(RUNS_COUNTED).await?.is_some() { return Ok(true) }
         let now = self.clock.now_ms();
         let after = self.store.get("runs-count-at").await?.unwrap_or_default();
-        let mut jobs: Vec<(String, Job)> = self.store.list("job:").await?.into_iter().filter(|(k, _)| *k > after).filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).collect();
+        let mut jobs: Vec<(String, Job)> = self.store.list("job:").await?.into_iter().filter(|(k, _)| *k >= after).filter_map(|(k, v)| Some((k, serde_json::from_str::<Job>(&v).ok()?))).collect();
         jobs.sort_by(|a, b| a.0.cmp(&b.0));
         for (done, (key, j)) in jobs.iter().enumerate() {
             if done == budget { self.store.put("runs-count-at", key.clone()).await?; return Ok(false) }
@@ -3153,8 +3154,7 @@ impl<'a> ControlPlane<'a> {
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
                         if let Some(g) = size.gpu { body["gpu"] = g.to_uppercase().into() }
-                        for (k, v) in work.json().as_object().into_iter().flatten() { body[k] = v.clone() }
-                        let v = self.launcher_call(plane_url, &a, "/launch", body).await?;
+                        let v = self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await?;
                         Ok(Tried::Started(v["id"].as_str().ok_or("launcher answered without an id")?.to_string(), v["kind"].as_str().unwrap_or_default().to_string()))
                     }.await,
                 };
@@ -3350,7 +3350,7 @@ impl<'a> ControlPlane<'a> {
         enum Place { Own, Launcher(Launcher), Aws(AwsConnection) }
         let mut places = vec![];
         if self.own_containers() { places.push(Place::Own) }
-        for c in ["cloudflare", "modal"] { if let Some(a) = self.config.launchers.iter().find(|a| a.cloud == c) { places.push(Place::Launcher(a.clone())) } }
+        places.extend(["cloudflare", "modal"].iter().filter_map(|c| self.config.launchers.iter().find(|a| a.cloud == *c)).map(|a| Place::Launcher(a.clone())));
         if let Ok(Some(a)) = self.aws_connection().await.map(|a| a.filter(|a| a.connected)) { places.push(Place::Aws(a)) }
         if places.is_empty() { return }
         let Some(app) = self.app_of(job) else { return };
@@ -3373,14 +3373,15 @@ impl<'a> ControlPlane<'a> {
         let work = Work::Fail { jit, why: crate::crypto::b64(line.as_bytes()) };
         let size = Size { cpu: 1, ram_gb: 4, disk_gb: 8, gpu: None };
         // The first place that starts it (a container that would not start, a cloud's hiccup: the next).
-        for place in places {
+        let mut places = places.into_iter();
+        loop {
+            let Some(place) = places.next() else { break };
             let started: Result<()> = async {
                 match place {
                     Place::Own => self.containers.ok_or("no containers")?.start(&name, &work, 10, size).await.map(|_| ()),
                     Place::Launcher(a) => {
-                        let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": 10, "cpu": 1, "ram_gb": 4, "disk_gb": 8, "location": self.config.cloudflare_location });
-                        for (k, v) in work.json().as_object().into_iter().flatten() { body[k] = v.clone() }
-                        self.launcher_call(plane_url, &a, "/launch", body).await.map(|_| ())
+                        let body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": 10, "cpu": 1, "ram_gb": 4, "disk_gb": 8, "location": self.config.cloudflare_location });
+                        self.launcher_call(plane_url, &a, "/launch", with_work(body, &work)).await.map(|_| ())
                     }
                     Place::Aws(a) => {
                         let creds = self.aws_creds(plane_url, &a).await?;
@@ -3390,16 +3391,17 @@ impl<'a> ControlPlane<'a> {
                         let user_data = aws::runner_user_data(&work, 10)?;
                         // A spot machine in the first region that has one; where spot is refused (its limit may be
                         // the very reason the job fails), an on-demand one, unless on-demand is turned off in the order.
-                        let markets: &[bool] = if self.config.routing.pool(AWS_ON_DEMAND).is_some_and(|p| p.off) { &[true] } else { &[true, false] };
-                        let mut started: Result<()> = Err("no AWS region".into());
-                        'regions: for region in self.aws_regions(&a) {
+                        let on_demand = !self.config.routing.pool(AWS_ON_DEMAND).is_some_and(|p| p.off);
+                        let (mut started, mut regions): (Result<()>, _) = (Err("no AWS region".into()), self.aws_regions(&a).into_iter());
+                        loop {
+                            let Some(region) = regions.next() else { break };
                             let (image, image_gb) = match self.image(&region, &Spec::default(), &creds, self.clock.now_ms()).await { Ok(i) => i, Err(e) => { started = Err(e); continue } };
                             let network = match self.network(&region, &creds, self.clock.now_ms()).await { Ok(n) => n, Err(e) => { started = Err(e); continue } };
-                            for spot in markets {
-                                started = aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, clock: None, skip: &[], tags: &tags, spot: *spot, os: "linux",
-                                    avoid: &[], timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet: false, store_disk: None }, self.clock.now_ms(), &mut aws::Told::default()).await.map(|_| ());
-                                if started.is_ok() { break 'regions }
-                            }
+                            let start = async |spot: bool| aws::run_instance(self.http, &creds, &aws::Launch { region: &region, network: network.as_ref(), image: &image, types: &types, user_data: &user_data, disk_gb: image_gb.max(30), disk_mibs: DISK_MIBS_INCLUDED, disk_iops: DISK_IOPS_INCLUDED, clock: None, skip: &[], tags: &tags, spot, os: "linux",
+                                avoid: &[], timer: Some(self.timer), jitter_ms: (job.job_id % 8) * 120, fleet: false, store_disk: None }, self.clock.now_ms(), &mut aws::Told::default()).await.map(|_| ());
+                            started = start(true).await;
+                            if started.is_err() && on_demand { started = start(false).await }
+                            if started.is_ok() { break }
                         }
                         started
                     }
@@ -5517,6 +5519,11 @@ impl<'a> ControlPlane<'a> {
 fn local_id() -> u64 {
     let r = crate::crypto::random_bytes(8);
     (1u64 << 52) | (u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]) & ((1u64 << 52) - 1))
+}
+
+/// A launcher's request with what the machine runs (its runner's settings), added to what it is asked for.
+fn with_work(body: serde_json::Value, work: &Work) -> serde_json::Value {
+    work.json().as_object().into_iter().flatten().fold(body, |mut body, (k, v)| { body[k] = v.clone(); body })
 }
 
 /// Where a part of a run's working tree is kept in the bucket.

@@ -5467,6 +5467,40 @@ fn a_damaged_signing_key_or_no_aws_credentials_fail_what_needs_them_saying_why()
     assert!(job(&store, 9)["error"].as_str().is_some_and(|e| e.contains("no AWS credentials in this runtime")), "{}", job(&store, 9));
 }
 
+#[test]
+fn many_jobs_kept_before_their_indexes_are_indexed_and_counted_over_several_sweeps_and_damaged_ones_are_passed_over() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    // More jobs than a sweep indexes at once (150), counted before runs were: each of a run of its own, one damaged.
+    for id in 1..=160u64 {
+        store.0.borrow_mut().insert(format!("job:{id:04}"), serde_json::json!({ "job_id": id, "run_id": id, "repo": "acme/app", "label": "superci", "state": "done", "at_ms": t - 3_600_000, "installation_id": 42,
+            "cloud": "aws", "seen_in_progress": true, "began": true, "ended_ms": t - 3_000_000, "cost_usd": 0.01, "counted_usd": 0.01 }).to_string());
+    }
+    store.0.borrow_mut().insert("job:0050".into(), "not a job".into());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.alarm()).unwrap();
+    assert!(!store.0.borrow().contains_key("indexed") && store.0.borrow().contains_key("reindex-at"), "a part at a time");
+    block_on(plane.alarm()).unwrap();
+    // Each of them, the one a part ended at too.
+    assert!(store.0.borrow().contains_key("indexed"));
+    assert_eq!(store.0.borrow().keys().filter(|k| k.starts_with("recent:")).count(), 159);
+    // Their runs counted a part at a time too, each once.
+    let marks = || store.0.borrow().keys().filter(|k| k.starts_with("counted-run:")).count();
+    assert!(!store.0.borrow().contains_key("runs-counted"));
+    block_on(plane.alarm()).unwrap();
+    assert!(store.0.borrow().contains_key("runs-counted"));
+    assert_eq!(marks(), 159);
+    // An index that points at a job no longer kept, or at a damaged one, and a damaged index: passed over where read.
+    store.0.borrow_mut().insert("live:9999".into(), String::new());
+    store.0.borrow_mut().insert("live:0050".into(), String::new());
+    store.0.borrow_mut().insert("recent:x".into(), String::new());
+    let status = json(&block_on(plane.handle(get("/status").with_header("authorization", "Bearer dashboard-session-key-1"))));
+    assert!(status["jobs"].as_array().is_some_and(|j| !j.is_empty()), "{status}");
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -5597,7 +5631,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         an_app_installed_nowhere_has_no_public_repositories_and_nothing_to_uninstall_and_one_github_refuses_is_said_on_leaving,
         events_this_control_plane_does_nothing_with_are_answered_and_change_nothing,
         a_gitlab_job_over_before_its_machine_came_is_cancelled_wherever_it_was,
-        a_damaged_signing_key_or_no_aws_credentials_fail_what_needs_them_saying_why
+        a_damaged_signing_key_or_no_aws_credentials_fail_what_needs_them_saying_why,
+        many_jobs_kept_before_their_indexes_are_indexed_and_counted_over_several_sweeps_and_damaged_ones_are_passed_over
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
