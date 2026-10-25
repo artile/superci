@@ -89,6 +89,20 @@ jobs:
       - name: ${{ matrix.sweep }}, every call and store operation failing in turn
         run: cargo test -p superci --test ${{ matrix.sweep }}
 
+  # The core's control plane tests again, each with every call and store operation failing in turn (in process: no
+  # build of the programs needed).
+  core-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SUPERCI_SWEEP_FAULTS: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: The core's control plane, every call and store operation failing in turn
+        run: cargo test -p superci-core --test plane every_test_here
+
   # superci-layers against containerd's own conformance suites for snapshotters and content stores (as root: the
   # snapshotter suite mounts overlays), directly and through containerd's metadata layer.
   layers:
