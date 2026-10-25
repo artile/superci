@@ -5704,6 +5704,84 @@ fn a_run_taken_away_or_changed_by_another_request_while_it_is_moved_on_is_left_t
     assert_eq!(block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs/9/cancel")).with_header("authorization", "Bearer dashboard-session-key-1"))).status, 404);
 }
 
+#[test]
+fn the_upkeep_ends_what_waited_too_long_or_was_cut_off_and_lets_go_of_failing_runners_github_no_longer_wants() {
+    let t = 1_790_000_000_000u64;
+    let hook = format!("{PLANE_URL}/gitlab/webhook");
+    let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+        let (u, json) = (r.url.as_str(), |v: serde_json::Value| Some(Response::new(200, "application/json", v.to_string())));
+        match u {
+            "https://api.github.com/repos/acme/app/actions/jobs/5" => json(serde_json::json!({ "status": "in_progress" })),
+            "https://api.github.com/repos/acme/app/actions/jobs/8" => json(serde_json::json!({ "status": "completed", "runner_name": null })),
+            "https://api.github.com/orgs/acme/actions/runners/66" if r.method == "DELETE" => Some(Response::new(204, "application/json", "")),
+            // Waiting jobs GitHub lists: one without its id.
+            "https://api.github.com/repos/acme/app/actions/runs?status=queued&per_page=10" => json(serde_json::json!({ "workflow_runs": [{ "id": 90 }] })),
+            "https://api.github.com/repos/acme/app/actions/runs/90/jobs?per_page=50" => json(serde_json::json!({ "jobs": [{ "status": "queued", "name": "no id" }] })),
+            // GitLab's pending jobs: one without its id.
+            _ if u.starts_with("https://gitlab.example/api/v4/projects?membership=true") => json(serde_json::json!([{ "id": 380, "path_with_namespace": "acme/app" }])),
+            "https://gitlab.example/api/v4/projects/380/hooks" => json(serde_json::json!([{ "id": 1, "url": hook }])),
+            _ if u.starts_with("https://gitlab.example/api/v4/projects/380/jobs?scope[]=pending") => json(serde_json::json!([{ "name": "no id" }])),
+            _ => None,
+        }
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    odd_plane(&mut config);
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let put = |id: &str, j: serde_json::Value| {
+        let mut base = serde_json::json!({ "job_id": 0, "run_id": 3, "repo": "acme/app", "state": "waiting", "at_ms": t - 60_000, "installation_id": 42, "cloud": "aws", "seen_in_progress": false, "label": "superci" });
+        for (k, v) in j.as_object().unwrap() { base[k] = v.clone() }
+        store.0.borrow_mut().insert(format!("job:{id}"), base.to_string());
+    };
+    // Waiting for room a day; its start cut off a third time; a failing runner GitHub no longer wants, for half an
+    // hour, its job taken (5), or no token for its repository (6).
+    put("1", serde_json::json!({ "job_id": 1, "at_ms": t - 25 * 3_600_000 }));
+    put("2", serde_json::json!({ "job_id": 2, "state": "launching", "retries": 2, "launched_ms": t - 180_000 }));
+    put("4", serde_json::json!({ "job_id": 4, "state": "failed", "fail_pending": "why", "ended_ms": t - 31 * 60_000 }));
+    put("5", serde_json::json!({ "job_id": 5, "state": "failed", "fail_pending": "why", "ended_ms": t - 60_000 }));
+    put("6", serde_json::json!({ "job_id": 6, "state": "failed", "fail_pending": "why", "ended_ms": t - 60_000, "installation_id": 999 }));
+    // A machine whose job was cancelled before any runner took it, the note of it missed: its runner taken back.
+    put("7", serde_json::json!({ "job_id": 7, "state": "launched", "launched_ms": t - 30_000, "machine_id": "i-7", "region": "us-east-1", "runner": "r-7", "runner_id": 66 }));
+    store.0.borrow_mut().insert("gone:7".into(), t.to_string());
+    // A machine whose job GitHub took elsewhere, with no runner of its own registered.
+    put("8", serde_json::json!({ "job_id": 8, "state": "launched", "launched_ms": t - 9 * 60_000, "machine_id": "i-8", "region": "us-east-1" }));
+    // A GitLab machine whose record says no project.
+    put("gl9", serde_json::json!({ "job_id": 9, "state": "launched", "launched_ms": t - 9 * 60_000, "machine_id": "i-9", "region": "us-east-1", "provider": "gitlab" }));
+    // A launch template note that names no template (passed over).
+    store.0.borrow_mut().insert("aws:template:nothing".into(), (t - 2 * 86_400_000).to_string());
+    block_on(plane.alarm()).unwrap();
+    let state = |id: &str| { let j: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("job:{id}")]).unwrap(); (j["state"].as_str().unwrap_or_default().to_string(), j["fail_pending"].is_null()) };
+    assert_eq!(state("1"), ("failed".to_string(), true));
+    assert_eq!(state("2"), ("failed".to_string(), true));
+    assert!(state("4").1 && state("5").1 && state("6").1, "let go of");
+    assert_eq!(state("7").0, "cancelled");
+    assert_eq!(state("8").0, "swept");
+    assert_ne!(state("gl9").0, "launched");
+    assert!(store.0.borrow().contains_key("aws:template:nothing"), "passed over");
+}
+
+#[test]
+fn just_after_a_move_here_the_upkeep_comes_back_within_the_minute_and_looks_for_jobs_github_did_not_tell_of() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    // No job yet: nothing to look for.
+    block_on(plane.alarm()).unwrap();
+    store.0.borrow_mut().insert("claimed_at".into(), "1790000000000".into());
+    // Two jobs of one repository, kept before the indexes: asked of once.
+    for id in [1, 2] { store.0.borrow_mut().insert(format!("job:{id}"), serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "state": "done", "at_ms": 1_789_999_000_000u64, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string()); }
+    store.0.borrow_mut().remove("indexed");
+    wakes.0.borrow_mut().clear();
+    // (A runtime started anew: what the last one kept in memory, that the indexes were built, is not known.)
+    let cache = Cache::default();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(wakes.0.borrow().last(), Some(&60_000));
+    assert_eq!(clouds.calls.borrow().iter().filter(|c| c.1.contains("/repos/acme/app/actions/runs?status=queued")).count(), 1);
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -5840,7 +5918,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_runs_called_workflows_and_expressions_are_read_as_github_reads_them,
         a_damaged_or_gone_run_record_is_left_as_it_is_and_says_why_where_it_is_moved_on,
         what_a_run_from_a_computer_is_asked_for_that_it_does_not_have_is_said_as_that,
-        a_run_taken_away_or_changed_by_another_request_while_it_is_moved_on_is_left_to_that_one
+        a_run_taken_away_or_changed_by_another_request_while_it_is_moved_on_is_left_to_that_one,
+        the_upkeep_ends_what_waited_too_long_or_was_cut_off_and_lets_go_of_failing_runners_github_no_longer_wants,
+        just_after_a_move_here_the_upkeep_comes_back_within_the_minute_and_looks_for_jobs_github_did_not_tell_of
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

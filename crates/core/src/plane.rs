@@ -4705,19 +4705,17 @@ impl<'a> ControlPlane<'a> {
         let _ = self.reindex(150).await;
         // (And the runs of jobs counted before runs were, once the indexes are there.)
         if self.indexed().await { let _ = self.recount_runs(150).await; }
-        let kept: Vec<(String, String)> = self.live_jobs().await?.into_iter().map(|(k, j)| (k, serde_json::to_string(&j).unwrap_or_default())).collect();
+        let kept = self.live_jobs().await?;
         // GitHub's jobs that still wait as far as it has said (with the runners that can take them), and the jobs
         // that machines still coming are for.
         let (mut queued, mut aimed): (Vec<(String, u64, String)>, Vec<u64>) = (vec![], vec![]);
-        for (_, v) in &kept {
-            let Ok(j) = serde_json::from_str::<Job>(v) else { continue };
+        for (_, j) in &kept {
             if !j.provider.is_empty() { continue }
             if ["launching", "launched"].contains(&j.state.as_str()) && !j.seen_in_progress { aimed.push(j.for_job.unwrap_or(j.job_id)) }
             let waits = !(j.began || j.over || j.failed_fast) && j.fail_pending.is_none() && j.rerun.is_none() && now.saturating_sub(j.at_ms) < 86_400_000;
-            if waits && ["launching", "launched", "running", "done"].contains(&j.state.as_str()) { queued.push((self.runners_of(&j), j.job_id, j.repo.clone())) }
+            if waits && ["launching", "launched", "running", "done"].contains(&j.state.as_str()) { queued.push((self.runners_of(j), j.job_id, j.repo.clone())) }
         }
-        for (key, v) in kept {
-            let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
+        for (key, mut j) in kept {
             // Nothing more to do for it (time has passed since it was written): no longer among the live ones.
             if self.indexed().await && !needs_care(&j, now) { self.store.delete(&format!("live:{}", key.trim_start_matches("job:"))).await?; continue }
             // Waiting for room: try again (GitHub keeps a job queued for up to a day). As it stands now, not as it
@@ -4800,13 +4798,15 @@ impl<'a> ControlPlane<'a> {
                     let (mut gone, mut on_runner) = ((j.failed_fast || j.over) && j.for_job.is_none(), None);
                     // (And whether it answered that the job still waits: not known, when it could not be asked.)
                     let mut waits_there = false;
+                    // (A GitHub job's App and token, asked for once.)
+                    let github = if j.provider.is_empty() { self.github_for(&j).await } else { None };
                     if !gone && j.provider == "gitlab" {
                         // GitLab has it on this machine's runner (the events that said so never came): as if told.
                         if self.gitlab_settle(&key, &mut j, now).await { if j.state == "running" { active += 1 } continue }
                         let status = match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(p)) => gitlab::job(self.http, gl, p, wanted).await.ok().map(|(_, s)| s), _ => None };
                         (gone, waits_there) = (status.as_deref().is_some_and(|s| s != "pending"), status.as_deref() == Some("pending"));
                     } else if !gone {
-                        if let Some((app, t)) = self.github_for(&j).await {
+                        if let Some((app, t)) = &github {
                             if let Ok((status, runner)) = github::job_state(self.http, &app.api(), &t, &j.repo, wanted).await { (gone, on_runner, waits_there) = (status != "queued", runner, status == "queued") }
                         }
                     }
@@ -4818,7 +4818,7 @@ impl<'a> ControlPlane<'a> {
                             continue;
                         }
                         // Its runner is busy all the same (what said so was lost): the machine is running a job.
-                        let busy = match (self.github_for(&j).await, j.runner_id) {
+                        let busy = match (&github, j.runner_id) {
                             (Some((app, t)), Some(id)) => github::runner_busy(self.http, &app.api(), &t, &Self::owner_of(app), &j.repo, id).await,
                             _ => Ok(false),
                         };
@@ -4842,7 +4842,7 @@ impl<'a> ControlPlane<'a> {
                         others.sort_unstable_by(|a, b| b.0.cmp(&a.0));
                         let mut next = None;
                         for (id, repo) in others.into_iter().take(3) {
-                            let Some((app, t)) = self.github_for(&j).await else { break };
+                            let Some((app, t)) = &github else { break };
                             match github::job_status(self.http, &app.api(), &t, &repo, id).await {
                                 Ok(status) if status == "queued" => { next = Some(id); break }
                                 Ok(_) => {
@@ -4926,7 +4926,9 @@ impl<'a> ControlPlane<'a> {
         self.sweep_gitlab_runners(now).await?;
         // Notes that only matter for a while: spot interruptions (counted for the pause), jobs asked to run again and
         // not arrived.
-        for (prefix, keep) in [("spot:interrupted:", SPOT_PAUSE.1 + SPOT_PAUSE.2), ("rerun:", 86_400_000), ("rerun-asked:", 7 * 86_400_000), ("gone:", 3_600_000)] {
+        let mut notes = [("spot:interrupted:", SPOT_PAUSE.1 + SPOT_PAUSE.2), ("rerun:", 86_400_000), ("rerun-asked:", 7 * 86_400_000), ("gone:", 3_600_000)].into_iter();
+        loop {
+            let Some((prefix, keep)) = notes.next() else { break };
             for (k, v) in self.store.list(prefix).await? { if v.trim_matches('"').parse::<u64>().is_ok_and(|at| now.saturating_sub(at) > keep) { self.store.delete(&k).await? } }
         }
         // A launch template left behind by a request for many spot pools (it could not be removed at the time):
@@ -4951,7 +4953,9 @@ impl<'a> ControlPlane<'a> {
             let run: serde_json::Value = serde_json::from_str(&v).unwrap_or_default();
             if run["at_ms"].as_u64().is_some_and(|at| now.saturating_sub(at) < 86_400_000) { continue }
             for token in run["jobs"].as_array().into_iter().flatten().filter_map(|j| j["token"].as_str()) {
-                for prefix in [format!("rline:{token}:"), format!("rlog:{token}:")] {
+                let mut kinds = [format!("rline:{token}:"), format!("rlog:{token}:")].into_iter();
+                loop {
+                    let Some(prefix) = kinds.next() else { break };
                     for (k, v) in self.store.list(&prefix).await? {
                         // (A log kept in the bucket goes from there too.)
                         if let Some(region) = v.trim_matches('"').strip_prefix("s3:") {
@@ -5038,7 +5042,9 @@ impl<'a> ControlPlane<'a> {
         let asked = self.store.get("gitlab:untold").await.ok().flatten().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         if now.saturating_sub(asked) < 180_000 { return }
         let _ = self.store.put("gitlab:untold", now.to_string()).await;
-        for gl in self.config.gitlabs() {
+        let mut gitlabs = self.config.gitlabs();
+        loop {
+            let Some(gl) = gitlabs.next() else { break };
             let known = format!("gitlab:enabled:{}", gl.id);
             let kept = get_json::<(Vec<(u64, String)>, u64)>(self.store, &known).await.ok().flatten();
             let projects = match kept {
