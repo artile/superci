@@ -444,7 +444,7 @@ impl ControlPlane<'_> {
         let Some(a) = self.aws_connection().await?.filter(|a| a.connected) else { return Ok(()) };
         let creds = self.aws_creds(plane_url, &a).await?;
         for (k, v) in converting {
-            let Some((region, digest)) = k.strip_prefix("lconv:").and_then(|r| r.split_once(':')) else { continue };
+            let Some((region, digest)) = k["lconv:".len()..].split_once(':') else { continue };
             let Ok(c) = serde_json::from_str::<Converting>(&v) else { self.store.delete(&k).await?; continue };
             let (_, _, done_key) = files(digest);
             let url = aws::s3_url(&cache::bucket(&self.config.plane_id, region), region, &done_key);

@@ -5898,18 +5898,25 @@ fn the_layer_store_passes_over_what_is_kept_damaged_and_says_what_a_machine_asks
     let (_, said) = call(good, "layers-propose", serde_json::json!({ "layers": [{ "digest": digest('c'), "size": 10 }, { "digest": digest('d'), "size": 10 }] }));
     assert_eq!(said.matches("\"have\"").count(), 2, "{said}");
     assert_eq!(call(bad, "layers-propose", serde_json::json!({ "layers": [{ "digest": digest('e'), "size": 10 }] })).0, 500);
-    // What a job had from the store, said after it: a layer used long ago noted used, one the store lacks passed over.
-    assert_eq!(call(good, "layers-kept", serde_json::json!({ "served_digests": [digest('a'), digest('f')] })).0, 200);
+    // What a job had from the store, said after it: a layer used long ago noted used (one used today left as it is),
+    // one the store lacks passed over.
+    store.0.borrow_mut().insert(format!("layer:us-east-1:{}", digest('i')), layer(t, t));
+    assert_eq!(call(good, "layers-kept", serde_json::json!({ "served_digests": [digest('a'), digest('f'), digest('i')] })).0, 200);
     assert!(store.0.borrow()[&format!("layer:us-east-1:{}", digest('a'))].contains(&format!("\"used\":{t}")));
     // A machine whose job is not kept, keeping its images.
     store.0.borrow_mut().insert(format!("cachem:{bad}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "", "job": "job:404" }).to_string());
     assert_eq!(call(bad, "layers-kept", serde_json::json!({ "keeping": true })).0, 404);
+    assert_eq!(call(bad, "layers-kept", serde_json::json!({})).0, 404);
     // The upkeep: a conversion kept damaged goes; a queued one kept under no region, or damaged, is passed over.
     {
         let mut m = store.0.borrow_mut();
         m.insert(format!("lconv:us-east-1:{}", digest('g')), "damaged".into());
         m.insert("lwant:nowhere".into(), "{}".into());
+        m.insert("lconv:nowhere".into(), "{}".into());
         m.insert(format!("lwant:us-east-1:{}", digest('h')), "damaged".into());
+        // (Two queued in one region: its room counted once.)
+        m.insert(format!("lwant:us-east-1:{}", digest('j')), serde_json::json!({ "at": t, "size": 10, "source": {} }).to_string());
+        m.insert(format!("lwant:us-east-1:{}", digest('k')), serde_json::json!({ "at": t + 1, "size": 10, "source": {} }).to_string());
     }
     block_on(plane.alarm()).unwrap();
     assert!(!store.0.borrow().contains_key(&format!("lconv:us-east-1:{}", digest('g'))));
@@ -5951,6 +5958,8 @@ fn a_runners_calls_that_bring_nothing_are_answered_as_its_service_answers_them()
     let r = call("POST", "/twirp/github.actions.results.api.v1.CacheService/DeleteCacheEntry", "{}");
     assert_eq!((r.status, json(&r)["code"].as_str()), (404, Some("not_found")));
     assert_eq!(json(&call("POST", "/_apis/v1/ActionDownloadInfo/p/j", "{}"))["actions"], serde_json::json!({}));
+    // GitHub's artifacts, asked of a machine without SuperCI's cache: said as not done there.
+    assert_eq!(call("POST", "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact", "{}").status, 501);
     // Steps' records with none in them; a log's content of nothing.
     assert_eq!(call("PATCH", "/_apis/v1/Timeline/p/t", r#"{"value":[]}"#).status, 200);
     assert_eq!(call("POST", "/_apis/v1/Logfiles/p/1", "").status, 200);
