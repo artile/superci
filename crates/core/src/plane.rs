@@ -4346,7 +4346,7 @@ impl<'a> ControlPlane<'a> {
             strategy: values["strategy"].clone(), needs: serde_json::Value::Object(needs), display: display.clone(), inputs: if inst["inputs"].is_object() { inst["inputs"].clone() } else { run["inputs"].clone() } };
         let message = crate::runner_service::job_message(&given)?;
         put_json(self.store, &format!("rjob:{token}"), &crate::runner_service::HandedJob { message, tree: run["tree"].as_str().map(str::to_string), parts: run["parts"].as_u64().unwrap_or(0) as u32, layered: run["layered"] == true, at_ms: now, job_id, ..Default::default() }).await?;
-        let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),
+        let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.as_deref().unwrap_or(key_name).to_string(), workflow: path, provider: "local".into(),
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), no_spot: inst["off_spot"] == true, ..Default::default() };
         // (Its id is new, and the job is this request's alone: taken in the run's record, written over what was read.)
         self.store.put(&job_key(&job), crate::io::json(&job)).await?;

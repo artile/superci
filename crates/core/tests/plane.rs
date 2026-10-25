@@ -5537,7 +5537,7 @@ fn run_plane(f: impl Fn(&dyn Fn(serde_json::Value) -> Response, &Mem)) {
     f(&new_run, &store);
 }
 
-const LIB: &str = "on:\n  workflow_call:\n    inputs:\n      n:\n        type: number\njobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo ${{ inputs.n }}\n";
+const LIB: &str = "on:\n  workflow_call:\n    inputs:\n      n:\n        type: number\n        required: true\njobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo ${{ inputs.n }}\n";
 
 #[test]
 fn a_runs_jobs_that_cannot_be_read_or_called_are_refused_saying_why() {
@@ -5556,6 +5556,12 @@ fn a_runs_jobs_that_cannot_be_read_or_called_are_refused_saying_why() {
             ("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    continue-on-error: ${{ ) }}\n", serde_json::json!({}), "unexpected RParen"),
             ("jobs:\n  a:\n    runs-on: superci/cpu=${{ ) }}\n    steps:\n      - run: echo\n", serde_json::json!({}), "unexpected RParen"),
             ("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    strategy:\n      matrix: ${{ ) }}\n", serde_json::json!({}), "the job a's matrix: "),
+            // A job that needs one the file does not have; a call of a workflow that may not be called, with a matrix,
+            // or whose job calls another in turn.
+            ("jobs:\n  a:\n    needs: b\n    runs-on: superci\n    steps:\n      - run: echo\n", serde_json::json!({}), "the job a needs b, which .github/workflows/ci.yml does not have"),
+            (calls, serde_json::json!({ ".github/workflows/lib.yml": "on: push\njobs:\n  a:\n    runs-on: superci\n" }), "which is not a workflow that may be called"),
+            ("jobs:\n  call:\n    uses: ./.github/workflows/lib.yml\n    strategy:\n      matrix:\n        v: [1]\n", serde_json::json!({ ".github/workflows/lib.yml": LIB }), "calls a workflow with a matrix"),
+            (calls, serde_json::json!({ ".github/workflows/lib.yml": "on:\n  workflow_call:\njobs:\n  a:\n    uses: ./.github/workflows/other.yml\n" }), "calls a workflow in turn"),
             // A caller whose `if` cannot be read.
             ("jobs:\n  call:\n    if: ${{ ) }}\n    uses: ./.github/workflows/lib.yml\n", serde_json::json!({ ".github/workflows/lib.yml": LIB }), "the job call's if: "),
             // An input given that cannot be read.
@@ -6372,6 +6378,45 @@ fn a_runs_jobs_end_as_their_runners_say_or_when_they_run_out_of_time_or_are_canc
     assert!(store.0.borrow().contains_key(&format!("run-error:{id}")));
 }
 
+#[test]
+fn a_role_aws_will_not_let_this_control_plane_take_leaves_what_needs_it_undone_or_estimated() {
+    let t = 1_790_000_000_000u64;
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| r.url.starts_with("https://sts.").then(|| Response::new(403, "text/xml", "<ErrorResponse><Error><Code>AccessDenied</Code><Message>Not authorized to perform sts:AssumeRoleWithWebIdentity</Message></Error></ErrorResponse>")));
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": role_arn("123456789012", PLANE_ID), "connected": true }).to_string());
+    // A machine that ran a job: its cost left as estimated, and what it sent not counted.
+    store.0.borrow_mut().insert("job:1".into(), serde_json::json!({ "job_id": 1, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t - 600_000, "installation_id": 42, "cloud": "aws", "seen_in_progress": true,
+        "machine_id": "i-1", "machine_type": "m8a.xlarge", "region": "us-east-1", "runner": "r-1" }).to_string());
+    store.0.borrow_mut().insert("runner:r-1".into(), "1".into());
+    block_on(plane.handle(job_event("completed", 1, "acme/app", Some("r-1"))));
+    assert!(job(&store, 1)["cost_from"].is_null());
+    store.0.borrow_mut().insert("job:2".into(), serde_json::json!({ "job_id": 2, "run_id": 3, "repo": "acme/app", "state": "done", "at_ms": t - 600_000, "installation_id": 42, "cloud": "aws", "seen_in_progress": true,
+        "machine_id": "i-2", "machine_type": "m8a.xlarge", "region": "us-east-1", "ended_ms": t - 13 * 60_000, "cost_from": "prices", "cost_usd": 0.1 }).to_string());
+    block_on(plane.alarm()).unwrap();
+    assert!(job(&store, 2)["sent_gb"].is_null());
+    // A launch template left for after an answer: not removed, said.
+    assert!(block_on(plane.later(&format!("{PLANE_URL}/webhook"), "template us-east-1 superci-abc123def456-7-1")).is_err());
+    // A job nothing here can run: its failing runner not started in AWS either.
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci/os=macos")));
+    assert_eq!(job(&store, 3)["state"], "failed");
+}
+
+#[test]
+fn a_gpu_job_refused_spot_for_the_accounts_limit_with_on_demand_turned_off_says_which_limit_to_raise() {
+    let (store, clouds, wakes, cache) = (Mem::default(), Kinds { clouds: FakeClouds::default(), no_gpus: true }, Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.routing.order = vec![Pool { regions: vec![], off: false, cloud: "aws".into(), max_jobs: None, monthly_usd: None }, Pool { regions: vec![], off: true, cloud: superci_core::plane::AWS_ON_DEMAND.into(), max_jobs: None, monthly_usd: None }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=l4")));
+    let e = job(&store, 1)["error"].as_str().unwrap_or_default().to_string();
+    assert!(e.contains("L-3819A6DF") && !e.contains("L-DB2E81BA"), "{e}");
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6524,7 +6569,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         gitlab_events_for_a_control_plane_that_moved_or_claimed_by_another_request_are_left_alone,
         installations_runners_and_machines_with_nothing_or_nobody_left_are_said_as_that,
         a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_is_there,
-        a_runs_jobs_end_as_their_runners_say_or_when_they_run_out_of_time_or_are_cancelled
+        a_runs_jobs_end_as_their_runners_say_or_when_they_run_out_of_time_or_are_cancelled,
+        a_role_aws_will_not_let_this_control_plane_take_leaves_what_needs_it_undone_or_estimated,
+        a_gpu_job_refused_spot_for_the_accounts_limit_with_on_demand_turned_off_says_which_limit_to_raise
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
