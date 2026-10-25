@@ -4411,7 +4411,12 @@ fn control_planes_are_set_up_in_cloudflare_and_modal_from_the_browser_and_delete
         b.wait("document.querySelector('dialog[open]') !== null");
         b.click("dialog[open] button.danger", "");
         let end = std::time::Instant::now() + std::time::Duration::from_secs(90);
-        while common::words(&common::part(&link, "/?p=planes&fragment=1").1).contains(&format!("{row} Move here")) { assert!(std::time::Instant::now() < end, "{row} deleted"); std::thread::sleep(std::time::Duration::from_millis(500)) }
+        loop {
+            let planes = common::words(&common::part(&link, "/?p=planes&fragment=1").1);
+            if !planes.contains(&format!("{row} Move here")) { break }
+            assert!(std::time::Instant::now() < end, "{row} deleted: {planes}\n{}", b.text("body"));
+            std::thread::sleep(std::time::Duration::from_millis(500))
+        }
     }
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&home);
