@@ -422,7 +422,7 @@ fn small_readings_of_aws_s_words_take_every_shape() {
     for (region, usd) in [("us-west-1", 0.096), ("eu-north-1", 0.0836), ("ap-south-1", 0.0912), ("ca-central-1", 0.088), ("eu-west-2", 0.0928), ("eu-central-1", 0.0952), ("eu-west-1", 0.088), ("us-east-1", 0.08), ("nowhere-1", 0.096)] { assert_eq!(disk_gb_month(region), usd) }
     assert_eq!(image_flavor("my-own-image-*"), "my-own-image");
     // A table's row with one cell, and a region that is none: left out.
-    assert!(published_images("### `k`\n\n| Region | AMI ID |\n| only |\n| US-EAST-1 | `ami-0123456789abcdef0` |\n", "k").is_empty());
+    assert!(published_images("### `k`\n\n| Region | AMI ID |\n| only |\n| |\n| US-EAST-1 | `ami-0123456789abcdef0` |\n", "k").is_empty());
     // An organization's policy whose account number is none, and a policy not an organization's; a refusal said
     // without its code.
     let r = Refusal { action: "x".into(), by: By::Organization, policy: "arn:aws:organizations::12:policy/p-1".into() };
@@ -433,7 +433,7 @@ fn small_readings_of_aws_s_words_take_every_shape() {
     assert_eq!(futures::executor::block_on(cheapest_for_speed(&answering(prices()), "us-east-1", &creds(), &none, "linux", 0)), None);
     let listed: Answer = Box::new(|_, _| (200, serde_json::json!({ "PriceList": [{ "terms": { "OnDemand": { "t": { "priceDimensions": { "d": { "pricePerUnit": {} }, "e": { "pricePerUnit": { "USD": "0.5" } } } } } } }] }).to_string()));
     assert_eq!(futures::executor::block_on(disk_price(&answering(listed), &creds(), "us-east-1", 0)).unwrap(), 0.5);
-    let spotless: Answer = Box::new(|_, _| (200, "<item><spotPrice>0.1</spotPrice></item><item><timestamp>1970-01-01T00:00:00Z</timestamp></item>".into()));
+    let spotless: Answer = Box::new(|_, _| (200, "<item><spotPrice>0.1</spotPrice></item><item><timestamp>1970-01-01T00:00:00Z</timestamp></item><item><timestamp>1970-01-01T00:00:00Z</timestamp><spotPrice>x</spotPrice></item>".into()));
     assert!(futures::executor::block_on(spot_cost(&answering(spotless), "us-east-1", "a", &creds(), "m7a.large", "linux", 0, 1, 0)).is_err());
     swept(prices, |aws| futures::executor::block_on(spot_cpu_quota(aws, "us-east-1", &creds(), 0)));
     swept(|| Box::new(|_, _| (400, "<Response><Errors><Error><Code>DryRunOperation</Code><Message>ok</Message></Error></Errors></Response>".into())), |aws| futures::executor::block_on(could_run(aws, "us-east-1", &creds(), "ami-1", "m7a.large", false, 0)));
@@ -447,7 +447,7 @@ fn small_readings_of_aws_s_words_take_every_shape() {
     let never = || answering(Box::new(|_, _| panic!("nothing is asked")));
     assert!(futures::executor::block_on(given_network(&never(), "us-east-1", &creds(), &given(&["subnet-0123456789abcdef0"], &[]), 0)).unwrap_err().contains("needs a subnet and a security group"));
     assert!(futures::executor::block_on(given_network(&never(), "us-east-1", &creds(), &given(&["subnet-0123456789abcdef0"], &["sg-x"]), 0)).unwrap_err().contains("sg-x is not"));
-    let no_vpc: Answer = Box::new(|_, _| (200, "<subnetId>subnet-0123456789abcdef0</subnetId><availabilityZone>a</availabilityZone>".into()));
+    let no_vpc: Answer = Box::new(|_, _| (200, "<subnetId>subnet-0123456789abcdef0</subnetId><availabilityZone>a</availabilityZone><subnetId>subnet-0123456789abcdef0</subnetId><vpcId>vpc-1</vpcId>".into()));
     assert!(futures::executor::block_on(given_network(&answering(no_vpc), "us-east-1", &creds(), &given(&["subnet-0123456789abcdef0"], &["sg-0123456789abcdef0"]), 0)).unwrap_err().contains("no subnet"));
 }
 
@@ -471,6 +471,8 @@ fn a_machines_start_up_script_refuses_what_it_cannot_put_together() {
     let jit = b64(serde_json::json!({ ".runner": b64(serde_json::json!({ "serverUrl": "https://a.example/x", "ServerUrl": "https://a.example/y", "serverUrlV2": "not an address" })) }));
     assert_eq!(runner_hosts(&jit), ["a.example"]);
     assert!(runner_hosts("not base64").is_empty());
+    // The cache's link before its part when the script restarts no Docker.
+    assert!(with_cache("cd /home/runner && run".into(), "https://a.example/c").unwrap().starts_with("c='https://a.example/c'\ncurl"));
 }
 
 #[test]
