@@ -983,6 +983,8 @@ mod tests {
         let mut empty = vec![0x50, 0x4b, 0x03, 0x04];
         empty.extend(zip(&[]).0);
         assert_eq!(unpacked(&empty, "empty"), Ok(0));
+        // One gone before it is opened: said as the system says it.
+        assert!(matches!(unzip(&dir.join("gone.zip"), &dir.join("gone")), Err(Unpack::Bad(e)) if !e.is_empty()));
         assert_eq!(unpacked(b"PK\x03\x04 and nothing that ends it", "endless"), Err("no end record".into()));
         // Its directory said to be past its end.
         let (mut z, _) = zip(&[("a.txt", 0, b"a")]);

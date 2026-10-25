@@ -9021,7 +9021,7 @@ mod tests {
         let t = now_ms() - 3_600_000;
         let job = |id: u64, run: u64| serde_json::json!({ "job_id": id, "run_id": run, "repo": "acme/app", "state": "done", "conclusion": "success", "at_ms": t, "started_ms": t + 5_000, "ended_ms": t + 65_000,
             "launched_ms": t, "cloud": "cloudflare", "machine_id": "m", "machine_type": "4cpu-12gb", "cpu": 4, "usd_per_hour": 0.4, "name": format!("job{id}"), "workflow": "ci", "installation_id": 1, "runner": null, "runner_id": null, "error": null });
-        let usage = |runs: bool| { let mut u = serde_json::json!({ "jobs": 3, "ran": 3, "not_ran": 0, "machine_minutes": 3.0, "billed_minutes": 3, "usd": 0.02, "host_usd": 0.05, "steps": (0..24).map(|i| serde_json::json!({ "ran": if i == 23 { 3 } else { 0 }, "not_ran": 0, "runs": if i == 23 { 2 } else { 0 }, "minutes": 0.0, "usd": 0.0, "host_usd": 0.0 })).collect::<Vec<_>>() }); if runs { u["runs"] = 2.into() } u };
+        let usage = |runs: bool| { let mut u = serde_json::json!({ "jobs": 3, "ran": 3, "not_ran": 0, "machine_minutes": 3.0, "billed_minutes": 3, "usd": 0.02, "host_usd": 0.05, "steps": (0..24).map(|i| serde_json::json!({ "ran": if i == 23 { 3 } else { (i == 22) as u64 }, "not_ran": (i == 22) as u64, "runs": if i == 23 { 2 } else { 0 }, "minutes": 0.0, "usd": 0.0, "host_usd": 0.0 })).collect::<Vec<_>>() }); if runs { u["runs"] = 2.into() } u };
         let view = |runs: bool| PlaneView { plane: plane.clone(), online: true, github: true, installed: true, aws: false, runners: true, gitlab: false, moved_to: None, standby: false, version: Some(superci_core::plane::VERSION.into()),
             status: Some(serde_json::json!({ "containers": true, "launchers": [], "jobs": [job(1, 7), job(2, 7), job(3, 8)], "usage": { "day": usage(runs), "week": usage(runs), "month": usage(runs) } })) };
         let html = d.render("overview", &[view(true)], None);
@@ -9029,9 +9029,11 @@ mod tests {
         // Runs counted, their jobs beside them; the latest runs listed, all of them a click away.
         assert!(html.contains(r#"<div class="kpi-num">2</div><div class="kpi-cap">runs</div>"#) && html.contains(r#"<div class="kpi-sub">3 jobs</div>"#), "{html}");
         assert!(html.contains(r#"<a class="chip" href="/?p=runs">All runs ›</a>"#) && html.matches(r#"class="jt-row" href="/?p=run&amp;"#).count() == 2, "{html}");
-        // A control plane that does not count runs yet: jobs, as before.
+        // A control plane that does not count runs yet: jobs, as before; an hour of jobs that ran and one that did not, one
+        // bar on the other.
         let older = d.render("overview", &[view(false)], None);
         assert!(older.contains(r#"<div class="kpi-num">3</div><div class="kpi-cap">jobs</div>"#));
+        assert!(older.contains(r#"<title>an hour ago: 1 ran, 1 did not</title>"#) && older.contains(r#"<rect class="b" x="222.0" y="12.5" "#), "{older}");
         // Runs is the page in the sidebar, its Runs tab first.
         assert!(Dashboard::sidebar("overview").contains(r#"<a href="/?p=runs" aria-current="false">"#) && Dashboard::sidebar("overview").contains("<span>Runs</span>"));
     }
