@@ -345,6 +345,7 @@ fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
     let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
     let mut said = String::new();
     while !said.contains("It is opening in your browser") { let mut l = String::new(); if std::io::BufRead::read_line(&mut out, &mut l).unwrap_or(0) == 0 { break } said.push_str(&l) }
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let _ = c.kill();
     let _ = c.wait();
     assert!(said.contains("It is opening in your browser"), "{said}");
@@ -353,7 +354,7 @@ fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
     let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
     let mut said = String::new();
     while !said.contains("Create the GitHub App") { let mut l = String::new(); if std::io::BufRead::read_line(&mut out, &mut l).unwrap_or(0) == 0 { break } said.push_str(&l) }
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let _ = c.kill();
     let _ = c.wait();
     assert!(said.contains("Create the GitHub App"), "{said}");
