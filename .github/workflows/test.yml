@@ -16,8 +16,24 @@ concurrency:
   group: test-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # What `./build.sh` makes that the tests need (the program crates carry it): kept between runs while the sources it
+  # is built from are the same, so a run that changes tests alone does not build it again (as the Coverage workflow).
+  PROGRAMS: |
+    crates/plane-cloudflare/build
+    crates/runners-cloudflare/build
+    crates/plane-aws/build
+    crates/plane-modal/build
+    target/x86_64-unknown-linux-musl/release/superci-cache
+    target/x86_64-unknown-linux-musl/release/superci-layers
+    target/aarch64-unknown-linux-musl/release/superci-cache
+    target/aarch64-unknown-linux-musl/release/superci-layers
+    target/x86_64-pc-windows-gnu/release/superci-cache.exe
+
 jobs:
-  test:
+  # Everything built once: the programs the binary carries (kept between runs while their sources stay), the tests,
+  # compiled into one archive the test jobs run from without compiling again, and what a release needs checked.
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # What the program carries, built for the tests with quicker settings (a release ships with LTO and one codegen
@@ -27,6 +43,13 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v6
+      - id: key
+        run: echo "programs=programs-2-${{ runner.os }}-${{ hashFiles('build.sh', 'Cargo.lock', 'Cargo.toml', 'scripts/mkfs-erofs/**', 'crates/core/src/**', 'crates/core/Cargo.toml', 'crates/plane-*/src/**', 'crates/plane-*/Cargo.toml', 'crates/plane-cloudflare/wrangler.toml', 'crates/runners-cloudflare/src/**', 'crates/runners-cloudflare/Cargo.toml', 'crates/runners-cloudflare/wrangler.toml', 'crates/cache/src/**', 'crates/cache/Cargo.toml', 'crates/layers/src/**', 'crates/layers/Cargo.toml', 'crates/layers/build.rs', 'crates/layers/assets/**', 'crates/layers/proto/**') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        id: programs
+        with:
+          path: ${{ env.PROGRAMS }}
+          key: ${{ steps.key.outputs.programs }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
@@ -40,13 +63,29 @@ jobs:
       # cache.)
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild
+          tool: cargo-zigbuild,cargo-nextest
       - name: worker-build
+        if: steps.programs.outputs.cache-hit != 'true'
         run: cargo install --locked worker-build
       - name: Build
+        if: steps.programs.outputs.cache-hit != 'true'
         run: ./build.sh
-      - name: The tests
-        run: cargo test --workspace
+      # (Kept at once: the Rust cache's own cleanup, at the job's end, takes what was built for other targets out of
+      # target/.)
+      - uses: actions/cache/save@v4
+        if: steps.programs.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.PROGRAMS }}
+          key: ${{ steps.key.outputs.programs }}
+      - name: The tests, compiled into one archive
+        run: cargo nextest archive --workspace --archive-file tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests
+          retention-days: 1
+          path: |
+            tests.tar.zst
+            ${{ env.PROGRAMS }}
       - name: The program for Windows builds
         run: cargo zigbuild --release --target x86_64-pc-windows-gnu -p superci
       - name: The crates pack and build as crates.io would get them
@@ -56,52 +95,49 @@ jobs:
           SUPERCI_INSTALL_DIR="$RUNNER_TEMP/bin" sh install.sh
           "$RUNNER_TEMP/bin/superci" --version
 
-  # Each sweep again with each of its calls and store operations failing in turn (the tests above run each scenario
-  # once): a job per file, side by side, so the run takes no longer than the tests do.
-  sweeps:
+  # The tests, in four parts side by side, run from the build's archive (unpacked where it was built, so the paths
+  # compiled into the tests are where they were). Each sweep's scenario runs once here.
+  test:
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        sweep: [sweep_jobs, sweep_plane, sweep_commands, sweep_commands_rest, sweep_flows, sweep_dashboard]
-    env:
-      CARGO_PROFILE_RELEASE_LTO: "false"
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-      SUPERCI_SWEEP_FAULTS: "1"
+        part: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-zigbuild
-      - name: worker-build
-        run: cargo install --locked worker-build
-      - name: Build
-        run: ./build.sh
-      - name: ${{ matrix.sweep }}, every call and store operation failing in turn
-        run: cargo test -p superci --test ${{ matrix.sweep }}
+          tool: cargo-nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+      - name: Part ${{ matrix.part }} of the tests
+        run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --partition count:${{ matrix.part }}/4 --no-fail-fast
 
-  # The core's control plane tests again, each with every call and store operation failing in turn (in process: no
-  # build of the programs needed).
-  core-sweep:
+  # Each sweep again with each of its calls and store operations failing in turn, and the core's control plane tests
+  # likewise (in process), in four parts side by side.
+  sweeps:
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
     env:
       SUPERCI_SWEEP_FAULTS: "1"
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: The core's control plane, every call and store operation failing in turn
-        run: cargo test -p superci-core --test plane every_test_here
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+      - name: Part ${{ matrix.part }} of the sweeps, every call and store operation failing in turn
+        run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --partition count:${{ matrix.part }}/4 --no-fail-fast -E 'binary(~sweep_) | (package(superci-core) & binary(=plane) & test(every_test_here))'
 
   # superci-layers against containerd's own conformance suites for snapshotters and content stores (as root: the
   # snapshotter suite mounts overlays), directly and through containerd's metadata layer.
