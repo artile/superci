@@ -204,11 +204,11 @@ pub async fn lookup(store: &dyn Store, access: &Access, key: &str, restore: &[St
 /// Marks a hit used (at most once an hour: a busy entry is not written at every restore).
 pub async fn used(store: &dyn Store, hit: &Hit, now: u64) -> Result<()> {
     if now.saturating_sub(hit.entry.used) < 3_600_000 { return Ok(()) }
-    let was = serde_json::to_string(&hit.entry).map_err(|e| e.to_string())?;
+    let was = crate::io::json(&hit.entry);
     let mut e = hit.entry.clone();
     e.used = now;
     // Another restore at the same moment wrote it already: as good.
-    store.swap_until(&hit.index, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?, Some(entry_end(&e))).await.map(|_| ())
+    store.swap_until(&hit.index, Some(&was), crate::io::json(&e), Some(entry_end(&e))).await.map(|_| ())
 }
 
 /// Why an entry could not be begun.
@@ -223,7 +223,7 @@ pub async fn begin(store: &dyn Store, access: &Access, key: &str, version: &str,
     let scope = access.writes_to().ok_or(Refused::NoWrite)?;
     let at = index(&access.ns, &scope.name, version, key);
     let entry = Entry { id: crate::crypto::random_id(20).to_ascii_lowercase(), region: region.to_string(), made: now, used: now, ..Default::default() };
-    let text = serde_json::to_string(&entry).map_err(|e| Refused::Bad(e.to_string()))?;
+    let text = crate::io::json(&entry);
     if store.put_if_absent(&at, text.clone()).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
     let was = store.get(&at).await.map_err(Refused::Bad)?;
     let stale = was.as_deref().and_then(|v| serde_json::from_str::<Entry>(v).ok()).is_some_and(|e| if e.done { too_old(&e, now) } else { now.saturating_sub(e.made) > TAKEOVER_MS });
@@ -248,13 +248,13 @@ pub async fn finish(store: &dyn Store, at: &str, entry: &Entry, pieces: Vec<(Str
 /// The same, with what a tool keeps beside it.
 pub async fn finish_with(store: &dyn Store, at: &str, entry: &Entry, pieces: Vec<(String, u64)>, meta: Option<String>) -> Result<Entry> {
     if pieces.is_empty() || pieces.len() > MOST_PIECES || !pieces.iter().all(|(n, _)| piece_name(n)) { return Err("pieces SuperCI does not keep".into()) }
-    let was = serde_json::to_string(entry).map_err(|e| e.to_string())?;
+    let was = crate::io::json(entry);
     let mut e = entry.clone();
     e.size = pieces.iter().map(|(_, s)| s).sum();
     e.pieces = pieces;
     e.done = true;
     e.meta = meta.filter(|m| m.len() <= 2048);
-    if !store.swap_until(at, Some(&was), serde_json::to_string(&e).map_err(|e| e.to_string())?, Some(entry_end(&e))).await? { return Err("the entry changed while it was saved".into()) }
+    if !store.swap_until(at, Some(&was), crate::io::json(&e), Some(entry_end(&e))).await? { return Err("the entry changed while it was saved".into()) }
     Ok(e)
 }
 
@@ -340,7 +340,7 @@ pub async fn begin_artifact(store: &dyn Store, run: &str, name: &str, region: &s
     if !artifact_name(name) { return Err(Refused::Bad("an artifact's name GitHub would not take".into())) }
     let at = artifact_index(run, name);
     let entry = Entry { id: crate::crypto::random_id(20).to_ascii_lowercase(), region: region.to_string(), made: now, used: now, by: by.clone(), ..Default::default() };
-    let text = serde_json::to_string(&entry).map_err(|e| Refused::Bad(e.to_string()))?;
+    let text = crate::io::json(&entry);
     if store.put_if_absent(&at, text.clone()).await.map_err(Refused::Bad)? { return Ok((at, entry)) }
     let Some(was) = store.get(&at).await.map_err(Refused::Bad)? else { return Err(Refused::Exists) };
     let earlier = serde_json::from_str::<Entry>(&was).ok().and_then(|e| e.by);
@@ -403,7 +403,7 @@ pub async fn machine(store: &dyn Store, token: &str, now: u64) -> Result<Option<
 
 pub async fn add_machine(store: &dyn Store, token: &str, m: &Machine) -> Result<()> {
     // (Kept a day past its longest job, then gone by itself.)
-    store.put_until(&format!("cachem:{token}"), serde_json::to_string(m).map_err(|e| e.to_string())?, m.until + 86_400_000).await
+    store.put_until(&format!("cachem:{token}"), crate::io::json(m), m.until + 86_400_000).await
 }
 
 #[cfg(test)]

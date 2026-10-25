@@ -322,7 +322,7 @@ mod tests {
         let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
         let public = key.to_public_key();
         let (n, e) = (b64url(&public.n().to_bytes_be()), b64url(&public.e().to_bytes_be()));
-        let jwks = serde_json::json!({ "keys": [{ "kty": "EC", "kid": "ec" }, { "kty": "RSA", "kid": "k1", "n": n, "e": e }, { "kty": "RSA", "kid": "bad-n", "n": "!", "e": e }, { "kty": "RSA", "kid": "tiny", "n": "AQAB", "e": "AQAB" }] });
+        let jwks = serde_json::json!({ "keys": [{ "kty": "EC", "kid": "ec" }, { "kty": "RSA", "kid": "k1", "n": n, "e": e }, { "kty": "RSA", "kid": "bad-n", "n": "!", "e": e }, { "kty": "RSA", "kid": "bad-e", "n": n, "e": "!" }, { "kty": "RSA", "kid": "tiny", "n": "AQAB", "e": "AQAB" }] });
         let unsigned = |header: serde_json::Value, claims: &str| format!("{}.{claims}", b64url(header.to_string().as_bytes()));
         let sign = |unsigned: String| format!("{unsigned}.{}", b64url(&rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone()).sign(unsigned.as_bytes()).to_vec()));
         let k1 = serde_json::json!({ "alg": "RS256", "kid": "k1" });
@@ -334,6 +334,7 @@ mod tests {
             (sign(unsigned(serde_json::json!({ "alg": "HS256", "kid": "k1" }), "e30")), "not RS256"),
             (sign(unsigned(serde_json::json!({ "alg": "RS256", "kid": "ec" }), "e30")), "signed by a key not in the set"),
             (sign(unsigned(serde_json::json!({ "alg": "RS256", "kid": "bad-n" }), "e30")), "Invalid symbol 33, offset 0."),
+            (sign(unsigned(serde_json::json!({ "alg": "RS256", "kid": "bad-e" }), "e30")), "Invalid symbol 33, offset 0."),
             (format!("{}.!", unsigned(k1.clone(), "e30")), "Invalid symbol 33, offset 0."),
             (format!("{}.AAAA", unsigned(k1.clone(), "e30")), "bad signature"),
             (sign(unsigned(k1.clone(), "!")), "Invalid symbol 33, offset 0."),

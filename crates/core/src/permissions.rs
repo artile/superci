@@ -82,11 +82,10 @@ pub const AWS_NETWORK: Need = Need { id: "OwnNetwork", what: "A network of its o
 /// Two IAM statements alike, with a list of one and the one itself counted the same (IAM may give either back).
 fn same_statement(a: &Value, b: &Value) -> bool {
     let norm = |v: &Value| -> Value {
-        let mut v = v.clone();
-        for k in ["Action", "Resource"] {
-            if let Some(list) = v[k].as_array().filter(|l| l.len() == 1) { v[k] = list[0].clone() }
-        }
-        v
+        ["Action", "Resource"].iter().fold(v.clone(), |mut v, k| {
+            if let Some(one) = v[*k].as_array().filter(|l| l.len() == 1).map(|l| l[0].clone()) { v[*k] = one }
+            v
+        })
     };
     norm(a) == norm(b)
 }

@@ -207,10 +207,6 @@ impl Config {
         }
     }
 
-    pub fn owner(&self) -> Option<Owner> {
-        self.app.as_ref().map(|a| Owner { org: a.owner_is_org, login: a.owner.clone() })
-    }
-
     /// Every GitHub App of this control plane: the first, then one for each further organization.
     pub fn apps(&self) -> impl Iterator<Item = &App> { self.app.iter().chain(self.more_apps.iter()) }
 
@@ -780,9 +776,6 @@ fn pool_of(key: &str) -> (String, String) {
     (parts.next().unwrap_or_default(), zone)
 }
 
-/// The day (UTC) a moment is in, as the moment it began.
-pub fn day_start_ms(now_ms: u64) -> u64 { now_ms - now_ms % 86_400_000 }
-
 /// The cloud account a place in the order spends in: AWS's on-demand machines are the same account's as its spot ones.
 pub fn account_of(cloud: &str) -> &str { if cloud == AWS_ON_DEMAND { "aws" } else { cloud } }
 
@@ -827,9 +820,6 @@ impl Pool {
 pub struct Rule { pub repo: String, pub cloud: String }
 
 impl Routing {
-    /// The cloud this policy names for a repository, if any.
-    pub fn cloud_for(&self, repo: &str) -> Option<&str> { self.rule_for(repo).or(self.default.as_deref()) }
-
     /// The cloud a repository's rule names (an exception to the order), if any.
     pub fn rule_for(&self, repo: &str) -> Option<&str> {
         self.rules.iter().find(|r| matches_repo(&r.repo, repo)).map(|r| r.cloud.as_str())
@@ -853,8 +843,8 @@ impl Routing {
 enum Runner { Aws(AwsConnection), Launcher(Launcher), Own }
 
 /// Where a job goes: a place now, later (every place that could run it is full, over its limit or offline), or nowhere
-/// (no connected place can run its machine), each with why.
-enum Placement { Run(Vec<(String, Runner)>), Wait(String), Fail(String) }
+/// (no connected place can run its machine), each with why. A place comes with the machine it starts for the job.
+enum Placement { Run(Vec<(String, Runner, Size)>), Wait(String), Fail(String) }
 
 /// The start of this month (UTC), in ms.
 pub fn month_start_ms(now_ms: u64) -> u64 {
@@ -957,10 +947,9 @@ pub fn usage_of(hours: &std::collections::BTreeMap<u64, Hour>, now: u64, step_ms
 }
 
 
-/// What a cloud's machines can be (the clouds this control plane starts machines in).
-fn capacity_of(cloud: &str) -> Capacity {
-    match cloud { "aws" => Capacity::aws(), "modal" => Capacity::modal(), _ => Capacity::cloudflare() }
-}
+/// What a cloud's containers can be (Cloudflare's, or Modal's sandboxes): started by this control plane itself, or
+/// by a launcher.
+fn capacity_of(cloud: &str) -> Capacity { if cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() } }
 
 fn active(j: &Job) -> bool { ["launching", "launched", "running"].contains(&j.state.as_str()) }
 
@@ -1250,7 +1239,7 @@ impl<'a> ControlPlane<'a> {
                 // The job message its runner was handed (the start of the runner's own log has it): its steps' shape.
                 if q.get("worker").is_some() {
                     if let Some(shape) = worker_message(&req.body).map(|m| step_shape(&m)).filter(|s| !s.is_empty()) {
-                        self.store.put_until(&format!("shape:{}", job_key(&j).trim_start_matches("job:")), serde_json::to_string(&shape).map_err(|e| e.to_string())?, now + JOB_KEPT_MS).await?;
+                        self.store.put_until(&format!("shape:{}", job_key(&j).trim_start_matches("job:")), crate::io::json(&shape), now + JOB_KEPT_MS).await?;
                     }
                     return Ok(Response::text(200, "ok"))
                 }
@@ -1266,7 +1255,7 @@ impl<'a> ControlPlane<'a> {
                     let text: String = String::from_utf8_lossy(&req.body).chars().filter(|c| *c == '\n' || (!c.is_control() && *c != '\u{fffd}')).take(16_000).collect();
                     said.log = Some(text.lines().map(|l| l.chars().take(300).collect::<String>()).collect::<Vec<_>>().join("\n")).filter(|t| !t.trim().is_empty());
                 }
-                self.store.put_until(&key, serde_json::to_string(&said).map_err(|e| e.to_string())?, now + JOB_KEPT_MS).await?;
+                self.store.put_until(&key, crate::io::json(&said), now + JOB_KEPT_MS).await?;
                 Ok(Response::text(200, "ok"))
             }
             // GitLab's projects, for the dashboard: which send their jobs here; switching one on or off; after the
@@ -1506,7 +1495,7 @@ impl<'a> ControlPlane<'a> {
             let Some(mut j) = job else { if self.store.put_if_absent(k, v.to_string()).await? { taken += 1 } continue };
             j.counted_usd = None;
             let add = self.counting(&mut j);
-            if self.store.swap_until(k, None, serde_json::to_string(&j).map_err(|e| e.to_string())?, Self::job_end(&j, self.clock.now_ms())).await? {
+            if self.store.swap_until(k, None, crate::io::json(&j), Self::job_end(&j, self.clock.now_ms())).await? {
                 self.indexes(k, &j, true, add).await?;
                 taken += 1;
             }
@@ -2018,7 +2007,7 @@ impl<'a> ControlPlane<'a> {
                 let mut job = Job { job_id: ev.job_id, run_id: ev.pipeline_id, repo: ev.project.clone(), state: "launching".into(), at_ms: self.clock.now_ms(), label: label.to_string(),
                     provider: "gitlab".into(), gitlab: gl.id.clone(), project_id: Some(ev.project_id), tags: tags.clone(), name: ev.name.clone(), workflow: ev.stage.clone(), ..Default::default() };
                 // Claimed once, however many deliveries arrive.
-                if !self.store.put_if_absent(&key, serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { return Ok(Response::text(200, "known")) }
+                if !self.store.put_if_absent(&key, crate::io::json(&job)).await? { return Ok(Response::text(200, "known")) }
                 self.indexes(&key, &job, true, None).await?;
                 // Run again after AWS took its spot machine back: not on a spot machine this time.
                 let again = rerun_key(&project, ev.pipeline_id, &ev.name);
@@ -2383,7 +2372,7 @@ impl<'a> ControlPlane<'a> {
             let runner = match cloud.as_str() {
                 "aws" | AWS_ON_DEMAND => aws.clone().map(|a| (Capacity::aws(), Runner::Aws(a))),
                 c if c == self.config.own_cloud && self.own_containers() => Some((capacity_of(c), Runner::Own)),
-                c => self.config.launchers.iter().find(|a| a.cloud == c).map(|a| (if c == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() }, Runner::Launcher(a.clone()))),
+                c => self.config.launchers.iter().find(|a| a.cloud == c).map(|a| (capacity_of(c), Runner::Launcher(a.clone()))),
             };
             // Limits from the order: turned off, jobs at once, spend this month.
             let pool = routing.pool(cloud);
@@ -2416,15 +2405,15 @@ impl<'a> ControlPlane<'a> {
             };
             if gitlab && cloud == "modal" { never.push("Modal runs no Docker (GitLab jobs run in Docker)".into()); continue }
             if gitlab && spec.os() == "windows" { never.push(format!("{name} runs no GitLab jobs on Windows")); continue }
-            if let Some(why) = capacity.refuses(spec) { never.push(format!("{name} runs {why}")); continue }
+            let size = match capacity.fit(spec) { Ok(size) => size, Err(why) => { never.push(format!("{name} runs {why}")); continue } };
             // Its label asks for an on-demand machine: not AWS's spot ones.
             if cloud == "aws" && spec.on_demand() { never.push("AWS spot machines are not asked for (spot=false)".into()); continue }
-            places.push((cloud.clone(), runner));
+            places.push((cloud.clone(), runner, size));
         }
         // Spot is passed over only when something else can take the job: with nothing else, a spot machine it is.
-        if no_spot && places.iter().any(|(c, _)| c != "aws") { places.retain(|(c, _)| c != "aws") }
+        if no_spot && places.iter().any(|(c, _, _)| c != "aws") { places.retain(|(c, _, _)| c != "aws") }
         // Places that failed this job before come after those that have not (still in order among themselves).
-        places.sort_by_key(|(c, _)| failed_at.contains(c));
+        places.sort_by_key(|(c, _, _)| failed_at.contains(c));
         Ok(if !places.is_empty() { Placement::Run(places) }
             else if !later.is_empty() { Placement::Wait(format!("waiting: {}", later.join("; "))) }
             else { Placement::Fail(format!("nowhere to run {}: {}", spec.describe(), never.join("; "))) })
@@ -2511,7 +2500,7 @@ impl<'a> ControlPlane<'a> {
             repo_id: ev.repo_id, branch: ev.branch.clone(), default_branch: ev.default_branch.clone(), ..Default::default() };
         // Claimed once, however many deliveries of the event arrive at once. A claim that never got past launching (the
         // runtime restarted mid-way) is taken over by a later delivery.
-        if self.store.put_if_absent(&key, serde_json::to_string(&job).map_err(|e| e.to_string())?).await? { self.indexes(&key, &job, true, None).await? } else {
+        if self.store.put_if_absent(&key, crate::io::json(&job)).await? { self.indexes(&key, &job, true, None).await? } else {
             let stuck = get_json::<Job>(self.store, &key).await?.is_some_and(|j| j.state == "launching" && job.at_ms.saturating_sub(j.at_ms) > 90_000);
             if !stuck { return Ok(()); }
             self.keep(&key, &job).await?;
@@ -2656,15 +2645,17 @@ impl<'a> ControlPlane<'a> {
     async fn count(&self, j: &Job, h: &Hour) -> Result<()> {
         let (day, hour) = (j.at_ms / 86_400_000, (j.at_ms % 86_400_000 / 3_600_000) as usize);
         let key = day_key(day);
-        for _ in 0..8 {
+        let mut tries = 0;
+        loop {
+            if tries == 8 { return Err(format!("{key} kept changing while it was written")) }
+            tries += 1;
             let was = self.store.get(&key).await?;
             let mut d: Day = was.as_deref().and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
             d.hours.resize(24, Hour::default());
             d.hours[hour].add(h);
             *d.spend.entry(place_of(j).to_string()).or_insert(0.0) += h.usd;
-            if self.store.swap_until(&key, was.as_deref(), serde_json::to_string(&d).map_err(|e| e.to_string())?, Some((day + 1) * 86_400_000 + DAY_KEPT_MS)).await? { return Ok(()) }
+            if self.store.swap_until(&key, was.as_deref(), crate::io::json(&d), Some((day + 1) * 86_400_000 + DAY_KEPT_MS)).await? { return Ok(()) }
         }
-        Err(format!("{key} kept changing while it was written"))
     }
 
     /// What a job's record is to carry before it is written: what of its cost its day's totals will hold, and what to
@@ -2698,7 +2689,7 @@ impl<'a> ControlPlane<'a> {
             if j.provider.is_empty() {
                 let at = format!("repo:{}", j.repo);
                 let newer = self.store.get(&at).await?.and_then(|v| serde_json::from_str::<Job>(&v).ok()).is_none_or(|kept| kept.at_ms <= j.at_ms);
-                if newer { self.store.put_until(&at, serde_json::to_string(j).map_err(|e| e.to_string())?, j.at_ms + 14 * 86_400_000).await? }
+                if newer { self.store.put_until(&at, crate::io::json(j), j.at_ms + 14 * 86_400_000).await? }
             }
         }
         if let Some(mut h) = add {
@@ -2723,7 +2714,7 @@ impl<'a> ControlPlane<'a> {
             if done == budget { self.store.put("reindex-at", key).await?; return Ok(false) }
             let Ok(mut j) = serde_json::from_str::<Job>(&v) else { continue };
             let add = self.counting(&mut j);
-            let wrote = self.store.swap_until(&key, Some(&v), serde_json::to_string(&j).map_err(|e| e.to_string())?, Self::job_end(&j, now)).await?;
+            let wrote = self.store.swap_until(&key, Some(&v), crate::io::json(&j), Self::job_end(&j, now)).await?;
             // (Written meanwhile by another request, which counted it: indexed all the same, as only a first write
             // makes its indexes.)
             self.indexes(&key, &j, true, add.filter(|_| wrote)).await?;
@@ -2759,7 +2750,10 @@ impl<'a> ControlPlane<'a> {
 
     async fn keep(&self, key: &str, job: &Job) -> Result<()> {
         // (Written over exactly what was read, see `Store::swap`: changed in between, it is read and weighed again.)
-        for _ in 0..4 {
+        let mut tries = 0;
+        loop {
+            if tries == 4 { return Err(format!("{key} kept changing while it was written")) }
+            tries += 1;
             let was = self.store.get(key).await.ok().flatten();
             let kept = was.as_deref().and_then(|v| serde_json::from_str::<Job>(v).ok()).filter(|kept| kept.rev != job.rev);
             let counted = was.as_deref().and_then(|v| serde_json::from_str::<Job>(v).ok()).and_then(|k| k.counted_usd);
@@ -2787,13 +2781,12 @@ impl<'a> ControlPlane<'a> {
             // (What its day's totals hold is the kept record's, whoever read it before.)
             write.counted_usd = counted;
             let add = self.counting(&mut write);
-            if self.store.swap_until(key, was.as_deref(), serde_json::to_string(&write).map_err(|e| e.to_string())?, Self::job_end(&write, self.clock.now_ms())).await? {
+            if self.store.swap_until(key, was.as_deref(), crate::io::json(&write), Self::job_end(&write, self.clock.now_ms())).await? {
                 job.rev.set(write.rev.get());
                 self.indexes(key, &write, was.is_none(), add).await?;
                 return Ok(())
             }
         }
-        Err(format!("{key} kept changing while it was written"))
     }
 
     /// Whether a job's record ended since this copy of it was read (cancelled at its code host, in another request).
@@ -2931,7 +2924,7 @@ impl<'a> ControlPlane<'a> {
             // What each place said where starting the machine failed.
             let mut failures: Vec<(String, String)> = vec![];
             let (mut more_spot, mut gone) = (false, false);
-            for (at, (place, runner)) in places.into_iter().enumerate() {
+            for (at, (place, runner, size)) in places.into_iter().enumerate() {
                 // Its job ended at its code host meanwhile, before any runner took it (cancelled): nothing more is asked for.
                 if self.store.get(&gone_key(job)).await.ok().flatten().is_some() { gone = true; break }
                 if self.ended_meanwhile(&key, job).await { gone = true; break }
@@ -2976,7 +2969,7 @@ impl<'a> ControlPlane<'a> {
                         let types = if standard { self.config.instance_types.clone() } else { aws_instance_types(&spec) };
                         let mut disk_gb = spec.disk_gb.unwrap_or(60);
                         let (mut disk_mibs, mut disk_iops) = (DISK_MIBS_INCLUDED, DISK_IOPS_INCLUDED);
-                        job.cpu = Some(Capacity::aws().fit(&spec).map(|s| s.cpu).unwrap_or(4));
+                        job.cpu = Some(size.cpu);
                         // A spot machine says when AWS takes it back, with a link only it has.
                         job.notice = (!on_demand).then(|| crate::crypto::random_token(18));
                         let notice = job.notice.as_ref().map(|t| if gitlab { format!("{plane_url}/interrupted?gl={}&t={t}", gitlab::local(&job.gitlab, job.job_id)) } else { format!("{plane_url}/interrupted?runner={name}&t={t}") });
@@ -3143,15 +3136,13 @@ impl<'a> ControlPlane<'a> {
                         Ok(Tried::Started(machine.id, machine.kind))
                     }.await,
                     Runner::Own => async {
-                        // Sized for the job (placement already checked it fits).
-                        let size = capacity_of(&self.config.own_cloud).fit(&spec)?;
+                        // (Sized for the job where it was placed.)
                         job.cpu = Some(size.cpu);
                         job.usd_per_hour = Some(if self.config.own_cloud == "modal" { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) } else { cloudflare_usd_per_hour(size) });
                         if self.config.own_cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
                         Ok(Tried::Started(self.containers.ok_or("no containers here")?.start(&name, &work, self.machine_minutes(&self.config.own_cloud), size).await?, machine_name(size)))
                     }.await,
                     Runner::Launcher(a) => async {
-                        let size = if a.cloud == "cloudflare" { Capacity::cloudflare() } else { Capacity::modal() }.fit(&spec)?;
                         job.cpu = Some(size.cpu);
                         job.usd_per_hour = match a.cloud.as_str() { "cloudflare" => Some(cloudflare_usd_per_hour(size)), "modal" => Some(modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu)), _ => None };
                         if a.cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
@@ -3214,7 +3205,7 @@ impl<'a> ControlPlane<'a> {
                     // limit not letting its machine start: a job larger than that limit would wait for room that
                     // never comes, when the spot limit it ran under a moment ago is free. A spot machine is asked
                     // for again (the pool that took one back is asked last, see `pools_to_avoid`).
-                    if at_limit && !tried_spot && !job.spot_again && matches!(self.place(&job.repo, &spec, gitlab, false, &job.failed_at).await, Ok(Placement::Run(p)) if p.iter().any(|(c, _)| c == "aws")) {
+                    if at_limit && !tried_spot && !job.spot_again && matches!(self.place(&job.repo, &spec, gitlab, false, &job.failed_at).await, Ok(Placement::Run(p)) if p.iter().any(|(c, _, _)| c == "aws")) {
                         return Err(format!("{BACK_ON_SPOT}{}", answers.join("; ")))
                     }
                     if at_limit { return Err(format!("{AT_LIMIT}{}", answers.join("; "))) }
@@ -4033,7 +4024,10 @@ impl<'a> ControlPlane<'a> {
     /// jobs ending together) never start a job twice: the jobs are started only once that write has been made.
     async fn advance_run(&self, plane_url: &str, run_id: u64) -> std::result::Result<(), String> {
         let key = format!("run:{run_id}");
-        for _ in 0..16 {
+        let mut tries = 0;
+        loop {
+            if tries == 16 { return Err("the run kept changing while it was moved on".into()) }
+            tries += 1;
             let Some(was) = self.store.get(&key).await? else { return Ok(()) };
             let mut run: serde_json::Value = serde_json::from_str(&was).map_err(|e| e.to_string())?;
             let wf = crate::workflow::parse(run["workflow"].as_str().unwrap_or_default())?;
@@ -4205,7 +4199,6 @@ impl<'a> ControlPlane<'a> {
             if let Some(tree) = run["tree"].as_str().filter(|_| jobs.iter().all(|j| j["state"] == "done")) { self.forget_tree(plane_url, tree).await? }
             return Ok(())
         }
-        Err("the run kept changing while it was moved on".into())
     }
 
     /// A job of a run reserved to start whose start failed before its record was written (a call or the store failed
@@ -4216,12 +4209,16 @@ impl<'a> ControlPlane<'a> {
         if !matches!(self.store.get(&format!("job:{id}")).await, Ok(None)) { return }
         // (What its runner was to be handed goes, its secrets with it: the job is handed anew when started again.)
         let _ = self.store.delete(&format!("rjob:{token}")).await;
-        for _ in 0..4 {
+        let mut tries = 0;
+        loop {
+            if tries == 4 { return }
+            tries += 1;
             let Ok(Some(was)) = self.store.get(key).await else { return };
             let Ok(mut run) = serde_json::from_str::<serde_json::Value>(&was) else { return };
             let Some(j) = run["jobs"].as_array_mut().into_iter().flatten().find(|j| j["token"] == token && j["state"] == "started") else { return };
             j["state"] = "pending".into();
-            if let Some(o) = j.as_object_mut() { o.remove("job_id"); o.remove("token"); }
+            let j = j.as_object_mut().expect("a job found by its token is a map");
+            (j.remove("job_id"), j.remove("token"));
             if !matches!(self.store.swap(key, Some(&was), run.to_string()).await, Ok(false)) { return }
         }
     }
@@ -4356,7 +4353,7 @@ impl<'a> ControlPlane<'a> {
         let mut job = Job { job_id, run_id, repo: repository, state: "launching".into(), at_ms: now, label, name: display.unwrap_or_else(|| key_name.to_string()), workflow: path, provider: "local".into(),
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), no_spot: inst["off_spot"] == true, ..Default::default() };
         // (Its id is new, and the job is this request's alone: taken in the run's record, written over what was read.)
-        self.store.put(&job_key(&job), serde_json::to_string(&job).map_err(|e| e.to_string())?).await?;
+        self.store.put(&job_key(&job), crate::io::json(&job)).await?;
         self.indexes(&job_key(&job), &job, true, None).await?;
         self.start_soon(plane_url, &mut job).await
     }
@@ -4381,7 +4378,10 @@ impl<'a> ControlPlane<'a> {
             };
             return Ok(Response::json(&match said { Ok(()) => serde_json::json!({ "run_id": id.to_string(), "cancelled": true, "github": true }), Err(e) => serde_json::json!({ "error": e }) }))
         }
-        for _ in 0..16 {
+        let mut tries = 0;
+        loop {
+            if tries == 16 { return Err("the run kept changing while it was cancelled".into()) }
+            tries += 1;
             let Some(was) = self.store.get(&key).await? else { return Ok(nothing_here()) };
             let mut run: serde_json::Value = serde_json::from_str(&was).map_err(|e| e.to_string())?;
             if run["jobs"].as_array().is_some_and(|jobs| jobs.iter().all(|j| j["state"] == "done")) { return Ok(Response::json(&serde_json::json!({ "run_id": id.to_string(), "cancelled": false, "over": true }))) }
@@ -4429,7 +4429,6 @@ impl<'a> ControlPlane<'a> {
             self.timer.wake_in(CANCEL_MS).await?;
             return Ok(Response::json(&serde_json::json!({ "run_id": id.to_string(), "cancelled": true, "over": false })))
         }
-        Err("the run kept changing while it was cancelled".into())
     }
 
     /// `GET /runs/<id>/artifacts`: a run from a computer's artifacts (each one's name and size), or with `name`, links

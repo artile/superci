@@ -280,7 +280,7 @@ impl ControlPlane<'_> {
             let mut erofs = json!({ "url": sign(&l.erofs.key)?, "size": l.erofs.size.unwrap_or(0) });
             if let Some(digest) = &l.erofs.digest { erofs["digest"] = digest.clone().into() }
             layers.insert(d.clone(), json!({ "size": l.size, "erofs": erofs, "blob": { "url": sign(&l.blob.key)? } }));
-            if now.saturating_sub(l.used) > 86_400_000 { l.used = now; self.store.put(key, serde_json::to_string(&l).map_err(|e| e.to_string())?).await? }
+            if now.saturating_sub(l.used) > 86_400_000 { l.used = now; self.store.put(key, crate::io::json(&l)).await? }
         }
         Ok(Response::json(&json!({ "layers": layers, "refresh": { "url": format!("{link}/layers-links"), "token": "" } })))
     }
@@ -317,7 +317,7 @@ impl ControlPlane<'_> {
         let sum = crate::crypto::b64(&(0..32).map(|i| u8::from_str_radix(&digest[7 + 2 * i..9 + 2 * i], 16).unwrap_or(0)).collect::<Vec<u8>>());
         let url = aws::presign_with("PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &machine.region), &machine.region, &key), creds, &machine.region, UPLOAD_MS / 1000, now, &[("x-amz-checksum-sha256", &sum)])?;
         let up = Upload { region: machine.region.clone(), digest: digest.to_string(), size, ns: ns.to_string(), key, public };
-        self.store.put_until(&format!("lup:{id}"), serde_json::to_string(&up).map_err(|e| e.to_string())?, now + UPLOAD_MS).await?;
+        self.store.put_until(&format!("lup:{id}"), crate::io::json(&up), now + UPLOAD_MS).await?;
         Ok(json!({ "do": "upload", "url": url, "headers": { "x-amz-checksum-sha256": sum }, "id": id }))
     }
 
@@ -420,14 +420,14 @@ impl ControlPlane<'_> {
         let keys: Vec<String> = served.iter().map(|d| layer_key(&machine.region, d)).collect();
         for (key, got) in keys.iter().zip(self.store.get_many(&keys).await?) {
             let Some(mut l) = got.and_then(|v| serde_json::from_str::<Layer>(&v).ok()) else { continue };
-            if now.saturating_sub(l.used) > 86_400_000 { l.used = now; self.store.put(key, serde_json::to_string(&l).map_err(|e| e.to_string())?).await? }
+            if now.saturating_sub(l.used) > 86_400_000 { l.used = now; self.store.put(key, crate::io::json(&l)).await? }
         }
         let Some(mut job) = self.job_of_machine(machine).await? else { return Ok(Response::text(404, "no job of this machine")) };
         said.used.retain(|d| is_digest(d));
         said.used.truncate(500);
         if !job.repo.is_empty() {
-            self.store.put_until(&images_key(&job.repo, &job.workflow, &job.name), serde_json::to_string(&said).map_err(|e| e.to_string())?, now + PLAN_MS).await?;
-            if plan(Some(&said), now) { self.store.put_until(&repo_images_key(&job.repo), serde_json::to_string(&Images { used: vec![], ..said.clone() }).map_err(|e| e.to_string())?, now + PLAN_MS).await?; }
+            self.store.put_until(&images_key(&job.repo, &job.workflow, &job.name), crate::io::json(&said), now + PLAN_MS).await?;
+            if plan(Some(&said), now) { self.store.put_until(&repo_images_key(&job.repo), crate::io::json(&Images { used: vec![], ..said.clone() }), now + PLAN_MS).await?; }
         }
         job.images = Some(Images { used: vec![], ..said });
         self.keep_job(&job).await?;
@@ -461,7 +461,7 @@ impl ControlPlane<'_> {
                     let file = |f: &Value| cache::StoredFile { key: f["key"].as_str().unwrap_or_default().to_string(), size: f["size"].as_u64(), digest: f["digest"].as_str().map(str::to_string) };
                     let l = Layer { size: c.size, diff_id: done["diff_id"].as_str().unwrap_or_default().to_string(), erofs: file(&done["erofs"]), blob: file(&done["blob"]), made: now, used: now, public: c.public.clone() };
                     if done["digest"] == digest && !l.erofs.key.is_empty() && !l.blob.key.is_empty() {
-                        self.store.put(&layer_key(region, digest), serde_json::to_string(&l).map_err(|e| e.to_string())?).await?;
+                        self.store.put(&layer_key(region, digest), crate::io::json(&l)).await?;
                     }
                 }
             }
@@ -513,7 +513,7 @@ impl ControlPlane<'_> {
                     asked += 1;
                     let digest = k.rsplit_once(":sha256:").map(|(_, h)| format!("sha256:{h}")).unwrap_or_default();
                     l.public = public_source(self.http, &p.registry, &p.repository, &digest).await.map(|_| Public { checked: now, ..p });
-                    self.store.put(&k, serde_json::to_string(&l).map_err(|e| e.to_string())?).await?;
+                    self.store.put(&k, crate::io::json(&l)).await?;
                 }
             }
         }

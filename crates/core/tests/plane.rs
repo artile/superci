@@ -18,12 +18,116 @@ use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, 
 struct Mem(RefCell<BTreeMap<String, String>>);
 #[async_trait(?Send)]
 impl Store for Mem {
-    async fn get(&self, k: &str) -> io::Result<Option<String>> { Ok(self.0.borrow().get(k).cloned()) }
-    async fn put(&self, k: &str, v: String) -> io::Result<()> { self.0.borrow_mut().insert(k.into(), v); Ok(()) }
-    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { let mut m = self.0.borrow_mut(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
-    async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> { let mut m = self.0.borrow_mut(); if m.get(k).map(String::as_str) != was { return Ok(false) } m.insert(k.into(), v); Ok(true) }
-    async fn delete(&self, k: &str) -> io::Result<()> { self.0.borrow_mut().remove(k); Ok(()) }
-    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
+    async fn get(&self, k: &str) -> io::Result<Option<String>> { faults::op()?; Ok(self.0.borrow().get(k).cloned()) }
+    async fn put(&self, k: &str, v: String) -> io::Result<()> { faults::op()?; self.0.borrow_mut().insert(k.into(), v); Ok(()) }
+    async fn put_if_absent(&self, k: &str, v: String) -> io::Result<bool> { faults::op()?; let mut m = self.0.borrow_mut(); if m.contains_key(k) { return Ok(false) } m.insert(k.into(), v); Ok(true) }
+    async fn swap(&self, k: &str, was: Option<&str>, v: String) -> io::Result<bool> {
+        faults::op()?;
+        let mut m = self.0.borrow_mut();
+        if m.get(k).map(String::as_str) != was || faults::swaps_lose() { return Ok(false) }
+        m.insert(k.into(), v);
+        Ok(true)
+    }
+    async fn delete(&self, k: &str) -> io::Result<()> { faults::op()?; self.0.borrow_mut().remove(k); Ok(()) }
+    async fn list(&self, p: &str) -> io::Result<Vec<(String, String)>> { faults::op()?; Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
+}
+
+/// Faults for the sweep at the end of this file (`every_test_here_holds_with_each_call_and_store_operation_failing`):
+/// on the thread a sweep runs a test on, each call to a fake cloud, each store operation and each wake asked of the
+/// timer counted, and the one planned failed. Off everywhere else: nothing counted, nothing failed.
+mod faults {
+    use std::cell::RefCell;
+    use superci_core::io::{self, Request, Response};
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum Fault {
+        /// The k-th call answered with its service's error, or its connection dropped.
+        Call(usize),
+        Dropped(usize),
+        /// The k-th store operation not answered.
+        Op(usize),
+        /// Every call from the k-th on failing, every store operation from the k-th on: what a try again does not get past.
+        CallsFrom(usize),
+        OpsFrom(usize),
+        /// Every swap from the k-th on losing, as to a writer that always gets there first.
+        SwapsLoseFrom(usize),
+    }
+
+    #[derive(Default)]
+    pub struct Plan { pub on: bool, pub fault: Option<Fault>, pub calls: usize, pub ops: usize, pub swaps: usize, depth: usize, pub cap: usize }
+    thread_local! { pub static PLAN: RefCell<Plan> = RefCell::default(); }
+
+    /// Counting on this thread, with `fault` planned, until `off`; a run that goes on far past what the clean run did
+    /// (a test waiting for what a fault keeps from happening) is stopped at `cap` operations.
+    pub fn on(fault: Option<Fault>, cap: usize) { PLAN.with(|p| *p.borrow_mut() = Plan { on: true, fault, cap, ..Plan::default() }) }
+    /// The calls, operations and swaps counted, counting stopped.
+    pub fn off() -> (usize, usize, usize) { PLAN.with(|p| { let mut p = p.borrow_mut(); p.on = false; (p.calls, p.ops, p.swaps) }) }
+
+    fn runaway(p: &Plan) { if p.calls + p.ops > p.cap { panic!("{} calls and {} store operations: stopped", p.calls, p.ops) } }
+
+    /// A call to a fake cloud, counted once however many fakes it passes through (the outermost counts): its failure
+    /// when it is the one planned.
+    pub struct Outer(bool);
+    impl Drop for Outer { fn drop(&mut self) { if self.0 { PLAN.with(|p| p.borrow_mut().depth -= 1) } } }
+    pub fn call(r: &Request) -> (Outer, Option<io::Result<Response>>) { call_to(&r.url) }
+    /// A container started or stopped: refused when it is the call planned.
+    pub fn container(what: &str) -> io::Result<()> {
+        let (_outer, failed) = call_to(what);
+        match failed { Some(Ok(_)) => Err(format!("{what}: the container service failed")), Some(Err(e)) => Err(e), None => Ok(()) }
+    }
+    fn call_to(url: &str) -> (Outer, Option<io::Result<Response>>) {
+        PLAN.with(|p| {
+            let mut p = p.borrow_mut();
+            if !p.on { return (Outer(false), None) }
+            p.depth += 1;
+            if p.depth > 1 { return (Outer(true), None) }
+            p.calls += 1;
+            runaway(&p);
+            let k = p.calls;
+            let failed = match p.fault {
+                Some(Fault::Dropped(n)) if n == k => Some(Err(format!("connection to {url} dropped"))),
+                Some(Fault::Call(n)) if n == k => Some(Ok(failed_answer(url))),
+                Some(Fault::CallsFrom(n)) if k >= n => Some(Ok(failed_answer(url))),
+                _ => None,
+            };
+            (Outer(true), failed)
+        })
+    }
+
+    /// A service's own error: AWS's query APIs answer in XML, its JSON APIs and the others in JSON.
+    fn failed_answer(url: &str) -> Response {
+        let json_api = url.contains("pricing.") || url.contains("lambda.") || url.contains("dynamodb.") || url.contains("monitoring.");
+        if url.contains("amazonaws.com") && !json_api {
+            return Response::new(500, "text/xml", "<Response><Errors><Error><Code>InternalError</Code><Message>An internal error has occurred</Message></Error></Errors></Response>");
+        }
+        Response::new(500, "application/json", serde_json::json!({ "__type": "InternalServerError", "message": "Server Error" }).to_string())
+    }
+
+    /// A store operation, or a wake asked of the timer: not answered when it is the one planned.
+    pub fn op() -> io::Result<()> {
+        PLAN.with(|p| {
+            let mut p = p.borrow_mut();
+            if !p.on { return Ok(()) }
+            p.ops += 1;
+            runaway(&p);
+            let k = p.ops;
+            match p.fault {
+                Some(Fault::Op(n)) if n == k => Err(format!("the store did not answer (operation {k})")),
+                Some(Fault::OpsFrom(n)) if k >= n => Err(format!("the store did not answer (operation {k})")),
+                _ => Ok(()),
+            }
+        })
+    }
+
+    /// A swap that would be written: lost when it is one of those planned to lose.
+    pub fn swaps_lose() -> bool {
+        PLAN.with(|p| {
+            let mut p = p.borrow_mut();
+            if !p.on { return false }
+            p.swaps += 1;
+            matches!(p.fault, Some(Fault::SwapsLoseFrom(n)) if p.swaps >= n)
+        })
+    }
 }
 
 #[derive(Default)]
@@ -31,6 +135,7 @@ struct FakeClouds { calls: RefCell<Vec<(String, String, String)>>, headers: RefC
 #[async_trait(?Send)]
 impl Http for FakeClouds {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         self.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body.clone()));
         self.headers.borrow_mut().push((r.url.clone(), r.headers.clone()));
@@ -119,7 +224,7 @@ impl Clock for FixedClock { fn now_ms(&self) -> u64 { 1_790_000_000_000 } }
 struct Wakes(RefCell<Vec<u64>>, RefCell<Vec<u64>>);
 #[async_trait(?Send)]
 impl Timer for Wakes {
-    async fn wake_in(&self, ms: u64) -> io::Result<()> { self.0.borrow_mut().push(ms); Ok(()) }
+    async fn wake_in(&self, ms: u64) -> io::Result<()> { faults::op()?; self.0.borrow_mut().push(ms); Ok(()) }
     async fn pause(&self, ms: u64) { self.1.borrow_mut().push(ms) }
 }
 
@@ -128,7 +233,9 @@ const PLANE_ID: &str = "abc123def456";
 
 fn app() -> App {
     use rsa::pkcs1::EncodeRsaPrivateKey;
-    let pem = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap().to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap().to_string();
+    // (One key for every App: making it is the slow part of a test, and the sweep runs each test many times.)
+    static PEM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let pem = PEM.get_or_init(|| rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap().to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap().to_string()).clone();
     App { id: 99, slug: "superci-acme-abc123".into(), pem, webhook_secret: "whsec".into(), owner: "acme".into(), owner_is_org: true, host: None }
 }
 
@@ -301,6 +408,7 @@ struct Networked(FakeClouds);
 #[async_trait(?Send)]
 impl Http for Networked {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         let xml = |s: &str| Ok(Response::new(200, "text/xml", s.to_string()));
         if r.url == "https://ec2.us-east-2.amazonaws.com/" {
@@ -459,6 +567,7 @@ struct Refusing { clouds: FakeClouds, code: &'static str }
 #[async_trait(?Send)]
 impl Http for Refusing {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         if body.contains("Action=RunInstances") || body.contains("Action=CreateFleet") {
             self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body));
@@ -493,12 +602,13 @@ struct OwnContainers(RefCell<Vec<String>>);
 #[async_trait(?Send)]
 impl Containers for OwnContainers {
     async fn start(&self, name: &str, work: &superci_core::io::Work, _max: u32, size: superci_core::spec::Size) -> io::Result<String> {
+        faults::container(name)?;
         let what = match work { superci_core::io::Work::GitHub { jit } => jit.clone(), superci_core::io::Work::GitLab { url, token } => format!("gitlab {url} {token}"),
             superci_core::io::Work::Fail { jit, why } => format!("fail {jit} {why}") };
         self.0.borrow_mut().push(format!("start {name} {what} {}cpu {}gb {}disk", size.cpu, size.ram_gb, size.disk_gb));
         Ok(name.to_string())
     }
-    async fn stop(&self, id: &str) -> io::Result<()> { self.0.borrow_mut().push(format!("stop {id}")); Ok(()) }
+    async fn stop(&self, id: &str) -> io::Result<()> { faults::container(id)?; self.0.borrow_mut().push(format!("stop {id}")); Ok(()) }
 }
 
 #[test]
@@ -705,6 +815,7 @@ struct Kinds { clouds: FakeClouds, no_gpus: bool }
 #[async_trait(?Send)]
 impl Http for Kinds {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         if r.url == "https://ec2.us-east-1.amazonaws.com/" && body.contains("Action=DescribeImages") && body.contains("windows25") {
             self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body));
@@ -732,6 +843,7 @@ impl NoSpot {
 #[async_trait(?Send)]
 impl Http for NoSpot {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         if body.contains("Action=RunInstances") && body.contains("MarketType=spot") {
             self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body));
@@ -774,6 +886,7 @@ struct Renamed { clouds: FakeClouds }
 #[async_trait(?Send)]
 impl Http for Renamed {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         if r.method == "GET" && r.url == "https://api.github.com/app" {
             return Ok(Response::new(200, "application/json", serde_json::json!({ "id": 99, "slug": "acme-ci", "name": "Acme CI", "permissions": { "organization_self_hosted_runners": "write", "actions": "write", "metadata": "read" } }).to_string()));
         }
@@ -799,6 +912,7 @@ struct OlderRegion { clouds: FakeClouds }
 #[async_trait(?Send)]
 impl Http for OlderRegion {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         if body.contains("Action=DescribeInstanceTypeOfferings") {
             self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body.clone()));
@@ -844,6 +958,7 @@ impl ByBudget {
 #[async_trait(?Send)]
 impl Http for ByBudget {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         // (The rule lets one kind of machine through: the small one that fails a refused job at GitHub with why.)
         if self.on.get() && body.contains("Action=RunInstances") && !superci_core::aws::SAYS_WHY_TYPES.iter().any(|t| body.contains(&format!("InstanceType={t}&"))) {
@@ -1220,11 +1335,12 @@ struct Flaky { fails: std::cell::Cell<u32>, starts: std::cell::Cell<u32> }
 #[async_trait(?Send)]
 impl Containers for Flaky {
     async fn start(&self, name: &str, _work: &superci_core::io::Work, _max: u32, _size: superci_core::spec::Size) -> io::Result<String> {
+        faults::container(name)?;
         self.starts.set(self.starts.get() + 1);
         if self.fails.get() > 0 { self.fails.set(self.fails.get() - 1); return Err("The container connection is temporarily unavailable, try again".into()) }
         Ok(name.to_string())
     }
-    async fn stop(&self, _id: &str) -> io::Result<()> { Ok(()) }
+    async fn stop(&self, id: &str) -> io::Result<()> { faults::container(id) }
 }
 
 #[test]
@@ -1420,6 +1536,7 @@ struct Zones(FakeClouds);
 #[async_trait(?Send)]
 impl Http for Zones {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         let xml = |s: &str| Ok(Response::new(200, "text/xml", s.to_string()));
         let err = |code: &str| Ok(Response::new(400, "text/xml", format!("<Response><Errors><Error><Code>{code}</Code><Message>no</Message></Error></Errors></Response>")));
@@ -1466,6 +1583,7 @@ struct Runs { clouds: FakeClouds, done: std::cell::Cell<bool>, may_rerun: bool }
 #[async_trait(?Send)]
 impl Http for Runs {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         if r.url == "https://api.github.com/repos/acme/app/actions/runs/3" {
             return Ok(Response::new(200, "application/json", serde_json::json!({ "status": if self.done.get() { "completed" } else { "in_progress" } }).to_string()));
         }
@@ -1619,6 +1737,7 @@ struct With<F: Fn(&Request, &str) -> Option<Response>>(FakeClouds, F);
 #[async_trait(?Send)]
 impl<F: Fn(&Request, &str) -> Option<Response>> Http for With<F> {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let body = String::from_utf8_lossy(&r.body).to_string();
         if let Some(answer) = (self.1)(&r, &body) { self.0.calls.borrow_mut().push((r.method.clone(), r.url.clone(), body)); return Ok(answer) }
         self.0.send(r).await
@@ -2205,6 +2324,7 @@ struct Logs(FakeClouds);
 #[async_trait(?Send)]
 impl Http for Logs {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         match r.url.as_str() {
             "https://api.github.com/repos/acme/app/actions/jobs/1/logs" => {
                 assert_eq!(r.header("authorization"), Some("Bearer ghs_test"), "asked with the App's token for the job's repository");
@@ -2283,6 +2403,7 @@ struct Untold(FakeClouds);
 #[async_trait(?Send)]
 impl Http for Untold {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let job = |id: u64, label: &str, at: &str| serde_json::json!({ "id": id, "run_id": 90, "status": "queued", "name": format!("job {id}"), "workflow_name": "ci", "labels": [label], "created_at": at });
         let ok = |v: serde_json::Value| Ok(Response::new(200, "application/json", v.to_string()));
         match r.url.strip_prefix("https://api.github.com/repos/acme/app/actions/runs") {
@@ -3933,6 +4054,7 @@ struct WithCache { clouds: FakeClouds, keys: serde_json::Value }
 #[async_trait(?Send)]
 impl Http for WithCache {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         if r.url == format!("https://superci-plane-{PLANE_ID}-us-east-1.s3.us-east-1.amazonaws.com/{}", superci_core::cache::program_key("x86_64")) && r.method == "HEAD" {
             assert!(r.header("authorization").is_some_and(|a| a.contains("/us-east-1/s3/aws4_request")));
             return Ok(Response::new(200, "application/octet-stream", ""));
@@ -4063,6 +4185,7 @@ const BUCKET: &str = "https://superci-plane-abc123def456-us-east-1.s3.us-east-1.
 #[async_trait(?Send)]
 impl Http for WithLayers {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         if r.method == "HEAD" && (r.url == format!("{BUCKET}{}", superci_core::cache::program_key("x86_64")) || r.url == format!("{BUCKET}{}", superci_core::cache::layers_key("x86_64"))) {
             return Ok(Response::new(200, "application/octet-stream", ""));
         }
@@ -4514,7 +4637,7 @@ fn a_gitlab_job_gitlab_never_told_of_gets_its_machine_from_the_sweep() {
 struct Leaves(RefCell<Vec<String>>);
 #[async_trait(?Send)]
 impl Timer for Leaves {
-    async fn wake_in(&self, _: u64) -> io::Result<()> { Ok(()) }
+    async fn wake_in(&self, _: u64) -> io::Result<()> { faults::op() }
     fn later(&self, what: &str) -> bool { self.0.borrow_mut().push(what.to_string()); true }
 }
 
@@ -4801,6 +4924,7 @@ struct WithGitLabProjects { clouds: FakeClouds, hooks: RefCell<Vec<(u64, String)
 #[async_trait(?Send)]
 impl Http for WithGitLabProjects {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         let json = |v: serde_json::Value| Ok(Response::new(200, "application/json", v.to_string()));
         if let Some(path) = r.url.strip_prefix("https://gitlab.example/api/v4") {
             self.clouds.calls.borrow_mut().push((r.method.clone(), r.url.clone(), String::from_utf8_lossy(&r.body).to_string()));
@@ -4851,6 +4975,7 @@ struct Sent { clouds: FakeClouds, sum: Option<f64> }
 #[async_trait(?Send)]
 impl Http for Sent {
     async fn send(&self, r: Request) -> io::Result<Response> {
+        let (_outer, failed) = faults::call(&r); if let Some(f) = failed { return f }
         if r.url.starts_with("https://monitoring.") {
             return Ok(match self.sum {
                 Some(s) => Response::new(200, "text/xml", format!("<GetMetricStatisticsResponse><GetMetricStatisticsResult><Datapoints><member><Sum>{}</Sum></member><member><Sum>{}</Sum></member></Datapoints></GetMetricStatisticsResult></GetMetricStatisticsResponse>", s / 2.0, s / 2.0)),
@@ -5176,4 +5301,189 @@ fn spot_goes_first_to_the_region_where_a_job_costs_least_with_the_first_favoured
         assert!(asked.first().is_some_and(|url| url.contains(first)), "Ohio at {ohio}: {asked:?}");
         assert_eq!(job(&store, 7)["region"].as_str(), Some(first), "Ohio at {ohio}");
     }
+}
+
+/// A test of this file run under the sweep: its name, and itself.
+type Swept = (&'static str, fn());
+macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
+
+/// Every other test of this file, as written, run again for each call to a fake cloud and each store operation it
+/// made, that one failing (a call answered with its service's error, or dropped; a store operation, or a wake asked
+/// of the timer, not answered), then with every call from each on failing, and every store operation from each on,
+/// and with every swap from each on lost. A test's own checks may not hold then (that is what the fault is for), and it stops where
+/// the first does not; what must hold is the control plane: whatever fails, it never panics. (The clean runs alone
+/// unless `SUPERCI_SWEEP_FAULTS=1`, as the sweeps of the CLI's flows.)
+#[test]
+fn every_test_here_holds_with_each_call_and_store_operation_failing() {
+    let tests: &[Swept] = tests![
+        online_only_public_documents_and_a_yes_no_health,
+        aws_connects_once_from_the_stack_then_jobs_run_on_spot_machines,
+        routing_set_in_the_control_plane_sends_jobs_to_a_cloudflare_agent_with_a_token_for_it_alone,
+        a_control_plane_in_aws_uses_its_own_credentials_for_machines,
+        machines_start_in_the_control_planes_own_network_cheapest_zone_first_else_the_default_one,
+        a_region_with_no_spot_capacity_left_sends_the_machine_to_the_next,
+        moving_hands_everything_to_the_new_control_plane_once_and_the_old_one_says_where,
+        a_network_or_an_image_aws_says_is_gone_is_looked_up_anew_for_the_next_job,
+        a_cloudflare_control_plane_starts_containers_itself,
+        a_machine_that_never_begins_its_job_is_tried_again_then_the_job_fails,
+        a_machine_whose_runner_waits_while_github_keeps_its_job_queued_is_ended_and_the_job_held_then_given_one_again,
+        a_job_whose_machine_never_starts_while_github_cannot_be_asked_fails_here_alone,
+        a_start_cut_off_midway_is_placed_again_by_the_sweep,
+        a_runner_that_takes_a_job_whose_machine_failed_leaves_its_own_job_a_new_machine,
+        how_a_job_itself_ended_is_kept_apart_from_whether_a_machine_ran_it,
+        an_app_renamed_on_github_is_known_by_its_new_address,
+        a_machine_type_the_region_does_not_have_is_not_asked_for_with_every_job,
+        a_machine_refused_by_the_accounts_own_budget_is_said_as_that_and_is_no_missing_permission,
+        an_organization_that_allows_no_spot_sends_the_job_on_demand_and_is_no_missing_permission,
+        gpus_and_windows_get_their_own_images_types_and_prices,
+        a_gpu_on_modal_goes_to_its_sandbox_and_into_the_price,
+        an_aws_account_with_no_gpu_quota_fails_gpu_jobs_at_once_saying_what_to_raise,
+        the_label_asks_for_the_machine_and_the_order_finds_a_place_that_can_run_it,
+        limits_make_jobs_wait_or_move_down_the_order,
+        gitlab_jobs_with_the_label_in_their_tags_get_a_machine_and_a_project_runner_of_their_own,
+        a_failing_runner_that_would_not_start_is_started_by_the_next_sweep,
+        a_machine_that_fails_to_start_is_tried_again_and_a_job_with_no_place_fails_at_once,
+        public_repositories_run_only_when_allowed_and_never_from_forks,
+        machines_larger_than_allowed_are_refused_and_on_demand_counts_toward_budgets,
+        a_moved_control_plane_forwards_only_signed_events,
+        measured_costs_from_the_dashboard_settle_finished_cloudflare_jobs_only,
+        jobs_nothing_here_can_run_fail_at_once,
+        removed_aws_runners_take_no_jobs,
+        without_its_own_network_a_machine_still_tries_each_zone_and_a_full_region_is_not_called_a_quota,
+        a_spot_machine_taken_back_fails_its_job_at_once_and_the_job_is_run_again_on_demand,
+        an_app_that_may_not_run_jobs_again_says_so,
+        cloudflare_runners_get_githubs_full_image_by_its_address_when_set,
+        one_control_plane_serves_several_organizations_each_through_its_own_app,
+        with_no_room_for_a_spot_machine_in_any_region_the_job_gets_an_on_demand_one,
+        a_job_that_passed_as_the_notice_came_is_not_run_again_and_a_notice_follows_the_machine_to_the_job_it_took,
+        several_jobs_of_one_run_taken_back_are_run_again_with_one_request,
+        a_failing_runner_that_takes_another_job_is_said_on_it_and_that_jobs_machine_takes_the_first,
+        a_gitlab_job_whose_spot_machine_is_taken_back_is_run_again_on_demand,
+        a_network_of_the_accounts_own_takes_the_machines_and_nothing_else_does_when_it_is_wrong,
+        the_sweep_counts_a_machines_age_from_its_start_and_starts_none_again_for_a_job_github_no_longer_has_queued,
+        a_github_enterprise_server_is_asked_at_its_own_address,
+        a_job_whose_runner_was_taken_gets_a_machine_even_if_the_other_jobs_never_comes_up,
+        out_of_time_while_spot_is_refused_the_next_try_starts_below_spot,
+        several_gitlabs_are_kept_apart_each_with_its_own_token_and_secret,
+        with_no_spot_machine_the_job_goes_to_the_next_place_in_the_order,
+        each_place_of_awss_starts_its_machines_in_its_own_regions,
+        with_on_demand_turned_off_and_nothing_else_in_the_order_the_job_waits_for_a_spot_machine,
+        a_provider_that_cannot_start_the_machine_sends_the_job_to_the_next_in_the_order,
+        a_provider_that_refuses_what_a_job_asks_is_passed_by_and_only_all_refusing_fails_it_at_once,
+        no_gpu_allowance_is_said_at_once_even_when_spot_refuses_for_another_reason,
+        a_key_that_only_reads_sees_the_status_and_a_jobs_log_and_changes_nothing,
+        a_job_github_never_told_of_is_found_by_asking_and_gets_its_machine,
+        a_control_plane_answers_to_the_labels_set_for_it_the_new_one_and_the_ones_before,
+        a_control_plane_is_called_what_it_is_named_where_people_read_it,
+        a_spot_request_refused_for_its_rate_to_the_end_goes_on_demand_and_says_why,
+        a_launch_aws_refuses_for_its_request_rate_is_asked_again_in_place,
+        a_job_that_began_on_anothers_runner_gets_no_machine_again_and_an_ended_machine_stays_in_the_books,
+        a_machine_nobody_waits_for_is_ended_at_the_first_sweep_after_it_had_time_to_come_up,
+        an_aws_machines_disk_is_as_fast_as_its_size_deserves_unless_said_and_a_label_can_ask_for_memory_or_a_local_disk,
+        a_spot_machine_is_asked_for_where_it_costs_least_for_its_speed_and_never_where_its_type_is_not_offered,
+        every_spot_pool_is_asked_before_an_on_demand_machine_and_none_twice_in_a_minute,
+        a_machine_for_a_job_cancelled_before_any_runner_took_it_is_ended_at_once,
+        a_jobs_start_is_kept_what_aws_was_asked_and_what_its_machine_said_of_itself,
+        a_job_waits_for_a_spot_machine_only_when_on_demand_was_refused_for_the_limit_alone_and_spot_was_asked,
+        a_job_run_again_after_a_reclaim_goes_back_on_spot_when_the_on_demand_limit_cannot_take_it,
+        runs_are_counted_once_each_and_those_of_jobs_counted_before_are_counted_by_the_upkeep,
+        a_job_sent_on_demand_by_the_spot_limit_notes_when_machines_just_ended_still_counted,
+        at_the_aws_accounts_limit_a_job_waits_for_one_of_its_own_to_end_and_fails_plainly_when_it_can_never_fit,
+        the_spot_pools_left_when_the_best_has_no_machine_are_asked_in_one_request,
+        a_job_gets_its_spot_machine_from_one_request_for_every_other_pool_and_a_role_that_may_not_asks_one_by_one,
+        a_queued_job_is_answered_at_once_and_its_machine_asked_for_after,
+        a_workflow_files_job_is_written_for_the_runner_as_github_writes_it,
+        the_runners_calls_for_a_job_are_answered_as_its_service_answers_them,
+        a_long_run_from_a_computers_log_is_given_with_its_steps_within_what_an_answer_may_be,
+        a_run_from_a_computer_gets_its_machine_and_its_runner_takes_the_job_from_the_control_plane,
+        a_key_for_coding_agents_starts_runs_within_the_control_planes_own_limits,
+        the_secrets_a_ci_keeps_go_to_the_runs_from_a_computer_that_name_them_the_narrowest_under_each_name,
+        a_run_from_a_computer_of_several_jobs_starts_each_once_what_it_needs_has_ended,
+        a_machine_keeps_githubs_cache_in_its_regions_bucket_as_its_jobs_token_allows,
+        a_label_asking_for_more_than_allowed_is_said_so,
+        ubuntu_26_machines_keep_their_jobs_images_and_a_repository_that_used_some_has_them_from_the_start,
+        the_plan_for_a_jobs_machine_follows_what_its_last_run_used,
+        machines_fill_the_layer_store_and_each_repository_reads_only_what_it_may,
+        docker_images_are_left_to_docker_when_the_cache_keeps_none,
+        a_cache_turned_off_leaves_jobs_to_githubs,
+        turbo_nx_and_bazel_keep_their_artifacts_by_the_branch_github_said_the_job_is_for,
+        a_gitlab_jobs_cache_is_its_projects_by_the_branch_gitlab_said_once_the_job_began,
+        a_gitlab_job_gitlab_never_told_of_gets_its_machine_from_the_sweep,
+        a_job_started_after_a_sweep_gets_the_control_planes_own_links,
+        a_gitlab_job_whose_events_never_come_is_seen_running_and_over_by_asking_gitlab,
+        a_gitlab_machine_whose_jobs_event_never_came_learns_its_job_by_asking_gitlab,
+        a_working_tree_goes_to_the_control_planes_bucket_in_one_and_its_checkout_is_sent_there,
+        usage_counts_every_job_of_a_period_its_minutes_and_what_the_code_host_would_have_charged,
+        a_store_without_ends_of_its_own_removes_a_record_at_its_end_and_not_one_written_again,
+        jobs_kept_before_their_indexes_are_indexed_once_and_each_job_is_counted_in_its_days_totals_once,
+        a_running_jobs_log_is_githubs_then_the_lines_its_machine_sent_after,
+        a_machine_that_keeps_its_jobs_images_is_not_ended_with_its_job_but_goes_off_by_itself,
+        gitlabs_projects_follow_a_move_and_leaving_takes_their_webhooks_and_its_runners_away,
+        what_a_machine_sent_to_the_internet_is_added_to_its_jobs_cost_once_cloudwatch_has_counted_it,
+        a_runner_name_github_has_already_gets_a_name_of_its_own,
+        a_job_whose_machine_aws_refuses_is_told_why_by_what_aws_said,
+        every_pair_of_aws_refusals_ends_each_kind_of_job_as_the_table_says,
+        each_kind_of_label_asks_aws_for_the_machine_the_table_says,
+        a_job_no_pool_has_room_for_is_asked_three_times_then_fails_and_a_type_a_zone_lacks_is_not_asked_there_again,
+        a_fleet_refused_for_something_else_than_room_goes_on_with_the_pools_in_rounds,
+        the_pools_asked_together_first_are_those_near_the_best_price_for_a_job_and_none_over_on_demand,
+        spot_goes_first_to_the_region_where_a_job_costs_least_with_the_first_favoured
+    ];
+    // (Each test of this file is in it but those that already step through every point of a flow themselves.)
+    let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
+        "a_job_that_runs_and_ends_at_any_step_of_a_sweep_stays_done", "a_gitlab_job_cancelled_at_any_step_of_its_start_leaves_no_machine_and_no_runner", "every_test_here_holds_with_each_call_and_store_operation_failing"];
+    let all: Vec<&str> = include_str!("plane.rs").split("#[test]\nfn ").skip(1).filter_map(|t| t.split('(').next()).collect();
+    let missing: Vec<&&str> = all.iter().filter(|t| !stepping.contains(t) && !tests.iter().any(|(n, _)| n == *t)).collect();
+    assert!(missing.is_empty(), "tests not in the sweep: {missing:?}");
+    if std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() != Some("1") { return }
+    panics_noted();
+    let next = std::sync::Mutex::new(0usize);
+    let found: std::sync::Mutex<Vec<String>> = Default::default();
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    std::thread::scope(|s| for _ in 0..threads {
+        s.spawn(|| loop {
+            let i = { let mut n = next.lock().unwrap(); *n += 1; *n - 1 };
+            let Some(&(name, test)) = tests.get(i) else { break };
+            let (clean, (calls, ops, swaps)) = (run_faulted(test, None, usize::MAX), faults::off());
+            if let Some(p) = clean { found.lock().unwrap().push(format!("{name}, clean: {p}")); continue }
+            use faults::Fault::*;
+            let plan = (1..=calls).flat_map(|k| [Call(k), Dropped(k), CallsFrom(k)]).chain((1..=ops).flat_map(|k| [Op(k), OpsFrom(k)])).chain((1..=swaps).map(SwapsLoseFrom));
+            for fault in plan {
+                runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(p) = run_faulted(test, Some(fault), 4 * (calls + ops) + 1_000).filter(|p| p.starts_with("the control plane")) {
+                    found.lock().unwrap().push(format!("{name}, {fault:?}: {p}"))
+                }
+                faults::off();
+            }
+        });
+    });
+    let found = found.into_inner().unwrap();
+    eprintln!("{} tests, {} faulted runs", tests.len(), runs.into_inner());
+    assert!(found.is_empty(), "{} runs broke what must hold:\n  {}", found.len(), found.join("\n  "));
+}
+
+thread_local! { static PANICKED: RefCell<Option<String>> = const { RefCell::new(None) }; }
+
+/// Panics on a thread a sweep runs on are noted there (where, and what they said), not printed.
+fn panics_noted() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let before = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !faults::PLAN.with(|p| p.borrow().on) { return before(info) }
+            let at = info.location().map(|l| l.file().to_string()).unwrap_or_default();
+            let said = info.payload().downcast_ref::<String>().cloned().or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+            let whose = if at.contains("/tests/") { "the test" } else { "the control plane" };
+            PANICKED.with(|p| *p.borrow_mut() = Some(format!("{whose} panicked at {at}: {said}")));
+        }));
+    });
+}
+
+/// `test` run once with `fault` planned: where it panicked, if it did.
+fn run_faulted(test: fn(), fault: Option<faults::Fault>, cap: usize) -> Option<String> {
+    PANICKED.with(|p| *p.borrow_mut() = None);
+    faults::on(fault, cap);
+    let ended = std::panic::catch_unwind(test);
+    ended.err().map(|_| PANICKED.with(|p| p.borrow_mut().take()).unwrap_or_else(|| "a panic".into()))
 }

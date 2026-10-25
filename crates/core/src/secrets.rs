@@ -121,12 +121,13 @@ pub fn glob(pattern: &str, text: &str) -> bool {
             Some(c) => t.first() == Some(c) && go(&p[1..], &t[1..]),
         }
     }
+    // A class's ranges (`a-z`) and characters, one after another.
     fn class(set: &[char], c: char) -> bool {
-        let mut i = 0;
-        while i < set.len() {
-            if i + 2 < set.len() && set[i + 1] == '-' { if set[i] <= c && c <= set[i + 2] { return true } i += 3 } else { if set[i] == c { return true } i += 1 }
+        match set {
+            [from, '-', to, rest @ ..] => (*from <= c && c <= *to) || class(rest, c),
+            [one, rest @ ..] => *one == c || class(rest, c),
+            [] => false,
         }
-        false
     }
     go(&p, &t)
 }
@@ -235,6 +236,8 @@ mod tests {
         assert!(glob("v[0-9]", "v7"));
         assert!(!glob("v[0-9]", "va"));
         assert!(glob("v[ab]", "vb"));
+        // Ranges and characters together; below a range, above it, and a dash at the end taken as itself.
+        assert!(glob("v[a-cx]", "vx") && glob("v[a-cx]", "vb") && !glob("v[b-cx]", "va") && !glob("v[a-cx]", "vd") && glob("v[a-]", "v-"));
         assert!(glob("[", "["));
         assert!(glob("*.yml", "deploy.yml"));
     }
@@ -262,6 +265,8 @@ mod tests {
         assert_eq!(named(&["run: ${{ secrets[matrix.name] }}"]), None);
         assert_eq!(named(&["run: ${{ secrets.A }}", "run: ${{ secrets.B }}"]).unwrap().len(), 2);
         assert!(named(&["run: echo hi"]).unwrap().is_empty());
+        assert!(named(&[]).unwrap().is_empty(), "no workflow files: none named");
+        assert_eq!(named(&["run: ${{ secrets['A }}"]), None, "a name whose quote never ends reads no one name");
     }
 
     #[test]
