@@ -146,7 +146,7 @@ impl Config {
         self.more_gitlabs = named("GITLAB_").filter_map(|(_, v)| serde_json::from_str::<crate::gitlab::GitLab>(v).ok()).filter(|g| crate::gitlab::valid_id(&g.id)).collect();
         self.machine = get("MACHINE").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
         // One per dashboard session: DEVICE_KEY_<expires, unix seconds>_<random>.
-        self.device_keys = named("DEVICE_KEY_").filter_map(|(n, v)| Some((n.strip_prefix("DEVICE_KEY_")?.split('_').next()?.parse::<u64>().ok()? * 1000, v.clone()))).collect();
+        self.device_keys = named("DEVICE_KEY_").filter_map(|(n, v)| Some((n["DEVICE_KEY_".len()..].split('_').next().unwrap_or_default().parse::<u64>().ok()? * 1000, v.clone()))).collect();
         self.device_key_names = named("DEVICE_KEY_").filter(|(_, v)| !v.is_empty()).map(|(n, v)| (n.to_string(), v.clone())).collect();
         // One per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
         self.read_keys = named("READ_KEY_").filter_map(|(n, v)| read_key(n, v)).collect();
@@ -867,16 +867,14 @@ pub fn last_time(log: &[u8]) -> Option<String> {
 
 /// The lines of a log written after `after` (a time as `last_time` says it), with the untimed lines that go with them.
 pub fn newer_lines(log: &[u8], after: &str) -> Vec<u8> {
-    if after.is_empty() || log.is_empty() { return vec![] }
-    let mut out = String::new();
+    if after.is_empty() { return vec![] }
     let mut keep = false;
-    for l in String::from_utf8_lossy(log).lines() {
+    String::from_utf8_lossy(log).lines().filter(|l| {
         let t = l.trim_start_matches('\u{feff}');
         let b = t.as_bytes();
         if b.len() > 19 && b[4] == b'-' && b[10] == b'T' && b[..4].iter().all(u8::is_ascii_digit) { keep = &t[..19] > after }
-        if keep { out.push_str(l); out.push('\n') }
-    }
-    out.into_bytes()
+        keep
+    }).map(|l| format!("{l}\n")).collect::<String>().into_bytes()
 }
 
 pub fn job_usd(j: &Job, now_ms: u64) -> f64 {
@@ -979,9 +977,8 @@ fn read_text(text: &str, c: &crate::expression::Contexts) -> std::result::Result
 /// What the jobs a job needs say (`needs.<name>.result`, `.outputs`), how they went together, and whether all went
 /// well. A call stands for its jobs, and gives the outputs its workflow's `on.workflow_call.outputs` make of
 /// theirs; within a called workflow (`call`), its own jobs are named as there.
-fn needs_said(jobs: &[serde_json::Value], needed: &[String], call: Option<&str>, called: &std::collections::BTreeMap<String, crate::workflow::Node>, wf: &crate::workflow::Node)
-    -> std::result::Result<(serde_json::Map<String, serde_json::Value>, crate::expression::Status, bool), String> {
-    let _ = wf;
+fn needs_said(jobs: &[serde_json::Value], needed: &[String], call: Option<&str>, called: &std::collections::BTreeMap<String, crate::workflow::Node>)
+    -> (serde_json::Map<String, serde_json::Value>, crate::expression::Status, bool) {
     let mut needs = serde_json::Map::new();
     let (mut status, mut all_good) = (crate::expression::Status::Success, true);
     for n in needed {
@@ -994,13 +991,13 @@ fn needs_said(jobs: &[serde_json::Value], needed: &[String], call: Option<&str>,
         let mut outputs = serde_json::Map::new();
         if let Some(source) = of.iter().find(|j| j["call"] == n.as_str()).and_then(|j| j["source"].as_str()) {
             // Its workflow's outputs, from its jobs' (`jobs.<name>.outputs.<output>`).
-            let mut theirs = serde_json::Map::new();
-            for j in &of {
+            let theirs = of.iter().fold(serde_json::Map::new(), |mut theirs, j| {
                 let k = j["job_key"].as_str().unwrap_or_default();
                 let entry = theirs.entry(k.to_string()).or_insert_with(|| serde_json::json!({ "result": j["result"], "outputs": {} }));
                 if j["result"] == "failure" { entry["result"] = "failure".into() }
                 for (o, v) in j["outputs"].as_object().into_iter().flatten() { entry["outputs"][o] = v.clone(); }
-            }
+                theirs
+            });
             let values: serde_json::Map<String, serde_json::Value> = [("jobs".to_string(), serde_json::Value::Object(theirs))].into_iter().collect();
             let c = crate::expression::Contexts { values: &values, status: crate::expression::Status::Success };
             for (o, def) in called.get(source).and_then(crate::workflow::call_part).and_then(|p| p.get("outputs")).map(|o| o.pairs().to_vec()).unwrap_or_default() {
@@ -1013,7 +1010,7 @@ fn needs_said(jobs: &[serde_json::Value], needed: &[String], call: Option<&str>,
         let name = call.and_then(|c| n.strip_prefix(&format!("{c}/"))).unwrap_or(n);
         needs.insert(name.to_string(), serde_json::json!({ "result": result, "outputs": outputs }));
     }
-    Ok((needs, status, all_good))
+    (needs, status, all_good)
 }
 
 /// A run from a computer's event payload and inputs, at most (bytes).
@@ -1033,8 +1030,9 @@ fn run_event(github: &mut serde_json::Value, run: &serde_json::Value) {
 /// A called workflow's inputs: each one's default, then what the caller gives (`with:`), read with the caller's
 /// contexts, as the input's type says (boolean, number, string). One required and not given is refused.
 fn call_inputs(part: Option<&crate::workflow::Node>, with: Option<&crate::workflow::Node>, c: &crate::expression::Contexts) -> std::result::Result<serde_json::Value, String> {
-    let defs = part.and_then(|p| p.get("inputs"));
-    let kind = |name: &str| defs.and_then(|d| d.get(name)).and_then(|d| d.get("type")).and_then(|t| t.text()).unwrap_or("string").to_string();
+    // (Each input by its name: a key that is no name, a list or a map, names none.)
+    let defs: Vec<(&str, &crate::workflow::Node)> = part.and_then(|p| p.get("inputs")).map(|d| d.pairs()).unwrap_or_default().iter().filter_map(|(k, d)| Some((k.text()?, d))).collect();
+    let kind = |name: &str| defs.iter().find(|(n, _)| *n == name).and_then(|(_, d)| d.get("type")).and_then(|t| t.text()).unwrap_or("string").to_string();
     let typed = |v: serde_json::Value, kind: &str| match (kind, &v) {
         ("boolean", serde_json::Value::String(s)) => serde_json::Value::Bool(s == "true"),
         ("number", serde_json::Value::String(s)) => s.trim().parse::<f64>().map(|f| serde_json::json!(f)).unwrap_or(v),
@@ -1042,17 +1040,15 @@ fn call_inputs(part: Option<&crate::workflow::Node>, with: Option<&crate::workfl
         _ => v,
     };
     let mut inputs = serde_json::Map::new();
-    for (k, d) in defs.map(|d| d.pairs().to_vec()).unwrap_or_default() {
-        let Some(name) = k.text() else { continue };
+    for (name, d) in &defs {
         if let Some(def) = d.get("default").and_then(|n| n.text()) { inputs.insert(name.to_string(), typed(read_text(def, c)?, &kind(name))); }
     }
     for (k, v) in with.map(|w| w.pairs().to_vec()).unwrap_or_default() {
         let (Some(name), Some(text)) = (k.text(), v.text()) else { continue };
         inputs.insert(name.to_string(), typed(read_text(text, c)?, &kind(name)));
     }
-    for (k, d) in defs.map(|d| d.pairs().to_vec()).unwrap_or_default() {
-        let Some(name) = k.text() else { continue };
-        if d.get("required").and_then(|r| r.text()) == Some("true") && !inputs.contains_key(name) { return Err(format!("the called workflow's input {name} is required, and not given")) }
+    for (name, d) in &defs {
+        if d.get("required").and_then(|r| r.text()) == Some("true") && !inputs.contains_key(*name) { return Err(format!("the called workflow's input {name} is required, and not given")) }
     }
     Ok(serde_json::Value::Object(inputs))
 }
@@ -1103,7 +1099,8 @@ fn forget_secrets(handed: &mut crate::runner_service::HandedJob) {
 pub fn worker_message(log: &[u8]) -> Option<serde_json::Value> {
     let at = log.windows(12).position(|w| w == b"Job message:")?;
     let from = at + log[at..].iter().position(|b| *b == b'{')?;
-    serde_json::Deserializer::from_slice(&log[from..]).into_iter::<serde_json::Value>().next()?.ok()
+    // (From a `{` there is always something to read: a value, or why it is none.)
+    serde_json::Deserializer::from_slice(&log[from..]).into_iter::<serde_json::Value>().next().and_then(std::result::Result::ok)
 }
 
 /// Each step's shape in a job message, in its order: its id, whether it runs in the background, its parallel group,
@@ -1187,9 +1184,8 @@ impl<'a> ControlPlane<'a> {
             ("GET", "/keys") if self.dashboard(&req) => self.keys().await,
             ("GET", "/secrets") if self.dashboard(&req) => self.secrets().await,
             // Moved: events that still arrive here (sent just before the switch) go on to the new control plane.
-            ("POST", "/webhook") | ("POST", "/gitlab/webhook") if self.store.get("moved_to").await?.is_some() => self.forward(&req, url.path()).await,
-            ("POST", "/webhook") => self.webhook(&req, &plane_url).await,
-            ("POST", "/gitlab/webhook") => self.gitlab_webhook(&req, &plane_url).await,
+            ("POST", "/webhook") => match self.forward(&req, "/webhook").await? { Some(r) => Ok(r), None => self.webhook(&req, &plane_url).await },
+            ("POST", "/gitlab/webhook") => match self.forward(&req, "/gitlab/webhook").await? { Some(r) => Ok(r), None => self.gitlab_webhook(&req, &plane_url).await },
             ("POST", "/aws/callback") => self.aws_callback(&req, &plane_url).await,
             // A spot machine saying AWS is taking it back (only it has its job's link).
             ("POST", "/interrupted") => {
@@ -1312,7 +1308,10 @@ impl<'a> ControlPlane<'a> {
                 if self.config.app.is_none() { return Err("no GitHub App".into()) }
                 // Each App by itself: one that GitHub no longer answers for (deleted there) does not hide the others'.
                 let (mut repos, mut failed) = (vec![], vec![]);
-                for app in self.config.apps() {
+                // (At least the first App: the loop is written out, as one over none never happens.)
+                let mut apps = self.config.apps();
+                loop {
+                    let Some(app) = apps.next() else { break };
                     let of_app: Result<Vec<String>> = async {
                         let mut out = vec![];
                         for i in github::installations(self.http, app, now).await? {
@@ -1412,19 +1411,18 @@ impl<'a> ControlPlane<'a> {
         nothing_here()
     }
 
-    /// An event for the control plane this one moved to, passed on as it came (its signature still holds there).
-    async fn forward(&self, req: &Request, path: &str) -> Result<Response> {
-        let to = get_json::<String>(self.store, "moved_to").await?.ok_or("not moved")?;
+    /// An event for the control plane this one moved to, passed on as it came (its signature still holds there); none
+    /// when this one has not moved.
+    async fn forward(&self, req: &Request, path: &str) -> Result<Option<Response>> {
+        let Some(to) = get_json::<String>(self.store, "moved_to").await? else { return Ok(None) };
         // Only events that really come from GitHub or GitLab (as here before the move).
         let genuine = if path == "/webhook" { self.config.apps().any(|a| verify_hub_signature(&a.webhook_secret, &req.body, req.header("x-hub-signature-256"))) }
             else { self.gitlab_signed(req).is_some() };
-        if !genuine { return Ok(Response::text(401, "bad signature")) }
-        let mut out = Request::new("POST", &format!("{to}{path}")).with_body(req.body.clone());
-        for (k, v) in &req.headers {
-            if k.starts_with("x-hub-") || k.starts_with("x-github-") || k.starts_with("x-gitlab-") || k == "content-type" || k == "user-agent" { out = out.with_header(k, v) }
-        }
+        if !genuine { return Ok(Some(Response::text(401, "bad signature"))) }
+        let out = req.headers.iter().filter(|(k, _)| k.starts_with("x-hub-") || k.starts_with("x-github-") || k.starts_with("x-gitlab-") || k == "content-type" || k == "user-agent")
+            .fold(Request::new("POST", &format!("{to}{path}")).with_body(req.body.clone()), |out, (k, v)| out.with_header(k, v));
         let r = self.http.send(out).await?;
-        Ok(Response::text(r.status, &r.body_text()))
+        Ok(Some(Response::text(r.status, &r.body_text())))
     }
 
     /// Stopping SuperCI: GitLab's projects stop sending jobs here (their webhooks go) and the project runners it
@@ -1629,9 +1627,9 @@ impl<'a> ControlPlane<'a> {
         // (`link=steps`: its run's logs, each step's apart, for steps run side by side.)
         if q("link").is_some() && j.provider.is_empty() {
             let steps = q("link").as_deref() == Some("steps");
-            let link = match (self.app_of(&j), self.installation_token_for(&j).await) {
-                (Some(app), Some(token)) if steps => github::run_logs_link(self.http, &app.api(), &token, &j.repo, j.run_id, j.attempt).await,
-                (Some(app), Some(token)) => github::job_log_link(self.http, &app.api(), &token, &j.repo, j.job_id).await,
+            let link = match self.github_for(&j).await {
+                Some((app, token)) if steps => github::run_logs_link(self.http, &app.api(), &token, &j.repo, j.run_id, j.attempt).await,
+                Some((app, token)) => github::job_log_link(self.http, &app.api(), &token, &j.repo, j.job_id).await,
                 _ => Err("GitHub gave no token for its repository".into()),
             };
             return Ok(Response::json(&match link { Ok(url) => serde_json::json!({ "url": url }), Err(e) => serde_json::json!({ "error": e }) }))
@@ -1648,7 +1646,7 @@ impl<'a> ControlPlane<'a> {
         let steps = if q("steps").is_none() { serde_json::Value::Null } else if j.provider == "local" {
             serde_json::Value::Array(local.clone())
         } else if j.provider.is_empty() {
-            match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_steps(self.http, &app.api(), &token, &j.repo, j.job_id).await.map(serde_json::Value::Array).unwrap_or_default(), _ => serde_json::Value::Null }
+            match self.github_for(&j).await { Some((app, token)) => github::job_steps(self.http, &app.api(), &token, &j.repo, j.job_id).await.map(serde_json::Value::Array).unwrap_or_default(), _ => serde_json::Value::Null }
         } else { serde_json::Value::Null };
         // A run from a computer: each step's whole log as its runner sent it here, else the lines it sent as it went.
         let mut source = if j.provider == "gitlab" { "GitLab's" } else { "its runner's" };
@@ -1658,7 +1656,7 @@ impl<'a> ControlPlane<'a> {
         } else if j.provider == "gitlab" {
             match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(project)) => gitlab::job_trace(self.http, gl, project, j.job_id).await, _ => Err("its GitLab is no longer connected".into()) }
         } else {
-            let from_github = match (self.app_of(&j), self.installation_token_for(&j).await) { (Some(app), Some(token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) };
+            let from_github = match self.github_for(&j).await { Some((app, token)) => github::job_log(self.http, &app.api(), &token, &j.repo, j.job_id).await, _ => Err("GitHub gave no token for its repository (is the App still installed there?)".into()) };
             // A job still running: GitHub has its log only as far as its runner has sent it in blocks (minutes behind,
             // at times), then what its machine sent after that. Not yet from GitHub: what its machine sent alone.
             let live = if active(&j) || !matches!(&from_github, Ok(l) if !l.is_empty()) { self.live_log(key.trim_start_matches("job:"), 1_000_000).await.unwrap_or_default() } else { vec![] };
@@ -1887,21 +1885,21 @@ impl<'a> ControlPlane<'a> {
 
     fn owner_of(app: &App) -> Owner { Owner { org: app.owner_is_org, login: app.owner.clone() } }
 
-    /// An installation token for a job's repository (None without the App, or if GitHub would not give one).
-    async fn installation_token_for(&self, j: &Job) -> Option<String> {
-        self.installation_token(self.app_of(j)?, j.installation_id).await.ok()
+    /// A job's App and an installation token for its repository (None without the App, or if GitHub would not give one).
+    async fn github_for(&self, j: &Job) -> Option<(&App, String)> {
+        let app = self.app_of(j)?;
+        Some((app, self.installation_token(app, j.installation_id).await.ok()?))
     }
 
     /// Whether a job's runner is up at GitHub and waiting for work (online, running nothing): its machine came up.
     async fn runner_waits(&self, j: &Job) -> bool {
-        let (Some(app), Some(id)) = (self.app_of(j), j.runner_id) else { return false };
-        let Some(token) = self.installation_token_for(j).await else { return false };
+        let Some(id) = j.runner_id else { return false };
+        let Some((app, token)) = self.github_for(j).await else { return false };
         github::runner_state(self.http, &app.api(), &token, &Self::owner_of(app), &j.repo, id).await.is_ok_and(|s| s == Some((true, false)))
     }
 
     /// Whether the App is installed anywhere (asked with its own key, at most once a minute).
     async fn installed(&self) -> bool {
-        if self.config.app.is_none() { return false }
         let now = self.clock.now_ms();
         if let Some((yes, at)) = *self.cache.installed.borrow() { if now.saturating_sub(at) < 60_000 { return yes; } }
         let mut yes = false;
@@ -2173,8 +2171,9 @@ impl<'a> ControlPlane<'a> {
     async fn spot_regions_by_cost(&self, a: &AwsConnection, place: &str, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<String> {
         let regions = self.place_regions(a, place);
         if regions.len() < 2 { return regions }
-        let mut scored = vec![];
-        for (i, r) in regions.iter().enumerate() {
+        let (mut scored, mut each) = (vec![], regions.iter().enumerate());
+        loop {
+            let Some((i, r)) = each.next() else { break };
             // (Kept two minutes: a burst of jobs asks AWS once, and spot prices move by the hour.)
             let key = format!("{r}/{os}/{}", types.join(","));
             let kept = self.cache.spot_best.borrow().get(&key).filter(|(_, until)| *until > now).map(|(best, _)| *best);
@@ -2257,8 +2256,8 @@ impl<'a> ControlPlane<'a> {
         let settled = async {
             if now.saturating_sub(r.at_ms) > 6 * 3_600_000 { return Some("not run again: its run was still going six hours later".to_string()) }
             // GitHub not answering now (a token, the run's status): asked again the next minute.
-            let token = self.installation_token_for(j).await?;
-            let api = self.app_of(j)?.api();
+            let (app, token) = self.github_for(j).await?;
+            let api = app.api();
             match github::run_status(self.http, &api, &token, &r.repo, r.run_id).await {
                 Ok(s) if s == "completed" => {}
                 Err(e) if e.contains(" 404 ") => return Some("not run again: its run is gone".into()),
@@ -2271,14 +2270,17 @@ impl<'a> ControlPlane<'a> {
             let claim = |id: u64| format!("rerun-asked:{id}");
             match self.store.put_if_absent(&claim(r.job_id), now.to_string()).await { Ok(true) => {} Ok(false) => return Some("asked".into()), Err(_) => return None }
             for o in &others { let _ = self.store.put_if_absent(&claim(o.job_id), now.to_string()).await; }
-            for name in std::iter::once(&r.name).chain(others.iter().map(|o| &o.name)) { let _ = put_json(self.store, &rerun_key(&r.repo, r.run_id, name), &now).await; }
+            let _ = put_json(self.store, &rerun_key(&r.repo, r.run_id, &r.name), &now).await;
+            for o in &others { let _ = put_json(self.store, &rerun_key(&r.repo, r.run_id, &o.name), &now).await; }
             let asked = if others.is_empty() { github::rerun_job(self.http, &api, &token, &r.repo, r.job_id).await } else { github::rerun_failed_jobs(self.http, &api, &token, &r.repo, r.run_id).await };
             let Err(e) = asked else { return Some("asked".into()) };
-            for name in std::iter::once(&r.name).chain(others.iter().map(|o| &o.name)) { let _ = self.store.delete(&rerun_key(&r.repo, r.run_id, name)).await; }
+            let _ = self.store.delete(&rerun_key(&r.repo, r.run_id, &r.name)).await;
+            for o in &others { let _ = self.store.delete(&rerun_key(&r.repo, r.run_id, &o.name)).await; }
             // Refused for good (the App may not, or GitHub will not run it again): said. Anything else: tried again.
             if e.contains("Resource not accessible") { return Some("not run again: GitHub's App may not (Actions: write; see Control plane → Permissions)".into()) }
             if [" 403 ", " 404 ", " 409 ", " 422 "].iter().any(|c| e.contains(c)) { return Some(format!("not run again: {e}")) }
-            for id in std::iter::once(r.job_id).chain(others.iter().map(|o| o.job_id)) { let _ = self.store.delete(&claim(id)).await; }
+            let _ = self.store.delete(&claim(r.job_id)).await;
+            for o in &others { let _ = self.store.delete(&claim(o.job_id)).await; }
             None
         }.await;
         let Some(state) = settled else { return false };
@@ -2367,7 +2369,9 @@ impl<'a> ControlPlane<'a> {
             if spent >= cap { return Ok(Placement::Fail(format!("{} reached its limit of {} a day (${spent:.2} spent on machines today): no job starts until tomorrow (UTC), or until the limit is raised (Runners in the dashboard, or `superci limits update --daily-usd=N`)", self.config.name(), dollars(cap)))) }
         }
         let (mut later, mut never, mut places) = (vec![], vec![], vec![]);
-        for cloud in &candidates {
+        let mut each = candidates.iter();
+        loop {
+            let Some(cloud) = each.next() else { break };
             let name = cloud_name(cloud);
             let runner = match cloud.as_str() {
                 "aws" | AWS_ON_DEMAND => aws.clone().map(|a| (Capacity::aws(), Runner::Aws(a))),
@@ -4103,7 +4107,7 @@ impl<'a> ControlPlane<'a> {
                     let own = match &source { Some(p) => called.get(p).ok_or_else(|| format!("{p} is not in the run"))?, None => &wf };
                     let key_name = jobs[i]["job_key"].as_str().or(jobs[i]["key"].as_str()).unwrap_or_default().to_string();
                     let job = own.get("jobs").and_then(|j| j.get(&key_name));
-                    let (needs, mut status, mut all_good) = needs_said(&jobs, &needed, call.as_deref(), &called, &wf)?;
+                    let (needs, mut status, mut all_good) = needs_said(&jobs, &needed, call.as_deref(), &called);
                     // Its run cancelled: as on GitHub, a job waiting runs only if its `if` says so then (`always()`,
                     // `cancelled()`); the rest end cancelled.
                     let cancelled = run["cancelled"] == true;
@@ -4111,7 +4115,7 @@ impl<'a> ControlPlane<'a> {
                     // A called workflow's job: its caller's `if` first (by default, if what the caller needs went well),
                     // then its inputs, from what the caller gives.
                     if let Some(caller) = &call {
-                        let (caller_needs, mut caller_status, mut caller_good) = needs_said(&jobs, &wait, None, &called, &wf)?;
+                        let (caller_needs, mut caller_status, mut caller_good) = needs_said(&jobs, &wait, None, &called);
                         if cancelled { (caller_status, caller_good) = (crate::expression::Status::Cancelled, false) }
                         let caller_job = wf.get("jobs").and_then(|j| j.get(caller));
                         let caller_values = self.run_contexts(&run, &serde_json::json!({}), &caller_needs);
@@ -4372,8 +4376,8 @@ impl<'a> ControlPlane<'a> {
             let mut known = self.live_jobs().await?.into_iter().map(|(_, j)| j).collect::<Vec<_>>();
             known.extend(self.newest_jobs(200).await?);
             let Some(j) = known.into_iter().find(|j| j.run_id == id && j.provider.is_empty()) else { return Ok(nothing_here()) };
-            let said = match (self.app_of(&j), self.installation_token_for(&j).await) {
-                (Some(app), Some(token)) => github::cancel_run(self.http, &app.api(), &token, &j.repo, id).await,
+            let said = match self.github_for(&j).await {
+                Some((app, token)) => github::cancel_run(self.http, &app.api(), &token, &j.repo, id).await,
                 _ => Err("GitHub gave no token for its repository".into()),
             };
             return Ok(Response::json(&match said { Ok(()) => serde_json::json!({ "run_id": id.to_string(), "cancelled": true, "github": true }), Err(e) => serde_json::json!({ "error": e }) }))
@@ -4760,8 +4764,8 @@ impl<'a> ControlPlane<'a> {
             // A failed job GitHub still has queued, its failing runner not started yet: tried again, for half an hour.
             if let (Some(why), false) = (j.fail_pending.clone(), j.provider == "gitlab") {
                 if now.saturating_sub(j.ended_ms.unwrap_or(j.at_ms)) > 30 * 60_000 { j.fail_pending = None; self.keep(&key, &j).await?; continue }
-                let queued = match (self.app_of(&j), self.installation_token_for(&j).await) {
-                    (Some(app), Some(t)) => github::job_status(self.http, &app.api(), &t, &j.repo, j.job_id).await.map(|s| s == "queued").unwrap_or(true),
+                let queued = match self.github_for(&j).await {
+                    Some((app, t)) => github::job_status(self.http, &app.api(), &t, &j.repo, j.job_id).await.map(|s| s == "queued").unwrap_or(true),
                     _ => false,
                 };
                 if queued { self.fail_fast(&plane_url, &mut j, &why).await; active += 1 } else { j.fail_pending = None; self.keep(&key, &j).await? }
@@ -4809,7 +4813,7 @@ impl<'a> ControlPlane<'a> {
                         let status = match (self.gitlab_of(&j), j.project_id) { (Some(gl), Some(p)) => gitlab::job(self.http, gl, p, wanted).await.ok().map(|(_, s)| s), _ => None };
                         (gone, waits_there) = (status.as_deref().is_some_and(|s| s != "pending"), status.as_deref() == Some("pending"));
                     } else if !gone {
-                        if let (Some(app), Some(t)) = (self.app_of(&j), self.installation_token_for(&j).await) {
+                        if let Some((app, t)) = self.github_for(&j).await {
                             if let Ok((status, runner)) = github::job_state(self.http, &app.api(), &t, &j.repo, wanted).await { (gone, on_runner, waits_there) = (status != "queued", runner, status == "queued") }
                         }
                     }
@@ -4821,8 +4825,8 @@ impl<'a> ControlPlane<'a> {
                             continue;
                         }
                         // Its runner is busy all the same (what said so was lost): the machine is running a job.
-                        let busy = match (self.app_of(&j), self.installation_token_for(&j).await, j.runner_id) {
-                            (Some(app), Some(t), Some(id)) => github::runner_busy(self.http, &app.api(), &t, &Self::owner_of(app), &j.repo, id).await,
+                        let busy = match (self.github_for(&j).await, j.runner_id) {
+                            (Some((app, t)), Some(id)) => github::runner_busy(self.http, &app.api(), &t, &Self::owner_of(app), &j.repo, id).await,
                             _ => Ok(false),
                         };
                         if busy.is_err() && !late { active += 1; continue }
@@ -4845,7 +4849,7 @@ impl<'a> ControlPlane<'a> {
                         others.sort_unstable_by(|a, b| b.0.cmp(&a.0));
                         let mut next = None;
                         for (id, repo) in others.into_iter().take(3) {
-                            let (Some(app), Some(t)) = (self.app_of(&j), self.installation_token_for(&j).await) else { break };
+                            let Some((app, t)) = self.github_for(&j).await else { break };
                             match github::job_status(self.http, &app.api(), &t, &repo, id).await {
                                 Ok(status) if status == "queued" => { next = Some(id); break }
                                 Ok(_) => {
@@ -5019,7 +5023,7 @@ impl<'a> ControlPlane<'a> {
         let turn = (now / 300_000) as usize;
         for i in 0..quiet.len().min(5) { repos.push(quiet[(turn * 5 + i) % quiet.len()]) }
         for known in repos {
-            let (Some(app), Some(token)) = (self.app_of(known), self.installation_token_for(known).await) else { continue };
+            let Some((app, token)) = self.github_for(known).await else { continue };
             let Ok(waiting) = github::waiting_jobs(self.http, &app.api(), &token, &known.repo, moved_lately).await else { continue };
             for (job, private) in waiting {
                 // Told of already, or made a moment ago (its event may still be on its way).
@@ -5558,5 +5562,59 @@ mod price_tests {
         assert_eq!(MODAL_GPU_USD_PER_SECOND.map(|(g, _)| g), crate::spec::GPUS);
         for (gpu, per_second) in MODAL_GPU_USD_PER_SECOND { assert_eq!(modal_gpu_usd_per_hour(Some(gpu)), per_second * 3600.0, "{gpu}") }
         assert_eq!((modal_gpu_usd_per_hour(Some("a10g")), modal_gpu_usd_per_hour(None), modal_gpu_usd_per_hour(Some("v100"))), (0.000306 * 3600.0, 0.0, 0.0));
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use crate::expression::{Contexts, Status};
+    use serde_json::json;
+
+    #[test]
+    fn what_needed_jobs_say_is_their_results_and_outputs_and_a_calls_its_workflows() {
+        let called: std::collections::BTreeMap<String, crate::workflow::Node> = [(".github/workflows/lib.yml".to_string(), crate::workflow::parse(
+            "on:\n  workflow_call:\n    outputs:\n      v:\n        value: ${{ jobs.a.outputs.v }}\n      unsaid:\n        description: no value\n jobs: {}\n".replace("\n jobs", "\njobs").as_str()).unwrap())].into_iter().collect();
+        let jobs = vec![
+            json!({ "key": "build", "result": "success", "outputs": { "x": "1" } }),
+            json!({ "key": "lib/a", "call": "lib", "job_key": "a", "source": ".github/workflows/lib.yml", "result": "success", "outputs": { "v": "7" } }),
+            json!({ "key": "lib/b", "call": "lib", "job_key": "b", "source": ".github/workflows/lib.yml", "result": "failure" }),
+            json!({ "key": "stopped", "result": "cancelled" }),
+        ];
+        let (needs, status, good) = needs_said(&jobs, &["build".into()], None, &called);
+        assert_eq!((needs["build"].clone(), status, good), (json!({ "result": "success", "outputs": { "x": "1" } }), Status::Success, true));
+        // A call: its workflow's outputs from its jobs' (one without a value says nothing), failed as one of them did.
+        let (needs, status, good) = needs_said(&jobs, &["lib".into()], None, &called);
+        assert_eq!((needs["lib"].clone(), status, good), (json!({ "result": "failure", "outputs": { "v": "7" } }), Status::Failure, false));
+        let (_, status, _) = needs_said(&jobs, &["stopped".into(), "build".into()], None, &called);
+        assert_eq!(status, Status::Cancelled);
+        // A job none of whose jobs is in the run (its matrix had none): skipped, with no outputs. Within a call, its
+        // own jobs are named as there.
+        let (needs, _, good) = needs_said(&jobs, &["lib/none".into()], Some("lib"), &called);
+        assert_eq!((needs["none"].clone(), good), (json!({ "result": "skipped", "outputs": {} }), false));
+    }
+
+    #[test]
+    fn a_called_workflows_inputs_are_typed_as_it_says_and_one_that_cannot_be_read_is_refused() {
+        let values = serde_json::Map::new();
+        let c = Contexts { values: &values, status: Status::Success };
+        let part = |inputs: &str| crate::workflow::parse(&format!("inputs:\n{inputs}")).unwrap();
+        let with = |w: &str| crate::workflow::parse(w).unwrap();
+        let p = part("  n:\n    type: number\n  b:\n    type: boolean\n  s:\n    default: ${{ 1 }}\n  ? [odd]\n  : x\n");
+        assert_eq!(call_inputs(Some(&p), Some(&with("n: ' 3 '\nb: 'true'\nother:\n  a: map\n")), &c).unwrap(), json!({ "n": 3.0, "b": true, "s": "1" }));
+        assert_eq!(call_inputs(Some(&p), Some(&with("n: three\n")), &c).unwrap()["n"], "three", "a number that is none is kept as given");
+        assert!(call_inputs(Some(&part("  s:\n    default: ${{ ) }}\n")), None, &c).is_err(), "a default that is no expression");
+        assert!(call_inputs(Some(&p), Some(&with("n: ${{ ) }}\n")), &c).is_err(), "a given value that is no expression");
+        assert_eq!(call_inputs(Some(&part("  r:\n    required: true\n")), None, &c).unwrap_err(), "the called workflow's input r is required, and not given");
+        assert_eq!(call_inputs(None, None, &c).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn a_read_keys_name_says_when_it_expires_and_a_runners_log_holds_its_job_message() {
+        let hash = "a".repeat(64);
+        assert!(read_key("READ_KEY_1800000000", &hash).is_none(), "no name after its time");
+        assert_eq!(read_key("READ_KEY_1800000000_AGENT", &hash).map(|k| k.0), Some(1_800_000_000_000));
+        assert_eq!(worker_message(b"[2026] Job message:\n {\"a\": 1}\nmore"), Some(json!({ "a": 1 })));
+        assert_eq!((worker_message(b"no message here"), worker_message(b"Job message: none"), worker_message(b"Job message: {not json")), (None, None, None));
     }
 }
