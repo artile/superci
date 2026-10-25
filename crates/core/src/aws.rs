@@ -1829,6 +1829,9 @@ mod tests {
         assert!(script.contains("for h in broker.actions.githubusercontent.com pipelinesghubeus5.actions.githubusercontent.com;do until curl") && script.contains("[ $w -ge 30 ]"), "{script}");
         assert!(script.find("&g=$!").unwrap() < script.find("xargs -0").unwrap() && script.find("xargs -0").unwrap() < script.find("wait $g").unwrap() && script.find("wait $g").unwrap() < script.find("./run.sh").unwrap());
         assert!(runner_hosts("not-base64!").is_empty() && !runner_user_data(&crate::io::Work::GitHub { jit: "abc".into() }, 60).unwrap().contains("wait $g"));
+        // An address with characters a script should not run, and one said twice: each passed over.
+        let odd = b64(serde_json::json!({ ".runner": b64(serde_json::json!({ "ServerUrl": "https://a_b.example/", "serverUrl": "https://c.example/", "ServerUrlV2": "https://c.example/" })) }));
+        assert_eq!(runner_hosts(&odd), ["c.example"]);
     }
 
     #[test]

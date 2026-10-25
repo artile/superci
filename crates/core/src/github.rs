@@ -523,8 +523,18 @@ mod tests {
         assert!(run(installations(&Answers(|_| Ok(crate::io::Response::new(200, "application/json", "not json"))), &real, 1_790_000_000_000)).unwrap_err().starts_with("GitHub /app/installations: "));
         assert_eq!(run(installation_token(&Answers(|_| answer(201, serde_json::json!({}))), &real, 42, 1_790_000_000_000)).unwrap_err(), "installation token missing");
         // Deliveries without their ids are passed over.
-        let failed = run(failed_deliveries(&Answers(|_| answer(200, serde_json::json!([{ "event": "workflow_job", "status_code": 502, "delivered_at": "2026-09-21T00:00:00Z" }, { "id": 5, "event": "workflow_job", "status_code": 502, "delivered_at": "2026-09-21T00:00:00Z" }]))), &real, 0, 1_790_000_000_000)).unwrap();
-        assert!(failed.is_empty());
+        let failed = run(failed_deliveries(&Answers(|_| answer(200, serde_json::json!([{ "event": "workflow_job", "status_code": 502, "delivered_at": "2026-09-21T00:00:00Z" }, { "id": 5, "event": "workflow_job", "status_code": 502, "delivered_at": "2026-09-21T00:00:00Z" },
+            { "id": 6, "guid": "g-6", "event": "workflow_job", "status_code": 502, "delivered_at": "2026-09-21T00:00:00Z" }]))), &real, 0, 1_790_000_000_000)).unwrap();
+        assert_eq!(failed, [(6, "g-6".to_string())]);
+        // What GitHub says of its deliveries, one and all; the App's webhook moved, an installation removed, a
+        // delivery sent again.
+        let deliveries_said = Answers(|r| answer(200, if r.url.ends_with("/deliveries/6") { serde_json::json!({ "id": 6, "request": { "payload": { "workflow_job": { "id": 7 } } } }) } else { serde_json::json!([{ "id": 6 }]) }));
+        assert_eq!(run(deliveries(&deliveries_said, &real, Some(6), 1_790_000_000_000)).unwrap()["job"], 7);
+        assert_eq!(run(deliveries(&deliveries_said, &real, None, 1_790_000_000_000)).unwrap()[0]["id"], 6);
+        let fine = Answers(|_| answer(200, serde_json::json!({})));
+        run(set_webhook_url(&fine, &real, "https://p/webhook", 1_790_000_000_000)).unwrap();
+        run(delete_installation(&fine, &real, 42, 1_790_000_000_000)).unwrap();
+        run(redeliver(&fine, &real, 6, 1_790_000_000_000)).unwrap();
         // A job's log: not reached, none yet, refused, or moved without saying where.
         let gone = |r: fn(&Request) -> Result<crate::io::Response>| run(job_log(&Answers(r), API, "t", "acme/app", 7));
         assert!(gone(|_| Err("connection reset".into())).is_err());
@@ -544,6 +554,7 @@ mod tests {
         // A run listed without its id; a run with no job waiting.
         let waiting = run(waiting_jobs(&Answers(|r| if r.url.contains("/runs?") { answer(200, serde_json::json!({ "workflow_runs": [{ "name": "no id" }, { "id": 9 }] })) } else { answer(200, serde_json::json!({ "jobs": [{ "id": 1, "status": "in_progress" }] })) }), API, "t", "acme/app", true)).unwrap();
         assert!(waiting.is_empty());
+        assert!(run(waiting_jobs(&Answers(|_| answer(200, serde_json::json!({ "workflow_runs": [] }))), API, "t", "acme/app", false)).unwrap().is_empty());
         // A thousand repositories at most, a hundred a page; fewer, the last page.
         let full = run(public_repositories(&Answers(|_| answer(200, serde_json::json!({ "repositories": vec![serde_json::json!({ "full_name": "acme/x", "private": false }); 100] }))), API, "t")).unwrap();
         assert_eq!(full.len(), 1000);

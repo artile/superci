@@ -4210,7 +4210,8 @@ impl<'a> ControlPlane<'a> {
     /// midway): pending again in the run's record, so that the upkeep, moving the run on, starts it again. (With a
     /// record, the job is the upkeep's to start, as any job left launching; nothing is changed.)
     async fn unreserve(&self, key: &str, inst: &serde_json::Value) {
-        let (Some(id), Some(token)) = (inst["job_id"].as_str(), inst["token"].as_str()) else { return };
+        // (A job reserved to start has both.)
+        let (id, token) = (inst["job_id"].as_str().unwrap_or_default(), inst["token"].as_str().unwrap_or_default());
         if !matches!(self.store.get(&format!("job:{id}")).await, Ok(None)) { return }
         // (What its runner was to be handed goes, its secrets with it: the job is handed anew when started again.)
         let _ = self.store.delete(&format!("rjob:{token}")).await;

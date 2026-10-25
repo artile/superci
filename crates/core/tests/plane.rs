@@ -5811,6 +5811,11 @@ fn just_after_a_move_here_the_upkeep_comes_back_within_the_minute_and_looks_for_
     assert_eq!(clouds.calls.borrow().iter().filter(|c| c.1.contains("/repos/acme/app/actions/runs?status=queued")).count(), 1);
 }
 
+/// AWS connected by the role the dashboard made for this control plane: its credentials asked of STS.
+fn connect_role(store: &Mem) {
+    store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": role_arn("123456789012", PLANE_ID), "connected": true }).to_string());
+}
+
 /// A machine's link to the cache, kept as `superci-cache`'s start gives it, for job 5001 of acme/app (GitHub's
 /// repository 77) on its branch main, in `region`.
 fn cache_machine(store: &Mem, link: &str, region: &str) {
@@ -5826,7 +5831,7 @@ fn a_machine_whose_region_makes_no_address_is_said_so_at_each_link_and_what_it_s
     let http = WithCache { clouds: FakeClouds::default(), keys: github_jobs_key().1 };
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    (config.aws_own, config.aws_own_creds) = own_aws();
+    connect_role(&store);
     let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let (bad, good) = ("machine-cache-link-0000000000bad", "machine-cache-link-000000000good");
     cache_machine(&store, bad, "us east-1");
@@ -6177,7 +6182,7 @@ fn a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after
     let clock = MovingClock(std::cell::Cell::new(t));
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
-    (config.aws_own, config.aws_own_creds) = own_aws();
+    connect_role(&store);
     config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
     let run = |r: Request| block_on(plane.handle(r));
@@ -6296,7 +6301,7 @@ fn a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let http = with_bucket();
     let mut config = Config::new(PLANE_ID.into());
-    (config.aws_own, config.aws_own_creds) = own_aws();
+    connect_role(&store);
     config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     // The control plane's own key, as a run's job's token is signed with it; a run of one job, on a machine.

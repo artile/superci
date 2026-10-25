@@ -223,5 +223,8 @@ mod tests {
         let hooks = |r: &Request| answer(200, if r.method == "GET" { r#"[{"id":7,"url":"https://p/gitlab/webhook"}]"# } else { "{}" });
         run(set_project(&Answers(hooks), &gl, 1, "https://p/gitlab/webhook", true)).unwrap();
         run(set_project(&Answers(|_| answer(200, "[]")), &gl, 1, "https://p/gitlab/webhook", false)).unwrap();
+        // GitLab refusing to give the webhook the secret again; one removed already when it is taken away.
+        assert!(run(set_project(&Answers(|r| if r.method == "GET" { answer(200, r#"[{"id":7,"url":"https://p/gitlab/webhook"}]"#) } else { answer(500, "{}") }), &gl, 1, "https://p/gitlab/webhook", true)).is_err());
+        run(set_project(&Answers(|r| if r.method == "GET" { answer(200, r#"[{"id":7,"url":"https://p/gitlab/webhook"}]"#) } else { answer(404, "{}") }), &gl, 1, "https://p/gitlab/webhook", false)).unwrap();
     }
 }

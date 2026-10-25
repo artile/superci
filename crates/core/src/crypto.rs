@@ -168,8 +168,9 @@ pub fn verify_rs256_jwt(token: &str, jwks: &serde_json::Value, now_secs: u64) ->
     let jwk = jwks["keys"].as_array().into_iter().flatten().find(|k| k["kid"] == header["kid"] && k["kty"] == "RSA").ok_or("signed by a key not in the set")?;
     let number = |k: &str| decode(jwk[k].as_str().unwrap_or_default()).map(|b| rsa::BigUint::from_bytes_be(&b));
     let key = rsa::RsaPublicKey::new(number("n")?, number("e")?).map_err(|e| e.to_string())?;
-    let sig = Signature::try_from(decode(parts[2])?.as_slice()).map_err(|e| e.to_string())?;
-    VerifyingKey::<Sha256>::new(key).verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).map_err(|_| "bad signature".to_string())?;
+    let sig = decode(parts[2])?;
+    // (Any bytes make a signature: checking it is what can fail.)
+    Signature::try_from(sig.as_slice()).and_then(|sig| VerifyingKey::<Sha256>::new(key).verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)).map_err(|_| "bad signature".to_string())?;
     let claims: serde_json::Value = serde_json::from_slice(&decode(parts[1])?).map_err(|e| e.to_string())?;
     if claims["exp"].as_u64().is_none_or(|exp| exp < now_secs) { return Err("expired".into()); }
     if claims["nbf"].as_u64().is_some_and(|nbf| nbf > now_secs + 60) { return Err("not yet valid".into()); }
