@@ -2285,8 +2285,7 @@ impl<'a> ControlPlane<'a> {
 
     /// A job whose spot machine AWS took back, its run finished: run again (GitHub makes a new attempt of that job and
     /// of those that need it), noted so the new attempt is not on a spot machine again. Whether it is settled.
-    async fn run_again(&self, j: &mut Job, now: u64) -> bool {
-        let Some(mut r) = j.rerun.clone().filter(|r| r.state == "pending") else { return true };
+    async fn run_again(&self, j: &mut Job, mut r: Rerun, now: u64) -> bool {
         let settled = async {
             if now.saturating_sub(r.at_ms) > 6 * 3_600_000 { return Some("not run again: its run was still going six hours later".to_string()) }
             // GitHub not answering now (a token, the run's status): asked again the next minute.
@@ -4747,8 +4746,8 @@ impl<'a> ControlPlane<'a> {
                 continue;
             }
             // A job whose spot machine AWS took back: run again once its run has finished.
-            if j.rerun.as_ref().is_some_and(|r| r.state == "pending") {
-                if self.run_again(&mut j, now).await { self.keep(&key, &j).await? } else { active += 1 }
+            if let Some(r) = j.rerun.clone().filter(|r| r.state == "pending") {
+                if self.run_again(&mut j, r, now).await { self.keep(&key, &j).await? } else { active += 1 }
                 continue;
             }
             // A failed job GitHub still has queued, its failing runner not started yet: tried again, for half an hour.

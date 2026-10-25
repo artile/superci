@@ -5954,6 +5954,177 @@ fn a_runners_calls_that_bring_nothing_are_answered_as_its_service_answers_them()
     assert!(store.0.borrow().iter().any(|(k, v)| k.starts_with(&format!("rline:{token}:")) && v.contains("0a1b2c3d")));
 }
 
+#[test]
+fn a_job_whose_label_app_gitlab_or_run_is_gone_fails_at_its_next_start_saying_which() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let put = |key: &str, j: serde_json::Value| {
+        let mut base = serde_json::json!({ "run_id": 3, "repo": "acme/app", "state": "waiting", "at_ms": t - 60_000, "installation_id": 42, "cloud": "", "seen_in_progress": false });
+        for (k, v) in j.as_object().unwrap() { base[k] = v.clone() }
+        store.0.borrow_mut().insert(key.into(), base.to_string());
+    };
+    // A label that is no machine, or another control plane's; a run from a computer's job kept without its link; a
+    // GitLab job of a connection removed; a GitHub job of an App removed; one whose spot machine AWS took back, of an
+    // installation GitHub no longer gives a token for (asked again the next minute).
+    put("job:1", serde_json::json!({ "job_id": 1, "label": "superci/cpu=many" }));
+    put("job:2", serde_json::json!({ "job_id": 2, "label": "someone-else" }));
+    put("job:3", serde_json::json!({ "job_id": 3, "label": "superci", "provider": "local" }));
+    put("job:glgone-4", serde_json::json!({ "job_id": 4, "label": "superci", "provider": "gitlab", "gitlab": "gone", "project_id": 380 }));
+    put("job:5", serde_json::json!({ "job_id": 5, "label": "superci", "app_id": 12345 }));
+    put("job:6", serde_json::json!({ "job_id": 6, "label": "superci", "state": "done", "installation_id": 999, "began": true, "ended_ms": t - 30_000,
+        "rerun": { "job_id": 6, "run_id": 3, "repo": "acme/app", "name": "test", "state": "pending", "at_ms": t - 60_000 } }));
+    block_on(plane.alarm()).unwrap();
+    let said = |key: &str| { let j: serde_json::Value = serde_json::from_str(&store.0.borrow()[key]).unwrap(); (j["state"].as_str().unwrap_or_default().to_string(), j["error"].as_str().unwrap_or_default().to_string()) };
+    for (key, why) in [("job:1", "cpu"), ("job:2", "is not this control plane's label"), ("job:3", "a run from a computer without its address"), ("job:glgone-4", "its GitLab is not connected any more"), ("job:5", "no GitHub App")] {
+        let (state, error) = said(key);
+        // (Failed at once, or tried again twice when it may be a hiccup: saying why either way.)
+        assert!(["failed", "waiting"].contains(&state.as_str()) && error.contains(why), "{key}: {state} {error}");
+    }
+    assert_eq!(said("job:6").0, "done");
+    assert!(store.0.borrow()["job:6"].contains("\"pending\""), "asked again later");
+    // What was left for after an answer: a template with no AWS account to remove it with; nothing known; a job gone.
+    let (store2, config2) = (Mem::default(), Config::new(PLANE_ID.into()));
+    let bare = ControlPlane { store: &store2, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config2, cache: &cache, containers: None };
+    for what in ["template us-east-1 superci-abc123def456-7-1", "something else", "start job:404"] { block_on(bare.later(&format!("{PLANE_URL}/webhook"), what)).unwrap() }
+    // A queued job's event delivered again while its machine is being asked for, a moment after: nothing more.
+    put("job:7", serde_json::json!({ "job_id": 7, "label": "superci", "state": "launching", "at_ms": t - 10_000 }));
+    let before = launches(&clouds).len();
+    block_on(plane.handle(job_event("queued", 7, "acme/app", None)));
+    assert_eq!((launches(&clouds).len(), said("job:7").0), (before, "launching".to_string()));
+}
+
+#[test]
+fn containers_and_launchers_that_cannot_start_a_machine_say_why_and_a_gpu_sandbox_is_named_with_its_gpu() {
+    // A Modal control plane's own sandbox for a GPU job: called by its size and GPU.
+    let (store, clouds, wakes, cache, own) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default(), OwnContainers::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.containers, config.own_cloud) = (true, "modal".into());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: Some(&own) };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/gpu=t4")));
+    assert!(job(&store, 1)["machine_type"].as_str().is_some_and(|t| t.ends_with("-t4")), "{}", job(&store, 1));
+    // One whose runtime gave it no containers after all: said, for the job and for its failing runner.
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci")));
+    assert!(job(&store, 2)["error"].as_str().is_some_and(|e| e.contains("no containers here")), "{}", job(&store, 2));
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci/os=macos")));
+    assert_eq!(job(&store, 3)["state"], "failed");
+    // Modal's launcher answering without an id, or refusing with what it said.
+    let refusing = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| match r.url.as_str() {
+        "https://modal.acme.example/launch" if refusing.get() => Some(Response::new(500, "application/json", r#"{"detail":"no GPUs without a payment method"}"#)),
+        "https://modal.acme.example/launch" => Some(Response::new(200, "application/json", r#"{"kind":"sandbox"}"#)),
+        _ => None,
+    });
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://modal.acme.example".into() }];
+    let (store, cache) = (Mem::default(), Cache::default());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci")));
+    assert!(job(&store, 4)["error"].as_str().is_some_and(|e| e.contains("launcher answered without an id")), "{}", job(&store, 4));
+    refusing.set(true);
+    block_on(plane.handle(labelled("queued", 5, "acme/app", None, "superci")));
+    assert!(job(&store, 5)["error"].as_str().is_some_and(|e| e.contains("no GPUs without a payment method")), "{}", job(&store, 5));
+}
+
+#[test]
+fn an_aws_machines_cost_is_settled_at_its_on_demand_price_and_left_an_estimate_when_aws_cannot_be_asked() {
+    let t = 1_790_000_000_000u64;
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| {
+        (r.url == "https://api.pricing.us-east-1.amazonaws.com/" && body.contains("instanceType")).then(|| {
+            let product = serde_json::json!({ "terms": { "OnDemand": { "X": { "priceDimensions": { "Y": { "pricePerUnit": { "USD": "0.2000000000" } } } } } } }).to_string();
+            Response::new(200, "application/x-amz-json-1.1", serde_json::json!({ "PriceList": [product] }).to_string())
+        })
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let ran = |id: u64, j: serde_json::Value| {
+        let mut base = serde_json::json!({ "job_id": id, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t - 600_000, "installation_id": 42, "cloud": "aws", "seen_in_progress": true, "began": true,
+            "machine_id": format!("i-{id}"), "machine_type": "m8a.xlarge", "region": "us-east-1", "on_demand": true, "launched_ms": t - 600_000, "runner": format!("superci-{PLANE_ID}-{id}") });
+        for (k, v) in j.as_object().unwrap() { base[k] = v.clone() }
+        store.0.borrow_mut().insert(format!("job:{id}"), base.to_string());
+        store.0.borrow_mut().insert(format!("runner:superci-{PLANE_ID}-{id}"), id.to_string());
+    };
+    // An on-demand machine: its price from AWS's Price List.
+    ran(1, serde_json::json!({}));
+    block_on(plane.handle(job_event("completed", 1, "acme/app", Some(&format!("superci-{PLANE_ID}-1")))));
+    assert_eq!(job(&store, 1)["cost_from"], "prices");
+    // What it sent, counted a while after it ended: of a machine with no id, or once AWS is no longer connected.
+    ran(2, serde_json::json!({ "state": "done", "ended_ms": t - 13 * 60_000, "cost_usd": 0.1, "cost_from": "prices" }));
+    store.0.borrow_mut().entry("job:2".into()).and_modify(|v| { let mut j: serde_json::Value = serde_json::from_str(v).unwrap(); j.as_object_mut().unwrap().remove("machine_id"); *v = j.to_string() });
+    block_on(plane.alarm()).unwrap();
+    assert!(job(&store, 2)["sent_gb"].is_null());
+    let (store2, config2) = (Mem::default(), { let mut c = Config::new(PLANE_ID.into()); c.app = Some(app()); c });
+    let bare = ControlPlane { store: &store2, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config2, cache: &cache, containers: None };
+    store2.0.borrow_mut().insert("job:3".into(), serde_json::json!({ "job_id": 3, "run_id": 3, "repo": "acme/app", "state": "done", "at_ms": t - 600_000, "installation_id": 42, "cloud": "aws", "seen_in_progress": true,
+        "machine_id": "i-3", "machine_type": "m8a.xlarge", "region": "us-east-1", "ended_ms": t - 13 * 60_000, "cost_from": "prices", "cost_usd": 0.1 }).to_string());
+    block_on(bare.alarm()).unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&store2.0.borrow()["job:3"]).unwrap()["sent_gb"].is_null());
+    // Ended while AWS is no longer connected: left an estimate.
+    store2.0.borrow_mut().insert("job:4".into(), serde_json::json!({ "job_id": 4, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t - 600_000, "installation_id": 42, "cloud": "aws", "seen_in_progress": true,
+        "machine_id": "i-4", "machine_type": "m8a.xlarge", "region": "us-east-1", "runner": "r-4" }).to_string());
+    store2.0.borrow_mut().insert("runner:r-4".into(), "4".into());
+    block_on(bare.handle(job_event("completed", 4, "acme/app", Some("r-4"))));
+    assert!(serde_json::from_str::<serde_json::Value>(&store2.0.borrow()["job:4"]).unwrap()["cost_from"].is_null());
+}
+
+#[test]
+fn the_dashboards_requests_go_through_with_what_github_and_gitlab_say_and_whatever_they_refuse() {
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let failing = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| {
+        let u = r.url.as_str();
+        if failing.get() && (u.ends_with("/app/installations") || u.contains("/app/installations/")) { return Some(Response::new(500, "application/json", r#"{"message":"Server Error"}"#)) }
+        if u.starts_with("https://gitlab.example/api/v4/projects?") { return Some(Response::new(200, "application/json", "[]")) }
+        if u.contains("/hooks") { return Some(Response::new(200, "application/json", "[]")) }
+        if r.method == "DELETE" && u.contains("/app/installations/") { return Some(Response::new(500, "application/json", r#"{"message":"Server Error"}"#)) }
+        if u == "https://api.github.com/repos/acme/app/actions/jobs/7/logs" { return Some(Response::new(302, "text/plain", "").with_header("location", "https://logs.example/7")) }
+        if u == "https://api.github.com/repos/acme/app/actions/runs/3/logs" { return Some(Response::new(302, "text/plain", "").with_header("location", "https://logs.example/run-3")) }
+        if u == "https://moved.acme.example/webhook" { return Some(Response::new(202, "text/plain", "taken")) }
+        None
+    });
+    let mut config = Config::new(PLANE_ID.into());
+    odd_plane(&mut config);
+    let mut beta = app();
+    (beta.id, beta.owner) = (100, "beta".into());
+    config.more_apps = vec![beta];
+    config.device_key_names = vec![("DEVICE_KEY_4102444800_abc".into(), "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    let post = |path: &str, body: &str| run(key(Request::new("POST", &format!("{PLANE_URL}{path}")).with_body(body.to_string())));
+    // The devices with keys; a project switched on by its id; the public repositories of every installation.
+    assert_eq!(json(&run(key(get("/keys"))))["devices"][0]["name"], "DEVICE_KEY_4102444800_abc");
+    post("/gitlab/projects", r#"{"id":380,"enabled":true}"#);
+    assert!(run(key(get("/github/public-repos"))).status >= 200);
+    // A job's whole log where GitHub keeps it, its own and its run's.
+    store.0.borrow_mut().insert("job:7".into(), serde_json::json!({ "job_id": 7, "run_id": 3, "repo": "acme/app", "state": "done", "at_ms": 1_789_999_000_000u64, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+    assert_eq!(json(&run(key(get("/job/log?id=7&link"))))["url"], "https://logs.example/7");
+    assert_eq!(json(&run(key(get("/job/log?id=7&link=steps"))))["url"], "https://logs.example/run-3");
+    // Moving here: a runner kept here already is not taken again.
+    store.0.borrow_mut().insert("glrunner:5".into(), r#"{"id":5}"#.into());
+    let moving = run(key(Request::new("POST", &format!("{PLANE_URL}/move/import")).with_header("x-move-token", "move-token-0123456789").with_body(r#"{"state":[["glrunner:5","{\"id\":5}"]]}"#)));
+    assert_eq!(json(&moving)["taken"], 0);
+    // Leaving with no GitLab runner kept: GitHub would not uninstall the App, said for each organization.
+    store.0.borrow_mut().remove("glrunner:5");
+    let left = json(&post("/leave", "{}"));
+    assert_eq!((left["gitlab_runners"].as_u64(), left["github_failed"].as_array().map(|f| f.len())), (Some(0), Some(2)), "{left}");
+    // An organization removed whose App GitHub no longer answers for.
+    failing.set(true);
+    assert!(json(&post("/github/uninstall", r#"{"app":100}"#))["error"].is_string());
+    // Moved: a GitHub event that still arrives here goes on.
+    store.0.borrow_mut().insert("moved_to".into(), "\"https://moved.acme.example\"".into());
+    assert_eq!(run(webhook("queued", None)).body_text(), "taken");
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6097,7 +6268,11 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         githubs_keys_that_are_no_json_or_a_damaged_signing_key_leave_a_jobs_token_unread_saying_why,
         the_layer_store_passes_over_what_is_kept_damaged_and_says_what_a_machine_asks_amiss,
         a_control_plane_not_in_aws_converts_no_layer_and_gives_its_index_without_links,
-        a_runners_calls_that_bring_nothing_are_answered_as_its_service_answers_them
+        a_runners_calls_that_bring_nothing_are_answered_as_its_service_answers_them,
+        a_job_whose_label_app_gitlab_or_run_is_gone_fails_at_its_next_start_saying_which,
+        containers_and_launchers_that_cannot_start_a_machine_say_why_and_a_gpu_sandbox_is_named_with_its_gpu,
+        an_aws_machines_cost_is_settled_at_its_on_demand_price_and_left_an_estimate_when_aws_cannot_be_asked,
+        the_dashboards_requests_go_through_with_what_github_and_gitlab_say_and_whatever_they_refuse
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
