@@ -1411,7 +1411,11 @@ impl Dashboard {
         // Signed in nowhere: the control plane kept here is still reached with this computer's key (a sign-in that
         // ended, or was made elsewhere, leaves it as it was).
         let only_reading = self.signed_in_as().is_none();
-        if only_reading && !(self.kept_plane.is_some() && (self.any_ended() || !self.keyed.is_empty())) { return Err(NOT_SIGNED_IN.into()) }
+        let reading_kept = match (only_reading, self.kept_plane.clone()) {
+            (false, _) => None,
+            (true, Some(p)) if self.any_ended() || !self.keyed.is_empty() => Some(p),
+            _ => return Err(NOT_SIGNED_IN.into()),
+        };
         // The one named, when it is known here; with none named, the kept one only when no other is known (with
         // several known, which of them are live is asked first, below).
         let known = match view::named() {
@@ -1428,8 +1432,7 @@ impl Dashboard {
             return Ok(Some(v))
         }
         // Nothing to find it again with: as it answers now (not at all, or without taking the key any more).
-        if only_reading {
-            let Some(p) = self.kept_plane.clone() else { return Err(self.nowhere().into()) };
+        if let Some(p) = reading_kept {
             let v = view::plane_view(&p, Some(&self.status_key));
             if let Some(why) = self.key_refused(&v) { return Err(why) }
             return Ok(Some(v))
@@ -2505,7 +2508,7 @@ impl Dashboard {
         let writer = Writer { cf: if self.cf.is_some() { self.cf_client().ok() } else { None }, aws: self.aws.as_mut().and_then(|s| s.credentials().ok()), modal: self.modal.clone(), own: self.own() };
         let before: Vec<bool> = planes.iter().map(|p| before_names(p.url())).collect();
         if !planes.iter().zip(&before).all(|(p, b)| writer.put(p, &name, &cloudflare::plane_key(&new, p.url())).is_ok() && (!b || writer.put(p, &old_key_name(&name), &cloudflare::plane_key(&new, p.url())).is_ok())) { return }
-        for p in &planes { say_device(p.url(), &new) }
+        planes.iter().for_each(|p| say_device(p.url(), &new));
         // (The key it replaces ends by itself: a command still running with it, here or in another terminal, goes on.)
         self.status_secret = name;
         self.status_key = new;
@@ -2546,7 +2549,7 @@ impl Dashboard {
         self.keep();
         drop(held);
         let mut tidy: Vec<Box<dyn FnOnce() + Send>> = vec![];
-        for p in &unkeyed {
+        unkeyed.iter().for_each(|p| {
             // (And the keys an older SuperCI on another device hands under the old name, which nothing here reads.)
             let expired = |names: Vec<String>| { let now = now_ms() / 1000; names.into_iter().filter(move |n| n.strip_prefix("DEVICE_KEY_").or_else(|| n.strip_prefix("DASHBOARD_KEY_")).and_then(|r| r.split('_').next().unwrap_or_default().parse::<u64>().ok()).is_some_and(|until| until < now)) };
             match p.clone() {
@@ -2556,12 +2559,11 @@ impl Dashboard {
                 Plane::Aws { region, plane_id, .. } => if let Ok(creds) = self.aws_creds() {
                     tidy.push(Box::new(move || for old in expired(aws_plane::secret_names(&creds, &region, &plane_id).unwrap_or_default()) { let _ = aws_plane::delete_secret(&creds, &region, &plane_id, &old); }));
                 },
-                // Modal keeps expired keys; the control plane ignores them.
-                Plane::Modal { .. } => {}
-                Plane::Seen { .. } => {}
+                // Modal keeps expired keys; the control plane ignores them. (One only seen has no key: not among these.)
+                _ => {}
             }
-        }
-        if !tidy.is_empty() { std::thread::spawn(move || for job in tidy { job() }); }
+        });
+        if !tidy.is_empty() { std::thread::spawn(move || tidy.into_iter().for_each(|job| job())); }
     }
 
     /// A deploy that finished: its control plane joins the list and is shown (discovery then gives it the key).
@@ -5153,10 +5155,10 @@ mark();load()})();</script>"#;
         let busy = |v: &PlaneView| updating.as_ref().filter(|u| u.plane == v.plane.plane_id() && !matches!(u.result, Some(Ok(_)))).map(|u| {
             let n = u.steps.len();
             match &u.result {
-                None => (format!(r#"Updating to {DASHBOARD_VERSION} · {} <span class="faint">({} of {n})</span><span class="slim"><i style="width:{}%"></i></span>"#, esc(u.steps.get(u.at).copied().unwrap_or("Finishing")), u.at + 1, (u.at * 100 + 50) / n.max(1)), r#"<span class="mini-spin"></span>"#.to_string()),
                 Some(Err(e)) => (format!(r#"<span class="bad-text">The update stopped: {}</span>"#, esc(&e.chars().take(140).collect::<String>())),
                     format!(r#"<form method="post" action="/plane/update"><input type="hidden" name="plane" value="{}"><input type="hidden" name="next"><button class="button secondary sm">Try again</button></form>"#, esc(v.plane.plane_id()))),
-                Some(Ok(())) => (String::new(), String::new()),
+                // (Under way: one that ended well is not busy.)
+                _ => (format!(r#"Updating to {DASHBOARD_VERSION} · {} <span class="faint">({} of {n})</span><span class="slim"><i style="width:{}%"></i></span>"#, esc(u.steps.get(u.at).copied().unwrap_or("Finishing")), u.at + 1, (u.at * 100 + 50) / n.max(1)), r#"<span class="mini-spin"></span>"#.to_string()),
             }
         });
         let row = |class: &str, v: &PlaneView, end: String| {
@@ -5535,7 +5537,7 @@ fn new_needs(v: &PlaneView, aws_lacks: &[&'static superci_core::permissions::Nee
 /// "2 new read permissions in AWS" (or "permissions" that change things).
 fn needs_text(needs: &[(&str, superci_core::permissions::Need)]) -> String {
     let mut by: Vec<(&str, usize, bool)> = vec![];
-    for (cloud, n) in needs { match by.iter_mut().find(|b| b.0 == *cloud) { Some(b) => { b.1 += 1; b.2 |= n.writes } None => by.push((cloud, 1, n.writes)) } }
+    needs.iter().for_each(|(cloud, n)| match by.iter_mut().find(|b| b.0 == *cloud) { Some(b) => { b.1 += 1; b.2 |= n.writes } None => by.push((cloud, 1, n.writes)) });
     by.iter().map(|(cloud, k, writes)| format!("{k} new {}permission{} in {}", if *writes { "" } else { "read " }, if *k == 1 { "" } else { "s" }, provider_name(cloud))).collect::<Vec<_>>().join(", ")
 }
 
@@ -5730,9 +5732,9 @@ fn side_update(v: &PlaneView, updating: Option<&Update>, aws_lacks: &[&'static s
 fn update_progress(u: &Update) -> String {
     let n = u.steps.len();
     match &u.result {
-        None => format!(r#"<div class="upd"><span class="upd-step"><span class="mini-spin"></span>{}</span><span class="slim"><i style="width:{}%"></i></span></div>"#, esc(u.steps.get(u.at).copied().unwrap_or("Finishing")), (u.at * 100 + 50) / n.max(1)),
         Some(Err(e)) => format!(r#"<div class="upd"><span class="bad-text">The update stopped: {}</span><form method="post" action="/plane/update"><input type="hidden" name="next"><button class="button secondary sm">Try again</button></form></div>"#, esc(&e.chars().take(160).collect::<String>())),
-        Some(Ok(())) => String::new(),
+        // (Under way: one that ended well is not shown here, see `side_update`.)
+        _ => format!(r#"<div class="upd"><span class="upd-step"><span class="mini-spin"></span>{}</span><span class="slim"><i style="width:{}%"></i></span></div>"#, esc(u.steps.get(u.at).copied().unwrap_or("Finishing")), (u.at * 100 + 50) / n.max(1)),
     }
 }
 
@@ -5741,12 +5743,12 @@ const CHANGELOG: &str = include_str!(env!("SUPERCI_CHANGELOG"));
 
 fn changelog() -> Vec<(String, String, Vec<String>)> {
     let mut out: Vec<(String, String, Vec<String>)> = vec![];
-    for line in CHANGELOG.lines() {
+    CHANGELOG.lines().for_each(|line| {
         if let Some(h) = line.strip_prefix("## ") {
             let (v, date) = h.split_once(" — ").unwrap_or((h, ""));
             out.push((v.trim().to_string(), date.trim().to_string(), vec![]));
         } else if let (Some(item), Some(last)) = (line.strip_prefix("- "), out.last_mut()) { last.2.push(item.to_string()) }
-    }
+    });
     // (A version newer than this dashboard, not released yet in a build from the repository, is not one to offer.)
     out.retain(|(v, _, _)| !view::older(Some(DASHBOARD_VERSION), v));
     out
@@ -6329,9 +6331,10 @@ pub fn whole_log(plane_url: &str, key: &str, j: &serde_json::Value) -> Result<Ve
 /// A GitHub job's steps' own logs, by number, from its run's logs (GitHub's link through the control plane; one that
 /// gives no such link yet gives nothing).
 fn step_logs(plane_url: &str, key: &str, j: &serde_json::Value) -> Option<serde_json::Value> {
-    let got = cloudflare::plane_get(plane_url, key, &format!("/job/log?id={}&link=steps", j["job_id"].as_u64()?)).ok()?;
+    let (id, name) = (j["job_id"].as_u64()?, j["name"].as_str()?);
+    let got = cloudflare::plane_get(plane_url, key, &format!("/job/log?id={id}&link=steps")).ok()?;
     let url = got["url"].as_str().filter(|u| u.starts_with("https://"))?;
-    crate::log_view::step_logs(&fetch_all(&[url.to_string()]).ok()?, j["name"].as_str()?)
+    crate::log_view::step_logs(&fetch_all(&[url.to_string()]).ok()?, name)
 }
 
 /// A run from a computer's artifact, whole: its pieces from the bucket, one after another.
@@ -6562,7 +6565,7 @@ const LOADING: &str = r#"<span class="loading-note"><span class="mini-spin"></sp
 fn jobs_card(v: Option<&PlaneView>, limit: usize) -> String {
     let jobs = v.map(|v| v.jobs()).unwrap_or_default();
     // Each job links to where its GitHub or GitLab is.
-    let listed: Vec<serde_json::Value> = jobs.iter().take(limit).map(|j| match v { Some(v) => with_hosts(v, j), None => j.clone() }).collect();
+    let listed: Vec<serde_json::Value> = v.map(|v| jobs.iter().take(limit).map(|j| with_hosts(v, j)).collect()).unwrap_or_default();
     let rows = match v { Some(_) if !listed.is_empty() => job_table(&listed), _ => String::new() };
     let label = esc(&v.map(|v| v.label()).unwrap_or_else(|| "superci".into()));
     let snippet = format!(r#"<pre class="snippet" style="text-align:left;padding:12px 16px;border-radius:10px;background:var(--card-2)">jobs:
@@ -6738,7 +6741,8 @@ impl Hub {
         let root = self.root.as_ref().ok_or("SuperCI keeps nothing on this machine (it has no home folder), so there is the one workspace.")?;
         let name = name.trim().to_string();
         superci_core::spec::valid_name(&name)?;
-        let id = crate::store::id_from(&name)?;
+        // (Every valid name makes a valid id.)
+        let id = crate::store::id_from(&name).unwrap_or(crate::store::FIRST.to_string());
         if self.has(&id) { return Err(format!("There is a workspace with the id {id} already. Give this one another name.")) }
         // The one this was started in has no folder until it keeps something: it gets one now, so that it stays
         // listed beside the new one.
@@ -9427,7 +9431,7 @@ mod rest_tests {
 
     /// A server on this computer answering each request as `answer` says (its method, path and body: a status and a
     /// JSON body): a control plane or another service, as far as a test needs one.
-    fn serving(answer: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static) -> String {
+    fn serving<B: Into<Vec<u8>>>(answer: impl Fn(&str, &str, &str) -> (u16, B) + Send + Sync + 'static) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let answer = Arc::new(answer);
@@ -9676,5 +9680,248 @@ mod rest_tests {
         assert!(d.deploy_progress().unwrap().contains("about 2 minutes"));
         *lock(&d.deploying) = Some(deploy("modal", Some(Ok(modal_plane("p2", NOWHERE)))));
         assert!(d.deploy_progress().is_none() && d.deploy_line().is_none());
+    }
+
+    /// A control plane's view as a page has it: online at this version, answering with `status`.
+    fn seen_as(plane: Plane, status: serde_json::Value) -> PlaneView {
+        PlaneView { plane, online: true, github: false, installed: false, aws: false, runners: false, gitlab: false, moved_to: None, standby: false, version: Some(DASHBOARD_VERSION.into()), status: Some(status) }
+    }
+
+    /// A folder for one test, gone when it ends.
+    struct Folder(std::path::PathBuf);
+    impl Folder { fn new(what: &str) -> Folder { let dir = std::env::temp_dir().join(format!("superci-{what}-{}-{}", std::process::id(), superci_core::crypto::random_id(6))); std::fs::create_dir_all(&dir).unwrap(); Folder(dir) } }
+    impl Drop for Folder { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+
+    fn hub_at(root: Option<std::path::PathBuf>, first: Option<&str>) -> Hub {
+        Hub { root, key: "k".repeat(32), base: "http://localhost:8976".into(), first: Mutex::new(first.map(str::to_string)), boards: Mutex::new(HashMap::new()), opened: Mutex::new(None) }
+    }
+
+    fn ask(hub: &Hub, path: &str, body: &str) -> (u16, String) {
+        let r = respond(hub, &Req { method: "POST".into(), path: path.into(), query: vec![], cookie: Some("k".repeat(32)), last: None, body: body.as_bytes().to_vec(), host: "localhost:8976".into(), origin: None, fetch_site: Some("same-origin".into()) });
+        (r.status, words_of(&r))
+    }
+
+    /// A server that says more is coming than it sends: what it answers is cut short.
+    fn cut_short() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || listener.incoming().flatten().for_each(|mut s| {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nabc");
+        }));
+        url
+    }
+
+    #[test]
+    fn workspaces_are_not_made_renamed_or_forgotten_where_nothing_can_be_kept() {
+        // A machine with no folder: there is the one workspace.
+        let hub = hub_at(None, Some("default"));
+        lock(&hub.boards).insert("default".into(), Arc::new(Mutex::new(Dashboard::new())));
+        assert!(ask(&hub, "/workspaces", "name=Acme").1.contains("SuperCI keeps nothing on this machine"));
+        assert!(ask(&hub, "/workspaces/rename", "w=default&id=acme").1.contains("SuperCI keeps nothing on this machine"));
+        assert!(ask(&hub, "/workspaces/remove", "w=default").1.contains("SuperCI keeps nothing on this machine"));
+        // A folder that cannot be made (where a file is): said, for the one started in and for the new one.
+        let f = Folder::new("hub-file");
+        let file = f.0.join("not-a-folder");
+        std::fs::write(&file, "x").unwrap();
+        assert!(hub_at(Some(file.clone()), Some("default")).create("Acme").unwrap_err().contains("could not make"));
+        assert!(hub_at(Some(file), None).create("Acme").unwrap_err().contains("could not make"));
+        // An id that cannot be one.
+        let hub = hub_at(Some(f.0.clone()), Some("default"));
+        assert!(hub.rename("default", "Not An Id!").unwrap_err().contains("A workspace's id is"));
+        // Its sign-ins that cannot be taken out (a folder where the file is), and a folder that cannot go: said,
+        // and nothing more is forgotten.
+        std::fs::create_dir_all(f.0.join("workspaces/acme/sign-ins.json")).unwrap();
+        assert!(hub.remove("acme").unwrap_err().contains("could not remove"));
+        let mut d = Dashboard::signed_in(Some(Store::under(&f.0, "acme")));
+        assert!(send(&mut d, "/signout", &[]).unwrap_err().contains("could not remove"));
+        std::fs::remove_dir_all(f.0.join("workspaces/acme/sign-ins.json")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(f.0.join("workspaces"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let gone = hub.remove("acme");
+        std::fs::set_permissions(f.0.join("workspaces"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(gone.unwrap_err().contains("could not remove"));
+    }
+
+    #[test]
+    fn a_deploy_of_a_control_plane_listed_already_shows_that_one() {
+        let mut d = Dashboard::new();
+        d.planes = vec![aws_plane("p0", NOWHERE), modal_plane("p2", NOWHERE)];
+        *lock(&d.deploying) = Some(Deploy { cloud: "modal", place: "workspace acme".into(), steps: &modal::DEPLOY_STEPS, at: 3, form: vec![], result: Some(Ok(modal_plane("p2", NOWHERE))) });
+        d.adopt_deploy();
+        assert_eq!((d.planes.len(), d.selected), (2, 1));
+        // Back from installing GitHub's App for one of several: to that one's pages.
+        d.github_for = Some("p2".into());
+        let back = words_of(&open(&mut d, "/github/installed", &[]).unwrap());
+        assert!(back.contains("Installed on GitHub"), "{back}");
+    }
+
+    #[test]
+    fn forms_with_what_cannot_be_taken_say_so_before_anything_is_written() {
+        let mut d = Dashboard::new();
+        d.planes = vec![aws_plane("p0", NOWHERE)];
+        assert_eq!(send(&mut d, "/gitlab/project", &[("id", "many")]).err().as_deref(), Some("which project?"));
+        // A further GitLab's token is taken out with its cloud's sign-in: none here.
+        assert_eq!(send(&mut d, "/gitlab/disconnect", &[("gitlab", "g1")]).err().as_deref(), Some("Sign in with AWS first."));
+    }
+
+    /// A Modal control plane, not signed in to Modal, answering with `status`: each change below stops where it would
+    /// be written.
+    fn modal_answering(status: serde_json::Value) -> Dashboard {
+        let mut d = Dashboard::new();
+        d.planes = vec![modal_plane("p2", &plane_answering(status))];
+        d
+    }
+
+    #[test]
+    fn changes_to_a_control_plane_elsewhere_go_by_what_it_says() {
+        // Its AWS account as its status says it: not signed in to it, AWS's permissions and budget are not changed.
+        let mut d = modal_answering(serde_json::json!({ "aws": { "account_id": "222222222222" }, "routing": {}, "account_limits": true, "daily_limits": true }));
+        let r = send(&mut d, "/permissions/aws", &[("plane", "p2")]).unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in to account 222222222222"), "{}", words_of(&r));
+        let r = send(&mut d, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "100"), ("budget", "emails")]).unwrap();
+        assert!(r.status == 403 && words_of(&r).contains("Sign in to account 222222222222"), "{}", words_of(&r));
+        // Public repositories: none chosen, or some; providers in an order (one taken out, or one unknown); its own
+        // network and its regions in AWS: each stops at writing, without a sign-in to Modal.
+        for fields in [&[("action", "public_set")][..], &[("action", "public_set"), ("repo", "acme/web")], &[("action", "order"), ("out_0", "aws"), ("cloud_x", "")],
+            &[("action", "account"), ("cloud", "aws"), ("networks", "us-east-1 subnet-0123456789abcdef0 sg-0123456789abcdef0")], &[("action", "pool"), ("cloud", "aws"), ("region_0", "us-west-2"), ("region_1", "us-west-2")]] {
+            let said = send(&mut d, "/routing", fields);
+            assert!(said.as_ref().err().is_some_and(|e| e == "Sign in with Modal first.") || said.as_ref().is_ok_and(|r| r.status == 400), "{fields:?}: {:?}", said.map(|r| words_of(&r)));
+        }
+        let r = send(&mut d, "/routing", &[("action", "order"), ("cloud_0", "aws"), ("out_0", "nowhere!")]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Unknown provider"));
+        let r = send(&mut d, "/routing", &[("action", "pool"), ("cloud", "aws"), ("region_0", "mars-1")]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Choose a region from the list"));
+        assert_eq!(send(&mut d, "/machine", &[]).err().as_deref(), Some("Sign in with Modal first."));
+        // Cloudflare's runners go into an account named when the sign-in reaches several.
+        let mut d = modal_answering(serde_json::json!({ "launchers": [] }));
+        d.cf = Some(cloudflare::Session::from_token("test"));
+        d.cf_accounts = vec![("a1".into(), "Acme".into()), ("a2".into(), "Globex".into())];
+        let r = send(&mut d, "/runners/cloudflare", &[]).unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("Your Cloudflare sign-in reaches 2: Acme (a1), Globex (a2)."), "{}", words_of(&r));
+    }
+
+    #[test]
+    fn the_kept_control_plane_is_read_with_its_key_also_when_it_is_listed_no_more() {
+        let url = plane_answering(serde_json::json!({ "jobs": [] }));
+        let mut d = Dashboard::new();
+        d.kept_plane = Some(aws_plane("p0", &url));
+        d.keyed.insert("p0".into());
+        d.aws_ended = true;
+        let v = d.current().unwrap().unwrap();
+        assert!(v.status.is_some() && d.planes.is_empty());
+    }
+
+    #[test]
+    fn gitlabs_projects_say_how_their_webhooks_stand() {
+        let url = serving(|_, path, _| match path {
+            "/gitlab/projects" => (200, serde_json::json!({ "last_event_ms": now_ms() - 120_000, "projects": [
+                { "id": 1, "path": "acme/paused", "enabled": true, "hook_status": "temporarily_disabled", "hook_paused_until": "2026-10-25T12:00:00Z" },
+                { "id": 2, "path": "acme/off", "enabled": true, "hook_status": "disabled" }] }).to_string()),
+            _ => (500, "{}".into()),
+        });
+        let mut d = Dashboard::new();
+        let v = seen_as(aws_plane("p0", &url), serde_json::json!({ "gitlab": { "url": "https://gitlab.com" } }));
+        let page = plain(&d.gitlab_page(Some(&v)));
+        assert!(page.contains("GitLab paused its webhook after failed deliveries, until 2026-10-25 12:00") && page.contains("GitLab disabled its webhook") && page.contains("Last event from GitLab 2m ago"), "{page}");
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "gitlab": { "url": "https://gitlab.com" } }));
+        assert!(plain(&d.gitlab_page(Some(&v))).contains("GitLab did not answer"));
+        d.gitlab_shown = "nope".into();
+        assert!(plain(&d.gitlab_page(Some(&v))).contains("GitLab is not connected"));
+    }
+
+    #[test]
+    fn pages_say_what_is_rare() {
+        let mut d = Dashboard::new();
+        // Setting a control plane up in one AWS account of two signed in to, none looked at yet.
+        d.aws = Some(aws::Session::for_test_until("111111111111", u64::MAX));
+        d.aws_others = vec![aws::Session::for_test_until("222222222222", u64::MAX)];
+        let actions = d.setup_actions(&[]);
+        assert!(actions[1].2.as_deref().is_some_and(|a| a.contains(r#"<option value="111111111111">account 111111111111</option><option value="222222222222">"#)), "{actions:?}");
+        let in_first = Plane::Aws { account_id: "111111111111".into(), region: "us-east-1".into(), url: NOWHERE.into(), plane_id: "p0".into(), label: "superci".into() };
+        assert!(d.setup_actions(&[in_first])[1].2.as_deref().is_some_and(|a| a.contains(r#"<input type="hidden" name="account" value="222222222222">"#)));
+        // Keys: one that ends tomorrow, and no device listed.
+        let keys = plain(&d.keys_card(Some(&serde_json::json!({ "read": [{ "name": "AGENT", "until_ms": now_ms() + 86_400_000 + 60_000 }] }))));
+        assert!(keys.contains("agentRead key: reads only · 1 more day"), "{keys}");
+        // Every control plane: none but one only seen from afar.
+        assert!(!d.all_page(&[seen_as(seen_plane("p3", NOWHERE), serde_json::json!({}))]).contains("pick act"));
+        // A run still running.
+        d.run_shown = ("acme/web".into(), "7".into(), String::new());
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [{ "job_id": 1, "run_id": 7, "repo": "acme/web", "state": "running", "at_ms": now_ms(), "name": "test" }] }));
+        assert!(d.run_page(Some(&v)).contains("Running"));
+        // What a GitLab connection's newer version asks for.
+        let old = PlaneView { version: Some("0.1.0".into()), ..seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "gitlab": { "url": "https://gitlab.com" } })) };
+        assert!(!new_needs(&old, &[]).iter().any(|(cloud, _)| *cloud == "gitlab"), "GitLab's scopes are all from the first version");
+        // Places of other kinds, and what each can run.
+        let v = seen_as(modal_plane("p2", NOWHERE), serde_json::json!({}));
+        assert_eq!(pool_text(&v, &Pool::of("modal")).1, "Modal");
+        assert_eq!(pool_text(&v, &Pool::of("machine:mac")).2, "");
+        assert!(pool_caps("modal").as_array().is_some_and(|a| a.len() == 1) && pool_caps("machine:mac").as_array().is_some_and(|a| a.is_empty()));
+        // Clouds: AWS's account unsaid (a control plane elsewhere that does not say it), and none at all.
+        let v = PlaneView { aws: true, ..seen_as(modal_plane("p2", NOWHERE), serde_json::json!({})) };
+        assert!(clouds_card(&v, &[]).contains("<strong>AWS</strong>"));
+        assert!(!clouds_card(&seen_as(modal_plane("p2", NOWHERE), serde_json::json!({})), &[]).contains("pool still"));
+        // The default machine, in words.
+        for (machine, said) in [(serde_json::json!({ "disk_mibs": superci_core::spec::DISK_MIBS_INCLUDED, "image": "ubuntu24", "docker_cache": false }), ["standard disk speed", "Ubuntu 24.04", "no Docker image cache"]),
+            (serde_json::json!({ "image": "ubuntu26", "docker_cache": true }), ["Ubuntu 26.04", "Docker image cache from the start", "spot"]),
+            (serde_json::json!({ "os": "windows" }), ["Windows", "x64", "spot"]), (serde_json::json!({ "os": "macos" }), ["macOS", "x64", "spot"])] {
+            let card = plain(&machines_card(&seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "machine": machine }))).0);
+            for s in said { assert!(card.contains(s), "{machine}: {s} in {card}") }
+        }
+        // Networks: a region with nothing after it.
+        assert!(given_networks("us-east-1").unwrap_err().contains("name at least one subnet and one security group"));
+        // Jobs before there is a control plane, and a week or a month with none.
+        assert!(plain(&jobs_card(None, 5)).contains("Once setup is done"));
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [], "usage": { "day": { "jobs": 0 }, "week": { "jobs": 0 }, "month": { "jobs": 0 } } }));
+        let long_ago = [serde_json::json!({ "job_id": 1, "run_id": 1, "repo": "acme/web", "state": "done", "at_ms": 1 })];
+        assert!(plain(&overview_cards(&v, &long_ago, "week")).contains("No jobs in the last 7 days") && plain(&overview_cards(&v, &long_ago, "month")).contains("No jobs in the last 30 days"));
+    }
+
+    #[test]
+    fn logs_and_pieces_that_do_not_come_say_why() {
+        let url = serving(|_, path, _| match path {
+            "/missing" => (404, Vec::new()),
+            "/job/log" => (200, br#"{"url":"https://example.invalid/steps"}"#.to_vec()),
+            _ => (500, Vec::new()),
+        });
+        assert_eq!(fetch_all(&[format!("{url}/missing")]).unwrap_err(), "the bucket answered 404 Not Found for a piece");
+        assert!(fetch_all(&[format!("{NOWHERE}/piece")]).is_err());
+        assert!(fetch_all(&[cut_short()]).is_err(), "a piece cut short is no piece");
+        // A job without its number or its name has no steps' logs to read; nor one whose control plane does not
+        // answer, gives no address, or one its logs are not at.
+        let test = serde_json::json!({ "job_id": 1, "name": "test" });
+        assert!(step_logs(&url, "k", &serde_json::json!({ "name": "test" })).is_none() && step_logs(&url, "k", &serde_json::json!({ "job_id": 1 })).is_none());
+        assert!(step_logs(NOWHERE, "k", &test).is_none() && step_logs(&url, "k", &test).is_none());
+        let plain_http = serving(|_, _, _| (200, br#"{"url":"http://example.invalid/steps"}"#.to_vec()));
+        assert!(step_logs(&plain_http, "k", &test).is_none());
+        // GitHub's answer about a name: none from this computer, one that is no text, no JSON, or without the name.
+        assert!(github_owner_at(NOWHERE, None, "acme").is_err());
+        let api = serving(|_, path, _| match path {
+            "/users/broken" => (200, vec![0xff, 0xfe]),
+            "/users/nojson" => (200, b"not json".to_vec()),
+            _ => (200, b"{}".to_vec()),
+        });
+        assert!(github_owner_at(&api, None, "broken").is_err() && github_owner_at(&api, None, "nojson").is_err());
+        assert_eq!(github_owner_at(&api, None, "nameless").unwrap_err(), "GitHub did not answer about that name; try again in a minute");
+    }
+
+    #[test]
+    fn an_app_that_github_converts_without_its_parts_is_refused() {
+        assert!(convert_manifest_code(NOWHERE, None, "abcdefgh").is_err());
+        let api = serving(|_, path, _| match path.split('/').nth(2).unwrap_or_default() {
+            "broken000" => (201, vec![0xff, 0xfe]),
+            "nojson000" => (201, b"not json".to_vec()),
+            "noid00000" => (201, br#"{"slug":"s","pem":"p","webhook_secret":"w"}"#.to_vec()),
+            "noslug000" => (201, br#"{"id":1,"pem":"p","webhook_secret":"w"}"#.to_vec()),
+            "nopem0000" => (201, br#"{"id":1,"slug":"s","webhook_secret":"w"}"#.to_vec()),
+            "nosecret0" => (201, br#"{"id":1,"slug":"s","pem":"p"}"#.to_vec()),
+            _ => (201, br#"{"id":1,"slug":"s","pem":"p","webhook_secret":"w","owner":{"login":"acme","type":"Organization"}}"#.to_vec()),
+        });
+        assert!(convert_manifest_code(&api, None, "broken000").is_err() && convert_manifest_code(&api, None, "nojson000").is_err());
+        for (code, part) in [("noid00000", "id"), ("noslug000", "slug"), ("nopem0000", "pem"), ("nosecret0", "webhook_secret")] {
+            assert_eq!(convert_manifest_code(&api, None, code).err(), Some(format!("App conversion without {part}")), "{code}");
+        }
+        assert!(convert_manifest_code(&api, None, "complete0").is_ok_and(|a| a.owner_is_org && a.slug == "s"));
     }
 }
