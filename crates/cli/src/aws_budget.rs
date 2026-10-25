@@ -170,9 +170,12 @@ impl Budgets<'_> {
 
     /// Waits for an action AWS is running or undoing to be done with it.
     fn settled(&self, id: &str) -> Result<()> {
-        for _ in 0..20 {
-            if !self.actions()?.iter().any(|(a, status)| a == id && status.ends_with("_IN_PROGRESS")) { return Ok(()) }
+        // (Thirty seconds at most: then on, as if it were.)
+        let mut asked = 0;
+        while self.actions()?.iter().any(|(a, status)| a == id && status.ends_with("_IN_PROGRESS")) {
             (self.pause)(1500);
+            asked += 1;
+            if asked == 20 { break }
         }
         Ok(())
     }
@@ -259,5 +262,109 @@ pub mod tests {
         // job at GitHub asks for first, and no job's own machine is ever one.
         assert_eq!((&statements[0]["Action"], &statements[0]["Condition"]), (&json!("ec2:RunInstances"), &json!({ "StringNotEquals": { "ec2:InstanceType": ["t3a.small", "t3.small"] } })));
         assert_eq!((&statements[1]["Action"], &statements[1]["Resource"]), (&json!(["ec2:CreateFleet", "ec2:RequestSpotInstances", "ec2:RequestSpotFleet"]), &json!("*")));
+    }
+
+    /// An account as a test has it: a budget of $100 (or none), these actions and notifications, and the `n`-th call
+    /// of `failing` (its target or action, with an action's execution type) answered with AWS's internal error.
+    struct Account { budget: bool, actions: Value, notifications: Value, failing: (&'static str, usize), asked: std::sync::Mutex<Vec<String>> }
+
+    #[async_trait::async_trait(?Send)]
+    impl Http for Account {
+        async fn send(&self, r: superci_core::io::Request) -> superci_core::io::Result<superci_core::io::Response> {
+            let body: Value = serde_json::from_slice(&r.body).unwrap_or_default();
+            let target = r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("x-amz-target")).map(|(_, v)| v.trim_start_matches("AWSBudgetServiceGateway.").to_string());
+            let what = match target {
+                Some(t) => format!("{t} {}", body["ExecutionType"].as_str().unwrap_or_default()).trim_end().to_string(),
+                None => String::from_utf8_lossy(&r.body).split('&').find_map(|kv| kv.strip_prefix("Action=")).unwrap_or_default().to_string(),
+            };
+            let mut asked = self.asked.lock().unwrap();
+            asked.push(what.clone());
+            let iam = r.url.contains("iam.");
+            let (status, answer) = if what.starts_with(self.failing.0) && asked.iter().filter(|a| a.starts_with(self.failing.0)).count() == self.failing.1 {
+                if iam { (500, "<ErrorResponse><Error><Code>ServiceFailure</Code><Message>Try again.</Message></Error></ErrorResponse>".to_string()) } else { (500, json!({ "__type": "InternalErrorException", "Message": "Try again." }).to_string()) }
+            } else {
+                match what.as_str() {
+                    "DescribeBudget" if !self.budget => (400, json!({ "__type": "NotFoundException", "Message": "No budget" }).to_string()),
+                    "DescribeBudget" => (200, json!({ "Budget": { "BudgetLimit": { "Amount": "100" }, "CalculatedSpend": { "ActualSpend": { "Amount": "5" } } } }).to_string()),
+                    "DescribeBudgetActionsForBudget" => (200, json!({ "Actions": self.actions }).to_string()),
+                    "DescribeNotificationsForBudget" => (200, json!({ "Notifications": self.notifications }).to_string()),
+                    "DescribeSubscribersForNotification" => (200, json!({ "Subscribers": [{ "SubscriptionType": "EMAIL", "Address": "someone@example.com" }] }).to_string()),
+                    _ if iam => (200, "<Ok/>".to_string()),
+                    _ => (200, "{}".to_string()),
+                }
+            };
+            Ok(superci_core::io::Response { status, headers: vec![], body: answer.into_bytes() })
+        }
+    }
+
+    fn account(budget: bool, actions: Value, failing: (&'static str, usize)) -> Account {
+        Account { budget, actions, notifications: json!([{ "NotificationType": "ACTUAL" }]), failing, asked: Default::default() }
+    }
+
+    /// `f` with the budget of this account.
+    fn budgets<R>(aws: &Account, f: impl FnOnce(&Budgets) -> R) -> R {
+        let creds = Credentials { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "secret".into(), session_token: None, expires_at_ms: 0 };
+        f(&Budgets { http: aws, creds: &creds, account: "111111111111", plane_id: "abcdefghijkl", pause: &|_| {} })
+    }
+
+    const SUCCEEDED: &str = r#"[{ "ActionId": "a1", "Status": "EXECUTION_SUCCESS" }]"#;
+
+    fn actions(json: &str) -> Value { serde_json::from_str(json).unwrap() }
+
+    #[test]
+    fn a_budget_whose_actions_cannot_be_read_is_not_said_found_and_an_action_without_its_id_is_none() {
+        assert!(budgets(&account(true, json!([]), ("DescribeBudgetActionsForBudget", 1)), |b| b.found()).is_err());
+        assert_eq!(budgets(&account(true, json!([{ "Status": "STANDBY" }]), ("", 0)), |b| b.found()).unwrap(), Some(Found { amount: 100.0, spent: 5.0, stop: false, stopped: false }));
+    }
+
+    #[test]
+    fn a_budget_aws_does_not_make_or_change_is_an_error() {
+        assert!(budgets(&account(false, json!([]), ("CreateBudget", 1)), |b| b.set(100.0, Some("someone@example.com"), false)).unwrap_err().starts_with("InternalErrorException"));
+        assert!(budgets(&account(true, json!([]), ("UpdateBudget", 1)), |b| b.set(120.0, None, false)).unwrap_err().starts_with("InternalErrorException"));
+    }
+
+    #[test]
+    fn the_stop_is_taken_off_when_no_longer_asked_for() {
+        let aws = account(true, actions(SUCCEEDED), ("", 0));
+        budgets(&aws, |b| b.set(100.0, None, false)).unwrap();
+        assert!(aws.asked.lock().unwrap().iter().any(|a| a == "DeleteBudgetAction"));
+    }
+
+    /// The limit raised after the stop ran: the rule must come off, and AWS not taking it off is an error.
+    #[test]
+    fn a_limit_raised_after_the_stop_ran_fails_when_the_rule_does_not_come_off() {
+        assert!(budgets(&account(true, actions(SUCCEEDED), ("ExecuteBudgetAction REVERSE", 1)), |b| b.set(120.0, None, true)).is_err());
+    }
+
+    /// The stop added with no address given: the budget's own, from its notifications; none there, or not read, and
+    /// the stop is not added.
+    #[test]
+    fn a_stop_added_without_an_address_needs_the_budgets_own() {
+        let set = |aws: &Account| budgets(aws, |b| b.set(100.0, None, true));
+        for failing in ["DescribeNotificationsForBudget", "DescribeSubscribersForNotification"] { assert!(set(&account(true, json!([]), (failing, 1))).is_err(), "{failing}") }
+        let mut none = account(true, json!([]), ("", 0));
+        none.notifications = json!([]);
+        assert!(set(&none).unwrap_err().starts_with("An address for AWS's emails is needed"));
+        set(&account(true, json!([]), ("", 0))).unwrap();
+        for failing in ["CreatePolicy", "PutRolePolicy"] { assert!(budgets(&account(true, json!([]), (failing, 1)), |b| b.set(100.0, Some("someone@example.com"), true)).is_err(), "{failing}") }
+    }
+
+    /// Lifting the rule: with no action there is only the role to take it off; each of AWS's steps failing is an
+    /// error (undoing the action, waiting for it, judging the budget anew).
+    #[test]
+    fn lifting_the_rule_fails_at_whichever_step_aws_refuses() {
+        budgets(&account(true, json!([]), ("", 0)), |b| b.lift(true)).unwrap();
+        for failing in [("DescribeBudgetActionsForBudget", 1), ("ExecuteBudgetAction REVERSE", 1), ("DescribeBudgetActionsForBudget", 2)] { assert!(budgets(&account(true, actions(SUCCEEDED), failing), |b| b.lift(false)).is_err(), "{failing:?}") }
+        assert!(budgets(&account(true, actions(r#"[{ "ActionId": "a1", "Status": "REVERSE_SUCCESS" }]"#), ("ExecuteBudgetAction RESET", 1)), |b| b.lift(true)).is_err());
+    }
+
+    /// Removing: an action AWS is still undoing is waited for half a minute, then removed all the same; each of
+    /// AWS's steps failing is an error.
+    #[test]
+    fn removing_waits_for_an_action_being_undone_and_fails_at_whichever_step_aws_refuses() {
+        let aws = account(true, actions(r#"[{ "ActionId": "a1", "Status": "REVERSE_IN_PROGRESS" }]"#), ("", 0));
+        budgets(&aws, |b| b.remove()).unwrap();
+        assert_eq!(aws.asked.lock().unwrap().iter().filter(|a| *a == "DescribeBudgetActionsForBudget").count(), 21);
+        for failing in [("DescribeBudgetActionsForBudget", 1), ("ExecuteBudgetAction REVERSE", 1), ("DescribeBudgetActionsForBudget", 2), ("DeleteRole", 2)] { assert!(budgets(&account(true, actions(SUCCEEDED), failing), |b| b.remove()).is_err(), "{failing:?}") }
     }
 }

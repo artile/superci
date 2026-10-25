@@ -1940,6 +1940,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "getrandom 0.2.17",
+ "libc",
  "miniz_oxide",
  "open",
  "prost",

@@ -70,7 +70,7 @@ impl Cloudflare {
                 let (scripts, sub) = std::thread::scope(|s| {
                     let scripts = s.spawn(|| self.call("GET", &format!("/accounts/{a}/workers/scripts"), None));
                     let sub = s.spawn(|| self.call("GET", &format!("/accounts/{a}/workers/subdomain"), None));
-                    (scripts.join().unwrap_or_else(|_| Err("stopped".into())), sub.join().unwrap_or_else(|_| Err("stopped".into())))
+                    (scripts.join().unwrap_or(Err("stopped".into())), sub.join().unwrap_or(Err("stopped".into())))
                 });
                 let candidates: Vec<String> = scripts?.as_array().into_iter().flatten()
                     .filter(|s| s["named_handlers"].as_array().is_some_and(|h| h.iter().any(|h| h["name"] == "PlaneObject")))
@@ -80,8 +80,9 @@ impl Cloudflare {
                 Ok(std::thread::scope(|s| {
                     let hs: Vec<_> = candidates.iter().map(|script| { let sub = &sub; s.spawn(move || -> Option<crate::plane::Plane> {
                         let url = format!("https://{script}.{sub}.workers.dev");
-                        let (plane_id, label) = match health(&url).filter(|h| h["plane"].is_string()) {
-                            Some(h) => (h["plane"].as_str()?.to_string(), h["label"].as_str().unwrap_or("superci").to_string()),
+                        let answered = health(&url).and_then(|h| Some((h["plane"].as_str()?.to_string(), h["label"].as_str().unwrap_or("superci").to_string())));
+                        let (plane_id, label) = match answered {
+                            Some(said) => said,
                             None => {
                                 let settings = self.call("GET", &format!("/accounts/{a}/workers/scripts/{script}/settings"), None).ok()?;
                                 let text = |n: &str| settings["bindings"].as_array().and_then(|bs| bs.iter().find(|b| b["name"] == n).and_then(|b| b["text"].as_str().map(str::to_string)));
@@ -93,7 +94,7 @@ impl Cloudflare {
                     hs.into_iter().filter_map(|h| h.join().ok().flatten()).collect()
                 }))
             })).collect();
-            hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("stopped".into()))).collect()
+            hs.into_iter().map(|h| h.join().unwrap_or(Err("stopped".into()))).collect()
         });
         let mut planes = vec![];
         for f in found { planes.extend(f?) }
@@ -226,23 +227,28 @@ impl Cloudflare {
     pub fn runner_image(&self, a: &str) -> Result<String> {
         let image = crate::image::copy_runner_image(self, a)?;
         // Cloudflare unpacks it once for its machines; the first time takes a few minutes.
-        for attempt in 0..120 {
-            let mut v = None;
-            for _ in 0..10 {
+        let mut attempt = 0;
+        loop {
+            let mut tries = 0;
+            let v = loop {
                 match self.json("POST", &format!("/accounts/{a}/containers/image-preparations"), json!({ "image": image })) {
                     // The registry can take a few seconds before a just-copied image is visible.
-                    Err(e) if e.contains("does not exist") || e.contains("DOESNT_CONTAIN") => crate::aws::pause(3000),
-                    r => { v = Some(r?); break }
+                    Err(e) if e.contains("does not exist") || e.contains("DOESNT_CONTAIN") => {
+                        crate::aws::pause(3000);
+                        tries += 1;
+                        if tries == 10 { return Err("Cloudflare does not see the runner image yet; try again in a minute".into()) }
+                    }
+                    r => break r?,
                 }
-            }
-            let v = v.ok_or("Cloudflare does not see the runner image yet; try again in a minute")?;
+            };
             match v["status"].as_str() {
                 Some("ready") => return Ok(image),
                 Some("error") => return Err(format!("Cloudflare could not prepare the runner image: {}", v["reason"].as_str().unwrap_or("no reason given"))),
                 _ => { if attempt % 6 == 0 { eprintln!("Cloudflare is preparing the runner image for its machines…") } crate::aws::pause(5000) }
             }
+            attempt += 1;
+            if attempt == 120 { return Err("Cloudflare took over 10 minutes to prepare the runner image; try again later".into()) }
         }
-        Err("Cloudflare took over 10 minutes to prepare the runner image; try again later".into())
     }
 
     /// The container application for a Worker's `JobRunner` class, with per-container scheduling (each container's image
@@ -329,14 +335,12 @@ impl Cloudflare {
     /// Turns on a Worker's workers.dev address and returns it (the API can answer "does not exist" for a few seconds
     /// after the first upload).
     fn workers_dev(&self, a: &str, name: &str) -> Result<String> {
-        let mut last = String::new();
-        for attempt in 0..10 {
-            match self.json("POST", &format!("/accounts/{a}/workers/scripts/{name}/subdomain"), json!({ "enabled": true, "previews_enabled": false })) {
-                Ok(_) => { last.clear(); break }
-                Err(e) => { last = e; crate::aws::pause((2 + attempt) * 1000) }
-            }
+        let mut attempt = 0;
+        while let Err(e) = self.json("POST", &format!("/accounts/{a}/workers/scripts/{name}/subdomain"), json!({ "enabled": true, "previews_enabled": false })) {
+            crate::aws::pause((2 + attempt) * 1000);
+            attempt += 1;
+            if attempt == 10 { return Err(e) }
         }
-        if !last.is_empty() { return Err(last) }
         let sub = self.call("GET", &format!("/accounts/{a}/workers/subdomain"), None)?["subdomain"].as_str().ok_or("this account has no workers.dev subdomain yet: open Workers in Cloudflare's dashboard once")?.to_string();
         Ok(format!("https://{name}.{sub}.workers.dev"))
     }
@@ -620,6 +624,212 @@ mod tests {
         });
         let ended = ended.expect("the runner was still online after 10 minutes");
         assert!(ended >= Duration::from_secs(150) && ended <= Duration::from_secs(7 * 60), "ended after {ended:?}");
+    }
+}
+
+#[cfg(test)]
+mod answers {
+    use super::*;
+    use crate::aws::clouds::{self, answer, cf, cut, with};
+
+    const API_AT: &str = "/api.cloudflare.com/client/v4";
+
+    /// Cloudflare's refusal, as its API says one.
+    fn refusal(message: &str) -> Vec<u8> { answer(400, &json!({ "success": false, "errors": [{ "code": 10000, "message": message }], "result": null }).to_string()) }
+
+    /// GitHub's runner image already in the account's registry (`acc`): what copying it asks, answered.
+    fn image_there(method: &str, path: &str) -> Option<Vec<u8>> {
+        match (method, path) {
+            ("GET", "/ghcr.io/v2/actions/actions-runner/manifests/latest") => Some(answer(200, r#"{"schemaVersion":2,"config":{"digest":"sha256:c","size":1},"layers":[]}"#)),
+            ("POST", p) if p.ends_with("/registry.cloudflare.com/credentials") => Some(cf(json!({ "username": "u", "password": "p" }))),
+            ("HEAD", "/registry.cloudflare.com/v2/acc/superci-runner/manifests/gh-latest") => Some(answer(200, "")),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_worker_moves_to_v3_from_where_it_is() {
+        let m = |existing, tag| migration(existing, tag, &["PlaneObject"]);
+        assert_eq!(m(false, Some("v2")).unwrap()["new_sqlite_classes"], json!(["PlaneObject", "JobRunner"]));
+        assert_eq!(m(true, None).unwrap()["new_sqlite_classes"], json!(["PlaneObject", "JobRunner"]));
+        assert_eq!(m(true, Some("v1")).unwrap()["old_tag"], "v1");
+        assert_eq!(m(true, Some("v2")).unwrap()["old_tag"], "v2");
+        assert_eq!(m(true, Some("v3")), None);
+    }
+
+    #[test]
+    fn control_planes_are_found_by_their_health_or_else_by_their_settings() {
+        let at = clouds::serve(|_, path, _| {
+            let settings = |bindings: Value| cf(json!({ "bindings": bindings }));
+            match path.strip_prefix(API_AT).unwrap_or(path) {
+                "/accounts/a1/workers/scripts" => cf(json!([
+                    { "id": "p1", "named_handlers": [{ "name": "PlaneObject" }] }, { "id": "p2", "named_handlers": [{ "name": "PlaneObject" }] },
+                    { "id": "p3", "named_handlers": [{ "name": "PlaneObject" }] }, { "id": "p4", "named_handlers": [{ "name": "PlaneObject" }] },
+                    { "id": "site", "named_handlers": [{ "name": "Other" }] }])),
+                "/accounts/a1/workers/subdomain" => cf(json!({ "subdomain": "acme" })),
+                // One answers as a control plane; one answers, but not as one (its settings say which it is); one
+                // does not answer and its settings cannot be read; one has settings without an id.
+                "/p1.acme.workers.dev/health" => answer(200, r#"{"plane":"plane0000001","label":"Ours"}"#),
+                "/p2.acme.workers.dev/health" => answer(200, r#"{"ok":true}"#),
+                "/accounts/a1/workers/scripts/p2/settings" => settings(json!([{ "name": "PLANE_ID", "text": "plane0000002" }])),
+                "/accounts/a1/workers/scripts/p3/settings" => refusal("Internal server error"),
+                "/accounts/a1/workers/scripts/p4/settings" => settings(json!([{ "name": "LABEL", "text": "x" }])),
+                _ => answer(500, "no"),
+            }
+        });
+        with(&at, || {
+            let c = Cloudflare::new("t");
+            let mut found: Vec<(String, String)> = c.find_planes(&[("a1".into(), "Acme".into())]).unwrap().into_iter().map(|p| match p {
+                crate::plane::Plane::Cloudflare { plane_id, label, .. } => (plane_id, label),
+                _ => unreachable!(),
+            }).collect();
+            found.sort();
+            assert_eq!(found, [("plane0000001".to_string(), "Ours".to_string()), ("plane0000002".to_string(), "superci".to_string())]);
+            assert!(c.find_planes(&[]).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn an_answer_cut_off_or_with_a_header_in_other_bytes_is_read_as_far_as_it_goes() {
+        // (A header's value that is not text is left out of what a recording keeps.)
+        let at = clouds::serve(|_, path, _| match path {
+            p if p.ends_with("/accounts?per_page=50") => {
+                let body = json!({ "success": true, "errors": [], "result": [{ "id": "a1", "name": "Acme" }] }).to_string();
+                let mut a = format!("HTTP/1.1 200 X\r\ncontent-type: application/json\r\nx-odd: ").into_bytes();
+                a.extend_from_slice(b"\xe9t\xe9");
+                a.extend_from_slice(format!("\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes());
+                a
+            }
+            _ => cut(200),
+        });
+        with(&at, || {
+            let c = Cloudflare::new("t");
+            assert_eq!(c.accounts().unwrap(), [("a1".to_string(), "Acme".to_string())]);
+            assert!(c.secret_names("a1", "superci").is_err());
+        });
+    }
+
+    #[test]
+    fn analytics_not_reached_cut_off_or_not_json_is_an_error_and_no_groups_cost_nothing() {
+        with(&clouds::closed(), || assert!(Cloudflare::new("t").container_costs("a1", &[], 0, 1).unwrap_err().starts_with("analytics: ")));
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let k = n.clone();
+        let at = clouds::serve(move |_, _, _| match k.fetch_add(1, std::sync::atomic::Ordering::SeqCst) { 0 => cut(200), 1 => answer(200, "not json"), _ => answer(200, r#"{"data":{"viewer":{"accounts":[{}]}}}"#) });
+        with(&at, || {
+            let c = Cloudflare::new("t");
+            assert!(c.container_costs("a1", &[], 0, 1).is_err());
+            assert!(c.container_costs("a1", &[], 0, 1).is_err());
+            assert!(c.container_costs("a1", &["x".into()], 0, 1).unwrap().is_empty());
+        });
+    }
+
+    /// A Worker at v2 whose container applications cannot be listed: its update stops there, for the control plane and
+    /// for a launcher alike.
+    #[test]
+    fn a_v2_worker_whose_applications_cannot_be_listed_is_not_updated() {
+        let at = clouds::serve(|method, path, _| {
+            if let Some(a) = image_there(method, path) { return a }
+            match path.strip_prefix(API_AT).unwrap_or(path) {
+                "/accounts/acc/workers/scripts/superci/settings" | "/accounts/acc/workers/scripts/superci-runners-p1/settings" => cf(json!({ "bindings": [] })),
+                "/accounts/acc/workers/scripts" => cf(json!([{ "id": "superci", "migration_tag": "v2" }, { "id": "superci-runners-p1", "migration_tag": "v2" }])),
+                "/accounts/acc/containers/image-preparations" => cf(json!({ "status": "ready" })),
+                "/plane.acme.workers.dev/.well-known/jwks.json" => answer(200, r#"{"keys":[]}"#),
+                "/accounts/acc/containers/applications" => refusal("Applications are not available"),
+                _ => answer(500, "no"),
+            }
+        });
+        with(&at, || {
+            let c = Cloudflare::new("t");
+            assert!(c.deploy("acc", "superci", "superci", false).err().unwrap().contains("Applications are not available"));
+            assert!(c.deploy_runners("acc", "https://plane.acme.workers.dev", "p1").unwrap_err().contains("Applications are not available"));
+        });
+    }
+
+    #[test]
+    fn a_launchers_control_plane_whose_keys_are_cut_off_gets_no_launcher() {
+        with(&clouds::serve(|_, _, _| cut(200)), || assert!(Cloudflare::new("t").deploy_runners("acc", "https://plane.acme.workers.dev", "p1").is_err()));
+    }
+
+    /// The runner image: not seen by Cloudflare after ten tries, or not prepared in ten minutes, is said as that.
+    #[test]
+    fn a_runner_image_cloudflare_never_sees_or_never_prepares_is_given_up_on() {
+        for (status, said) in [(None, "does not see the runner image yet"), (Some("preparing"), "took over 10 minutes")] {
+            let at = clouds::serve(move |method, path, _| {
+                if let Some(a) = image_there(method, path) { return a }
+                match status {
+                    None => answer(404, r#"{"success":false,"errors":[{"code":1,"message":"image does not exist"}]}"#),
+                    Some(s) => cf(json!({ "status": s })),
+                }
+            });
+            with(&at, || assert!(Cloudflare::new("t").runner_image("acc").unwrap_err().contains(said), "{said}"));
+        }
+    }
+
+    #[test]
+    fn container_applications_without_the_runners_namespace_are_not_made() {
+        let at = clouds::serve(|_, path, _| if path.ends_with("/containers/applications") { cf(json!([])) } else { cf(json!([{ "script": "other", "class": "JobRunner", "id": "n1" }])) });
+        with(&at, || assert!(Cloudflare::new("t").jobs_application("acc", "superci-jobs", "superci").unwrap_err().contains("did not appear")));
+    }
+
+    #[test]
+    fn registry_credentials_without_a_user_or_a_password_are_refused() {
+        for (given, said) in [(json!({ "password": "p" }), "no registry user"), (json!({ "username": "u" }), "no registry password")] {
+            with(&clouds::serve(move |_, _, _| cf(given.clone())), || assert_eq!(Cloudflare::new("t").registry_push_credentials("acc").unwrap_err(), said));
+        }
+    }
+
+    /// A workers.dev address turned on after a refusal; then the account's subdomain not read, or none yet.
+    #[test]
+    fn a_workers_dev_address_is_asked_again_and_the_accounts_subdomain_must_be_there() {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let k = n.clone();
+        let at = clouds::serve(move |_, path, _| {
+            if path.ends_with("/scripts/superci/subdomain") { return if k.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % 2 == 0 { refusal("does not exist") } else { cf(json!({})) } }
+            if k.load(std::sync::atomic::Ordering::SeqCst) <= 2 { refusal("Subdomain unavailable") } else { cf(json!({})) }
+        });
+        with(&at, || {
+            let c = Cloudflare::new("t");
+            assert!(c.workers_dev("acc", "superci").unwrap_err().contains("Subdomain unavailable"));
+            assert!(c.workers_dev("acc", "superci").unwrap_err().contains("no workers.dev subdomain"));
+        });
+        // Refused ten times: the last refusal is the answer.
+        with(&clouds::serve(|_, _, _| refusal("Subdomain unavailable")), || assert!(Cloudflare::new("t").workers_dev("acc", "superci").unwrap_err().contains("Subdomain unavailable")));
+    }
+
+    #[test]
+    fn a_launcher_whose_applications_cannot_be_listed_is_not_removed() {
+        with(&clouds::serve(|_, _, _| refusal("Applications are not available")), || assert!(Cloudflare::new("t").delete_runners("acc", "p1").unwrap_err().contains("Applications are not available")));
+    }
+
+    #[test]
+    fn a_workers_secrets_are_named() {
+        with(&clouds::serve(|_, _, _| cf(json!([{ "name": "GITHUB_APP" }, { "type": "secret_text" }]))), || assert_eq!(Cloudflare::new("t").secret_names("acc", "superci").unwrap(), ["GITHUB_APP"]));
+    }
+
+    #[test]
+    fn a_sign_in_cloudflare_does_not_answer_or_answers_cut_off_is_an_error_and_not_ended() {
+        let (_, p) = authorize();
+        with(&clouds::closed(), || {
+            assert!(exchange(Pending { verifier: p.verifier.clone(), state: p.state.clone() }, "code").is_err());
+            assert!(!end_sign_in("refresh"));
+        });
+        with(&clouds::serve(|_, _, _| cut(200)), || assert!(exchange(p, "code").is_err()));
+    }
+
+    /// A control plane's answers cut off midway, not JSON, or not given at all: nothing taken from them.
+    #[test]
+    fn a_control_planes_answers_cut_off_or_not_json_are_not_taken() {
+        let plane = clouds::serve(|_, _, _| cut(200));
+        assert_eq!(health(&plane), None);
+        assert!(plane_get(&plane, "k", "/x").is_err());
+        assert!(plane_post(&plane, "k", "/x", &json!({})).is_err());
+        assert!(plane_move_call(&plane, "k", "t", "/x", &json!({})).is_err());
+        assert_eq!(refused(&plane, "k"), None);
+        assert_eq!(status(&plane, "k"), None);
+        let not_json = clouds::serve(|_, _, _| answer(200, "not json"));
+        assert!(plane_get(&not_json, "k", "/x").is_err());
+        assert!(plane_post(&not_json, "k", "/x", &json!({})).is_err());
+        assert_eq!(refused(&clouds::closed(), "k"), None);
     }
 }
 

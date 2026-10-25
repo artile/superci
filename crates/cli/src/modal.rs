@@ -77,7 +77,7 @@ pub struct Month { pub metered: f64, pub billed: f64, pub superci: f64 }
 
 pub fn month(session: &Session) -> Result<Month> {
     let mut c = Client::new(Some(session.clone()))?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs() as i64;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let start = superci_core::plane::month_start_ms(now as u64 * 1000) as i64 / 1000;
     let ts = |seconds: i64| Some(pb::Timestamp { seconds, nanos: 0 });
     let summary: pb::WorkspaceBillingSummaryResponse = c.unary("WorkspaceBillingSummary", pb::WorkspaceBillingSummaryRequest { start_timestamp: ts(start) })?;
@@ -112,7 +112,18 @@ fn api() -> String { std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_emp
 #[cfg(not(debug_assertions))]
 fn api() -> String { API.to_string() }
 
-struct Client { rt: tokio::runtime::Runtime, channel: Option<Channel>, session: Option<Session>, auth_token: Option<String> }
+struct Client { rt: tokio::runtime::Runtime, channel: Channel, session: Option<Session>, auth_token: Option<String> }
+
+/// A call's address on Modal's API (a method's name, one of ours, always makes one).
+fn path(method: &str) -> tonic::codegen::http::uri::PathAndQuery { format!("/modal.client.ModalClient/{method}").parse().expect("a method's name makes a path") }
+
+/// A channel ready for a call. A connected one always is: it connects again by itself when its connection breaks, and
+/// a connection that cannot be made is the call's own error.
+async fn ready(channel: &Channel) -> tonic::client::Grpc<Channel> {
+    let mut grpc = tonic::client::Grpc::new(channel.clone());
+    grpc.ready().await.expect("a connected channel is ready");
+    grpc
+}
 
 impl Client {
     fn new(session: Option<Session>) -> Result<Self> {
@@ -122,7 +133,7 @@ impl Client {
             Endpoint::from_shared(api()).map_err(|e| e.to_string())?.tls_config(ClientTlsConfig::new().with_webpki_roots()).map_err(|e| e.to_string())?
                 .timeout(Duration::from_secs(90)).connect().await.map_err(|e| format!("Modal: {e}"))
         })?;
-        Ok(Client { rt, channel: Some(channel), session, auth_token: None })
+        Ok(Client { rt, channel, session, auth_token: None })
     }
 
     /// In a debug build with `SUPERCI_RECORD`: the call, kept as the test kit answers it (what was asked by its size
@@ -161,11 +172,8 @@ impl Client {
         #[cfg(debug_assertions)]
         let asked = message.encoded_len();
         let req = self.request(message);
-        let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
-        let mut grpc = tonic::client::Grpc::new(self.channel.clone().ok_or("Modal: no connection")?);
         let got: Result<R> = self.rt.block_on(async {
-            grpc.ready().await.map_err(|e| format!("Modal: {e}"))?;
-            grpc.unary(req, path, tonic_prost::ProstCodec::default()).await.map(|r| r.into_inner()).map_err(|s| refused(method, &s))
+            ready(&self.channel).await.unary(req, path(method), tonic_prost::ProstCodec::default()).await.map(|r| r.into_inner()).map_err(|s| refused(method, &s))
         });
         #[cfg(debug_assertions)]
         Self::record(method, asked, got.as_ref().map(|r| vec![r.encode_to_vec()]).map_err(String::as_str));
@@ -177,11 +185,8 @@ impl Client {
         #[cfg(debug_assertions)]
         let asked = message.encoded_len();
         let req = self.request(message);
-        let path: tonic::codegen::http::uri::PathAndQuery = format!("/modal.client.ModalClient/{method}").parse().map_err(|_| "bad method".to_string())?;
-        let mut grpc = tonic::client::Grpc::new(self.channel.clone().ok_or("Modal: no connection")?);
         let got: Result<Vec<R>> = self.rt.block_on(async {
-            grpc.ready().await.map_err(|e| format!("Modal: {e}"))?;
-            let mut s = grpc.server_streaming(req, path, tonic_prost::ProstCodec::default()).await.map_err(|s| refused(method, &s))?.into_inner();
+            let mut s = ready(&self.channel).await.server_streaming(req, path(method), tonic_prost::ProstCodec::default()).await.map_err(|s| refused(method, &s))?.into_inner();
             let mut out = vec![];
             while let Some(m) = s.message().await.map_err(|s| refused(method, &s))? { out.push(m); if out.len() >= limit { break } }
             Ok(out)
@@ -207,18 +212,17 @@ impl Pending {
 /// "API token created"), so it is not asked to: SuperCI asks Modal whether the sign-in was approved (`wait`).
 pub fn authorize(_back: &str) -> Result<Pending> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let port = listener.local_addr().expect("a bound listener has an address").port();
     let mut client = Client::new(None)?;
     let r: pb::TokenFlowCreateResponse = client.unary("TokenFlowCreate", pb::TokenFlowCreateRequest { utm_source: "superci".into(), localhost_port: port as i32, next_url: String::new() })?;
     let flow_id = r.token_flow_id.clone();
     std::thread::spawn(move || {
         let _ = listener.set_nonblocking(false);
-        for stream in listener.incoming().flatten().take(20) {
-            let mut stream = stream;
+        listener.incoming().flatten().take(20).for_each(|mut stream| {
             let mut line = String::new();
             let _ = BufReader::new(&stream).read_line(&mut line);
             let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\naccess-control-allow-origin: *\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", flow_id.len(), flow_id);
-        }
+        });
     });
     Ok(Pending { web_url: r.web_url, flow_id: r.token_flow_id, wait_secret: r.wait_secret })
 }
@@ -335,12 +339,14 @@ fn modal_run(session: &Session, command: &str, script: &str, file: Option<&[u8]>
     })?;
     let mut result = image.result.filter(|r| r.status != 0);
     let mut last = String::new();
-    for _ in 0..30 {
-        if result.is_some() { break }
+    // (Thirty waits of up to 55 seconds each, at most.)
+    let mut waits = 0;
+    while result.is_none() && waits < 30 {
         for m in c.stream::<_, pb::ImageJoinStreamingResponse>("ImageJoinStreaming", pb::ImageJoinStreamingRequest { image_id: image.image_id.clone(), timeout: 55.0, last_entry_id: last.clone() }, 10_000)? {
             if !m.entry_id.is_empty() { last = m.entry_id.clone() }
             if let Some(r) = m.result.filter(|r| r.status != 0) { result = Some(r); break }
         }
+        waits += 1;
     }
     match result { Some(r) if r.status == 1 => {}, Some(r) => return Err(format!("Modal could not build the setup image: {}", r.exception)), None => return Err("Modal's setup image did not finish building".into()) }
 
@@ -360,15 +366,18 @@ fn modal_run(session: &Session, command: &str, script: &str, file: Option<&[u8]>
     if let Some(bytes) = file {
         let encoded = b64.encode(bytes).into_bytes();
         let chunks: Vec<&[u8]> = encoded.chunks(512 * 1024).collect();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let _: pb::Empty = c.unary("SandboxStdinWrite", pb::SandboxStdinWriteRequest { sandbox_id: sandbox.sandbox_id.clone(), input: chunk.to_vec(), index: i as u32 + 1, eof: i + 1 == chunks.len() })?;
-        }
+        chunks.iter().enumerate().try_for_each(|(i, chunk)| {
+            c.unary::<_, pb::Empty>("SandboxStdinWrite", pb::SandboxStdinWriteRequest { sandbox_id: sandbox.sandbox_id.clone(), input: chunk.to_vec(), index: i as u32 + 1, eof: i + 1 == chunks.len() }).map(|_| ())
+        })?;
     }
-    let mut done = None;
-    for _ in 0..18 {
+    // (Eighteen waits of up to 50 seconds each, at most.)
+    let mut waits = 0;
+    let done = loop {
         let w: pb::SandboxWaitResponse = c.unary("SandboxWait", pb::SandboxWaitRequest { sandbox_id: sandbox.sandbox_id.clone(), timeout: 50.0 })?;
-        if let Some(r) = w.result.filter(|r| r.status != 0) { done = Some(r); break }
-    }
+        waits += 1;
+        if let Some(r) = w.result.filter(|r| r.status != 0) { break Some(r) }
+        if waits == 18 { break None }
+    };
     let ok = done.as_ref().is_some_and(|r| r.status == 1 && r.exitcode == 0);
     if !ok {
         let logs = c.stream::<_, pb::TaskLogsBatch>("SandboxGetLogs", pb::SandboxGetLogsRequest { sandbox_id: sandbox.sandbox_id.clone(), file_descriptor: 2, timeout: 5.0, last_entry_id: String::new() }, 50)
@@ -377,6 +386,136 @@ fn modal_run(session: &Session, command: &str, script: &str, file: Option<&[u8]>
         return Err(format!("`{command}` did not succeed ({}): {tail}", done.map(|r| format!("status {}, exit {}", r.status, r.exitcode)).unwrap_or_else(|| "still running".into())));
     }
     Ok(if settings.webhook_suffix.is_empty() { "modal.run".to_string() } else { settings.webhook_suffix })
+}
+
+#[cfg(test)]
+mod answers {
+    use super::*;
+    use crate::aws::clouds::{self, with};
+    use base64::Engine;
+    use prost::Message;
+    use serde_json::{json, Value};
+
+    /// A message as a recording keeps it.
+    fn kept(m: &impl Message) -> String { base64::engine::general_purpose::STANDARD.encode(m.encode_to_vec()) }
+    fn says(messages: Vec<String>) -> Value { json!({ "answers": messages }) }
+    fn refuses(method: &str) -> Value { json!({ "error": format!("Modal {method}: not now") }) }
+
+    /// Modal as a test has it, at the test kit's stand-in: a sign-in it takes, and each method answering as given
+    /// (each answer in its turn, the last one again after).
+    fn modal(given: Vec<(&str, Value)>) -> superci_testkit::Aws {
+        let aws = superci_testkit::Aws::serve();
+        let lines: Vec<String> = std::iter::once(("AuthTokenGet", says(vec![kept(&pb::AuthTokenGetResponse { token: "t".into() })]))).chain(given)
+            .map(|(m, a)| json!({ "method": "POST", "url": format!("https://api.modal.com/modal.client.ModalClient/{m}"), "target": "", "asked": "", "status": 200, "answer": a.to_string() }).to_string()).collect();
+        aws.replaying(&lines.join("\n"), &[]);
+        aws
+    }
+
+    fn session() -> Session { Session { token_id: "ak-test".into(), token_secret: "as-test".into(), workspace: "acmeorg".into() } }
+
+    #[test]
+    fn modals_own_api_is_reached_without_a_stand_in() {
+        with("", || { std::env::remove_var("SUPERCI_STAND_IN"); assert_eq!(api(), API) });
+    }
+
+    /// Modal at an address that is none, one without a host, or one nobody answers at: everything asked of it is an
+    /// error, and a token given by name is not taken.
+    #[test]
+    fn modal_not_reached_is_an_error_wherever_it_is_asked() {
+        for at in ["no address".to_string(), "/no-host".to_string(), clouds::closed()] {
+            with(&at, || {
+                assert!(month(&session()).is_err(), "{at}");
+                assert!(find_planes(&session()).is_err());
+                assert!(put_setting(&session(), "p1", "K", "v").is_err());
+                assert!(delete_runners(&session(), "p1").is_err());
+                assert!(authorize("").is_err());
+                assert!(wait(&Pending::for_test(), 1.0).is_err());
+                std::env::set_var("SUPERCI_MODAL_TOKEN_ID", "ak-test");
+                assert!(Session::from_env().is_none());
+                std::env::set_var("SUPERCI_MODAL_TOKEN_SECRET", "as-test");
+                assert!(Session::from_env().is_none());
+                std::env::remove_var("SUPERCI_MODAL_TOKEN_ID");
+                std::env::remove_var("SUPERCI_MODAL_TOKEN_SECRET");
+            });
+        }
+    }
+
+    /// This month at Modal: its report refused, or broken off midway, is an error; a report of nothing is nothing.
+    #[test]
+    fn a_month_whose_report_is_refused_or_breaks_off_is_an_error() {
+        let summary = ("WorkspaceBillingSummary", says(vec![kept(&pb::WorkspaceBillingSummaryResponse { metered_cost: "1.5".into(), billed_cost: "0".into(), adjustments: Default::default() })]));
+        let item = kept(&pb::WorkspaceBillingReportItem { object_id: "ap-1".into(), description: "superci-plane-p1".into(), cost: "0.5".into() });
+        let month_of = |report: Value| { let aws = modal(vec![summary.clone(), ("WorkspaceBillingReport", report)]); with(&aws.url, || month(&session())) };
+        assert!(month_of(refuses("WorkspaceBillingReport")).is_err());
+        assert!(month_of(json!({ "answers": [item], "error": "Modal WorkspaceBillingReport: broken off" })).unwrap_err().contains("broken off"));
+        assert_eq!(month_of(says(vec![])).unwrap(), Month { metered: 1.5, billed: 0.0, superci: 0.0 });
+    }
+
+    /// The browser sign-in: the page's check of this computer is answered with the flow's id; Modal refusing to
+    /// start one, or to say whether it was approved, is an error.
+    #[test]
+    fn a_sign_in_is_answered_on_this_computer_and_modals_refusals_are_errors() {
+        let created = ("TokenFlowCreate", says(vec![kept(&pb::TokenFlowCreateResponse { token_flow_id: "tf-1".into(), web_url: "https://modal.com/token-flow/tf-1".into(), code: String::new(), wait_secret: "w".into() })]));
+        let aws = modal(vec![created, ("TokenFlowWait", refuses("TokenFlowWait"))]);
+        let p = with(&aws.url, || authorize("")).unwrap();
+        let asked = aws.asked.lock().unwrap().iter().find(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/TokenFlowCreate"))).cloned().unwrap();
+        let request = pb::TokenFlowCreateRequest::decode(&base64::engine::general_purpose::STANDARD.decode(asked["asked"].as_str().unwrap()).unwrap()[..]).unwrap();
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", request.localhost_port as u16)).unwrap();
+        use std::io::Read;
+        write!(s, "GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut said = String::new();
+        let _ = s.read_to_string(&mut said);
+        assert!(said.ends_with("tf-1"), "{said}");
+        assert!(with(&aws.url, || wait(&p, 1.0)).err().unwrap().contains("not now"));
+        let refused = modal(vec![("TokenFlowCreate", refuses("TokenFlowCreate"))]);
+        assert!(with(&refused.url, || authorize("")).is_err());
+    }
+
+    /// A process out of open files: neither the sign-in's listener nor a connection to Modal can be made, and each is
+    /// an error. (Run in a process of its own, its limit lowered for those calls alone: the other tests open files.)
+    #[test]
+    fn modal_cannot_be_reached_from_a_process_out_of_open_files() {
+        if std::env::var_os("SUPERCI_TEST_OUT_OF_FILES").is_none() {
+            let o = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "modal::answers::modal_cannot_be_reached_from_a_process_out_of_open_files", "--test-threads=1"]).env("SUPERCI_TEST_OUT_OF_FILES", "1").output().unwrap();
+            let said = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success() && said.contains("1 passed"), "{said}");
+            return;
+        }
+        let mut was = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut was) };
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &libc::rlimit { rlim_cur: 0, rlim_max: was.rlim_max }) };
+        let (signed_in, billed) = (authorize("").map(|_| ()), month(&session()));
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &was) };
+        assert!(signed_in.is_err() && billed.is_err(), "{signed_in:?} {billed:?}");
+    }
+
+    #[test]
+    fn a_setting_named_past_60_kb_is_not_written() {
+        let aws = modal(vec![("DictGetOrCreate", says(vec![kept(&pb::DictGetOrCreateResponse { dict_id: "di-1".into() })]))]);
+        assert_eq!(with(&aws.url, || put_setting(&session(), "p1", &"K".repeat(60_000), "v")).unwrap_err(), "a setting longer than 60 kB");
+    }
+
+    /// Modal's setup image that never finishes building (or whose build cannot be followed), and a sandbox that never
+    /// ends: each said, the sandbox with the last of what it wrote.
+    #[test]
+    fn a_setup_image_never_built_or_a_sandbox_never_ended_is_said() {
+        let start = |image: pb::ImageGetOrCreateResponse, join: Value| vec![("EnvironmentGetOrCreate", says(vec![String::new()])), ("AppGetOrCreate", says(vec![kept(&pb::AppGetOrCreateResponse { app_id: "ap-1".into() })])),
+            ("ImageGetOrCreate", says(vec![kept(&image)])), ("ImageJoinStreaming", join)];
+        let building = pb::ImageGetOrCreateResponse { image_id: "im-1".into(), result: None };
+        let aws = modal(start(building.clone(), says(vec![])));
+        assert_eq!(with(&aws.url, || delete_runners(&session(), "p1")).unwrap_err(), "Modal's setup image did not finish building");
+        let aws = modal(start(building, refuses("ImageJoinStreaming")));
+        assert!(with(&aws.url, || delete_runners(&session(), "p1")).unwrap_err().contains("ImageJoinStreaming"));
+        let built = pb::ImageGetOrCreateResponse { image_id: "im-1".into(), result: Some(pb::GenericResult { status: 1, exception: String::new(), exitcode: 0 }) };
+        let mut given = start(built, says(vec![]));
+        given.extend([("SandboxCreate", says(vec![kept(&pb::SandboxCreateResponse { sandbox_id: "sb-1".into() })])), ("SandboxWait", says(vec![kept(&pb::SandboxWaitResponse { result: None })])),
+            ("SandboxGetLogs", says(vec![kept(&pb::TaskLogsBatch { items: vec![pb::TaskLogs { data: "deploying\n".into() }], entry_id: "1".into(), eof: true })]))]);
+        let aws = modal(given);
+        // (An empty file is given as none: nothing on the sandbox's input.)
+        let said = with(&aws.url, || modal_run(&session(), "modal deploy app.py", "", Some(b""))).unwrap_err();
+        assert!(said.contains("still running") && said.contains("deploying"), "{said}");
+    }
 }
 
 #[cfg(test)]

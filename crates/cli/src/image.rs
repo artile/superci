@@ -28,7 +28,9 @@ struct Registry { agent: ureq::Agent, base: String, basic: Option<String>, beare
 
 impl Registry {
     fn send(&mut self, method: &str, url: &str, headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<Answer> {
-        for attempt in 0..2 {
+        // (Asked again once, after the token a 401 asks for; a second 401 is its answer.)
+        let mut authenticated = false;
+        loop {
             let url = if url.starts_with("http") { url.to_string() } else { format!("{}{url}", self.base) };
             let mut b = ureq::http::Request::builder().method(method).uri(crate::aws::stand_in(&url).as_str());
             for (k, v) in headers { b = b.header(*k, *v) }
@@ -37,8 +39,9 @@ impl Registry {
             let mut r = self.agent.run(req).map_err(|e| format!("{method} {url}: {e}"))?;
             let h = |n: &str| r.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
             let answer = Answer { status: r.status().as_u16(), location: h("location"), content_type: h("content-type"), challenge: h("www-authenticate"), body: vec![] };
-            if answer.status == 401 && attempt == 0 {
+            if answer.status == 401 && !authenticated {
                 self.authenticate(answer.challenge.as_deref().unwrap_or_default())?;
+                authenticated = true;
                 continue;
             }
             let body = if method == "HEAD" { vec![] } else { r.body_mut().with_config().limit(64 * 1024 * 1024).read_to_vec().map_err(|e| e.to_string())? };
@@ -50,7 +53,6 @@ impl Registry {
             }
             return Ok(Answer { body, ..answer });
         }
-        Err(format!("{method} {url}: not allowed"))
     }
 
     /// The registry's challenge: `Bearer realm="…",service="…",scope="…"` → a token from the realm.
@@ -130,17 +132,14 @@ fn copy_blob(github: &mut Registry, cloudflare: &mut Registry, repo: &str, diges
     let start = cloudflare.send("POST", &format!("/v2/{repo}/blobs/uploads/"), &[("content-length", "0")], Some(&[]))?;
     let mut location = start.location.ok_or("Cloudflare's registry gave no upload location")?;
     let mut offset: u64 = 0;
-    let mut chunk = vec![0u8; CHUNK];
+    let mut chunk = Vec::with_capacity(CHUNK);
     loop {
-        let mut filled = 0;
-        while filled < CHUNK {
-            let n = reader.read(&mut chunk[filled..]).map_err(|e| e.to_string())?;
-            if n == 0 { break }
-            filled += n;
-        }
+        chunk.clear();
+        (&mut reader).take(CHUNK as u64).read_to_end(&mut chunk).map_err(|e| e.to_string())?;
+        let filled = chunk.len();
         if filled == 0 { break }
         let range = format!("{}-{}", offset, offset + filled as u64 - 1);
-        let r = cloudflare.send("PATCH", &location, &[("content-type", "application/octet-stream"), ("content-range", &range)], Some(&chunk[..filled]))?;
+        let r = cloudflare.send("PATCH", &location, &[("content-type", "application/octet-stream"), ("content-range", &range)], Some(&chunk))?;
         if r.status >= 300 { return Err(format!("Cloudflare's registry refused a layer chunk: {} {}", r.status, String::from_utf8_lossy(&r.body))) }
         location = r.location.unwrap_or(location);
         offset += filled as u64;
@@ -150,4 +149,91 @@ fn copy_blob(github: &mut Registry, cloudflare: &mut Registry, repo: &str, diges
     let done = cloudflare.send("PUT", &format!("{location}{separator}digest={digest}"), &[("content-length", "0")], Some(&[]))?;
     if done.status >= 300 { return Err(format!("Cloudflare's registry refused layer {digest}: {} {}", done.status, String::from_utf8_lossy(&done.body))) }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aws::clouds::{self, answer, cf, cut, with};
+    use serde_json::json;
+
+    const INDEX: &str = r#"{"manifests":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:arm"},{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:amd"}]}"#;
+    const MANIFEST: &str = r#"{"config":{"digest":"sha256:cfg","size":5},"layers":[]}"#;
+    const INDEX_AT: &str = "GET /ghcr.io/v2/actions/actions-runner/manifests/latest";
+
+    /// An answer with these headers too.
+    fn answer_with(status: u16, headers: &str, body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status} X\r\n{headers}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).into_bytes()
+    }
+
+    /// GitHub's registry and the account's (`acc`) as a copy of the runner image meets them: GitHub's asks for a token
+    /// first, the image has one layer, and Cloudflare's registry has none of it. What a request ("METHOD address") starts with in `given` is answered
+    /// as given there instead (nothing: its connection closed unanswered).
+    fn registries(given: Vec<(&'static str, Vec<u8>)>) -> String {
+        let challenged = std::sync::atomic::AtomicBool::new(false);
+        clouds::serve(move |method, path, _| {
+            let asked = format!("{method} {path}");
+            if let Some((_, a)) = given.iter().find(|(p, _)| asked.starts_with(p)) { return a.clone() }
+            if asked == INDEX_AT && !challenged.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return answer_with(401, r#"www-authenticate: Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:actions/actions-runner:pull""#, "")
+            }
+            match (method, path) {
+                ("GET", "/ghcr.io/token?service=ghcr.io&scope=repository%3Aactions%2Factions-runner%3Apull") => answer(200, r#"{"token":"t"}"#),
+                ("GET", "/ghcr.io/v2/actions/actions-runner/manifests/latest") => answer(200, INDEX),
+                ("GET", "/ghcr.io/v2/actions/actions-runner/manifests/sha256:amd") => answer_with(200, "content-type: application/vnd.oci.image.manifest.v1+json", MANIFEST),
+                ("GET", "/ghcr.io/v2/actions/actions-runner/blobs/sha256:cfg") => answer(200, "layer"),
+                ("POST", p) if p.ends_with("/credentials") => cf(json!({ "username": "u", "password": "p" })),
+                ("HEAD", _) => answer(404, ""),
+                ("POST", "/registry.cloudflare.com/v2/acc/superci-runner/blobs/uploads/") => answer_with(202, "location: /v2/acc/superci-runner/blobs/uploads/u1", ""),
+                ("PATCH", "/registry.cloudflare.com/v2/acc/superci-runner/blobs/uploads/u1") => answer_with(202, "location: /v2/acc/superci-runner/blobs/uploads/u1?part=2", ""),
+                ("PUT", "/registry.cloudflare.com/v2/acc/superci-runner/blobs/uploads/u1?part=2&digest=sha256:cfg") => answer(201, ""),
+                ("PUT", "/registry.cloudflare.com/v2/acc/superci-runner/manifests/gh-latest") => answer(201, ""),
+                _ => answer(500, "the test has no answer for it"),
+            }
+        })
+    }
+
+    fn copy(given: Vec<(&'static str, Vec<u8>)>) -> Result<String> { with(&registries(given), || copy_runner_image(&Cloudflare::new("t"), "acc")) }
+
+    #[test]
+    fn the_runner_image_is_copied_layer_by_layer_and_pinned_by_its_manifest() {
+        assert!(copy(vec![]).unwrap().starts_with("registry.cloudflare.com/acc/superci-runner@sha256:"));
+        // A single image (no index) is the one copied; a manifest naming no layer leaves only itself to copy.
+        assert!(copy(vec![(INDEX_AT, answer(200, "{}"))]).is_ok());
+    }
+
+    /// Whichever exchange of a copy gets no answer, or an answer cut off, the copy fails saying so.
+    #[test]
+    fn a_copy_fails_at_whichever_exchange_goes_unanswered_or_is_cut_off() {
+        for at in ["HEAD /registry.cloudflare.com/v2/acc/superci-runner/manifests", "HEAD /registry.cloudflare.com/v2/acc/superci-runner/blobs", "GET /ghcr.io/v2/actions/actions-runner/blobs",
+            "POST /registry.cloudflare.com/v2/acc/superci-runner/blobs/uploads", "PATCH", "PUT /registry.cloudflare.com/v2/acc/superci-runner/blobs", "PUT /registry.cloudflare.com/v2/acc/superci-runner/manifests"] {
+            assert!(copy(vec![(at, vec![])]).is_err(), "{at}");
+        }
+        assert!(copy(vec![(INDEX_AT, cut(200))]).is_err());
+        assert!(copy(vec![("GET /ghcr.io/v2/actions/actions-runner/blobs", cut(200))]).is_err());
+        // An upload address that is no address.
+        assert!(copy(vec![("POST /registry.cloudflare.com/v2/acc/superci-runner/blobs/uploads", answer_with(202, "location: /v2/x y", ""))]).is_err());
+    }
+
+    #[test]
+    fn manifests_that_are_not_json_or_have_no_linux_amd64_image_are_not_copied() {
+        assert!(copy(vec![(INDEX_AT, answer(200, "not json"))]).is_err());
+        assert_eq!(copy(vec![(INDEX_AT, answer(200, r#"{"manifests":[]}"#))]).unwrap_err(), "no linux/amd64 runner image");
+        assert!(copy(vec![("GET /ghcr.io/v2/actions/actions-runner/manifests/sha256:amd", answer(200, "not json"))]).is_err());
+        // (A layer without its digest is none to copy.)
+        assert!(copy(vec![("GET /ghcr.io/v2/actions/actions-runner/manifests/sha256:amd", answer(200, r#"{"config":{"size":1}}"#))]).is_ok());
+    }
+
+    /// GitHub's registry asking for a token from a realm that is no address, does not answer, answers cut off, not
+    /// JSON or without a token: the copy fails.
+    #[test]
+    fn a_token_the_registrys_realm_does_not_give_fails_the_copy() {
+        let challenge = |realm: &str| answer_with(401, &format!(r#"www-authenticate: Bearer realm="{realm}",service="ghcr.io""#), "");
+        let closed = format!("{}/token", clouds::closed());
+        // (A token that still leaves GitHub's registry refusing: its refusal is the answer.)
+        assert_eq!(copy(vec![(INDEX_AT, challenge("https://ghcr.io/token")), ("GET /ghcr.io/token", answer(200, r#"{"token":"t"}"#))]).unwrap_err(), "GitHub's registry: 401 for the runner image");
+        for (realm, token) in [("::no address", answer(200, "{}")), (closed.as_str(), answer(200, "{}")), ("https://ghcr.io/token", cut(200)), ("https://ghcr.io/token", answer(200, "not json")), ("https://ghcr.io/token", answer(200, "{}"))] {
+            assert!(copy(vec![(INDEX_AT, challenge(realm)), ("GET /ghcr.io/token", token)]).is_err(), "{realm}");
+        }
+    }
 }

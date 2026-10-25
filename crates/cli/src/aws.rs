@@ -58,7 +58,7 @@ pub(crate) fn record(r: &Request, status: u16, headers: &[(String, String)], bod
     use std::io::Write;
     // (One line at a time: questions are asked side by side.)
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) { let _ = f.write_all(format!("{line}\n").as_bytes()); }
 }
 
@@ -259,20 +259,16 @@ pub fn make_networks(creds: &Credentials, plane_id: &str, regions: &[String]) ->
             if let Err(e) = make_cache(&http, r, creds, plane_id) { eprintln!("The cache in {r} was not set up: {e}") }
             Ok(())
         })).collect();
-        each.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("making a network stopped".into()))).collect()
+        each.into_iter().map(|h| h.join().unwrap_or(Err("making a network stopped".into()))).collect()
     });
     made.into_iter().collect()
 }
 
 fn make_cache(http: &Blocking, region: &str, creds: &Credentials, plane_id: &str) -> Result<()> {
     futures::executor::block_on(aws::make_bucket(http, region, creds, plane_id, now_ms()))?;
-    for (arch, program) in CACHE_PROGRAMS {
-        futures::executor::block_on(aws::put_once(http, region, creds, plane_id, &superci_core::cache::program_key(arch), program, now_ms()))?;
-    }
-    for (arch, program) in superci_programs_layers::LAYERS {
-        futures::executor::block_on(aws::put_once(http, region, creds, plane_id, &superci_core::cache::layers_key(arch), program, now_ms()))?;
-    }
-    Ok(())
+    let put = |key: String, program: &[u8]| futures::executor::block_on(aws::put_once(http, region, creds, plane_id, &key, program, now_ms()));
+    CACHE_PROGRAMS.iter().try_for_each(|(arch, program)| put(superci_core::cache::program_key(arch), program))?;
+    superci_programs_layers::LAYERS.iter().try_for_each(|(arch, program)| put(superci_core::cache::layers_key(arch), program))
 }
 
 
@@ -299,7 +295,7 @@ pub fn delete_networks(creds: &Credentials, plane_id: &str, regions: &[&str]) ->
                 done => done.map_err(|e| format!("{r}: the cache bucket: {e}")),
             }
         })).collect();
-        each.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("removing a network stopped".into()))).collect()
+        each.into_iter().map(|h| h.join().unwrap_or(Err("removing a network stopped".into()))).collect()
     });
     done.into_iter().collect()
 }
@@ -400,8 +396,8 @@ impl Look {
     /// What AWS said in place of an answer, when it said of no region whether the account may work there (the
     /// sign-in was over, or AWS did not answer): nothing is known of the account then.
     pub fn unanswered(&self) -> Option<&str> {
-        if self.regions.iter().any(|(_, a)| !matches!(a, Answer::Unknown(_))) { return None }
-        self.regions.iter().find_map(|(_, a)| match a { Answer::Unknown(e) => Some(e.as_str()), _ => None })
+        let said: Option<Vec<&str>> = self.regions.iter().map(|(_, a)| match a { Answer::Unknown(e) => Some(e.as_str()), _ => None }).collect();
+        said?.first().copied()
     }
 
     pub fn kind(&self) -> Kind {
@@ -449,8 +445,8 @@ pub fn look_with<H: Http>(http: &(dyn Fn() -> H + Sync), creds: &Credentials) ->
     look.images = found.iter().map(|(r, image)| (r.clone(), match image { Ok(_) => Some(true), Err(e) if e.starts_with("no image ") => Some(false), Err(_) => None })).collect();
     // The rest is asked in one region: the first that has the image, else the first allowed.
     let Some(region) = look.usable_regions().first().or(allowed.first().map(String::as_str).as_ref()).map(|r| r.to_string()) else { return look };
-    let ours = found.into_iter().find(|(r, _)| *r == region).map(|(_, image)| image).unwrap_or_else(|| Err("not asked".into()));
-    let kind = superci_core::spec::aws_instance_types(&superci_core::spec::Spec::default()).into_iter().next().unwrap_or_else(|| "c8a.xlarge".into());
+    let ours = found.into_iter().find(|(r, _)| *r == region).map(|(_, image)| image).unwrap_or(Err("not asked".into()));
+    let kind = superci_core::spec::aws_instance_types(&superci_core::spec::Spec::default()).into_iter().next().unwrap_or("c8a.xlarge".into());
     // A dry run has to name an image that exists: where ours is not, Amazon's own Linux (its id is a public
     // parameter in every region).
     let image = match ours {
@@ -499,7 +495,8 @@ pub fn published_image<H: Http>(http: &H) -> Result<(String, Vec<(String, String
     let releases: serde_json::Value = serde_json::from_slice(&answer.body).map_err(|e| format!("The list of runner images from GitHub could not be read: {e}"))?;
     releases.as_array().into_iter().flatten().find_map(|r| {
         let published = aws::published_images(r["body"].as_str()?, &flavor);
-        let stamp = r["tag_name"].as_str()?.rsplit('-').next()?.to_string();
+        let tag = r["tag_name"].as_str()?;
+        let stamp = tag.rsplit('-').next().unwrap_or(tag).to_string();
         (!published.is_empty() && stamp.len() >= 8 && stamp.bytes().all(|b| b.is_ascii_digit())).then_some((stamp, published))
     }).ok_or_else(|| format!("The maker's list of runner images has no {flavor} image now. Name one yourself: --from=REGION:ami-…"))
 }
@@ -561,10 +558,12 @@ pub fn build_day(stamp: &str) -> String {
     }
 }
 
+/// The newest build last read, and when.
+static NEWEST: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
+
 /// The newest build its maker lists (asked at most every six hours: the list is GitHub's, read with no sign-in).
 pub fn newest_build() -> Option<String> {
-    static KNOWN: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
-    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut known = NEWEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((at, stamp)) = known.as_ref().filter(|(at, _)| now_ms() < at + 6 * 3_600_000) { let _ = at; return Some(stamp.clone()) }
     let stamp = published_image(&Blocking::new()).ok()?.0;
     *known = Some((now_ms(), stamp.clone()));
@@ -587,7 +586,7 @@ fn amz_stamp() -> String { aws::amz_date(now_ms()).chars().filter(|c| c.is_ascii
 /// The policy in an IAM GetRolePolicy answer (URL-encoded JSON in XML).
 fn policy_document(xml: &str) -> Option<serde_json::Value> {
     let encoded = aws::xml_tag(xml, "PolicyDocument")?;
-    let decoded = url::form_urlencoded::parse(format!("d={}", encoded.replace('+', "%2B")).as_bytes()).next()?.1.to_string();
+    let decoded: String = url::form_urlencoded::parse(format!("d={}", encoded.replace('+', "%2B")).as_bytes()).map(|(_, v)| v).collect();
     serde_json::from_str(&decoded).ok()
 }
 
@@ -760,6 +759,223 @@ pub mod replay {
             })
         }
     }
+}
+
+/// Clouds answering as a test has them, on this computer, for code that reaches them over HTTP itself (Cloudflare's
+/// API, registries, a control plane's address): a server answering each request with what `answer` makes of it, and
+/// every outside address sent there (`SUPERCI_STAND_IN`) while `with` runs. Where they go is the process's, so one
+/// such test at a time.
+#[cfg(test)]
+pub mod clouds {
+    use std::io::{Read, Write};
+
+    /// A whole HTTP answer: its status and body (JSON, by its first character; else text).
+    pub fn answer(status: u16, body: &str) -> Vec<u8> {
+        let kind = if body.starts_with('{') || body.starts_with('[') { "application/json" } else { "text/plain" };
+        format!("HTTP/1.1 {status} X\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).into_bytes()
+    }
+
+    /// An answer cut off midway: it says more is coming than comes before its connection closes.
+    pub fn cut(status: u16) -> Vec<u8> { format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{{\"part").into_bytes() }
+
+    /// Cloudflare's envelope around a result.
+    pub fn cf(result: serde_json::Value) -> Vec<u8> { answer(200, &serde_json::json!({ "success": true, "errors": [], "result": result }).to_string()) }
+
+    /// A server answering each request (its method, address and body) with what `answer` makes of it. Its address.
+    pub fn serve(answer: impl Fn(&str, &str, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> String { listen(move |method, path, _, body| answer(method, path, body)) }
+
+    /// AWS as a test has it: each call answered with what `answer` makes of what it asks (its target, its action, or
+    /// its method and address for an API by address, Lambda's) and its body.
+    pub fn serve_aws(answer: impl Fn(&str, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> String {
+        listen(move |method, path, head, body| {
+            let target = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("x-amz-target")).map(|(_, t)| t.trim().to_string()));
+            let action = String::from_utf8_lossy(body).split('&').find_map(|kv| kv.strip_prefix("Action=").map(str::to_string));
+            answer(&target.or(action).unwrap_or_else(|| format!("{method} {path}")), body)
+        })
+    }
+
+    /// AWS's error for a JSON API (`kind`), or for a query API (IAM's) when `kind` is said with `query:`.
+    pub fn aws_error(kind: &str) -> Vec<u8> {
+        match kind.strip_prefix("query:") {
+            Some(code) => answer(400, &format!("<ErrorResponse><Error><Code>{code}</Code><Message>Refused.</Message></Error></ErrorResponse>")),
+            None => answer(400, &serde_json::json!({ "__type": kind, "message": "Refused." }).to_string()),
+        }
+    }
+
+    fn listen(answer: impl Fn(&str, &str, &str, &[u8]) -> Vec<u8> + Send + Sync + 'static) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let answer = std::sync::Arc::new(answer);
+        std::thread::spawn(move || for mut s in listener.incoming().flatten() {
+            let answer = answer.clone();
+            std::thread::spawn(move || {
+                let mut got = vec![];
+                let mut buf = [0u8; 65536];
+                let head = loop {
+                    let Ok(n) = s.read(&mut buf) else { return };
+                    if n == 0 { return }
+                    got.extend_from_slice(&buf[..n]);
+                    if let Some(at) = got.windows(4).position(|w| w == b"\r\n\r\n") { break at + 4 }
+                };
+                let text = String::from_utf8_lossy(&got[..head]).to_string();
+                let length: usize = text.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
+                while got.len() < head + length { let Ok(n) = s.read(&mut buf) else { return }; if n == 0 { break } got.extend_from_slice(&buf[..n]); }
+                let mut first = text.split_whitespace();
+                let (method, path) = (first.next().unwrap_or_default().to_string(), first.next().unwrap_or_default().to_string());
+                let _ = s.write_all(&answer(&method, &path, &text, &got[head..]));
+            });
+        });
+        url
+    }
+
+    /// An address nobody answers at.
+    pub fn closed() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// `f` run with every outside address sent to `at` (and no pause between tries), one such test at a time.
+    pub fn with<T>(at: &str, f: impl FnOnce() -> T) -> T {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SUPERCI_STAND_IN", at);
+        std::env::set_var("SUPERCI_PAUSE_MS", "0");
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::remove_var("SUPERCI_STAND_IN");
+        std::env::remove_var("SUPERCI_PAUSE_MS");
+        out.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    }
+}
+
+#[cfg(test)]
+mod answers {
+    use super::clouds::{self, answer, aws_error, cut, with};
+    use super::replay::Replay;
+    use super::*;
+
+    fn creds() -> Credentials { Credentials { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "secret".into(), session_token: None, expires_at_ms: 0 } }
+
+    /// The maker's list of builds, with one image published only in `region`.
+    fn releases(region: &str) -> String {
+        serde_json::json!([{ "tag_name": "v2.2-20261006080949" }, { "body": "no tag" },
+            { "tag_name": "v2.2-20261006080949", "body": format!("### `ubuntu24-full-x64`\n| Region | AMI |\n| --- | --- |\n| {region} | `ami-0123456789abcdef0` |\n") }]).to_string()
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_made_or_whose_answer_is_cut_off_is_an_error_and_an_answers_telling_headers_are_recorded() {
+        assert!(futures::executor::block_on(Blocking::new().send(Request::new("GET", "http://no where/"))).is_err());
+        assert!(futures::executor::block_on(Blocking::new().send(Request::new("GET", &clouds::serve(|_, _, _| cut(200))))).is_err());
+        // (A header's value that is not text is left out; one that tells what kind of error, kept.)
+        let at = clouds::serve(|_, _, _| {
+            let mut a = b"HTTP/1.1 400 X\r\nx-amzn-errortype: ThrottlingException\r\nx-odd: ".to_vec();
+            a.extend_from_slice(b"\xe9\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}");
+            a
+        });
+        let file = std::env::temp_dir().join(format!("superci-record-{}", superci_core::crypto::random_id(6)));
+        let r = with(&at, || {
+            std::env::set_var("SUPERCI_RECORD", &file);
+            let r = futures::executor::block_on(Blocking::new().send(Request::new("POST", &format!("{at}/")).with_body("Action=X")));
+            std::env::remove_var("SUPERCI_RECORD");
+            r
+        });
+        assert_eq!(r.unwrap().header("x-odd"), None);
+        let line: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(line["headers"], serde_json::json!([["x-amzn-errortype", "ThrottlingException"]]));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// AWS's sign-in answering without the credentials, with an id token that is not one, or without what renews
+    /// it: refused, but for what renews it, which a renewal may leave as it was.
+    #[test]
+    fn a_sign_in_answer_without_its_credentials_or_with_a_broken_id_token_is_refused() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(s);
+        let full = || serde_json::json!({ "accessToken": { "accessKeyId": "ASIAX", "secretAccessKey": "s", "sessionToken": "t" }, "refreshToken": "r" });
+        let from = |v: &serde_json::Value, previous: Option<&Session>| session_from("us-east-1", SigningKeyStore::generate(), v, previous);
+        for missing in ["accessKeyId", "secretAccessKey", "sessionToken"] {
+            let mut v = full();
+            v["accessToken"].as_object_mut().unwrap().remove(missing);
+            assert_eq!(from(&v, None).err().unwrap(), format!("AWS sign-in answer without {missing}"));
+        }
+        for id in ["no-dots".to_string(), "a.!!!.c".to_string(), format!("a.{}.c", b64("not json"))] {
+            let mut v = full();
+            v["idToken"] = id.clone().into();
+            assert!(from(&v, None).is_err(), "{id}");
+        }
+        // Nobody named, nothing before: no account; nothing to renew with is refused unless one was there before.
+        let first = from(&full(), None).unwrap();
+        assert_eq!((first.who.as_str(), first.account_id.as_str()), ("", ""));
+        let mut v = full();
+        v.as_object_mut().unwrap().remove("refreshToken");
+        assert_eq!(from(&v, None).err().unwrap(), "no refresh token");
+        assert_eq!(from(&v, Some(&first)).unwrap().refresh_token, "r");
+    }
+
+    /// A renewal AWS does not answer, or answers without credentials: an error, and the sign-in not taken as ended.
+    #[test]
+    fn a_renewal_aws_does_not_answer_or_answers_without_credentials_is_an_error() {
+        let session = || Session { region: "us-east-1".into(), account_id: "111111111111".into(), who: String::new(), creds: creds(), refresh_token: "r".into(), dpop: SigningKeyStore::generate() };
+        with(&clouds::closed(), || assert!(!session().credentials().unwrap_err().starts_with(ENDED)));
+        with(&clouds::serve(|_, _, _| answer(200, "{}")), || assert_eq!(session().credentials().unwrap_err(), "AWS sign-in answer without accessKeyId"));
+    }
+
+    #[test]
+    fn a_control_plane_address_that_is_none_connects_and_disconnects_nothing() {
+        assert_eq!(connect_runners(&creds(), "111111111111", "no address", "p1", "aud").unwrap_err(), "bad control plane URL");
+        assert_eq!(disconnect_runners(&creds(), "111111111111", "no address", "p1").unwrap_err(), "bad control plane URL");
+    }
+
+    #[test]
+    fn a_runner_role_there_already_whose_trust_cannot_be_updated_is_an_error() {
+        let at = clouds::serve_aws(|what, _| match what {
+            "CreateRole" => aws_error("query:EntityAlreadyExists"),
+            "UpdateAssumeRolePolicy" => aws_error("query:ServiceFailure"),
+            _ => answer(200, "<Ok/>"),
+        });
+        with(&at, || assert!(connect_runners(&creds(), "111111111111", "https://plane.example", "p1", "aud").unwrap_err().starts_with("ServiceFailure")));
+    }
+
+    #[test]
+    fn a_low_limit_is_not_known_without_the_on_demand_limit_where_spot_is_refused_and_no_region_is_no_answer() {
+        let refused = aws::Refusal { action: "ec2:RunInstances".into(), by: aws::By::Identity, policy: String::new() };
+        let look = Look { regions: vec![], asked_in: Some("us-east-1".into()), spot: Some(Answer::Refused(refused)), on_demand: None, spot_cpus: Some(5), on_demand_cpus: None, images: vec![], organization_id: None, management_account: None };
+        assert_eq!((look.low_limit(), look.unanswered()), (None, None));
+    }
+
+    /// The maker's list of builds: not JSON, or with no build of the image, is said as that; a build without its
+    /// notes or its tag is passed over.
+    #[test]
+    fn the_makers_list_is_read_for_the_newest_build_of_the_image() {
+        let listed = |status: u16, body: &str| Replay::of(&serde_json::json!({ "method": "GET", "url": IMAGE_LIST, "target": "", "asked": "", "status": status, "answer": body }).to_string());
+        assert!(published_image(&listed(200, "not json")).unwrap_err().starts_with("The list of runner images from GitHub could not be read"));
+        assert!(published_image(&listed(200, "[]")).unwrap_err().starts_with("The maker's list of runner images has no ubuntu24-full-x64 image now"));
+        assert_eq!(published_image(&listed(200, &releases("us-east-1"))).unwrap(), ("20261006080949".to_string(), vec![("us-east-1".to_string(), "ami-0123456789abcdef0".to_string())]));
+        // Published only where the copy would go: nowhere to copy it from.
+        with(&clouds::serve(|_, _, _| answer(200, &releases("us-east-1"))), || assert_eq!(copy_source_for("us-east-1", None).unwrap_err(), "The image is published in no other region to copy it from."));
+    }
+
+    /// The newest build: not known while GitHub does not answer; once read, kept for six hours.
+    #[test]
+    fn the_newest_build_is_kept_once_read() {
+        *NEWEST.lock().unwrap() = None;
+        with(&clouds::closed(), || assert_eq!(newest_build(), None));
+        with(&clouds::serve(|_, _, _| answer(200, &releases("eu-west-1"))), || assert_eq!(newest_build().as_deref(), Some("20261006080949")));
+        with(&clouds::closed(), || assert_eq!(newest_build().as_deref(), Some("20261006080949")));
+    }
+
+    #[test]
+    fn copies_aws_does_not_list_or_remove_are_an_error() {
+        let listed = "<DescribeImagesResponse><imagesSet><item><imageId>ami-0123456789abcdef0</imageId><name>runs-on-v2.2-ubuntu24-full-x64-20261006080949</name><imageState>available</imageState></item></imagesSet></DescribeImagesResponse>";
+        for failing in ["DescribeImages", "DeregisterImage"] {
+            let at = clouds::serve_aws(move |what, _| if what == failing { aws_error("query:InternalError") } else { answer(200, listed) });
+            with(&at, || assert!(delete_copied_images(&creds(), "eu-west-1").unwrap_err().starts_with("eu-west-1: InternalError"), "{failing}"));
+        }
+        let at = clouds::serve_aws(|_, _| aws_error("query:InternalError"));
+        with(&at, || assert!(tidy_copies(&creds(), "eu-west-1").unwrap_err().starts_with("eu-west-1: InternalError")));
+    }
+
+    #[test]
+    fn a_role_policy_answer_without_its_document_has_none() { assert_eq!(policy_document("<GetRolePolicyResponse/>"), None) }
 }
 
 #[cfg(test)]

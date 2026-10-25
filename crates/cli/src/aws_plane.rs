@@ -98,9 +98,12 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         "KeySchema": [{ "AttributeName": "p", "KeyType": "HASH" }, { "AttributeName": "k", "KeyType": "RANGE" }],
         "Tags": [{ "Key": "superci-plane", "Value": plane_id }] })), &["ResourceInUseException"])?;
     // Records with an end (`x`, seconds) are removed by DynamoDB itself. Only for tidying, so a refusal stops nothing.
-    for _ in 0..30 {
-        if ddb("DescribeTable", json!({ "TableName": name })).is_ok_and(|t| t["Table"]["TableStatus"] == "ACTIVE") { break }
+    // (Half a minute at most: then on, as if it were.)
+    let mut asked = 0;
+    while !ddb("DescribeTable", json!({ "TableName": name })).is_ok_and(|t| t["Table"]["TableStatus"] == "ACTIVE") {
         crate::aws::pause(1000);
+        asked += 1;
+        if asked == 30 { break }
     }
     let ttl = ddb("DescribeTimeToLive", json!({ "TableName": name })).ok();
     if !ttl.as_ref().is_some_and(|t| ["ENABLED", "ENABLING"].contains(&t["TimeToLiveDescription"]["TimeToLiveStatus"].as_str().unwrap_or(""))) {
@@ -119,18 +122,9 @@ pub fn deploy_with(creds: &Credentials, account_id: &str, region: &str, plane_id
         wait_ready(&a, &name)?;
         a.lambda("PUT", &format!("/2015-03-31/functions/{name}/configuration"), Some(json!({ "MemorySize": MEMORY_MB, "Timeout": 60 })))?;
     } else {
-        // A new role takes a few seconds before Lambda may use it.
-        let mut last = String::new();
-        for attempt in 0..12 {
-            match a.lambda("POST", "/2015-03-31/functions", Some(json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap",
-                "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 60, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
-                "Tags": { "superci-plane": plane_id } }))) {
-                Ok(_) => { last.clear(); break }
-                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; crate::aws::pause((3 + attempt) * 1000) }
-                Err(e) => return Err(e),
-            }
-        }
-        if !last.is_empty() { return Err(last) }
+        create_function(&a, json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap",
+            "Role": role_arn, "Code": { "ZipFile": zip }, "Timeout": 60, "MemorySize": MEMORY_MB, "Environment": env, "Description": "SuperCI control plane",
+            "Tags": { "superci-plane": plane_id } }))?;
     }
     wait_ready(&a, &name)?;
     deploy_converter(&a, account_id, region, plane_id, &zip)?;
@@ -178,19 +172,27 @@ fn deploy_converter(a: &Api, account_id: &str, region: &str, plane_id: &str, zip
     } else {
         let mut create = json!({ "FunctionName": name, "Runtime": "provided.al2023", "Architectures": ["arm64"], "Handler": "bootstrap", "Role": format!("arn:aws:iam::{account_id}:role/{name}"),
             "Code": { "ZipFile": zip }, "Description": "SuperCI layer store converter", "Tags": { "superci-plane": plane_id } });
-        for (k, v) in config.as_object().unwrap() { create[k] = v.clone() }
-        let mut last = String::new();
-        for attempt in 0..12 {
-            match a.lambda("POST", "/2015-03-31/functions", Some(create.clone())) {
-                Ok(_) => { last.clear(); break }
-                Err(e) if e.contains("cannot be assumed") || e.contains("role") => { last = e; crate::aws::pause((3 + attempt) * 1000) }
-                Err(e) => return Err(e),
-            }
-        }
-        if !last.is_empty() { return Err(last) }
+        create.as_object_mut().unwrap().extend(config.as_object().unwrap().clone());
+        create_function(a, create)?;
     }
     wait_ready(a, &name)?;
     a.lambda("PUT", &format!("/2019-09-25/functions/{name}/event-invoke-config"), Some(json!({ "MaximumRetryAttempts": 0 }))).map(|_| ())
+}
+
+/// A function made, asked again while its new role is not yet one Lambda may use (a few seconds, a minute at most).
+fn create_function(a: &Api, create: Value) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        match a.lambda("POST", "/2015-03-31/functions", Some(create.clone())) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.contains("cannot be assumed") || e.contains("role") => {
+                crate::aws::pause((3 + attempt) * 1000);
+                attempt += 1;
+                if attempt == 12 { return Err(e) }
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Deletes the control plane `plane_id` from `region`: its schedule, function, table, parameters, logs and role. Safe
@@ -228,10 +230,14 @@ fn delete_in_region(creds: &Credentials, region: &str, plane_id: &str) -> Result
     ok_if(a.lambda("DELETE", &format!("/2015-03-31/functions/{}", converter_name(plane_id)), None), &gone)?;
     ok_if(a.target("logs", &format!("logs.{region}.amazonaws.com"), "Logs_20140328.DeleteLogGroup", "1.1", json!({ "logGroupName": format!("/aws/lambda/{}", converter_name(plane_id)) })), &gone)?;
     ok_if(a.target("dynamodb", &format!("dynamodb.{region}.amazonaws.com"), "DynamoDB_20120810.DeleteTable", "1.0", json!({ "TableName": name })), &gone)?;
-    for _ in 0..20 {
+    // (Ten at a time; twenty rounds at most.)
+    let mut rounds = 0;
+    loop {
         let names: Vec<String> = secret_names(creds, region, plane_id)?.into_iter().map(|n| format!("/superci/{plane_id}/{n}")).collect();
         if names.is_empty() { break }
         a.ssm("DeleteParameters", json!({ "Names": names }))?;
+        rounds += 1;
+        if rounds == 20 { break }
     }
     ok_if(a.target("logs", &format!("logs.{region}.amazonaws.com"), "Logs_20140328.DeleteLogGroup", "1.1", json!({ "logGroupName": format!("/aws/lambda/{name}") })), &gone).map(|_| ())
 }
@@ -240,7 +246,7 @@ fn delete_role(creds: &Credentials, region: &str, plane_id: &str) -> Result<()> 
     let a = api(creds, region);
     let name = name(plane_id);
     let gone = ["ResourceNotFoundException", "NoSuchEntity", "ParameterNotFound"];
-    for policy in ["control-plane", "runner-machines"] { ok_if(a.iam("DeleteRolePolicy", json!({ "RoleName": name, "PolicyName": policy })), &gone)?; }
+    ["control-plane", "runner-machines"].iter().try_for_each(|policy| ok_if(a.iam("DeleteRolePolicy", json!({ "RoleName": name, "PolicyName": policy })), &gone))?;
     ok_if(a.iam("DeleteRolePolicy", json!({ "RoleName": converter_name(plane_id), "PolicyName": "converter" })), &gone)?;
     ok_if(a.iam("DeleteRole", json!({ "RoleName": converter_name(plane_id) })), &gone)?;
     ok_if(a.iam("DeleteRole", json!({ "RoleName": name })), &gone)
@@ -252,14 +258,16 @@ pub fn delete_runner_policy(creds: &Credentials, region: &str, plane_id: &str) -
 }
 
 fn wait_ready(a: &Api, name: &str) -> Result<()> {
-    for _ in 0..30 {
+    let mut asked = 0;
+    loop {
         let v = a.lambda("GET", &format!("/2015-03-31/functions/{name}/configuration"), None)?;
         let (state, update) = (v["State"].as_str().unwrap_or(""), v["LastUpdateStatus"].as_str().unwrap_or(""));
         if state == "Active" && update != "InProgress" { return Ok(()) }
         if state == "Failed" || update == "Failed" { return Err(format!("the function failed to start: {}", v["StateReason"].as_str().or(v["LastUpdateStatusReason"].as_str()).unwrap_or(""))) }
         crate::aws::pause(2000);
+        asked += 1;
+        if asked == 30 { return Err("the function did not become ready".into()) }
     }
-    Err("the function did not become ready".into())
 }
 
 /// A secret for the control plane: a SecureString parameter it reads (encrypted with the account's key for SSM).
@@ -295,4 +303,75 @@ pub fn about(creds: &Credentials, region: &str, plane_id: &str) -> Result<(Optio
     let v = api(creds, region).ssm("GetParameters", json!({ "Names": names, "WithDecryption": true }))?;
     let get = |n: &str| v["Parameters"].as_array().into_iter().flatten().find(|p| p["Name"].as_str().is_some_and(|x| x.ends_with(&format!("/{n}")))).and_then(|p| p["Value"].as_str()).filter(|s| !s.is_empty()).map(str::to_string);
     Ok((get("NAME"), get("OWNERS")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aws::clouds::{self, answer, aws_error, with};
+
+    const LAMBDA: &str = "/lambda.us-east-1.amazonaws.com/2015-03-31/functions";
+
+    fn creds() -> Credentials { Credentials { access_key_id: "AKIDEXAMPLE".into(), secret_access_key: "secret".into(), session_token: None, expires_at_ms: 0 } }
+
+    /// An account in us-east-1 as a test has it: the control plane `p1`'s functions there already (`exists`) or not,
+    /// every call going through, but for what a call's target, action or address starts with in `given`: answered as
+    /// given there.
+    fn account(exists: bool, given: Vec<(String, Vec<u8>)>) -> String {
+        clouds::serve_aws(move |what, _| {
+            if let Some((_, a)) = given.iter().find(|(p, _)| what.starts_with(p.as_str())) { return a.clone() }
+            match what {
+                w if w.starts_with("GET ") && w.ends_with("/configuration") => answer(200, r#"{"State":"Active","LastUpdateStatus":"Successful"}"#),
+                w if w.starts_with(&format!("GET {LAMBDA}/")) && !exists => aws_error("ResourceNotFoundException"),
+                w if w.contains("/url") => answer(200, r#"{"FunctionUrl":"https://p1.lambda-url.us-east-1.on.aws/"}"#),
+                "DynamoDB_20120810.DescribeTable" => answer(200, r#"{"Table":{"TableStatus":"ACTIVE"}}"#),
+                "DynamoDB_20120810.DescribeTimeToLive" => answer(200, r#"{"TimeToLiveDescription":{"TimeToLiveStatus":"ENABLED"}}"#),
+                "AWSEvents.PutRule" => answer(200, r#"{"RuleArn":"arn:aws:events:us-east-1:111111111111:rule/superci-plane-p1"}"#),
+                "AmazonSSM.GetParametersByPath" => answer(200, r#"{"Parameters":[]}"#),
+                _ => answer(200, "{}"),
+            }
+        })
+    }
+
+    fn deploy(at: &str) -> Result<Deployed> { with(at, || deploy_with(&creds(), "111111111111", "us-east-1", "p1", "superci", false, &|_| {})) }
+
+    fn given(what: &str, a: Vec<u8>) -> Vec<(String, Vec<u8>)> { vec![(what.to_string(), a)] }
+
+    /// A control plane updated: its function and its converter's each given their code, waited for and sized; each
+    /// step refused is an error.
+    #[test]
+    fn an_update_fails_at_whichever_step_lambda_refuses() {
+        assert_eq!(deploy(&account(true, vec![])).ok().map(|d| d.url).as_deref(), Some("https://p1.lambda-url.us-east-1.on.aws"));
+        for step in [format!("PUT {LAMBDA}/superci-plane-p1/code"), format!("GET {LAMBDA}/superci-plane-p1/configuration"), format!("PUT {LAMBDA}/superci-plane-p1/configuration"),
+            format!("PUT {LAMBDA}/superci-plane-p1-convert/code"), format!("GET {LAMBDA}/superci-plane-p1-convert/configuration"), format!("PUT {LAMBDA}/superci-plane-p1-convert/configuration")] {
+            assert!(deploy(&account(true, given(&step, aws_error("ServiceException")))).is_err(), "{step}");
+        }
+    }
+
+    /// A new control plane whose table never says it is active goes on all the same; its function, refused for its
+    /// new role every time, is not made: the refusal is said after a minute of asking again. A function that never
+    /// becomes ready is said as that.
+    #[test]
+    fn a_new_function_whose_role_lambda_never_takes_or_that_never_becomes_ready_is_an_error() {
+        let mut slow = given("DynamoDB_20120810.DescribeTable", answer(200, r#"{"Table":{"TableStatus":"CREATING"}}"#));
+        slow.push((format!("POST {LAMBDA}"), answer(400, r#"{"Type":"User","message":"The role defined for the function cannot be assumed by Lambda."}"#)));
+        assert!(deploy(&account(false, slow)).err().unwrap().contains("cannot be assumed"));
+        assert_eq!(deploy(&account(true, given("GET ", answer(200, r#"{"State":"Pending"}"#)))).err().unwrap(), "the function did not become ready");
+        // Refused for another reason: said at once. A new function that cannot be read once made: an error.
+        assert!(deploy(&account(false, given(&format!("POST {LAMBDA}"), aws_error("CodeStorageExceededException")))).is_err());
+        assert!(deploy(&account(false, given(&format!("GET {LAMBDA}/superci-plane-p1/configuration"), aws_error("ServiceException")))).is_err());
+    }
+
+    /// Deleting: parameters that keep coming back are deleted twenty rounds, then the rest goes on; a parameter
+    /// without its name is none.
+    #[test]
+    fn parameters_that_keep_coming_back_are_deleted_twenty_times_then_left() {
+        let at = account(true, given("AmazonSSM.GetParametersByPath", answer(200, r#"{"Parameters":[{"Name":"/superci/p1/KEY"},{"Type":"SecureString"}]}"#)));
+        with(&at, || {
+            assert_eq!(secret_names(&creds(), "us-east-1", "p1").unwrap(), ["KEY"]);
+            delete_in_region(&creds(), "us-east-1", "p1").unwrap();
+        });
+        // A role whose policies cannot be taken off stays.
+        with(&account(true, given("DeleteRolePolicy", aws_error("query:ServiceFailure"))), || assert!(delete_role(&creds(), "us-east-1", "p1").unwrap_err().starts_with("ServiceFailure")));
+    }
 }
