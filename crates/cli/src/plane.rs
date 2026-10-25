@@ -37,3 +37,22 @@ impl Plane {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each kind of control plane takes a new label and says it; one known only by its address keeps none.
+    #[test]
+    fn each_control_plane_takes_a_new_label_but_one_known_only_by_its_address() {
+        let (url, plane_id, label) = (String::from("https://p.example"), String::from("p1"), String::from("superci"));
+        let mut planes = [
+            Plane::Cloudflare { account_id: "a".into(), account_name: "A".into(), script: "s".into(), url: url.clone(), plane_id: plane_id.clone(), label: label.clone() },
+            Plane::Aws { account_id: "123456789012".into(), region: "us-east-1".into(), url: url.clone(), plane_id: plane_id.clone(), label: label.clone() },
+            Plane::Modal { workspace: "w".into(), url: url.clone(), plane_id: plane_id.clone(), label },
+            Plane::Seen { url, plane_id },
+        ];
+        for p in planes.iter_mut() { p.set_label("fast") }
+        assert_eq!(planes.iter().map(Plane::label).collect::<Vec<_>>(), ["fast", "fast", "fast", "superci"]);
+    }
+}

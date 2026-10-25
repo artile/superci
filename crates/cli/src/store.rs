@@ -80,8 +80,11 @@ pub struct Store { dir: PathBuf }
 pub const FIRST: &str = "default";
 
 /// SuperCI's folder: `SUPERCI_HOME`, or `.superci` in the home folder. None when there is no home folder.
-pub fn root() -> Option<PathBuf> {
-    let var = |n: &str| std::env::var_os(n).filter(|v| !v.is_empty()).map(PathBuf::from);
+pub fn root() -> Option<PathBuf> { root_in(|n| std::env::var_os(n)) }
+
+/// The same, from these settings (the environment's, or a test's).
+fn root_in(var_os: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let var = |n: &str| var_os(n).filter(|v| !v.is_empty()).map(PathBuf::from);
     var("SUPERCI_HOME").or_else(|| var("HOME").or_else(|| var("USERPROFILE")).map(|h| h.join(".superci")))
 }
 
@@ -179,7 +182,7 @@ pub fn kept_here(root: &std::path::Path, name: &str) -> bool {
 
 impl Store {
     /// Where one workspace's sign-ins are kept under SuperCI's folder. None when there is no home folder.
-    pub fn of(workspace: &str) -> Option<Store> { Some(Store::under(&root()?, workspace)) }
+    pub fn of(workspace: &str) -> Option<Store> { root().map(|r| Store::under(&r, workspace)) }
 
     pub fn under(root: &std::path::Path, workspace: &str) -> Store { Store { dir: root.join("workspaces").join(workspace) } }
 
@@ -190,8 +193,7 @@ impl Store {
 
     pub fn set_about(&self, about: &About) -> crate::Result<()> {
         self.make()?;
-        let text = serde_json::to_vec_pretty(about).map_err(|e| e.to_string())?;
-        write_private(&self.dir.join("workspace.json"), &text).map_err(|e| format!("could not write in {}: {e}", self.dir.display()))
+        write_private(&self.dir.join("workspace.json"), &pretty(about)).map_err(|e| format!("could not write in {}: {e}", self.dir.display()))
     }
 
     /// The workspace's id: its folder's name.
@@ -209,9 +211,10 @@ impl Store {
     fn owners_alone(&self) {
         only_the_owner(&self.dir, 0o700);
         // (A folder named `workspaces` is in one: SuperCI's.)
-        let Some((all, root)) = self.dir.parent().filter(|p| p.file_name().is_some_and(|n| n == "workspaces")).and_then(|all| Some((all, all.parent()?))) else { return };
+        let Some(all) = self.dir.parent().filter(|p| p.file_name().is_some_and(|n| n == "workspaces")) else { return };
         only_the_owner(all, 0o700);
-        only_the_owner(root, 0o700);
+        // (A folder with a name always has one above it.)
+        only_the_owner(all.parent().unwrap_or(all), 0o700);
     }
 
     /// Forgets the workspace on this computer: its sign-ins and its folder. Nothing in any cloud is touched.
@@ -236,7 +239,8 @@ impl Store {
     pub fn renewing(&self) -> Option<std::fs::File> {
         std::fs::create_dir_all(&self.dir).ok()?;
         let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.dir.join(".renewing")).ok()?;
-        f.lock().ok()?;
+        // (A lock refused leaves it unheld; whoever asked goes on either way, as without the file.)
+        let _ = f.lock();
         Some(f)
     }
 
@@ -256,8 +260,7 @@ impl Store {
         std::fs::create_dir_all(&self.dir).map_err(say)?;
         self.owners_alone();
         let tmp = self.dir.join(format!("sign-ins.json.{}", std::process::id()));
-        let text = serde_json::to_vec_pretty(kept).map_err(|e| e.to_string())?;
-        write_private(&tmp, &text).map_err(say)?;
+        write_private(&tmp, &pretty(kept)).map_err(say)?;
         std::fs::rename(&tmp, self.path()).map_err(say)
     }
 
@@ -270,6 +273,9 @@ impl Store {
         }
     }
 }
+
+/// What is kept here as JSON for people to read: strings, numbers, flags and lists, which serde_json always writes.
+fn pretty<T: Serialize>(value: &T) -> Vec<u8> { serde_json::to_vec_pretty(value).expect("what is kept here is always JSON") }
 
 #[cfg(unix)]
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -371,6 +377,50 @@ mod tests {
         // An id from a name.
         for (name, id) in [("MyCI", "myci"), ("Acme CI", "acme-ci"), (" Build  Farm 2 ", "build-farm-2"), ("9 Lives", "lives"), ("A name that is much too long for it", "a-name-that-is-much-too")] { assert_eq!(id_from(name).unwrap(), id, "{name}") }
         assert_eq!(id_from("7").unwrap_err(), "A workspace's name needs two letters or more (AcmeCI, Build Farm).");
+        assert!(id_from("   ").is_err() && id_from("").is_err());
+        // SuperCI's folder: SUPERCI_HOME, else .superci in the home folder (HOME, else USERPROFILE); one set empty is none.
+        let given = |set: &'static [(&'static str, &'static str)]| move |n: &str| set.iter().find(|(k, _)| *k == n).map(|(_, v)| std::ffi::OsString::from(v));
+        assert_eq!(root_in(given(&[("SUPERCI_HOME", "/s"), ("HOME", "/h")])), Some(PathBuf::from("/s")));
+        assert_eq!(root_in(given(&[("SUPERCI_HOME", ""), ("HOME", "/h")])), Some(PathBuf::from("/h/.superci")));
+        assert_eq!(root_in(given(&[("USERPROFILE", "/u")])), Some(PathBuf::from("/u/.superci")));
+        assert_eq!(root_in(given(&[])), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A folder that cannot be made or written in is said, with where; a lock asked where none can be made is none;
+    /// a store not under SuperCI's folder has no root.
+    #[test]
+    fn what_cannot_be_written_is_said_and_a_lock_that_cannot_be_had_is_none() {
+        let base = std::env::temp_dir().join(format!("superci-store-refused-{}-{}", std::process::id(), superci_core::crypto::random_id(6)));
+        std::fs::create_dir_all(&base).unwrap();
+        // (A file where a folder would be.)
+        std::fs::write(base.join("file"), b"").unwrap();
+        let under_file = Store::at(base.join("file/workspaces/x"));
+        assert!(under_file.make().unwrap_err().starts_with("could not make"));
+        assert!(under_file.set_about(&About::default()).unwrap_err().starts_with("could not make"));
+        assert!(under_file.write(&Kept::default()).unwrap_err().starts_with("could not keep the sign-in in"));
+        assert!(under_file.renewing().is_none());
+        // Its file beside the sign-ins taken by a folder: the sign-ins cannot be written, and nothing is kept.
+        let store = Store::at(base.join("ws"));
+        std::fs::create_dir_all(base.join(format!("ws/sign-ins.json.{}", std::process::id()))).unwrap();
+        assert!(store.write(&Kept::default()).unwrap_err().starts_with("could not keep the sign-in in"));
+        assert!(!store.path().exists());
+        // Its lock's file taken by a folder: no lock; otherwise one.
+        std::fs::create_dir_all(base.join("ws/.renewing")).unwrap();
+        assert!(store.renewing().is_none());
+        assert!(Store::at(base.join("other")).renewing().is_some());
+        assert!(Store::at("").root().is_none() && Store::at("x").root().is_none());
+        // A workspace that cannot be moved (its folder's folder not writable) is said.
+        let root = base.join("root");
+        Store::under(&root, "acme").make().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.join("workspaces"), std::fs::Permissions::from_mode(0o500)).unwrap();
+            // (Whoever is root may write anywhere: then it moves.)
+            if let Err(e) = rename(&root, "acme", "globex") { assert!(e.starts_with("could not rename"), "{e}") }
+            std::fs::set_permissions(root.join("workspaces"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

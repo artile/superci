@@ -48,8 +48,8 @@ impl PlaneView {
         let said: Vec<String> = self.status.as_ref().and_then(|s| s["labels"].as_array().cloned()).unwrap_or_default().iter().filter_map(|l| l.as_str().map(str::to_string)).collect();
         if said.is_empty() { vec![self.plane.label().to_string()] } else { said }
     }
-    /// The label shown in examples: the first of them.
-    pub fn label(&self) -> String { self.labels().into_iter().next().unwrap_or_else(|| "superci".into()) }
+    /// The label shown in examples: the first of them (there is always one).
+    pub fn label(&self) -> String { self.labels().swap_remove(0) }
     /// What it is called (SuperCI, unless named; one from before it could be named: SuperCI).
     pub fn name(&self) -> String { self.status.as_ref().and_then(|s| s["name"].as_str()).filter(|n| !n.is_empty()).unwrap_or("SuperCI").to_string() }
     /// The latest jobs, each a machine's row. A machine that took another job's work than the one it was started
@@ -61,7 +61,7 @@ impl PlaneView {
         for j in jobs.iter_mut() {
             let Some(ran) = j["ran"].as_u64().and_then(|id| own.get(&id)) else { continue };
             j["started_for"] = j["job_id"].clone();
-            for field in ["job_id", "name", "workflow", "run_id", "attempt", "repo", "conclusion"] { j[field] = ran[field].clone() }
+            ["job_id", "name", "workflow", "run_id", "attempt", "repo", "conclusion"].into_iter().for_each(|field| j[field] = ran[field].clone());
         }
         jobs
     }
@@ -251,5 +251,22 @@ mod tests {
         assert!(seen(Some(serde_json::json!({}))).gitlabs().is_empty() && seen(None).gitlabs().is_empty());
         // A connection said without where it is: not one.
         assert!(seen(Some(serde_json::json!({ "gitlabs": [{ "id": "x" }] }))).gitlabs().is_empty());
+    }
+
+    /// A machine that ran another job's work is listed as that job; a row with no job of its own is listed as it is
+    /// and no other job's row is taken for it. An AWS connection said without its region is none, and its label is
+    /// the control plane's own when it says none.
+    #[test]
+    fn a_job_is_listed_as_the_work_it_ran_and_what_is_said_only_in_part_is_not_taken() {
+        let v = seen(Some(serde_json::json!({ "jobs": [
+            { "job_id": 1, "name": "lint", "ran": 2 },
+            { "job_id": 2, "name": "tests", "repo": "o/r", "conclusion": "success" },
+            { "name": "no id", "ran": 9 },
+        ], "aws": { "account_id": "123456789012" } })));
+        let jobs = v.jobs();
+        assert_eq!((jobs[0]["name"].as_str(), jobs[0]["job_id"].as_u64(), jobs[0]["started_for"].as_u64(), jobs[0]["conclusion"].as_str()), (Some("tests"), Some(2), Some(1), Some("success")));
+        assert_eq!(jobs[2], serde_json::json!({ "name": "no id", "ran": 9 }));
+        assert_eq!((v.aws_account(), v.aws_regions()), (None, Vec::<String>::new()));
+        assert_eq!(v.label(), "superci");
     }
 }

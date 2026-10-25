@@ -192,13 +192,17 @@ fn listed(s: &str) -> Option<(char, String, String, bool)> {
         inner.strip_prefix("retry #").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
             || ["ms", "s", "m", "h"].iter().any(|u| inner.strip_suffix(u).is_some_and(num))
     };
-    for _ in 0..2 {
-        let Some(open) = title.rfind(" (").filter(|_| title.ends_with(')')) else { break };
+    // One taken off the end; whether there was one.
+    let mut take_one = |title: &mut String| {
+        let Some(open) = title.rfind(" (").filter(|_| title.ends_with(')')) else { return false };
         let inner = &title[open + 2..title.len() - 1];
-        if !added(inner) { break }
+        if !added(inner) { return false }
         retry |= inner.starts_with("retry #");
         title.truncate(open);
-    }
+        true
+    };
+    // (Two at most: a time, and a retry's mark before it.)
+    if take_one(&mut title) { take_one(&mut title); }
     Some((mark, match project { Some(p) => format!("[{p}] {title}"), None => title }, file.trim().to_string(), retry))
 }
 
@@ -346,6 +350,16 @@ fn read_lines(lines: &[String]) -> Tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log of no lines says no runner and no test; a title's added marks are taken off two at most.
+    #[test]
+    fn no_lines_are_no_tests_and_at_most_two_marks_come_off_a_title() {
+        let t = read_lines(&[]);
+        assert!(t.runners.is_empty() && t.failures.is_empty() && (t.passed, t.failed, t.skipped) == (0, 0, 0));
+        assert_eq!(listed("✓  1 a.spec.ts:4:3 › logs in (retry #1) (2.1s)"), Some(('✓', "logs in".into(), "a.spec.ts:4:3".into(), true)));
+        assert_eq!(listed("✓  1 a.spec.ts:4:3 › logs in (1s) (retry #1) (2.1s)"), Some(('✓', "logs in (1s)".into(), "a.spec.ts:4:3".into(), true)));
+        assert_eq!(listed("✓  1 a.spec.ts:4:3 › logs in (old layout) (2.1s)"), Some(('✓', "logs in (old layout)".into(), "a.spec.ts:4:3".into(), false)));
+    }
 
     #[test]
     fn vitest_s_failures_and_counts() {

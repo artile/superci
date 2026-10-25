@@ -40,21 +40,22 @@ fn shaped(steps: Vec<Step>, shape: &[Value]) -> Vec<(Step, Value)> {
     let names: std::collections::HashMap<String, String> = shape.iter().zip(&steps[from..]).filter_map(|(sh, st)| Some((sh["id"].as_str()?.to_string(), st.name.clone()))).collect();
     let mut out: Vec<(Step, Value)> = vec![];
     let mut held: Vec<(Step, Value)> = vec![];
-    for (i, step) in steps.into_iter().enumerate() {
-        if !(from..from + shape.len()).contains(&i) { out.push((step, Value::Null)); continue }
+    // (There are steps here: at least as many as the shape has.)
+    steps.into_iter().enumerate().for_each(|(i, step)| {
+        if !(from..from + shape.len()).contains(&i) { out.push((step, Value::Null)); return }
         let sh = &shape[i - from];
         let mut v = json!({});
         if sh["bg"] == true { v["bg"] = true.into() }
         match (sh["control"].as_str(), sh["group"].as_str()) {
             // A parallel group's steps: held until its own row, which goes before them.
-            (None, Some(_)) => { v["child"] = true.into(); held.push((step, v)); continue }
+            (None, Some(_)) => { v["child"] = true.into(); held.push((step, v)); return }
             (Some(_), Some(_)) => {
                 let kids: Vec<(Step, Value)> = std::mem::take(&mut held);
                 let mut row = json!({ "group": kids.len() });
                 if kids.iter().all(|(_, k)| k["bg"] == true) { row["bg"] = true.into() }
                 out.push((step, row));
                 out.extend(kids);
-                continue
+                return
             }
             (Some(c), None) => {
                 v["control"] = c.into();
@@ -65,7 +66,7 @@ fn shaped(steps: Vec<Step>, shape: &[Value]) -> Vec<(Step, Value)> {
         // (A group's steps whose own row never came: as they are.)
         out.append(&mut held);
         out.push((step, v));
-    }
+    });
     out.append(&mut held);
     out
 }
@@ -114,7 +115,8 @@ fn zip_files(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
     let u32at = |i: usize| data.get(i..i + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).ok_or("cut short");
     // Its end record: in the last 64 KB (and 22 bytes), the last that says so.
     let end = (data.len().saturating_sub(65_557)..data.len().saturating_sub(21)).rev().find(|&i| data[i..i + 4] == [0x50, 0x4b, 0x05, 0x06]).ok_or("not a zip")?;
-    let (count, mut at) = (u16at(end + 10)?, u32at(end + 16)?);
+    // (The end record found is whole: 22 bytes from `end`.)
+    let (count, mut at) = (u16::from_le_bytes([data[end + 10], data[end + 11]]) as usize, u32::from_le_bytes([data[end + 16], data[end + 17], data[end + 18], data[end + 19]]) as usize);
     let mut out = vec![];
     for _ in 0..count {
         if data.get(at..at + 4) != Some(&[0x50, 0x4b, 0x01, 0x02][..]) { return Err("a damaged directory".into()) }
@@ -147,10 +149,11 @@ fn github(got: &Value, log: &str) -> Vec<Step> {
         return if log.trim().is_empty() { vec![] } else { vec![Step { name: "Log".into(), state: "success".into(), ms: None, lines: log.lines().map(line).collect() }] }
     }
     if let Some(own) = got["step_logs"].as_object() {
-        for (s, g) in steps.iter_mut().zip(&given) {
+        // (There are steps here: none were seen above.)
+        steps.iter_mut().zip(&given).for_each(|(s, g)| {
             let text = g["number"].as_u64().and_then(|n| own.get(&n.to_string())).and_then(Value::as_str).unwrap_or_default();
             s.0.lines = text.lines().map(line).collect();
-        }
+        });
         return steps.into_iter().map(|(s, _)| s).collect()
     }
     let mut at = 0;
@@ -332,6 +335,43 @@ mod tests {
     }
 
     use super::*;
+
+    /// A shape's step with no id is named by none, and a wait naming a step no shape has says the name as given.
+    #[test]
+    fn a_wait_for_a_step_not_in_the_shape_says_the_name_as_given() {
+        let step = |name: &str| Step { name: name.into(), state: "success".into(), ms: None, lines: vec![] };
+        let shaped = shaped(vec![step("Set up job"), step("Wait"), step("Run echo")], &[json!({ "control": "wait", "targets": ["nope", "x"] }), json!({ "id": "x" })]);
+        assert_eq!(shaped.iter().map(|(s, v)| (s.name.as_str(), v.clone())).collect::<Vec<_>>(), [
+            ("Set up job", Value::Null), ("Wait", json!({ "control": "wait", "targets": ["nope", "Run echo"] })), ("Run echo", json!({})),
+        ]);
+    }
+
+    /// A zip whose directory or file header is cut short at each field read is refused as cut short.
+    #[test]
+    fn a_zip_cut_short_at_any_field_is_refused() {
+        // Its end record (one entry, its directory at 22), then a directory entry: nothing packed, a file header at `local`.
+        let zip = |len: usize, local: u32| {
+            let mut z = vec![0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 1, 0, 1, 0, 46, 0, 0, 0, 22, 0, 0, 0, 0, 0];
+            let mut entry = vec![0u8; 46];
+            entry[..4].copy_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+            entry[42..46].copy_from_slice(&local.to_le_bytes());
+            z.extend(entry);
+            z.truncate(len);
+            z
+        };
+        // Cut in its method, size, name's, extra's and comment's lengths, and where its file is; then where that file's
+        // name's and extra's lengths would be.
+        for len in [33, 45, 51, 53, 55, 67] { assert_eq!(zip_files(&zip(len, 0)), Err("cut short".to_string()), "{len}") }
+        assert_eq!(zip_files(&zip(68, 1000)), Err("cut short".to_string()));
+        assert_eq!(zip_files(&zip(68, 40)), Err("cut short".to_string()));
+    }
+
+    /// A time with its day, hour, minute or second not a number is none.
+    #[test]
+    fn a_time_with_a_part_not_a_number_is_none() {
+        assert_eq!(seconds("2026-10-14T21:09:53Z"), Some(1_792_012_193));
+        for t in ["2026-10-xxT21:09:53Z", "2026-10-14Txx:09:53Z", "2026-10-14T21:xx:53Z", "2026-10-14T21:09:xxZ"] { assert_eq!(seconds(t), None, "{t}") }
+    }
 
     #[test]
     fn a_lines_time_and_gitlabs_stream_mark_are_read_only_where_they_are() {
