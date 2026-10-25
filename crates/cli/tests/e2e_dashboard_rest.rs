@@ -755,3 +755,32 @@ fn an_update_of_a_control_plane_in_cloudflare_gives_its_aws_role_what_it_asks_fo
     until("its role given what it asks for", given);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Cloudflare's own containers for a control plane in Cloudflare that had a launcher there from before: the launcher's
+/// place given up, which Cloudflare will not keep: said.
+#[test]
+fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_keep_that() {
+    let served = serve(|_| {});
+    let aws = served.aws.clone();
+    let cf = superci_testkit::serve_as("cfplane00002", move |c| {
+        let settings = aws.worker_settings("superci");
+        c.read_settings(&settings);
+        c.containers = settings.iter().any(|(k, v)| k == "CONTAINERS" && v == "on");
+    });
+    served.aws.workers.lock().unwrap().insert("superci.acme.workers.dev".into(), cf.url.clone());
+    served.aws.worker_secrets.lock().unwrap().entry("superci".into()).or_default().insert("LAUNCHERS".into(), r#"[{"cloud":"cloudflare","url":"https://superci-runners-cfplane00002.acme.workers.dev"}]"#.into());
+    let home = common::signed_in(&served);
+    kept_as(&home, |k| {
+        k["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": "https://superci.acme.workers.dev", "plane_id": "cfplane00002", "label": "superci" } });
+        k.as_object_mut().unwrap().remove("key");
+        k["cloudflare"] = cloudflare_signed_in();
+    });
+    served.aws.replaying(include_str!("../fixtures/move/03-cf-containers.jsonl"), &[]);
+    served.aws.fail("/secrets|LAUNCHERS", 500, CF_FAILED, None);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    // (Its key handed as a page is first read.)
+    until("its key handed", || { common::part(&link, "/?p=runners&fragment=1"); served.aws.worker_settings("superci").iter().any(|(k, _)| k.starts_with("DEVICE_KEY_")) });
+    let (status, said) = sent(&link, "/runners/cloudflare", &[]);
+    assert!(status >= 400 && said.contains("Internal server error"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}

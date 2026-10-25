@@ -10083,4 +10083,15 @@ mod rest_tests {
         assert_eq!(hub.remove("initech").unwrap(), "/");
         assert_eq!(hub.first().as_deref(), Some(crate::store::FIRST));
     }
+
+    #[test]
+    fn signed_in_nowhere_the_kept_control_plane_is_read_only_with_its_key() {
+        let mut d = Dashboard::new();
+        d.kept_plane = Some(aws_plane("p0", NOWHERE));
+        // No key handed it, and no sign-in that ended: nothing to read it with.
+        assert_eq!(d.current().err().as_deref(), Some(NOT_SIGNED_IN));
+        // With its key: read as it answers (here not at all).
+        d.keyed.insert("p0".into());
+        assert!(d.current().unwrap().is_some_and(|v| !v.online));
+    }
 }
