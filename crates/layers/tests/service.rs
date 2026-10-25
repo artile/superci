@@ -282,7 +282,7 @@ async fn lists_are_chosen_by_filters_as_containerd_parses_them() {
         assert_eq!(list(&mut c, f).await.unwrap(), n, "{f}");
     }
     for f in [r#"labels.oct=="\777""#, r#"labels.uni=="\U00110000""#, "labels.esc /x/", "/x/==a", "a b", "=x", "a==", "a=b", "a<b", "a\0", "\0", "a==\0", "\"unterminated",
-        r#""bad \q""#, r#""\x4""#, "a==b,,c", "a\u{fffd}", "a==b\u{1}c", "a.\"b\nc\"", "a.==b"] {
+        r#""bad \q""#, r#""\x4""#, r#""\xZ1""#, "a==b,,c", "a\u{fffd}", "a==b\u{1}c", "a.\"b\nc\"", "a.==b"] {
         assert_eq!(list(&mut c, f).await.unwrap_err().code(), Code::InvalidArgument, "{f:?}");
     }
 }
@@ -332,11 +332,16 @@ async fn its_snapshots_are_containerds_overlay() {
         sapi::PrepareSnapshotRequest { key: key.into(), labels, ..Default::default() }
     };
     let root = unsafe { libc::geteuid() } == 0;
+    // (One mapped by its group only: its owner's group.)
+    let mut by_group = mapped("ns/2/group", "", Some("0:100000:65536"));
+    by_group.labels.remove("containerd.io/snapshot/uidmapping");
+    let grouped = c.prepare(by_group).await;
+    assert!(grouped.is_ok() || !root, "{grouped:?}");
     match c.prepare(mapped("ns/2/mapped", "0:100000:65536", Some("+0: 100000: 65536"))).await {
         Ok(m) => { use std::os::unix::fs::MetadataExt; assert!(root); assert_eq!(std::fs::metadata(&m.into_inner().mounts[0].source).unwrap().uid(), 100000) }
         Err(e) => assert!(!root && e.message().contains("failed to chown"), "{e:?}"),
     }
-    for (i, (uid, gid)) in [("a:b", None), ("0:1", None), ("0:1:", None), ("0:-1:5", None), ("0:4294967295:1", None), ("1:5:10", None), ("0:5:1", Some("1:5:10"))].into_iter().enumerate() {
+    for (i, (uid, gid)) in [("a:b", None), ("0", None), ("0:x:1", None), ("0:1", None), ("0:1:", None), ("0:-1:5", None), ("0:4294967295:1", None), ("1:5:10", None), ("0:5:0", None), ("0:5:1", Some("1:5:10")), ("0:5:1", Some("bad"))].into_iter().enumerate() {
         assert!(c.prepare(mapped(&format!("ns/2/bad{i}"), uid, gid)).await.is_err(), "{uid} {gid:?}");
     }
 }
@@ -385,25 +390,25 @@ async fn what_containerd_asks_amiss_or_leaves_midway_is_answered_as_containerd_d
         while l.message().await.unwrap().is_some() {}
     }
     // More than a page of each (a page is a hundred): every one listed; a list left after its first page.
-    for i in 0..250 { prepare(&mut c, &format!("many-{i}"), "").await.unwrap(); }
+    for i in 0..700 { prepare(&mut c, &format!("many-{i}"), "").await.unwrap(); }
     let mut l = c.list(sapi::ListSnapshotsRequest::default()).await.unwrap().into_inner();
     let mut n = 0;
     while let Some(m) = l.message().await.unwrap() { n += m.info.len() }
-    assert!(n >= 250, "{n}");
+    assert!(n >= 700, "{n}");
     let mut l = c.list(sapi::ListSnapshotsRequest::default()).await.unwrap().into_inner();
     let _ = l.message().await;
     drop(l);
     let mut content = s.content().await;
-    for i in 0..250 { write(&mut content, vec![msg(Commit, &format!("w{i}"), 0, "", 0, format!("blob {i}").as_bytes())]).await.unwrap(); }
+    for i in 0..700 { write(&mut content, vec![msg(Commit, &format!("w{i}"), 0, "", 0, format!("blob {i}").as_bytes())]).await.unwrap(); }
     let mut l = content.list(capi::ListContentRequest::default()).await.unwrap().into_inner();
     let mut n = 0;
     while let Some(m) = l.message().await.unwrap() { n += m.info.len() }
-    assert!(n >= 250, "{n}");
+    assert!(n >= 700, "{n}");
     let mut l = content.list(capi::ListContentRequest::default()).await.unwrap().into_inner();
     let _ = l.message().await;
     drop(l);
     // A blob read from its very end (nothing); one left after its first part.
-    let big = vec![5u8; 5 << 20];
+    let big = vec![5u8; 9 << 20];
     let d = digest(&big);
     write(&mut content, vec![msg(Commit, "big", big.len() as i64, &d, 0, &big)]).await.unwrap();
     assert!(read_all(&mut content, &d, big.len() as i64, 0).await.unwrap().is_empty());
@@ -420,7 +425,17 @@ async fn what_containerd_asks_amiss_or_leaves_midway_is_answered_as_containerd_d
     let mut a = content.write(tokio_stream::wrappers::ReceiverStream::new(rx)).await.unwrap().into_inner();
     let _ = a.message().await;
     drop(a);
+    // (Its answers no longer read, it goes on writing: the service finds the caller gone.)
+    let _ = tx.send(msg(Write, "left", 10, "", 4, b"more")).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
     drop(tx);
+    // A write that says, after it began, it is of a blob there already: given up, as containerd's.
+    let there = b"blob 1".to_vec();
+    assert_eq!(write(&mut content, vec![msg(Write, "late", 0, "", 0, b"x"), msg(Commit, "late", there.len() as i64, &digest(&there), 1, b"")]).await.unwrap_err().code(), Code::AlreadyExists);
+    // Asked of no digest at all; asked of one not there (said in the log).
+    assert_eq!(read_all(&mut content, "nope", 0, 0).await.unwrap_err().code(), Code::InvalidArgument);
+    assert_eq!(content.delete(capi::DeleteContentRequest { digest: "nope".into() }).await.unwrap_err().code(), Code::InvalidArgument);
+    assert_eq!(content.info(capi::InfoRequest { digest: digest(b"not there") }).await.unwrap_err().code(), Code::NotFound);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(s.log().contains("superci-layers: info") || s.log().contains("superci-layers: write"), "{}", s.log().lines().take(5).collect::<Vec<_>>().join("\n"));
 }
@@ -466,6 +481,15 @@ fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
                 ("GET", f) if f.starts_with("/files/drop/") => {}
                 ("GET", f) if f.starts_with("/files/whole/") => { let b = p.lock().unwrap().files.get(&f[13..]).cloned().unwrap_or_default(); send(&mut out, 200, "", &b) }
                 ("GET", f) if f.starts_with("/files/short/") => { let _ = out.write_all(b"HTTP/1.1 206 X\r\ncontent-length: 5\r\nconnection: close\r\n\r\nshort"); }
+                // (Its first range slow, the others dropped: the slow one ends after the others have failed.)
+                ("GET", f) if f.starts_with("/files/slowfirst/") => {
+                    if headers.get("range").is_some_and(|r| r.starts_with("bytes=0-")) {
+                        std::thread::sleep(Duration::from_millis(3000));
+                        let b = p.lock().unwrap().files.get(&f[17..]).cloned().unwrap_or_default();
+                        let z = b.len().min(8 << 20) - 1;
+                        send(&mut out, 206, &format!("content-range: bytes 0-{z}/{}\r\n", b.len()), &b[..=z])
+                    }
+                }
                 ("GET", f) if f.starts_with("/files/") => {
                     let Some(b) = p.lock().unwrap().files.get(&f[7..]).cloned() else { return send(&mut out, 404, "", b"") };
                     match headers.get("range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-')) {
@@ -702,15 +726,15 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     let Some(erofs) = erofs_of(&tar) else { eprintln!("no mkfs.erofs here: skipped"); return };
     let d = digest(&tar);
     // (A second layer of the image, fetched ahead as the last run used it, and a third the store has, fetched ahead too.)
-    let (tar2, tar3) = (tar_of("second", b"the image's other layer"), tar_of("third", b"another"));
-    let (erofs2, erofs3) = (erofs_of(&tar2).unwrap(), erofs_of(&tar3).unwrap());
-    let (d2, d3) = (digest(&tar2), digest(&tar3));
-    let (p, at) = plane([(format!("{d}.erofs"), erofs.clone()), (format!("{d}.blob"), tar.clone()), (format!("{d2}.erofs"), erofs2.clone()), (format!("{d3}.erofs"), erofs3.clone())].into_iter().collect());
+    let (tar2, tar3, tar4) = (tar_of("second", b"the image's other layer"), tar_of("third", b"another"), tar_of("fourth", b"fetched ahead, never used"));
+    let (erofs2, erofs3, erofs4) = (erofs_of(&tar2).unwrap(), erofs_of(&tar3).unwrap(), erofs_of(&tar4).unwrap());
+    let (d2, d3, d4) = (digest(&tar2), digest(&tar3), digest(&tar4));
+    let (p, at) = plane([(format!("{d}.erofs"), erofs.clone()), (format!("{d}.blob"), tar.clone()), (format!("{d2}.erofs"), erofs2.clone()), (format!("{d3}.erofs"), erofs3.clone()), (format!("{d4}.erofs"), erofs4.clone())].into_iter().collect());
     let entry = |d: &str, size: usize, erofs: &[u8], ahead: bool| serde_json::json!({ "size": size, "erofs": { "url": format!("{at}/files/{d}.erofs"), "size": erofs.len() }, "blob": { "url": format!("{at}/files/{d}.blob") }, "ahead": ahead, "usage": { "size": 4096, "inodes": 2 } });
     // (The third says nothing of what its files take: measured on its folder once mounted.)
     let mut third = entry(&d3, tar3.len(), &erofs3, true);
     third.as_object_mut().unwrap().remove("usage");
-    let index = serde_json::json!({ "layers": { &d: entry(&d, tar.len(), &erofs, false), &d2: entry(&d2, tar2.len(), &erofs2, true), &d3: third }, "refresh": { "url": format!("{at}/links"), "token": "" } });
+    let index = serde_json::json!({ "layers": { &d: entry(&d, tar.len(), &erofs, false), &d2: entry(&d2, tar2.len(), &erofs2, true), &d3: third, &d4: entry(&d4, tar4.len(), &erofs4, true) }, "refresh": { "url": format!("{at}/links"), "token": "" } });
     // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself, which tmpfs is not.)
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("superci-layers-served-{}", std::process::id()));
     let _ = rooted(&prefix, "rm").arg("-rf").arg(&dir).status();
@@ -816,39 +840,48 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_layers_file_is_fetched_whatever_the_bucket_and_the_control_plane_answer() {
     let erofs = vec![3u8; (17 << 20) + 5];
-    let digests: Vec<String> = (0..10).map(|i| digest(format!("layer {i}").as_bytes())).collect();
+    let digests: Vec<String> = (0..14).map(|i| digest(format!("layer {i}").as_bytes())).collect();
     let files: HashMap<String, Vec<u8>> = digests.iter().map(|d| (format!("{d}.erofs"), erofs.clone())).collect();
     let (p, at) = plane(files);
     let link = |i: usize, at_path: &str| format!("{at}/files/{at_path}{}.erofs", digests[i]);
     // (In turn: run out, none, run out with links refused, given for others, not said, run out again; dropped, not
     // ranged, cut short; not its digest.)
-    let urls = [link(0, "expired/"), String::new(), link(2, "expired/"), link(3, "expired/"), link(4, "expired/"), link(5, "expired/"), link(6, "drop/"), link(7, "whole/"), link(8, "short/"), link(9, "")];
+    // (Then, for later: run out twice more, its first range slow, and a digest that is none.)
+    let urls = [link(0, "expired/"), String::new(), link(2, "expired/"), link(3, "expired/"), link(4, "expired/"), link(5, "expired/"), link(6, "drop/"), link(7, "whole/"), link(8, "short/"), link(9, ""),
+        link(10, "expired/"), link(11, "expired/"), link(12, "slowfirst/"), link(13, "")];
     let layers: serde_json::Map<String, serde_json::Value> = digests.iter().zip(urls.iter()).enumerate().map(|(i, (d, u))| {
         let mut erofs_entry = serde_json::json!({ "url": u, "size": erofs.len() });
         if i == 9 { erofs_entry["digest"] = digest(b"something else").into() }
+        if i == 13 { erofs_entry["digest"] = "nonsense".into() }
         (d.clone(), serde_json::json!({ "size": 1, "erofs": erofs_entry, "blob": {} }))
     }).collect();
     let s = start("fetch", Some(&serde_json::json!({ "layers": layers, "refresh": { "url": format!("{at}/links"), "token": "t" } })));
     let mut snap = s.snapshots().await;
     let modes = ["", "", "refused", "elsewhere", "nonsense", "expired", "", "", "", ""];
-    for (i, d) in digests.iter().enumerate() {
+    for (i, d) in digests[..10].iter().enumerate() {
         p.lock().unwrap().links = modes[i].to_string();
         let req = sapi::PrepareSnapshotRequest { key: format!("moby/f/{i}"), labels: [("containerd.io/snapshot.ref".to_string(), format!("chain-f{i}")), ("containerd.io/snapshot/cri.layer-digest".to_string(), d.clone())].into_iter().collect(), ..Default::default() };
         let _ = snap.prepare(req).await;
     }
     let log = s.log();
-    for (i, d) in digests.iter().enumerate() {
+    for (i, d) in digests[..10].iter().enumerate() {
         let fetched = log.contains(&format!("{d}'s file (17.8 MB) fetched in"));
         assert_eq!(fetched, i < 2, "{i}: {}", log.lines().filter(|l| l.contains(d.as_str())).collect::<Vec<_>>().join("\n"));
     }
     assert!(log.contains("refused its link") && log.contains("not what its digest says") && log.contains("the store answered 200") && log.contains("sent 5 of"), "{log}");
     // Links asked for and answered cut short, or with none; one with no link and none given; an index saying nowhere
     // to ask, and one whose place to ask is out of reach.
-    for (i, mode) in ["truncated", "none"].into_iter().enumerate() {
+    for (i, mode) in ["truncated", "none", "", ""].into_iter().enumerate() {
         p.lock().unwrap().links = mode.to_string();
-        let req = sapi::PrepareSnapshotRequest { key: format!("moby/g/{i}"), labels: [("containerd.io/snapshot.ref".to_string(), format!("chain-g{i}")), ("containerd.io/snapshot/cri.layer-digest".to_string(), digests[i + 2].clone())].into_iter().collect(), ..Default::default() };
+        let req = sapi::PrepareSnapshotRequest { key: format!("moby/g/{i}"), labels: [("containerd.io/snapshot.ref".to_string(), format!("chain-g{i}")), ("containerd.io/snapshot/cri.layer-digest".to_string(), digests[i + 10].clone())].into_iter().collect(), ..Default::default() };
         let _ = snap.prepare(req).await;
     }
+    assert!(s.log().contains("the store's digest"), "{}", s.log());
+    // A layer the last run used, with no link yet: asked for as the store starts.
+    p.lock().unwrap().links = String::new();
+    let ahead = start("aheadnolink", Some(&serde_json::json!({ "layers": { &digests[1]: { "size": 1, "erofs": { "url": "", "size": erofs.len() }, "blob": {}, "ahead": true } }, "refresh": { "url": format!("{at}/links"), "token": "" } })));
+    let until = Instant::now() + Duration::from_secs(20);
+    while !ahead.log().contains("fetched ahead in") { assert!(Instant::now() < until, "{}", ahead.log()); tokio::time::sleep(Duration::from_millis(100)).await }
     let gone = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
     for (name, refresh) in [("norefresh", serde_json::Value::Null), ("faraway", serde_json::json!({ "url": format!("http://127.0.0.1:{gone}/links"), "token": "" }))] {
         let index = serde_json::json!({ "layers": { &digests[0]: { "size": 1, "erofs": { "url": link(0, "expired/"), "size": erofs.len() }, "blob": {} }, &digests[1]: { "size": 1, "erofs": { "url": "", "size": erofs.len() }, "blob": {} } }, "refresh": refresh });

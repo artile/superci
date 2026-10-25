@@ -113,7 +113,8 @@ fn parents(t: &impl ReadableTable<&'static str, &'static [u8]>, parent: &str) ->
     let mut ids = vec![];
     let mut name = parent.to_string();
     loop {
-        let Some(r) = get(t, &name).and_then(crate::faults::pass)? else { return Err(Error::NotFound("missing parent".into())) };
+        // (A snapshot with children is never taken out: each parent is there.)
+        let r = get(t, &name).and_then(crate::faults::pass)?.expect("a parent kept while it has children");
         ids.push(r.id.to_string());
         if r.parent.is_empty() { return Ok(ids) }
         name = r.parent;
@@ -224,7 +225,7 @@ impl Write<'_> {
         let Some(r) = get(&self.snapshots, key).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("snapshot {key}"))) };
         if self.has_children(r.id).and_then(crate::faults::pass)? { return Err(Error::FailedPrecondition("cannot remove snapshot with child".into())) }
         if !r.parent.is_empty() {
-            let Some(p) = get(&self.snapshots, &r.parent).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("snapshot {key}"))) };
+            let p = get(&self.snapshots, &r.parent).and_then(crate::faults::pass)?.expect("a parent kept while it has children");
             self.parents.remove((p.id, r.id)).and_then(crate::faults::pass).map_err(db)?;
         }
         self.snapshots.remove(key).and_then(crate::faults::pass).map_err(db)?;
@@ -236,7 +237,8 @@ impl Write<'_> {
     pub fn commit(&mut self, key: &str, name: &str, usage: Usage, mut labels: BTreeMap<String, String>, parent: &str) -> Result<String> {
         labels.retain(|_, v| !v.is_empty());
         if get(&self.snapshots, name).and_then(crate::faults::pass)?.is_some() { return Err(Error::AlreadyExists(String::new()).context(format!("committed snapshot {name}"))) }
-        let Some(mut r) = get(&self.snapshots, key).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("failed to get active snapshot {key:?}"))) };
+        // (Read a moment ago in the same change, by `commit_with`.)
+        let mut r = get(&self.snapshots, key).and_then(crate::faults::pass)?.expect("the snapshot being committed");
         if r.kind != Kind::Active { return Err(Error::FailedPrecondition(format!("snapshot {key:?} is not active"))) }
         r.kind = Kind::Committed;
         r.created = now();
@@ -265,16 +267,16 @@ impl Write<'_> {
         if paths.is_empty() {
             r.labels = info.labels.clone();
         } else {
-            for path in paths {
+            paths.iter().try_for_each(|path| {
                 if let Some(key) = path.strip_prefix("labels.") {
                     match info.labels.get(key) { Some(v) => { r.labels.insert(key.to_string(), v.clone()); } None => { r.labels.insert(key.to_string(), String::new()); } }
-                    continue;
+                    return Ok(())
                 }
                 match path.as_str() {
-                    "labels" => r.labels = info.labels.clone(),
-                    _ => return Err(Error::InvalidArgument(format!("cannot update {path:?} field on snapshot {:?}", info.name))),
+                    "labels" => { r.labels = info.labels.clone(); Ok(()) }
+                    _ => Err(Error::InvalidArgument(format!("cannot update {path:?} field on snapshot {:?}", info.name))),
                 }
-            }
+            }).and_then(crate::faults::pass)?;
         }
         // (A label set to nothing is no label: containerd keeps no empty value.)
         r.labels.retain(|_, v| !v.is_empty());

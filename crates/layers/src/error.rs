@@ -21,14 +21,10 @@ impl Error {
     pub fn context(self, what: impl fmt::Display) -> Error {
         // (An error with nothing of its own to say says only what it is about.)
         let w = |m: String| if m.is_empty() { what.to_string() } else { format!("{what}: {m}") };
-        match self {
-            Error::NotFound(m) => Error::NotFound(w(m)),
-            Error::AlreadyExists(m) => Error::AlreadyExists(w(m)),
-            Error::FailedPrecondition(m) => Error::FailedPrecondition(w(m)),
-            Error::InvalidArgument(m) => Error::InvalidArgument(w(m)),
-            Error::Unavailable(m) => Error::Unavailable(w(m)),
-            Error::Other(m) => Error::Other(w(m)),
-        }
+        let mut e = self;
+        let (Error::NotFound(m) | Error::AlreadyExists(m) | Error::FailedPrecondition(m) | Error::InvalidArgument(m) | Error::Unavailable(m) | Error::Other(m)) = &mut e;
+        *m = w(std::mem::take(m));
+        e
     }
 
     pub fn is_not_found(&self) -> bool { matches!(self, Error::NotFound(_)) }

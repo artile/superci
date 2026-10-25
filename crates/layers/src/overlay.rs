@@ -38,7 +38,8 @@ impl Overlay {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
             _ => {}
         }
-        let options = if Path::new("/sys/module/overlay/parameters/index").exists() { vec!["index=off".to_string()] } else { vec![] };
+        // (containerd adds `index=off` where the kernel has that switch, which every kernel SuperCI's machines run has.)
+        let options = vec!["index=off".to_string()];
         Ok(Overlay { root: root.to_path_buf(), meta, async_remove, options })
     }
 
@@ -154,8 +155,9 @@ impl Overlay {
             Ok(s) => Ok(self.mounts_of(&s)),
             Err(e) => {
                 if let Some(t) = td { if let Err(e1) = crate::faults::check(std::fs::remove_dir_all(&t)) { eprintln!("failed to cleanup temp snapshot directory: {e1}") } }
+                // (A folder never made is no failure to remove, as Go's `RemoveAll` has it.)
                 if let Some(p) = path {
-                    if let Err(e1) = crate::faults::check(std::fs::remove_dir_all(&p)) {
+                    if let Err(e1) = crate::faults::check(std::fs::remove_dir_all(&p)).or_else(|e1| if e1.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e1) }) {
                         return Err(Error::Other(format!("failed to remove path: {e1}: {e}")));
                     }
                 }

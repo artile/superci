@@ -149,7 +149,8 @@ impl Store {
 
     /// A blob's labels changed: all of them, or the `labels` and `labels.KEY` paths given (a key given no value goes).
     pub fn update(&self, info: &Info, paths: &[String]) -> Result<Info> {
-        let d = Digest::parse(&info.digest).map_err(|e| Error::InvalidArgument(format!("{:?} failed validation: {e}", info.digest))).and_then(crate::faults::pass)?;
+        // (The service checks a digest before it asks.)
+        let d = Digest::parse(&info.digest).expect("a digest checked by the service");
         let p = self.blob_path(&d);
         let m = match crate::faults::check(std::fs::metadata(&p)) {
             Ok(m) => m,
@@ -391,7 +392,7 @@ impl Writer<'_> {
             if e.algorithm != d.algorithm {
                 // (Opened with no digest to say its algorithm: hashed again as the commit asks.)
                 let mut h = e.algorithm.hasher();
-                let mut f = std::fs::File::open(self.path.join("data")).map_err(|err| Error::Other(format!("failed to open ingest data for re-hashing to {}: {err}", e.algorithm.name()))).and_then(crate::faults::pass)?;
+                let mut f = std::fs::File::open(self.path.join("data")).and_then(crate::faults::pass).map_err(|err| Error::Other(format!("failed to open ingest data for re-hashing to {}: {err}", e.algorithm.name())))?;
                 let mut buf = vec![0u8; 1 << 20];
                 loop { let k = f.read(&mut buf).and_then(crate::faults::pass)?; if k == 0 { break } h.update(&buf[..k]) }
                 self.hasher = h;
@@ -407,7 +408,7 @@ impl Writer<'_> {
             return Err(Error::AlreadyExists(format!("content {d}")));
         }
         std::fs::rename(&ingest, &target).and_then(crate::faults::pass)?;
-        std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all()).map_err(|e| Error::Other(format!("failed to sync dir {}: {e}", target.parent().unwrap().display()))).and_then(crate::faults::pass)?;
+        std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all()).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("failed to sync dir {}: {e}", target.parent().unwrap().display()))).and_then(crate::faults::pass)?;
         // From here the blob is in the store: what fails is said, not returned (it cannot be taken back).
         let t = crate::meta::now();
         if let Err(e) = crate::faults::check(set_times(&target, t, t)) { eprintln!("failed to change file time to commit time for {d}: {e}") }
@@ -459,7 +460,7 @@ fn write_to_completion(path: &Path, data: &[u8]) -> Result<()> {
     let w = f.write_all(data).and_then(|_| f.sync_all());
     drop(f);
     w.and_then(crate::faults::pass).map_err(|e| Error::Other(format!("write tmp file: {e}")))?;
-    std::fs::rename(&tmp, path).map_err(|e| Error::Other(format!("rename tmp file: {e}")))
+    std::fs::rename(&tmp, path).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("rename tmp file: {e}")))
 }
 
 /// A file's access and change times set by its path (Go's `os.Chtimes`), read-only as a blob is.
@@ -494,7 +495,8 @@ pub fn parse_rfc3339(s: &str) -> Option<Nanos> {
         while j < b.len() && b[j].is_ascii_digit() { j += 1 }
         if j == start { return None }
         let digits = &s[start..j.min(start + 9)];
-        nanos = digits.parse::<i64>().ok()? * 10i64.pow(9 - digits.len() as u32);
+        // (Nine digits at most: a number.)
+        nanos = digits.parse::<i64>().unwrap_or(0) * 10i64.pow(9 - digits.len() as u32);
         i = j;
     }
     let offset = match b.get(i)? {

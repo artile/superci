@@ -3,19 +3,23 @@
 
 use std::path::Path;
 
+/// A path as the kernel takes it (the service's own paths: none has a NUL in it).
 #[cfg(target_os = "linux")]
-fn cstr(p: &Path) -> std::io::Result<std::ffi::CString> {
+fn cstr(p: &Path) -> std::ffi::CString {
     use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    std::ffi::CString::new(p.as_os_str().as_bytes()).expect("a path with no NUL")
 }
+
+/// A system call's answer (0, or what failed).
+#[cfg(target_os = "linux")]
+fn os(r: libc::c_int) -> std::io::Result<()> { if r == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) } }
 
 /// An EROFS file mounted read-only at `target` (the kernel reads the file itself: Linux 6.12 and later).
 #[cfg(target_os = "linux")]
 pub fn mount_erofs(file: &Path, target: &Path) -> std::io::Result<()> {
-    let (src, dst) = (cstr(file).and_then(crate::faults::pass)?, cstr(target).and_then(crate::faults::pass)?);
+    let (src, dst) = (cstr(file), cstr(target));
     let fstype = c"erofs";
-    let r = unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), fstype.as_ptr(), libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID, std::ptr::null()) };
-    if r == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    crate::faults::check(os(unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), fstype.as_ptr(), libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID, std::ptr::null()) }))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -27,9 +31,8 @@ pub fn mount_erofs(_file: &Path, _target: &Path) -> std::io::Result<()> {
 /// last user lets go, as `umount -l`.
 #[cfg(target_os = "linux")]
 pub fn unmount(target: &Path) -> std::io::Result<()> {
-    let dst = cstr(target).and_then(crate::faults::pass)?;
-    let r = unsafe { libc::umount2(dst.as_ptr(), libc::MNT_DETACH) };
-    if r == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    let dst = cstr(target);
+    crate::faults::check(os(unsafe { libc::umount2(dst.as_ptr(), libc::MNT_DETACH) }))
 }
 
 #[cfg(not(target_os = "linux"))]

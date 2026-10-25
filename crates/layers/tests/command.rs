@@ -54,6 +54,8 @@ fn what_the_program_is_told_amiss_is_said_and_its_service_says_it_is_ready() {
         let (code, words) = said(args);
         assert_eq!(code, Some(2), "{args:?}: {words}");
     }
+    // With nothing said, its own folders (where a machine has them): as another user than root, it cannot make them.
+    if unsafe { libc::geteuid() } != 0 { assert_eq!(program().output().unwrap().status.code(), Some(1)); }
     // A socket where none can be: said, ended.
     let dir = folder("bad");
     let o = program().args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), "--socket=/".to_string()]).output().unwrap();
@@ -82,6 +84,13 @@ fn what_the_program_is_told_amiss_is_said_and_its_service_says_it_is_ready() {
     let until = Instant::now() + Duration::from_secs(10);
     while !s.log().contains("the index was not read again") { assert!(Instant::now() < until, "{}", s.log()); std::thread::sleep(Duration::from_millis(50)) }
     drop(s);
+    // systemd's socket at a path too long for one: not told, up all the same; stopped as a terminal stops it.
+    let dir = folder("longnotify");
+    let s = serve(&dir, &[], &[("NOTIFY_SOCKET", &format!("/{}", "n".repeat(200)))]);
+    unsafe { libc::kill(s.0.id() as i32, libc::SIGINT); }
+    let mut s = s;
+    let until = Instant::now() + Duration::from_secs(10);
+    while !matches!(s.0.try_wait(), Ok(Some(_))) { assert!(Instant::now() < until, "SIGINT stops it"); std::thread::sleep(Duration::from_millis(50)) }
     #[cfg(target_os = "linux")]
     {
         use std::os::linux::net::SocketAddrExt;
@@ -271,6 +280,13 @@ async fn keep_says_what_was_kept_whatever_the_control_plane_answers() {
         assert_eq!(last["had"].as_u64(), Some(1), "{last}");
     }
     assert!(p.lock().unwrap().reports.last().unwrap()["failed"].as_u64().unwrap() >= 1);
+    // containerd's socket answering nothing it can read: said, as containerd out of reach is.
+    let mute = dir4.join("mute.sock");
+    let l = std::os::unix::net::UnixListener::bind(&mute).unwrap();
+    std::thread::spawn(move || for c in l.incoming().flatten() { drop(c) });
+    let o = program().args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", mute.display())]).output().unwrap();
+    assert!(o.status.success());
+    assert!(p.lock().unwrap().reports.last().unwrap()["error"].as_str().is_some_and(|e| e.starts_with("containerd: ")));
     // (An offer answered 200 with what is not JSON.)
     let raw_plane = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); let at = format!("http://{}", l.local_addr().unwrap()); std::thread::spawn(move || for mut c in l.incoming().flatten() { let mut b = [0u8; 4096]; let _ = c.read(&mut b); let _ = c.write_all(b"HTTP/1.1 200 X\r\ncontent-length: 8\r\nconnection: close\r\n\r\nnot json"); }); at };
     assert!(keep(&raw_plane, &dir4, &[]).status.success());

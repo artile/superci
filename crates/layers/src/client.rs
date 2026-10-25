@@ -62,7 +62,8 @@ impl Containerd {
         let req = Self::with_namespace(tokio_stream::wrappers::ReceiverStream::new(rx), namespace, Some(&lease)).and_then(crate::faults::said)?;
         let answer = |e: tonic::Status| if e.code() == tonic::Code::AlreadyExists { Ok(()) } else { Err(e.message().to_string()) };
         let mut s = match crate::faults::check(capi::content_client::ContentClient::new(ch).write(req).await) { Ok(r) => r.into_inner(), Err(e) => return answer(e) };
-        let status = match crate::faults::check(s.message().await) { Ok(Some(m)) => m, Ok(None) => return Err("containerd ended the write".into()), Err(e) => return answer(e) };
+        // (containerd answers a write's first message, or ends it with an error.)
+        let status = match crate::faults::check(s.message().await) { Ok(m) => m.expect("containerd's answer to a status"), Err(e) => return answer(e) };
         let commit = capi::WriteContentRequest { action: capi::WriteAction::Commit as i32, r#ref, total: size, expected: digest.to_string(), offset: status.offset, ..Default::default() };
         // (Were containerd to end the write meanwhile, its answer says so below.)
         let _ = tx.send(commit).await;

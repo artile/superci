@@ -272,6 +272,7 @@ fn stop_rooted(prefix: &[&str], child: &mut Child) {
 /// The served scenario: a stored layer served (and asked again), one on it, its blob read; restarted; the layer asked
 /// for under another name (its file there already); all removed, cleaned up.
 async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Child, fault: Option<usize>, count: &std::path::Path, d: &str) -> Result<(), String> {
+    // (`fault` is the restarted program's: the first one's is given as it starts.)
     let socket = dir.join("layers.sock");
     let layer = |key: &str, chain: &str| sapi::PrepareSnapshotRequest { key: key.into(), labels: [("containerd.io/snapshot.ref".to_string(), chain.to_string()),
         ("containerd.io/snapshot/cri.layer-digest".to_string(), d.to_string()), ("containerd.io/snapshot/cri.image-layers".to_string(), format!(",{d},sha256:{}", "e".repeat(64)))].into_iter().collect(), ..Default::default() };
@@ -322,8 +323,9 @@ async fn the_served_store_holds_with_each_call_and_store_operation_failing() {
     let Some(erofs) = erofs_of(&tar) else { eprintln!("no mkfs.erofs here: skipped"); return };
     let d = digest(&tar);
     let at = plane([(format!("{d}.erofs"), erofs.clone()), (format!("{d}.blob"), tar.clone())].into_iter().collect());
-    let index = serde_json::json!({ "layers": { &d: { "size": tar.len(), "erofs": { "url": format!("{at}/files/{d}.erofs"), "size": erofs.len() }, "blob": { "url": format!("{at}/files/{d}.blob") }, "usage": { "size": 4096, "inodes": 3 }, "ahead": true } } });
-    let run = |fault: Option<usize>| { let (prefix, index, d) = (prefix.clone(), index.clone(), d.clone()); async move {
+    let index = serde_json::json!({ "layers": { &d: { "size": tar.len(), "erofs": { "url": format!("{at}/files/{d}.erofs"), "size": erofs.len(), "digest": digest(&erofs) }, "blob": { "url": format!("{at}/files/{d}.blob") }, "usage": { "size": 4096, "inodes": 3 }, "ahead": true } } });
+    // (A fault for the first program, and one for it restarted: each step of each swept, the other one's run whole.)
+    let run = |first: Option<usize>, fault: Option<usize>| { let (prefix, index, d) = (prefix.clone(), index.clone(), d.clone()); async move {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself.)
         let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sl-served-sweep-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
@@ -331,7 +333,7 @@ async fn the_served_store_holds_with_each_call_and_store_operation_failing() {
         std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
         let count = dir.join("count");
         let mut containerd = own_containerd(&prefix, &dir);
-        let done = match start_rooted(&prefix, &dir, fault, &count) {
+        let done = match start_rooted(&prefix, &dir, first, &count) {
             None => Ok(()),
             Some(mut child) => { let r = served_scenario(&prefix, &dir, &mut child, fault, &count, &d).await; stop_rooted(&prefix, &mut child); r }
         };
@@ -344,15 +346,17 @@ async fn the_served_store_holds_with_each_call_and_store_operation_failing() {
         let _ = clean.args(["-c", &format!("grep -o ' {0}[^ ]*' /proc/self/mounts | sort -r | xargs -r umount -l; rm -rf {0}", dir.display())]).status();
         (done, log, steps)
     } };
-    let (done, log, steps) = run(None).await;
+    let (done, log, steps) = run(None, None).await;
     assert!(done.is_ok() && !log.contains("panicked") && log.contains("from the store in"), "{done:?}\n{log}");
     if std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() != Some("1") { return }
     let said = std::env::var("SUPERCI_SWEEP_SLICE").unwrap_or_default();
     let (k0, n) = said.split_once('/').and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?))).filter(|(k, n)| *k >= 1 && k <= n).unwrap_or((1, 1));
     let mut broke = vec![];
     for k in (1..=steps).filter(|k| (k - 1) % n == k0 - 1) {
-        let (done, log, _) = run(Some(k)).await;
-        if done.is_err() || log.contains("panicked") { broke.push(format!("step {k}: {done:?}\n{}", log.lines().rev().take(8).collect::<Vec<_>>().join("\n"))) }
+        for (first, restarted) in [(Some(k), Some(k)), (None, Some(k))] {
+            let (done, log, _) = run(first, restarted).await;
+            if done.is_err() || log.contains("panicked") { broke.push(format!("step {k} ({first:?}, {restarted:?}): {done:?}\n{}", log.lines().rev().take(8).collect::<Vec<_>>().join("\n"))) }
+        }
     }
     assert!(broke.is_empty(), "{} of {steps} faults broke it:\n{}", broke.len(), broke.join("\n\n"));
 }
