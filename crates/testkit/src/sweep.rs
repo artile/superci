@@ -228,7 +228,9 @@ fn swept(name: &str, outages: bool, scenario: impl Fn(Fault) -> Outcome + Sync) 
     // (Each run on a control plane of its own: side by side.)
     let next = Mutex::new(0usize);
     let found: Mutex<Vec<String>> = Mutex::default();
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    // (Fewer with `SUPERCI_SWEEP_THREADS=N`: on macOS, whose closed connections hold their ports half a minute and are
+    // not reused on loopback as Linux reuses them, a sweep of the CLI's cloud flows under a coverage tool runs out.)
+    let threads = std::env::var("SUPERCI_SWEEP_THREADS").ok().and_then(|n| n.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8)).max(1);
     std::thread::scope(|s| for _ in 0..threads {
         s.spawn(|| loop {
             let i = { let mut n = next.lock().unwrap(); *n += 1; *n - 1 };

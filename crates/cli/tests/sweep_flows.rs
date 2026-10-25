@@ -169,6 +169,14 @@ fn said_why(out: &Outcome, what: &str, ok: bool, said: &str) {
     out.check(ok || said.trim().len() > 10, || format!("{what} failed saying nothing: {said:?}"));
 }
 
+/// One sweep at a time, whatever runs these tests side by side: each makes a thousand connections a second to
+/// the stand-ins, and two or more at once run out of this computer's ports (each closed one held a while).
+fn one_at_a_time<T>(f: impl FnOnce() -> T) -> T {
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
 /// Step `i` of `flow`, the steps before it gone through; then what it left checked.
 fn flow_step(flow: &Flow, i: usize, fault: Fault) -> Outcome {
     let (served, w) = (flow.world)();
@@ -207,100 +215,100 @@ fn flow_step(flow: &Flow, i: usize, fault: Fault) -> Outcome {
 
 #[test]
 fn an_aws_control_plane_set_up_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("an aws control plane set up from the cli", |f| flow_step(&EVERY_PROVIDER, 0, f));
+    one_at_a_time(|| sweep("an aws control plane set up from the cli", |f| flow_step(&EVERY_PROVIDER, 0, f)));
 }
 
 #[test]
 fn aws_runners_added_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("aws runners added from the cli", |f| flow_step(&EVERY_PROVIDER, 1, f));
+    one_at_a_time(|| sweep("aws runners added from the cli", |f| flow_step(&EVERY_PROVIDER, 1, f)));
 }
 
 #[test]
 fn cloudflare_runners_added_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("cloudflare runners added from the cli", |f| flow_step(&EVERY_PROVIDER, 2, f));
+    one_at_a_time(|| sweep("cloudflare runners added from the cli", |f| flow_step(&EVERY_PROVIDER, 2, f)));
 }
 
 #[test]
 fn modal_runners_added_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("modal runners added from the cli", |f| flow_step(&EVERY_PROVIDER, 3, f));
+    one_at_a_time(|| sweep("modal runners added from the cli", |f| flow_step(&EVERY_PROVIDER, 3, f)));
 }
 
 #[test]
 fn a_cloudflare_control_plane_set_up_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("a cloudflare control plane set up from the cli", |f| flow_step(&EVERY_PROVIDER, 4, f));
+    one_at_a_time(|| sweep("a cloudflare control plane set up from the cli", |f| flow_step(&EVERY_PROVIDER, 4, f)));
 }
 
 #[test]
 fn a_move_from_aws_to_cloudflare_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("a move from aws to cloudflare from the cli", |f| flow_step(&EVERY_PROVIDER, 5, f));
+    one_at_a_time(|| sweep("a move from aws to cloudflare from the cli", |f| flow_step(&EVERY_PROVIDER, 5, f)));
 }
 
 #[test]
 fn aws_runners_taken_out_of_the_cloudflare_control_plane_holds_with_each_call_and_store_operation_failing() {
-    sweep("aws runners taken out of the cloudflare control plane", |f| flow_step(&EVERY_PROVIDER, 6, f));
+    one_at_a_time(|| sweep("aws runners taken out of the cloudflare control plane", |f| flow_step(&EVERY_PROVIDER, 6, f)));
 }
 
 #[test]
 fn the_cloudflare_control_plane_deleted_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("the cloudflare control plane deleted from the cli", |f| flow_step(&EVERY_PROVIDER, 7, f));
+    one_at_a_time(|| sweep("the cloudflare control plane deleted from the cli", |f| flow_step(&EVERY_PROVIDER, 7, f)));
 }
 
 #[test]
 fn the_aws_control_plane_deleted_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("the aws control plane deleted from the cli", |f| flow_step(&EVERY_PROVIDER, 8, f));
+    one_at_a_time(|| sweep("the aws control plane deleted from the cli", |f| flow_step(&EVERY_PROVIDER, 8, f)));
 }
 
 #[test]
 fn a_cloudflare_control_plane_set_up_beside_another_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("a cloudflare control plane set up beside another from the cli", |f| flow_step(&MOVE_TO_MODAL, 0, f));
+    one_at_a_time(|| sweep("a cloudflare control plane set up beside another from the cli", |f| flow_step(&MOVE_TO_MODAL, 0, f)));
 }
 
 #[test]
 fn a_modal_control_plane_set_up_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("a modal control plane set up from the cli", |f| flow_step(&MOVE_TO_MODAL, 1, f));
+    one_at_a_time(|| sweep("a modal control plane set up from the cli", |f| flow_step(&MOVE_TO_MODAL, 1, f)));
 }
 
 #[test]
 fn cloudflare_containers_added_to_a_cloudflare_control_plane_holds_with_each_call_and_store_operation_failing() {
-    sweep("cloudflare containers added to a cloudflare control plane", |f| flow_step(&MOVE_TO_MODAL, 2, f));
+    one_at_a_time(|| sweep("cloudflare containers added to a cloudflare control plane", |f| flow_step(&MOVE_TO_MODAL, 2, f)));
 }
 
 #[test]
 fn a_modal_launcher_added_to_a_cloudflare_control_plane_holds_with_each_call_and_store_operation_failing() {
-    sweep("a modal launcher added to a cloudflare control plane", |f| flow_step(&MOVE_TO_MODAL, 3, f));
+    one_at_a_time(|| sweep("a modal launcher added to a cloudflare control plane", |f| flow_step(&MOVE_TO_MODAL, 3, f)));
 }
 
 #[test]
 fn a_move_from_cloudflare_to_modal_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("a move from cloudflare to modal from the cli", |f| flow_step(&MOVE_TO_MODAL, 4, f));
+    one_at_a_time(|| sweep("a move from cloudflare to modal from the cli", |f| flow_step(&MOVE_TO_MODAL, 4, f)));
 }
 
 #[test]
 fn the_cloudflare_launcher_taken_out_of_the_modal_control_plane_holds_with_each_call_and_store_operation_failing() {
-    sweep("the cloudflare launcher taken out of the modal control plane", |f| flow_step(&MOVE_TO_MODAL, 5, f));
+    one_at_a_time(|| sweep("the cloudflare launcher taken out of the modal control plane", |f| flow_step(&MOVE_TO_MODAL, 5, f)));
 }
 
 #[test]
 fn a_cloudflare_control_plane_that_moved_away_deleted_holds_with_each_call_and_store_operation_failing() {
-    sweep("a cloudflare control plane that moved away deleted", |f| flow_step(&MOVE_TO_MODAL, 6, f));
+    one_at_a_time(|| sweep("a cloudflare control plane that moved away deleted", |f| flow_step(&MOVE_TO_MODAL, 6, f)));
 }
 
 #[test]
 fn a_modal_control_plane_deleted_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("a modal control plane deleted from the cli", |f| flow_step(&MOVE_TO_MODAL, 7, f));
+    one_at_a_time(|| sweep("a modal control plane deleted from the cli", |f| flow_step(&MOVE_TO_MODAL, 7, f)));
 }
 
 #[test]
 fn cloudflare_containers_settings_changed_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("cloudflare containers settings changed from the cli", |f| flow_step(&UPDATE, 3, f));
+    one_at_a_time(|| sweep("cloudflare containers settings changed from the cli", |f| flow_step(&UPDATE, 3, f)));
 }
 
 #[test]
 fn a_cloudflare_control_plane_updated_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("a cloudflare control plane updated from the cli", |f| flow_step(&UPDATE, 4, f));
+    one_at_a_time(|| sweep("a cloudflare control plane updated from the cli", |f| flow_step(&UPDATE, 4, f)));
 }
 
 #[test]
 fn a_modal_control_plane_updated_from_the_cli_holds_with_each_call_and_store_operation_failing() {
-    sweep("a modal control plane updated from the cli", |f| flow_step(&UPDATE, 5, f));
+    one_at_a_time(|| sweep("a modal control plane updated from the cli", |f| flow_step(&UPDATE, 5, f)));
 }
