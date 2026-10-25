@@ -14,6 +14,12 @@ CONF=/etc/containerd/config.toml
 # IMAGES names (CI uses Google's: ECR Public limits what one address pulls in a month, and GitHub's runners share theirs).
 L=${IMAGES:-public.ecr.aws/docker/library}
 ALPINE=$L/alpine:3.22 BUSYBOX=$L/busybox:1.37 POSTGRES=$L/postgres:17-alpine REGISTRY=$L/registry:2
+# An image pulled, asked again a few times when the mirror does not give it (a public mirror at times lists a layer it
+# cannot yet give): the last try's failure is the test's.
+pull() {
+  for wait in 5 10 20 40; do docker pull -q "$1" > /dev/null && return; echo "the pull of $1 failed: again in $wait s" >&2; sleep "$wait"; done
+  docker pull -q "$1" > /dev/null
+}
 cp "$CONF" /root/config.stock.toml
 mkdir -p /etc/docker /root/out
 
@@ -44,8 +50,8 @@ fresh() {
 work() {
   local o=/root/out/$1
   T "$1: pull and run"
-  docker pull -q $ALPINE > /dev/null
-  docker pull -q $BUSYBOX > /dev/null
+  pull $ALPINE
+  pull $BUSYBOX
   docker run --rm $ALPINE cat /etc/alpine-release > "$o.run"
   docker image inspect -f '{{.Id}}' $ALPINE $BUSYBOX > "$o.ids"
   T "$1: build (two stages, a cache mount, a copy from another image)"
@@ -113,7 +119,7 @@ fi
 T "the store: each layer of the images used made an EROFS file, as SuperCI's converter makes it, in a bucket"
 fresh; start stock
 mkdir -p /root/bucket /root/oci
-for img in $ALPINE $BUSYBOX $POSTGRES; do docker pull -q "$img" > /dev/null; done
+for img in $ALPINE $BUSYBOX $POSTGRES; do pull "$img"; done
 docker save $ALPINE $BUSYBOX $POSTGRES | tar -x -C /root/oci
 python3 - <<'PY' > /root/layers.txt
 import json, os
@@ -176,7 +182,7 @@ mv /root/index.store.json /root/index.json
 : > /var/log/superci-layers.log
 start superci
 work store
-docker pull -q $POSTGRES > /dev/null
+pull $POSTGRES
 docker run --rm $POSTGRES postgres --version > /root/out/store.postgres
 served=$(grep -c "from the store" /var/log/superci-layers.log || true)
 usual=$(grep -c "pulled as usual" /var/log/superci-layers.log || true)
@@ -219,7 +225,7 @@ done
 [ $bad = 0 ]
 
 T "superci-layers started again while Docker runs; then everything started again"
-docker pull -q $ALPINE > /dev/null
+pull $ALPINE
 docker run -d --name live $ALPINE sleep 600 > /dev/null
 pkill -x superci-layers; sleep 0.5
 layers
