@@ -32,67 +32,9 @@ env:
     target/x86_64-pc-windows-gnu/release/superci-cache.exe
 
 jobs:
-  coverage:
-    if: inputs.tests == 'all'
-    # Ubuntu 26.04, as SuperCI's machines that keep Docker's images: its kernel mounts EROFS files, so the layer
-    # store's setup is measured switching Docker over (GitHub's 24.04 kernel cannot).
-    runs-on: ubuntu-26.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl,x86_64-unknown-linux-musl,x86_64-pc-windows-gnu,wasm32-unknown-unknown
-          components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
-      # (No cache of Zig's own: one of 250 MB a run filled the repository's cache, and the Rust cache was evicted.)
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-          use-cache: false
-      # (cargo-zigbuild built, downloaded; worker-build has no build to download: compiled once, then kept by the Rust
-      # cache.)
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-      - name: worker-build
-        run: cargo install --locked worker-build
-      - name: Build
-        run: ./build.sh
-      - name: The kernel's EROFS (the layer store's setup test mounts its files from a container, which loads no module)
-        run: |
-          uname -r
-          grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
-          sudo modprobe erofs && grep erofs /proc/filesystems
-      - name: The tests, measured
-        # (In supercov's own copy of the repository: what ./build.sh built is found in this one.)
-        env:
-          SUPERCI_BUILT: ${{ github.workspace }}
-          # (superci-layers' end-to-end suite in a privileged container, measured with the rest.)
-          SUPERCI_LAYERS_E2E: "1"
-          # (Every sweep with each of its calls and store operations failing in turn: what the error paths reach.)
-          SUPERCI_SWEEP_FAULTS: "1"
-          IMAGES: mirror.gcr.io/library
-        run: npx -y supercov@4.19.0 -- cargo test --workspace
-      - name: What the tests reach
-        if: always()
-        run: .github/coverage-gaps.sh
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage
-          path: .supercov/runs
-          include-hidden-files: true
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: gaps
-          path: gaps
-
-  # The browser suite, or every end-to-end suite: the programs built (or kept from before), and the tests listed and
+  # The programs built (or kept from before); for the browser suite or every end-to-end suite, the tests listed and
   # dealt into eight shards.
   prepare:
-    if: inputs.tests != 'all'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     outputs:
@@ -138,6 +80,7 @@ jobs:
           path: ${{ env.PROGRAMS }}
           key: ${{ steps.key.outputs.programs }}
       - name: The tests, listed and dealt into shards
+        if: inputs.tests != 'all'
         id: deal
         run: |
           if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
@@ -153,6 +96,7 @@ jobs:
 
   shard:
     needs: prepare
+    if: inputs.tests != 'all'
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
@@ -196,11 +140,66 @@ jobs:
           path: .supercov/runs
           include-hidden-files: true
 
+  # Every test of every crate, in six parts side by side: each its share of the tests (dealt by nextest) and its sixth of
+  # every sweep's faults, two runs merged with the others'. Ubuntu 26.04, as SuperCI's machines that keep Docker's
+  # images: its kernel mounts EROFS files, so the layer store's setup is measured switching Docker over.
+  all:
+    needs: prepare
+    if: inputs.tests == 'all'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4, 5, 6]
+    env:
+      SUPERCI_BUILT: ${{ github.workspace }}
+      # (superci-layers' end-to-end suite in a privileged container, measured with the rest.)
+      SUPERCI_LAYERS_E2E: "1"
+      IMAGES: mirror.gcr.io/library
+      SUPERCI_BROWSER_WAIT_S: "120"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PROGRAMS }}
+          key: ${{ needs.prepare.outputs.programs }}
+          fail-on-cache-miss: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage-all
+          save-if: ${{ matrix.part == 1 }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: The kernel's EROFS (the layer store's setup test mounts its files from a container, which loads no module)
+        run: |
+          uname -r
+          grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
+          sudo modprobe erofs && grep erofs /proc/filesystems
+      - name: Part ${{ matrix.part }} of the tests, measured
+        run: npx -y supercov@4.19.0 -- cargo nextest run --workspace --no-fail-fast --partition count:${{ matrix.part }}/6 -E 'not (binary(~sweep_) | test(every_test_here))'
+      - name: Slice ${{ matrix.part }} of every sweep's faults, measured
+        if: always()
+        env:
+          SUPERCI_SWEEP_FAULTS: "1"
+          SUPERCI_SWEEP_SLICE: ${{ matrix.part }}/6
+        run: npx -y supercov@4.19.0 -- cargo nextest run --workspace --no-fail-fast -E 'binary(~sweep_) | (package(superci-core) & binary(=plane) & test(every_test_here))'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-shard-${{ matrix.part }}
+          path: .supercov/runs
+          include-hidden-files: true
+
   # The shards' runs, as one: what the tests reach, and each file's conditions still to show.
   merge:
-    needs: shard
+    needs: [shard, all]
     # (Also when a shard was cut off at its time limit: the others' runs, merged, still say what they reach.)
-    if: ${{ always() && needs.shard.result != 'skipped' }}
+    if: ${{ always() && (needs.shard.result != 'skipped' || needs.all.result != 'skipped') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
