@@ -344,6 +344,8 @@ mod tests {
             assert_eq!(verify_rs256_jwt(&token, &jwks, 1_000).unwrap_err(), said, "{token}");
         }
         assert!(verify_rs256_jwt(&sign(unsigned(serde_json::json!({ "alg": "RS256", "kid": "tiny" }), "e30")), &jwks, 1_000).is_err());
+        // A signature of nothing at all.
+        assert!(verify_rs256_jwt(&format!("{}.", unsigned(k1.clone(), "e30")), &jwks, 1_000).is_err());
         assert!(verify_rs256_jwt(&sign(unsigned(k1, &claims(serde_json::json!({ "exp": 2_000, "nbf": 1_060 })))), &jwks, 1_000).is_ok(), "a minute early is allowed");
     }
 

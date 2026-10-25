@@ -299,8 +299,10 @@ pub async fn list(store: &dyn Store, ns: Option<&str>) -> Result<Vec<Listed>> {
     let start = match ns { Some(n) => format!("cache:{n}:"), None => "cache:".to_string() };
     let mut all: Vec<Listed> = store.list(&start).await?.into_iter().filter_map(|(k, v)| {
         let entry: Entry = serde_json::from_str(&v).ok().filter(|e: &Entry| e.done)?;
-        let mut p = k.splitn(5, ':').skip(1);
-        let (ns, scope, version, key) = (p.next()?.to_string(), p.next()?.to_string(), p.next()?.to_string(), p.next()?.to_string());
+        // (`cache:<repository>:<scope>:<version>:<key>`; one without all of them is passed over.)
+        let mut p = k["cache:".len()..].splitn(4, ':');
+        let ns = p.next().unwrap_or_default().to_string();
+        let (scope, version, key) = (p.next()?.to_string(), p.next()?.to_string(), p.next()?.to_string());
         Some(Listed { ns, scope, key, version, entry })
     }).collect();
     all.sort_by_key(|l| std::cmp::Reverse(l.entry.used.max(l.entry.made)));
@@ -414,7 +416,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// The store, in memory; `1`: the operation it does not answer (`get`, `swap`, …), and `2`: one it answers as
-    /// though another request had removed the key just before (`get`).
+    /// though another request had removed the key just before (`get`), or written it (`swap`, lost).
     #[derive(Default)]
     struct Mem(RefCell<BTreeMap<String, String>>, RefCell<&'static str>, RefCell<&'static str>);
     impl Mem {
@@ -425,7 +427,7 @@ mod tests {
         async fn get(&self, k: &str) -> Result<Option<String>> { self.failing("get")?; if *self.2.borrow() == "get" { return Ok(None) } Ok(self.0.borrow().get(k).cloned()) }
         async fn put(&self, k: &str, v: String) -> Result<()> { self.0.borrow_mut().insert(k.into(), v); Ok(()) }
         async fn put_if_absent(&self, k: &str, v: String) -> Result<bool> { if self.0.borrow().contains_key(k) { return Ok(false) } self.0.borrow_mut().insert(k.into(), v); Ok(true) }
-        async fn swap(&self, k: &str, was: Option<&str>, v: String) -> Result<bool> { self.failing("swap")?; crate::io::swap_in_two_steps(self, k, was, v).await }
+        async fn swap(&self, k: &str, was: Option<&str>, v: String) -> Result<bool> { self.failing("swap")?; if *self.2.borrow() == "swap" { return Ok(false) } crate::io::swap_in_two_steps(self, k, was, v).await }
         async fn delete(&self, k: &str) -> Result<()> { self.0.borrow_mut().remove(k); Ok(()) }
         async fn list(&self, p: &str) -> Result<Vec<(String, String)>> { self.failing("list")?; Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
     }
@@ -599,7 +601,15 @@ mod tests {
         store.0.borrow_mut().insert("cache:gh77:refs/heads/main:0123abcd:deps-2".into(), "damaged".into());
         store.0.borrow_mut().insert("cache:gh77:short".into(), crate::io::json(&Entry { id: "x".into(), region: "us-east-1".into(), done: true, ..Default::default() }));
         assert_eq!(run(lookup(&store, &main_branch(), "deps-9", &["deps-".into()], V, 2)).unwrap().unwrap().key, "deps-1");
-        assert_eq!(run(list(&store, Some("gh77"))).unwrap().len(), 1);
+        // (Of a restore key's entries, one unfinished and one too old are no hit either.)
+        let (_, _) = run(begin(&store, &main_branch(), "deps-3", V, "us-east-1", 5)).unwrap();
+        save(&store, &main_branch(), "deps-0", 0);
+        assert_eq!(run(lookup(&store, &main_branch(), "deps-9", &["deps-".into()], V, MAX_AGE_DAYS as u64 * 86_400_000)).unwrap().unwrap().key, "deps-1");
+        for k in ["cache:gh77:s", "cache:gh77:s:v"] { store.0.borrow_mut().insert(k.into(), crate::io::json(&Entry { id: "x".into(), region: "us-east-1".into(), done: true, ..Default::default() })); }
+        store.0.borrow_mut().insert("cache:gh77".into(), crate::io::json(&Entry { id: "x".into(), region: "us-east-1".into(), done: true, ..Default::default() }));
+        assert_eq!(run(list(&store, None)).unwrap().len(), 2, "deps-1 and deps-0, the rest without all their parts");
+        store.0.borrow_mut().insert("artifact:41:damaged".into(), "damaged".into());
+        assert!(run(artifacts(&store, "41")).unwrap().is_empty());
         assert_eq!(run(evict_within(&store, 3, 100, 7 * 86_400_000)).unwrap().len(), 0);
     }
 
@@ -621,8 +631,17 @@ mod tests {
         run(begin_artifact(&store, "41", "report", "us-east-1", Some(("1".into(), "tests".into())), 5)).unwrap();
         *store.2.borrow_mut() = "get";
         assert_eq!(run(begin_artifact(&store, "41", "report", "us-east-1", None, 6)).unwrap_err(), Refused::Exists);
+        *store.2.borrow_mut() = "swap";
+        assert_eq!(run(begin_artifact(&store, "41", "report", "us-east-1", Some(("2".into(), "tests".into())), 7)).unwrap_err(), Refused::Exists, "another attempt took its place first");
         *store.2.borrow_mut() = "";
-        *store.1.borrow_mut() = "swap";
-        assert!(matches!(run(begin_artifact(&store, "41", "report", "us-east-1", Some(("2".into(), "tests".into())), 7)), Err(Refused::Bad(_))));
+        for op in ["get", "swap"] {
+            *store.1.borrow_mut() = op;
+            assert!(matches!(run(begin_artifact(&store, "41", "report", "us-east-1", Some(("2".into(), "tests".into())), 7)), Err(Refused::Bad(_))), "{op}");
+        }
+        // An entry left unfinished, begun anew as another request begins it too: that one's.
+        *store.1.borrow_mut() = "";
+        run(begin(&store, &main_branch(), "left", V, "us-east-1", 100)).unwrap();
+        *store.2.borrow_mut() = "swap";
+        assert_eq!(run(begin(&store, &main_branch(), "left", V, "us-east-1", 200 + TAKEOVER_MS)).unwrap_err(), Refused::Exists);
     }
 }
