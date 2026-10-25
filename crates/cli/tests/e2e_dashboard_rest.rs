@@ -380,7 +380,10 @@ struct Moving { served: Served, new: Served, home: std::path::PathBuf, _child: c
 
 impl Drop for Moving { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.home); } }
 
-fn moving(front: Option<fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>)>) -> Moving {
+fn moving(front: Option<fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>)>) -> Moving { moving_with(front, |_, _| {}) }
+
+/// The same, with `before` done to the control plane in use and the workspace before the dashboard starts.
+fn moving_with(front: Option<fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>)>, before: impl Fn(&Served, &std::path::Path)) -> Moving {
     let served = serve(|_| {});
     served.connect_github();
     served.connect_gitlab();
@@ -416,6 +419,7 @@ fn moving(front: Option<fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>)>) -> Movi
         k["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": url, "plane_id": "testplane0002", "label": "superci" } }]);
         k["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
     });
+    before(&served, &home);
     let (child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "1")]);
     Moving { served, new, home, _child: child, link }
 }
@@ -470,4 +474,172 @@ fn a_move_says_a_new_control_plane_that_refuses_it_never_takes_it_or_could_not_m
     };
     let page = moving(Some(partly)).moved();
     assert!(page.contains("GitHub would not point an App here (globex: Not Found)"), "{page}");
+}
+
+/// A move that brings a launcher in Cloudflare while no Cloudflare account is known to put it in, and one that brings
+/// a launcher in Modal to a new control plane that does not give its keys: each said.
+#[test]
+fn a_move_bringing_a_launcher_says_where_it_cannot_go() {
+    let launchers = |cloud: &'static str| move |served: &Served, home: &std::path::Path| {
+        served.aws.put(&format!("/superci/{}/LAUNCHERS", superci_testkit::PLANE), &serde_json::json!([{ "cloud": cloud, "url": format!("https://superci-runners-testplane0001.{cloud}.example") }]).to_string());
+        kept_as(home, |k| { k["cloudflare"] = cloudflare_signed_in(); k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" }); });
+    };
+    let page = moving_with(None, launchers("cloudflare")).moved();
+    assert!(page.contains("no Cloudflare account"), "{page}");
+    let keyless: fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) = |_, target, status, body| if target.starts_with("/.well-known/jwks.json") { (500, b"{}".to_vec()) } else { (status, body) };
+    let page = moving_with(Some(keyless), launchers("modal")).moved();
+    assert!(page.contains("500"), "{page}");
+}
+
+/// A workspace whose control plane is the served one, its key not kept (the dashboard hands it a new one), and an
+/// expired key of another device's in its settings: taken out once the new one is handed. In AWS, and in Cloudflare
+/// (the served one kept as Cloudflare's).
+#[test]
+fn a_device_key_that_has_expired_is_taken_out_once_a_new_one_is_handed() {
+    let served = serve(|_| {});
+    served.aws.put(&format!("/superci/{}/DEVICE_KEY_1000_OLD", superci_testkit::PLANE), "x");
+    let home = common::signed_in(&served);
+    kept_as(&home, |k| { k.as_object_mut().unwrap().remove("key"); });
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    until("the expired key taken out", || { common::part(&link, "/?p=overview&fragment=1"); !served.aws.settings(superci_testkit::PLANE).iter().any(|(k, _)| k == "DEVICE_KEY_1000_OLD") });
+    let _ = std::fs::remove_dir_all(&home);
+    let served = serve(|_| {});
+    let home = cloudflare_only(&served);
+    kept_as(&home, |k| { k.as_object_mut().unwrap().remove("key"); });
+    served.aws.fail("/workers/scripts/superci/secrets", 200, r#"{"success":true,"errors":[],"messages":[],"result":[{"name":"DEVICE_KEY_1000_OLD","type":"secret_text"}]}"#, None);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let gone = || served.aws.asked.lock().unwrap().iter().any(|a| a["method"] == "DELETE" && a["url"].as_str().is_some_and(|u| u.ends_with("/secrets/DEVICE_KEY_1000_OLD")));
+    until("the expired key taken out", || { common::part(&link, "/?p=overview&fragment=1"); gone() });
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Signing out of a workspace whose control plane is in Cloudflare: its key taken out there. A device key taken out of
+/// one in Modal: through Modal, which says what it says.
+#[test]
+fn a_key_is_taken_out_of_a_control_plane_in_cloudflare_or_modal_with_its_sign_in() {
+    let served = serve(|_| {});
+    let home = cloudflare_only(&served);
+    let (ok, said) = common::superci_in_time(&home, &["logout"], &[("SUPERCI_PAUSE_MS", "1")], 60);
+    assert!(ok && said.contains("no longer takes this machine's key"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let url = served.url.clone();
+    kept_as(&home, |k| {
+        k["plane"] = serde_json::json!({ "Modal": { "workspace": "acmeorg", "url": url, "plane_id": superci_testkit::PLANE, "label": "superci" } });
+        k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" });
+    });
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/keys/remove", &[("name", "DEVICE_KEY_4102444800_OTHER")]);
+    assert!(status == 303 || said.contains("That key was not taken out"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane in Cloudflare from before the new names, its launchers said as agents: its update writes them as
+/// LAUNCHERS first, and stops there when Cloudflare will not keep that: nothing is deployed.
+#[test]
+fn an_update_that_cannot_move_a_control_planes_old_names_stops_before_deploying() {
+    let served = serve(|_| {});
+    let plane = superci_testkit::front(&served.url, |_, target, status, body| {
+        let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        if target.starts_with("/health") { v["version"] = "0.19.12".into() }
+        else if target.starts_with("/status") { v["agents"] = serde_json::json!([{ "cloud": "modal", "url": "https://acme--superci-runners.modal.run" }]) }
+        else { return (status, body) }
+        (status, v.to_string().into_bytes())
+    });
+    *served.aws.plane_url.lock().unwrap() = plane.clone();
+    let home = cloudflare_only(&served);
+    kept_as(&home, |k| k["plane"]["Cloudflare"]["url"] = plane.clone().into());
+    served.aws.fail("/secrets|LAUNCHERS", 500, CF_FAILED, None);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/plane/update", &[("plane", superci_testkit::PLANE)]);
+    assert!(status == 303, "{status} {said}");
+    // (Its launchers written first, refused: nothing deployed after.)
+    until("its launchers refused", || served.aws.asked.lock().unwrap().iter().any(|a| a["method"] == "PUT" && a["status"] == 500 && a["asked"].as_str().is_some_and(|s| s.contains("LAUNCHERS"))));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/workers/scripts/superci"))), "nothing deployed");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane in Cloudflare whose machines start in the AWS account signed in to: its update gives its role
+/// there what this version asks for, which needs AWS's sign-in, not renewed now: said, nothing deployed.
+#[test]
+fn an_update_that_gives_an_aws_role_needs_aws_s_sign_in() {
+    let creds = superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX };
+    let served = serve(move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(creds.clone())));
+    let home = common::signed_in(&served);
+    as_cloudflare(&home, &served);
+    kept_as(&home, |k| k["cloudflare"] = cloudflare_signed_in());
+    aws_renewal_fails(&served, &home);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/plane/update", &[("plane", superci_testkit::PLANE)]);
+    assert!(status >= 400 && said.contains("AWS"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What an AWS role lacks, asked of a control plane that does not answer (read with what is kept of its regions) and
+/// of one whose machines are in no AWS account: each said.
+#[test]
+fn what_an_aws_role_lacks_is_read_of_control_planes_that_do_not_answer_or_have_none() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    beside(&home, serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": "http://127.0.0.1:9", "plane_id": "otherplane01", "label": "superci" } },
+        { "Modal": { "workspace": "acmeorg", "url": "http://127.0.0.1:9", "plane_id": "mdplane00009", "label": "superci" } }]));
+    let (_, said) = common::superci_in_time(&home, &["planes", "allow", "otherplane01", "--dry-run"], &[("SUPERCI_PAUSE_MS", "1")], 60);
+    assert!(said.contains("otherplane01"), "{said}");
+    let (ok, said) = common::superci_in_time(&home, &["planes", "allow", "mdplane00009", "--dry-run"], &[("SUPERCI_PAUSE_MS", "1")], 60);
+    assert!(!ok && said.contains("Its machines do not run in an AWS account"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A control plane in Cloudflare deleted from beside the one in use, its machines in the AWS account signed in to:
+/// once deleted in Cloudflare, its part in AWS needs AWS's sign-in, not renewed now: said.
+#[test]
+fn a_control_plane_deleted_with_a_part_in_aws_needs_aws_s_sign_in_for_that_part() {
+    let served = serve(|_| {});
+    let creds = superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX };
+    let other = superci_testkit::serve_as("testplane0002", move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(creds.clone())));
+    let home = common::signed_in(&served);
+    let url = other.url.clone();
+    kept_as(&home, |k| {
+        k["planes_more"] = serde_json::json!([{ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci-other", "url": url, "plane_id": "testplane0002", "label": "superci" } }]);
+        k["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+        k["cloudflare"] = cloudflare_signed_in();
+    });
+    aws_renewal_fails(&served, &home);
+    served.aws.fail("/containers/applications", 200, r#"{"success":true,"errors":[],"messages":[],"result":[]}"#, None);
+    served.aws.fail("/workers/scripts/superci-other", 200, r#"{"success":true,"errors":[],"messages":[],"result":null}"#, None);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/plane/delete", &[("plane", "testplane0002")]);
+    assert!(status >= 400 && said.contains("AWS"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Modal's runners for a control plane that does not give its keys: said, nothing deployed.
+#[test]
+fn modal_runners_are_not_added_to_a_control_plane_that_does_not_give_its_keys() {
+    let served = serve(|_| {});
+    let plane = superci_testkit::front(&served.url, |_, target, status, body| if target.starts_with("/.well-known/jwks.json") { (500, b"{}".to_vec()) } else { (status, body) });
+    *served.aws.plane_url.lock().unwrap() = plane.clone();
+    let home = common::signed_in(&served);
+    common::kept_at(&home, &plane);
+    kept_as(&home, |k| k["modal"] = serde_json::json!({ "token_id": "ak-modal-for-tests", "token_secret": "as-modal-for-tests", "workspace": "acmeorg" }));
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/runners/modal", &[]);
+    assert!(status >= 400 && said.contains("500"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// An AWS control plane updated while AWS will not make its machines' network: said where it stopped.
+#[test]
+fn an_update_that_cannot_make_the_machines_network_says_so() {
+    let creds = superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX };
+    let served = serve(move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(creds.clone())));
+    let home = common::signed_in(&served);
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.fail("CreateVpc", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
+    served.aws.fail("DescribeVpcs", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
+    let (ok, said) = common::superci_in_time(&home, &["planes", "update"], &[("SUPERCI_PAUSE_MS", "1")], 120);
+    assert!(!ok && said.contains("internal error"), "{said}");
+    let _ = std::fs::remove_dir_all(&home);
 }
