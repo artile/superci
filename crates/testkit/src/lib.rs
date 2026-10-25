@@ -12,7 +12,7 @@ pub mod cloudflare;
 #[cfg(unix)]
 pub use cloudflare::{serve_cloudflare, CloudflarePlane};
 pub mod sweep;
-pub use sweep::{sweep, Fault, Faults, Outcome};
+pub use sweep::{sweep, sweep_with_outages, Fault, Faults, Outcome};
 #[cfg(unix)]
 mod browser;
 #[cfg(unix)]
@@ -105,7 +105,27 @@ pub struct Served { pub plane: String, pub url: String, pub store: Shared, pub m
     /// deployed one's URL): its machines' links are made with it.
     pub public: Arc<Mutex<Option<String>>>,
     /// It stopped answering (its connections closed at once), until this is set back.
-    pub down: Arc<std::sync::atomic::AtomicBool> }
+    pub down: Arc<std::sync::atomic::AtomicBool>,
+    /// Its servers (its own, and its stand-ins'), ended when it is dropped.
+    pub ends: Ends }
+
+/// Servers that end when this is dropped: each told to stop, then reached once, so that one waiting for a connection
+/// sees it. (A sweep serves thousands of control planes in one test program: left on, their threads would pass what
+/// a program may have.)
+pub struct Ends { stops: Vec<Arc<std::sync::atomic::AtomicBool>>, at: Vec<String> }
+
+impl Ends {
+    fn of(plane: &Arc<std::sync::atomic::AtomicBool>, url: &str, aws: &Aws) -> Ends {
+        Ends { stops: vec![plane.clone(), aws.stop.clone()], at: [url, aws.url.as_str()].iter().map(|u| u.trim_start_matches("http://").to_string()).collect() }
+    }
+}
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        for s in &self.stops { s.store(true, std::sync::atomic::Ordering::SeqCst) }
+        for a in &self.at { let _ = TcpStream::connect(a); }
+    }
+}
 
 impl Served {
     /// Moves the control plane's time on by `ms`.
@@ -231,12 +251,14 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
     let clock = Now::default();
     let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let public: Arc<Mutex<Option<String>>> = Arc::default();
-    let (s, m, a, u, c, g, id, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), plane.to_string(), down.clone(), public.clone());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (s, m, a, u, c, g, id, dn, pb, st) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), plane.to_string(), down.clone(), public.clone(), stop.clone());
     // (Written before it answers anything: before a sweep's counting starts.)
     block_on(store.put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
         let cache = Cache::default();
         for stream in listener.incoming().flatten() {
+            if st.load(std::sync::atomic::Ordering::SeqCst) { break }
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
             let mut config = Config::new(id.clone());
             let mut settings = a.settings(&id);
@@ -257,7 +279,8 @@ pub fn serve_as(plane: &str, configure: impl Fn(&mut Config) + Send + 'static) -
         }
     });
     let gitlab = github.gitlab.clone();
-    Served { plane: plane.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public }
+    let ends = Ends::of(&stop, &url, &aws);
+    Served { plane: plane.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public, ends }
 }
 
 /// A request as it arrived: method, target, headers, body.
@@ -419,6 +442,8 @@ pub struct Aws {
     /// Every call answered here (and by GitHub's stand-in, the control plane's store and machines) counted, one of
     /// them failing when a sweep says so; what the control plane answered.
     pub faults: Faults,
+    /// Its server ends (see `Ends`).
+    pub stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// EC2's error answer (and IAM's, STS's: the query APIs'), as AWS documents it.
@@ -507,6 +532,7 @@ impl Aws {
         let aws = Aws { url: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), recorded: Arc::new(Mutex::new(recorded)), ..Default::default() };
         let a = aws.clone();
         std::thread::spawn(move || for stream in listener.incoming().flatten() {
+            if a.stop.load(std::sync::atomic::Ordering::SeqCst) { break }
             // HTTP/2 (its preface first): Modal's API over gRPC, as the CLI calls it.
             let mut first = [0u8; 3];
             if stream.peek(&mut first).is_ok_and(|n| n == 3) && &first == b"PRI" { let a = a.clone(); std::thread::spawn(move || a.serve_grpc(stream)); continue }
@@ -910,12 +936,14 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let clock = Now::default();
     let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let public: Arc<Mutex<Option<String>>> = Arc::default();
-    let (s, m, a, u, c, g, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (s, m, a, u, c, g, dn, pb, st) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone(), stop.clone());
     block_on(io::Ending(store.clone()).put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
         let cache = Cache::default();
         let ending = io::Ending(s);
         for stream in listener.incoming().flatten() {
+            if st.load(std::sync::atomic::Ordering::SeqCst) { break }
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
             let mut config = Config::new(PLANE.to_string());
             let settings = a.settings(PLANE);
@@ -928,7 +956,8 @@ pub fn serve_with_ends(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
         }
     });
     let gitlab = github.gitlab.clone();
-    Served { plane: PLANE.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public }
+    let ends = Ends::of(&stop, &url, &aws);
+    Served { plane: PLANE.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public, ends }
 }
 
 /// A server in front of `to` (a control plane, as a network or a control plane of another version stands between):
@@ -987,11 +1016,13 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
     let clock = Now::default();
     let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let public: Arc<Mutex<Option<String>>> = Arc::default();
-    let (s, m, a, u, c, g, dn, pb) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (s, m, a, u, c, g, dn, pb, st) = (store.clone(), machines.clone(), aws.clone(), url.clone(), clock.clone(), github.clone(), down.clone(), public.clone(), stop.clone());
     block_on(store.put("plane_url", format!("\"{url}\""))).unwrap();
     std::thread::spawn(move || {
         let (cache, left) = (Cache::default(), Deferring::default());
         for stream in listener.incoming().flatten() {
+            if st.load(std::sync::atomic::Ordering::SeqCst) { break }
             if dn.load(std::sync::atomic::Ordering::SeqCst) { drop(stream); continue }
             let mut config = Config::new(PLANE.to_string());
             let settings = a.settings(PLANE);
@@ -1027,7 +1058,8 @@ pub fn serve_deferring(configure: impl Fn(&mut Config) + Send + 'static) -> Serv
         }
     });
     let gitlab = github.gitlab.clone();
-    Served { plane: PLANE.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public }
+    let ends = Ends::of(&stop, &url, &aws);
+    Served { plane: PLANE.to_string(), url, store, machines, aws, github, gitlab, key, run_key, clock, down, public, ends }
 }
 
 impl Served {

@@ -126,6 +126,26 @@ pub fn dashboard_with(home: &std::path::Path, envs: &[(&str, &str)]) -> (Dashboa
     (Dashboard(child), link)
 }
 
+/// A dashboard as `dashboard_with` starts it, and each line it wrote to its errors (a panic among them), kept for the
+/// test to read.
+pub fn dashboard_heard(home: &std::path::Path, envs: &[(&str, &str)]) -> (Dashboard, String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    // (Started again on another port when the one picked was taken meanwhile: many start side by side in a sweep.)
+    let (mut child, link) = (0..5).find_map(|_| {
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut child = command(home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string()).envs(envs.iter().copied())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
+        let link = lines.find_map(|l| l.split_whitespace().find(|w| w.starts_with("http://localhost")).map(str::to_string));
+        std::thread::spawn(move || lines.for_each(drop));
+        match link { Some(link) => Some((child, link)), None => { let _ = child.kill(); let _ = child.wait(); None } }
+    }).expect("the dashboard's link");
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let kept = heard.clone();
+    let errors = BufReader::new(child.stderr.take().unwrap()).lines().map_while(Result::ok);
+    std::thread::spawn(move || errors.for_each(|l| kept.lock().unwrap().push(l)));
+    (Dashboard(child), link, heard)
+}
+
 /// What the dashboard answers for `path`, as its own page asks (with the cookie its link set): status and body.
 pub fn part(link: &str, path: &str) -> (u16, String) {
     let (base, key) = link.split_once("/?k=").unwrap();

@@ -1553,7 +1553,7 @@ impl Dashboard {
         for _ in 0..60 {
             let seen = cloudflare::plane_get(plane.url(), &self.status_key, "/secrets").unwrap_or_default();
             if seen["secrets"].as_array().into_iter().flatten().any(|s| s["setting"] == setting.as_str() && s["updated_ms"].as_u64() == Some(at)) { return Ok(name) }
-            std::thread::sleep(Duration::from_millis(500));
+            aws::pause(500);
         }
         Err(format!("{name} is written; the control plane has not taken it yet. Look with `superci secrets list` in a moment."))
     }
@@ -1573,7 +1573,7 @@ impl Dashboard {
         for _ in 0..60 {
             let seen = cloudflare::plane_get(plane.url(), &self.status_key, "/secrets").unwrap_or_default();
             if !seen["secrets"].as_array().into_iter().flatten().any(|s| s["setting"] == setting.as_str()) { return Ok(name) }
-            std::thread::sleep(Duration::from_millis(500));
+            aws::pause(500);
         }
         // (Never said as done while the control plane still gives it to runs.)
         Err(format!("{name} is taken out of the control plane's cloud; the control plane still has it. Look with `superci secrets list` in a moment."))
@@ -7065,7 +7065,7 @@ fn folder_key() -> String { format!("{}{}", cloudflare::FOLDER_KEY, random_token
 fn wait_for(plane_url: &str, key: &str, done: impl Fn(&serde_json::Value) -> bool) -> bool {
     for _ in 0..40 {
         if cloudflare::status_light(plane_url, key).is_some_and(|s| done(&s)) { return true }
-        std::thread::sleep(Duration::from_millis(500));
+        aws::pause(500);
     }
     false
 }

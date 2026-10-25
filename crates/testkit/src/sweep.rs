@@ -22,6 +22,11 @@ pub enum Fault {
     Dropped(usize),
     /// The k-th store operation not answered.
     Store(usize),
+    /// The k-th call and every one after it answered with its service's error, until the scenario says the outage is
+    /// over (`Faults::calm`): what a client that tries a call again does not get past.
+    Outage(usize),
+    /// The k-th store operation and every one after it not answered, until then.
+    StoreDown(usize),
 }
 
 impl std::fmt::Display for Fault {
@@ -31,6 +36,8 @@ impl std::fmt::Display for Fault {
             Fault::Call(k) => write!(f, "call {k} failing"),
             Fault::Dropped(k) => write!(f, "call {k} dropped"),
             Fault::Store(k) => write!(f, "store operation {k} failing"),
+            Fault::Outage(k) => write!(f, "calls failing from call {k} on"),
+            Fault::StoreDown(k) => write!(f, "the store failing from operation {k} on"),
         }
     }
 }
@@ -50,6 +57,9 @@ struct Faulting {
     /// The call (its place among `calls`) to fail, and whether by dropping it; the operation to fail.
     call: Option<(usize, bool)>,
     op: Option<usize>,
+    /// The first call, and the first store operation, of an outage: each from it on fails (see `Fault::Outage`).
+    outage: Option<usize>,
+    down: Option<usize>,
     /// What was failed.
     fired: Vec<String>,
     /// The control plane's panics: what it was answering, and what the panic said.
@@ -65,13 +75,18 @@ impl Faults {
         let mut f = self.0.lock().unwrap();
         f.marks = (f.calls.len(), f.ops.len(), f.answers.len());
         let (calls, ops) = (f.calls.len(), f.ops.len());
-        (f.call, f.op) = match fault {
-            Fault::None => (None, None),
-            Fault::Call(k) => (Some((calls + k - 1, false)), None),
-            Fault::Dropped(k) => (Some((calls + k - 1, true)), None),
-            Fault::Store(k) => (None, Some(ops + k - 1)),
+        (f.call, f.op, f.outage, f.down) = match fault {
+            Fault::None => (None, None, None, None),
+            Fault::Call(k) => (Some((calls + k - 1, false)), None, None, None),
+            Fault::Dropped(k) => (Some((calls + k - 1, true)), None, None, None),
+            Fault::Store(k) => (None, Some(ops + k - 1), None, None),
+            Fault::Outage(k) => (None, None, Some(calls + k - 1), None),
+            Fault::StoreDown(k) => (None, None, None, Some(ops + k - 1)),
         };
     }
+
+    /// Nothing fails any more (an outage over), counting going on as before.
+    pub fn calm(&self) { let mut f = self.0.lock().unwrap(); (f.call, f.op, f.outage, f.down) = (None, None, None, None) }
 
     /// The k-th call from now answered with its service's error.
     pub fn fail_call(&self, k: usize) { let mut f = self.0.lock().unwrap(); f.call = Some((f.calls.len() + k - 1, false)) }
@@ -96,7 +111,7 @@ impl Faults {
         let mut f = self.0.lock().unwrap();
         let at = f.calls.len();
         f.calls.push(what.clone());
-        let hit = f.call.filter(|(k, _)| *k == at).map(|(_, dropped)| dropped);
+        let hit = f.call.filter(|(k, _)| *k == at).map(|(_, dropped)| dropped).or(f.outage.filter(|k| at >= *k).map(|_| false));
         if let Some(dropped) = hit { f.fired.push(format!("{} {what}", if dropped { "dropped" } else { "failed" })) }
         hit
     }
@@ -106,7 +121,7 @@ impl Faults {
         let mut f = self.0.lock().unwrap();
         let at = f.ops.len();
         f.ops.push(what.clone());
-        if f.op != Some(at) { return Ok(()) }
+        if f.op != Some(at) && !f.down.is_some_and(|k| at >= k) { return Ok(()) }
         f.fired.push(format!("failed {what}"));
         Err(format!("the store did not answer ({what})"))
     }
@@ -168,7 +183,14 @@ pub struct Swept { pub calls: usize, pub store_ops: usize, pub runs: usize, pub 
 /// answered with an error, and dropped). It builds its own control plane each time and arms the fault it is given
 /// once set up (`Served::arm`). Panics, naming each fault and what it broke, when any run broke what must hold.
 /// (`SUPERCI_SWEEP_CLEAN=1` runs the clean run alone: what the faults add to coverage is measured against it.)
-pub fn sweep(name: &str, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept {
+pub fn sweep(name: &str, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept { swept(name, false, scenario) }
+
+/// The same, with outages too: run again for each call, that call and every one after it failing, and for each store
+/// operation, the store failing from it on (`Fault::Outage`, `Fault::StoreDown`); the scenario ends the outage
+/// (`Faults::calm`) where it looks at what is left.
+pub fn sweep_with_outages(name: &str, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept { swept(name, true, scenario) }
+
+fn swept(name: &str, outages: bool, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept {
     let started = std::time::Instant::now();
     let clean = run(&scenario, Fault::None);
     let (calls, ops) = match clean {
@@ -180,12 +202,17 @@ pub fn sweep(name: &str, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept {
     if std::env::var("SUPERCI_SWEEP_CLEAN").ok().as_deref() != Some("1") {
         for k in 1..=calls.len() { faults.push(Fault::Call(k)); faults.push(Fault::Dropped(k)) }
         for k in 1..=ops.len() { faults.push(Fault::Store(k)) }
+        if outages {
+            for k in 1..=calls.len() { faults.push(Fault::Outage(k)) }
+            for k in 1..=ops.len() { faults.push(Fault::StoreDown(k)) }
+        }
     }
-    // (One of them alone, said in full, to look into it: `SUPERCI_SWEEP_ONLY=store:109`, `call:41`, `dropped:41`.)
+    // (One of them alone, said in full, to look into it: `SUPERCI_SWEEP_ONLY=store:109`, `call:41`, `dropped:41`,
+    // `outage:41`, `down:109`.)
     let only = std::env::var("SUPERCI_SWEEP_ONLY").ok();
     if let Some((kind, k)) = only.as_deref().and_then(|o| o.split_once(':')) {
         let k: usize = k.parse().unwrap_or(1).max(1);
-        faults = vec![match kind { "call" => Fault::Call(k), "dropped" => Fault::Dropped(k), _ => Fault::Store(k) }];
+        faults = vec![match kind { "call" => Fault::Call(k), "dropped" => Fault::Dropped(k), "outage" => Fault::Outage(k), "down" => Fault::StoreDown(k), _ => Fault::Store(k) }];
     }
     // (Each run on a control plane of its own: side by side.)
     let next = Mutex::new(0usize);
@@ -195,7 +222,7 @@ pub fn sweep(name: &str, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept {
         s.spawn(|| loop {
             let i = { let mut n = next.lock().unwrap(); *n += 1; *n - 1 };
             let Some(fault) = faults.get(i).copied() else { break };
-            let planned = match fault { Fault::Call(k) | Fault::Dropped(k) => calls.get(k - 1).cloned(), Fault::Store(k) => ops.get(k - 1).cloned(), Fault::None => None }.unwrap_or_default();
+            let planned = match fault { Fault::Call(k) | Fault::Dropped(k) | Fault::Outage(k) => calls.get(k - 1).cloned(), Fault::Store(k) | Fault::StoreDown(k) => ops.get(k - 1).cloned(), Fault::None => None }.unwrap_or_default();
             let problems = match run(&scenario, fault) {
                 Ok((o, p)) => {
                     let f = o.served.faults();
