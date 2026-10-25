@@ -69,30 +69,31 @@ fn pack_files(root: &Path, files: &[Vec<u8>], removed: &[String]) -> Result<Vec<
     // machine reads both in turn, past the end of the first).
     let mut raw = tar_of(root, files, false)?;
     let extra = std::env::temp_dir().join(format!("superci-removed-{}", superci_core::crypto::random_token(8)));
-    std::fs::create_dir_all(&extra).map_err(|e| e.to_string())?;
-    std::fs::write(extra.join(".superci-removed"), removed.join("\n") + "\n").map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&extra).and_then(|_| std::fs::write(extra.join(".superci-removed"), removed.join("\n") + "\n")).map_err(|e| e.to_string())?;
     let list = tar_of(&extra, &[b".superci-removed".to_vec()], false);
     let _ = std::fs::remove_dir_all(&extra);
     raw.extend(list?);
-    let mut gz = Command::new("gzip").arg("-c").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().map_err(|e| format!("gzip: {e}"))?;
-    let mut stdin = gz.stdin.take().ok_or("gzip took no input")?;
-    let writer = std::thread::spawn(move || stdin.write_all(&raw));
-    let out = gz.wait_with_output().map_err(|e| format!("gzip: {e}"))?;
-    let _ = writer.join();
+    let out = piped(Command::new("gzip").arg("-c"), raw).map_err(|e| format!("gzip: {e}"))?;
     if !out.status.success() { return Err("gzip failed".into()) }
     Ok(out.stdout)
+}
+
+/// What a program gives for `input` on its standard input, written from a thread of its own (it may fill its output
+/// before it has read all of it).
+fn piped(cmd: &mut Command, input: Vec<u8>) -> std::io::Result<std::process::Output> {
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut stdin = child.stdin.take();
+    let writer = std::thread::spawn(move || stdin.as_mut().map(|s| s.write_all(&input)));
+    let out = child.wait_with_output();
+    let _ = writer.join();
+    out
 }
 
 fn tar_of(root: &Path, files: &[Vec<u8>], compress: bool) -> Result<Vec<u8>> {
     let files: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
     let args = [if compress { "-czf" } else { "-cf" }, "-", "--no-xattrs", "--null", "-T", "-"];
-    let mut tar = Command::new("tar").current_dir(root).args(args).env("COPYFILE_DISABLE", "1")
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("tar: {e}"))?;
     let list: Vec<u8> = files.iter().flat_map(|f| f.iter().copied().chain([0])).collect();
-    let mut stdin = tar.stdin.take().ok_or("tar took no input")?;
-    let writer = std::thread::spawn(move || stdin.write_all(&list));
-    let out = tar.wait_with_output().map_err(|e| format!("tar: {e}"))?;
-    let _ = writer.join();
+    let out = piped(Command::new("tar").current_dir(root).args(args).env("COPYFILE_DISABLE", "1").stderr(Stdio::piped()), list).map_err(|e| format!("tar: {e}"))?;
     if !out.status.success() { return Err(format!("tar: {}", String::from_utf8_lossy(&out.stderr).trim())) }
     Ok(out.stdout)
 }
@@ -318,7 +319,7 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         (None, None) => {
             let parts = packed.chunks(PART).count() as u32;
             say(&format!("Sending the working tree ({} KB packed, {parts} part{})", packed.len().div_ceil(1000), if parts == 1 { "" } else { "s" }));
-            for (i, part) in packed.chunks(PART).enumerate() { call("POST", &format!("/runs/tree?id={tree}&part={i}"), part.to_vec())?; }
+            packed.chunks(PART).enumerate().try_for_each(|(i, part)| call("POST", &format!("/runs/tree?id={tree}&part={i}"), part.to_vec()).map(drop))?;
             (parts, false)
         }
     };
@@ -361,7 +362,7 @@ pub fn create(plane: &str, key: &str, workflow: &str, job: Option<&str>, event: 
         })
     });
     let sent = |sending: Option<std::thread::JoinHandle<Result<bool>>>| -> Result<()> {
-        match sending.map(|t| t.join().unwrap_or_else(|_| Err("sending the working tree stopped".into()))) {
+        match sending.map(|t| t.join().unwrap_or(Err("sending the working tree stopped".into()))) {
             Some(Ok(true)) => { keep_base(&name, &now); Ok(()) }
             Some(Err(e)) => Err(format!("The working tree was not sent ({e}); run {run} was cancelled.")),
             _ => Ok(()),
@@ -554,7 +555,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
                 }
                 // A runner slow to reach the control plane: what it logged meanwhile (its machine sends it once it listens).
                 if let Some(log) = j["start"]["machine"]["log"].as_str().filter(|l| !l.trim().is_empty()) {
-                    for l in crate::dashboard::runner_log_lines(log, true) { say(&format!("{}  {l}", crate::commands::JOB_LINE)) }
+                    crate::dashboard::runner_log_lines(log, true).iter().for_each(|l| say(&format!("{}  {l}", crate::commands::JOB_LINE)));
                 }
                 // A failed job: which steps failed, said in words (all its tests may have passed: a type-check failed, say).
                 if j["result"] == "failure" {
@@ -641,13 +642,14 @@ fn unzip(path: &Path, dir: &Path) -> std::result::Result<usize, Unpack> {
     use std::io::{Read, Seek, SeekFrom};
     let bad = |e: &str| Unpack::Bad(e.to_string());
     let mut f = std::fs::File::open(path).map_err(|e| Unpack::Bad(e.to_string()))?;
-    let len = f.metadata().map_err(|e| Unpack::Bad(e.to_string()))?.len();
     let mut head = [0u8; 4];
     if f.read_exact(&mut head).is_err() || head != [0x50, 0x4b, 0x03, 0x04] { return Err(Unpack::NotZip) }
-    // Its end record: in the last 64 KB (and 22 bytes), the last that says so.
+    // Its end record: in the last 64 KB (and 22 bytes), the last that says so. (A file just opened and read from is
+    // measured and read within its length; were that ever refused, no end record is found.)
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     let tail_len = len.min(65_557);
     let mut tail = vec![0u8; tail_len as usize];
-    f.seek(SeekFrom::Start(len - tail_len)).and_then(|_| f.read_exact(&mut tail)).map_err(|e| Unpack::Bad(e.to_string()))?;
+    let tail = f.seek(SeekFrom::Start(len - tail_len)).and_then(|_| f.read_exact(&mut tail)).map(|_| tail).unwrap_or_default();
     let end = (0..tail.len().saturating_sub(21)).rev().find(|&i| tail[i..i + 4] == [0x50, 0x4b, 0x05, 0x06]).ok_or(bad("no end record"))?;
     let u16at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as u64;
     let u32at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as u64;
@@ -668,8 +670,8 @@ fn unzip(path: &Path, dir: &Path) -> std::result::Result<usize, Unpack> {
         if name.ends_with('/') { std::fs::create_dir_all(&to).map_err(|e| Unpack::Bad(e.to_string()))?; continue }
         if packed == 0xffff_ffff || size == 0xffff_ffff { return Err(bad("a file over 4 GB (zip64), which this does not unpack yet")) }
         let mut lh = [0u8; 30];
-        f.seek(SeekFrom::Start(local)).and_then(|_| f.read_exact(&mut lh)).map_err(|e| Unpack::Bad(e.to_string()))?;
-        f.seek(SeekFrom::Current((u16at(&lh, 26) + u16at(&lh, 28)) as i64)).map_err(|e| Unpack::Bad(e.to_string()))?;
+        // (Past its header, its name and extra field: a seek forward, which a file takes past its end too.)
+        f.seek(SeekFrom::Start(local)).and_then(|_| f.read_exact(&mut lh)).and_then(|_| f.seek(SeekFrom::Current((u16at(&lh, 26) + u16at(&lh, 28)) as i64))).map_err(|e| Unpack::Bad(e.to_string()))?;
         let mut data = vec![0u8; packed as usize];
         f.read_exact(&mut data).map_err(|e| Unpack::Bad(e.to_string()))?;
         let data = match method {
@@ -718,7 +720,6 @@ impl Lines {
         steps.sort_by_key(|s| s["order"].as_u64().unwrap_or(0));
         self.steps = steps.len();
         let mut out = vec![];
-        if steps.is_empty() { for (_, _, lines) in self.held.drain(..) { out.extend(lines) } return out }
         // (A step is over once one after it has begun, whatever its own record says.)
         let begun: Vec<bool> = steps.iter().map(|s| s["state"].as_str().is_some_and(|st| st != "pending")).collect();
         for (at, s) in steps.iter().enumerate() {
@@ -786,6 +787,8 @@ impl Lines {
             }
             self.done.insert(id.to_string());
         }
+        // (No steps known yet: what came, as it came.)
+        if steps.is_empty() { out.extend(self.held.drain(..).flat_map(|(_, _, lines)| lines)) }
         out
     }
 
@@ -801,12 +804,10 @@ fn last_lines(text: &str) -> Vec<String> {
     for l in &lines { let m = crate::test_results::marked(l).0; if !m.is_empty() && !marks.contains(&m) { marks.push(m) } }
     if marks.len() < 2 { return lines[lines.len().saturating_sub(40)..].iter().map(|l| l.to_string()).collect() }
     let each = (40 / marks.len()).max(8);
-    let mut out = vec![];
-    for m in marks {
-        let own: Vec<&&str> = lines.iter().filter(|l| crate::test_results::marked(l).0 == m).collect();
-        out.extend(own[own.len().saturating_sub(each)..].iter().map(|l| l.to_string()));
-    }
-    out
+    marks.iter().flat_map(|m| {
+        let own: Vec<&&str> = lines.iter().filter(|l| crate::test_results::marked(l).0 == *m).collect();
+        own[own.len().saturating_sub(each)..].iter().map(|l| l.to_string()).collect::<Vec<_>>()
+    }).collect()
 }
 
 /// A time in seconds as a person reads it: "42 s", "3m 5s".
@@ -919,6 +920,90 @@ mod tests {
         let log = |_: u64| Some(["a1", "a2", "", "a4", "", "a6", "a7", "", "a9"].iter().map(|t| format!("2026-10-16T19:55:31.2107257Z {t}")).collect::<Vec<_>>().join("\n"));
         let j = json!({ "posts": [post("a", 1, &["a1", "a2", "a4"]), post("a", 6, &["a6"]), post("a", 7, &["a7"])], "steps": [step("a", 1, "completed", Some(1))] });
         assert_eq!(l.take(&j, false, &log, &|_| None), ["a1", "a2", "a4", "a6", "a7", "", "a9"]);
+    }
+
+    #[test]
+    fn how_long_ago_is_said_in_minutes_hours_or_a_day_or_more() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let said: Vec<String> = [0, 1, 5, 61, 125, 1440].iter().map(|m| ago(now - m * 60_000 - 1_000)).collect();
+        assert_eq!(said, ["just now", "a minute ago", "5 minutes ago", "an hour ago", "2 hours ago", "a day or more ago"]);
+    }
+
+    #[test]
+    fn lines_with_no_steps_known_come_as_they_came_and_a_post_without_its_place_or_lines_follows_on() {
+        let none = |_: u64| None;
+        let mut l = Lines::default();
+        let j = json!({ "posts": [{ "step": "a", "start": 1, "lines": ["x"] }, { "lines": ["y"] }], "steps": [] });
+        assert_eq!(l.take(&j, false, &none, &|_| None), ["x", "y"]);
+        // A post with no line in it, and one that does not say where it begins: on from what is out.
+        let mut l = Lines::default();
+        let j = json!({ "posts": [{ "step": "a", "start": 1, "lines": [] }, { "step": "a", "lines": ["a1", "a2"] }], "steps": [{ "id": "a", "order": 1, "state": "inProgress" }] });
+        assert_eq!(l.take(&j, false, &none, &|_| None), ["a1", "a2"]);
+        let j = json!({ "posts": [{ "step": "a", "start": 3, "lines": ["a3"] }], "steps": [{ "id": "a", "order": 1, "state": "inProgress" }] });
+        assert_eq!(l.take(&j, false, &none, &|_| None), ["a3"], "none twice, none said missing");
+    }
+
+    #[test]
+    fn an_empty_failed_steps_last_lines_are_none() {
+        assert!(last_lines("").is_empty());
+    }
+
+    /// A zip as `upload-artifact` makes one: each entry's name, how it is packed (0 stored, 8 deflated) and its bytes
+    /// as they are in the zip.
+    fn zip(entries: &[(&str, u16, &[u8])]) -> (Vec<u8>, Vec<usize>) {
+        let (mut out, mut dir, mut at) = (vec![], vec![], vec![]);
+        for (name, method, data) in entries {
+            at.push(out.len());
+            let (n, size) = (name.len() as u16, data.len() as u32);
+            out.extend([0x50, 0x4b, 0x03, 0x04, 20, 0, 0, 0]); out.extend(method.to_le_bytes()); out.extend([0u8; 8]);
+            out.extend(size.to_le_bytes()); out.extend(size.to_le_bytes()); out.extend(n.to_le_bytes()); out.extend(0u16.to_le_bytes());
+            out.extend(name.as_bytes()); out.extend(*data);
+            dir.extend([0x50, 0x4b, 0x01, 0x02, 20, 0, 20, 0, 0, 0]); dir.extend(method.to_le_bytes()); dir.extend([0u8; 8]);
+            dir.extend(size.to_le_bytes()); dir.extend(size.to_le_bytes()); dir.extend(n.to_le_bytes());
+            dir.extend([0u8; 12]); dir.extend((*at.last().unwrap() as u32).to_le_bytes()); dir.extend(name.as_bytes());
+        }
+        let (cd_at, cd_len, count) = (out.len() as u32, dir.len() as u32, entries.len() as u16);
+        out.extend(dir);
+        out.extend([0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]);
+        out.extend(count.to_le_bytes()); out.extend(count.to_le_bytes()); out.extend(cd_len.to_le_bytes()); out.extend(cd_at.to_le_bytes()); out.extend([0, 0]);
+        (out, at)
+    }
+
+    #[test]
+    fn a_damaged_zip_is_refused_saying_what_is_wrong_and_an_empty_one_unpacks_to_nothing() {
+        let dir = std::env::temp_dir().join(format!("superci-unzip-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unpacked = |bytes: &[u8], name: &str| -> std::result::Result<usize, String> {
+            let (file, out) = (dir.join(format!("{name}.zip")), dir.join(name));
+            std::fs::write(&file, bytes).unwrap();
+            unzip(&file, &out).map_err(|e| match e { Unpack::Bad(e) => e, Unpack::NotZip => "not a zip".into() })
+        };
+        // Nothing in it: only a header's first bytes, then its end record.
+        let mut empty = vec![0x50, 0x4b, 0x03, 0x04];
+        empty.extend(zip(&[]).0);
+        assert_eq!(unpacked(&empty, "empty"), Ok(0));
+        assert_eq!(unpacked(b"PK\x03\x04 and nothing that ends it", "endless"), Err("no end record".into()));
+        // Its directory said to be past its end.
+        let (mut z, _) = zip(&[("a.txt", 0, b"a")]);
+        let n = z.len();
+        z[n - 6..n - 2].copy_from_slice(&1_000_000u32.to_le_bytes());
+        assert!(unpacked(&z, "far-directory").is_err_and(|e| !e.is_empty()));
+        // An entry whose own header is past the end, and one longer than the file.
+        let (mut z, _) = zip(&[("a.txt", 0, b"a")]);
+        let cd = u32::from_le_bytes(z[z.len() - 6..z.len() - 2].try_into().unwrap()) as usize;
+        z[cd + 42..cd + 46].copy_from_slice(&1_000_000u32.to_le_bytes());
+        assert!(unpacked(&z, "far-entry").is_err_and(|e| !e.is_empty()));
+        let (mut z, _) = zip(&[("a.txt", 0, b"a")]);
+        z[cd + 20..cd + 24].copy_from_slice(&1_000_000u32.to_le_bytes());
+        assert!(unpacked(&z, "long-entry").is_err_and(|e| !e.is_empty()));
+        // Deflated bytes that do not inflate.
+        assert!(unpacked(&zip(&[("a.txt", 8, &[0xff; 16])]).0, "not-deflated").is_err_and(|e| e.starts_with("a.txt: ")));
+        // A file where a folder goes, and a folder where a file goes.
+        assert!(unpacked(&zip(&[("a", 0, b"a"), ("a/b", 0, b"b")]).0, "file-then-folder").is_err());
+        assert!(unpacked(&zip(&[("a", 0, b"a"), ("a/", 0, b"")]).0, "file-then-dir").is_err());
+        assert!(unpacked(&zip(&[("d/", 0, b""), ("d", 0, b"d")]).0, "dir-then-file").is_err_and(|e| e.contains("/d: ")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

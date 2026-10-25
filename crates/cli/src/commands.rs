@@ -407,7 +407,7 @@ pub fn expected_lines(t: &Value, indent: &str) -> Vec<String> {
     let ran = t["ran"].as_array().map(|r| r.len()).unwrap_or(0);
     if ran > 30 {
         out.push(format!("{indent}Failed as expected:"));
-        for r in &tests { out.push(format!("{indent}  ✓ {}{}", r["name"].as_str().unwrap_or_default(), r["file"].as_str().map(|f| format!("  ({f})")).unwrap_or_default())) }
+        out.extend(tests.iter().map(|r| format!("{indent}  ✓ {}{}", r["name"].as_str().unwrap_or_default(), r["file"].as_str().map(|f| format!("  ({f})")).unwrap_or_default())));
     }
     out.push(format!("{indent}(Marked to fail, as test.fail(): Playwright prints no error for these, and passes one that failed for another reason too.)"));
     out
@@ -418,10 +418,10 @@ pub fn ran_lines(t: &Value, indent: &str) -> Vec<String> {
     let ran = t["ran"].as_array().cloned().unwrap_or_default();
     if ran.is_empty() || ran.len() > 30 { return vec![] }
     let mut out = vec![format!("{indent}What ran:")];
-    for r in &ran {
+    out.extend(ran.iter().map(|r| {
         let mark = match r["outcome"].as_str().unwrap_or_default() { "passed" => "✓", "failed" => "✗", "skipped" => "–", "flaky" => "✓ (flaky)", "failed as expected" => "✓ (failed as expected)", _ => "·" };
-        out.push(format!("{indent}  {mark} {}{}", r["name"].as_str().unwrap_or_default(), r["file"].as_str().map(|f| format!("  ({f})")).unwrap_or_default()));
-    }
+        format!("{indent}  {mark} {}{}", r["name"].as_str().unwrap_or_default(), r["file"].as_str().map(|f| format!("  ({f})")).unwrap_or_default())
+    }));
     out
 }
 
@@ -635,12 +635,13 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             if of.is_empty() { return Err("That run is not among the latest this control plane keeps (ids are in `superci runs list`).".into()) }
             let jobs = v.jobs();
             let (mut said, mut data) = (vec![], vec![]);
-            for r in of.iter().rev() {
+            // (Each run found has its jobs: a run is made of them.)
+            of.iter().rev().for_each(|r| {
                 let raw: Vec<&Value> = jobs.iter().filter(|j| j["run_id"] == r["id"] && j["attempt"].as_u64().filter(|a| *a > 0) == r["attempt"].as_u64()).collect();
                 let mut its: Vec<Value> = raw.iter().map(|j| job_words(j)).collect();
                 said.push(run_line(r));
                 said.push(r["link"].as_str().unwrap_or_default().to_string());
-                for (j, words) in raw.iter().zip(its.iter_mut()) {
+                raw.iter().zip(its.iter_mut()).for_each(|(j, words)| {
                     said.push(format!("  {}", job_line(words)));
                     // Its tests, from its whole log: a passed job's too (it may have run fewer than asked, or none),
                     // whatever ran it.
@@ -649,11 +650,11 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                         said.extend(tests_lines(&tests, "    "));
                         words["tests"] = tests;
                     }
-                }
+                });
                 let mut r = r.clone();
                 r["job_list"] = its.into();
                 data.push(r);
-            }
+            });
             Ok(Done { said, data: json!({ "runs": data }) })
         }
         ("caches", operation @ ("retrieve" | "list" | "update" | "delete")) => {
@@ -916,11 +917,8 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let pieces: u32 = w(6).parse().map_err(|_| "PIECES is a number")?;
             let mut paths: Vec<String> = ["index.json", "hot.json", "meta.tar.zst", "layers.sqsh", "image-reader", "baseline.txt"].iter().map(|s| s.to_string()).collect();
             paths.extend((0..pieces).map(|i| format!("p/{i:06}")));
-            let mut out = serde_json::Map::new();
-            for p in paths {
-                let link = superci_core::aws::presign(method, &superci_core::aws::s3_url(bucket, region, &format!("{prefix}/{p}")), &creds, region, 3600, now)?;
-                out.insert(p, link.into());
-            }
+            let out = paths.into_iter().map(|p| superci_core::aws::presign(method, &superci_core::aws::s3_url(bucket, region, &format!("{prefix}/{p}")), &creds, region, 3600, now).map(|link| (p, Value::from(link))))
+                .collect::<std::result::Result<serde_json::Map<String, Value>, String>>()?;
             println!("{}", serde_json::Value::Object(out));
             Ok(Done { said: vec![], data: json!({}) })
         }
@@ -1255,7 +1253,7 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
             let out: Vec<String> = now.iter().map(|p| p.cloud.clone()).filter(|c| !order.contains(c)).collect();
             let names: Vec<String> = (0..order.len()).map(|i| format!("cloud_{i}")).chain((0..out.len()).map(|i| format!("out_{i}"))).collect();
             let mut fields: Vec<(&str, String)> = vec![field("action", "order")];
-            for (name, cloud) in names.iter().zip(order.iter().chain(&out)) { fields.push((name, cloud.clone())) }
+            fields.extend(names.iter().zip(order.iter().chain(&out)).map(|(name, cloud)| (name.as_str(), cloud.clone())));
             to_set(&mut d)?;
             apply!(d, args, format!("set the order to {}{}", order.join(", "), if out.is_empty() { String::new() } else { format!(" (taking out {})", out.join(", ")) }), "/routing", &fields);
             let mut said = vec![format!("Order: {}.", order.join(", "))];
@@ -1320,11 +1318,10 @@ pub fn run(args: &Args, steps: &mut dyn FnMut(&str)) -> Result<Done> {
                 // Each key a label has, by the same name and the same rules: what is given is set (`default` leaves
                 // it to each provider's standard again), the rest stays as it is.
                 let mut want = now.pairs();
-                for key in KEYS {
-                    let Some(value) = args.get(key) else { continue };
+                KEYS.iter().filter_map(|key| args.get(key).map(|value| (*key, value))).for_each(|(key, value)| {
                     want.retain(|(k, _)| *k != key);
                     if value != "default" { want.push((key, value.to_string())) }
-                }
+                });
                 let mut machine = Spec::default();
                 for (key, value) in &want { if let Err(e) = machine.set(key, value) { return usage(e) } }
                 if let Err(e) = machine.check() { return usage(e) }
@@ -1520,7 +1517,8 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
             d.adding = add;
             Some(d.for_task(Task::Login(cloud)).serve(open, false).map_err(Fail::from))
         }
-        ("connections", "create") => Some((|| {
+        // (The rest: `superci connections create github OWNER`.)
+        _ => Some((|| {
             let owner = args.word(3);
             if owner.is_empty() { return usage("Say whose repositories: `superci connections create github OWNER` (an organization, or your own GitHub name).") }
             let d = ready()?;
@@ -1529,9 +1527,8 @@ pub fn in_browser(args: &Args) -> Option<Result<()>> {
             let note = crate::dashboard::owner_note(owner, &plane.place());
             if args.has("dry-run") { println!("Would open GitHub in the browser, for a person to create the App for {owner} and choose its repositories. Nothing was changed.\nOnly an owner of {owner} can create it. A note to send one:\n\n{note}"); return Ok(()) }
             println!("Only an owner of {owner} can create its App (GitHub shows anyone else a 404). Not an owner? `superci connections create github {owner} --dry-run` prints a note to send one.");
-            Ok(d.for_task(Task::GitHub { login: owner.to_string(), host: args.get("host").unwrap_or_default().to_string(), started: false, done: false }).serve(open, false)?)
+            d.for_task(Task::GitHub { login: owner.to_string(), host: args.get("host").unwrap_or_default().to_string(), started: false, done: false }).serve(open, false).map_err(Fail::from)
         })()),
-        _ => None,
     }
 }
 
@@ -1635,8 +1632,8 @@ fn workspaces(args: &Args) -> Result<Done> {
             // Its name, as typed (several words are one name); its id is made from it.
             let name = args.words[2.min(args.words.len())..].join(" ");
             if name.is_empty() { return usage("Give it a name: `superci workspaces create AcmeCI`.") }
-            superci_core::spec::valid_name(&name)?;
-            let id = store::id_from(&name)?;
+            // (A name that is valid always gives an id.)
+            let id = superci_core::spec::valid_name(&name).and_then(|_| store::id_from(&name))?;
             if root.join("workspaces").join(&id).exists() { return Err(format!("There is a workspace with the id {id} already. Give this one another name.").into()) }
             if let Some(done) = dry(args, &format!("make an empty workspace called {name}, with the id {id}"), "workspaces", &[]) { return Ok(done) }
             store::Store::under(&root, &id).set_about(&store::About { name: name.clone(), ..Default::default() })?;

@@ -64,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sweep: [sweep_jobs, sweep_plane, sweep_commands, sweep_flows, sweep_dashboard]
+        sweep: [sweep_jobs, sweep_plane, sweep_commands, sweep_commands_rest, sweep_flows, sweep_dashboard]
     env:
       CARGO_PROFILE_RELEASE_LTO: "false"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
