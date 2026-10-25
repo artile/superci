@@ -199,7 +199,7 @@ impl capi::content_server::Content for Content {
         let l = self.layers.clone();
         let size = blocking({ let (l, d) = (l.clone(), d.clone()); move || l.content_info(&d) }).await.and_then(crate::faults::pass)?.size;
         // (A blob SuperCI's store has but this machine does not yet: fetched whole first.)
-        let (file, _) = l.clone().open_blob(d.clone()).await.and_then(crate::faults::pass).map_err(Status::from)?;
+        let (file, _) = l.clone().open_blob(d.clone(), size as u64).await.and_then(crate::faults::pass).map_err(Status::from)?;
         let mut offset = r.offset.max(0);
         if offset > size { return Err(Status::out_of_range(format!("read past object length {size} bytes"))) }
         let mut want = r.size;

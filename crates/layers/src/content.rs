@@ -158,20 +158,20 @@ impl Store {
         };
         let (mut all, mut changed) = (false, BTreeMap::new());
         if paths.is_empty() { all = true; changed = info.labels.clone() } else {
-            for path in paths {
+            paths.iter().try_for_each(|path| {
                 if let Some(key) = path.strip_prefix("labels.") {
                     changed.insert(key.to_string(), info.labels.get(key).cloned().unwrap_or_default());
-                    continue;
+                    return Ok(())
                 }
                 match path.as_str() {
-                    "labels" => { all = true; changed = info.labels.clone() }
-                    _ => return Err(Error::InvalidArgument(format!("cannot update {path:?} field on content info {:?}", info.digest))),
+                    "labels" => { all = true; changed = info.labels.clone(); Ok(()) }
+                    _ => Err(Error::InvalidArgument(format!("cannot update {path:?} field on content info {:?}", info.digest))),
                 }
-            }
+            }).and_then(crate::faults::pass)?;
         }
         let labels = if all { changed.retain(|_, v| !v.is_empty()); changed } else {
             let mut l = self.get_labels(&d).and_then(crate::faults::pass)?;
-            for (k, v) in changed { if v.is_empty() { l.remove(&k); } else { l.insert(k, v); } }
+            changed.into_iter().for_each(|(k, v)| { if v.is_empty() { l.remove(&k); } else { l.insert(k, v); } });
             l
         };
         self.set_labels(&d, &labels).and_then(crate::faults::pass)?;
@@ -220,7 +220,7 @@ impl Store {
     }
 
     /// A file fetched whole made the blob `d`, if it is: hashed, moved into place, made read-only (as a commit
-    /// does). One there already is kept, and the file thrown away.
+    /// does).
     pub fn put_file(&self, d: &Digest, file: &Path) -> Result<()> {
         let got = crate::fetch::hash_file(file, d.algorithm).and_then(crate::faults::pass)?;
         if got != *d {
@@ -229,7 +229,7 @@ impl Store {
         }
         let target = self.blob_path(d);
         std::fs::create_dir_all(target.parent().unwrap()).and_then(crate::faults::pass)?;
-        if target.exists() { let _ = std::fs::remove_file(file); return Ok(()) }
+        // (Fetched once: the service refuses a write of a blob it serves, so none is here before it.)
         std::fs::rename(file, &target).and_then(crate::faults::pass)?;
         std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all()).and_then(crate::faults::pass)?;
         use std::os::unix::fs::PermissionsExt;

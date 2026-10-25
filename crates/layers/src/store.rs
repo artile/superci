@@ -238,15 +238,15 @@ impl Layers {
         }
     }
 
-    /// A blob to read, and its size: a served layer's blob fetched whole from the store first.
-    pub async fn open_blob(self: Arc<Self>, d: Digest) -> Result<(std::fs::File, u64)> {
+    /// A blob to read (of `size` bytes, as `content_info` said): a served layer's blob fetched whole from the store
+    /// first.
+    pub async fn open_blob(self: Arc<Self>, d: Digest, size: u64) -> Result<(std::fs::File, u64)> {
         let l = self.clone();
         let dd = d.clone();
         match crate::faults::check(off_thread(move || l.content.open_blob(&dd)).await) {
+            // (Not kept here, yet said to be: a served layer's.)
             Err(e) if e.is_not_found() => {
-                let st = &self.store;
-                if st.served_size(&d.to_string()).is_none() { return Err(e) }
-                self.clone().fetch_blob(&d).await.map_err(Error::Other).and_then(crate::faults::pass)?;
+                self.clone().fetch_blob(&d, size).await.map_err(Error::Other).and_then(crate::faults::pass)?;
                 let l = self.clone();
                 crate::faults::check(off_thread(move || l.content.open_blob(&d)).await)
             }
@@ -254,14 +254,13 @@ impl Layers {
         }
     }
 
-    async fn fetch_blob(self: Arc<Self>, d: &Digest) -> std::result::Result<(), String> {
+    async fn fetch_blob(self: Arc<Self>, d: &Digest, size: u64) -> std::result::Result<(), String> {
         let st = &self.store;
         let key = d.to_string();
         let cell = st.blobs.lock().unwrap().entry(key.clone()).or_default().clone();
         let l = self.clone();
         let r = cell.get_or_init(|| async move {
             let st = &l.store;
-            let size = st.served_size(&key).ok_or("not served")?;
             // (The semaphore is never closed.)
             let _turn = st.at_once.acquire().await.expect("a turn");
             let (l2, key2, d) = (l.clone(), key.clone(), d.clone());
@@ -309,13 +308,13 @@ impl Layers {
         let (n, bytes) = (ahead.len(), ahead.iter().map(|(_, l)| l.erofs.size).sum::<u64>());
         let began = std::time::Instant::now();
         let left = Arc::new(std::sync::atomic::AtomicUsize::new(n));
-        for (digest, layer) in ahead {
+        ahead.into_iter().for_each(|(digest, layer)| {
             let (me, left) = (self.clone(), left.clone());
             tokio::spawn(async move {
                 if let Err(e) = me.erofs(&digest, &layer).await { eprintln!("superci-layers: {digest} not fetched ahead: {e}") }
                 if left.fetch_sub(1, Ordering::Relaxed) == 1 { eprintln!("superci-layers: {n} layers' files ({:.0} MB) fetched ahead in {:.2} s", bytes as f64 / 1e6, began.elapsed().as_secs_f64()) }
             });
-        }
+        });
     }
 
     /// The layers SuperCI's store has, read again (the machine's start writes it, then says so with SIGHUP).
@@ -366,7 +365,7 @@ impl StoreSide {
         let link = IndexLink { st: self, digest: digest.to_string(), erofs: true };
         let began = std::time::Instant::now();
         let n = crate::fetch::fetch(&self.agent, &link, layer.erofs.size, &tmp, self.parallel, layer.erofs.digest.as_deref())?;
-        std::fs::rename(&tmp, file).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, file).and_then(crate::faults::pass).map_err(|e| e.to_string())?;
         self.stats.bytes.fetch_add(n, Ordering::Relaxed);
         eprintln!("superci-layers: {digest}'s file ({:.1} MB) fetched in {:.2} s", n as f64 / 1e6, began.elapsed().as_secs_f64());
         Ok(())
