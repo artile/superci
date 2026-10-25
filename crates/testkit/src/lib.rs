@@ -481,15 +481,17 @@ impl Aws {
         });
         self.asked.lock().unwrap().push(json!({ "method": "POST", "url": url, "target": "", "asked": asked, "status": status, "answer": answer }));
         let v: Value = serde_json::from_str(&answer).unwrap_or_default();
-        // (A refusal is recorded as the CLI said it: "Modal METHOD: …", or a sign-in Modal no longer takes, code 16.)
+        let answers = v["answers"].as_array().into_iter().flatten().filter_map(|a| b64.decode(a.as_str()?).ok()).collect();
+        // (A refusal is recorded as the CLI said it: "Modal METHOD: …", or a sign-in Modal no longer takes, code 16.
+        // One with answers too is a stream that broke off after them.)
         if let Some(e) = v["error"].as_str() {
             let said = format!("Modal {method}: ");
             return match e.find(&format!("(Modal {method}: ")) {
-                Some(at) if e.contains("no longer accepted") => (vec![], Some((16, e[at + 1 + said.len()..].trim_end_matches(')').to_string()))),
-                _ => (vec![], Some((2, e.strip_prefix(&said).unwrap_or(e).to_string()))),
+                Some(at) if e.contains("no longer accepted") => (answers, Some((16, e[at + 1 + said.len()..].trim_end_matches(')').to_string()))),
+                _ => (answers, Some((2, e.strip_prefix(&said).unwrap_or(e).to_string()))),
             }
         }
-        (v["answers"].as_array().into_iter().flatten().filter_map(|a| b64.decode(a.as_str()?).ok()).collect(), None)
+        (answers, None)
     }
 
     /// One HTTP/2 connection, each request a gRPC call to Modal (`modal_answer`): its message out of gRPC's frame, each
@@ -510,6 +512,13 @@ impl Aws {
                     while let Some(Ok(chunk)) = body.data().await { let _ = body.flow_control().release_capacity(chunk.len()); data.extend_from_slice(&chunk); }
                     // (gRPC's frame: a flag, four bytes of length, the message.)
                     let (answers, refused) = a.modal_answer(&method, data.get(5..).unwrap_or_default());
+                    // (Its message percent-encoded where gRPC asks it to be.)
+                    let encode = |message: &str| -> String { message.bytes().map(|b| if (0x20..0x7f).contains(&b) && b != b'%' { (b as char).to_string() } else { format!("%{b:02X}") }).collect() };
+                    // A refusal with nothing before it comes as gRPC servers send one, in the answer's headers alone.
+                    if let (Some((code, message)), true) = (&refused, answers.is_empty()) {
+                        let _ = respond.send_response(http::Response::builder().status(200).header("content-type", "application/grpc").header("grpc-status", code.to_string()).header("grpc-message", encode(message)).body(()).unwrap(), true);
+                        return;
+                    }
                     let Ok(mut send) = respond.send_response(http::Response::builder().status(200).header("content-type", "application/grpc").body(()).unwrap(), false) else { return };
                     for m in &answers {
                         let mut f = vec![0u8];
@@ -520,9 +529,7 @@ impl Aws {
                     let mut trailers = http::HeaderMap::new();
                     let (code, message) = refused.unwrap_or((0, String::new()));
                     trailers.insert("grpc-status", code.to_string().parse().unwrap());
-                    // (Its message percent-encoded where gRPC asks it to be.)
-                    let encoded: String = message.bytes().map(|b| if (0x20..0x7f).contains(&b) && b != b'%' { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
-                    if code != 0 { if let Ok(v) = encoded.parse() { trailers.insert("grpc-message", v); } }
+                    if code != 0 { if let Ok(v) = encode(&message).parse() { trailers.insert("grpc-message", v); } }
                     let _ = send.send_trailers(trailers);
                 });
             }
