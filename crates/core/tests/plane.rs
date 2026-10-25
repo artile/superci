@@ -5593,6 +5593,9 @@ fn a_runs_called_workflows_and_expressions_are_read_as_github_reads_them() {
             serde_json::from_str(&store.0.borrow()[&format!("run:{id}")]).unwrap()
         };
         let states = |r: &serde_json::Value| r["jobs"].as_array().unwrap().iter().map(|j| format!("{}={}{}", j["name"].as_str().or(j["key"].as_str()).unwrap_or_default(), j["state"].as_str().unwrap(), j["result"].as_str().map(|r| format!(":{r}")).unwrap_or_default())).collect::<Vec<_>>();
+        // A called workflow whose jobs need each other: named within the call.
+        let r = run("jobs:\n  call:\n    uses: ./.github/workflows/two.yml\n", serde_json::json!({ ".github/workflows/two.yml": "on:\n  workflow_call:\njobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n  b:\n    needs: a\n    runs-on: superci\n    steps:\n      - run: echo\n" }));
+        assert_eq!(r["jobs"][1]["needs"], serde_json::json!(["call/a"]));
         // A called workflow with no jobs: nothing to run, the run over at once.
         assert!(run("jobs:\n  call:\n    uses: ./.github/workflows/none.yml\n", serde_json::json!({ ".github/workflows/none.yml": "on:\n  workflow_call:\njobs: {}\n" }))["jobs"].as_array().unwrap().is_empty());
         // A caller that does not run, and one that does: its secrets as it names them (what is no text, or cannot be
@@ -5856,6 +5859,10 @@ fn a_machine_whose_region_makes_no_address_is_said_so_at_each_link_and_what_it_s
     assert_eq!(call(good, "begin", serde_json::json!({ "token": reader, "key": "deps-2", "version": v })).0, 403);
     let r = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/cache/{good}/lookup")).with_body("not json")));
     assert!(r.status == 500 && r.body_text().starts_with("not JSON"));
+    // A GitLab machine whose job runs for a branch SuperCI does not keep.
+    store.0.borrow_mut().insert("cachem:machine-cache-link-0000000gitlab".into(), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "gl:61" }).to_string());
+    store.0.borrow_mut().insert("glrunner:61".into(), serde_json::json!({ "id": 61, "gitlab": "", "running": { "job": 1, "project_id": 380, "project": "acme/app", "ref": "a:b", "tag": false } }).to_string());
+    assert_eq!(call("machine-cache-link-0000000gitlab", "tool-get", serde_json::json!({ "tool": "gitlab", "hash": "0123456789abcdef" })).0, 403);
     // A path of the layer store's it does not know.
     assert_eq!(block_on(plane.handle(get(&format!("/cache/{good}/more/layers")))).status, 404);
 }
@@ -6299,9 +6306,14 @@ fn installations_runners_and_machines_with_nothing_or_nobody_left_are_said_as_th
     store.0.borrow_mut().insert("job:gl10".into(), serde_json::json!({ "job_id": 10, "run_id": 3, "repo": "acme/app", "state": "launched", "at_ms": t - 30_000, "launched_ms": t - 30_000, "installation_id": 0,
         "cloud": "aws", "machine_id": "i-10", "region": "us-east-1", "seen_in_progress": false, "provider": "gitlab", "project_id": 380, "runner_id": 77 }).to_string());
     store.0.borrow_mut().insert("gone:gl10".into(), t.to_string());
+    // (And one of GitHub's whose job ended unseen, with no runner registered to take back.)
+    store.0.borrow_mut().insert("job:11".into(), serde_json::json!({ "job_id": 11, "run_id": 3, "repo": "acme/app", "state": "launched", "at_ms": t - 30_000, "launched_ms": t - 30_000, "installation_id": 42,
+        "cloud": "aws", "machine_id": "i-11", "region": "us-east-1", "seen_in_progress": false, "label": "superci" }).to_string());
+    store.0.borrow_mut().insert("gone:11".into(), t.to_string());
     block_on(plane.alarm()).unwrap();
     assert!(job(&store, 8)["held_until_ms"].is_null(), "{}", job(&store, 8));
-    // Leaving, with the App installed nowhere.
+    // Leaving: the App uninstalled where it is; then, installed nowhere.
+    assert_eq!(json(&post("/leave", "{}"))["github_installations"], 2);
     empty.set(true);
     assert_eq!(json(&post("/leave", "{}"))["github_installations"], 0);
 }
@@ -6335,7 +6347,10 @@ fn a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_
     assert_eq!(call(good, "artifact-begin", serde_json::json!({ "name": "a/b" })).0, 400);
     assert_eq!(call(good, "artifact-begin", serde_json::json!({ "name": "report" })).0, 200);
     assert_eq!(call(good, "artifact-begin", serde_json::json!({ "name": "report" })).0, 409);
+    assert_eq!(call(good, "artifact-sign", serde_json::json!({ "name": "report", "names": ["p1"] })).0, 200);
     assert!(call(good, "artifact-finish", serde_json::json!({ "name": "report", "pieces": [["p0", "x"], [1, 2], ["p1", 3]] })).1.contains(r#""size":3"#));
+    assert_eq!(call(good, "artifact-get", serde_json::json!({ "name": "report" })).0, 200);
+    assert_eq!(call(good, "artifact-delete", serde_json::json!({ "name": "report" })).0, 200);
     store.0.borrow_mut().insert("artifact:41:empty".into(), serde_json::json!({ "id": "e", "region": "us-east-1", "made": t, "done": true }).to_string());
     assert_eq!(call(good, "artifact-delete", serde_json::json!({ "name": "empty" })).0, 200);
     // Begun by a token of the control plane's that says no job: kept by none.
@@ -6350,7 +6365,16 @@ fn a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_
     // A tool's artifact begun twice; its pieces said amiss (the job is a run's: its machine reads the run).
     assert_eq!(call(good, "tool-begin", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 200);
     assert_eq!(call(good, "tool-begin", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 409);
-    assert_eq!(call(good, "tool-finish", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "pieces": [["p00000", 5], [1, 2]] })).0, 200);
+    assert_eq!(call(good, "tool-finish", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "pieces": [["p00000", 5], [1, 2], ["p00001", "x"]] })).0, 200);
+    // The dashboard takes the repository's entries out (their pieces from the bucket too); a month on, what is left goes.
+    assert_eq!(block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/caches/delete")).with_header("authorization", "Bearer dashboard-session-key-1").with_body(r#"{"repo":"gh77"}"#))).status, 200);
+    store.0.borrow_mut().insert("cache:gh77:refs/heads/main:v:left".into(), serde_json::json!({ "id": "l", "region": "us-east-1", "made": t, "done": false }).to_string());
+    store.0.borrow_mut().insert("cache:gh77:refs/heads/main:v:old".into(), serde_json::json!({ "id": "o", "region": "us-east-1", "made": 0, "used": 0, "done": true, "pieces": [["p0", 1]] }).to_string());
+    block_on(plane.alarm()).unwrap();
+    assert!(!store.0.borrow().contains_key("cache:gh77:refs/heads/main:v:old"));
+    // The run gone: a tool on its machine reads nothing.
+    store.0.borrow_mut().remove("run:41");
+    assert_eq!(call(good, "tool-get", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 403);
 }
 
 /// What a runner sends for a run's job, as a real one sent it (`fixtures/runner`): up to `upto` of its requests (all:
