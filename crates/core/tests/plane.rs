@@ -5501,6 +5501,95 @@ fn many_jobs_kept_before_their_indexes_are_indexed_and_counted_over_several_swee
     assert!(status["jobs"].as_array().is_some_and(|j| !j.is_empty()), "{status}");
 }
 
+/// A control plane in AWS with a dashboard key, for runs from a computer: what it answers to a new run.
+fn run_plane(f: impl Fn(&dyn Fn(serde_json::Value) -> Response, &Mem)) {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let new_run = |body: serde_json::Value| block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1").with_body(body.to_string())));
+    f(&new_run, &store);
+}
+
+const LIB: &str = "on:\n  workflow_call:\n    inputs:\n      n:\n        type: number\njobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo ${{ inputs.n }}\n";
+
+#[test]
+fn a_runs_jobs_that_cannot_be_read_or_called_are_refused_saying_why() {
+    run_plane(|new_run, _| {
+        let refused = |workflow: &str, called: serde_json::Value| { let r = new_run(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "called": called })); (r.status, r.body_text()) };
+        let calls = "jobs:\n  call:\n    uses: ./.github/workflows/lib.yml\n";
+        for (workflow, called, said) in [
+            (calls, serde_json::json!({}), "which was not sent with the run"),
+            (calls, serde_json::json!({ ".github/workflows/lib.yml": "jobs: [" }), ".github/workflows/lib.yml: "),
+            (calls, serde_json::json!({ ".github/workflows/lib.yml": "on:\n  workflow_call:\njobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    strategy:\n      matrix: [1, 2]\n" }), ".github/workflows/lib.yml's job a: the matrix is not a mapping"),
+            ("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    strategy:\n      matrix:\n        os: linux\n", serde_json::json!({}), "the job a: the matrix's os is not a list"),
+            // Read as the run starts: its name, how long it may take, whether it may fail, its machine, its matrix.
+            ("jobs:\n  a:\n    name: ${{ ) }}\n    runs-on: superci\n    steps:\n      - run: echo\n", serde_json::json!({}), "unexpected RParen"),
+            ("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    timeout-minutes: ${{ ) }}\n", serde_json::json!({}), "unexpected RParen"),
+            ("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    timeout-minutes: soon\n", serde_json::json!({}), "the job a's timeout-minutes is not a number"),
+            ("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    continue-on-error: ${{ ) }}\n", serde_json::json!({}), "unexpected RParen"),
+            ("jobs:\n  a:\n    runs-on: superci/cpu=${{ ) }}\n    steps:\n      - run: echo\n", serde_json::json!({}), "unexpected RParen"),
+            ("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    strategy:\n      matrix: ${{ ) }}\n", serde_json::json!({}), "the job a's matrix: "),
+            // A caller whose `if` cannot be read.
+            ("jobs:\n  call:\n    if: ${{ ) }}\n    uses: ./.github/workflows/lib.yml\n", serde_json::json!({ ".github/workflows/lib.yml": LIB }), "the job call's if: "),
+            // An input given that cannot be read.
+            ("jobs:\n  call:\n    uses: ./.github/workflows/lib.yml\n    with:\n      n: ${{ ) }}\n", serde_json::json!({ ".github/workflows/lib.yml": LIB }), "unexpected RParen"),
+        ] {
+            let (status, body) = refused(workflow, called);
+            assert!(status == 400 && body.contains(said) && !body.is_empty(), "{workflow}: {status} {body}");
+        }
+    });
+}
+
+#[test]
+fn a_runs_called_workflows_and_expressions_are_read_as_github_reads_them() {
+    run_plane(|new_run, store| {
+        let run = |workflow: &str, called: serde_json::Value| -> serde_json::Value {
+            let r = new_run(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app", "called": called, "secrets": [["X", "secret-x"]] }));
+            assert_eq!(r.status, 200, "{workflow}: {}", r.body_text());
+            let id = json(&r)["run_id"].as_str().unwrap().to_string();
+            serde_json::from_str(&store.0.borrow()[&format!("run:{id}")]).unwrap()
+        };
+        let states = |r: &serde_json::Value| r["jobs"].as_array().unwrap().iter().map(|j| format!("{}={}{}", j["name"].as_str().or(j["key"].as_str()).unwrap_or_default(), j["state"].as_str().unwrap(), j["result"].as_str().map(|r| format!(":{r}")).unwrap_or_default())).collect::<Vec<_>>();
+        // A called workflow with no jobs: nothing to run, the run over at once.
+        assert!(run("jobs:\n  call:\n    uses: ./.github/workflows/none.yml\n", serde_json::json!({ ".github/workflows/none.yml": "on:\n  workflow_call:\njobs: {}\n" }))["jobs"].as_array().unwrap().is_empty());
+        // A caller that does not run, and one that does: its secrets as it names them (what is no text, or cannot be
+        // read, is none), its machine in an environment named by an expression.
+        let r = run("jobs:\n  skipped:\n    if: false\n    uses: ./.github/workflows/lib.yml\n  call:\n    if: true\n    uses: ./.github/workflows/lib.yml\n    with:\n      n: '3'\n    secrets:\n      A: ${{ secrets.X }}\n      B:\n        n: 1\n      C: ${{ ) }}\n      ? [odd]\n      : x\n",
+            serde_json::json!({ ".github/workflows/lib.yml": LIB.replace("    runs-on: superci\n    steps:\n      - run: echo\n", "    runs-on: superci\n    steps:\n      - run: echo\n    environment: ${{ 1 }}\n") }));
+        assert_eq!(states(&r), ["skipped / a=done:skipped", "call / a=started"]);
+        assert_eq!(r["jobs"][1]["inputs"], serde_json::json!({ "n": 3.0 }));
+        let token = r["jobs"][1]["token"].as_str().unwrap();
+        let handed: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("rjob:{token}")]).unwrap();
+        assert!(handed.to_string().contains("secret-x"), "the secret it names, given");
+        // A matrix read as the run starts: of values written with an expression in them, or of none (failed, as GitHub fails it).
+        let r = run("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    strategy:\n      matrix:\n        v: [\"x-${{ 1 }}\"]\n", serde_json::json!({}));
+        assert_eq!(states(&r), ["a (x-1)=started"]);
+        let r = run("jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n    strategy:\n      matrix: ${{ fromJSON('{\"v\":[]}') }}\n", serde_json::json!({}));
+        assert_eq!(states(&r), ["a (its matrix has no combinations)=done:failure"]);
+    });
+}
+
+#[test]
+fn a_damaged_or_gone_run_record_is_left_as_it_is_and_says_why_where_it_is_moved_on() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let put = |k: &str, v: serde_json::Value| { store.0.borrow_mut().insert(k.into(), v.to_string()); };
+    // A started job without its id or token; a run whose called workflow is no workflow; a job of a called workflow
+    // the run does not have.
+    put("run:1", serde_json::json!({ "at_ms": 1_790_000_000_000u64, "workflow": "jobs:\n  a:\n    runs-on: superci\n", "jobs": [{ "key": "a", "state": "started" }] }));
+    put("run:2", serde_json::json!({ "at_ms": 1_790_000_000_000u64, "workflow": "jobs:\n  a:\n    runs-on: superci\n", "called": { "x.yml": "jobs: [" }, "jobs": [{ "key": "a", "state": "pending", "needs": [] }] }));
+    put("run:3", serde_json::json!({ "at_ms": 1_790_000_000_000u64, "workflow": "jobs:\n  a:\n    runs-on: superci\n", "jobs": [{ "key": "lib/a", "job_key": "a", "source": "lib.yml", "call": "lib", "state": "pending", "needs": [] }] }));
+    block_on(plane.alarm()).unwrap();
+    for id in [1, 2, 3] { assert!(store.0.borrow().contains_key(&format!("run:{id}")), "run {id} kept") }
+    assert!(!store.0.borrow().contains_key("run-error:1"));
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -5632,7 +5721,10 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         events_this_control_plane_does_nothing_with_are_answered_and_change_nothing,
         a_gitlab_job_over_before_its_machine_came_is_cancelled_wherever_it_was,
         a_damaged_signing_key_or_no_aws_credentials_fail_what_needs_them_saying_why,
-        many_jobs_kept_before_their_indexes_are_indexed_and_counted_over_several_sweeps_and_damaged_ones_are_passed_over
+        many_jobs_kept_before_their_indexes_are_indexed_and_counted_over_several_sweeps_and_damaged_ones_are_passed_over,
+        a_runs_jobs_that_cannot_be_read_or_called_are_refused_saying_why,
+        a_runs_called_workflows_and_expressions_are_read_as_github_reads_them,
+        a_damaged_or_gone_run_record_is_left_as_it_is_and_says_why_where_it_is_moved_on
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

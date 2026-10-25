@@ -955,6 +955,45 @@ fn active(j: &Job) -> bool { ["launching", "launched", "running"].contains(&j.st
 /// jobs of the workflow a job of that name calls.
 fn of_job<'a>(jobs: &'a [serde_json::Value], n: &str) -> Vec<&'a serde_json::Value> { jobs.iter().filter(|j| j["key"] == n || j["call"] == n).collect() }
 
+/// A run from a computer's jobs: each job named, each combination of its matrix, in the order of the file. A call of
+/// another workflow of the repository (`called`, by path) stands for that workflow's jobs, each a job of the run
+/// (`caller / job`) after the jobs the caller needs, with the inputs and secrets the caller gives (see `advance_run`).
+/// What cannot be run from a computer is refused, saying why.
+fn run_jobs<'a>(wf: &crate::workflow::Node, names: impl Iterator<Item = &'a String>, called: &std::collections::BTreeMap<String, String>) -> std::result::Result<Vec<serde_json::Value>, String> {
+    let lists = names.map(|name| {
+        let job = wf.get("jobs").and_then(|j| j.get(name)).cloned().unwrap_or(crate::workflow::Node::Scalar { text: String::new(), plain: true, line: 0, col: 0 });
+        let Some(uses) = job.get("uses").and_then(|u| u.text()) else {
+            let (later, combos) = combinations(&job).map_err(|e| format!("the job {name}: {e}"))?;
+            let total = combos.len();
+            return Ok(combos.into_iter().enumerate().map(|(index, matrix)| serde_json::json!({ "key": name, "index": index, "total": total, "matrix": matrix, "needs": crate::workflow::needs(&job), "state": "pending", "matrix_later": later })).collect())
+        };
+        let path = uses.strip_prefix("./").filter(|p| !p.contains('@'))
+            .ok_or_else(|| format!("the job {name} calls {uses}: a workflow of another repository is not run from a computer yet (one of this repository, ./.github/workflows/…, is)"))?;
+        let text = called.get(path).ok_or_else(|| format!("the job {name} calls {uses}, which was not sent with the run (update SuperCI on this computer)"))?;
+        let workflow = crate::workflow::parse(text).map_err(|e| format!("{path}: {e}"))?;
+        if !crate::workflow::callable(&workflow) { return Err(format!("the job {name} calls {path}, which is not a workflow that may be called (on: workflow_call)")) }
+        if job.get("strategy").and_then(|s| s.get("matrix")).is_some() { return Err(format!("the job {name} calls a workflow with a matrix: not run from a computer yet")) }
+        let theirs = workflow.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default().into_iter().map(|(ck, cj)| {
+            let cname = ck.text().unwrap_or_default().to_string();
+            if cj.get("uses").is_some() { return Err(format!("{path}'s job {cname} calls a workflow in turn: not run from a computer yet")) }
+            let internal: Vec<String> = crate::workflow::needs(&cj).iter().map(|n| format!("{name}/{n}")).collect();
+            let (later, combos) = combinations(&cj).map_err(|e| format!("{path}'s job {cname}: {e}"))?;
+            let total = combos.len();
+            Ok(combos.into_iter().enumerate().map(|(index, matrix)| serde_json::json!({ "key": format!("{name}/{cname}"), "job_key": cname, "source": path, "call": name, "index": index, "total": total,
+                "matrix": matrix, "needs": internal, "wait": crate::workflow::needs(&job), "state": "pending", "matrix_later": later })).collect::<Vec<_>>())
+        });
+        Ok(theirs.collect::<std::result::Result<Vec<_>, String>>()?.concat())
+    });
+    Ok(lists.collect::<std::result::Result<Vec<Vec<_>>, String>>()?.concat())
+}
+
+/// A job's combinations of its matrix (one, null, without a matrix), and whether its matrix is made by an expression,
+/// read once the jobs it needs have ended (one, null, until then).
+fn combinations(job: &crate::workflow::Node) -> std::result::Result<(bool, Vec<serde_json::Value>), String> {
+    if crate::workflow::matrix_later(job) { return Ok((true, vec![serde_json::Value::Null])) }
+    Ok((false, crate::workflow::matrix(job)?.map_or_else(|| vec![serde_json::Value::Null], |c| c.into_iter().map(serde_json::Value::Object).collect())))
+}
+
 /// The workflows a run's jobs call, read.
 fn called_workflows(run: &serde_json::Value) -> std::result::Result<std::collections::BTreeMap<String, crate::workflow::Node>, String> {
     run["called"].as_object().into_iter().flatten().map(|(p, t)| Ok((p.clone(), crate::workflow::parse(t.as_str().unwrap_or_default()).map_err(|e| format!("{p}: {e}"))?))).collect()
@@ -3753,10 +3792,12 @@ impl<'a> ControlPlane<'a> {
             let put = aws::s3(self.http, "PUT", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, &object), &region, &creds, body.to_vec(), &[], now).await?;
             if put.status < 300 { return self.store.put_until(&mark, format!("s3:{region}:{}", body.len()), until).await }
         }
-        for (i, piece) in body.chunks(crate::runner_service::LOG_PIECE).enumerate() {
+        // (Something is always sent: see `/hello`.)
+        let mut pieces = body.chunks(crate::runner_service::LOG_PIECE).enumerate();
+        loop {
+            let Some((i, piece)) = pieces.next() else { return Ok(()) };
             self.store.put_until(&format!("{mark}:{i:03}"), crate::crypto::b64(piece), until).await?;
         }
-        Ok(())
     }
 
     /// What a job's runner has written so far of one step (its pages: `<timeline>_<step>_<n>.log`), as the step's log
@@ -3913,53 +3954,18 @@ impl<'a> ControlPlane<'a> {
             Some(j) => return Ok(Response::text(400, &format!("{} has no job named {j}: {}", r.path, names.join(", ")))),
             None => names.clone(),
         };
+        // (Each one wanted, then what it needs, as long as that adds any.)
         let mut i = 0;
-        while i < wanted.len() {
-            let job = wf.get("jobs").and_then(|j| j.get(&wanted[i])).cloned();
-            for n in job.as_ref().map(crate::workflow::needs).unwrap_or_default() {
-                if !names.contains(&n) { return Ok(Response::text(400, &format!("the job {} needs {n}, which {} does not have", wanted[i], r.path))) }
+        loop {
+            let Some(w) = wanted.get(i).cloned() else { break };
+            for n in wf.get("jobs").and_then(|j| j.get(&w)).map(crate::workflow::needs).unwrap_or_default() {
+                if !names.contains(&n) { return Ok(Response::text(400, &format!("the job {w} needs {n}, which {} does not have", r.path))) }
                 if !wanted.contains(&n) { wanted.push(n) }
             }
             i += 1;
         }
-        // Each job, each combination of its matrix: one job of the run, in the order of the file.
         let now = self.clock.now_ms();
-        let mut instances = vec![];
-        for name in names.iter().filter(|n| wanted.contains(n)) {
-            let job = wf.get("jobs").and_then(|j| j.get(name)).cloned().unwrap_or(crate::workflow::Node::Scalar { text: String::new(), plain: true, line: 0, col: 0 });
-            // A call of another workflow of this repository: its jobs, each a job of the run (`caller / job`), after
-            // the jobs the caller needs, with the inputs and secrets the caller gives (see `advance_run`).
-            if let Some(uses) = job.get("uses").and_then(|u| u.text()) {
-                let Some(path) = uses.strip_prefix("./").filter(|p| !p.contains('@')) else {
-                    return Ok(Response::text(400, &format!("the job {name} calls {uses}: a workflow of another repository is not run from a computer yet (one of this repository, ./.github/workflows/…, is)")))
-                };
-                let Some(text) = r.called.get(path) else { return Ok(Response::text(400, &format!("the job {name} calls {uses}, which was not sent with the run (update SuperCI on this computer)"))) };
-                let called = match crate::workflow::parse(text) { Ok(w) => w, Err(e) => return Ok(Response::text(400, &format!("{path}: {e}"))) };
-                if !crate::workflow::callable(&called) { return Ok(Response::text(400, &format!("the job {name} calls {path}, which is not a workflow that may be called (on: workflow_call)"))) }
-                if job.get("strategy").and_then(|s| s.get("matrix")).is_some() { return Ok(Response::text(400, &format!("the job {name} calls a workflow with a matrix: not run from a computer yet"))) }
-                for (ck, cj) in called.get("jobs").map(|j| j.pairs().to_vec()).unwrap_or_default() {
-                    let cname = ck.text().unwrap_or_default().to_string();
-                    if cj.get("uses").is_some() { return Ok(Response::text(400, &format!("{path}'s job {cname} calls a workflow in turn: not run from a computer yet"))) }
-                    let internal: Vec<String> = crate::workflow::needs(&cj).iter().map(|n| format!("{name}/{n}")).collect();
-                    let later = crate::workflow::matrix_later(&cj);
-                    let combos = if later { vec![serde_json::Value::Null] } else { match crate::workflow::matrix(&cj) { Ok(Some(c)) => c.into_iter().map(serde_json::Value::Object).collect::<Vec<_>>(), Ok(None) => vec![serde_json::Value::Null], Err(e) => return Ok(Response::text(400, &format!("{path}'s job {cname}: {e}"))) } };
-                    let total = combos.len();
-                    for (index, matrix) in combos.into_iter().enumerate() {
-                        instances.push(serde_json::json!({ "key": format!("{name}/{cname}"), "job_key": cname, "source": path, "call": name, "index": index, "total": total, "matrix": matrix,
-                            "needs": internal, "wait": crate::workflow::needs(&job), "state": "pending", "matrix_later": later }));
-                    }
-                }
-                continue;
-            }
-            // A matrix made by an expression is read once the jobs the job needs have ended.
-            let later = crate::workflow::matrix_later(&job);
-            let combos = if later { vec![serde_json::Value::Null] } else { match crate::workflow::matrix(&job) { Ok(Some(c)) => c.into_iter().map(serde_json::Value::Object).collect::<Vec<_>>(), Ok(None) => vec![serde_json::Value::Null], Err(e) => return Ok(Response::text(400, &format!("the job {name}: {e}"))) } };
-            if combos.is_empty() { continue }
-            let total = combos.len();
-            for (index, matrix) in combos.into_iter().enumerate() {
-                instances.push(serde_json::json!({ "key": name, "index": index, "total": total, "matrix": matrix, "needs": crate::workflow::needs(&job), "state": "pending", "matrix_later": later }));
-            }
-        }
+        let instances = match run_jobs(&wf, names.iter().filter(|n| wanted.contains(n)), &r.called) { Ok(i) => i, Err(e) => return Ok(Response::text(400, &e)) };
         if instances.len() > 64 { return Ok(Response::text(400, &format!("{} jobs: a run from a computer runs 64 at most", instances.len()))) }
         let run_id = local_id();
         // The secrets this CI keeps that the run may have (see `secrets`): those its workflows name, whose scope holds
@@ -4124,13 +4130,14 @@ impl<'a> ControlPlane<'a> {
                         if combos.is_empty() {
                             // (As GitHub, which fails the run: a matrix of nothing runs nothing.)
                             let mut failed = template.clone();
-                            for (k, v) in [("state", serde_json::json!("done")), ("result", "failure".into()), ("name", format!("{key_name} (its matrix has no combinations)").into()), ("matrix_later", false.into())] { failed[k] = v }
+                            (failed["state"], failed["result"]) = ("done".into(), "failure".into());
+                            (failed["name"], failed["matrix_later"]) = (format!("{key_name} (its matrix has no combinations)").into(), false.into());
                             jobs.insert(i, failed);
                         }
                         let total = combos.len();
                         for (n, m) in combos.into_iter().enumerate() {
                             let mut one = template.clone();
-                            for (k, v) in [("matrix", serde_json::Value::Object(m)), ("index", n.into()), ("total", total.into()), ("matrix_later", false.into())] { one[k] = v }
+                            (one["matrix"], one["index"], one["total"], one["matrix_later"]) = (serde_json::Value::Object(m), n.into(), total.into(), false.into());
                             jobs.insert(i + n, one);
                         }
                         moved = true;
@@ -4179,7 +4186,7 @@ impl<'a> ControlPlane<'a> {
             run["jobs"] = serde_json::Value::Array(jobs.clone());
             if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
             for i in start {
-                if let Err(e) = self.start_instance(plane_url, run_id, &run, &jobs[i], &secrets, &wf).await {
+                if let Err(e) = self.start_instance(plane_url, run_id, &run, &jobs[i], &secrets, &wf, &called).await {
                     self.unreserve(&key, &jobs[i]).await;
                     return Err(e)
                 }
@@ -4250,7 +4257,7 @@ impl<'a> ControlPlane<'a> {
 
     /// A repository's id and default branch as GitHub has them, where an App of this control plane is installed on it.
     async fn repository_of(&self, repository: &str) -> Option<(u64, String)> {
-        let owner = repository.split('/').next()?;
+        let owner = repository.split('/').next().unwrap_or_default();
         let now = self.clock.now_ms();
         for app in self.config.apps() {
             let Ok(found) = github::installations(self.http, app, now).await else { continue };
@@ -4264,15 +4271,15 @@ impl<'a> ControlPlane<'a> {
 
     /// Starts one job of a run from a computer: its message (with its matrix, strategy and needs), its record, and
     /// its machine, as any job's.
-    async fn start_instance(&self, plane_url: &str, run_id: u64, run: &serde_json::Value, inst: &serde_json::Value, secrets: &[(String, String)], wf: &crate::workflow::Node) -> std::result::Result<(), String> {
+    async fn start_instance(&self, plane_url: &str, run_id: u64, run: &serde_json::Value, inst: &serde_json::Value, secrets: &[(String, String)], wf: &crate::workflow::Node,
+        called: &std::collections::BTreeMap<String, crate::workflow::Node>) -> std::result::Result<(), String> {
         let (key_name, token) = (inst["job_key"].as_str().or(inst["key"].as_str()).unwrap_or_default(), inst["token"].as_str().unwrap_or_default());
-        let job_id: u64 = inst["job_id"].as_str().and_then(|i| i.parse().ok()).ok_or("a job without its id")?;
-        // A job of a called workflow: that file's, and the secrets its caller gives it (all of the run's with
-        // `secrets: inherit`, those it names, or none).
+        let job_id: u64 = inst["job_id"].as_str().and_then(|i| i.parse().ok()).expect("a job reserved to start has its id");
+        // A job of a called workflow: that file's (read as the run was moved on, see `advance_run`), and the secrets
+        // its caller gives it (all of the run's with `secrets: inherit`, those it names, or none).
         let source = inst["source"].as_str();
-        let own_text = match source { Some(p) => run["called"][p].as_str().ok_or_else(|| format!("{p} is not in the run"))?.to_string(), None => run["workflow"].as_str().unwrap_or_default().to_string() };
-        let own = match source { Some(_) => crate::workflow::parse(&own_text)?, None => wf.clone() };
-        let wf = &own;
+        let own_text = source.map_or_else(|| run["workflow"].as_str(), |p| run["called"][p].as_str()).unwrap_or_default().to_string();
+        let wf = source.and_then(|p| called.get(p)).unwrap_or(wf);
         // The run's secrets: those this CI keeps that the run was given (see `create_run`), the narrowest under each
         // name, and those given with the run, which win.
         let stored: Vec<crate::secrets::Stored> = serde_json::from_value(run["stored"].clone()).unwrap_or_default();
@@ -4332,7 +4339,8 @@ impl<'a> ControlPlane<'a> {
         let who = run["by"].as_str().filter(|b| !b.is_empty() && b.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))).unwrap_or("computer");
         let mut claims = cache::local_claims(run["cache"]["ns"].as_str().unwrap_or_default(), who, &reference, run["cache"]["default_branch"].as_str().unwrap_or("main"), &run_id.to_string(), &job_id.to_string());
         let secs = now / 1000;
-        for (k, v) in [("iss", serde_json::json!(plane_url)), ("aud", "superci-cache".into()), ("sub", format!("run:{run_id}").into()), ("iat", secs.into()), ("exp", (secs + (self.machine_minutes("aws") as u64 + 60) * 60).into())] { claims[k] = v }
+        (claims["iss"], claims["aud"], claims["sub"]) = (plane_url.into(), "superci-cache".into(), format!("run:{run_id}").into());
+        (claims["iat"], claims["exp"]) = (secs.into(), (secs + (self.machine_minutes("aws") as u64 + 60) * 60).into());
         let access_token = self.identity().await?.signing.jwt(&claims)?;
         let given = crate::runner_service::Given { workflow: &own_text, path: &path, job: key_name, secrets, vars: &vars, github, service: &service,
             access_token: &access_token, ids: crate::runner_service::Ids::new(1), matrix: inst["matrix"].clone(),
