@@ -42,7 +42,9 @@ fn lex(s: &str) -> Result<Vec<Tok>> {
             continue
         }
         if ch.is_ascii_alphabetic() || ch == '_' {
+            // (The first character is one of a name's: the rest from the next.)
             let start = i;
+            i += 1;
             while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_' || c[i] == '-') { i += 1 }
             out.push(Tok::Ident(c[start..i].iter().collect()));
             continue
@@ -279,6 +281,8 @@ mod tests {
         let c = Contexts { values: &values, status: Status::Success };
         let e = |s: &str| evaluate(s, &c).unwrap();
         assert_eq!(e("needs.build.outputs.version"), json!("1.2"));
+        // A name of one character.
+        assert_eq!(e("x"), json!(null));
         assert_eq!(e("needs['build'].result == 'SUCCESS'"), json!(true));
         assert_eq!(e("matrix.node == '20'"), json!(true));
         assert_eq!(e("github.event_name == 'push' && 'yes' || 'no'"), json!("yes"));

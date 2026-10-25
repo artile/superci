@@ -33,7 +33,15 @@ impl Node {
     fn empty(&self) -> bool { matches!(self, Node::Scalar { text, plain: true, .. } if text.is_empty() || text == "~" || text == "null") }
 }
 
-struct Build { stack: Vec<Node>, keys: Vec<Vec<Node>>, done: Option<Node>, error: Option<String>,
+/// A sequence or a mapping being read.
+enum Open { Seq { items: Vec<Node>, line: usize, col: usize }, Map { pairs: Vec<(Node, Node)>, line: usize, col: usize } }
+
+impl Open {
+    /// Read to its end.
+    fn node(self) -> Node { match self { Open::Seq { items, line, col } => Node::Seq { items, line, col }, Open::Map { pairs, line, col } => Node::Map { pairs, line, col } } }
+}
+
+struct Build { stack: Vec<Open>, keys: Vec<Vec<Node>>, done: Option<Node>, error: Option<String>,
     /// The scalar being put is a block (`|`, `>`): it stands where its mark is, after its key, not where its text begins.
     block: bool,
     /// Anchors (`&name`): each value by its id, once read; and the id of each sequence and mapping being read.
@@ -43,8 +51,8 @@ impl Build {
     fn put(&mut self, node: Node) {
         match self.stack.last_mut() {
             None => self.done = Some(node),
-            Some(Node::Seq { items, .. }) => items.push(node),
-            Some(Node::Map { pairs, .. }) => {
+            Some(Open::Seq { items, .. }) => items.push(node),
+            Some(Open::Map { pairs, .. }) => {
                 let keys = self.keys.last_mut().expect("a key list for every mapping");
                 match keys.pop() {
                     Some(key) => {
@@ -63,7 +71,6 @@ impl Build {
                     None => keys.push(node),
                 }
             }
-            Some(Node::Scalar { .. }) => {}
         }
     }
 }
@@ -88,11 +95,11 @@ impl MarkedEventReceiver for Build {
                 self.put(node);
                 self.block = false;
             }
-            Event::SequenceStart(anchor, ..) => { self.stack.push(Node::Seq { items: vec![], line, col }); self.anchored.push(anchor) }
-            Event::MappingStart(anchor, ..) => { self.stack.push(Node::Map { pairs: vec![], line, col }); self.keys.push(vec![]); self.anchored.push(anchor) }
+            Event::SequenceStart(anchor, ..) => { self.stack.push(Open::Seq { items: vec![], line, col }); self.anchored.push(anchor) }
+            Event::MappingStart(anchor, ..) => { self.stack.push(Open::Map { pairs: vec![], line, col }); self.keys.push(vec![]); self.anchored.push(anchor) }
             // (The parser ends only what it began.)
-            Event::SequenceEnd => { let n = self.stack.pop().expect("a sequence begun"); self.end(n) }
-            Event::MappingEnd => { self.keys.pop(); let n = self.stack.pop().expect("a mapping begun"); self.end(n) }
+            Event::SequenceEnd => { let n = self.stack.pop().expect("a sequence begun").node(); self.end(n) }
+            Event::MappingEnd => { self.keys.pop(); let n = self.stack.pop().expect("a mapping begun").node(); self.end(n) }
             // An alias (`*name`): the value its anchor named, as if written here (as GitHub Actions reads it).
             Event::Alias(anchor) => match self.anchors.get(&anchor).cloned() {
                 Some(node) => self.put(node),
@@ -247,8 +254,8 @@ fn step(node: &Node, file: u32, seen: &mut Vec<String>, id: String, named: Optio
     }
     out["condition"] = condition(node).into();
     // (`true`, `3`: what they are, when written so; an expression is left to the runner.)
-    for (key, field, kind, value) in [("continue-on-error", "continueOnError", 5, "bool"), ("timeout-minutes", "timeoutInMinutes", 6, "num")] {
-        let Some(n) = node.get(key) else { continue };
+    let fields = [("continue-on-error", "continueOnError", 5, "bool"), ("timeout-minutes", "timeoutInMinutes", 6, "num")];
+    for (n, field, kind, value) in fields.into_iter().filter_map(|(key, field, kind, value)| Some((node.get(key)?, field, kind, value))) {
         let text = n.text().unwrap_or_default();
         let mut t = at(kind, file, n);
         match (kind, text.parse::<bool>(), text.parse::<f64>()) {
@@ -302,8 +309,9 @@ pub fn job_parts(workflow: &Node, path: &str, job: &str, ids: &mut dyn FnMut() -
     let mut seen = vec![];
     let steps = found.get("steps").map(Node::items).unwrap_or_default();
     if steps.is_empty() { return Err(format!("the job {job} in {path} has no steps (a job that calls another workflow is not run here yet)")) }
-    let (mut written, mut known, mut groups) = (vec![], vec![], 0);
-    for s in steps {
+    let (mut written, mut known, mut groups, mut each) = (vec![], vec![], 0, steps.iter());
+    loop {
+        let Some(s) = each.next() else { break };
         if let Some(c) = control(s, file, &known, ids())? { written.push(c); continue }
         let Some(group) = s.get("parallel") else {
             let one = step(s, file, &mut seen, ids(), None)?;
@@ -332,8 +340,8 @@ pub fn job_parts(workflow: &Node, path: &str, job: &str, ids: &mut dyn FnMut() -
         written.push(json!({ "type": "backgroundStepControl", "controlType": "wait", "stepIds": names, "displayNameToken": "Parallel group", "condition": "", "parallelGroupId": group_id, "id": ids(), "name": "Parallel group" }));
     }
     out["steps"] = written.into();
-    for (key, field) in [("outputs", "jobOutputs"), ("services", "jobServiceContainers"), ("container", "jobContainer")] {
-        if let Some(n) = found.get(key).filter(|n| !n.empty()) { out[field] = token(n, file) }
+    for (field, n) in [("outputs", "jobOutputs"), ("services", "jobServiceContainers"), ("container", "jobContainer")].into_iter().filter_map(|(key, field)| Some((field, found.get(key).filter(|n| !n.empty())?))) {
+        out[field] = token(n, file)
     }
     Ok(out)
 }
@@ -471,6 +479,12 @@ mod tests {
         // A `}}` inside a quoted string does not end the expression; one never closed is text.
         assert_eq!(t("${{ format('{0}}}', 1) }}"), json!({ "type": 3, "expr": "format('{0}}}', 1)" }));
         assert_eq!(t("${{ open"), json!({ "type": 0, "lit": "${{ open" }));
+    }
+
+    #[test]
+    fn a_matrixs_values_are_what_they_are_written_as() {
+        let job = parse("strategy:\n  matrix:\n    v: [true, false, ~, 3, x, 'true']\n").unwrap();
+        assert_eq!(matrix(&job).unwrap().unwrap().iter().map(|m| m["v"].clone()).collect::<Vec<_>>(), [json!(true), json!(false), json!(null), json!(3.0), json!("x"), json!("true")]);
     }
 
     #[test]
