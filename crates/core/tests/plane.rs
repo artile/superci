@@ -5860,6 +5860,74 @@ fn githubs_keys_that_are_no_json_or_a_damaged_signing_key_leave_a_jobs_token_unr
     assert_eq!(block_on(plane.handle(get(&format!("/cache/{link}/program")))).status, 404);
 }
 
+#[test]
+fn the_layer_store_passes_over_what_is_kept_damaged_and_says_what_a_machine_asks_amiss() {
+    let t = 1_790_000_000_000u64;
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = WithLayers { clouds: FakeClouds::default(), objects: Default::default(), converted: Default::default(), deleted: Default::default() };
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let (good, bad) = ("machine-cache-link-000000000good", "machine-cache-link-0000000000bad");
+    cache_machine(&store, good, "us-east-1");
+    cache_machine(&store, bad, "us east-1");
+    let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    let layer = |made: u64, used: u64| serde_json::json!({ "size": 10, "diff_id": "d", "erofs": { "key": "layers/x.erofs", "size": 5 }, "blob": { "key": "layers/x.blob" }, "made": made, "used": used, "public": { "registry": "docker.io", "repository": "library/alpine", "checked": t } }).to_string();
+    {
+        let mut m = store.0.borrow_mut();
+        m.insert(format!("layer:us-east-1:{}", digest('a')), layer(t, t - 2 * 86_400_000));
+        m.insert(format!("layer:us-east-1:{}", digest('b')), "damaged".into());
+        // On its way: being converted for anyone, or queued for anyone.
+        m.insert(format!("lconv:us-east-1:{}", digest('c')), serde_json::json!({ "at": t, "size": 10, "public": { "registry": "docker.io", "repository": "library/alpine", "checked": t } }).to_string());
+        m.insert(format!("lwant:us-east-1:{}", digest('d')), serde_json::json!({ "at": t, "size": 10, "source": {}, "public": { "registry": "docker.io", "repository": "library/alpine", "checked": t } }).to_string());
+    }
+    let call = |link: &str, what: &str, body: serde_json::Value| { let r = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/{what}")).with_body(body.to_string()))); (r.status, r.body_text()) };
+    // The index passes over a damaged record; links for nothing asked are none.
+    let index = block_on(plane.handle(get(&format!("/cache/{good}/layers.json"))));
+    assert!(index.status == 200 && index.body_text().contains(&digest('a')) && !index.body_text().contains(&digest('b')), "{}", index.body_text());
+    assert_eq!(call(good, "layers-links", serde_json::json!({})).0, 200);
+    // Proposed: nothing; what is on its way already; from a machine whose region makes no address, what the store lacks.
+    assert_eq!(call(good, "layers-propose", serde_json::json!({ "layers": [] })).0, 200);
+    let (_, said) = call(good, "layers-propose", serde_json::json!({ "layers": [{ "digest": digest('c'), "size": 10 }, { "digest": digest('d'), "size": 10 }] }));
+    assert_eq!(said.matches("\"have\"").count(), 2, "{said}");
+    assert_eq!(call(bad, "layers-propose", serde_json::json!({ "layers": [{ "digest": digest('e'), "size": 10 }] })).0, 500);
+    // What a job had from the store, said after it: a layer used long ago noted used, one the store lacks passed over.
+    assert_eq!(call(good, "layers-kept", serde_json::json!({ "served_digests": [digest('a'), digest('f')] })).0, 200);
+    assert!(store.0.borrow()[&format!("layer:us-east-1:{}", digest('a'))].contains(&format!("\"used\":{t}")));
+    // A machine whose job is not kept, keeping its images.
+    store.0.borrow_mut().insert(format!("cachem:{bad}"), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "", "job": "job:404" }).to_string());
+    assert_eq!(call(bad, "layers-kept", serde_json::json!({ "keeping": true })).0, 404);
+    // The upkeep: a conversion kept damaged goes; a queued one kept under no region, or damaged, is passed over.
+    {
+        let mut m = store.0.borrow_mut();
+        m.insert(format!("lconv:us-east-1:{}", digest('g')), "damaged".into());
+        m.insert("lwant:nowhere".into(), "{}".into());
+        m.insert(format!("lwant:us-east-1:{}", digest('h')), "damaged".into());
+    }
+    block_on(plane.alarm()).unwrap();
+    assert!(!store.0.borrow().contains_key(&format!("lconv:us-east-1:{}", digest('g'))));
+}
+
+#[test]
+fn a_control_plane_not_in_aws_converts_no_layer_and_gives_its_index_without_links() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let config = Config::new(PLANE_ID.into());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let link = "machine-cache-link-000000000good";
+    cache_machine(&store, link, "us-east-1");
+    let a = format!("sha256:{}", "a".repeat(64));
+    store.0.borrow_mut().insert(format!("layer:us-east-1:{a}"), serde_json::json!({ "size": 10, "diff_id": "d", "erofs": { "key": "layers/x.erofs", "size": 5 }, "blob": { "key": "layers/x.blob" }, "made": t, "used": t, "public": { "registry": "docker.io", "repository": "library/alpine", "checked": t } }).to_string());
+    let index = block_on(plane.handle(get(&format!("/cache/{link}/layers.json"))));
+    assert!(index.status == 200 && index.body_text().contains("\"url\":\"\""), "{}", index.body_text());
+    // A layer queued as a control plane in AWS would queue it, on one connected by a role: not converted here.
+    store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": role_arn("123456789012", PLANE_ID), "connected": true }).to_string());
+    store.0.borrow_mut().insert(format!("lwant:us-east-1:{a}"), serde_json::json!({ "at": t, "size": 10, "source": {} }).to_string());
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(store.0.borrow().get("layers-convert-error").map(String::as_str), Some("only a control plane on AWS converts layers"));
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6000,7 +6068,9 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         the_upkeep_ends_what_waited_too_long_or_was_cut_off_and_lets_go_of_failing_runners_github_no_longer_wants,
         just_after_a_move_here_the_upkeep_comes_back_within_the_minute_and_looks_for_jobs_github_did_not_tell_of,
         a_machine_whose_region_makes_no_address_is_said_so_at_each_link_and_what_it_sends_amiss_is_passed_over,
-        githubs_keys_that_are_no_json_or_a_damaged_signing_key_leave_a_jobs_token_unread_saying_why
+        githubs_keys_that_are_no_json_or_a_damaged_signing_key_leave_a_jobs_token_unread_saying_why,
+        the_layer_store_passes_over_what_is_kept_damaged_and_says_what_a_machine_asks_amiss,
+        a_control_plane_not_in_aws_converts_no_layer_and_gives_its_index_without_links
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

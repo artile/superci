@@ -470,7 +470,7 @@ impl ControlPlane<'_> {
         }
         // The queue, oldest first, as far as each region has room.
         let mut queued: Vec<(String, String, Wanted)> = wanted.into_iter().filter_map(|(k, v)| {
-            let (region, digest) = k.strip_prefix("lwant:")?.split_once(':')?;
+            let (region, digest) = k["lwant:".len()..].split_once(':')?;
             Some((region.to_string(), digest.to_string(), serde_json::from_str::<Wanted>(&v).ok()?))
         }).collect();
         queued.sort_by_key(|(_, _, w)| w.at);
@@ -491,19 +491,20 @@ impl ControlPlane<'_> {
         let unused = self.config.routing.cache.unused_ms();
         let mut by_region: std::collections::BTreeMap<String, Vec<(String, Layer)>> = Default::default();
         for (k, v) in self.store.list("layer:").await? {
-            let Some(region) = k.strip_prefix("layer:").and_then(|r| r.split(':').next()) else { continue };
+            let region = k["layer:".len()..].split(':').next().unwrap_or_default();
             if let Ok(l) = serde_json::from_str::<Layer>(&v) { by_region.entry(region.to_string()).or_default().push((k.clone(), l)) }
         }
         let mut asked = 0;
         for (region, mut layers) in by_region {
             layers.sort_by_key(|(_, l)| std::cmp::Reverse(l.used));
-            let mut kept = 0u64;
-            for (k, mut l) in layers {
+            let (mut kept, mut layers) = (0u64, layers.into_iter());
+            loop {
+                let Some((k, mut l)) = layers.next() else { break };
                 let goes = !l.current(now) || now.saturating_sub(l.used) > unused || kept + l.bytes() > REGION_BYTES;
                 if goes {
-                    for key in [&l.erofs.key, &l.blob.key] {
-                        let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, key), &region, creds, vec![], &[], now).await;
-                    }
+                    let delete = async |key: &str| { let _ = aws::s3(self.http, "DELETE", &aws::s3_url(&cache::bucket(&self.config.plane_id, &region), &region, key), &region, creds, vec![], &[], now).await; };
+                    delete(&l.erofs.key).await;
+                    delete(&l.blob.key).await;
                     self.store.delete(&k).await?;
                     continue
                 }
@@ -540,5 +541,38 @@ mod tests {
         assert_eq!(c, [("realm".to_string(), "https://auth.docker.io/token".to_string()), ("service".into(), "registry.docker.io".into()), ("scope".into(), "repository:library/alpine:pull".into())]);
         assert_eq!(bearer_challenge(r#"Bearer realm="https://ghcr.io/token",service=ghcr.io"#).unwrap()[1], ("service".to_string(), "ghcr.io".to_string()));
         assert!(bearer_challenge(r#"Basic realm="x""#).is_none());
+        // A challenge with nothing in it, and one whose quote never ends.
+        assert_eq!(bearer_challenge("Bearer nothing"), Some(vec![]));
+        assert!(bearer_challenge(r#"Bearer realm="https://auth.docker.io/token"#).is_none());
+    }
+
+    /// A registry as a test has it answer each request: an answer, or a connection that failed.
+    struct Registry(fn(&Request) -> crate::io::Result<Response>);
+    #[async_trait::async_trait(?Send)]
+    impl crate::io::Http for Registry {
+        async fn send(&self, r: Request) -> crate::io::Result<Response> { (self.0)(&r) }
+    }
+
+    /// The registry's challenge to a request with no token, naming where tokens are had (`realm`).
+    fn challenge(realm: &str) -> crate::io::Result<Response> {
+        Ok(Response::new(401, "application/json", "").with_header("www-authenticate", &format!(r#"Bearer realm="{realm}",service="ghcr.io""#)))
+    }
+
+    #[test]
+    fn a_layer_is_public_only_when_its_registry_gives_it_to_anyone_and_any_failure_on_the_way_says_not() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let ask = |answers: fn(&Request) -> crate::io::Result<Response>| futures::executor::block_on(public_source(&Registry(answers), "ghcr.io", "acme/app", &digest));
+        // Given at once; the registry not reached; a realm that is no address; no token, or one that is no JSON; the
+        // blob not reached with the token.
+        assert!(ask(|_| Ok(Response::new(206, "application/octet-stream", "x"))).is_some());
+        assert!(ask(|_| Err("connection refused".into())).is_none());
+        assert!(ask(|_| challenge("https://exa mple/token")).is_none());
+        assert!(ask(|r| if r.url.contains("/v2/") { challenge("https://ghcr.io/token") } else { Err("connection refused".into()) }).is_none());
+        assert!(ask(|r| if r.url.contains("/v2/") { challenge("https://ghcr.io/token") } else { Ok(Response::new(200, "application/json", "not json")) }).is_none());
+        assert!(ask(|r| match (r.url.contains("/v2/"), r.header("authorization").is_some()) {
+            (true, false) => challenge("https://ghcr.io/token"),
+            (false, _) => Ok(Response::new(200, "application/json", r#"{"token":"t"}"#)),
+            (true, true) => Err("connection reset".into()),
+        }).is_none());
     }
 }
