@@ -17,7 +17,8 @@ fn the_runners_node_points_actions_here_and_keeps_every_variable() {
     assert!(bin.join("node.real").exists());
     let run = |results: Option<&str>| {
         let mut c = Command::new(bin.join("node"));
-        c.env_clear().env("INPUT_IF-NO-FILES-FOUND", "warn").env("PATH", "/usr/bin:/bin");
+        // (What else the test runs with stays: a coverage tool's, among it.)
+        c.env_remove("ACTIONS_RESULTS_URL").env("INPUT_IF-NO-FILES-FOUND", "warn").env("PATH", "/usr/bin:/bin");
         if let Some(r) = results { c.env("ACTIONS_RESULTS_URL", r); }
         let out = String::from_utf8(c.output().unwrap().stdout).unwrap();
         (out.lines().find_map(|l| l.strip_prefix("ACTIONS_RESULTS_URL=")).map(str::to_string), out.contains("INPUT_IF-NO-FILES-FOUND=warn"))
@@ -30,5 +31,6 @@ fn the_runners_node_points_actions_here_and_keeps_every_variable() {
     // Already here (a Node an action started itself), or none: left alone.
     assert_eq!(run(Some("http://10.0.0.5:4000/")), (Some("http://10.0.0.5:4000/".to_string()), true));
     assert_eq!(run(None), (None, true));
+    assert_eq!(run(Some("unix:///run/results")), (Some("unix:///run/results".to_string()), true), "not an address of the web: as it was");
     std::fs::remove_dir_all(&dir).unwrap();
 }

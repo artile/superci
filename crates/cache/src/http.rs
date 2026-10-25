@@ -31,17 +31,22 @@ impl Response {
     pub fn with_headers(mut self, more: Vec<(String, String)>) -> Response { self.headers.extend(more); self }
 }
 
-pub fn serve(listener: TcpListener, handle: impl Fn(Request, &mut dyn Read) -> Response + Send + Sync + 'static) {
+/// Serves for as long as the program runs (a connection that cannot be taken is passed over).
+pub fn serve(listener: TcpListener, handle: impl Fn(Request, &mut dyn Read) -> Response + Send + Sync + 'static) -> ! {
     let handle = Arc::new(handle);
-    for stream in listener.incoming().flatten() {
-        let handle = handle.clone();
-        std::thread::spawn(move || { let _ = connection(stream, &*handle); });
+    // (`incoming` never ends: the loop is only for the type.)
+    loop {
+        listener.incoming().flatten().for_each(|stream| {
+            let handle = handle.clone();
+            std::thread::spawn(move || { let _ = connection(stream, &*handle); });
+        })
     }
 }
 
 fn connection(stream: TcpStream, handle: &dyn Fn(Request, &mut dyn Read) -> Response) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
-    let mut reader = BufReader::with_capacity(1 << 16, stream.try_clone()?);
+    // (A socket's second handle: the system makes it as long as it has descriptors to give.)
+    let mut reader = BufReader::with_capacity(1 << 16, stream.try_clone().expect("a socket's second handle"));
     let mut writer = BufWriter::with_capacity(1 << 16, stream);
     loop {
         let mut line = String::new();
@@ -59,7 +64,8 @@ fn connection(stream: TcpStream, handle: &dyn Fn(Request, &mut dyn Read) -> Resp
             if let Some((k, v)) = h.split_once(':') { headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string())) }
         }
         let get = |n: &str| headers.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
-        if get("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) { writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?; writer.flush()?; }
+        // (Not said, the connection is broken: reading the body says so.)
+        if get("expect").is_some_and(|e| e.eq_ignore_ascii_case("100-continue")) { let _ = writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").and_then(|_| writer.flush()); }
         let chunks = get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked"));
         let n: u64 = if chunks { 0 } else { get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0) };
         let streamed = n > WHOLE;
@@ -99,18 +105,15 @@ fn chunked(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// The answer's head and (to all but a `HEAD`) its body, as one stream: what is not given whole breaks the connection.
 fn write(w: &mut impl Write, res: Response, head: bool, close: bool) -> std::io::Result<()> {
     let reason = match res.status { 200 => "OK", 201 => "Created", 206 => "Partial Content", 400 => "Bad Request", 403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed",
         409 => "Conflict", 416 => "Range Not Satisfiable", 500 => "Internal Server Error", 501 => "Not Implemented", 503 => "Service Unavailable", _ => "" };
-    write!(w, "HTTP/1.1 {} {reason}\r\n", res.status)?;
-    for (k, v) in &res.headers { write!(w, "{k}: {v}\r\n")? }
-    write!(w, "content-length: {}\r\nconnection: {}\r\n\r\n", res.length, if close { "close" } else { "keep-alive" })?;
-    if !head {
-        match res.body {
-            Body::Bytes(b) => w.write_all(&b)?,
-            Body::Stream(r) => { if std::io::copy(&mut r.take(res.length), w)? < res.length { return Err(std::io::Error::other("a download broken off")) } }
-        }
-    }
+    let lines: String = res.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+    let top = format!("HTTP/1.1 {} {reason}\r\n{lines}content-length: {}\r\nconnection: {}\r\n\r\n", res.status, res.length, if close { "close" } else { "keep-alive" });
+    let length = if head { 0 } else { res.length };
+    let body: Box<dyn Read> = match res.body { _ if head => Box::new(std::io::empty()), Body::Bytes(b) => Box::new(std::io::Cursor::new(b)), Body::Stream(r) => Box::new(r.take(length)) };
+    if std::io::copy(&mut top.as_bytes().chain(body), w)? < top.len() as u64 + length { return Err(std::io::Error::other("a download broken off")) }
     w.flush()
 }
 

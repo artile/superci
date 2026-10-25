@@ -88,7 +88,8 @@ fn node(given: Vec<std::ffi::OsString>) -> ! {
 
 /// Puts this program in front of each of the runner's Nodes (again: only this program is put there anew).
 fn wrap(externals: &Path) -> Result<(), String> {
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    // (This program, as it was started: its own path is there to read.)
+    let me = std::env::current_exe().expect("this program's path");
     let mut wrapped = 0;
     for dir in std::fs::read_dir(externals).map_err(|e| format!("{}: {e}", externals.display()))?.flatten() {
         if !dir.file_name().to_string_lossy().starts_with("node") { continue }
@@ -113,15 +114,15 @@ fn executable(_: &Path) -> std::io::Result<()> { Ok(()) }
 /// The machine's private address (what its network gives it; containers on it reach it there).
 fn private_ip() -> Result<IpAddr, String> {
     if let Some(given) = std::env::var("SUPERCI_CACHE_LISTEN").ok().filter(|g| !g.is_empty()) { return given.parse().map_err(|e| format!("SUPERCI_CACHE_LISTEN: {e}")) }
-    let s = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    s.connect("169.254.169.254:80").map_err(|e| e.to_string())?;
-    Ok(s.local_addr().map_err(|e| e.to_string())?.ip())
+    // (The address the system would send from to the instance metadata service: no packet is sent.)
+    std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("169.254.169.254:80").and_then(|_| s.local_addr())).map(|a| a.ip()).map_err(|e| ToString::to_string(&e))
 }
 
-fn random_hex(n: usize) -> Result<String, String> {
+/// (The system's randomness, there on every system this runs on.)
+fn random_hex(n: usize) -> String {
     let mut b = vec![0u8; n];
-    getrandom::getrandom(&mut b).map_err(|e| e.to_string())?;
-    Ok(hex(&b))
+    getrandom::getrandom(&mut b).expect("the system's randomness");
+    hex(&b)
 }
 
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
@@ -146,7 +147,8 @@ fn serve(externals: &Path) -> Result<(), String> {
     // The port the tools are told of (see the machine's start-up script), else any.
     let port: u16 = std::env::var("SUPERCI_CACHE_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(PORT);
     let listener = std::net::TcpListener::bind((ip, port)).or_else(|_| std::net::TcpListener::bind((ip, 0))).map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    // (A socket just bound has its address.)
+    let port = listener.local_addr().expect("a bound socket's address").port();
     let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
     let base = format!("http://{host}:{port}");
     let github = std::env::var("SUPERCI_CACHE_GITHUB").unwrap_or_else(|_| GITHUB.to_string());
@@ -157,19 +159,22 @@ fn serve(externals: &Path) -> Result<(), String> {
     let (at, next) = (externals.join(ADDRESS), externals.join(format!(".{ADDRESS}")));
     std::fs::write(&next, &base).and_then(|_| std::fs::rename(&next, &at)).map_err(|e| format!("{}: {e}", at.display()))?;
     eprintln!("serving GitHub's cache at {host}:{port}");
-    http::serve(listener, move |req, body| state.handle(req, body));
-    Ok(())
+    http::serve(listener, move |req, body| state.handle(req, body))
 }
 
 /// An entry being saved (a cache entry, or a run's artifact: its name is its key): the job's token, its key and
 /// version, links to upload pieces not used yet (asked for many at a time), and the pieces uploaded so far (by GitHub's
 /// client's block id), then their order.
 /// Blocks are taken at once and put in the bucket beside, so many at a time (`pending`; what failed, `failed`).
-struct Upload { token: String, key: String, version: String, artifact: bool, links: std::collections::VecDeque<(String, String)>, next: u32, blocks: HashMap<String, (String, u64)>, order: Option<Vec<(String, u64)>>, began: Instant, pending: usize, failed: Option<String> }
+/// Kept once finished (`done`: nothing more is taken for it), so that a request on its way still finds it.
+struct Upload { token: String, key: String, version: String, artifact: bool, links: std::collections::VecDeque<(String, String)>, next: u32, blocks: HashMap<String, (String, u64)>, order: Option<Vec<(String, u64)>>, began: Instant, pending: usize, failed: Option<String>, done: bool }
 
 impl Upload {
-    fn new(token: String, key: String, version: String, artifact: bool) -> Upload { Upload { token, key, version, artifact, links: Default::default(), next: 0, blocks: HashMap::new(), order: None, began: Instant::now(), pending: 0, failed: None } }
+    fn new(token: String, key: String, version: String, artifact: bool) -> Upload { Upload { token, key, version, artifact, links: Default::default(), next: 0, blocks: HashMap::new(), order: None, began: Instant::now(), pending: 0, failed: None, done: false } }
 }
+
+/// What every upload's lookup says: an upload, once begun, is never taken out (see `Upload`).
+const KEPT: &str = "an upload is kept once begun";
 
 /// Blocks of an upload being put in the bucket at most at once (a client that sends one small block after another,
 /// as BuildKit's does, is answered at once and waits only here).
@@ -218,7 +223,7 @@ fn debug(line: &str) { if std::env::var_os("SUPERCI_CACHE_DEBUG").is_some() { ep
 fn mb(n: u64) -> String { format!("{:.0} MB", n as f64 / 1e6) }
 
 impl State {
-    fn id(&self) -> String { format!("{}{}", self.ids.fetch_add(1, Ordering::Relaxed), random_hex(6).unwrap_or_default()) }
+    fn id(&self) -> String { format!("{}{}", self.ids.fetch_add(1, Ordering::Relaxed), random_hex(6)) }
 
     fn handle(self: &Arc<Self>, req: Request, body: &mut dyn Read) -> Response {
         let url = req.target.trim_start_matches('/').to_string();
@@ -239,20 +244,22 @@ impl State {
 
     /// A call to the control plane's cache (see `superci_core::plane`'s `cache_route`): its status and answer.
     fn plane(&self, what: &str, body: Value) -> Result<(u16, Value), String> {
-        let mut last = String::new();
-        for attempt in 0..3 {
-            if attempt > 0 { std::thread::sleep(Duration::from_millis(300 * attempt)) }
-            match self.agent.post(&format!("{}/{what}", self.plane)).header("content-type", "application/json").send(body.to_string()) {
-                Ok(r) if r.status().as_u16() >= 500 => last = format!("the control plane said {}", r.status()),
+        // (Asked three times, waiting a little longer each time.)
+        let mut attempt = 0;
+        loop {
+            let last = match self.agent.post(&format!("{}/{what}", self.plane)).header("content-type", "application/json").send(body.to_string()) {
+                Ok(r) if r.status().as_u16() >= 500 => format!("the control plane said {}", r.status()),
                 Ok(r) => {
                     let status = r.status().as_u16();
                     let text = r.into_body().read_to_string().unwrap_or_default();
                     return Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
                 }
-                Err(e) => last = e.to_string(),
-            }
+                Err(e) => e.to_string(),
+            };
+            attempt += 1;
+            if attempt == 3 { return Err(last) }
+            std::thread::sleep(Duration::from_millis(300 * attempt));
         }
-        Err(last)
     }
 
     /// GitHub's results service, as the job's actions call it: the cache's calls here, the rest on to GitHub's (for a
@@ -292,8 +299,9 @@ impl State {
                 }
                 // Refused for what the control plane cannot take (a key, a moment's trouble): a job of GitHub's saves
                 // it in GitHub's own cache, where a lookup not found here goes too.
-                Ok((status, said)) if github && (status == 400 || status >= 500) => {
-                    eprintln!("save {key}: not taken here ({status} {}); saved in GitHub's cache", said["why"].as_str().unwrap_or_default());
+                // (A moment's trouble that lasts, 5xx, comes as an error: see `plane`.)
+                Ok((400, said)) if github => {
+                    eprintln!("save {key}: not taken here (400 {}); saved in GitHub's cache", said["why"].as_str().unwrap_or_default());
                     self.elsewhere.lock().unwrap().insert((key, version));
                     on()
                 }
@@ -311,7 +319,7 @@ impl State {
             },
             Some("FinalizeCacheEntryUpload") => {
                 if self.elsewhere.lock().unwrap().contains(&(key.clone(), version.clone())) { return on() }
-                let found = { let up = self.uploads.lock().unwrap(); up.iter().find(|(_, u)| !u.artifact && u.key == key && u.version == version && u.order.is_some()).map(|(id, u)| (id.clone(), u.token.clone(), u.order.clone().unwrap_or_default(), u.began)) };
+                let found = { let up = self.uploads.lock().unwrap(); up.iter().find(|(_, u)| !u.artifact && !u.done && u.key == key && u.version == version && u.order.is_some()).map(|(id, u)| (id.clone(), u.token.clone(), u.order.clone().unwrap_or_default(), u.began)) };
                 let Some((id, token, pieces, began)) = found else { eprintln!("save {key}: finished before its upload"); return Ok(json_reply(json!({ "ok": false }))) };
                 let size: u64 = pieces.iter().map(|(_, s)| s).sum();
                 if asked["size_bytes"].as_str().and_then(|s| s.parse::<u64>().ok()).or(asked["size_bytes"].as_u64()).is_some_and(|said| said != size) {
@@ -321,7 +329,7 @@ impl State {
                 let pieces: Vec<Value> = pieces.iter().map(|(n, s)| json!([n, s])).collect();
                 match self.plane("finish", json!({ "token": token, "key": key, "version": version, "pieces": pieces })) {
                     Ok((200, said)) if said["ok"] == true => {
-                        self.uploads.lock().unwrap().remove(&id);
+                        self.uploads.lock().unwrap().get_mut(&id).expect(KEPT).done = true;
                         let secs = began.elapsed().as_secs_f64();
                         eprintln!("save {key}: saved, {} in {secs:.1} s ({:.0} MB/s)", mb(size), size as f64 / 1e6 / secs.max(0.001));
                         Ok(json_reply(json!({ "ok": true, "entry_id": "1" })))
@@ -358,13 +366,13 @@ impl State {
                 Err((s, why)) => twirp(if s == 503 { 503 } else { 400 }, "failed_precondition", &why),
             },
             "FinalizeArtifact" => {
-                let found = { let up = self.uploads.lock().unwrap(); up.iter().find(|(_, u)| u.artifact && u.key == name && u.order.is_some()).map(|(id, u)| (id.clone(), u.order.clone().unwrap_or_default(), u.began)) };
+                let found = { let up = self.uploads.lock().unwrap(); up.iter().find(|(_, u)| u.artifact && !u.done && u.key == name && u.order.is_some()).map(|(id, u)| (id.clone(), u.order.clone().unwrap_or_default(), u.began)) };
                 let Some((id, pieces, began)) = found else { return twirp(400, "failed_precondition", "finished before its upload") };
                 let size: u64 = pieces.iter().map(|(_, s)| s).sum();
                 let pieces: Vec<Value> = pieces.iter().map(|(n, s)| json!([n, s])).collect();
                 match said(self.plane("artifact-finish", json!({ "token": token, "name": name, "pieces": pieces }))) {
                     Ok(v) => {
-                        self.uploads.lock().unwrap().remove(&id);
+                        self.uploads.lock().unwrap().get_mut(&id).expect(KEPT).done = true;
                         eprintln!("artifact {name}: kept, {} in {:.1} s", mb(size), began.elapsed().as_secs_f64());
                         Ok(json_reply(json!({ "ok": true, "artifact_id": v["id"].as_u64().unwrap_or(1).to_string() })))
                     }
@@ -459,7 +467,7 @@ impl State {
     /// (a workflow's own, for Vercel), on to Vercel as it came.
     fn turbo(&self, req: &Request, path: &str, query: &str) -> Result<Response, String> {
         if req.header("authorization").map(|a| a.trim_start_matches("Bearer ").trim()) != Some(TOOL_TOKEN) {
-            let vercel = std::env::var("SUPERCI_CACHE_VERCEL").unwrap_or_else(|_| VERCEL.to_string());
+            let vercel = std::env::var("SUPERCI_CACHE_VERCEL").unwrap_or(VERCEL.to_string());
             return self.forward(req, &vercel, &if query.is_empty() { path.to_string() } else { format!("{path}?{query}") })
         }
         let hash = path.strip_prefix("v8/artifacts/").unwrap_or_default();
@@ -561,7 +569,7 @@ impl State {
     fn upload(self: &Arc<Self>, req: &Request, id: &str, query: &str) -> Result<Response, String> {
         if req.method != "PUT" { return Ok(empty(405)) }
         let q: HashMap<String, String> = query.split('&').filter_map(|p| p.split_once('=')).map(|(k, v)| (unpercent(k), unpercent(v))).collect();
-        if !self.uploads.lock().unwrap().contains_key(id) { return Ok(empty(404)) }
+        if !self.uploads.lock().unwrap().get(id).is_some_and(|u| !u.done) { return Ok(empty(404)) }
         let body = req.body.clone();
         match q.get("comp").map(String::as_str) {
             Some("blocklist") => {
@@ -570,7 +578,7 @@ impl State {
                 // Once every block is in the bucket.
                 let mut ups = self.uploads.lock().unwrap();
                 while ups.get(id).is_some_and(|u| u.pending > 0) { ups = self.stored.wait(ups).unwrap() }
-                let up = ups.get_mut(id).ok_or("no such upload")?;
+                let up = ups.get_mut(id).expect(KEPT);
                 if let Some(e) = up.failed.clone() { return Err(format!("a block was not stored: {e}")) }
                 let order: Option<Vec<(String, u64)>> = ids.iter().map(|b| up.blocks.get(b).cloned()).collect();
                 let Some(order) = order.filter(|o| !o.is_empty()) else { return Ok(empty(400)) };
@@ -587,14 +595,14 @@ impl State {
                 // One piece, the whole entry: stored before the answer.
                 if comp != Some("block") {
                     self.put(&link, &body)?;
-                    if let Some(up) = self.uploads.lock().unwrap().get_mut(id) { up.order = Some(vec![(name, size)]) }
+                    self.uploads.lock().unwrap().get_mut(id).expect(KEPT).order = Some(vec![(name, size)]);
                     return Ok(empty(201))
                 }
                 // A block: taken now, stored beside (at most `BLOCKS_AT_ONCE` of the upload's at a time).
                 {
                     let mut ups = self.uploads.lock().unwrap();
                     while ups.get(id).is_some_and(|u| u.pending >= BLOCKS_AT_ONCE) { ups = self.stored.wait(ups).unwrap() }
-                    let up = ups.get_mut(id).ok_or("no such upload")?;
+                    let up = ups.get_mut(id).expect(KEPT);
                     up.blocks.insert(block, (name, size));
                     up.pending += 1;
                 }
@@ -603,7 +611,9 @@ impl State {
                     let stored = me.put(&link, &body);
                     debug(&format!("{id}: a block stored ({stored:?})"));
                     let mut ups = me.uploads.lock().unwrap();
-                    if let Some(up) = ups.get_mut(&id) { up.pending -= 1; if let Err(e) = stored { up.failed.get_or_insert(e); } }
+                    let up = ups.get_mut(&id).expect(KEPT);
+                    up.pending -= 1;
+                    if let Err(e) = stored { up.failed.get_or_insert(e); }
                     drop(ups);
                     me.stored.notify_all();
                 });
@@ -617,7 +627,7 @@ impl State {
     fn link(&self, id: &str) -> Result<(String, String), String> {
         let (op, body, names) = {
             let mut ups = self.uploads.lock().unwrap();
-            let up = ups.get_mut(id).ok_or("no such upload")?;
+            let up = ups.get_mut(id).expect(KEPT);
             if let Some(l) = up.links.pop_front() { return Ok(l) }
             let names: Vec<String> = (up.next..up.next + LINKS_AT_A_TIME).map(|n| format!("p{n:05}")).collect();
             up.next += LINKS_AT_A_TIME;
@@ -628,22 +638,24 @@ impl State {
         if status != 200 || urls.len() != names.len() { return Err(format!("no links to upload ({status} {})", said["why"].as_str().unwrap_or_default())) }
         let mut links: Vec<(String, String)> = names.into_iter().zip(urls).collect();
         let first = links.remove(0);
-        if let Some(up) = self.uploads.lock().unwrap().get_mut(id) { up.links.extend(links) }
+        self.uploads.lock().unwrap().get_mut(id).expect(KEPT).links.extend(links);
         Ok(first)
     }
 
+    /// (Tried four times, waiting a little longer each time.)
     fn put(&self, link: &str, body: &[u8]) -> Result<(), String> {
-        let mut last = String::new();
-        for attempt in 0..4 {
-            if attempt > 0 { std::thread::sleep(Duration::from_millis(500 * attempt)) }
+        let mut attempt = 0;
+        loop {
             debug(&format!("put {} bytes to {}", body.len(), link.split('?').next().unwrap_or_default()));
-            match self.agent.put(&stand_in(link)).send(body) {
+            let last = match self.agent.put(&stand_in(link)).send(body) {
                 Ok(r) if r.status().is_success() => return Ok(()),
-                Ok(r) => last = format!("the bucket said {}: {}", r.status(), r.into_body().read_to_string().unwrap_or_default().chars().take(200).collect::<String>()),
-                Err(e) => last = e.to_string(),
-            }
+                Ok(r) => format!("the bucket said {}: {}", r.status(), r.into_body().read_to_string().unwrap_or_default().chars().take(200).collect::<String>()),
+                Err(e) => e.to_string(),
+            };
+            attempt += 1;
+            if attempt == 4 { return Err(last) }
+            std::thread::sleep(Duration::from_millis(500 * attempt));
         }
-        Err(last)
     }
 
     /// A hit, as one stream (GitHub's client reads one from an address that is not Azure's), or the part of it a
@@ -715,7 +727,7 @@ impl<R: Read> Drop for Said<R> {
 /// as given, and stops without one).
 fn azure_headers() -> Vec<(String, String)> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let id = random_hex(16).unwrap_or_else(|_| "0".repeat(32));
+    let id = random_hex(16);
     let id = format!("{}-{}-{}-{}-{}", &id[..8], &id[8..12], &id[12..16], &id[16..20], &id[20..]);
     [("x-ms-request-id", id.as_str()), ("x-ms-version", "2023-11-03"), ("date", &http_date(now)), ("last-modified", &http_date(now)), ("etag", &format!("\"0x{:X}\"", now)), ("x-ms-request-server-encrypted", "true")]
         .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -749,7 +761,7 @@ impl Parallel {
         let total = parts.len();
         let shared = Arc::new((Mutex::new(Fetched { next_read: 0, next_fetch: 0, done: HashMap::new(), stop: false }), Condvar::new()));
         let parts = Arc::new(parts);
-        for _ in 0..workers.min(total.max(1)) {
+        (0..workers.min(total.max(1))).for_each(|_| {
             let (shared, parts, agent) = (shared.clone(), parts.clone(), agent.clone());
             std::thread::spawn(move || loop {
                 let i = {
@@ -765,7 +777,7 @@ impl Parallel {
                 lock.lock().unwrap().done.insert(i, got);
                 wake.notify_all();
             });
-        }
+        });
         Parallel { shared, current: Cursor::new(vec![]), total }
     }
 }
@@ -777,7 +789,8 @@ impl Drop for Parallel {
 impl Read for Parallel {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            let n = self.current.read(buf)?;
+            // (What was fetched, in memory: reading it does not fail.)
+            let n = self.current.read(buf).expect("a part in memory");
             if n > 0 || buf.is_empty() { return Ok(n) }
             let (lock, wake) = &*self.shared;
             let mut f = lock.lock().unwrap();
@@ -804,23 +817,24 @@ fn stand_in(link: &str) -> String {
 
 /// One part of a piece, by its range; tried four times.
 fn fetch(agent: &ureq::Agent, (link, at, len): &(String, u64, u64)) -> Result<Vec<u8>, String> {
-    let mut last = String::new();
-    for attempt in 0..4 {
-        if attempt > 0 { std::thread::sleep(Duration::from_millis(300 * attempt)) }
-        match agent.get(&stand_in(link)).header("range", &format!("bytes={at}-{}", at + len - 1)).call() {
+    let mut attempt = 0;
+    loop {
+        let last = match agent.get(&stand_in(link)).header("range", &format!("bytes={at}-{}", at + len - 1)).call() {
             Ok(r) if r.status().as_u16() == 206 || (r.status().as_u16() == 200 && *at == 0) => {
                 let mut body = Vec::with_capacity(*len as usize);
                 match r.into_body().into_reader().take(*len).read_to_end(&mut body) {
                     Ok(_) if body.len() as u64 == *len => return Ok(body),
-                    Ok(_) => last = format!("{} bytes of {len}", body.len()),
-                    Err(e) => last = e.to_string(),
+                    Ok(_) => format!("{} bytes of {len}", body.len()),
+                    Err(e) => e.to_string(),
                 }
             }
-            Ok(r) => last = format!("the bucket said {}", r.status()),
-            Err(e) => last = e.to_string(),
-        }
+            Ok(r) => format!("the bucket said {}", r.status()),
+            Err(e) => e.to_string(),
+        };
+        attempt += 1;
+        if attempt == 4 { return Err(last) }
+        std::thread::sleep(Duration::from_millis(300 * attempt));
     }
-    Err(last)
 }
 
 #[cfg(test)]
@@ -840,5 +854,35 @@ mod tests {
         assert!(githubs("eyJhbGciOiJSUzI1NiIsImtpZCI6IjM4ODI2YjE3LTZhMzAtNWY5Yi1iMTY5LThiZWI4MjAyZjcyMyIsInR5cCI6IkpXVCIsIng1dCI6InlrTmFZNHFNX3RhNGsyVGdaT0NFWUxrY1lsQSJ9.e30.x"));
         assert!(!githubs("eyJhbGciOiJFUzI1NiJ9.e30.x"));
         assert!(!githubs("nonsense"));
+        // base64url's own `-` and `_`, base64's `+` and `/`, and what is neither.
+        assert_eq!(base64url("-_+/!"), base64url("-_-_"));
+    }
+
+    /// Parts fetched ahead of a slow reader, at most twice as many as there are workers; a read into no room reads
+    /// nothing; read to the end, nothing more; dropped midway, the workers stop.
+    #[test]
+    fn a_download_is_fetched_ahead_of_its_reader_and_stops_when_dropped() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || for mut c in listener.incoming().flatten() {
+            use std::io::Write;
+            let mut head = [0u8; 2048];
+            let _ = c.read(&mut head);
+            let _ = c.write_all(b"HTTP/1.1 206 X\r\ncontent-length: 1\r\nconnection: close\r\n\r\na");
+        });
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let parts: Vec<(String, u64, u64)> = (0..12).map(|i| (format!("{at}/{i}"), 0, 1)).collect();
+        let mut p = Parallel::start(agent.clone(), parts.clone(), 1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(p.read(&mut []).unwrap(), 0);
+        let mut all = vec![];
+        p.read_to_end(&mut all).unwrap();
+        assert_eq!(all, b"a".repeat(12));
+        assert_eq!(p.read(&mut [0u8; 4]).unwrap(), 0);
+        let mut first = [0u8; 1];
+        let mut dropped = Parallel::start(agent, parts, 1);
+        assert_eq!(dropped.read(&mut first).unwrap(), 1);
+        drop(dropped);
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
