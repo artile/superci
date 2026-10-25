@@ -120,7 +120,6 @@ impl Overlay {
     fn create(&self, kind: Kind, key: &str, parent: &str, labels: BTreeMap<String, String>) -> Result<Vec<Mount>> {
         let snapshots = self.root.join("snapshots");
         let mut td: Option<PathBuf> = None;
-        let mut path: Option<PathBuf> = None;
         let out = self.meta.write(|w| {
             let t = prepare_directory(&snapshots, kind).map_err(|(t, e)| (t, e.context("failed to create prepare snapshot dir")));
             let t = match t { Ok(t) => t, Err((t, e)) => { td = t; return Err(e) } };
@@ -146,7 +145,6 @@ impl Overlay {
                 std::os::unix::fs::lchown(t.join("fs"), Some(uid), Some(gid)).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("failed to chown: {e}")))?;
             }
             let p = snapshots.join(&s.id);
-            path = Some(p.clone());
             std::fs::rename(&t, &p).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("failed to rename: {e}")))?;
             td = None;
             Ok(s)
@@ -154,13 +152,8 @@ impl Overlay {
         match out {
             Ok(s) => Ok(self.mounts_of(&s)),
             Err(e) => {
+                // (The folder under its own name is made last, by the rename: on any failure there is none.)
                 if let Some(t) = td { if let Err(e1) = crate::faults::check(std::fs::remove_dir_all(&t)) { eprintln!("failed to cleanup temp snapshot directory: {e1}") } }
-                // (A folder never made is no failure to remove, as Go's `RemoveAll` has it.)
-                if let Some(p) = path {
-                    if let Err(e1) = crate::faults::check(std::fs::remove_dir_all(&p)).or_else(|e1| if e1.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e1) }) {
-                        return Err(Error::Other(format!("failed to remove path: {e1}: {e}")));
-                    }
-                }
                 Err(e)
             }
         }

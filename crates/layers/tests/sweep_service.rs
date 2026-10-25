@@ -108,6 +108,7 @@ async fn step<T>(what: &str, f: impl std::future::Future<Output = T>) -> Result<
 
 /// The scenario: what containerd asks of the content store and the snapshots, a stored layer used, `keep` after.
 async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, stored: &str, fault: Option<usize>) -> Result<(), String> {
+    // (`fault`: keep's, counted from its start, into `dir/keep-count`.)
     use capi::WriteAction::*;
     let Ok(channel) = step("connect", superci_layers::client::channel(socket)).await? else { return Ok(()) };
     let mut c = capi::content_client::ContentClient::new(channel.clone());
@@ -116,7 +117,25 @@ async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, sto
     let blob = b"a blob's bytes".repeat(100);
     let d = digest(&blob);
     // (Each answer, success or error, is taken: only no answer fails the run.)
-    let _ = step("write", async { let mut a = c.write(tokio_stream::iter(vec![msg(Stat, "r1", blob.len() as i64, "", 0, b""), msg(Write, "r1", 0, "", 0, &blob[..10]), msg(Commit, "r1", blob.len() as i64, &d, 10, &blob[10..])])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let mut labelled = msg(Commit, "r1", blob.len() as i64, &d, 10, &blob[10..]);
+    labelled.labels.insert("containerd.io/gc.root".into(), "now".into());
+    let _ = step("write", async { let mut a = c.write(tokio_stream::iter(vec![msg(Stat, "r1", blob.len() as i64, "", 0, b""), msg(Write, "r1", 0, "", 0, &blob[..10]), labelled])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    // The same bytes again under another ref, not said whose they are: there already at the commit.
+    let _ = step("again", async { let mut a = c.write(tokio_stream::iter(vec![msg(Write, "r1b", 0, "", 0, &blob), msg(Commit, "r1b", blob.len() as i64, "", blob.len() as i64, b"")])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    // Said only at its commit to be a blob there already: given up.
+    let _ = step("late", async { let mut a = c.write(tokio_stream::iter(vec![msg(Write, "r1c", 0, "", 0, b"x"), msg(Commit, "r1c", blob.len() as i64, &d, 1, b"")])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    // A caller gone mid-write.
+    let _ = step("gone", async {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _ = tx.send(msg(Write, "r1d", 20, "", 0, b"part")).await;
+        let mut a = c.write(tokio_stream::wrappers::ReceiverStream::new(rx)).await?.into_inner();
+        let _ = a.message().await;
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = tx.send(msg(Write, "r1d", 20, "", 4, b"more")).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok::<_, tonic::Status>(())
+    }).await?;
     let _ = step("info", c.info(capi::InfoRequest { digest: d.clone() })).await?;
     let _ = step("read", async { let mut r = c.read(capi::ReadContentRequest { digest: d.clone(), offset: 0, size: 0 }).await?.into_inner(); while r.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
     let mut labels = HashMap::new();
@@ -137,7 +156,10 @@ async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, sto
     let _ = step("abort", c.abort(capi::AbortRequest { r#ref: "r2".into() })).await?;
     let _ = step("delete", c.delete(capi::DeleteContentRequest { digest: d.clone() })).await?;
     // Snapshots: prepared, committed, one on it, a view, listed, changed, removed, cleaned up.
-    let _ = step("prepare", s.prepare(sapi::PrepareSnapshotRequest { key: "ns/1/a".into(), ..Default::default() })).await?;
+    if let Ok(Ok(m)) = step("prepare", s.prepare(sapi::PrepareSnapshotRequest { key: "ns/1/a".into(), ..Default::default() })).await {
+        // (A file in it: what its usage counts.)
+        if let Some(m) = m.into_inner().mounts.first() { let _ = std::fs::write(std::path::Path::new(&m.source).join("file"), b"in the layer"); }
+    }
     let _ = step("mounts", s.mounts(sapi::MountsRequest { key: "ns/1/a".into(), ..Default::default() })).await?;
     let _ = step("usage", s.usage(sapi::UsageRequest { key: "ns/1/a".into(), ..Default::default() })).await?;
     let _ = step("commit", s.commit(sapi::CommitSnapshotRequest { name: "ns/1/base".into(), key: "ns/1/a".into(), ..Default::default() })).await?;
@@ -160,6 +182,7 @@ async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, sto
     keep.args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", socket.display()),
         format!("--content={}", dir.join("content").display()), format!("--index={}", dir.join("index.json").display()), "--most=20".into()]);
     // (Under the same fault, counted from its own start.)
+    keep.env("SUPERCI_LAYERS_FAULTS", dir.join("keep-count"));
     if let Some(k) = fault { keep.env("SUPERCI_LAYERS_FAULT", k.to_string()); }
     let keep = keep.output().unwrap();
     if String::from_utf8_lossy(&keep.stderr).contains("panicked") { return Err(format!("keep panicked: {}", String::from_utf8_lossy(&keep.stderr))) }
@@ -174,6 +197,7 @@ async fn the_service_holds_with_each_call_and_store_operation_failing() {
     let (run, socket) = start(None, &count, &at, &stored).expect("the clean run starts");
     let dir = run.dir.clone();
     scenario(&socket, &dir, &at, &stored, None).await.unwrap();
+    let keep_steps: usize = std::fs::read_to_string(dir.join("keep-count")).unwrap_or_default().trim().parse().unwrap_or(0);
     let (log, panicked) = run.stop();
     assert!(!panicked, "{log}");
     let steps: usize = std::fs::read_to_string(&count).unwrap_or_default().trim().parse().unwrap_or(0);
@@ -187,10 +211,20 @@ async fn the_service_holds_with_each_call_and_store_operation_failing() {
         let faulted = std::env::temp_dir().join(format!("superci-layers-sweep-count-{}-{k}", std::process::id()));
         let Some((run, socket)) = start(Some(k), &faulted, &at, &stored) else { continue };
         let dir = run.dir.clone();
-        let done = scenario(&socket, &dir, &at, &stored, Some(k)).await;
+        let done = scenario(&socket, &dir, &at, &stored, None).await;
         let (log, panicked) = run.stop();
         if panicked || done.is_err() { broke.push(format!("step {k}: {done:?}\n{}", log.lines().rev().take(8).collect::<Vec<_>>().join("\n"))) }
         let _ = std::fs::remove_file(&faulted);
+    }
+    // keep's own steps, each failing in turn, the service clean.
+    for k in (1..=keep_steps).filter(|k| (k - 1) % n == k0 - 1) {
+        let clean = std::env::temp_dir().join(format!("superci-layers-sweep-count-{}-keep{k}", std::process::id()));
+        let (run, socket) = start(None, &clean, &at, &stored).unwrap();
+        let dir = run.dir.clone();
+        let done = scenario(&socket, &dir, &at, &stored, Some(k)).await;
+        let (log, panicked) = run.stop();
+        if panicked || done.is_err() { broke.push(format!("keep step {k}: {done:?}\n{}", log.lines().rev().take(8).collect::<Vec<_>>().join("\n"))) }
+        let _ = std::fs::remove_file(&clean);
     }
     assert!(broke.is_empty(), "{} of {steps} faults broke it:\n{}", broke.len(), broke.join("\n\n"));
 }
@@ -283,6 +317,12 @@ async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Chi
         let _ = step("served", s.prepare(layer(&format!("moby/{round}/a"), &format!("chain-{round}")))).await?;
         let _ = step("again", s.prepare(layer(&format!("moby/{round}/b"), &format!("chain-{round}")))).await?;
         let _ = step("on it", s.prepare(sapi::PrepareSnapshotRequest { key: format!("moby/{round}/top"), parent: format!("moby/{round}/a/superci-layers"), ..Default::default() })).await?;
+        // (The layer on a parent of its own, as a later layer of an image is.)
+        let mut on_parent = layer(&format!("moby/{round}/c"), &format!("chain-c{round}"));
+        on_parent.parent = format!("moby/{round}/a/superci-layers");
+        let _ = step("on a parent", s.prepare(on_parent)).await?;
+        // (A moment for containerd to be told.)
+        tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = step("blob", async { let mut r = c.read(capi::ReadContentRequest { digest: d.to_string(), offset: 0, size: 0 }).await?.into_inner(); while r.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
         let _ = step("info", c.info(capi::InfoRequest { digest: d.to_string() })).await?;
         if round == 0 {
@@ -293,11 +333,12 @@ async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Chi
     }
     let ch = step("connect", superci_layers::client::channel(&socket)).await?.map_err(|e| e.to_string())?;
     let mut s = sapi::snapshots_client::SnapshotsClient::new(ch);
-    for k in ["moby/0/top", "moby/1/top", "moby/0/a/superci-layers", "moby/1/a/superci-layers"] { let _ = step("remove", s.remove(sapi::RemoveSnapshotRequest { key: k.into(), ..Default::default() })).await?; }
-    let _ = step("cleanup", s.cleanup(sapi::CleanupRequest::default())).await?;
-    // Restarted once more, with no fault: what a removal under one left is put right.
+    for k in ["moby/0/top", "moby/1/top", "moby/0/c/superci-layers", "moby/1/c/superci-layers", "moby/0/a/superci-layers", "moby/1/a/superci-layers"] { let _ = step("remove", s.remove(sapi::RemoveSnapshotRequest { key: k.into(), ..Default::default() })).await?; }
+    // Restarted once more, with no fault: what a removal under one left is put right; then cleaned up.
     stop_rooted(prefix, child);
     if let Some(next) = start_rooted(prefix, dir, None, count) { *child = next }
+    let ch = step("connect", superci_layers::client::channel(&socket)).await?.map_err(|e| e.to_string())?;
+    let _ = step("cleanup", sapi::snapshots_client::SnapshotsClient::new(ch).cleanup(sapi::CleanupRequest::default())).await?;
     Ok(())
 }
 
