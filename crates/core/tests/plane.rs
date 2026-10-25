@@ -3053,6 +3053,14 @@ fn a_job_run_again_after_a_reclaim_goes_back_on_spot_when_the_on_demand_limit_ca
     // Two minutes on, nothing of its own counts any more: the limits themselves are what refuses it.
     sweep_after(130_000);
     assert!(job(&store, 10)["error"].as_str().unwrap().starts_with("waiting: starting its machine failed, trying again (Your AWS account's limits do not let this machine start"), "{}", job(&store, 10)["error"]);
+
+    // Asked on a spot machine again already, its label asking for no spot machine: the limits are what is said.
+    full.set(false);
+    store.0.borrow_mut().insert("job:11".into(), serde_json::json!({ "job_id": 11, "run_id": 3, "repo": "acme/app", "state": "waiting", "at_ms": clock.0.get(), "installation_id": 42, "app_id": 99,
+        "cloud": "", "seen_in_progress": false, "label": "superci/spot=false", "spot_again": true }).to_string());
+    store.0.borrow_mut().insert("live:11".into(), String::new());
+    sweep_after(30_000);
+    assert!(job(&store, 11)["error"].as_str().is_some_and(|e| e.contains("limit of running CPUs")), "{}", job(&store, 11));
 }
 
 #[test]
