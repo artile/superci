@@ -33,10 +33,7 @@ fn mounts_proto(m: Vec<Mount>) -> Vec<types::Mount> {
 
 /// Work on files and the database, off the threads that answer calls.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> std::result::Result<T, Status> {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(r) => r.map_err(Status::from),
-        Err(e) => Err(Status::internal(e.to_string())),
-    }
+    crate::store::off_thread(f).await.map_err(Status::from)
 }
 
 pub struct Snapshots { pub layers: Arc<Layers> }

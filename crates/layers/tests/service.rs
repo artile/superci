@@ -57,8 +57,19 @@ fn launch(dir: &std::path::Path) -> Child {
 
 impl Service {
     fn log(&self) -> String { std::fs::read_to_string(self.dir.join("log")).unwrap_or_default() }
-    async fn content(&self) -> capi::content_client::ContentClient<tonic::transport::Channel> { capi::content_client::ContentClient::new(superci_layers::client::channel(&self.socket).await.unwrap()) }
-    async fn snapshots(&self) -> sapi::snapshots_client::SnapshotsClient<tonic::transport::Channel> { sapi::snapshots_client::SnapshotsClient::new(superci_layers::client::channel(&self.socket).await.unwrap()) }
+    async fn content(&self) -> capi::content_client::ContentClient<tonic::transport::Channel> { capi::content_client::ContentClient::new(connect(&self.socket).await) }
+    async fn snapshots(&self) -> sapi::snapshots_client::SnapshotsClient<tonic::transport::Channel> { sapi::snapshots_client::SnapshotsClient::new(connect(&self.socket).await) }
+}
+
+/// A channel to the service's socket (asked again for a moment: a socket just made may not take one yet).
+async fn connect(socket: &std::path::Path) -> tonic::transport::Channel {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match superci_layers::client::channel(socket).await {
+            Ok(c) => return c,
+            Err(e) => { assert!(Instant::now() < until, "{e}"); tokio::time::sleep(Duration::from_millis(50)).await }
+        }
+    }
 }
 
 /// A write session of these messages: the answers, or how it was refused.
@@ -578,7 +589,7 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     let csock = containerd.as_ref().map(|(_, s)| s.clone()).unwrap_or(dir.join("no-containerd.sock"));
     let mut child = launch_rooted(&prefix, &dir, &csock);
     let log = || std::fs::read_to_string(dir.join("log")).unwrap_or_default();
-    let ch = superci_layers::client::channel(&dir.join("layers.sock")).await.unwrap();
+    let ch = connect(&dir.join("layers.sock")).await;
     let mut snap = sapi::snapshots_client::SnapshotsClient::new(ch.clone());
     let layer = sapi::PrepareSnapshotRequest { key: "moby/1/extract-1".into(), labels: [("containerd.io/snapshot.ref".to_string(), "chain-1".to_string()),
         ("containerd.io/snapshot/cri.layer-digest".to_string(), d.clone()), ("containerd.io/snapshot/cri.image-layers".to_string(), d.clone())].into_iter().collect(), ..Default::default() };
@@ -586,7 +597,7 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     assert!(log().contains(&format!("{d} from the store in")), "{}", log());
     // Made known in its namespace, in containerd.
     if let Some((_, csock)) = &containerd {
-        let mut c = capi::content_client::ContentClient::new(superci_layers::client::channel(csock).await.unwrap());
+        let mut c = capi::content_client::ContentClient::new(connect(csock).await);
         let until = Instant::now() + Duration::from_secs(10);
         loop {
             let mut r = tonic::Request::new(capi::InfoRequest { digest: d.clone() });
@@ -622,12 +633,12 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     }
     assert!(log().contains("could not be mounted again: its file is gone and the index has no such layer"), "{}", log());
     // Removed: let go, its file taken away.
-    let mut snap = sapi::snapshots_client::SnapshotsClient::new(superci_layers::client::channel(&dir.join("layers.sock")).await.unwrap());
+    let mut snap = sapi::snapshots_client::SnapshotsClient::new(connect(&dir.join("layers.sock")).await);
     snap.remove(sapi::RemoveSnapshotRequest { key: "moby/1/top".into(), ..Default::default() }).await.unwrap();
     snap.remove(sapi::RemoveSnapshotRequest { key: "moby/1/extract-1/superci-layers".into(), ..Default::default() }).await.unwrap();
     snap.cleanup(sapi::CleanupRequest::default()).await.unwrap();
     stop(&prefix, &mut child);
     if let Some((mut c, _)) = containerd { stop(&prefix, &mut c) }
-    let _ = rooted(&prefix, "umount").args(["-R", "-l"]).arg(&dir).status();
-    let _ = rooted(&prefix, "rm").arg("-rf").arg(&dir).status();
+    // (Each mount under the folder: one there is not unmounted with the folder, which is no mount itself.)
+    let _ = rooted(&prefix, "sh").args(["-c", &format!("grep -o ' {0}[^ ]*' /proc/self/mounts | sort -r | xargs -r umount -l; rm -rf {0}", dir.display())]).status();
 }

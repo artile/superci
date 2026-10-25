@@ -65,7 +65,9 @@ pub struct Stats { pub served: AtomicU64, pub pulled: AtomicU64, pub fell_back: 
 
 pub struct Options { pub files: PathBuf, pub db: PathBuf, pub index: Index, pub containerd: PathBuf, pub parallel: usize, pub layers_at_once: usize }
 
-fn other(e: impl std::fmt::Display) -> Error { Error::Other(e.to_string()) }
+/// Work on files and the database off the threads that answer calls: what it gives (a panic in it is passed on as
+/// one: only a step's own bug makes it).
+pub async fn off_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T { tokio::task::spawn_blocking(f).await.expect("a step off the answering threads") }
 
 impl Layers {
     /// The layers as they were left: each snapshot served from the store mounted again if it is not (a restart
@@ -125,7 +127,7 @@ impl Layers {
     pub async fn prepare(self: Arc<Self>, key: String, parent: String, labels: BTreeMap<String, String>) -> Result<Vec<Mount>> {
         if let Some(served) = self.clone().serve(&key, &parent, &labels).await { return Err(served) }
         let l = self.clone();
-        tokio::task::spawn_blocking(move || l.overlay.prepare(&key, &parent, labels)).await.map_err(other).and_then(crate::faults::pass)?
+        crate::faults::check(off_thread(move || l.overlay.prepare(&key, &parent, labels)).await)
     }
 
     /// The layer served from the store, or `None` to make the snapshot as containerd's own does.
@@ -140,16 +142,16 @@ impl Layers {
         let lock = st.targets.lock().unwrap().entry(format!("{parent}\n{target}")).or_default().clone();
         let _one = lock.lock().await;
         let (l, t, p) = (self.clone(), target.clone(), parent.to_string());
-        let found = tokio::task::spawn_blocking(move || {
+        let found = off_thread(move || {
             let mut found = false;
             let filter = format!("labels.{REF:?}=={t:?},parent=={p:?},kind==committed");
             l.overlay.walk(&[filter], |_| { found = true; Ok(()) }).map(|_| found)
-        }).await.ok()?.ok()?;
+        }).await.ok()?;
         if found { return Some(Error::AlreadyExists(format!("target snapshot {target:?}"))) }
         // (Links for the image's layers the index has, asked for at once: the first of its layers to come.)
         let image: Vec<String> = labels.get(IMAGE_LAYERS).map(|all| all.split(',').filter(|d| !d.is_empty()).map(str::to_string).collect()).unwrap_or_default();
         let unlinked: Vec<String> = { let i = st.index.read().unwrap(); image.iter().chain([digest]).filter(|d| i.get(d).is_some_and(|l| l.erofs.url.is_empty())).cloned().collect() };
-        if !unlinked.is_empty() { let l = self.clone(); let _ = tokio::task::spawn_blocking(move || l.store.refresh_many(&unlinked)).await; }
+        if !unlinked.is_empty() { let l = self.clone(); off_thread(move || l.store.refresh_many(&unlinked)).await; }
         let layer = st.index.read().unwrap().get(digest).cloned().unwrap_or(layer);
         if let Some(all) = labels.get(IMAGE_LAYERS) {
             for d in all.split(',').filter(|d| !d.is_empty() && *d != digest) {
@@ -164,7 +166,7 @@ impl Layers {
         };
         let (l, k, p, lb, d, f, size) = (self.clone(), key.to_string(), parent.to_string(), labels.clone(), digest.clone(), file.clone(), layer.size);
         let usage = layer.usage.map(|u| Usage { size: u.size, inodes: u.inodes });
-        let made = tokio::task::spawn_blocking(move || l.serve_snapshot(&k, &p, lb, &d, &f, size, usage)).await.map_err(other).and_then(|r| r);
+        let made = off_thread(move || l.serve_snapshot(&k, &p, lb, &d, &f, size, usage)).await;
         match made {
             Ok(()) => {
                 st.stats.served.fetch_add(1, Ordering::Relaxed);
@@ -240,13 +242,13 @@ impl Layers {
     pub async fn open_blob(self: Arc<Self>, d: Digest) -> Result<(std::fs::File, u64)> {
         let l = self.clone();
         let dd = d.clone();
-        match tokio::task::spawn_blocking(move || l.content.open_blob(&dd)).await.map_err(other).and_then(crate::faults::pass)? {
+        match crate::faults::check(off_thread(move || l.content.open_blob(&dd)).await) {
             Err(e) if e.is_not_found() => {
                 let st = &self.store;
                 if st.served_size(&d.to_string()).is_none() { return Err(e) }
                 self.clone().fetch_blob(&d).await.map_err(Error::Other).and_then(crate::faults::pass)?;
                 let l = self.clone();
-                tokio::task::spawn_blocking(move || l.content.open_blob(&d)).await.map_err(other).and_then(crate::faults::pass)?
+                crate::faults::check(off_thread(move || l.content.open_blob(&d)).await)
             }
             r => r,
         }
@@ -260,11 +262,11 @@ impl Layers {
         let r = cell.get_or_init(|| async move {
             let st = &l.store;
             let size = st.served_size(&key).ok_or("not served")?;
-            let _turn = st.at_once.acquire().await.map_err(|e| e.to_string())?;
-            let (l2, key2) = (l.clone(), key.clone());
-            tokio::task::spawn_blocking(move || -> std::result::Result<(), String> {
+            // (The semaphore is never closed.)
+            let _turn = st.at_once.acquire().await.expect("a turn");
+            let (l2, key2, d) = (l.clone(), key.clone(), d.clone());
+            off_thread(move || -> std::result::Result<(), String> {
                 let st = &l2.store;
-                let d = Digest::parse(&key2).map_err(|e| e.to_string())?;
                 let tmp = l2.content.fetch_dir().map_err(|e| e.to_string())?.join(&d.hex);
                 let link = IndexLink { st, digest: key2.clone(), erofs: false };
                 let began = std::time::Instant::now();
@@ -274,7 +276,7 @@ impl Layers {
                 st.stats.bytes.fetch_add(n, Ordering::Relaxed);
                 eprintln!("superci-layers: blob {key2} read from the store in {:.2} s", began.elapsed().as_secs_f64());
                 Ok(())
-            }).await.map_err(|e| e.to_string())?
+            }).await
         }).await.clone();
         // (A failed read may be asked again: the next reader tries afresh.)
         if r.is_err() { st.blobs.lock().unwrap().remove(&d.to_string()); }
@@ -290,9 +292,10 @@ impl Layers {
             let st = &l.store;
             let file = st.files.join(format!("{}.erofs", digest.split_once(':').map(|(_, h)| h).unwrap_or(digest)));
             if std::fs::metadata(&file).is_ok_and(|m| m.len() == layer.erofs.size) { return Ok(file) }
-            let _turn = st.at_once.acquire().await.map_err(|e| e.to_string())?;
+            // (The semaphore is never closed.)
+            let _turn = st.at_once.acquire().await.expect("a turn");
             let (l2, d, layer, f) = (l.clone(), digest.to_string(), layer.clone(), file.clone());
-            tokio::task::spawn_blocking(move || l2.store.fetch_erofs_blocking(&d, &layer, &f)).await.map_err(|e| e.to_string())??;
+            off_thread(move || l2.store.fetch_erofs_blocking(&d, &layer, &f)).await?;
             Ok(file)
         }).await.clone()
     }

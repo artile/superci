@@ -312,7 +312,8 @@ async fn the_served_store_holds_with_each_call_and_store_operation_failing() {
         let steps: usize = std::fs::read_to_string(&count).unwrap_or_default().trim().parse().unwrap_or(0);
         let mut clean = Command::new(prefix.first().copied().unwrap_or("sh"));
         if !prefix.is_empty() { clean.args(&prefix[1..]).arg("sh"); }
-        let _ = clean.args(["-c", &format!("umount -R -l {0} 2>/dev/null; rm -rf {0}", dir.display())]).status();
+        // (Each mount under the folder: one there is not unmounted with the folder, which is no mount itself.)
+        let _ = clean.args(["-c", &format!("grep -o ' {0}[^ ]*' /proc/self/mounts | sort -r | xargs -r umount -l; rm -rf {0}", dir.display())]).status();
         (done, log, steps)
     } };
     let (done, log, steps) = run(None).await;
