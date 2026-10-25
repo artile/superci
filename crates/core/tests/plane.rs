@@ -5928,6 +5928,31 @@ fn a_control_plane_not_in_aws_converts_no_layer_and_gives_its_index_without_link
     assert_eq!(store.0.borrow().get("layers-convert-error").map(String::as_str), Some("only a control plane on AWS converts layers"));
 }
 
+#[test]
+fn a_runners_calls_that_bring_nothing_are_answered_as_its_service_answers_them() {
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let made = run(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1")
+        .with_body(serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string()));
+    let id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let token = serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("run:{id}")]).unwrap()["jobs"][0]["token"].as_str().unwrap().to_string();
+    let call = |method: &str, path: &str, body: &str| run(Request::new(method, &format!("{PLANE_URL}/runner/{token}{path}")).with_body(body.to_string()));
+    // The cache's other calls, from a machine without SuperCI's cache: no entry. Actions to download: none asked.
+    let r = call("POST", "/twirp/github.actions.results.api.v1.CacheService/DeleteCacheEntry", "{}");
+    assert_eq!((r.status, json(&r)["code"].as_str()), (404, Some("not_found")));
+    assert_eq!(json(&call("POST", "/_apis/v1/ActionDownloadInfo/p/j", "{}"))["actions"], serde_json::json!({}));
+    // Steps' records with none in them; a log's content of nothing.
+    assert_eq!(call("PATCH", "/_apis/v1/Timeline/p/t", r#"{"value":[]}"#).status, 200);
+    assert_eq!(call("POST", "/_apis/v1/Logfiles/p/1", "").status, 200);
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with(&format!("rlog:{token}:"))));
+    // A call the runner makes of a page its lines go to, but not as it sends them: none.
+    assert_eq!(call("GET", "/_apis/v1/TimeLineWebConsoleLog/p/t/s", "").status, 404);
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6070,7 +6095,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_machine_whose_region_makes_no_address_is_said_so_at_each_link_and_what_it_sends_amiss_is_passed_over,
         githubs_keys_that_are_no_json_or_a_damaged_signing_key_leave_a_jobs_token_unread_saying_why,
         the_layer_store_passes_over_what_is_kept_damaged_and_says_what_a_machine_asks_amiss,
-        a_control_plane_not_in_aws_converts_no_layer_and_gives_its_index_without_links
+        a_control_plane_not_in_aws_converts_no_layer_and_gives_its_index_without_links,
+        a_runners_calls_that_bring_nothing_are_answered_as_its_service_answers_them
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

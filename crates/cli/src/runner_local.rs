@@ -40,7 +40,7 @@ pub fn serve(workflow: &str, job: &str, port: u16, root: &str, secrets: &[(Strin
     let store = Memory::default();
     // (Kept in memory, which takes any write.)
     store.0.lock().unwrap().insert("rjob:local".into(), io::json(&HandedJob { message, ..Default::default() }));
-    jit_config(root, "superci-local").and_then(|jit| std::fs::write(jit_file, jit).map_err(|e| e.to_string()))?;
+    std::fs::write(jit_file, jit_config(root, "superci-local")).map_err(|e| e.to_string())?;
     let prefix = url::Url::parse(root).map_err(|e| e.to_string())?.path().trim_end_matches('/').to_string();
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     eprintln!("serving {job} of {path} on 127.0.0.1:{port} for {root}; the runner's configuration is in {jit_file}");

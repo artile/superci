@@ -132,11 +132,9 @@ pub fn job_message(g: &Given) -> Result<Value> {
     let mut m = crate::workflow::job_parts(&workflow, g.path, g.job, &mut guid)?;
     let job = workflow.get("jobs").and_then(|j| j.get(g.job));
     let display = g.display.clone().unwrap_or_else(|| job.and_then(|j| j.get("name")).and_then(|n| n.text()).filter(|n| !n.contains("${{")).unwrap_or(g.job).to_string());
-    let mut variables = serde_json::Map::new();
-    for s in SWITCHES { variables.insert(s.to_string(), json!({ "value": "true" })); }
-    for (k, v) in [("system.github.job", g.job), ("system.phaseDisplayName", g.job), ("system.runnerGroupName", "Default"), ("system.runner.lowdiskspacethreshold", "100"), ("system.workflowFilePath", g.path)] {
-        variables.insert(k.into(), json!({ "value": v }));
-    }
+    let mut variables: serde_json::Map<String, Value> = SWITCHES.iter().map(|s| (s.to_string(), json!({ "value": "true" }))).collect();
+    variables.extend([("system.github.job", g.job), ("system.phaseDisplayName", g.job), ("system.runnerGroupName", "Default"), ("system.runner.lowdiskspacethreshold", "100"), ("system.workflowFilePath", g.path)]
+        .map(|(k, v)| (k.to_string(), json!({ "value": v }))));
     // A run's secrets: the runner makes its `secrets` context of them, and hides each wherever it would be printed.
     for (k, v) in g.secrets { variables.insert(k.clone(), json!({ "value": v, "isSecret": true })); }
     // GitHub's cache as GitHub's jobs have it now (version 2: `ACTIONS_CACHE_SERVICE_V2` for the job's actions).
@@ -248,11 +246,11 @@ fn tar(files: &[(&str, &[u8])]) -> Vec<u8> {
     let folder = files.first().and_then(|(n, _)| n.split_once('/')).map(|(f, _)| format!("{f}/")).unwrap_or_default();
     // (Its one caller puts its files in a folder.)
     out.extend_from_slice(&header(&folder, 0, b'5', "0000755"));
-    for (name, data) in files {
+    files.iter().for_each(|(name, data)| {
         out.extend_from_slice(&header(name, data.len(), b'0', "0000644"));
         out.extend_from_slice(data);
         out.resize(out.len().div_ceil(512) * 512, 0);
-    }
+    });
     out.resize(out.len() + 1024, 0);
     out
 }
@@ -272,24 +270,18 @@ fn gzip_stored(data: &[u8]) -> Vec<u8> {
 }
 
 fn crc32(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for b in data {
-        crc ^= *b as u32;
-        for _ in 0..8 { crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 } }
-    }
-    !crc
+    !data.iter().fold(!0u32, |crc, b| (0..8).fold(crc ^ *b as u32, |crc, _| if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 }))
 }
 
 /// A runner's key. In a debug build one made once and kept: the tests start hundreds of runners, and making a 2048-bit
 /// key takes from a fraction of a second to several (nothing checks what a runner signs with it, see `jit_config`).
-fn runner_key() -> Result<rsa::RsaPrivateKey> {
-    let made = || rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).map_err(|e| e.to_string());
+fn runner_key() -> rsa::RsaPrivateKey {
+    // (Made from the system's randomness, of a size RSA takes: it never fails.)
+    let made = || rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).expect("a 2048-bit RSA key");
     #[cfg(debug_assertions)]
     {
         static KEY: std::sync::OnceLock<rsa::RsaPrivateKey> = std::sync::OnceLock::new();
-        if let Some(k) = KEY.get() { return Ok(k.clone()) }
-        let k = made()?;
-        return Ok(KEY.get_or_init(|| k).clone())
+        KEY.get_or_init(made).clone()
     }
     #[cfg(not(debug_assertions))]
     made()
@@ -299,21 +291,22 @@ fn runner_key() -> Result<rsa::RsaPrivateKey> {
 /// runner, here pointing at this service: `root` is where its calls go (no trailing slash), `name` what it is
 /// called. It runs one job and ends. Its key is made for it (the runner signs with it when it asks for a token;
 /// this service does not need what it signs: the address it is given is what lets it in).
-pub fn jit_config(root: &str, name: &str) -> Result<String> {
+pub fn jit_config(root: &str, name: &str) -> String {
     use rsa::traits::{PrivateKeyParts, PublicKeyParts};
-    let key = runner_key()?;
+    let key = runner_key();
     let n = |b: &rsa::BigUint| crate::crypto::b64(&b.to_bytes_be());
     let primes = key.primes();
     let (p, q) = (&primes[0], &primes[1]);
     let one = rsa::BigUint::from(1u8);
     let (dp, dq) = (key.d() % (p - &one), key.d() % (q - &one));
-    let inverse_q = key.crt_coefficient().ok_or("no CRT coefficient")?;
+    // (A key just made has its CRT values.)
+    let inverse_q = key.crt_coefficient().expect("a key just made has its CRT coefficient");
     let rsaparams = json!({ "d": n(key.d()), "dp": n(&dp), "dq": n(&dq), "exponent": n(key.e()), "inverseQ": n(&inverse_q), "modulus": n(key.n()), "p": n(p), "q": n(q) });
     // (Its work folder where GitHub's own runners have theirs, as SuperCI's machines expect.)
     let runner = json!({ "AgentId": "1", "AgentName": name, "DisableUpdate": "True", "Ephemeral": "True", "PoolId": "1", "PoolName": "Default", "ServerUrl": root, "WorkFolder": "/home/runner/work", "GitHubUrl": root });
     let credentials = json!({ "Scheme": "OAuth", "Data": { "ClientId": guid(), "AuthorizationUrl": format!("{root}/_apis/v1/auth/"), "RequireFipsCryptography": "False" } });
     let b = |v: &Value| crate::crypto::b64(v.to_string().as_bytes());
-    Ok(b(&json!({ ".runner": b(&runner), ".credentials": b(&credentials), ".credentials_rsaparams": b(&rsaparams) })))
+    b(&json!({ ".runner": b(&runner), ".credentials": b(&credentials), ".credentials_rsaparams": b(&rsaparams) }))
 }
 
 fn ok(body: Value) -> Response { Response::json(&body) }
@@ -378,18 +371,6 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> R
                 "tarballUrl": tarball, "zipballUrl": format!("https://api.github.com/repos/{name}/zipball/{r}") }));
         }
         ok(json!({ "actions": out }))
-    } else if p.contains("/TimeLineWebConsoleLog/") {
-        // The job's lines as they are written, each post as one entry, with its step and the number of its first line
-        // in that step's log: the runner drops lines when it writes faster than it sends them (it holds 1,024 at
-        // most), so a gap is seen, and the step's whole log (`/Logfiles/`) fills it.
-        let lines: Vec<String> = body["value"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
-        if !lines.is_empty() {
-            job.lines += 1;
-            let step = body["stepId"].as_str().map(str::to_string).or_else(|| p.trim_end_matches('/').rsplit('/').next().map(str::to_string));
-            store.put_until(&format!("rline:{id}:{:06}", job.lines), json!({ "step": step, "start": body["startLine"], "lines": lines }).to_string(), job.at_ms + KEPT_MS).await?;
-            put_json(store, &key, &job).await?;
-        }
-        empty()
     } else if p.contains("/Timeline/") {
         // Each step's record: the last word of each kept.
         for r in body["value"].as_array().into_iter().flatten() {
@@ -397,7 +378,7 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> R
             let mut slim = json!({ "id": r["id"], "type": r["type"], "name": r["name"], "state": r["state"], "result": r["result"], "order": r["order"], "log": log, "start": r["startTime"], "finish": r["finishTime"] });
             match job.steps.iter_mut().find(|s| s["id"] == r["id"]) {
                 // (A later word that leaves something out keeps what was said of it before.)
-                Some(s) => { for (k, v) in slim.as_object_mut().into_iter().flatten() { if v.is_null() { *v = s[k.as_str()].clone() } } *s = slim }
+                Some(s) => { slim.as_object_mut().into_iter().flatten().filter(|(_, v)| v.is_null()).for_each(|(k, v)| *v = s[k.as_str()].clone()); *s = slim }
                 None => job.steps.push(slim),
             }
         }
@@ -440,6 +421,15 @@ mod tests {
         assert!(g.len() == 36 && g.as_bytes()[14] == b'4', "{g}");
         assert_eq!(access_token(1_790_000_000_000).split('.').count(), 3);
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn lines_kept_before_steps_were_said_are_read_alone_and_a_workflow_that_cannot_be_read_hands_no_job() {
+        assert_eq!(feed(r#"["a", 1, "b"]"#), (None, None, vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(feed(r#"{"step":"s","start":4,"lines":["c"]}"#), (Some("s".to_string()), Some(4), vec!["c".to_string()]));
+        let g = Given { workflow: "jobs: [", path: ".github/workflows/ci.yml", job: "a", secrets: &[], vars: &[], github: json!({}), service: "https://p/runner/t/", access_token: "t",
+            ids: Ids::new(1), matrix: Value::Null, strategy: Value::Null, needs: json!({}), display: None, inputs: Value::Null };
+        assert!(job_message(&g).is_err());
     }
 
     #[test]

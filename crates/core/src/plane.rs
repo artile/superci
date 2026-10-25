@@ -2917,7 +2917,7 @@ impl<'a> ControlPlane<'a> {
                     job.cloud = String::new();
                     return Err("its run from a computer is gone: what a run keeps is kept a day".into())
                 };
-                let jit = crate::runner_service::jit_config(&format!("{plane_url}/runner/{token}"), &name)?;
+                let jit = crate::runner_service::jit_config(&format!("{plane_url}/runner/{token}"), &name);
                 job.runner = Some(name.clone());
                 self.keep(&key, &*job).await?;
                 self.store.put_until(&format!("runner:{name}"), job.job_id.to_string(), self.clock.now_ms() + RUNNER_KEPT_MS).await?;
