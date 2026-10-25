@@ -6829,9 +6829,10 @@ fn removing_aws_when_aws_answers_nothing_forgets_it_and_says_what_is_left_there(
     served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"account_usd":{"aws":100.0},"aws_budget":{"stop":false},"default":"aws","rules":[{"repo":"acme/*","cloud":"aws"}],"order":[{"cloud":"aws"},{"cloud":"aws-on-demand"},{"cloud":"cloudflare"}]}"#);
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
-    b.goto(&format!("{link}&p=runners"));
-    b.wait(&shows("Runner providers"));
-    // (Sent from a page that does not read the dashboard again by itself: what it says is for the next page.)
+    // (Runners is not opened in the browser: while AWS is asked about the account it reads itself again every few
+    // seconds, and one such read after the removal would take what the removal said before this test reads it.)
+    until("Runners", || common::part(&link, "/?p=runners&fragment=1").1.contains("Runner providers"));
+    b.goto(&link);
     b.goto(&format!("{}/job/view?id=0", link.split("/?").next().unwrap()));
     let (got, text) = post(&mut b, "/runners/remove", &[("cloud", "aws")]);
     assert!(got < 400, "{got} {text}");
