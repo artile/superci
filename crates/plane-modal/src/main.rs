@@ -87,8 +87,9 @@ struct Blocking(ureq::Agent, ureq::Agent);
 #[async_trait(?Send)]
 impl Http for Blocking {
     async fn send(&self, r: Request) -> io::Result<Response> {
-        let mut builder = ureq::http::Request::builder().method(r.method.as_str()).uri(r.url.as_str());
-        for (k, v) in &r.headers { builder = builder.header(k.as_str(), v.as_str()) }
+        // (In a test, the clouds' stand-in: see `io::stand_in`.)
+        let url = io::stand_in(&r.url);
+        let builder = r.headers.iter().fold(ureq::http::Request::builder().method(r.method.as_str()).uri(url.as_str()), |b, (k, v)| b.header(k.as_str(), v.as_str()));
         let request = builder.body(r.body.clone()).map_err(|e| e.to_string())?;
         let mut response = if r.no_follow { &self.1 } else { &self.0 }.run(request).map_err(|e| format!("{} {}: {e}", r.method, r.url))?;
         let headers = response.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string()))).collect();
@@ -132,5 +133,19 @@ fn main() {
         let response = block_on(plane.handle(r));
         let headers: serde_json::Map<String, Value> = response.headers.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
         bridge.send(&json!({ "type": "response", "status": response.status, "headers": headers, "body": STANDARD.encode(&response.body) }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A GitLab job is never placed on Modal (its jobs need Docker), and were one given, nothing is asked of plane.py.
+    #[test]
+    fn a_gitlab_job_is_refused_a_sandbox() {
+        let bridge = Bridge { input: RefCell::new(std::io::stdin().lock()), output: RefCell::new(std::io::stdout()) };
+        let work = Work::GitLab { url: "https://gitlab.com".into(), token: "glrt-x".into() };
+        let said = block_on(Sandboxes(&bridge).start("superci-1", &work, 10, Size { cpu: 2, ram_gb: 8, disk_gb: 14, gpu: None }));
+        assert_eq!(said, Err("Modal runs no Docker for GitLab jobs".to_string()));
     }
 }
