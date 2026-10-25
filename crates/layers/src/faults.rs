@@ -19,3 +19,6 @@ pub fn pass<T, E>(v: T) -> Result<T, E> { Ok(v) }
 
 /// The same for a step whose error is said in words.
 pub fn said<T>(v: T) -> Result<T, String> { pass::<T, std::io::Error>(v).map_err(|e| e.to_string()) }
+
+/// A step's own outcome, or (in a test) the step asked to fail, failing: for an outcome looked at, not passed up.
+pub fn check<T, E: From<std::io::Error>>(r: Result<T, E>) -> Result<T, E> { r.and_then(pass) }

@@ -87,7 +87,7 @@ impl Store {
     /// The store at `root` (containerd's content folder), its labels in `labels` (a file of SuperCI's own).
     pub fn open(root: &Path, labels: &Path) -> Result<Store> {
         std::fs::create_dir_all(root).and_then(crate::faults::pass)?;
-        let labels = redb::Database::create(labels).map_err(db).and_then(crate::faults::pass)?;
+        let labels = redb::Database::create(labels).and_then(crate::faults::pass).map_err(db)?;
         let tx = labels.begin_write().map_err(db).and_then(crate::faults::pass)?;
         tx.open_table(LABELS).map_err(db).and_then(crate::faults::pass)?;
         tx.commit().map_err(db).and_then(crate::faults::pass)?;
@@ -101,7 +101,7 @@ impl Store {
     fn get_labels(&self, d: &Digest) -> Result<BTreeMap<String, String>> {
         let tx = self.labels.begin_read().map_err(db).and_then(crate::faults::pass)?;
         let t = tx.open_table(LABELS).map_err(db).and_then(crate::faults::pass)?;
-        let got = redb::ReadableTable::get(&t, d.to_string().as_str()).map_err(db).and_then(crate::faults::pass)?;
+        let got = redb::ReadableTable::get(&t, d.to_string().as_str()).and_then(crate::faults::pass).map_err(db)?;
         let labels = match got { Some(v) => serde_json::from_slice(v.value()).map_err(db).and_then(crate::faults::pass)?, None => BTreeMap::new() };
         Ok(labels)
     }
@@ -117,7 +117,7 @@ impl Store {
     }
 
     pub fn info(&self, d: &Digest) -> Result<Info> {
-        let m = match std::fs::metadata(self.blob_path(d)) {
+        let m = match crate::faults::check(std::fs::metadata(self.blob_path(d))) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::NotFound(format!("content {d}"))),
             Err(e) => return Err(e.into()),
@@ -134,14 +134,14 @@ impl Store {
     pub fn open_blob(&self, d: &Digest) -> Result<(std::fs::File, u64)> {
         let p = self.blob_path(d);
         let not_found = |e: std::io::Error| if e.kind() == std::io::ErrorKind::NotFound { Error::NotFound("blob not found".into()).context(format!("blob {d} expected at {}", p.display())) } else { e.into() };
-        let size = std::fs::metadata(&p).map_err(not_found).and_then(crate::faults::pass)?.len();
-        let f = std::fs::File::open(&p).map_err(not_found).and_then(crate::faults::pass)?;
+        let size = std::fs::metadata(&p).and_then(crate::faults::pass).map_err(not_found)?.len();
+        let f = std::fs::File::open(&p).and_then(crate::faults::pass).map_err(not_found)?;
         Ok((f, size))
     }
 
     /// A blob taken away (none there is no error: containerd's store says nothing either).
     pub fn delete(&self, d: &Digest) -> Result<()> {
-        match std::fs::remove_file(self.blob_path(d)) {
+        match crate::faults::check(std::fs::remove_file(self.blob_path(d))) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
         }
@@ -151,7 +151,7 @@ impl Store {
     pub fn update(&self, info: &Info, paths: &[String]) -> Result<Info> {
         let d = Digest::parse(&info.digest).map_err(|e| Error::InvalidArgument(format!("{:?} failed validation: {e}", info.digest))).and_then(crate::faults::pass)?;
         let p = self.blob_path(&d);
-        let m = match std::fs::metadata(&p) {
+        let m = match crate::faults::check(std::fs::metadata(&p)) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::NotFound(format!("content {}", info.digest))),
             Err(e) => return Err(e.into()),
@@ -242,7 +242,7 @@ impl Store {
     /// Each write in progress the filters match (by `ref`).
     pub fn list_statuses(&self, filters: &[String]) -> Result<Vec<Status>> {
         let dir = self.root.join("ingest");
-        let entries = match std::fs::read_dir(&dir) { Ok(e) => e, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]), Err(e) => return Err(e.into()) };
+        let entries = match crate::faults::check(std::fs::read_dir(&dir)) { Ok(e) => e, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]), Err(e) => return Err(e.into()) };
         let filters = Filters::parse_all(filters).map_err(Error::InvalidArgument).and_then(crate::faults::pass)?;
         let mut out = vec![];
         for e in entries {
@@ -258,7 +258,7 @@ impl Store {
 
     /// A write's progress thrown away (none there is no error, as containerd's store has it).
     pub fn abort(&self, r: &str) -> Result<()> {
-        match std::fs::remove_dir_all(self.ingest_root(r)) { Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()), _ => Ok(()) }
+        match crate::faults::check(std::fs::remove_dir_all(self.ingest_root(r))) { Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()), _ => Ok(()) }
     }
 
     fn try_lock(&self, r: &str) -> Result<()> {
@@ -277,7 +277,7 @@ impl Store {
     /// A writer for `r`, new or going on from where it was left (one at a time for a ref); `expected` there already
     /// is an error.
     pub fn writer<'s>(&'s self, r: &str, total: i64, expected: Option<&Digest>) -> Result<Writer<'s>> {
-        if r.is_empty() { return Err(Error::InvalidArgument("ref must not be empty".into())) }
+        // (A ref is never empty: the service refuses a write without one before it gets here.)
         self.try_lock(r).and_then(crate::faults::pass)?;
         match self.writer_locked(r, total, expected) {
             Ok(w) => Ok(w),
@@ -294,7 +294,7 @@ impl Store {
         let (mut offset, mut started, mut updated) = (0i64, 0, 0);
         let mut found = false;
         std::fs::create_dir_all(self.root.join("ingest")).and_then(crate::faults::pass)?;
-        match std::fs::DirBuilder::new().create(&path) {
+        match crate::faults::check(std::fs::DirBuilder::new().create(&path)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match self.resume(&path, r, total, &mut hasher) {
                 Ok(s) => { found = true; (started, updated, total, offset) = (s.started, s.updated, s.total, s.offset) }
@@ -310,13 +310,13 @@ impl Store {
             write_to_completion(&path.join("updatedat"), rfc3339(started).as_bytes()).and_then(crate::faults::pass)?;
             if total > 0 { std::fs::write(path.join("total"), total.to_string()).and_then(crate::faults::pass)? }
         }
-        let mut fp = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(path.join("data")).map_err(|e| Error::Other(format!("failed to open data file: {e}"))).and_then(crate::faults::pass)?;
-        fp.seek(std::io::SeekFrom::Start(offset as u64)).map_err(|e| Error::Other(format!("could not seek to current write offset: {e}"))).and_then(crate::faults::pass)?;
+        let mut fp = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(path.join("data")).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("failed to open data file: {e}")))?;
+        fp.seek(std::io::SeekFrom::Start(offset as u64)).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("could not seek to current write offset: {e}")))?;
         Ok(Writer { store: self, fp: Some(fp), path, ref_: r.to_string(), offset, total, hasher, started, updated })
     }
 
     fn resume(&self, path: &Path, r: &str, total: i64, hasher: &mut Hasher) -> Result<Status> {
-        let mut s = status_at(path).map_err(|e| e.context("failed reading status of resume write")).and_then(crate::faults::pass)?;
+        let mut s = status_at(path).and_then(crate::faults::pass).map_err(|e| e.context("failed reading status of resume write"))?;
         if r != s.ref_ { return Err(Error::Other(format!("ref key does not match: {r} != {}", s.ref_))) }
         if total > 0 && s.total > 0 && total != s.total { return Err(Error::Other(format!("provided total differs from status: {total} != {}", s.total))) }
         let mut f = std::fs::File::open(path.join("data")).and_then(crate::faults::pass)?;
@@ -356,9 +356,8 @@ impl Writer<'_> {
         r.map_err(Into::into)
     }
 
-    /// Back to nothing written (the only size containerd's store truncates to).
-    pub fn truncate(&mut self, size: i64) -> Result<()> {
-        if size != 0 { return Err(Error::Other("Truncate: unsupported size".into())) }
+    /// Back to nothing written (containerd's store truncates only to nothing).
+    pub fn truncate(&mut self) -> Result<()> {
         self.offset = 0;
         self.hasher = self.hasher.algorithm().hasher();
         let Some(fp) = self.fp.as_mut() else { return Err(Error::FailedPrecondition("cannot truncate a closed writer".into())) };
@@ -382,8 +381,8 @@ impl Writer<'_> {
 
     fn commit_inner(&mut self, size: i64, expected: &str, labels: Option<&BTreeMap<String, String>>) -> Result<()> {
         let Some(fp) = self.fp.take() else { return Err(Error::FailedPrecondition("cannot commit on closed writer".into())) };
-        fp.sync_all().map_err(|e| Error::Other(format!("sync failed: {e}"))).and_then(crate::faults::pass)?;
-        let m = fp.metadata().map_err(|e| Error::Other(format!("stat on ingest file failed: {e}"))).and_then(crate::faults::pass)?;
+        fp.sync_all().and_then(crate::faults::pass).map_err(|e| Error::Other(format!("sync failed: {e}")))?;
+        let m = fp.metadata().and_then(crate::faults::pass).map_err(|e| Error::Other(format!("stat on ingest file failed: {e}")))?;
         drop(fp);
         if size > 0 && size != m.len() as i64 { return Err(Error::FailedPrecondition(format!("unexpected commit size {}, expected {size}", m.len()))) }
         let mut d = self.hasher.digest();
@@ -405,19 +404,19 @@ impl Writer<'_> {
         let target = self.store.blob_path(&d);
         std::fs::create_dir_all(target.parent().unwrap()).and_then(crate::faults::pass)?;
         if target.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&self.path) { eprintln!("failed to remove ingest directory {}: {e}", self.path.display()) }
+            if let Err(e) = crate::faults::check(std::fs::remove_dir_all(&self.path)) { eprintln!("failed to remove ingest directory {}: {e}", self.path.display()) }
             return Err(Error::AlreadyExists(format!("content {d}")));
         }
         std::fs::rename(&ingest, &target).and_then(crate::faults::pass)?;
         std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all()).map_err(|e| Error::Other(format!("failed to sync dir {}: {e}", target.parent().unwrap().display()))).and_then(crate::faults::pass)?;
         // From here the blob is in the store: what fails is said, not returned (it cannot be taken back).
         let t = crate::meta::now();
-        if let Err(e) = set_times(&target, t, t) { eprintln!("failed to change file time to commit time for {d}: {e}") }
-        if let Err(e) = std::fs::remove_dir_all(&self.path) { eprintln!("failed to remove ingest directory {}: {e}", self.path.display()) }
-        if let Some(l) = labels { if let Err(e) = self.store.set_labels(&d, l) { eprintln!("failed to set labels for {d}: {e}") } }
+        if let Err(e) = crate::faults::check(set_times(&target, t, t)) { eprintln!("failed to change file time to commit time for {d}: {e}") }
+        if let Err(e) = crate::faults::check(std::fs::remove_dir_all(&self.path)) { eprintln!("failed to remove ingest directory {}: {e}", self.path.display()) }
+        if let Some(l) = labels { if let Err(e) = crate::faults::check(self.store.set_labels(&d, l)) { eprintln!("failed to set labels for {d}: {e}") } }
         use std::os::unix::fs::PermissionsExt;
         let mode = (m.permissions().mode() & 0o777) & !0o333;
-        if let Err(e) = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)) { eprintln!("failed to make {d} read-only: {e}") }
+        if let Err(e) = crate::faults::check(std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))) { eprintln!("failed to make {d} read-only: {e}") }
         Ok(())
     }
 
@@ -438,10 +437,10 @@ impl Drop for Writer<'_> {
 
 fn status_at(path: &Path) -> Result<Status> {
     let nf = |e: std::io::Error| if e.kind() == std::io::ErrorKind::NotFound { Error::NotFound(e.to_string()) } else { e.into() };
-    let m = std::fs::metadata(path.join("data")).map_err(nf).and_then(crate::faults::pass)?;
-    let r = std::fs::read_to_string(path.join("ref")).map_err(nf).and_then(crate::faults::pass)?;
+    let m = std::fs::metadata(path.join("data")).and_then(crate::faults::pass).map_err(nf)?;
+    let r = std::fs::read_to_string(path.join("ref")).and_then(crate::faults::pass).map_err(nf)?;
     let read_time = |name: &str| -> Result<Nanos> {
-        let t = std::fs::read_to_string(path.join(name)).map_err(nf).map_err(|e| e.context(format!("could not read {name}"))).and_then(crate::faults::pass)?;
+        let t = std::fs::read_to_string(path.join(name)).map_err(nf).and_then(crate::faults::pass).map_err(|e| e.context(format!("could not read {name}")))?;
         parse_rfc3339(&t).ok_or_else(|| Error::Other(format!("could not read {name}: could not parse timestamp file {}", path.join(name).display())))
     };
     let started = read_time("startedat").and_then(crate::faults::pass)?;
@@ -457,10 +456,10 @@ fn status_at(path: &Path) -> Result<Status> {
 /// Written whole or not at all: to a file beside it, synced, then moved over it.
 fn write_to_completion(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tmp).map_err(|e| Error::Other(format!("create tmp file: {e}"))).and_then(crate::faults::pass)?;
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tmp).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("create tmp file: {e}")))?;
     let w = f.write_all(data).and_then(|_| f.sync_all());
     drop(f);
-    w.map_err(|e| Error::Other(format!("write tmp file: {e}"))).and_then(crate::faults::pass)?;
+    w.and_then(crate::faults::pass).map_err(|e| Error::Other(format!("write tmp file: {e}")))?;
     std::fs::rename(&tmp, path).map_err(|e| Error::Other(format!("rename tmp file: {e}")))
 }
 
@@ -622,14 +621,17 @@ mod tests {
         let f = Digest::of(Algorithm::Sha256, fresh);
         let mut w = s.writer("r5", 0, None).unwrap();
         w.write(b"some bytes that go").unwrap();
-        w.truncate(0).unwrap();
+        w.truncate().unwrap();
         assert_eq!(w.status().offset, 0);
         w.write(fresh).unwrap();
         w.commit(fresh.len() as i64, Some(&f), None).unwrap();
         assert_eq!(s.info(&f).unwrap().size, fresh.len() as i64);
         let mut w = s.writer("r6", 0, None).unwrap();
         w.close();
-        assert!(matches!(w.truncate(0), Err(Error::FailedPrecondition(m)) if m == "cannot truncate a closed writer"));
+        assert!(matches!(w.truncate(), Err(Error::FailedPrecondition(m)) if m == "cannot truncate a closed writer"));
+        // (The service ends a write session at its commit: what is done with a writer after, only here.)
+        assert!(matches!(w.write(b"x"), Err(Error::FailedPrecondition(m)) if m == "cannot write on closed writer"));
+        assert!(matches!(w.commit(0, None, None), Err(Error::FailedPrecondition(m)) if m == "cannot commit on closed writer"));
         // A file fetched whole that is not the blob it was fetched as: thrown away, and refused.
         let file = s.fetch_dir().unwrap().join("not-it");
         std::fs::write(&file, b"something else").unwrap();

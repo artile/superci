@@ -37,7 +37,7 @@ impl Overlay {
         // (containerd adds "userxattr" for an overlay made in a user namespace; this runs as the machine's root only.)
         if in_user_namespace() { return Err(Error::Other("not supported in a user namespace".into())) }
         let meta = Meta::open(&root.join("metadata.db")).and_then(crate::faults::pass)?;
-        match std::fs::DirBuilder::new().mode(0o700).create(root.join("snapshots")) {
+        match crate::faults::check(std::fs::DirBuilder::new().mode(0o700).create(root.join("snapshots"))) {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
             _ => {}
         }
@@ -69,8 +69,8 @@ impl Overlay {
 
     pub fn mounts(&self, key: &str) -> Result<Vec<Mount>> {
         let (s, info) = self.meta.read(|r| {
-            let s = r.snapshot(key).map_err(|e| e.context("failed to get active mount")).and_then(crate::faults::pass)?;
-            let (_, info, _) = r.info(key).map_err(|e| e.context("failed to get snapshot info")).and_then(crate::faults::pass)?;
+            let s = r.snapshot(key).and_then(crate::faults::pass).map_err(|e| e.context("failed to get active mount"))?;
+            let (_, info, _) = r.info(key).and_then(crate::faults::pass).map_err(|e| e.context("failed to get snapshot info"))?;
             Ok((s, info))
         }).and_then(crate::faults::pass)?;
         Ok(self.mounts_of(&s, &info))
@@ -86,7 +86,7 @@ impl Overlay {
         self.meta.write(|w| {
             let (id, _, _) = w.info(key).and_then(crate::faults::pass)?;
             let usage = match usage { Some(u) => u, None => disk_usage(&self.upper(&id)).and_then(crate::faults::pass)? };
-            w.commit(key, name, usage, labels, parent).map_err(|e| e.context(format!("failed to commit snapshot {key}"))).and_then(crate::faults::pass)?;
+            w.commit(key, name, usage, labels, parent).and_then(crate::faults::pass).map_err(|e| e.context(format!("failed to commit snapshot {key}")))?;
             Ok(())
         })
     }
@@ -94,7 +94,7 @@ impl Overlay {
     /// Takes a snapshot out; its folder now, or at the next `cleanup` (`async_remove`).
     pub fn remove(&self, key: &str) -> Result<()> {
         let removals = self.meta.write(|w| {
-            w.remove(key).map_err(|e| e.context(format!("failed to remove snapshot {key}"))).and_then(crate::faults::pass)?;
+            w.remove(key).and_then(crate::faults::pass).map_err(|e| e.context(format!("failed to remove snapshot {key}")))?;
             if self.async_remove { return Ok(vec![]) }
             self.cleanup_dirs(&w.ids().and_then(crate::faults::pass)?).map_err(|e| e.context("unable to get directories for removal"))
         }).and_then(crate::faults::pass)?;
@@ -131,8 +131,8 @@ impl Overlay {
             let t = prepare_directory(&snapshots, kind).map_err(|(t, e)| (t, e.context("failed to create prepare snapshot dir")));
             let t = match t { Ok(t) => t, Err((t, e)) => { td = t; return Err(e) } };
             td = Some(t.clone());
-            let s = w.create(kind, key, parent, labels).map_err(|e| e.context("failed to create snapshot")).and_then(crate::faults::pass)?;
-            let (_, info, _) = w.info(key).map_err(|e| e.context("failed to get snapshot info")).and_then(crate::faults::pass)?;
+            let s = w.create(kind, key, parent, labels).and_then(crate::faults::pass).map_err(|e| e.context("failed to create snapshot"))?;
+            let (_, info, _) = w.info(key).and_then(crate::faults::pass).map_err(|e| e.context("failed to get snapshot info"))?;
             // The owner of its files' root: the user namespace's root when mapped, else its parent's root's.
             let mut owner: Option<(u32, u32)> = None;
             if info.labels.contains_key(UID_MAPPING) || info.labels.contains_key(GID_MAPPING) {
@@ -144,16 +144,16 @@ impl Overlay {
             if owner.is_none() {
                 if let Some(p) = s.parent_ids.first() {
                     use std::os::unix::fs::MetadataExt;
-                    let st = std::fs::metadata(self.upper(p)).map_err(|e| Error::Other(format!("failed to stat parent: {e}"))).and_then(crate::faults::pass)?;
+                    let st = std::fs::metadata(self.upper(p)).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("failed to stat parent: {e}")))?;
                     owner = Some((st.uid(), st.gid()));
                 }
             }
             if let Some((uid, gid)) = owner {
-                std::os::unix::fs::lchown(t.join("fs"), Some(uid), Some(gid)).map_err(|e| Error::Other(format!("failed to chown: {e}"))).and_then(crate::faults::pass)?;
+                std::os::unix::fs::lchown(t.join("fs"), Some(uid), Some(gid)).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("failed to chown: {e}")))?;
             }
             let p = snapshots.join(&s.id);
             path = Some(p.clone());
-            std::fs::rename(&t, &p).map_err(|e| Error::Other(format!("failed to rename: {e}"))).and_then(crate::faults::pass)?;
+            std::fs::rename(&t, &p).and_then(crate::faults::pass).map_err(|e| Error::Other(format!("failed to rename: {e}")))?;
             td = None;
             Ok((s, info))
         });
@@ -205,16 +205,16 @@ fn prepare_directory(snapshots: &Path, kind: Kind) -> std::result::Result<PathBu
     let mut td = None;
     for _ in 0..10_000 {
         let t = snapshots.join(format!("new-{}", random_suffix()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&t) {
+        match crate::faults::check(std::fs::DirBuilder::new().mode(0o700).create(&t)) {
             Ok(()) => { td = Some(t); break }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err((None, Error::Other(format!("failed to create temp dir: {e}")))),
         }
     }
     let Some(td) = td else { return Err((None, Error::Other("failed to create temp dir: too many tries".into()))) };
-    if let Err(e) = std::fs::DirBuilder::new().mode(0o755).create(td.join("fs")) { return Err((Some(td), e.into())) }
+    if let Err(e) = crate::faults::check(std::fs::DirBuilder::new().mode(0o755).create(td.join("fs"))) { return Err((Some(td), e.into())) }
     if kind == Kind::Active {
-        if let Err(e) = std::fs::DirBuilder::new().mode(0o711).create(td.join("work")) { return Err((Some(td), e.into())) }
+        if let Err(e) = crate::faults::check(std::fs::DirBuilder::new().mode(0o711).create(td.join("work"))) { return Err((Some(td), e.into())) }
     }
     Ok(td)
 }
@@ -230,7 +230,7 @@ fn random_suffix() -> String {
 pub fn remove_snapshot_dir(dir: &Path) -> std::io::Result<()> {
     let fs = dir.join("fs");
     if is_mount_point(&fs) { crate::mount::unmount(&fs).and_then(crate::faults::pass)? }
-    match std::fs::remove_dir_all(dir) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), r => r }
+    match crate::faults::check(std::fs::remove_dir_all(dir)) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), r => r }
 }
 
 /// Whether a folder is where something is mounted: on another device than its parent folder.
@@ -319,7 +319,7 @@ fn supports_dtype(path: &Path) -> Result<bool> {
 
 /// Whether this runs in a user namespace (containerd's `RunningInUserNS`): its ids map other than one to one.
 fn in_user_namespace() -> bool {
-    match std::fs::read_to_string("/proc/self/uid_map") {
+    match crate::faults::check(std::fs::read_to_string("/proc/self/uid_map")) {
         Ok(m) => {
             let f: Vec<&str> = m.split_whitespace().collect();
             !(f.len() == 3 && f[0] == "0" && f[1] == "0" && f[2] == "4294967295")

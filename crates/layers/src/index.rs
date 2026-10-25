@@ -57,7 +57,7 @@ pub struct Index {
 impl Index {
     /// The index at `path`; none there is an empty one (nothing from the store).
     pub fn load(path: &Path) -> Result<Index, String> {
-        match std::fs::read(path) {
+        match crate::faults::check(std::fs::read(path)) {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Index::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),

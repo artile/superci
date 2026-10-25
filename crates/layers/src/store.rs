@@ -73,7 +73,7 @@ impl Layers {
     pub fn open(overlay: Overlay, content: Store, store: Option<Options>) -> Result<Layers> {
         let Some(o) = store else { return Ok(Layers { overlay, content, store: None }) };
         std::fs::create_dir_all(&o.files).and_then(crate::faults::pass)?;
-        let database = redb::Database::create(&o.db).map_err(db).and_then(crate::faults::pass)?;
+        let database = redb::Database::create(&o.db).and_then(crate::faults::pass).map_err(db)?;
         let tx = database.begin_write().map_err(db).and_then(crate::faults::pass)?;
         tx.open_table(MOUNTS).map_err(db).and_then(crate::faults::pass)?;
         tx.commit().map_err(db).and_then(crate::faults::pass)?;
@@ -95,8 +95,8 @@ impl Layers {
         let tx = st.db.begin_read().map_err(db).and_then(crate::faults::pass)?;
         let t = tx.open_table(MOUNTS).map_err(db).and_then(crate::faults::pass)?;
         let mut all = vec![];
-        for item in t.iter().map_err(db).and_then(crate::faults::pass)? {
-            let (k, v) = item.map_err(db).and_then(crate::faults::pass)?;
+        for item in t.iter().and_then(crate::faults::pass).map_err(db)? {
+            let (k, v) = item.and_then(crate::faults::pass).map_err(db)?;
             all.push((k.value().to_string(), serde_json::from_slice::<Served>(v.value()).map_err(db).and_then(crate::faults::pass)?));
         }
         drop(t);

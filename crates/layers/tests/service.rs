@@ -121,6 +121,80 @@ async fn its_content_store_is_containerds() {
     c.delete(capi::DeleteContentRequest { digest: d }).await.unwrap();
 }
 
+/// Digests of each algorithm containerd takes (and those go-digest refuses, as it refuses them); a write hashed again
+/// as its commit asks; labels changed whole, by path, or not at all; filters by what is not there; a write left and
+/// taken up again (from its own record, or anew when that record is not its own).
+#[tokio::test(flavor = "multi_thread")]
+async fn its_content_store_takes_every_digest_and_write_as_containerds_does() {
+    use capi::WriteAction::*;
+    let s = start("digests", None);
+    let mut c = s.content().await;
+    let info = |c: &mut capi::content_client::ContentClient<tonic::transport::Channel>, d: String| { let mut c = c.clone(); async move { c.info(capi::InfoRequest { digest: d }).await } };
+    // What is not a digest (no algorithm, none after it, an algorithm not taken, written amiss, too short, not hex).
+    for d in ["sha256", "sha256:", &format!("md5:{}", "a".repeat(32)), &format!("MD5:{}", "a".repeat(32)), "md5:short", &format!("md5:{}", "*".repeat(32)),
+        &format!("md5:{}==", "a".repeat(32)), &format!("md5..x:{}", "a".repeat(32)), &format!("sha256:{}", "a".repeat(63)), &format!("sha256:{}", "A".repeat(64))] {
+        assert_eq!(info(&mut c, d.to_string()).await.unwrap_err().code(), Code::InvalidArgument, "{d}");
+    }
+    // sha512 and sha384: one written knowing its digest, one hashed again at its commit; both read and listed.
+    let (big, mid) = (b"a blob kept by its sha512".to_vec(), b"a blob kept by its sha384".to_vec());
+    let of = |alg: &str, b: &[u8]| -> String { match alg { "sha512" => format!("sha512:{}", sha2::Sha512::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>()), _ => format!("sha384:{}", sha2::Sha384::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>()) } };
+    let (d512, d384) = (of("sha512", &big), of("sha384", &mid));
+    write(&mut c, vec![msg(Commit, "r512", big.len() as i64, &d512, 0, &big)]).await.unwrap();
+    write(&mut c, vec![msg(Write, "r384", 0, "", 0, &mid), msg(Commit, "r384", mid.len() as i64, &d384, mid.len() as i64, b"")]).await.unwrap();
+    assert_eq!(read_all(&mut c, &d512, 0, 0).await.unwrap(), big);
+    assert_eq!(info(&mut c, d384.clone()).await.unwrap().into_inner().info.unwrap().size, mid.len() as i64);
+    let listed = |c: &mut capi::content_client::ContentClient<tonic::transport::Channel>, f: &str| { let (mut c, f) = (c.clone(), f.to_string()); async move {
+        let mut l = c.list(capi::ListContentRequest { filters: vec![f] }).await.unwrap().into_inner();
+        let mut out = vec![];
+        while let Some(m) = l.message().await.unwrap() { out.extend(m.info.into_iter().map(|i| i.digest)) }
+        out
+    } };
+    assert_eq!(listed(&mut c, &format!("digest=={d384}")).await, [d384.clone()]);
+    // Filters by what a blob does not have: labels when it has none, a field no blob has.
+    assert!(listed(&mut c, "labels.none==x").await.is_empty());
+    assert!(listed(&mut c, "size==1").await.is_empty());
+    // Labels set whole (no paths), by `labels`, one taken away by a path with no value, a path that is no field,
+    // and a blob that is not there.
+    let update = |c: &mut capi::content_client::ContentClient<tonic::transport::Channel>, d: &str, labels: &[(&str, &str)], paths: &[&str]| {
+        let mut c = c.clone();
+        let info = capi::Info { digest: d.to_string(), labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..Default::default() };
+        let mask = prost_types::FieldMask { paths: paths.iter().map(|p| p.to_string()).collect() };
+        async move { c.update(capi::UpdateRequest { info: Some(info), update_mask: Some(mask) }).await }
+    };
+    let set = update(&mut c, &d512, &[("a", "1"), ("b", "2"), ("gone", "")], &[]).await.unwrap().into_inner().info.unwrap();
+    assert_eq!(set.labels.len(), 2);
+    assert_eq!(update(&mut c, &d512, &[("c", "3")], &["labels"]).await.unwrap().into_inner().info.unwrap().labels.len(), 1);
+    assert!(update(&mut c, &d512, &[], &["labels.c"]).await.unwrap().into_inner().info.unwrap().labels.is_empty());
+    assert_eq!(update(&mut c, &d512, &[], &["size"]).await.unwrap_err().code(), Code::InvalidArgument);
+    assert_eq!(update(&mut c, &digest(b"none"), &[], &[]).await.unwrap_err().code(), Code::NotFound);
+    // Statuses by a filter that matches none; one asked of no ref.
+    write(&mut c, vec![msg(Write, "left", 10, "", 0, b"hello")]).await.unwrap();
+    assert!(c.list_statuses(capi::ListStatusesRequest { filters: vec!["ref==other".into()] }).await.unwrap().into_inner().statuses.is_empty());
+    assert_eq!(c.status(capi::StatusRequest { r#ref: String::new() }).await.unwrap_err().code(), Code::NotFound);
+    // Taken up again where it was left (a new session, the same ref); with another total, or a record not its own:
+    // begun anew.
+    let w = write(&mut c, vec![msg(Write, "left", 10, "", 5, b"world")]).await.unwrap();
+    assert_eq!(w.last().unwrap().offset, 10);
+    write(&mut c, vec![msg(Write, "other-total", 4, "", 0, b"ab")]).await.unwrap();
+    assert_eq!(write(&mut c, vec![msg(Write, "other-total", 9, "", 0, b"")]).await.unwrap()[0].offset, 0, "begun anew");
+    write(&mut c, vec![msg(Write, "tampered", 4, "", 0, b"ab")]).await.unwrap();
+    for e in std::fs::read_dir(s.dir.join("content/ingest")).unwrap().flatten() {
+        if std::fs::read_to_string(e.path().join("ref")).unwrap_or_default() == "tampered" { std::fs::write(e.path().join("ref"), "someone else's").unwrap() }
+    }
+    assert_eq!(write(&mut c, vec![msg(Write, "tampered", 4, "", 0, b"")]).await.unwrap()[0].offset, 0, "begun anew");
+    // A digest that is no digest: refused as the write begins; at its commit, the commit refused.
+    assert_eq!(write(&mut c, vec![msg(Commit, "odd", 3, "nonsense", 0, b"abc")]).await.unwrap_err().code(), Code::InvalidArgument);
+    assert_eq!(write(&mut c, vec![msg(Write, "odd", 3, "", 0, b"abc"), msg(Commit, "odd", 3, "nonsense", 3, b"")]).await.unwrap_err().code(), Code::FailedPrecondition);
+    // What in its folders is not a blob's: passed over when listing.
+    std::fs::create_dir_all(s.dir.join("content/blobs/md5")).unwrap();
+    let only_file = start("ff", None);
+    let mut oc = only_file.content().await;
+    std::fs::create_dir_all(only_file.dir.join("content/blobs")).unwrap();
+    std::fs::write(only_file.dir.join("content/blobs/sha256"), b"").unwrap();
+    assert!(listed(&mut oc, "digest==x").await.is_empty());
+    assert_eq!(listed(&mut c, &format!("digest=={d512}")).await, [d512]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn its_snapshots_are_containerds_overlay() {
     let s = start("snapshots", None);
@@ -236,7 +310,7 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_
     // A layer the store has (its EROFS file a stand-in: mounting it is not what is tested here), and its index
     // without links.
     let (stored, erofs) = (digest(b"a stored layer's blob"), vec![7u8; 300_000]);
-    let (p, at) = plane([(format!("{stored}.erofs"), erofs.clone())].into_iter().collect());
+    let (p, at) = plane([(format!("{stored}.erofs"), erofs.clone()), (format!("{stored}.blob"), b"a stored layer's blob".to_vec())].into_iter().collect());
     let index = serde_json::json!({ "layers": { &stored: { "size": 21, "erofs": { "size": erofs.len() }, "blob": {} } }, "refresh": { "url": format!("{at}/links"), "token": "" } });
     let s = start("store", Some(&index));
     let mut snap = s.snapshots().await;
@@ -246,7 +320,14 @@ async fn layers_from_the_store_are_fetched_when_used_and_pulled_ones_kept_after_
     let served = snap.prepare(layer("moby/1/extract-1", &stored, &stored)).await;
     assert!(p.lock().unwrap().asked.iter().any(|a| a == "POST /links") && p.lock().unwrap().asked.iter().any(|a| a.starts_with(&format!("GET /files/{stored}.erofs"))), "{:?}", p.lock().unwrap().asked);
     match served {
-        Err(e) => assert_eq!(e.code(), Code::AlreadyExists, "served: containerd told it exists"),
+        Err(e) => {
+            assert_eq!(e.code(), Code::AlreadyExists, "served: containerd told it exists");
+            // Its blob read through the content store (as `docker save` reads it): its size from the index, its bytes
+            // fetched whole from the store and kept.
+            let mut c = s.content().await;
+            assert_eq!(c.info(capi::InfoRequest { digest: stored.clone() }).await.unwrap().into_inner().info.unwrap().size, 21);
+            assert_eq!(read_all(&mut c, &stored, 0, 0).await.unwrap(), b"a stored layer's blob");
+        }
         Ok(m) => { assert_eq!(m.into_inner().mounts[0].r#type, "bind"); assert!(s.log().contains(&format!("{stored} pulled as usual")), "{}", s.log()) }
     }
     assert!(s.log().contains(&format!("{stored}'s file (0.3 MB) fetched in")), "{}", s.log());

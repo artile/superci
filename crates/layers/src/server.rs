@@ -46,7 +46,7 @@ impl sapi::snapshots_server::Snapshots for Snapshots {
     async fn prepare(&self, r: Request<sapi::PrepareSnapshotRequest>) -> std::result::Result<Response<sapi::PrepareSnapshotResponse>, Status> {
         let r = r.into_inner();
         let l = self.layers.clone();
-        let mounts = l.prepare(r.key, r.parent, sorted(r.labels)).await.map_err(Status::from).and_then(crate::faults::pass)?;
+        let mounts = l.prepare(r.key, r.parent, sorted(r.labels)).await.and_then(crate::faults::pass).map_err(Status::from)?;
         Ok(Response::new(sapi::PrepareSnapshotResponse { mounts: mounts_proto(mounts) }))
     }
 
@@ -202,7 +202,7 @@ impl capi::content_server::Content for Content {
         let l = self.layers.clone();
         let size = blocking({ let (l, d) = (l.clone(), d.clone()); move || l.content_info(&d) }).await.and_then(crate::faults::pass)?.size;
         // (A blob SuperCI's store has but this machine does not yet: fetched whole first.)
-        let (file, _) = l.clone().open_blob(d.clone()).await.map_err(Status::from).and_then(crate::faults::pass)?;
+        let (file, _) = l.clone().open_blob(d.clone()).await.and_then(crate::faults::pass).map_err(Status::from)?;
         let mut offset = r.offset.max(0);
         if offset > size { return Err(Status::out_of_range(format!("read past object length {size} bytes"))) }
         let mut want = r.size;
@@ -288,7 +288,7 @@ fn write_session(l: &Layers, mut stream: tonic::Streaming<capi::WriteContentRequ
     let first = if expected.is_empty() { None } else {
         Some(Digest::parse(&expected).map_err(|e| Status::from(Error::InvalidArgument(format!("calculating expected blob path for writer: cannot calculate blob path from invalid digest: {e}")))).and_then(crate::faults::pass)?)
     };
-    let mut wr = store.writer(&reference, total, first.as_ref()).map_err(Status::from).and_then(crate::faults::pass)?;
+    let mut wr = store.writer(&reference, total, first.as_ref()).and_then(crate::faults::pass).map_err(Status::from)?;
     loop {
         msg.action = req.action;
         let ws = wr.status();
@@ -316,17 +316,17 @@ fn write_session(l: &Layers, mut stream: tonic::Streaming<capi::WriteContentRequ
                     return Err(Status::out_of_range(format!("write @{} must occur at current offset {}", req.offset, ws.offset)));
                 }
                 if req.offset == 0 && ws.offset > 0 {
-                    wr.truncate(0).map_err(|e| Status::unknown(format!("truncate failed: {e}"))).and_then(crate::faults::pass)?;
+                    wr.truncate().and_then(crate::faults::pass).map_err(|e| Status::unknown(format!("truncate failed: {e}")))?;
                     msg.offset = 0;
                 }
                 if !req.data.is_empty() {
-                    let n = wr.write(&req.data).map_err(Status::from).and_then(crate::faults::pass)?;
+                    let n = wr.write(&req.data).and_then(crate::faults::pass).map_err(Status::from)?;
                     if n != req.data.len() { return Err(Status::data_loss(format!("wrote {n} of {} bytes", req.data.len()))) }
                     msg.offset += n as i64;
                 }
                 if action == capi::WriteAction::Commit {
                     let labels = (!req.labels.is_empty()).then(|| sorted(std::mem::take(&mut req.labels)));
-                    wr.commit_str(total, &expected, labels.as_ref()).map_err(Status::from).and_then(crate::faults::pass)?;
+                    wr.commit_str(total, &expected, labels.as_ref()).and_then(crate::faults::pass).map_err(Status::from)?;
                 }
                 msg.digest = wr.digest().to_string();
             }

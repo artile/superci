@@ -256,7 +256,7 @@ fn fetch_index(url: &str) -> Result<usize, String> {
 fn keep(path: &str) -> Result<(), String> {
     let kept = format!("{path}{KEPT}");
     if Path::new(&kept).exists() || Path::new(&format!("{kept}-none")).exists() { return Ok(()) }
-    match std::fs::copy(path, &kept) {
+    match crate::faults::check(std::fs::copy(path, &kept)) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::write(format!("{kept}-none"), b"").map_err(|e| e.to_string()),
         Err(e) => Err(format!("{path}: {e}")),
