@@ -6310,6 +6310,68 @@ fn a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_
     assert_eq!(call(good, "tool-finish", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "pieces": [["p00000", 5], [1, 2]] })).0, 200);
 }
 
+/// What a runner sends for a run's job, as a real one sent it (`fixtures/runner`): up to `upto` of its requests (all:
+/// it takes the job and ends it), its ending said as `result`, or cut short.
+fn runner_says(plane: &ControlPlane, token: &str, upto: usize, result: &str) {
+    for line in include_str!("fixtures/runner/runner-requests.jsonl").lines().take(upto) {
+        let r: serde_json::Value = serde_json::from_str(line).unwrap();
+        let path = r["path"].as_str().unwrap().trim_start_matches("/runner/server");
+        let mut req = Request::new(r["method"].as_str().unwrap(), &format!("{PLANE_URL}/runner/{token}{path}"));
+        req.body = r["request"].as_str().unwrap().replace("\"result\":\"succeeded\"", &format!("\"result\":\"{result}\"")).into_bytes();
+        if result == "cut" && path.contains("/FinishJob/") { req.body = br#"{"requestId":4,"result":"failed","outp"#.to_vec() }
+        block_on(plane.handle(req));
+    }
+}
+
+#[test]
+fn a_runs_jobs_end_as_their_runners_say_or_when_they_run_out_of_time_or_are_cancelled() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let clock = MovingClock(std::cell::Cell::new(t));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    let new_run = |workflow: &str| -> (String, String) {
+        let r = block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": workflow, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string()))));
+        let id = json(&r)["run_id"].as_str().unwrap().to_string();
+        let token = serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("run:{id}")]).unwrap()["jobs"][0]["token"].as_str().unwrap().to_string();
+        (id, token)
+    };
+    let result = |id: &str| serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("run:{id}")]).unwrap()["jobs"][0]["result"].as_str().unwrap_or_default().to_string();
+    let one = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n";
+    // Skipped, failed, cancelled, as its runner says; failed, said in a body cut short.
+    for (said, want) in [("skipped", "skipped"), ("failed", "failure"), ("canceled", "cancelled"), ("cut", "failure")] {
+        let (id, token) = new_run(one);
+        runner_says(&plane, &token, usize::MAX, said);
+        assert_eq!(result(&id), want, "{said}");
+    }
+    // Past its timeout-minutes: its machine ended, and it fails.
+    let (id, token) = new_run("jobs:\n  a:\n    runs-on: superci\n    timeout-minutes: 1\n    steps:\n      - run: echo\n");
+    runner_says(&plane, &token, 8, "succeeded");
+    clock.0.set(clock.0.get() + 2 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(result(&id), "failure");
+    // Cancelled while its runner has it, and the runner never stops: its machine ended after the grace time.
+    let (id, token) = new_run(one);
+    runner_says(&plane, &token, 8, "succeeded");
+    assert_eq!(json(&block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}/runs/{id}/cancel"))))))["cancelled"], true);
+    // (Its runner, asking for its next message, is told to stop.)
+    let told = block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/_apis/v1/Message/p?sessionId=s"))));
+    assert!(told.body_text().contains("JobCancellation"), "{}", told.body_text());
+    clock.0.set(clock.0.get() + 10 * 60_000);
+    block_on(plane.alarm()).unwrap();
+    assert_eq!(result(&id), "cancelled");
+    // A run whose record is damaged as its job ends: said where the run's errors are kept.
+    let (id, token) = new_run(one);
+    runner_says(&plane, &token, 8, "succeeded");
+    store.0.borrow_mut().insert(format!("run:{id}"), "not a run".into());
+    runner_says(&plane, &token, usize::MAX, "succeeded");
+    assert!(store.0.borrow().contains_key(&format!("run-error:{id}")));
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6461,7 +6523,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after_a_day,
         gitlab_events_for_a_control_plane_that_moved_or_claimed_by_another_request_are_left_alone,
         installations_runners_and_machines_with_nothing_or_nobody_left_are_said_as_that,
-        a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_is_there
+        a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_is_there,
+        a_runs_jobs_end_as_their_runners_say_or_when_they_run_out_of_time_or_are_cancelled
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
