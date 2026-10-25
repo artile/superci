@@ -10094,4 +10094,20 @@ mod rest_tests {
         d.keyed.insert("p0".into());
         assert!(d.current().unwrap().is_some_and(|v| !v.online));
     }
+
+    #[test]
+    fn a_rule_replaces_the_one_for_its_repository_and_a_place_not_in_the_order_is_none_to_take_out() {
+        let mut d = modal_answering(serde_json::json!({ "routing": { "rules": [{ "repo": "acme/web", "cloud": "aws" }], "order": [{ "cloud": "aws" }] } }));
+        assert_eq!(send(&mut d, "/routing", &[("action", "add"), ("repo", "acme/web"), ("cloud", "modal")]).err().as_deref(), Some("Sign in with Modal first."));
+        let r = send(&mut d, "/routing", &[("action", "take_out"), ("cloud", "modal"), ("current", "aws")]).unwrap();
+        assert!(r.status == 400 && words_of(&r).contains("Unknown provider"));
+        // A run whose jobs are over, said by no conclusion: done.
+        d.run_shown = ("acme/web".into(), "7".into(), String::new());
+        let v = seen_as(aws_plane("p0", NOWHERE), serde_json::json!({ "jobs": [{ "job_id": 1, "run_id": 7, "repo": "acme/web", "state": "done", "at_ms": now_ms(), "name": "test" }] }));
+        assert!(d.run_page(Some(&v)).contains("Done"));
+        // Renaming with no workspace named, none opened first: which one is asked.
+        let hub = hub_at(Some(Folder::new("hub-none").0.clone()), None);
+        let (status, said) = ask(&hub, "/workspaces/rename", "id=acme");
+        assert!(status == 409 && said.contains("Which workspace?"), "{status} {said}");
+    }
 }

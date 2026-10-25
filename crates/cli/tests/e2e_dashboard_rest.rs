@@ -37,7 +37,7 @@ fn sent(link: &str, path: &str, fields: &[(&str, &str)]) -> (u16, String) {
 /// Every change that needs AWS's sign-in, while AWS does not renew it: each says so, and none goes on without it.
 #[test]
 fn every_change_that_needs_aws_says_so_while_aws_does_not_renew_its_sign_in() {
-    let served = serve(|_| {});
+    let served = serve(move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(own_role())));
     served.connect_github();
     let home = common::signed_in(&served);
     beside(&home, serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": "http://127.0.0.1:9", "plane_id": "otherplane01", "label": "superci" } }]));
@@ -327,7 +327,8 @@ fn a_picture_github_does_not_give_is_left_out() {
     }
 }
 
-/// `superci dashboard` opens its page in the browser; asked for a port that is Cloudflare's own and taken, it says so.
+/// `superci dashboard` opens its page in the browser, and so does a task; asked for a port that is Cloudflare's own
+/// and taken, it says so.
 #[test]
 fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
     let served = serve(|_| {});
@@ -347,6 +348,15 @@ fn the_dashboard_opens_in_the_browser_and_a_port_asked_for_and_taken_is_said() {
     let _ = c.kill();
     let _ = c.wait();
     assert!(said.contains("It is opening in your browser"), "{said}");
+    // A task (connecting GitHub) opens its page too.
+    let mut c = common::command(&home).args(["connections", "create", "github", "acme", "--workspace=default"]).env("SUPERCI_PORT", { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() }.to_string()).env("PATH", &bin).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
+    let mut said = String::new();
+    while !said.contains("Create the GitHub App") { let mut l = String::new(); if std::io::BufRead::read_line(&mut out, &mut l).unwrap_or(0) == 0 { break } said.push_str(&l) }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = c.kill();
+    let _ = c.wait();
+    assert!(said.contains("Create the GitHub App"), "{said}");
     let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = taken.local_addr().unwrap().port().to_string();
     let o = common::command(&home).args(["dashboard", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", &port).env("SUPERCI_OAUTH_PORT", &port).output().unwrap();
@@ -636,8 +646,9 @@ fn an_update_that_cannot_make_the_machines_network_says_so() {
     let served = serve(move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(creds.clone())));
     let home = common::signed_in(&served);
     served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
-    served.aws.fail("CreateVpc", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
-    served.aws.fail("DescribeVpcs", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None);
+    // (Once its new code is up: what makes the network fails from then on.)
+    let aws = served.aws.clone();
+    served.aws.during(&format!("functions/superci-plane-{}/code", superci_testkit::PLANE), move || aws.fail("DescribeVpcs", 500, &superci_testkit::ec2_error("InternalError", "An internal error has occurred"), None));
     let (ok, said) = common::superci_in_time(&home, &["planes", "update"], &[("SUPERCI_PAUSE_MS", "1")], 120);
     assert!(!ok && said.contains("internal error"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
@@ -665,6 +676,7 @@ fn an_accounts_copy_is_looked_at_while_the_newest_build_cannot_be_read() {
     let served = serve(|_| {});
     let home = common::aws_only(&served.aws);
     served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[("ca-central-1", "us-east-1")]);
+    served.aws.replaying(include_str!("../fixtures/aws/images/05-update-newest.jsonl"), &[("20261006080844", "20250101000000"), ("ca-central-1", "us-east-1")]);
     served.github.answer_with("GET", "runner-images-for-aws/releases", 500, &[], r#"{"message":"Server Error"}"#);
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     until("the account looked at", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("AWS account"));
@@ -706,8 +718,11 @@ fn cloudflare_runners_go_into_the_account_named_and_an_update_says_a_launcher_cl
     assert!(status >= 400, "deployed nowhere here: {status} {said}");
     let (status, said) = sent(&link, "/plane/update", &[("plane", superci_testkit::PLANE)]);
     assert!(status == 303, "{status} {said}");
-    let tried = || served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("/workers/scripts/superci-runners-testplane0001")));
+    // (Its launcher tried a second time: by the update, after the runners added above.)
+    let tried = || served.aws.asked.lock().unwrap().iter().filter(|a| a["url"].as_str().is_some_and(|u| u.ends_with("/workers/scripts/superci-runners-testplane0001/settings"))).count() >= 2;
     until("its launcher tried", tried);
+    // (Its update ends saying so, a moment after.)
+    std::thread::sleep(std::time::Duration::from_secs(1));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -725,10 +740,13 @@ fn aws_runners_for_a_control_plane_in_cloudflare_connect_or_say_what_stopped_the
         let home = common::signed_in(&served);
         as_cloudflare(&home, &served);
         kept_as(&home, |k| { k["plane"]["Cloudflare"]["url"] = plane.clone().into(); k["cloudflare"] = cloudflare_signed_in(); });
+        // (Its role and network, as AWS answered them for a control plane in Cloudflare.)
+        for region in ["us-east-1", "us-east-2", "us-west-2"] { served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &plane), ("us-east-1", region)]) }
         if let Some(name) = refused { served.aws.fail(&format!("/secrets|{name}"), 500, CF_FAILED, None) }
         let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
         let (status, said) = sent(&link, "/aws/connect", &[("region", "us-east-1")]);
-        assert!(status == 303 || status >= 400, "{callback:?} {refused:?}: {status} {said}");
+        let want = match (callback, refused) { (Some(c), _) if c.contains("true") => "", (Some(_), _) => "the control plane could not use it yet", _ => "Internal server error" };
+        assert!(if want.is_empty() { status == 303 } else { status >= 400 && said.contains(want) }, "{callback:?} {refused:?}: {status} {said}");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
@@ -747,11 +765,14 @@ fn an_update_of_a_control_plane_in_cloudflare_gives_its_aws_role_what_it_asks_fo
         k["cloudflare"] = cloudflare_signed_in();
     });
     served.aws.replaying(include_str!("../fixtures/update/05-update-cf.jsonl"), &[("http://new-plane.test", &cf.url)]);
+    // (Its role, as AWS answered for a control plane in Cloudflare.)
+    served.aws.replaying(include_str!("../fixtures/runners/08-move.jsonl"), &[("http://new-plane.test", &cf.url)]);
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     let (status, said) = sent(&link, "/plane/update", &[("plane", "cfplane00003")]);
     assert!(status == 303, "{status} {said}");
-    let given = || served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.contains("PutRolePolicy")));
+    let given = || served.aws.asked.lock().unwrap().iter().any(|a| a["status"] == 200 && a["asked"].as_str().is_some_and(|s| s.contains("PutRolePolicy")));
     until("its role given what it asks for", given);
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -781,5 +802,29 @@ fn containers_that_replace_a_launcher_from_before_say_when_cloudflare_will_not_k
     until("its key handed", || { common::part(&link, "/?p=runners&fragment=1"); served.aws.worker_settings("superci").iter().any(|(k, _)| k.starts_with("DEVICE_KEY_")) });
     let (status, said) = sent(&link, "/runners/cloudflare", &[]);
     assert!(status >= 400 && said.contains("Internal server error"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// What a control plane's AWS role lacks, read while the control plane does not give its status: with the regions it
+/// is known by. And the account looked at with credentials AWS ended early, while AWS's sign-in does not renew them:
+/// said.
+#[test]
+fn an_aws_role_and_account_are_read_while_the_control_plane_or_aws_do_not_answer_as_asked() {
+    let served = serve(move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(own_role())));
+    let plane = superci_testkit::front(&served.url, |method, target, status, body| if method == "GET" && target.starts_with("/status") { (500, br#"{"error":"busy"}"#.to_vec()) } else { (status, body) });
+    *served.aws.plane_url.lock().unwrap() = plane.clone();
+    let home = common::signed_in(&served);
+    common::kept_at(&home, &plane);
+    let (_, said) = common::superci_in_time(&home, &["planes", "allow", superci_testkit::PLANE, "--dry-run"], &[("SUPERCI_PAUSE_MS", "1")], 60);
+    assert!(said.contains(superci_testkit::PLANE) || said.contains("AWS"), "{said}");
+    // AWS saying the credentials are over before they said they would be, and its sign-in not answering.
+    kept_as(&home, |k| {
+        k["aws"]["refresh_token"] = "superci-refresh".into();
+        k["aws"]["dpop"] = serde_json::to_value(superci_core::crypto::SigningKeyStore::generate()).unwrap();
+    });
+    served.aws.fail("ec2.", 400, &superci_testkit::ec2_error("ExpiredToken", "The security token included in the request is expired"), None);
+    served.aws.fail("signin.aws.amazon.com/v1/token", 500, r#"{"error":"server_error"}"#, None);
+    let (ok, said) = common::superci_in_time(&home, &["accounts", "retrieve", "aws"], &[("SUPERCI_PAUSE_MS", "1")], 60);
+    assert!(!ok && said.contains("server_error"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
