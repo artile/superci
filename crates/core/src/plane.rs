@@ -1926,9 +1926,9 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Whether a job's runner is up at GitHub and waiting for work (online, running nothing): its machine came up.
-    async fn runner_waits(&self, j: &Job) -> bool {
-        let Some(id) = j.runner_id else { return false };
-        let Some((app, token)) = self.github_for(j).await else { return false };
+    /// (`github`: its App and a token for its repository, as asked for already.)
+    async fn runner_waits(&self, j: &Job, github: &Option<(&App, String)>) -> bool {
+        let (Some(id), Some((app, token))) = (j.runner_id, github) else { return false };
         github::runner_state(self.http, &app.api(), &token, &Self::owner_of(app), &j.repo, id).await.is_ok_and(|s| s == Some((true, false)))
     }
 
@@ -3690,7 +3690,8 @@ impl<'a> ControlPlane<'a> {
                 }
                 _ => tree_object(id, part),
             };
-            let link = aws::presign("PUT", &aws::s3_url(&bucket, &region, &object), &creds, &region, cache::LINK_SECONDS, now)?;
+            // (The bucket answered, and the object's name is one SuperCI made: a link it can always sign.)
+            let link = aws::presign("PUT", &aws::s3_url(&bucket, &region, &object), &creds, &region, cache::LINK_SECONDS, now).expect("a link to an object of SuperCI's");
             self.store.put(&format!("rtree-s3:{id}:{part:05}"), format!("{region}|{object}")).await?;
             return Ok(Response::json(&serde_json::json!({ "url": link, "later": later })))
         }
@@ -4877,7 +4878,7 @@ impl<'a> ControlPlane<'a> {
                         // handed the job out (as when its Actions are degraded), and another machine would wait the
                         // same. The machine is ended (it is paid while it waits) and the job held, with no machine,
                         // for `HELD_MS`; then one is started again. Not counted as a machine that did not start.
-                        if waits_there && j.provider.is_empty() && j.for_job.is_none() && self.runner_waits(&j).await {
+                        if waits_there && j.provider.is_empty() && j.for_job.is_none() && self.runner_waits(&j, &github).await {
                             self.stop_machine(&plane_url, &j).await;
                             j.held_until_ms = Some(now + HELD_MS);
                             self.unplace(&key, &mut j, &format!("GitHub had not handed this job to its runner {} minutes after its machine was started, though the runner was ready for it (GitHub may be slow to hand out jobs); a machine is started again in {} minutes",

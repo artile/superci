@@ -6189,6 +6189,127 @@ fn a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after
     assert!(!store.0.borrow().keys().any(|k| k.starts_with(&format!("rlog:{token}")) || k.starts_with(&format!("rtree-s3:{tree}"))), "{:?}", store.0.borrow().keys().filter(|k| k.starts_with("r")).collect::<Vec<_>>());
 }
 
+#[test]
+fn gitlab_events_for_a_control_plane_that_moved_or_claimed_by_another_request_are_left_alone() {
+    let t = 1_790_000_000_000u64;
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| match r.url.as_str() {
+        "https://moved.acme.example/gitlab/webhook" => Some(Response::new(200, "text/plain", "taken")),
+        u if u.ends_with("/retry") => Some(Response::new(500, "application/json", r#"{"message":"500 Internal Server Error"}"#)),
+        _ => None,
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    odd_plane(&mut config);
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let secret = "hook-secret-0123456789";
+    // A job another request claimed as this one asked GitLab of it: known.
+    store.meddling(|op, k, m| if op == "put_if_absent" && k == "job:gl1977" { m.insert(k.to_string(), "{}".into()); });
+    assert_eq!(block_on(plane.handle(gitlab_event(1977, "pending", secret))).body_text(), "known");
+    store.meddling(|_, _, _| {});
+    // A job whose spot machine AWS took back, failed: GitLab refuses to run it again, said, and the note of it goes.
+    store.0.borrow_mut().insert("glrunner:55".into(), serde_json::json!({ "id": 55, "job": 5, "gitlab": "" }).to_string());
+    store.0.borrow_mut().insert("job:gl5".into(), serde_json::json!({ "job_id": 5, "run_id": 2366, "repo": "acme/app", "name": "test", "state": "running", "at_ms": t - 60_000, "installation_id": 0, "cloud": "aws",
+        "seen_in_progress": true, "provider": "gitlab", "project_id": 380, "interrupted": true, "runner_id": 55 }).to_string());
+    block_on(plane.handle(gitlab_event_on(5, "failed", secret, Some(55))));
+    let five: serde_json::Value = serde_json::from_str(&store.0.borrow()["job:gl5"]).unwrap();
+    assert!(five["error"].as_str().is_some_and(|e| e.contains("not run again")), "{five}");
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with("rerun:")));
+    // A runner kept damaged: passed over by the upkeep.
+    store.0.borrow_mut().insert("glrunner:bad".into(), "not json".into());
+    block_on(plane.alarm()).unwrap();
+    assert!(store.0.borrow().contains_key("glrunner:bad"));
+    // Moved: a GitLab event that still arrives goes on.
+    store.0.borrow_mut().insert("moved_to".into(), "\"https://moved.acme.example\"".into());
+    assert_eq!(block_on(plane.handle(gitlab_event(1978, "pending", secret))).body_text(), "taken");
+}
+
+#[test]
+fn installations_runners_and_machines_with_nothing_or_nobody_left_are_said_as_that() {
+    let t = 1_790_000_000_000u64;
+    let empty = std::cell::Cell::new(false);
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| match (r.method.as_str(), r.url.as_str()) {
+        (_, u) if u.ends_with("/app/installations") && empty.get() => Some(Response::new(200, "application/json", "[]")),
+        ("DELETE", u) if u.contains("/app/installations/") => Some(Response::new(204, "application/json", "")),
+        (_, u) if u.starts_with("https://gitlab.example/api/v4/projects?") => Some(Response::new(200, "application/json", "[]")),
+        (_, "https://api.github.com/repos/acme/app/actions/jobs/8") => Some(Response::new(200, "application/json", r#"{"status":"queued"}"#)),
+        _ => None,
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    odd_plane(&mut config);
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let mut beta = app();
+    (beta.id, beta.owner) = (100, "beta".into());
+    config.more_apps = vec![beta];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    let post = |path: &str, body: &str| block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}{path}")).with_body(body.to_string()))));
+    // An organization removed: its App uninstalled where it is installed.
+    assert_eq!(json(&post("/github/uninstall", r#"{"app":100}"#))["github_installations"], 1);
+    // A job of an App this control plane no longer has: no token for its log.
+    store.0.borrow_mut().insert("job:9".into(), serde_json::json!({ "job_id": 9, "run_id": 3, "repo": "acme/app", "state": "done", "at_ms": t - 60_000, "installation_id": 42, "app_id": 12345, "cloud": "aws", "seen_in_progress": true }).to_string());
+    assert_eq!(json(&block_on(plane.handle(key(get("/job/log?id=9&link")))))["error"], "GitHub gave no token for its repository");
+    // A machine whose job GitHub still has queued, past its time: with no runner registered for it, it is not held
+    // (only a ready runner is); a GitLab machine whose job ended unseen keeps its runner (none of GitHub's to take back).
+    store.0.borrow_mut().insert("job:8".into(), serde_json::json!({ "job_id": 8, "run_id": 3, "repo": "acme/app", "state": "launched", "at_ms": t - 9 * 60_000, "launched_ms": t - 9 * 60_000, "installation_id": 42,
+        "cloud": "aws", "machine_id": "i-8", "region": "us-east-1", "seen_in_progress": false, "label": "superci" }).to_string());
+    store.0.borrow_mut().insert("job:gl10".into(), serde_json::json!({ "job_id": 10, "run_id": 3, "repo": "acme/app", "state": "launched", "at_ms": t - 30_000, "launched_ms": t - 30_000, "installation_id": 0,
+        "cloud": "aws", "machine_id": "i-10", "region": "us-east-1", "seen_in_progress": false, "provider": "gitlab", "project_id": 380, "runner_id": 77 }).to_string());
+    store.0.borrow_mut().insert("gone:gl10".into(), t.to_string());
+    block_on(plane.alarm()).unwrap();
+    assert!(job(&store, 8)["held_until_ms"].is_null(), "{}", job(&store, 8));
+    // Leaving, with the App installed nowhere.
+    empty.set(true);
+    assert_eq!(json(&post("/leave", "{}"))["github_installations"], 0);
+}
+
+#[test]
+fn a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_is_there() {
+    let t = 1_790_000_000_000u64;
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let http = with_bucket();
+    let mut config = Config::new(PLANE_ID.into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &http, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    // The control plane's own key, as a run's job's token is signed with it; a run of one job, on a machine.
+    let key = superci_core::crypto::SigningKeyStore::generate();
+    store.0.borrow_mut().insert("identity".into(), serde_json::json!({ "signing": key }).to_string());
+    store.0.borrow_mut().insert("run:41".into(), serde_json::json!({ "at_ms": t, "repository": "acme/app", "ref": "refs/heads/main", "cache": { "ns": "gh77", "default_branch": "main" }, "jobs": [{ "key": "a", "state": "started", "job_id": "9" }] }).to_string());
+    store.0.borrow_mut().insert("job:9".into(), serde_json::json!({ "job_id": 9, "run_id": 41, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 0, "cloud": "aws", "seen_in_progress": true, "provider": "local", "name": "a" }).to_string());
+    let (good, bad) = ("machine-cache-link-000000000good", "machine-cache-link-0000000000bad");
+    for (link, region) in [(good, "us-east-1"), (bad, "us east-1")] {
+        store.0.borrow_mut().insert(format!("cachem:{link}"), serde_json::json!({ "region": region, "arch": "x86_64", "until": u64::MAX / 4, "runner": "", "job": "job:9" }).to_string());
+    }
+    let token = |scp: bool| {
+        let mut claims = superci_core::cache::local_claims("gh77", "computer", "refs/heads/main", "main", "41", "9");
+        if !scp { claims.as_object_mut().unwrap().remove("scp"); }
+        (claims["iss"], claims["aud"], claims["exp"]) = (PLANE_URL.into(), "superci-cache".into(), 4_102_444_800u64.into());
+        key.jwt(&claims).unwrap()
+    };
+    let call = |link: &str, what: &str, mut body: serde_json::Value| { body["token"] = token(true).into(); let r = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/cache/{link}/{what}")).with_body(body.to_string()))); (r.status, r.body_text()) };
+    // An artifact's name GitHub would not take; one begun twice; its pieces said amiss; one of no pieces taken out.
+    assert_eq!(call(good, "artifact-begin", serde_json::json!({ "name": "a/b" })).0, 400);
+    assert_eq!(call(good, "artifact-begin", serde_json::json!({ "name": "report" })).0, 200);
+    assert_eq!(call(good, "artifact-begin", serde_json::json!({ "name": "report" })).0, 409);
+    assert!(call(good, "artifact-finish", serde_json::json!({ "name": "report", "pieces": [["p0", "x"], [1, 2], ["p1", 3]] })).1.contains(r#""size":3"#));
+    store.0.borrow_mut().insert("artifact:41:empty".into(), serde_json::json!({ "id": "e", "region": "us-east-1", "made": t, "done": true }).to_string());
+    assert_eq!(call(good, "artifact-delete", serde_json::json!({ "name": "empty" })).0, 200);
+    // Begun by a token of the control plane's that says no job: kept by none.
+    let r = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/cache/{good}/artifact-begin")).with_body(serde_json::json!({ "token": token(false), "name": "unkept" }).to_string())));
+    assert_eq!(r.status, 200);
+    // From a machine whose region makes no address: no link to write or read its pieces.
+    assert_eq!(call(bad, "artifact-begin", serde_json::json!({ "name": "far" })).0, 200);
+    assert_eq!(call(bad, "artifact-sign", serde_json::json!({ "name": "far", "names": ["p0"] })).0, 500);
+    assert_eq!(call(bad, "artifact-finish", serde_json::json!({ "name": "far", "pieces": [["p0", 1]] })).0, 200);
+    assert_eq!(call(bad, "artifact-get", serde_json::json!({ "name": "far" })).0, 500);
+    assert_eq!(block_on(plane.handle(get("/runs/41/artifacts?name=far").with_header("authorization", "Bearer dashboard-session-key-1"))).status, 500);
+    // A tool's artifact begun twice; its pieces said amiss (the job is a run's: its machine reads the run).
+    assert_eq!(call(good, "tool-begin", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 200);
+    assert_eq!(call(good, "tool-begin", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 409);
+    assert_eq!(call(good, "tool-finish", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "pieces": [["p00000", 5], [1, 2]] })).0, 200);
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6337,7 +6458,10 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         containers_and_launchers_that_cannot_start_a_machine_say_why_and_a_gpu_sandbox_is_named_with_its_gpu,
         an_aws_machines_cost_is_settled_at_its_on_demand_price_and_left_an_estimate_when_aws_cannot_be_asked,
         the_dashboards_requests_go_through_with_what_github_and_gitlab_say_and_whatever_they_refuse,
-        a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after_a_day
+        a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after_a_day,
+        gitlab_events_for_a_control_plane_that_moved_or_claimed_by_another_request_are_left_alone,
+        installations_runners_and_machines_with_nothing_or_nobody_left_are_said_as_that,
+        a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_is_there
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
