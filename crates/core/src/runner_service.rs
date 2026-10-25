@@ -302,7 +302,7 @@ fn runner_key() -> Result<rsa::RsaPrivateKey> {
 pub fn jit_config(root: &str, name: &str) -> Result<String> {
     use rsa::traits::{PrivateKeyParts, PublicKeyParts};
     let key = runner_key()?;
-    let n =|b: &rsa::BigUint| crate::crypto::b64(&b.to_bytes_be());
+    let n = |b: &rsa::BigUint| crate::crypto::b64(&b.to_bytes_be());
     let primes = key.primes();
     let (p, q) = (&primes[0], &primes[1]);
     let one = rsa::BigUint::from(1u8);
