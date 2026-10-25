@@ -87,7 +87,7 @@ fn as_cloudflare(home: &std::path::Path, served: &Served) {
 const CF_FAILED: &str = r#"{"success":false,"errors":[{"code":10000,"message":"Internal server error"}],"messages":[],"result":null}"#;
 
 /// Waits up to 15 seconds for `holds`, else fails saying `what`.
-fn until(what: &str, holds: impl Fn() -> bool) {
+fn until(what: &str, mut holds: impl FnMut() -> bool) {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while !holds() { assert!(std::time::Instant::now() < end, "waited for {what}"); std::thread::sleep(std::time::Duration::from_millis(100)) }
 }
@@ -370,4 +370,104 @@ fn a_key_is_not_made_while_the_control_plane_does_not_give_its_status() {
     let (ok, said) = common::superci_in_time(&home, &["keys", "create", "agent"], &[("SUPERCI_PAUSE_MS", "1")], 60);
     assert!(!ok && said.contains("The control plane did not answer"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Two control planes in one AWS account: the one in use with everything a move carries (a further organization's
+/// App, a further GitLab, a secret for runs, its own network, Cloudflare's image and location, a label and a name),
+/// and one standing by from a move begun before, with what the one in use no longer has (an organization's App, a
+/// GitLab, a secret). The new one at `front(new)`'s address, when one is given. A dashboard on the workspace.
+struct Moving { served: Served, new: Served, home: std::path::PathBuf, _child: common::Dashboard, link: String }
+
+impl Drop for Moving { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.home); } }
+
+fn moving(front: Option<fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>)>) -> Moving {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let mut app = superci_testkit::GitHub::app();
+    let secret = |name: &str| (superci_core::secrets::setting(name, &Default::default()), serde_json::json!({ "name": name, "value": "x", "updated_ms": 1 }).to_string());
+    let at = |id: &str, k: &str| format!("/superci/{id}/{k}");
+    app["id"] = 2002.into();
+    app["owner"] = "globex".into();
+    let mut gitlab = superci_testkit::GitLab::connection();
+    gitlab["id"] = "gnew01".into();
+    let (npm, npm_kept) = secret("NPM_TOKEN");
+    for (k, v) in [("CONTAINERS", "off".to_string()), ("GITHUB_APP_2002", app.to_string()), ("GITLAB_gnew01", gitlab.to_string()), (npm.as_str(), npm_kept), ("LABELS", r#"["big","superci"]"#.into()), ("NAME", "Acme CI".into()),
+        ("AWS_NETWORKS", r#"{"us-east-1":{"subnets":["subnet-0123456789abcdef0"],"security_groups":["sg-0123456789abcdef0"],"private":false}}"#.into()), ("CF_IMAGE", "https://images.example.com/full".into()), ("CF_LOCATION", "weur".into())] {
+        served.aws.put(&at(superci_testkit::PLANE, k), &v);
+    }
+    // The new one, standing by, with what the one in use no longer has.
+    let mut stale = superci_testkit::GitHub::app();
+    stale["id"] = 9.into();
+    let mut old_gitlab = superci_testkit::GitLab::connection();
+    old_gitlab["id"] = "gold".into();
+    let (old, old_kept) = secret("OLD_TOKEN");
+    for (k, v) in [("GITHUB_APP", superci_testkit::GitHub::app().to_string()), ("GITHUB_APP_9", stale.to_string()), ("GITLAB_gold", old_gitlab.to_string()), (old.as_str(), old_kept)] { served.aws.put(&at("testplane0002", k), &v) }
+    let aws = served.aws.clone();
+    let new = superci_testkit::serve_as("testplane0002", move |c| c.read_settings(&aws.settings("testplane0002")));
+    new.store.0.lock().unwrap().insert("standby".into(), "1".into());
+    for (k, v) in new.aws.settings("testplane0002") { served.aws.put(&at("testplane0002", &k), &v) }
+    let url = match front { Some(f) => superci_testkit::front(&new.url, f), None => new.url.clone() };
+    *new.aws.plane_url.lock().unwrap() = url.clone();
+    // (The account lists both, as AWS answered for two.)
+    served.aws.replaying(include_str!("../fixtures/aws/planes/delete.jsonl"), &[("http://new-plane.test", &url)]);
+    let home = common::signed_in(&served);
+    kept_as(&home, |k| {
+        k["planes_more"] = serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": url, "plane_id": "testplane0002", "label": "superci" } }]);
+        k["key"]["planes"] = serde_json::json!(["testplane0001", "testplane0002"]);
+    });
+    let (child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1"), ("SUPERCI_MOVE_PAUSE_MS", "1")]);
+    Moving { served, new, home, _child: child, link }
+}
+
+impl Moving {
+    /// The move started, and how it ended as its row says it (what it stopped with, or that it moved).
+    fn moved(&self) -> String {
+        let (status, to, said) = common::post(&self.link, "/plane/move?c=testplane0001", &[("plane", "testplane0002")]);
+        assert!(status == 303 && to == "/?p=planes", "{status} {to} {}", common::words(&said));
+        let mut page = String::new();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !(page.contains("Try again") || page.contains("Moved to")) {
+            assert!(std::time::Instant::now() < end, "the move not over: {page}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            page = common::words(&common::part(&self.link, "/?p=planes&fragment=1&c=testplane0001").1);
+        }
+        page
+    }
+}
+
+/// A move whose every write to the new control plane's settings can fail: each stops it there, said, and the old one
+/// stays in use (its own network, Cloudflare's image and location, its labels and name, each further App, GitLab and
+/// secret, and what the new one had from before that goes).
+#[test]
+fn a_move_stops_where_a_write_to_the_new_control_plane_fails_and_says_so() {
+    for (action, setting) in [("PutParameter", "GITHUB_APP_2002"), ("DeleteParameter", "GITHUB_APP_9"), ("PutParameter", "GITLAB_gnew01"), ("DeleteParameter", "GITLAB_gold"),
+        ("PutParameter", "SECRET_NPM_TOKEN"), ("DeleteParameter", "SECRET_OLD_TOKEN"), ("PutParameter", "AWS_NETWORKS"), ("PutParameter", "CF_IMAGE"), ("PutParameter", "LABELS"),
+        ("PutParameter", "NAME"), ("PutParameter", "CF_LOCATION")] {
+        let m = moving(None);
+        m.served.aws.fail(&format!("AmazonSSM.{action}|/superci/testplane0002/{setting}"), 500, &superci_testkit::json_error("InternalServerError", "An internal error occurred. Try again."), None);
+        let page = m.moved();
+        assert!(page.contains("An internal error occurred") && page.contains("Try again"), "{setting}: {page}");
+        assert!(m.new.store.under("standby").len() == 1, "{setting}: still standing by");
+    }
+}
+
+/// A new control plane that refuses its part of a move outright, one that never takes its move token, and one that
+/// takes GitHub over but for an organization whose App would not move: each said.
+#[test]
+fn a_move_says_a_new_control_plane_that_refuses_it_never_takes_it_or_could_not_move_an_app() {
+    let refusing: fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) = |method, target, status, body| if method == "POST" && target.starts_with("/move/import") { (400, br#"{"error":"no"}"#.to_vec()) } else { (status, body) };
+    let page = moving(Some(refusing)).moved();
+    assert!(page.contains("answered 400"), "{page}");
+    let never: fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) = |method, target, status, body| if method == "POST" && target.starts_with("/move/import") { (403, b"no move token, or one used already".to_vec()) } else { (status, body) };
+    let page = moving(Some(never)).moved();
+    assert!(page.contains("did not take its move token"), "{page}");
+    let partly: fn(&str, &str, u16, Vec<u8>) -> (u16, Vec<u8>) = |method, target, status, body| {
+        if method != "POST" || !target.starts_with("/move/claim") || status != 200 { return (status, body) }
+        let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        v["github_failed"] = serde_json::json!(["globex: Not Found"]);
+        (200, v.to_string().into_bytes())
+    };
+    let page = moving(Some(partly)).moved();
+    assert!(page.contains("GitHub would not point an App here (globex: Not Found)"), "{page}");
 }
