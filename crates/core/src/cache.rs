@@ -123,10 +123,10 @@ pub fn github_access(claims: &Value) -> Result<Access> {
 /// branch's to read.
 /// It also says its run and job in GitHub's form (`scp`), where GitHub's artifact client looks for them.
 pub fn local_claims(ns: &str, who: &str, reference: &str, default_branch: &str, run: &str, job: &str) -> Value {
-    let mut ac = vec![serde_json::json!({ "Scope": format!("refs/superci/{who}"), "Permission": 3 })];
-    for r in [reference.to_string(), format!("refs/heads/{default_branch}")] {
+    let ac = [reference.to_string(), format!("refs/heads/{default_branch}")].into_iter().fold(vec![serde_json::json!({ "Scope": format!("refs/superci/{who}"), "Permission": 3 })], |mut ac, r| {
         if !r.is_empty() && plain(&r) && !ac.iter().any(|s| s["Scope"] == r.as_str()) { ac.push(serde_json::json!({ "Scope": r, "Permission": 1 })) }
-    }
+        ac
+    });
     serde_json::json!({ "ns": ns, "ac": serde_json::Value::Array(ac).to_string(), "scp": format!("Actions.Results:{run}:{job}"), "run": run })
 }
 
@@ -272,8 +272,9 @@ async fn evict_within(store: &dyn Store, now: u64, limit: u64, unused: u64) -> R
     let mut gone = vec![];
     for (ns, mut entries) in by_ns {
         entries.sort_by_key(|(_, e)| std::cmp::Reverse(e.used.max(e.made)));
-        let mut kept = 0u64;
-        for (k, e) in entries {
+        let (mut kept, mut entries) = (0u64, entries.into_iter());
+        loop {
+            let Some((k, e)) = entries.next() else { break };
             let old = if e.done { now.saturating_sub(e.used.max(e.made)) > unused || too_old(&e, now) } else { now.saturating_sub(e.made) > UNFINISHED_MS };
             if !old && (!e.done || kept + e.size <= limit) { kept += e.size; continue }
             store.delete(&k).await?;
@@ -359,7 +360,7 @@ pub async fn artifact(store: &dyn Store, run: &str, name: &str, done: bool) -> R
 /// A run's finished artifacts, by name, the oldest first.
 pub async fn artifacts(store: &dyn Store, run: &str) -> Result<Vec<(String, Entry)>> {
     let start = artifact_index(run, "");
-    let mut all: Vec<(String, Entry)> = store.list(&start).await?.into_iter().filter_map(|(k, v)| Some((k.strip_prefix(&start)?.to_string(), serde_json::from_str::<Entry>(&v).ok()?))).filter(|(_, e)| e.done).collect();
+    let mut all: Vec<(String, Entry)> = store.list(&start).await?.into_iter().filter_map(|(k, v)| Some((k[start.len()..].to_string(), serde_json::from_str::<Entry>(&v).ok()?))).filter(|(_, e)| e.done).collect();
     all.sort_by_key(|(_, e)| e.made);
     Ok(all)
 }
@@ -412,15 +413,21 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
+    /// The store, in memory; `1`: the operation it does not answer (`get`, `swap`, …), and `2`: one it answers as
+    /// though another request had removed the key just before (`get`).
     #[derive(Default)]
-    struct Mem(RefCell<BTreeMap<String, String>>);
+    struct Mem(RefCell<BTreeMap<String, String>>, RefCell<&'static str>, RefCell<&'static str>);
+    impl Mem {
+        fn failing(&self, op: &str) -> Result<()> { if *self.1.borrow() == op { Err(format!("the store did not answer ({op})")) } else { Ok(()) } }
+    }
     #[async_trait::async_trait(?Send)]
     impl Store for Mem {
-        async fn get(&self, k: &str) -> Result<Option<String>> { Ok(self.0.borrow().get(k).cloned()) }
+        async fn get(&self, k: &str) -> Result<Option<String>> { self.failing("get")?; if *self.2.borrow() == "get" { return Ok(None) } Ok(self.0.borrow().get(k).cloned()) }
         async fn put(&self, k: &str, v: String) -> Result<()> { self.0.borrow_mut().insert(k.into(), v); Ok(()) }
         async fn put_if_absent(&self, k: &str, v: String) -> Result<bool> { if self.0.borrow().contains_key(k) { return Ok(false) } self.0.borrow_mut().insert(k.into(), v); Ok(true) }
+        async fn swap(&self, k: &str, was: Option<&str>, v: String) -> Result<bool> { self.failing("swap")?; crate::io::swap_in_two_steps(self, k, was, v).await }
         async fn delete(&self, k: &str) -> Result<()> { self.0.borrow_mut().remove(k); Ok(()) }
-        async fn list(&self, p: &str) -> Result<Vec<(String, String)>> { Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
+        async fn list(&self, p: &str) -> Result<Vec<(String, String)>> { self.failing("list")?; Ok(self.0.borrow().iter().filter(|(k, _)| k.starts_with(p)).map(|(k, v)| (k.clone(), v.clone())).collect()) }
     }
     fn run<T>(f: impl std::future::Future<Output = T>) -> T { futures::executor::block_on(f) }
     const V: &str = "0123abcd";
@@ -574,5 +581,48 @@ mod tests {
         assert_eq!(local_access(&local_claims("gh77", "computer", "refs/heads/main", "main", "1", "1")).unwrap().scopes.len(), 2);
         assert!(local_access(&serde_json::json!({ "ns": "x/y", "ac": "[]" })).is_err());
         assert!(local_ns("acme/app").starts_with("local-"));
+    }
+
+    #[test]
+    fn a_token_whose_scopes_cannot_be_read_gives_no_access_and_what_is_kept_damaged_is_passed_over() {
+        // Scopes that are no list, one without its name or permission (passed over), a repository given as a number.
+        assert!(github_access(&serde_json::json!({ "repository_id": "77", "ac": "not a list" })).unwrap_err().starts_with("the token's cache scopes"));
+        assert!(local_access(&serde_json::json!({ "ns": "gh77", "ac": "not a list" })).is_err());
+        let some = github_access(&serde_json::json!({ "repository_id": 77, "ac": r#"[{"Permission":3},{"Scope":"refs/heads/a"},{"Scope":"refs/heads/main","Permission":1}]"# })).unwrap();
+        assert_eq!((some.ns.as_str(), some.scopes.len()), ("gh77", 1));
+        // A key that is none, and a job that may only read: nothing being saved.
+        let store = Mem::default();
+        assert!(run(begun(&store, &main_branch(), "a,b", V)).is_err());
+        assert!(run(begun(&store, &some, "deps", V)).unwrap().is_none());
+        // Entries kept damaged, and an index key without its parts: passed over where they are read.
+        save(&store, &main_branch(), "deps-1", 1);
+        store.0.borrow_mut().insert("cache:gh77:refs/heads/main:0123abcd:deps-2".into(), "damaged".into());
+        store.0.borrow_mut().insert("cache:gh77:short".into(), crate::io::json(&Entry { id: "x".into(), region: "us-east-1".into(), done: true, ..Default::default() }));
+        assert_eq!(run(lookup(&store, &main_branch(), "deps-9", &["deps-".into()], V, 2)).unwrap().unwrap().key, "deps-1");
+        assert_eq!(run(list(&store, Some("gh77"))).unwrap().len(), 1);
+        assert_eq!(run(evict_within(&store, 3, 100, 7 * 86_400_000)).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_store_that_does_not_answer_midway_is_said_and_nothing_is_begun_twice() {
+        let store = Mem::default();
+        let (at, e) = run(begin(&store, &main_branch(), "k", V, "us-east-1", 100)).unwrap();
+        // Begun again over one left unfinished: the store not answering as it is read, or as it is written over.
+        let later = 100 + TAKEOVER_MS + 1;
+        for op in ["get", "swap"] {
+            *store.1.borrow_mut() = op;
+            assert!(matches!(run(begin(&store, &main_branch(), "k", V, "us-east-1", later)), Err(Refused::Bad(_))), "{op}");
+        }
+        *store.1.borrow_mut() = "list";
+        assert!(run(kept(&store, "gh77")).is_err());
+        *store.1.borrow_mut() = "";
+        run(finish(&store, &at, &e, vec![("p0".into(), 1)])).unwrap();
+        // An artifact of a name taken: gone as it is read (another request removed it), or the store not answering.
+        run(begin_artifact(&store, "41", "report", "us-east-1", Some(("1".into(), "tests".into())), 5)).unwrap();
+        *store.2.borrow_mut() = "get";
+        assert_eq!(run(begin_artifact(&store, "41", "report", "us-east-1", None, 6)).unwrap_err(), Refused::Exists);
+        *store.2.borrow_mut() = "";
+        *store.1.borrow_mut() = "swap";
+        assert!(matches!(run(begin_artifact(&store, "41", "report", "us-east-1", Some(("2".into(), "tests".into())), 7)), Err(Refused::Bad(_))));
     }
 }
