@@ -14,8 +14,7 @@ fn kept_as(home: &std::path::Path, change: impl Fn(&mut serde_json::Value)) {
     std::fs::write(&file, k.to_string()).unwrap();
 }
 
-/// Another control plane in the workspace beside the one in use: in the same AWS account, set up and never used (it
-/// answers nowhere).
+/// Other control planes kept in the workspace beside the one in use (listed at once, before any cloud is asked).
 fn beside(home: &std::path::Path, planes: serde_json::Value) { kept_as(home, |k| k["planes_more"] = planes.clone()) }
 
 /// The workspace's AWS sign-in with its credentials over, and AWS's sign-in failing as it renews them (not ending
@@ -44,7 +43,7 @@ fn every_change_that_needs_aws_says_so_while_aws_does_not_renew_its_sign_in() {
     beside(&home, serde_json::json!([{ "Aws": { "account_id": "111111111111", "region": "us-east-1", "url": "http://127.0.0.1:9", "plane_id": "otherplane01", "label": "superci" } }]));
     aws_renewal_fails(&served, &home);
     // (Signed in to Cloudflare too: the control plane's launcher there comes along with a move.)
-    kept_as(&home, |k| k["cloudflare"] = serde_json::json!({ "access": "cloudflare-access-for-tests", "expires_at_ms": 4102444800000u64, "refresh": "cloudflare-refresh-for-tests" }));
+    kept_as(&home, |k| k["cloudflare"] = cloudflare_signed_in());
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_VIEWS_S", "0"), ("SUPERCI_PAUSE_MS", "1")]);
     let networks = "us-east-1 subnet-0123456789abcdef0 sg-0123456789abcdef0";
     for (path, fields) in [
