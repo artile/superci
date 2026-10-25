@@ -5925,6 +5925,8 @@ fn the_layer_store_passes_over_what_is_kept_damaged_and_says_what_a_machine_asks
     let index = block_on(plane.handle(get(&format!("/cache/{good}/layers.json"))));
     assert!(index.status == 200 && index.body_text().contains(&digest('a')) && !index.body_text().contains(&digest('b')), "{}", index.body_text());
     assert_eq!(call(good, "layers-links", serde_json::json!({})).0, 200);
+    store.0.borrow_mut().insert(format!("layer:us-east-1:{}", digest('0')), layer(t, t));
+    assert!(call(good, "layers-links", serde_json::json!({ "digests": [digest('0')] })).1.contains(&digest('0')));
     // Proposed: nothing; what is on its way already; from a machine whose region makes no address, what the store lacks.
     assert_eq!(call(good, "layers-propose", serde_json::json!({ "layers": [] })).0, 200);
     let (_, said) = call(good, "layers-propose", serde_json::json!({ "layers": [{ "digest": digest('c'), "size": 10 }, { "digest": digest('d'), "size": 10 }] }));
@@ -6376,7 +6378,7 @@ fn a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_
     assert_eq!(call(good, "tool-finish", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef", "pieces": [["p00000", 5], [1, 2], ["p00001", "x"]] })).0, 200);
     // The dashboard takes the repository's entries out (their pieces from the bucket too); a month on, what is left goes.
     assert_eq!(block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/caches/delete")).with_header("authorization", "Bearer dashboard-session-key-1").with_body(r#"{"repo":"gh77"}"#))).status, 200);
-    store.0.borrow_mut().insert("cache:gh77:refs/heads/main:v:left".into(), serde_json::json!({ "id": "l", "region": "us-east-1", "made": t, "done": false }).to_string());
+    store.0.borrow_mut().insert("cache:gh77:refs/heads/main:v:left".into(), serde_json::json!({ "id": "l", "region": "us-east-1", "made": 0, "done": false }).to_string());
     store.0.borrow_mut().insert("cache:gh77:refs/heads/main:v:old".into(), serde_json::json!({ "id": "o", "region": "us-east-1", "made": 0, "used": 0, "done": true, "pieces": [["p0", 1]] }).to_string());
     block_on(plane.alarm()).unwrap();
     assert!(!store.0.borrow().contains_key("cache:gh77:refs/heads/main:v:old"));
@@ -6454,6 +6456,7 @@ fn a_role_aws_will_not_let_this_control_plane_take_leaves_what_needs_it_undone_o
     let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
     let mut config = Config::new(PLANE_ID.into());
     config.app = Some(app());
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
     let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
     store.0.borrow_mut().insert("aws".into(), serde_json::json!({ "account_id": "123456789012", "region": "us-east-1", "role_arn": role_arn("123456789012", PLANE_ID), "connected": true }).to_string());
     // A machine that ran a job: its cost left as estimated, and what it sent not counted.
@@ -6468,6 +6471,29 @@ fn a_role_aws_will_not_let_this_control_plane_take_leaves_what_needs_it_undone_o
     assert!(job(&store, 2)["sent_gb"].is_null());
     // A launch template left for after an answer: not removed, said.
     assert!(block_on(plane.later(&format!("{PLANE_URL}/webhook"), "template us-east-1 superci-abc123def456-7-1")).is_err());
+    // A run's job's log and pages in the bucket, its working tree there, its artifact: none of it read or linked.
+    {
+        let mut m = store.0.borrow_mut();
+        m.insert("run:41".into(), serde_json::json!({ "at_ms": t, "jobs": [{ "key": "a", "state": "started", "job_id": "9", "token": "tok-0123456789abcdef" }] }).to_string());
+        m.insert("job:9".into(), serde_json::json!({ "job_id": 9, "run_id": 41, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 0, "cloud": "aws", "seen_in_progress": true, "provider": "local", "local": "tok-0123456789abcdef" }).to_string());
+        m.insert("rjob:tok-0123456789abcdef".into(), serde_json::json!({ "message": {}, "job_id": 9, "at_ms": t, "tree": "tree-0123456789abcdef", "steps": [{ "type": "Task", "id": "s1", "order": 1, "log": 1, "state": "completed" }] }).to_string());
+        m.insert("rlog:tok-0123456789abcdef:0001:0000".into(), "s3:us-east-1".into());
+        m.insert("rtree-s3:tree-0123456789abcdef:00000".into(), "us-east-1|runs/x/00000".into());
+        m.insert("glive:7:tl_a_1.log:0000000000000".into(), "s3:us-east-1:5".into());
+        m.insert("job:7".into(), serde_json::json!({ "job_id": 7, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+        m.insert("artifact:41:out".into(), serde_json::json!({ "id": "e", "region": "us-east-1", "made": t, "done": true, "pieces": [["p0", 1]] }).to_string());
+        m.insert("cachem:machine-cache-link-000000000good".into(), serde_json::json!({ "region": "us-east-1", "arch": "x86_64", "until": u64::MAX / 4, "runner": "", "job": "job:9" }).to_string());
+        m.insert("cache:gh77:refs/heads/main:v:k".into(), serde_json::json!({ "id": "c", "region": "us-east-1", "made": t, "done": true, "pieces": [["p0", 1]] }).to_string());
+    }
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    for path in ["/runs/41/log?job=0&log=1", "/job/log?id=9&link", "/runs/41/artifacts?name=out"] {
+        assert_eq!(block_on(plane.handle(key(get(path)))).status, 500, "{path}");
+    }
+    // (A GitHub job's pages its machine sent: left out of its log, which is read from GitHub.)
+    assert_eq!(block_on(plane.handle(key(get("/job/log?id=7")))).status, 200);
+    assert_eq!(block_on(plane.handle(get("/runner/tok-0123456789abcdef/superci/tree?part=0"))).status, 500);
+    for path in ["/cache/machine-cache-link-000000000good/program", "/cache/machine-cache-link-000000000good/layers.json"] { assert_eq!(block_on(plane.handle(get(path))).status, 500, "{path}") }
+    assert_eq!(block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}/caches/delete")).with_body(r#"{"repo":"gh77"}"#)))).status, 500);
     // A job nothing here can run: its failing runner not started in AWS either.
     block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci/os=macos")));
     assert_eq!(job(&store, 3)["state"], "failed");

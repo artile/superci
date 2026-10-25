@@ -518,6 +518,9 @@ mod tests {
         let app = |pem: String| App { id: 1, slug: "a".into(), pem, webhook_secret: "s".into(), owner: "acme".into(), owner_is_org: true, host: None };
         // An App whose key is none signs nothing; an answer that is no JSON; a token that is not in it.
         assert!(run(installations(&Answers(|_| answer(200, serde_json::json!([]))), &app("not a key".into()), 1_790_000_000_000)).is_err());
+        assert!(run(deliveries(&Answers(|_| answer(200, serde_json::json!([]))), &app("not a key".into()), Some(6), 1_790_000_000_000)).is_err());
+        assert!(run(deliveries(&Answers(|_| answer(200, serde_json::json!([]))), &app("not a key".into()), None, 1_790_000_000_000)).is_err());
+        assert_eq!(run(run_status(&Answers(|_| answer(200, serde_json::json!({}))), API, "t", "acme/app", 3)).unwrap_err(), "no run status");
         let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap().to_pkcs1_pem(rsa::pkcs1::LineEnding::LF).unwrap().to_string();
         let real = app(key);
         assert!(run(installations(&Answers(|_| Ok(crate::io::Response::new(200, "application/json", "not json"))), &real, 1_790_000_000_000)).unwrap_err().starts_with("GitHub /app/installations: "));

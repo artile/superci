@@ -3195,7 +3195,8 @@ impl<'a> ControlPlane<'a> {
                     }.await,
                     Runner::Launcher(a) => async {
                         job.cpu = Some(size.cpu);
-                        job.usd_per_hour = match a.cloud.as_str() { "cloudflare" => Some(cloudflare_usd_per_hour(size)), "modal" => Some(modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu)), _ => None };
+                        // (Priced as its capacity is had: Cloudflare's, else Modal's, see `capacity_of`.)
+                        job.usd_per_hour = Some(if a.cloud == "cloudflare" { cloudflare_usd_per_hour(size) } else { modal_usd_per_hour(size.cpu, size.ram_gb) + modal_gpu_usd_per_hour(size.gpu) });
                         if a.cloud == "cloudflare" { job.waiting_usd_per_hour = Some(cloudflare_waiting_usd_per_hour(size)) }
                         let mut body = serde_json::json!({ "name": name, "job": job.job_id, "repo": job.repo, "max_minutes": self.machine_minutes(&a.cloud), "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb, "location": self.config.cloudflare_location });
                         if a.cloud == "cloudflare" { if let Some(i) = &self.config.cloudflare_image { body["image_url"] = i.clone().into() } }
@@ -4196,7 +4197,8 @@ impl<'a> ControlPlane<'a> {
             for (n, i) in start.iter().enumerate() {
                 if let Err(e) = self.start_instance(plane_url, run_id, &run, &jobs[*i], &secrets, &wf, &called).await {
                     // (It, and those reserved with it not started yet: each pending again, for the next move on.)
-                    for j in &start[n..] { self.unreserve(&key, &jobs[*j]).await }
+                    self.unreserve(&key, &jobs[*i]).await;
+                    for j in &start[n + 1..] { self.unreserve(&key, &jobs[*j]).await }
                     return Err(e)
                 }
             }

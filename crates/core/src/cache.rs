@@ -604,7 +604,7 @@ mod tests {
         // (Of a restore key's entries, one unfinished and one too old are no hit either.)
         let (_, _) = run(begin(&store, &main_branch(), "deps-3", V, "us-east-1", 5)).unwrap();
         save(&store, &main_branch(), "deps-0", 0);
-        assert_eq!(run(lookup(&store, &main_branch(), "deps-9", &["deps-".into()], V, MAX_AGE_DAYS as u64 * 86_400_000)).unwrap().unwrap().key, "deps-1");
+        assert_eq!(run(lookup(&store, &main_branch(), "deps-9", &["deps-".into()], V, MAX_AGE_DAYS as u64 * 86_400_000 + 1)).unwrap().unwrap().key, "deps-1");
         for k in ["cache:gh77:s", "cache:gh77:s:v"] { store.0.borrow_mut().insert(k.into(), crate::io::json(&Entry { id: "x".into(), region: "us-east-1".into(), done: true, ..Default::default() })); }
         store.0.borrow_mut().insert("cache:gh77".into(), crate::io::json(&Entry { id: "x".into(), region: "us-east-1".into(), done: true, ..Default::default() }));
         assert_eq!(run(list(&store, None)).unwrap().len(), 2, "deps-1 and deps-0, the rest without all their parts");
