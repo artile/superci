@@ -684,6 +684,19 @@ fn an_accounts_copy_is_looked_at_while_the_newest_build_cannot_be_read() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The image copied into a region, AWS refusing the copy: what AWS said, with the region it was asked for in.
+#[test]
+fn an_image_copy_aws_refuses_is_said_with_its_region() {
+    let served = serve(|_| {});
+    let home = common::aws_only(&served.aws);
+    served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[]);
+    served.aws.fail("CopyImage", 400, &superci_testkit::ec2_error("InvalidAMIID.NotFound", "The image id '[ami-0123456789abcdef0]' does not exist"), None);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/aws/image", &[("region", "ca-central-1")]);
+    assert!(status >= 400 && said.contains("ca-central-1") && said.contains("does not exist"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A name checked against the other CIs in the account: a control plane there that is not a Lambda function (one
 /// elsewhere, whose machines start there) has no name to clash with.
 #[test]

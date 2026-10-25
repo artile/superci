@@ -15184,41 +15184,46 @@ mod dashboard_suite_in_browser {
     }
 
     /// `superci login modal`: Modal's page (its token flow made), then waited on until approved there (as a real one went:
-    /// a while of "not yet", then the token): kept, with the workspace's name, and the command ends by itself.
+    /// a while of "not yet", then the token): kept, with the workspace's name, and the command ends by itself; also when
+    /// the tab, left on Modal's page, never comes back to ask.
     #[test]
     fn a_modal_sign_in_waits_for_its_approval_and_keeps_the_token_as_modal_answered_a_real_one() {
         use std::io::BufRead;
-        let served = serve(|_| {});
-        served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
-        let home = home(&served);
-        std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
-        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
-        let mut child = common::command(&home).args(["login", "modal", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
-            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
-        let out = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { let _ = tx.send(l); });
-        let link = loop { let l = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("its link"); if let Some(w) = l.split_whitespace().find(|w| w.starts_with("http://localhost")) { break w.to_string() } };
-        // The browser opens the sign-in: to Modal's page, its flow made.
-        let (_, _, page) = common::get(&link, "/connect/modal");
-        assert!(page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{}", words(&page));
-        // The tab, open meanwhile, asks Modal itself as its page is read, until the sign-in is approved there.
-        let asked = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut tab = String::new();
-        while std::time::Instant::now() < asked && !tab.contains("Signed in with Modal") && !matches!(child.try_wait(), Ok(Some(_))) {
-            tab = common::get(&link, "/").2;
+        for tab_open in [true, false] {
+            let served = serve(|_| {});
+            served.aws.replaying(include_str!("../fixtures/modal/sign-in/token-flow.jsonl"), &[]);
+            let home = home(&served);
+            std::fs::write(home.join("aws-at"), &served.aws.url).unwrap();
+            let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+            let mut child = common::command(&home).args(["login", "modal", "--no-browser", "--workspace=default"]).env("SUPERCI_PORT", port.to_string())
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+            let out = child.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || for l in std::io::BufReader::new(out).lines().map_while(Result::ok) { let _ = tx.send(l); });
+            let link = loop { let l = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("its link"); if let Some(w) = l.split_whitespace().find(|w| w.starts_with("http://localhost")) { break w.to_string() } };
+            // The browser opens the sign-in: to Modal's page, its flow made.
+            let (_, _, page) = common::get(&link, "/connect/modal");
+            assert!(page.contains("https://modal.com/token-flow/tf-EXAMPLE"), "{}", words(&page));
+            // The tab, open meanwhile, asks Modal itself as its page is read, until the sign-in is approved there.
+            if tab_open {
+                let asked = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut tab = String::new();
+                while std::time::Instant::now() < asked && !tab.contains("Signed in with Modal") && !matches!(child.try_wait(), Ok(Some(_))) {
+                    tab = common::get(&link, "/").2;
+                }
+                assert!(tab.contains("Signed in with Modal"), "{}", words(&tab));
+            }
+            // Approved there: the command says so and ends.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut said = vec![];
+            while let Ok(l) = rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) { said.push(l) }
+            let status = child.wait().unwrap();
+            assert!(status.success() && said.iter().any(|l| l.contains("Modal workspace acmeci1")), "{status} {said:?}");
+            let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
+            assert_eq!((kept["modal"]["token_id"].as_str(), kept["modal"]["workspace"].as_str()), (Some("ak-EXAMPLE000000000000001"), Some("acmeci1")), "{kept}");
+            let _ = std::fs::remove_dir_all(&home);
+            super::seen_in_browser(&served);
         }
-        assert!(tab.contains("Signed in with Modal"), "{}", words(&tab));
-        // Approved there: the command says so and ends.
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut said = vec![];
-        while let Ok(l) = rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) { said.push(l) }
-        let status = child.wait().unwrap();
-        assert!(status.success() && said.iter().any(|l| l.contains("Modal workspace acmeci1")), "{status} {said:?}");
-        let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("workspaces/default/sign-ins.json")).unwrap()).unwrap();
-        assert_eq!((kept["modal"]["token_id"].as_str(), kept["modal"]["workspace"].as_str()), (Some("ak-EXAMPLE000000000000001"), Some("acmeci1")), "{kept}");
-        let _ = std::fs::remove_dir_all(&home);
-        super::seen_in_browser(&served);
     }
 
     #[test]

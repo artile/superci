@@ -6398,11 +6398,14 @@ fn a_runs_artifacts_and_its_tools_cache_refuse_what_cannot_be_kept_and_say_what_
     // The run gone: a tool on its machine reads nothing.
     store.0.borrow_mut().remove("run:41");
     assert_eq!(call(good, "tool-get", serde_json::json!({ "tool": "turbo", "hash": "0123456789abcdef" })).0, 403);
-    // Its artifact of no pieces taken out at the next sweep, with nothing to delete from the bucket.
+    // Its artifacts taken out at the next sweep; then one of no pieces alone, with nothing to delete from the bucket.
+    store.0.borrow_mut().insert("cache-swept".into(), "0".into());
+    block_on(plane.alarm()).unwrap();
     store.0.borrow_mut().insert("artifact:41:bare".into(), serde_json::json!({ "id": "b", "region": "us-east-1", "made": t, "done": true }).to_string());
     store.0.borrow_mut().insert("cache-swept".into(), "0".into());
     block_on(plane.alarm()).unwrap();
     assert!(!store.0.borrow().contains_key("artifact:41:bare"));
+    assert_eq!(store.0.borrow().get("cache-sweep-error"), None);
 }
 
 /// What a runner sends for a run's job, as a real one sent it (`fixtures/runner`): up to `upto` of its requests (all:
