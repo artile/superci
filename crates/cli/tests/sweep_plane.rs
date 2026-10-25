@@ -276,7 +276,7 @@ fn layer_store(fault: Fault) -> Outcome {
     let hex = "6".repeat(64);
     served.github.put_object(&format!("{bucket}/layers/done/{hex}.json"), json!({ "digest": digest('6'), "diff_id": "sha256:diff", "erofs": { "key": format!("layers/{hex}.erofs"), "size": 1 }, "blob": { "key": format!("layers/{hex}.blob"), "size": 500 } }).to_string().as_bytes());
     served.arm(fault);
-    let (call, again) = (|what: &str, body: Value| cache_call(&served, &link, what, body), |what: &str, body: Value| cache_call_again(&served, &link, what, body));
+    let again = |what: &str, body: Value| cache_call_again(&served, &link, what, body);
     for what in ["layers", "layers.json", "layers-program", "program", "cache"] { let _ = ask(&served, "GET", &format!("/cache/{link}/{what}"), None, None); }
     let _ = again("layers-links", json!({ "digests": [digest('1')] }));
     // A layer it pulled that the store lacks: proposed, put at the link given, said uploaded.
