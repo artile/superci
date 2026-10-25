@@ -315,3 +315,250 @@ fn the_layer_store_holds_with_each_call_and_store_operation_failing() {
     let _one = one_at_a_time();
     sweep("the layer store", layer_store);
 }
+
+/// Every job on the control plane's records is over once time has passed: none left launching, launched, running or
+/// waiting with nothing to move it on.
+fn nothing_stuck(out: &Outcome) {
+    for (k, j) in out.served.store.under("job:") {
+        let state = j["state"].as_str().unwrap_or_default();
+        out.check(!["launching", "launched", "running", "waiting", "orphan"].contains(&state), || format!("{k} is left {state}: {j}"));
+    }
+}
+
+/// A busy control plane of its own machines, GitHub and GitLab connected: jobs launched, running, refused a machine
+/// (waiting), whose start was cut off, past their machine's time, over with their indexes left, machines of jobs over
+/// (orphans); and what the upkeep forgets: launch templates, working trees, runs and their logs, machines' cache links
+/// and GitLab runners past their time, spot notes and reruns of days ago. Its upkeep run every few minutes with
+/// GitHub ending the jobs meanwhile; hours and days on, nothing is left stuck.
+fn busy_upkeep(fault: Fault) -> Outcome {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let now = served.now_ms();
+    let (launched, q) = served.github.queue("launched", "superci", now);
+    served.webhook(q);
+    let (running, q) = served.github.queue("running", "superci", now);
+    served.webhook(q);
+    served.webhook(served.github.start(running));
+    // Refused a machine: it waits.
+    served.machines_refuse(Some("no room for another container"));
+    let (waiting, q) = served.github.queue("waiting", "superci", now);
+    served.webhook(q);
+    served.machines_refuse(None);
+    {
+        let mut m = served.store.0.lock().unwrap();
+        let job = |id: u64, state: &str, at: u64, extra: Value| {
+            let mut j = json!({ "job_id": id, "run_id": 1, "repo": "acme/app", "state": state, "label": "superci", "at_ms": at, "installation_id": 42, "app_id": 1001, "cloud": "cloudflare", "seen_in_progress": false, "name": "test", "workflow": "CI" });
+            for (k, v) in extra.as_object().into_iter().flatten() { j[k] = v.clone() }
+            j.to_string()
+        };
+        // Its start cut off a while ago; running past its machine's time; machines of jobs over; over days ago with its
+        // indexes left.
+        for (id, state, at, extra) in [(701u64, "launching", now - 10 * 60_000, json!({})), (702, "running", now - 3 * 86_400_000, json!({ "machine_id": "machine-702", "seen_in_progress": true, "began": true, "started_ms": now - 3 * 86_400_000 })),
+            (703, "orphan", now - 60_000, json!({ "machine_id": "machine-703" })), (704, "done", now - 3 * 86_400_000, json!({ "ended_ms": now - 3 * 86_400_000 + 60_000, "conclusion": "success", "seen_in_progress": true, "began": true }))] {
+            m.insert(format!("job:{id}"), job(id, state, at, extra));
+            m.insert(format!("live:{id}"), String::new());
+        }
+        let old = now - 8 * 86_400_000;
+        m.insert("aws:template:us-east-1:superci-lt-old".into(), old.to_string());
+        m.insert("rtree-at:tree0001".into(), old.to_string());
+        m.insert("rtree:tree0001:00000:000".into(), "\"cGFydA==\"".into());
+        m.insert("run:111".into(), json!({ "id": 111, "at_ms": old, "jobs": [{ "token": "oldtoken0000000000000001", "state": "done" }] }).to_string());
+        m.insert("rjob:oldtoken0000000000000001".into(), json!({ "message": {}, "job_id": 1 }).to_string());
+        m.insert("rline:oldtoken0000000000000001:0000000000001000".into(), "line".into());
+        m.insert("rlog:oldtoken0000000000000001:0001:0000".into(), "\"bG9n\"".into());
+        m.insert("cachem:machine-cache-link-000000000041".into(), json!({ "region": "us-east-1", "arch": "x86_64", "until": old, "runner": "gone" }).to_string());
+        m.insert("glrunner:61".into(), json!({ "id": 61, "gitlab": "", "at_ms": old }).to_string());
+        m.insert(format!("spot:interrupted:{old}:1"), old.to_string());
+        m.insert(format!("rerun:acme/app:1:test"), old.to_string());
+        m.insert("artifact:111:report".into(), json!({ "id": "report", "region": "us-east-1", "size": 3, "made": old, "done": true, "pieces": [["p-1", 3]] }).to_string());
+    }
+    served.arm(fault);
+    // Its upkeep every few minutes, GitHub ending each job meanwhile.
+    for round in 0..4 {
+        served.later(4 * 60_000 + 1_000);
+        served.try_upkeep();
+        if round == 1 {
+            for id in [launched, running, waiting] { served.webhook(served.github.finish(id, "success", "ok\n", served.now_ms())); }
+        }
+        for again in served.github.to_send_again() { served.webhook(again); }
+    }
+    // Hours, then days on.
+    for ms in [3_600_000, 6 * 3_600_000, 6 * 86_400_000] { served.later(ms); served.try_upkeep(); served.try_upkeep(); }
+    let out = Outcome::new(served);
+    refusals_say_why(&out);
+    nothing_stuck(&out);
+    let served = &out.served;
+    // What is past its time is forgotten.
+    for prefix in ["aws:template:", "rtree", "run:111", "rjob:oldtoken", "rline:oldtoken", "rlog:oldtoken", "cachem:", "glrunner:", "spot:interrupted:", "rerun:", "artifact:"] {
+        let left = served.store.under(prefix);
+        out.check(left.is_empty(), || format!("kept past its time: {left:?}"));
+    }
+    // The jobs over are no longer cared for.
+    let live: Vec<String> = served.store.under("live:").into_iter().map(|(k, _)| k).collect();
+    out.check(live.is_empty(), || format!("jobs over still cared for: {live:?}"));
+    out
+}
+
+#[test]
+fn the_upkeep_of_a_busy_control_plane_holds_with_each_call_and_store_operation_failing() {
+    let _one = one_at_a_time();
+    sweep("the upkeep of a busy control plane", busy_upkeep);
+}
+
+/// GitHub jobs through a Cloudflare and a Modal launcher (the control plane's own containers off): each
+/// started, taken, finished; the upkeep after.
+fn launchers(fault: Fault) -> Outcome {
+    let served = serve(|_| {});
+    served.connect_github();
+    let launchers = r#"[{"cloud":"cloudflare","url":"https://superci-runners.acme.workers.dev"},{"cloud":"modal","url":"https://acme--superci-runners.modal.run"}]"#;
+    for (k, v) in [("CONTAINERS", "off"), ("LAUNCHERS", launchers), ("CF_IMAGE", "https://images.example.com/full:1")] { served.aws.put(&format!("/superci/{PLANE}/{k}"), v) }
+    served.arm(fault);
+    let now = served.now_ms();
+    let (cf, q) = served.github.queue("on cloudflare", "superci", now);
+    served.webhook(q);
+    let (modal, q) = served.github.queue("on modal", "superci/provider=modal/gpu=t4", now);
+    served.webhook(q);
+    settle(&served);
+    for id in [cf, modal] {
+        served.webhook(served.github.start(id));
+        served.webhook(served.github.finish(id, "success", "ok\n", served.now_ms()));
+    }
+    settle(&served);
+    for again in served.github.to_send_again() { served.webhook(again); }
+    for ms in [3_600_000, 6 * 86_400_000] { served.later(ms); served.try_upkeep(); served.try_upkeep(); }
+    let out = Outcome::new(served);
+    refusals_say_why(&out);
+    nothing_stuck(&out);
+    if fault == Fault::None {
+        let clouds: Vec<String> = [cf, modal].iter().map(|id| record(&out.served, &format!("job:{id}")).map(|j| format!("{} {}", j["cloud"], j["state"])).unwrap_or_default()).collect();
+        out.check(clouds == ["\"cloudflare\" \"done\"", "\"modal\" \"done\""], || format!("the clean run did not go through: {clouds:?}"));
+    }
+    out
+}
+
+#[test]
+fn jobs_through_cloudflare_and_modal_launchers_hold_with_each_call_and_store_operation_failing() {
+    let _one = one_at_a_time();
+    sweep("jobs through launchers", launchers);
+}
+
+/// A control plane of AWS's machines, its GitHub connected, served at https://plane.acme.test, AWS answering as it
+/// answered Test.
+fn aws_plane() -> Served {
+    let served = serve(|c| {
+        (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX }));
+    });
+    served.connect_github();
+    *served.public.lock().unwrap() = Some("https://plane.acme.test".into());
+    served.aws.put(&format!("/superci/{PLANE}/ROUTING"), r#"{"order":[{"cloud":"aws","max_jobs":100},{"cloud":"aws-on-demand"},{"cloud":"cloudflare","off":true}]}"#);
+    served.aws.replaying(include_str!("../fixtures/aws/launch/spot.jsonl"), &[]);
+    served.store.0.lock().unwrap().insert("aws:no-fleet".into(), served.now_ms().to_string());
+    served
+}
+
+/// What a spot machine reports of its job: how its start went (its times, its runner's log, the job message, a page of
+/// a step's log as it runs), then AWS taking it back; GitHub ends the job, and it is run again off spot machines; its
+/// page and log read; the upkeep after.
+fn machine_reports(fault: Fault) -> Outcome {
+    let served = aws_plane();
+    let (id, q) = served.github.queue("tests", "superci", served.now_ms());
+    served.webhook(q);
+    // (AWS's first pools full: a machine from another a few minutes on.)
+    for _ in 0..5 {
+        if record(&served, &format!("job:{id}")).is_some_and(|j| j["machine_id"].is_string() && j["runner"].as_str().is_some_and(|r| served.github.runner_names().iter().any(|n| n == r))) { break }
+        served.later(5 * 60_000 + 1_000);
+        served.upkeep();
+    }
+    let j = record(&served, &format!("job:{id}")).expect("its record");
+    let (runner, hello, notice) = (j["runner"].as_str().unwrap_or_default().to_string(), j["hello"].as_str().unwrap_or_default().to_string(), j["notice"].as_str().unwrap_or_default().to_string());
+    assert!(!runner.is_empty() && !hello.is_empty() && !notice.is_empty() && served.github.runner_names().contains(&runner), "{j} {:?}", served.github.runner_names());
+    served.arm(fault);
+    let now = served.now_ms();
+    let say = |q: &str, body: &str| -> (u16, String) {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        match agent.post(&format!("{}{q}", served.url)).send(body.to_string()) { Ok(mut r) => (r.status().as_u16(), r.body_mut().read_to_string().unwrap_or_default()), Err(e) => (0, e.to_string()) }
+    };
+    let _ = say(&format!("/hello?runner={runner}&t={hello}&script={}&boot=12.5&read={}&ready={}&listening={}&gh=3", now - 5_000, now - 4_000, now - 3_000, now - 2_000), "");
+    let _ = say(&format!("/hello?runner={runner}&t={hello}&log=runner"), "[RUNNER 2026-10-15 10:00:00Z INFO] Listening for jobs\n");
+    let _ = say(&format!("/hello?runner={runner}&t={hello}&worker=1"), "[WORKER 2026-10-15 10:00:01Z INFO] Job message:\n{\"steps\":[{\"id\":\"s1\",\"displayName\":\"Run tests\",\"reference\":{\"type\":\"script\"}}]}\n");
+    served.github.ready(&runner);
+    served.webhook(served.github.start_on(id, &runner));
+    let _ = say(&format!("/hello?runner={runner}&t={hello}&live=step_1.log&at=0"), "2026-10-15T10:00:02.0000000Z running\n");
+    // AWS takes it back (the machine says so twice, as two of its checks may).
+    let (taken, said) = say(&format!("/interrupted?runner={runner}&t={notice}"), "");
+    let _ = say(&format!("/interrupted?runner={runner}&t={notice}"), "");
+    served.webhook(served.github.finish(id, "failure", "The runner has received a shutdown signal.\n", served.now_ms()));
+    for again in served.github.to_send_again() { served.webhook(again); }
+    for what in [format!("/job/log?id={id}"), "/status".to_string(), format!("/job/view?id={id}")] { let _ = ask(&served, "GET", &what, Some(&served.key), None); }
+    settle(&served);
+    for ms in [3_600_000, 6 * 86_400_000] { served.later(ms); served.try_upkeep(); served.try_upkeep(); }
+    let out = Outcome::new(served);
+    refusals_say_why(&out);
+    nothing_stuck(&out);
+    let j = record(&out.served, &format!("job:{id}")).unwrap_or_default();
+    // Taken back as the machine said: the job knows it.
+    out.check(taken != 200 || j["interrupted"] == true, || format!("AWS took its machine back ({said}), and the job does not say so: {j}"));
+    if fault == Fault::None { out.check(taken == 200 && j["interrupted"] == true && j["rerun"].is_object(), || format!("the clean run did not go through: {taken} {j}")) }
+    out
+}
+
+#[test]
+fn what_a_spot_machine_reports_holds_with_each_call_and_store_operation_failing() {
+    let _one = one_at_a_time();
+    sweep("what a spot machine reports", machine_reports);
+}
+
+/// What the dashboard and the CLI ask of the control plane with a device's key and a coding agent's: a device said
+/// hello, keys and secrets listed, a run that uses a secret (its use noted), GitLab's projects read and switched off and
+/// on, costs measured elsewhere kept, permissions given, GitHub's deliveries and public repositories, AWS forgotten.
+fn dashboard_calls(fault: Fault) -> Outcome {
+    let served = serve(|_| {});
+    served.connect_github();
+    served.connect_gitlab();
+    let scope = superci_core::secrets::Scope::default();
+    let kept = superci_core::secrets::Stored { name: "TOKEN".into(), value: "v".into(), scope: scope.clone(), updated_ms: 1 };
+    served.aws.put(&format!("/superci/{PLANE}/{}", superci_core::secrets::setting("TOKEN", &scope)), &serde_json::to_string(&kept).unwrap());
+    let now = served.now_ms();
+    served.store.0.lock().unwrap().insert("job:801".into(), json!({ "job_id": 801, "run_id": 1, "repo": "acme/app", "state": "done", "at_ms": now - 60_000, "ended_ms": now - 1_000, "installation_id": 42, "cloud": "cloudflare", "seen_in_progress": true }).to_string());
+    served.store.0.lock().unwrap().insert("aws".into(), json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": "arn:aws:iam::111111111111:role/superci-testplane0001", "connected": true }).to_string());
+    served.store.0.lock().unwrap().insert("denied:aws:ec2:RunInstances".into(), now.to_string());
+    served.arm(fault);
+    let key = served.key.clone();
+    let said: Vec<(u16, String)> = vec![
+        ask(&served, "POST", "/keys/hello", Some(&key), Some(json!({ "device": "a laptop" }))),
+        ask(&served, "GET", "/keys", Some(&key), None),
+        ask(&served, "GET", "/secrets", Some(&key), None),
+        ask(&served, "POST", "/runs", Some(&served.run_key), Some(json!({ "workflow": "jobs:\n  t:\n    if: false\n    runs-on: superci\n    steps:\n      - run: echo ${{ secrets.TOKEN }}\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "ref": "refs/heads/main" }))),
+        ask(&served, "GET", "/secrets", Some(&key), None),
+        ask(&served, "GET", "/gitlab/projects", Some(&key), None),
+        ask(&served, "POST", "/gitlab/projects", Some(&key), Some(json!({ "all_on": true }))),
+        ask(&served, "POST", "/gitlab/projects", Some(&key), Some(json!({ "refresh": true }))),
+        ask(&served, "POST", "/gitlab/projects", Some(&key), Some(json!({ "all_off": true }))),
+        ask(&served, "POST", "/costs", Some(&key), Some(json!({ "measured": { "job:801": 0.25 } }))),
+        ask(&served, "POST", "/permissions/given", Some(&key), Some(json!({ "cloud": "aws" }))),
+        ask(&served, "GET", "/github/deliveries", Some(&key), None),
+        ask(&served, "GET", "/github/public-repos", Some(&key), None),
+        ask(&served, "GET", "/status", Some(&key), None),
+        ask(&served, "GET", "/health", None, None),
+        ask(&served, "POST", "/aws/forget", Some(&key), None),
+    ];
+    let out = Outcome::new(served);
+    refusals_say_why(&out);
+    let served = &out.served;
+    // Each change answered as made is made.
+    let made = |i: usize| said[i].0 == 200;
+    out.check(!made(0) || served.store.under("dkey:").iter().any(|(_, v)| v.to_string().contains("a laptop")), || format!("hello answered {:?}, and the device not noted: {:?}", said[0], served.store.under("dkey:")));
+    out.check(!made(3) || !served.store.under("sused:").is_empty(), || format!("a run that used a secret ({:?}), its use not noted", said[3]));
+    out.check(!made(9) || record(served, "job:801").is_some_and(|j| j["cost_usd"] == 0.25), || format!("costs kept ({:?}), not on the job", said[9]));
+    out.check(!made(10) || served.store.under("denied:").is_empty(), || format!("permissions given ({:?}), what was denied still kept", said[10]));
+    out.check(!made(15) || served.store.under("aws").iter().all(|(k, _)| k != "aws"), || format!("AWS forgotten ({:?}), still kept", said[15]));
+    if fault == Fault::None { out.check(said.iter().all(|(s, _)| *s == 200), || format!("the clean run did not go through: {said:?}")) }
+    out
+}
+
+#[test]
+fn what_the_dashboard_asks_holds_with_each_call_and_store_operation_failing() {
+    let _one = one_at_a_time();
+    sweep("what the dashboard asks", dashboard_calls);
+}
