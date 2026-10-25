@@ -6553,6 +6553,120 @@ fn a_job_claimed_as_the_store_fails_to_index_it_is_claimed_again_and_gets_its_ma
     for j in run["jobs"].as_array().unwrap() { assert_eq!(job(&store, j["job_id"].as_str().unwrap().parse().unwrap())["state"], "launched", "{run}") }
 }
 
+#[test]
+fn a_runs_cancelling_passes_over_what_its_record_lacks_and_a_runner_that_ends_before_it_takes_its_job_is_heard() {
+    let t = 1_790_000_000_000u64;
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    // Started jobs: one kept without its link; one whose handed job is gone; one never taken whose record is gone; one over.
+    store.0.borrow_mut().insert("run:5".into(), serde_json::json!({ "at_ms": t, "workflow": "jobs:\n  a:\n    runs-on: superci\n", "jobs": [
+        { "key": "a", "state": "started" }, { "key": "a", "state": "started", "token": "tok-gone-000000000001", "job_id": "11" },
+        { "key": "a", "state": "started", "token": "tok-here-000000000002", "job_id": "12" }, { "key": "a", "state": "done", "result": "success" }] }).to_string());
+    store.0.borrow_mut().insert("rjob:tok-here-000000000002".into(), serde_json::json!({ "message": {}, "job_id": 12, "at_ms": t }).to_string());
+    assert_eq!(json(&block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}/runs/5/cancel"))))))["cancelled"], true);
+    assert!(store.0.borrow()["rjob:tok-here-000000000002"].contains("cancelled"));
+    // A GitHub run, cancelled at GitHub (with the App's token for its repository).
+    store.0.borrow_mut().insert("job:7".into(), serde_json::json!({ "job_id": 7, "run_id": 3, "repo": "acme/app", "state": "running", "at_ms": t, "installation_id": 42, "cloud": "aws", "seen_in_progress": true }).to_string());
+    assert!(block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}/runs/3/cancel"))))).status < 500);
+    // A run's job whose runner says it ended before it took the job, then takes it: begun, and over as it said.
+    let made = block_on(plane.handle(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string()))));
+    let id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let token = serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("run:{id}")]).unwrap()["jobs"][0]["token"].as_str().unwrap().to_string();
+    let finish = include_str!("fixtures/runner/runner-requests.jsonl").lines().map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()).find(|r| r["path"].as_str().unwrap().contains("/FinishJob/")).unwrap();
+    let mut req = Request::new("POST", &format!("{PLANE_URL}/runner/{token}{}", finish["path"].as_str().unwrap()));
+    req.body = finish["request"].as_str().unwrap().as_bytes().to_vec();
+    block_on(plane.handle(req));
+    block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/_apis/v1/Message/p?sessionId=s"))));
+    let handed: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("rjob:{token}")]).unwrap();
+    assert!(handed["noted_end"] == true && handed["noted_taken"] == true, "{handed}");
+    // Its working tree: none sent with the run; one still on its way from the computer.
+    assert_eq!(block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/superci/tree?part=0")))).status, 404);
+    store.0.borrow_mut().entry(format!("rjob:{token}")).and_modify(|v| { let mut h: serde_json::Value = serde_json::from_str(v).unwrap(); h["tree"] = "tree-0123456789abcdef".into(); *v = h.to_string() });
+    store.0.borrow_mut().insert("rtree-later:tree-0123456789abcdef".into(), t.to_string());
+    assert_eq!(block_on(plane.handle(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/superci/tree?part=0")))).status, 425);
+}
+
+#[test]
+fn machines_whose_jobs_went_elsewhere_hand_themselves_on_or_end_as_github_and_gitlab_say() {
+    let t = 1_790_000_000_000u64;
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| match r.url.as_str() {
+        "https://api.github.com/repos/acme/app/actions/jobs/21" => Some(Response::new(200, "application/json", r#"{"status":"completed"}"#)),
+        _ => None,
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    odd_plane(&mut config);
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let put = |key: &str, j: serde_json::Value| {
+        let mut base = serde_json::json!({ "run_id": 3, "repo": "acme/app", "state": "launched", "at_ms": t - 9 * 60_000, "launched_ms": t - 9 * 60_000, "installation_id": 42, "cloud": "aws", "machine_id": "i-1", "region": "us-east-1", "seen_in_progress": false, "label": "superci" });
+        for (k, v) in j.as_object().unwrap() { base[k] = v.clone() }
+        store.0.borrow_mut().insert(key.into(), base.to_string());
+    };
+    // A GitLab machine past its time whose job GitLab still has pending: ended, and the job tried again.
+    put("job:gl1977", serde_json::json!({ "job_id": 1977, "provider": "gitlab", "project_id": 380, "installation_id": 0, "runner_id": 55 }));
+    // Failing runners' machines (their jobs over), with jobs of the same runners waiting: for one with no token to ask
+    // GitHub with, none is handed on; for one with, the waiting job GitHub says is over, its record gone meanwhile.
+    put("job:20", serde_json::json!({ "job_id": 20, "failed_fast": true, "installation_id": 999 }));
+    put("job:22", serde_json::json!({ "job_id": 22, "state": "running", "installation_id": 999, "launched_ms": t }));
+    put("job:23", serde_json::json!({ "job_id": 23, "failed_fast": true }));
+    put("job:21", serde_json::json!({ "job_id": 21, "state": "running", "launched_ms": t }));
+    store.meddling(|op, k, m| if op == "get" && k == "job:21" { m.remove(k); });
+    block_on(plane.alarm()).unwrap();
+    let gl: serde_json::Value = serde_json::from_str(&store.0.borrow()["job:gl1977"]).unwrap();
+    assert_ne!(gl["machine_id"], "i-1", "{gl}");
+    assert_eq!(job(&store, 20)["state"], "swept");
+}
+
+#[test]
+fn launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not() {
+    // A failing runner started by Cloudflare's launcher; a job on Modal's, priced as Modal prices it.
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clouds = With(FakeClouds::default(), |r: &Request, _: &str| match r.url.as_str() {
+        "https://modal.acme.example/launch" => Some(Response::new(200, "application/json", r#"{"id":"sb-1","kind":"sandbox"}"#)),
+        "https://broken.acme.example/launch" => Some(Response::new(200, "application/json", "not json")),
+        _ => None,
+    });
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "cloudflare".into(), url: "https://runners.acme.workers.dev".into() }];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 1, "acme/app", None, "superci/os=macos")));
+    assert_eq!(job(&store, 1)["failed_fast"], true, "{}", job(&store, 1));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "modal".into(), url: "https://modal.acme.example".into() }];
+    let (store, cache) = (Mem::default(), Cache::default());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 2, "acme/app", None, "superci")));
+    assert!(job(&store, 2)["usd_per_hour"].as_f64().is_some_and(|p| p > 0.0) && job(&store, 2)["machine_id"] == "sb-1", "{}", job(&store, 2));
+    // A launcher whose answer is no JSON; a job cancelled before its start was asked for.
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    config.launchers = vec![Launcher { cloud: "cloudflare".into(), url: "https://broken.acme.example".into() }];
+    let (store, cache) = (Mem::default(), Cache::default());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 3, "acme/app", None, "superci")));
+    assert!(job(&store, 3)["error"].as_str().is_some_and(|e| e.contains("launcher")), "{}", job(&store, 3));
+    store.0.borrow_mut().insert("gone:4".into(), "1790000000000".into());
+    block_on(plane.handle(labelled("queued", 4, "acme/app", None, "superci")));
+    assert_eq!(job(&store, 4)["state"], "cancelled");
+    // A failing runner whose configuration from GitHub is no runner's: not started in AWS.
+    let clouds = With(FakeClouds::default(), |r: &Request, body: &str| (r.url.ends_with("/generate-jitconfig") && body.contains("-x\"")).then(|| Response::new(201, "application/json", r#"{"encoded_jit_config":"not a config!","runner":{"id":9}}"#)));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    let (store, cache) = (Mem::default(), Cache::default());
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.handle(labelled("queued", 5, "acme/app", None, "superci/os=macos")));
+    assert!(job(&store, 5)["fail_pending"].is_string(), "{}", job(&store, 5));
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6710,7 +6824,10 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_gpu_job_refused_spot_for_the_accounts_limit_with_on_demand_turned_off_says_which_limit_to_raise,
         logs_and_trees_kept_in_a_bucket_this_control_plane_can_no_longer_reach_are_passed_over_or_said,
         a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_as_they_are,
-        a_job_claimed_as_the_store_fails_to_index_it_is_claimed_again_and_gets_its_machine
+        a_job_claimed_as_the_store_fails_to_index_it_is_claimed_again_and_gets_its_machine,
+        a_runs_cancelling_passes_over_what_its_record_lacks_and_a_runner_that_ends_before_it_takes_its_job_is_heard,
+        machines_whose_jobs_went_elsewhere_hand_themselves_on_or_end_as_github_and_gitlab_say,
+        launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
