@@ -6705,10 +6705,10 @@ macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())
 
 /// Every other test of this file, as written, run again for each call to a fake cloud and each store operation it
 /// made, that one failing (a call answered with its service's error, or dropped; a store operation, or a wake asked
-/// of the timer, not answered), then with every call from each on failing, and every store operation from each on,
-/// and with every swap from each on lost. A test's own checks may not hold then (that is what the fault is for), and it stops where
-/// the first does not; what must hold is the control plane: whatever fails, it never panics. (The clean runs alone
-/// unless `SUPERCI_SWEEP_FAULTS=1`, as the sweeps of the CLI's flows.)
+/// of the timer, not answered), then with every call from each on failing, every store operation from each on, and
+/// every swap from each on lost. A test's own checks may not hold then (that is what the fault is for), and it stops
+/// where the first does not; what must hold is the control plane: whatever fails, it never panics. (The clean runs
+/// alone unless `SUPERCI_SWEEP_FAULTS=1`, as the sweeps of the CLI's flows.)
 #[test]
 fn every_test_here_holds_with_each_call_and_store_operation_failing() {
     let tests: &[Swept] = tests![
