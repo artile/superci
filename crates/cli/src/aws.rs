@@ -874,13 +874,13 @@ mod answers {
         let file = std::env::temp_dir().join(format!("superci-record-{}", superci_core::crypto::random_id(6)));
         let r = with(&at, || {
             std::env::set_var("SUPERCI_RECORD", &file);
-            let r = futures::executor::block_on(Blocking::new().send(Request::new("POST", &format!("{at}/")).with_body("Action=X")));
+            let r = futures::executor::block_on(Blocking::new().send(Request::new("POST", &format!("{at}/")).with_header("x-amz-target", "AmazonSSM.GetParameter").with_body("{}")));
             std::env::remove_var("SUPERCI_RECORD");
             r
         });
         assert_eq!(r.unwrap().header("x-odd"), None);
         let line: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert_eq!(line["headers"], serde_json::json!([["x-amzn-errortype", "ThrottlingException"]]));
+        assert_eq!((&line["headers"], &line["target"]), (&serde_json::json!([["x-amzn-errortype", "ThrottlingException"]]), &serde_json::json!("AmazonSSM.GetParameter")));
         let _ = std::fs::remove_file(&file);
     }
 
