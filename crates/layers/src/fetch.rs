@@ -44,8 +44,8 @@ pub fn fetch(agent: &ureq::Agent, link: &dyn Link, size: u64, dest: &Path, paral
 
 fn fetch_inner(agent: &ureq::Agent, link: &dyn Link, size: u64, dest: &Path, parallel: usize, digest: Option<&str>) -> Result<u64, String> {
     let want = digest.map(Digest::parse).transpose().map_err(|e| format!("the store's digest: {e}")).and_then(crate::faults::said)?;
-    let file = std::fs::File::create(dest).map_err(|e| format!("{}: {e}", dest.display())).and_then(crate::faults::said)?;
-    file.set_len(size).map_err(|e| format!("{}: {e}", dest.display())).and_then(crate::faults::said)?;
+    let file = std::fs::File::create(dest).and_then(crate::faults::pass).map_err(|e| format!("{}: {e}", dest.display()))?;
+    file.set_len(size).and_then(crate::faults::pass).map_err(|e| format!("{}: {e}", dest.display()))?;
     let parts = size.div_ceil(PART) as usize;
     let next = AtomicUsize::new(0);
     let read = AtomicU64::new(0);
@@ -53,8 +53,7 @@ fn fetch_inner(agent: &ureq::Agent, link: &dyn Link, size: u64, dest: &Path, par
     // (One refresh at a time: the first range refused gets the new link, the others use it.)
     let refreshing = Mutex::new(());
     std::thread::scope(|s| {
-        for _ in 0..parallel.clamp(1, parts.max(1)) {
-            s.spawn(|| loop {
+        (0..parallel.clamp(1, parts.max(1))).for_each(|_| { s.spawn(|| loop {
                 if failed.lock().unwrap().is_some() { return }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= parts { return }
@@ -63,13 +62,12 @@ fn fetch_inner(agent: &ureq::Agent, link: &dyn Link, size: u64, dest: &Path, par
                     Ok(n) => { read.fetch_add(n, Ordering::Relaxed); }
                     Err(e) => { failed.lock().unwrap().get_or_insert(e); return }
                 }
-            });
-        }
+            }); });
     });
     if let Some(e) = failed.into_inner().unwrap() { return Err(e) }
-    file.sync_all().map_err(|e| format!("{}: {e}", dest.display())).and_then(crate::faults::said)?;
+    file.sync_all().and_then(crate::faults::pass).map_err(|e| format!("{}: {e}", dest.display()))?;
     if let Some(want) = want {
-        let got = hash_file(dest, want.algorithm).map_err(|e| format!("{}: {e}", dest.display())).and_then(crate::faults::said)?;
+        let got = hash_file(dest, want.algorithm).and_then(crate::faults::pass).map_err(|e| format!("{}: {e}", dest.display()))?;
         if got != want { return Err(format!("the store's file is not what its digest says ({got}, not {want})")) }
     }
     Ok(read.into_inner())
@@ -77,10 +75,11 @@ fn fetch_inner(agent: &ureq::Agent, link: &dyn Link, size: u64, dest: &Path, par
 
 /// One range, tried again until it comes whole.
 fn range(agent: &ureq::Agent, link: &dyn Link, file: &std::fs::File, from: u64, to: u64, refreshing: &Mutex<()>) -> Result<u64, String> {
-    let mut last = String::new();
-    let mut refreshed = 0;
-    for attempt in 0..TRIES {
+    let (mut last, mut refreshed, mut attempt) = (String::new(), 0, 0);
+    loop {
+        if attempt == TRIES { break }
         if attempt > 0 { std::thread::sleep(Duration::from_millis(200 * attempt as u64)) }
+        attempt += 1;
         let url = link.url();
         let res = agent.get(&url).header("range", format!("bytes={from}-{}", to - 1)).call();
         let r = match res { Ok(r) => r, Err(e) => { last = e.to_string(); continue } };
@@ -103,7 +102,7 @@ fn range(agent: &ureq::Agent, link: &dyn Link, file: &std::fs::File, from: u64, 
             if at >= to { break true }
             match body.read(&mut buf[..((to - at) as usize).min(1 << 20)]) {
                 Ok(0) => break false,
-                Ok(n) => { if let Err(e) = file.write_all_at(&buf[..n], at) { return Err(e.to_string()) } at += n as u64 }
+                Ok(n) => { if let Err(e) = crate::faults::check(file.write_all_at(&buf[..n], at)) { return Err(e.to_string()) } at += n as u64 }
                 Err(e) => { last = e.to_string(); break false }
             }
         };

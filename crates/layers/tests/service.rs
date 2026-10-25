@@ -426,7 +426,10 @@ async fn what_containerd_asks_amiss_or_leaves_midway_is_answered_as_containerd_d
 /// taken only with the SHA-256 they say), their word (`POST /uploaded`) and what was kept (`POST /layers-kept`).
 /// What it was asked, kept.
 #[derive(Default)]
-struct Plane { files: HashMap<String, Vec<u8>>, asked: Vec<String>, uploaded: HashMap<String, Vec<u8>>, kept: Option<serde_json::Value>, first: Option<serde_json::Value> }
+struct Plane { files: HashMap<String, Vec<u8>>, asked: Vec<String>, uploaded: HashMap<String, Vec<u8>>, kept: Option<serde_json::Value>, first: Option<serde_json::Value>,
+    /// How links are given when asked for again: "" (as they should be), "refused", "nonsense", "elsewhere" (for
+    /// other layers only), "expired" (links that are refused too).
+    links: String }
 
 fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -454,6 +457,11 @@ fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
             let send = |out: &mut std::net::TcpStream, status: u16, extra: &str, body: &[u8]| { let _ = out.write_all(format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n", body.len()).as_bytes()); let _ = out.write_all(body); };
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             match (method.as_str(), path.as_str()) {
+                // (A link refused as one run out; a connection dropped; a range not taken; a range cut short.)
+                ("GET", f) if f.starts_with("/files/expired/") => send(&mut out, 403, "", b"<Error><Code>AccessDenied</Code></Error>"),
+                ("GET", f) if f.starts_with("/files/drop/") => {}
+                ("GET", f) if f.starts_with("/files/whole/") => { let b = p.lock().unwrap().files.get(&f[13..]).cloned().unwrap_or_default(); send(&mut out, 200, "", &b) }
+                ("GET", f) if f.starts_with("/files/short/") => { let _ = out.write_all(b"HTTP/1.1 206 X\r\ncontent-length: 5\r\nconnection: close\r\n\r\nshort"); }
                 ("GET", f) if f.starts_with("/files/") => {
                     let Some(b) = p.lock().unwrap().files.get(&f[7..]).cloned() else { return send(&mut out, 404, "", b"") };
                     match headers.get("range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-')) {
@@ -462,10 +470,17 @@ fn plane(files: HashMap<String, Vec<u8>>) -> (Arc<Mutex<Plane>>, String) {
                     }
                 }
                 ("POST", "/links") => {
+                    let mode = p.lock().unwrap().links.clone();
+                    match mode.as_str() {
+                        "refused" => return send(&mut out, 500, "", b"{}"),
+                        "nonsense" => return send(&mut out, 200, "", b"not json"),
+                        _ => {}
+                    }
                     let layers: serde_json::Map<String, serde_json::Value> = json["digests"].as_array().unwrap().iter().map(|d| {
                         let d = d.as_str().unwrap();
                         let size = p.lock().unwrap().files.get(&format!("{d}.erofs")).map(|f| f.len()).unwrap_or(0);
-                        (d.to_string(), serde_json::json!({ "size": 1, "erofs": { "url": format!("{base}/files/{d}.erofs"), "size": size }, "blob": { "url": format!("{base}/files/{d}.blob") } }))
+                        let (name, at) = match mode.as_str() { "elsewhere" => (format!("{d}-other"), ""), "expired" => (d.to_string(), "expired/"), _ => (d.to_string(), "") };
+                        (name, serde_json::json!({ "size": 1, "erofs": { "url": format!("{base}/files/{at}{d}.erofs"), "size": size }, "blob": { "url": format!("{base}/files/{d}.blob") } }))
                     }).collect();
                     send(&mut out, 200, "", serde_json::json!({ "layers": layers }).to_string().as_bytes())
                 }
@@ -743,4 +758,38 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     if let Some((mut c, _)) = containerd { stop(&prefix, &mut c) }
     // (Each mount under the folder: one there is not unmounted with the folder, which is no mount itself.)
     let _ = rooted(&prefix, "sh").args(["-c", &format!("grep -o ' {0}[^ ]*' /proc/self/mounts | sort -r | xargs -r umount -l; rm -rf {0}", dir.display())]).status();
+}
+
+/// A layer's file fetched as the store's bucket and the control plane answer it amiss: a link run out (signed again),
+/// none yet (asked for), a new one refused, not said, or given for other layers only, run out again; a connection
+/// dropped; a range not taken; one cut short; a file not what its digest says. Each said, and the layer pulled as usual.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_layers_file_is_fetched_whatever_the_bucket_and_the_control_plane_answer() {
+    let erofs = vec![3u8; (17 << 20) + 5];
+    let digests: Vec<String> = (0..10).map(|i| digest(format!("layer {i}").as_bytes())).collect();
+    let files: HashMap<String, Vec<u8>> = digests.iter().map(|d| (format!("{d}.erofs"), erofs.clone())).collect();
+    let (p, at) = plane(files);
+    let link = |i: usize, at_path: &str| format!("{at}/files/{at_path}{}.erofs", digests[i]);
+    // (In turn: run out, none, run out with links refused, given for others, not said, run out again; dropped, not
+    // ranged, cut short; not its digest.)
+    let urls = [link(0, "expired/"), String::new(), link(2, "expired/"), link(3, "expired/"), link(4, "expired/"), link(5, "expired/"), link(6, "drop/"), link(7, "whole/"), link(8, "short/"), link(9, "")];
+    let layers: serde_json::Map<String, serde_json::Value> = digests.iter().zip(urls.iter()).enumerate().map(|(i, (d, u))| {
+        let mut erofs_entry = serde_json::json!({ "url": u, "size": erofs.len() });
+        if i == 9 { erofs_entry["digest"] = digest(b"something else").into() }
+        (d.clone(), serde_json::json!({ "size": 1, "erofs": erofs_entry, "blob": {} }))
+    }).collect();
+    let s = start("fetch", Some(&serde_json::json!({ "layers": layers, "refresh": { "url": format!("{at}/links"), "token": "t" } })));
+    let mut snap = s.snapshots().await;
+    let modes = ["", "", "refused", "elsewhere", "nonsense", "expired", "", "", "", ""];
+    for (i, d) in digests.iter().enumerate() {
+        p.lock().unwrap().links = modes[i].to_string();
+        let req = sapi::PrepareSnapshotRequest { key: format!("moby/f/{i}"), labels: [("containerd.io/snapshot.ref".to_string(), format!("chain-f{i}")), ("containerd.io/snapshot/cri.layer-digest".to_string(), d.clone())].into_iter().collect(), ..Default::default() };
+        let _ = snap.prepare(req).await;
+    }
+    let log = s.log();
+    for (i, d) in digests.iter().enumerate() {
+        let fetched = log.contains(&format!("{d}'s file (17.8 MB) fetched in"));
+        assert_eq!(fetched, i < 2, "{i}: {}", log.lines().filter(|l| l.contains(d.as_str())).collect::<Vec<_>>().join("\n"));
+    }
+    assert!(log.contains("refused its link") && log.contains("not what its digest says") && log.contains("the store answered 200") && log.contains("sent 5 of"), "{log}");
 }

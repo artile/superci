@@ -46,17 +46,9 @@ impl Containerd {
         let id = format!("superci-layers-{now}");
         let expire = crate::content::rfc3339(now + LEASE_FOR.as_nanos() as i64);
         let req = lapi::CreateRequest { id: id.clone(), labels: [("containerd.io/gc.expire".to_string(), expire)].into_iter().collect() };
-        lapi::leases_client::LeasesClient::new(ch).create(Self::with_namespace(req, namespace, None).and_then(crate::faults::said)?).await.map_err(|e| format!("a lease: {}", e.message())).and_then(crate::faults::said)?;
+        lapi::leases_client::LeasesClient::new(ch).create(Self::with_namespace(req, namespace, None).and_then(crate::faults::said)?).await.and_then(crate::faults::pass).map_err(|e| format!("a lease: {}", e.message()))?;
         self.leases.lock().unwrap().insert(namespace.to_string(), (id.clone(), Instant::now()));
         Ok(id)
-    }
-
-    /// A blob's labels in a namespace (where it was pulled from: `containerd.io/distribution.source.<registry>`).
-    pub async fn labels(&self, namespace: &str, digest: &str) -> Result<HashMap<String, String>, String> {
-        let ch = self.channel().await.and_then(crate::faults::said)?;
-        let req = Self::with_namespace(capi::InfoRequest { digest: digest.to_string() }, namespace, None).and_then(crate::faults::said)?;
-        let info = capi::content_client::ContentClient::new(ch).info(req).await.map_err(|e| e.message().to_string()).and_then(crate::faults::said)?.into_inner();
-        Ok(info.info.map(|i| i.labels.into_iter().collect()).unwrap_or_default())
     }
 
     /// `digest` (of `size` bytes) made known in `namespace`; known already is no error. As containerd's own client

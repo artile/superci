@@ -87,9 +87,9 @@ pub fn finish() -> i32 {
 /// A program started on its own (its own session, its output in the log), not waited for.
 fn detached(argv: &[&str]) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
-    let log = std::fs::OpenOptions::new().create(true).append(true).open("/var/log/superci-layers.log").map_err(|e| e.to_string()).and_then(crate::faults::said)?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open("/var/log/superci-layers.log").and_then(crate::faults::pass).map_err(|e| e.to_string())?;
     let mut c = Command::new(argv[0]);
-    c.args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e| e.to_string()).and_then(crate::faults::said)?).stderr(log);
+    c.args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(log.try_clone().and_then(crate::faults::pass).map_err(|e| e.to_string())?).stderr(log);
     unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
     c.spawn().map(|_| ()).map_err(|e| format!("{}: {e}", argv[0]))
 }
@@ -113,7 +113,7 @@ pub fn off() -> i32 {
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(cmd).args(args).output().map_err(|e| format!("{cmd}: {e}")).and_then(crate::faults::said)?;
+    let out = Command::new(cmd).args(args).output().and_then(crate::faults::pass).map_err(|e| format!("{cmd}: {e}"))?;
     if out.status.success() { Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()) } else {
         Err(format!("{cmd} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("failed")))
     }
@@ -127,7 +127,7 @@ fn switch(o: &Options) -> Result<String, String> {
     // 1-3 at once, each timed: Docker keeps its images in containerd already; an EROFS file mounts (its module
     // loaded, the first time); the files' disk made; the index fetched.
     let files = o.root.join("files");
-    std::fs::create_dir_all(&files).map_err(|e| format!("{}: {e}", files.display())).and_then(crate::faults::said)?;
+    std::fs::create_dir_all(&files).and_then(crate::faults::pass).map_err(|e| format!("{}: {e}", files.display()))?;
     let timed = |f: &dyn Fn() -> Result<String, String>| { let t = std::time::Instant::now(); (f(), t.elapsed().as_secs_f64()) };
     let (docker, erofs, disk, index) = std::thread::scope(|s| {
         let docker = s.spawn(|| timed(&|| docker_keeps_images_in_containerd().map(|_| String::new())));
@@ -163,9 +163,9 @@ fn switch(o: &Options) -> Result<String, String> {
     keep(CONTAINERD_CONFIG).and_then(crate::faults::said)?;
     keep(DOCKER_CONFIG).and_then(crate::faults::said)?;
     let config = std::fs::read_to_string(CONTAINERD_CONFIG).unwrap_or_default();
-    std::fs::write(CONTAINERD_CONFIG, containerd_config(&config).and_then(crate::faults::said)?).map_err(|e| format!("{CONTAINERD_CONFIG}: {e}")).and_then(crate::faults::said)?;
+    std::fs::write(CONTAINERD_CONFIG, containerd_config(&config).and_then(crate::faults::said)?).and_then(crate::faults::pass).map_err(|e| format!("{CONTAINERD_CONFIG}: {e}"))?;
     let daemon = std::fs::read_to_string(DOCKER_CONFIG).unwrap_or_else(|_| "{}".into());
-    std::fs::write(DOCKER_CONFIG, docker_config(&daemon).and_then(crate::faults::said)?).map_err(|e| format!("{DOCKER_CONFIG}: {e}")).and_then(crate::faults::said)?;
+    std::fs::write(DOCKER_CONFIG, docker_config(&daemon).and_then(crate::faults::said)?).and_then(crate::faults::pass).map_err(|e| format!("{DOCKER_CONFIG}: {e}"))?;
     step("settings", &mut took);
     // 6. (Started again and checked beside the runner: `finish`.)
     let times = took.iter().map(|(n, t)| format!("{n} {t:.2} s")).collect::<Vec<_>>().join(", ");
@@ -175,11 +175,11 @@ fn switch(o: &Options) -> Result<String, String> {
 /// The small EROFS file mounted and read.
 fn check_erofs(root: &Path) -> Result<(), String> {
     let dir = root.join("check");
-    std::fs::create_dir_all(dir.join("mnt")).map_err(|e| e.to_string()).and_then(crate::faults::said)?;
+    std::fs::create_dir_all(dir.join("mnt")).and_then(crate::faults::pass).map_err(|e| e.to_string())?;
     let file = dir.join("check.erofs");
-    std::fs::write(&file, CHECK_EROFS).map_err(|e| e.to_string()).and_then(crate::faults::said)?;
+    std::fs::write(&file, CHECK_EROFS).and_then(crate::faults::pass).map_err(|e| e.to_string())?;
     let mnt = dir.join("mnt");
-    crate::mount::mount_erofs(&file, &mnt).map_err(|e| format!("the kernel does not mount an EROFS file: {e}")).and_then(crate::faults::said)?;
+    crate::mount::mount_erofs(&file, &mnt).and_then(crate::faults::pass).map_err(|e| format!("the kernel does not mount an EROFS file: {e}"))?;
     let read = std::fs::read_to_string(mnt.join("ok"));
     let _ = crate::mount::unmount(&mnt);
     let _ = std::fs::remove_dir_all(&dir);
@@ -240,15 +240,15 @@ fn unused_ebs() -> Result<Option<String>, String> {
 
 fn fetch_index(url: &str) -> Result<usize, String> {
     let agent = crate::fetch::agent();
-    let res = agent.get(url).call().map_err(|e| format!("the index: {e}")).and_then(crate::faults::said)?;
+    let res = agent.get(url).call().and_then(crate::faults::pass).map_err(|e| format!("the index: {e}"))?;
     if res.status().as_u16() != 200 { return Err(format!("the index: the control plane answered {}", res.status())) }
-    let text = res.into_body().with_config().limit(64 << 20).read_to_string().map_err(|e| format!("the index: {e}")).and_then(crate::faults::said)?;
+    let text = res.into_body().with_config().limit(64 << 20).read_to_string().and_then(crate::faults::pass).map_err(|e| format!("the index: {e}"))?;
     let index: crate::index::Index = serde_json::from_str(&text).map_err(|e| format!("the index: {e}")).and_then(crate::faults::said)?;
     if index.layers.is_empty() { return Err("the store has no layers for this machine yet".into()) }
-    std::fs::create_dir_all(Path::new(INDEX).parent().unwrap()).map_err(|e| e.to_string()).and_then(crate::faults::said)?;
+    std::fs::create_dir_all(Path::new(INDEX).parent().unwrap()).and_then(crate::faults::pass).map_err(|e| e.to_string())?;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(INDEX).map_err(|e| format!("{INDEX}: {e}")).and_then(crate::faults::said)?;
-    std::io::Write::write_all(&mut f, text.as_bytes()).map_err(|e| format!("{INDEX}: {e}")).and_then(crate::faults::said)?;
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(INDEX).and_then(crate::faults::pass).map_err(|e| format!("{INDEX}: {e}"))?;
+    std::io::Write::write_all(&mut f, text.as_bytes()).and_then(crate::faults::pass).map_err(|e| format!("{INDEX}: {e}"))?;
     Ok(index.layers.len())
 }
 
@@ -340,12 +340,12 @@ fn docker_version(status: &str) -> Option<u32> {
 /// command, which a machine just started reads from a disk still coming from its snapshot (seconds, the first time).
 fn docker_info() -> Result<serde_json::Value, String> {
     use std::io::{Read, Write};
-    let mut s = std::os::unix::net::UnixStream::connect("/var/run/docker.sock").map_err(|e| format!("Docker's socket: {e}")).and_then(crate::faults::said)?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(30))).map_err(|e| e.to_string()).and_then(crate::faults::said)?;
+    let mut s = std::os::unix::net::UnixStream::connect("/var/run/docker.sock").and_then(crate::faults::pass).map_err(|e| format!("Docker's socket: {e}"))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30))).and_then(crate::faults::pass).map_err(|e| e.to_string())?;
     // (HTTP/1.0: the answer whole, then the connection closed; no chunks.)
-    s.write_all(b"GET /info HTTP/1.0\r\nHost: docker\r\n\r\n").map_err(|e| format!("Docker's socket: {e}")).and_then(crate::faults::said)?;
+    s.write_all(b"GET /info HTTP/1.0\r\nHost: docker\r\n\r\n").and_then(crate::faults::pass).map_err(|e| format!("Docker's socket: {e}"))?;
     let mut answer = Vec::new();
-    s.read_to_end(&mut answer).map_err(|e| format!("Docker's socket: {e}")).and_then(crate::faults::said)?;
+    s.read_to_end(&mut answer).and_then(crate::faults::pass).map_err(|e| format!("Docker's socket: {e}"))?;
     let text = String::from_utf8_lossy(&answer);
     let (head, body) = text.split_once("\r\n\r\n").ok_or("Docker's daemon answered no HTTP")?;
     if !head.starts_with("HTTP/1.0 200") && !head.starts_with("HTTP/1.1 200") { return Err(format!("Docker's daemon answered {}", head.lines().next().unwrap_or_default())) }
@@ -364,12 +364,12 @@ fn wait_for_docker() -> Result<(), String> {
 /// not unreachable).
 fn check_containerd() -> Result<(), String> {
     use crate::containerd::services::{content::v1 as capi, snapshots::v1 as sapi};
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string()).and_then(crate::faults::said)?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().and_then(crate::faults::pass).map_err(|e| e.to_string())?;
     rt.block_on(async {
         let ch = crate::client::channel(Path::new("/run/containerd/containerd.sock")).await.and_then(crate::faults::said)?;
         fn ns<T>(m: T) -> tonic::Request<T> { let mut r = tonic::Request::new(m); r.metadata_mut().insert("containerd-namespace", tonic::metadata::MetadataValue::from_static("moby")); r }
-        let mut list = sapi::snapshots_client::SnapshotsClient::new(ch.clone()).list(ns(sapi::ListSnapshotsRequest { snapshotter: "superci".into(), filters: vec![] })).await.map_err(|e| format!("containerd's snapshots from superci-layers: {}", e.message())).and_then(crate::faults::said)?.into_inner();
-        while list.message().await.map_err(|e| format!("containerd's snapshots from superci-layers: {}", e.message())).and_then(crate::faults::said)?.is_some() {}
+        let mut list = sapi::snapshots_client::SnapshotsClient::new(ch.clone()).list(ns(sapi::ListSnapshotsRequest { snapshotter: "superci".into(), filters: vec![] })).await.and_then(crate::faults::pass).map_err(|e| format!("containerd's snapshots from superci-layers: {}", e.message()))?.into_inner();
+        while list.message().await.and_then(crate::faults::pass).map_err(|e| format!("containerd's snapshots from superci-layers: {}", e.message()))?.is_some() {}
         let empty = crate::content::Digest::of(crate::content::Algorithm::Sha256, b"").to_string();
         match capi::content_client::ContentClient::new(ch).info(ns(capi::InfoRequest { digest: empty })).await {
             Ok(_) => Ok(()),
@@ -383,7 +383,7 @@ fn check_containerd() -> Result<(), String> {
 fn restore_settings() -> Result<(), String> {
     for path in [CONTAINERD_CONFIG, DOCKER_CONFIG] {
         let kept = format!("{path}{KEPT}");
-        if Path::new(&kept).exists() { std::fs::rename(&kept, path).map_err(|e| format!("{path}: {e}")).and_then(crate::faults::said)? }
+        if Path::new(&kept).exists() { std::fs::rename(&kept, path).and_then(crate::faults::pass).map_err(|e| format!("{path}: {e}"))? }
         else if Path::new(&format!("{kept}-none")).exists() { let _ = std::fs::remove_file(path); let _ = std::fs::remove_file(format!("{kept}-none")); }
     }
     Ok(())
