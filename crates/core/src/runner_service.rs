@@ -371,6 +371,18 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> R
                 "tarballUrl": tarball, "zipballUrl": format!("https://api.github.com/repos/{name}/zipball/{r}") }));
         }
         ok(json!({ "actions": out }))
+    } else if p.contains("/TimeLineWebConsoleLog/") {
+        // The job's lines as they are written, each post as one entry, with its step and the number of its first line
+        // in that step's log: the runner drops lines when it writes faster than it sends them (it holds 1,024 at
+        // most), so a gap is seen, and the step's whole log (`/Logfiles/`) fills it.
+        let lines: Vec<String> = body["value"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
+        if !lines.is_empty() {
+            job.lines += 1;
+            let step = body["stepId"].as_str().map(str::to_string).or_else(|| p.trim_end_matches('/').rsplit('/').next().map(str::to_string));
+            store.put_until(&format!("rline:{id}:{:06}", job.lines), json!({ "step": step, "start": body["startLine"], "lines": lines }).to_string(), job.at_ms + KEPT_MS).await?;
+            put_json(store, &key, &job).await?;
+        }
+        empty()
     } else if p.contains("/Timeline/") {
         // Each step's record: the last word of each kept.
         for r in body["value"].as_array().into_iter().flatten() {

@@ -999,11 +999,6 @@ fn called_workflows(run: &serde_json::Value) -> std::result::Result<std::collect
     run["called"].as_object().into_iter().flatten().map(|(p, t)| Ok((p.clone(), crate::workflow::parse(t.as_str().unwrap_or_default()).map_err(|e| format!("{p}: {e}"))?))).collect()
 }
 
-/// A job of the run's own workflow, by its key.
-fn run_wf_job(run: &serde_json::Value, key: &str) -> Option<crate::workflow::Node> {
-    crate::workflow::parse(run["workflow"].as_str().unwrap_or_default()).ok()?.get("jobs")?.get(key).cloned()
-}
-
 /// A text of a workflow read with contexts: a whole `${{ }}` its value, else the text with each replaced.
 fn read_text(text: &str, c: &crate::expression::Contexts) -> std::result::Result<serde_json::Value, String> {
     let t = text.trim();
@@ -2968,7 +2963,9 @@ impl<'a> ControlPlane<'a> {
             // What each place said where starting the machine failed.
             let mut failures: Vec<(String, String)> = vec![];
             let (mut more_spot, mut gone) = (false, false);
-            for (at, (place, runner, size)) in places.into_iter().enumerate() {
+            let mut places = places.into_iter().enumerate();
+            loop {
+                let Some((at, (place, runner, size))) = places.next() else { break };
                 // Its job ended at its code host meanwhile, before any runner took it (cancelled): nothing more is asked for.
                 if self.store.get(&gone_key(job)).await.ok().flatten().is_some() { gone = true; break }
                 if self.ended_meanwhile(&key, job).await { gone = true; break }
@@ -3036,7 +3033,9 @@ impl<'a> ControlPlane<'a> {
                         // Its regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         // (Spot: the region where a job costs least first, the first counted a little cheaper.)
                         let regions = if on_demand { self.place_regions(&a, &place) } else { self.spot_regions_by_cost(&a, &place, &types, spec.os(), &creds, now).await };
-                        for region in &regions {
+                        let mut each = regions.iter();
+                        loop {
+                            let Some(region) = each.next() else { break };
                             if self.clock.now_ms().saturating_sub(began) > LAUNCH_BUDGET_MS { return Ok(Tried::OutOfTime) }
                             let said = |what: &str| format!("{region}{}: {what}", if on_demand { " on-demand" } else { "" });
                             let (image, image_gb) = match self.image(region, &spec, &creds, now).await { Ok(i) => i, Err(e) => { last = said(&e); continue } };
@@ -4279,7 +4278,7 @@ impl<'a> ControlPlane<'a> {
         // its caller gives it (all of the run's with `secrets: inherit`, those it names, or none).
         let source = inst["source"].as_str();
         let own_text = source.map_or_else(|| run["workflow"].as_str(), |p| run["called"][p].as_str()).unwrap_or_default().to_string();
-        let wf = source.and_then(|p| called.get(p)).unwrap_or(wf);
+        let (run_wf, wf) = (wf, source.and_then(|p| called.get(p)).unwrap_or(wf));
         // The run's secrets: those this CI keeps that the run was given (see `create_run`), the narrowest under each
         // name, and those given with the run, which win.
         let stored: Vec<crate::secrets::Stored> = serde_json::from_value(run["stored"].clone()).unwrap_or_default();
@@ -4288,7 +4287,7 @@ impl<'a> ControlPlane<'a> {
         all.retain(|(n, _)| !with_run.contains(n));
         all.extend(secrets.iter().cloned());
         let secrets = &all[..];
-        let mut secrets: Vec<(String, String)> = match inst["call"].as_str().and_then(|c| run_wf_job(run, c)).and_then(|j| j.get("secrets").cloned()) {
+        let mut secrets: Vec<(String, String)> = match inst["call"].as_str().and_then(|c| run_wf.get("jobs").and_then(|j| j.get(c))).and_then(|j| j.get("secrets").cloned()) {
             Some(crate::workflow::Node::Scalar { text, .. }) if text == "inherit" => secrets.to_vec(),
             Some(m @ crate::workflow::Node::Map { .. }) => {
                 let mut values = self.run_contexts(run, &serde_json::json!({}), &serde_json::Map::new());

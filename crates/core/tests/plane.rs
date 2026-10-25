@@ -5949,8 +5949,9 @@ fn a_runners_calls_that_bring_nothing_are_answered_as_its_service_answers_them()
     assert_eq!(call("PATCH", "/_apis/v1/Timeline/p/t", r#"{"value":[]}"#).status, 200);
     assert_eq!(call("POST", "/_apis/v1/Logfiles/p/1", "").status, 200);
     assert!(!store.0.borrow().keys().any(|k| k.starts_with(&format!("rlog:{token}:"))));
-    // A call the runner makes of a page its lines go to, but not as it sends them: none.
-    assert_eq!(call("GET", "/_apis/v1/TimeLineWebConsoleLog/p/t/s", "").status, 404);
+    // Lines that say no step, sent another way than the runner sends them: the step is the address's.
+    assert_eq!(call("PUT", "/_apis/v1/TimeLineWebConsoleLog/p/t/0a1b2c3d", r#"{"value":["a line"]}"#).status, 200);
+    assert!(store.0.borrow().iter().any(|(k, v)| k.starts_with(&format!("rline:{token}:")) && v.contains("0a1b2c3d")));
 }
 
 /// A test of this file run under the sweep: its name, and itself.
