@@ -276,6 +276,77 @@ mod tests {
     }
 
     #[test]
+    fn a_digest_is_sha256s_and_an_app_key_is_read_in_either_form() {
+        assert_eq!(hex(&sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        use rsa::pkcs8::EncodePrivateKey;
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).unwrap();
+        let pem = key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        assert_eq!(rs256_jwt(&serde_json::json!({ "iss": "1" }), &pem).unwrap().split('.').count(), 3);
+        assert!(rs256_jwt(&serde_json::json!({}), "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n").unwrap_err().starts_with("App key: "));
+        assert!(rs256_jwt(&serde_json::json!({}), "not a key").unwrap_err().starts_with("App key: "));
+    }
+
+    #[test]
+    fn a_stored_key_that_is_not_one_says_so_wherever_it_is_used() {
+        for private_b64 in ["not base64!", "AAAA"] {
+            let bad = SigningKeyStore { private_b64: private_b64.into(), kid: "k".into() };
+            assert!(bad.public_jwk().is_err() && bad.jwt(&serde_json::json!({})).is_err() && bad.dpop("https://x", 0).is_err(), "{private_b64}");
+        }
+    }
+
+    #[test]
+    fn every_malformed_es256_token_says_what_is_wrong() {
+        use p256::ecdsa::signature::Signer as _;
+        let key = SigningKeyStore::generate();
+        let jwk = key.public_jwk().unwrap();
+        let signed = |unsigned: &str| { let sig: Signature = key.key().unwrap().sign(unsigned.as_bytes()); format!("{unsigned}.{}", b64url(&sig.to_bytes())) };
+        let token = key.jwt(&serde_json::json!({ "exp": 2_000 })).unwrap();
+        let (head, body) = (token.split('.').next().unwrap(), token.split('.').nth(1).unwrap());
+        for (token, jwk, said) in [
+            ("a.b".to_string(), jwk.clone(), "not a JWT"),
+            (token.clone(), serde_json::json!({ "x": "!", "y": jwk["y"] }), "Invalid symbol 33, offset 0."),
+            (token.clone(), serde_json::json!({ "x": jwk["x"], "y": "!" }), "Invalid symbol 33, offset 0."),
+            (format!("{head}.{body}.!"), jwk.clone(), "Invalid symbol 33, offset 0."),
+            (format!("{head}.{body}.AAAA"), jwk.clone(), "signature error"),
+            (signed(&format!("{head}.!")), jwk.clone(), "Invalid symbol 33, offset 0."),
+            (signed(&format!("{head}.{}", b64url(b"not json"))), jwk.clone(), "expected ident at line 1 column 2"),
+            (key.jwt(&serde_json::json!({})).unwrap(), jwk.clone(), "expired"),
+        ] {
+            assert_eq!(verify_es256_jwt(&token, &jwk, 1_000).unwrap_err(), said, "{token}");
+        }
+    }
+
+    #[test]
+    fn every_malformed_rs256_token_says_what_is_wrong() {
+        use rsa::traits::PublicKeyParts;
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+        let public = key.to_public_key();
+        let (n, e) = (b64url(&public.n().to_bytes_be()), b64url(&public.e().to_bytes_be()));
+        let jwks = serde_json::json!({ "keys": [{ "kty": "EC", "kid": "ec" }, { "kty": "RSA", "kid": "k1", "n": n, "e": e }, { "kty": "RSA", "kid": "bad-n", "n": "!", "e": e }, { "kty": "RSA", "kid": "tiny", "n": "AQAB", "e": "AQAB" }] });
+        let unsigned = |header: serde_json::Value, claims: &str| format!("{}.{claims}", b64url(header.to_string().as_bytes()));
+        let sign = |unsigned: String| format!("{unsigned}.{}", b64url(&rsa::pkcs1v15::SigningKey::<Sha256>::new(key.clone()).sign(unsigned.as_bytes()).to_vec()));
+        let k1 = serde_json::json!({ "alg": "RS256", "kid": "k1" });
+        let claims = |c: serde_json::Value| b64url(c.to_string().as_bytes());
+        for (token, said) in [
+            ("a.b.c.d".to_string(), "not a JWT"),
+            ("!.b.c".to_string(), "Invalid symbol 33, offset 0."),
+            (format!("{}.b.c", b64url(b"not json")), "expected ident at line 1 column 2"),
+            (sign(unsigned(serde_json::json!({ "alg": "HS256", "kid": "k1" }), "e30")), "not RS256"),
+            (sign(unsigned(serde_json::json!({ "alg": "RS256", "kid": "ec" }), "e30")), "signed by a key not in the set"),
+            (sign(unsigned(serde_json::json!({ "alg": "RS256", "kid": "bad-n" }), "e30")), "Invalid symbol 33, offset 0."),
+            (format!("{}.!", unsigned(k1.clone(), "e30")), "Invalid symbol 33, offset 0."),
+            (format!("{}.AAAA", unsigned(k1.clone(), "e30")), "bad signature"),
+            (sign(unsigned(k1.clone(), "!")), "Invalid symbol 33, offset 0."),
+            (sign(unsigned(k1.clone(), &b64url(b"not json"))), "expected ident at line 1 column 2"),
+            (sign(unsigned(k1.clone(), &claims(serde_json::json!({ "exp": 2_000, "nbf": 1_061 })))), "not yet valid"),
+        ] {
+            assert_eq!(verify_rs256_jwt(&token, &jwks, 1_000).unwrap_err(), said, "{token}");
+        }
+        assert!(verify_rs256_jwt(&sign(unsigned(serde_json::json!({ "alg": "RS256", "kid": "tiny" }), "e30")), &jwks, 1_000).is_err());
+        assert!(verify_rs256_jwt(&sign(unsigned(k1, &claims(serde_json::json!({ "exp": 2_000, "nbf": 1_060 })))), &jwks, 1_000).is_ok(), "a minute early is allowed");
+    }
+
+    #[test]
     fn ids_and_equality() {
         assert_eq!(random_id(12).len(), 12);
         assert!(random_id(12).chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
