@@ -212,12 +212,12 @@ impl capi::content_server::Content for Content {
             let mut sent = 0i64;
             while offset < end {
                 let n = ((end - offset) as usize).min(buf.len());
-                match file.read_at(&mut buf[..n], offset as u64) {
-                    Ok(0) => break,
-                    Ok(k) => {
-                        if tx.blocking_send(Ok(capi::ReadContentResponse { offset: sent, data: buf[..k].to_vec() })).is_err() { return }
-                        offset += k as i64;
-                        sent += k as i64;
+                // (A blob is not changed once kept: read to the size it had, or an error.)
+                match crate::faults::check(file.read_exact_at(&mut buf[..n], offset as u64)) {
+                    Ok(()) => {
+                        if tx.blocking_send(Ok(capi::ReadContentResponse { offset: sent, data: buf[..n].to_vec() })).is_err() { return }
+                        offset += n as i64;
+                        sent += n as i64;
                     }
                     Err(e) => { let _ = tx.blocking_send(Err(Status::from(Error::from(e)))); return }
                 }
@@ -295,7 +295,7 @@ fn write_session(l: &Layers, mut stream: tonic::Streaming<capi::WriteContentRequ
             if let Ok(d) = Digest::parse(&expected) {
                 if l.content_info(&d).is_ok() {
                     wr.close();
-                    if let Err(e) = store.abort(&reference) { eprintln!("failed to abort write: {e}") }
+                    if let Err(e) = crate::faults::check(store.abort(&reference)) { eprintln!("failed to abort write: {e}") }
                     return Err(Status::already_exists(format!("blob with expected digest {expected} exists")));
                 }
             }

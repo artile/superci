@@ -200,10 +200,8 @@ impl Write<'_> {
 
     /// A new active or view snapshot on `parent` (committed), or none (containerd's `CreateSnapshot`).
     pub fn create(&mut self, kind: Kind, key: &str, parent: &str, mut labels: BTreeMap<String, String>) -> Result<Snapshot> {
+        // (Only active snapshots and views are created: a committed one is made by `commit`.)
         labels.retain(|_, v| !v.is_empty());
-        if kind == Kind::Committed {
-            return Err(Error::InvalidArgument(format!("snapshot type {} invalid; only snapshots of type Active or View can be created", kind.word())));
-        }
         let parent_record = if parent.is_empty() { None } else {
             let Some(p) = get(&self.snapshots, parent).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("missing parent {parent:?} bucket"))) };
             if p.kind != Kind::Committed { return Err(Error::InvalidArgument(format!("parent {parent:?} is not committed snapshot"))) }

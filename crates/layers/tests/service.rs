@@ -42,14 +42,17 @@ fn start(name: &str, index: Option<&serde_json::Value>) -> Service {
 }
 
 /// The program on `dir`'s folders, once its socket is there (what it says, to `dir/log`, after what it said before).
-fn launch(dir: &std::path::Path) -> Child {
+fn launch(dir: &std::path::Path) -> Child { launch_with(dir, &[]) }
+
+/// The same with this environment besides.
+fn launch_with(dir: &std::path::Path, env: &[(&str, &str)]) -> Child {
     let socket = dir.join("layers.sock");
     let _ = std::fs::remove_file(&socket);
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_superci-layers"))
         .args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", socket.display()),
             format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("no-containerd.sock").display()), "--parallel=4".into(), "--sync-remove".into()])
-        .stderr(log).spawn().unwrap();
+        .envs(env.iter().copied()).stderr(log).spawn().unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     while !socket.exists() { assert!(Instant::now() < until, "it did not answer: {}", std::fs::read_to_string(dir.join("log")).unwrap_or_default()); std::thread::sleep(Duration::from_millis(20)) }
     child
@@ -332,6 +335,90 @@ async fn its_snapshots_are_containerds_overlay() {
     for (i, (uid, gid)) in [("a:b", None), ("0:1", None), ("0:1:", None), ("0:-1:5", None), ("0:4294967295:1", None), ("1:5:10", None), ("0:5:1", Some("1:5:10"))].into_iter().enumerate() {
         assert!(c.prepare(mapped(&format!("ns/2/bad{i}"), uid, gid)).await.is_err(), "{uid} {gid:?}");
     }
+}
+
+/// What containerd may ask amiss, or leave midway: commits with a parent given (taken, changed, missing, not
+/// committed), one onto a name there already, a view committed; lists of more than a page, read and left after the
+/// first; a blob left midway, one read from its end; a write with no message, or an action there is none of; every
+/// call said in the service's log when asked to (`SUPERCI_LAYERS_DEBUG`).
+#[tokio::test(flavor = "multi_thread")]
+async fn what_containerd_asks_amiss_or_leaves_midway_is_answered_as_containerd_does() {
+    use capi::WriteAction::*;
+    let dir = std::env::temp_dir().join(format!("superci-layers-service-{}-amiss", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s = Service { child: launch_with(&dir, &[("SUPERCI_LAYERS_DEBUG", "1")]), socket: dir.join("layers.sock"), dir };
+    let mut c = s.snapshots().await;
+    let prepare = |c: &mut sapi::snapshots_client::SnapshotsClient<tonic::transport::Channel>, key: &str, parent: &str| { let (mut c, key, parent) = (c.clone(), key.to_string(), parent.to_string()); async move { c.prepare(sapi::PrepareSnapshotRequest { key, parent, ..Default::default() }).await } };
+    let commit = |c: &mut sapi::snapshots_client::SnapshotsClient<tonic::transport::Channel>, name: &str, key: &str, parent: &str| { let (mut c, name, key, parent) = (c.clone(), name.to_string(), key.to_string(), parent.to_string()); async move { c.commit(sapi::CommitSnapshotRequest { name, key, parent, ..Default::default() }).await } };
+    prepare(&mut c, "base-k", "").await.unwrap();
+    commit(&mut c, "base", "base-k", "").await.unwrap();
+    prepare(&mut c, "other-k", "").await.unwrap();
+    commit(&mut c, "other", "other-k", "").await.unwrap();
+    // A parent given at the commit: taken by one made with none; refused for one made on another; missing; active.
+    prepare(&mut c, "orphan", "").await.unwrap();
+    commit(&mut c, "adopted", "orphan", "base").await.unwrap();
+    assert_eq!(c.stat(sapi::StatSnapshotRequest { key: "adopted".into(), ..Default::default() }).await.unwrap().into_inner().info.unwrap().parent, "base");
+    prepare(&mut c, "on-base", "base").await.unwrap();
+    assert_eq!(commit(&mut c, "x", "on-base", "other").await.unwrap_err().code(), Code::InvalidArgument);
+    prepare(&mut c, "lost", "").await.unwrap();
+    assert_eq!(commit(&mut c, "x", "lost", "nowhere").await.unwrap_err().code(), Code::NotFound);
+    prepare(&mut c, "active-parent", "").await.unwrap();
+    assert_eq!(commit(&mut c, "x", "lost", "active-parent").await.unwrap_err().code(), Code::FailedPrecondition);
+    // Onto a name there already; a view committed; a parent that is not committed for a new one.
+    assert_eq!(commit(&mut c, "base", "lost", "").await.unwrap_err().code(), Code::AlreadyExists);
+    c.view(sapi::ViewSnapshotRequest { key: "v".into(), parent: "base".into(), ..Default::default() }).await.unwrap();
+    assert_eq!(commit(&mut c, "x", "v", "").await.unwrap_err().code(), Code::FailedPrecondition);
+    assert_eq!(prepare(&mut c, "y", "lost").await.unwrap_err().code(), Code::InvalidArgument);
+    // Labels changed whole; listed by labels when there are none, and by a field there is none of.
+    let mut info = c.stat(sapi::StatSnapshotRequest { key: "base".into(), ..Default::default() }).await.unwrap().into_inner().info.unwrap();
+    info.labels = [("a".to_string(), "1".to_string())].into_iter().collect();
+    c.update(sapi::UpdateSnapshotRequest { info: Some(info.clone()), update_mask: None, ..Default::default() }).await.unwrap();
+    info.name = "nowhere".into();
+    assert_eq!(c.update(sapi::UpdateSnapshotRequest { info: Some(info), update_mask: None, ..Default::default() }).await.unwrap_err().code(), Code::NotFound);
+    for f in ["labels.none==x", "size==1"] {
+        let mut l = c.list(sapi::ListSnapshotsRequest { filters: vec![f.into()], ..Default::default() }).await.unwrap().into_inner();
+        while l.message().await.unwrap().is_some() {}
+    }
+    // More than a page of each (a page is a hundred): every one listed; a list left after its first page.
+    for i in 0..250 { prepare(&mut c, &format!("many-{i}"), "").await.unwrap(); }
+    let mut l = c.list(sapi::ListSnapshotsRequest::default()).await.unwrap().into_inner();
+    let mut n = 0;
+    while let Some(m) = l.message().await.unwrap() { n += m.info.len() }
+    assert!(n >= 250, "{n}");
+    let mut l = c.list(sapi::ListSnapshotsRequest::default()).await.unwrap().into_inner();
+    let _ = l.message().await;
+    drop(l);
+    let mut content = s.content().await;
+    for i in 0..250 { write(&mut content, vec![msg(Commit, &format!("w{i}"), 0, "", 0, format!("blob {i}").as_bytes())]).await.unwrap(); }
+    let mut l = content.list(capi::ListContentRequest::default()).await.unwrap().into_inner();
+    let mut n = 0;
+    while let Some(m) = l.message().await.unwrap() { n += m.info.len() }
+    assert!(n >= 250, "{n}");
+    let mut l = content.list(capi::ListContentRequest::default()).await.unwrap().into_inner();
+    let _ = l.message().await;
+    drop(l);
+    // A blob read from its very end (nothing); one left after its first part.
+    let big = vec![5u8; 5 << 20];
+    let d = digest(&big);
+    write(&mut content, vec![msg(Commit, "big", big.len() as i64, &d, 0, &big)]).await.unwrap();
+    assert!(read_all(&mut content, &d, big.len() as i64, 0).await.unwrap().is_empty());
+    let mut r = content.read(capi::ReadContentRequest { digest: d.clone(), offset: 0, size: 0 }).await.unwrap().into_inner();
+    let _ = r.message().await;
+    drop(r);
+    // A write with no message at all; one of an action there is none of; one left after its first answer.
+    assert_eq!(content.write(tokio_stream::iter(Vec::<capi::WriteContentRequest>::new())).await.err().map(|e| e.code()).unwrap_or(Code::Cancelled), Code::Cancelled);
+    let mut odd = msg(Stat, "odd", 0, "", 0, b"");
+    odd.action = 99;
+    write(&mut content, vec![odd]).await.unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(msg(Write, "left", 10, "", 0, b"part")).await.unwrap();
+    let mut a = content.write(tokio_stream::wrappers::ReceiverStream::new(rx)).await.unwrap().into_inner();
+    let _ = a.message().await;
+    drop(a);
+    drop(tx);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(s.log().contains("superci-layers: info") || s.log().contains("superci-layers: write"), "{}", s.log().lines().take(5).collect::<Vec<_>>().join("\n"));
 }
 
 /// SuperCI's store and control plane for the test, on one port: files by ranges (`/files/…`), links to a layer's
