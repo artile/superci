@@ -1934,10 +1934,15 @@ impl<'a> ControlPlane<'a> {
 
     /// Whether the App is installed anywhere (asked with its own key, at most once a minute).
     async fn installed(&self) -> bool {
+        // (None without an App, and nothing kept: an App made a moment later is asked of at once.)
+        if self.config.app.is_none() { return false }
         let now = self.clock.now_ms();
         if let Some((yes, at)) = *self.cache.installed.borrow() { if now.saturating_sub(at) < 60_000 { return yes; } }
-        let mut yes = false;
-        for app in self.config.apps() { yes |= github::installations(self.http, app, now).await.map(|i| !i.is_empty()).unwrap_or(false) }
+        let (mut yes, mut apps) = (false, self.config.apps());
+        loop {
+            let Some(app) = apps.next() else { break };
+            yes |= github::installations(self.http, app, now).await.map(|i| !i.is_empty()).unwrap_or(false)
+        }
         self.cache.installed.replace(Some((yes, now)));
         yes
     }
