@@ -165,7 +165,7 @@ jobs:
         with:
           name: tests
       - name: Slice ${{ matrix.part }} of every sweep's faults
-        run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --no-fail-fast -E 'binary(~sweep_) | (package(superci-core) & binary(=plane) & test(every_test_here))'
+        run: cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --no-fail-fast -E 'binary(~sweep_) | test(~holds_with_each_call_and_store_operation_failing) | (package(superci-core) & binary(=plane) & test(every_test_here))'
 
   # superci-layers against containerd's own conformance suites for snapshotters and content stores (as root: the
   # snapshotter suite mounts overlays), directly and through containerd's metadata layer.

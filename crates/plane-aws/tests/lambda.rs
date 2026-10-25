@@ -23,8 +23,9 @@ fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_mi
 struct Runtime { queue: Mutex<VecDeque<(String, Value)>>, queued: Condvar, answers: Mutex<BTreeMap<String, (String, Value)>>, answered: Condvar }
 
 impl Runtime {
-    fn serve() -> (Arc<Runtime>, String) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    fn serve() -> (Arc<Runtime>, String) { Self::serve_on(TcpListener::bind("127.0.0.1:0").unwrap()) }
+
+    fn serve_on(listener: TcpListener) -> (Arc<Runtime>, String) {
         let at = listener.local_addr().unwrap().to_string();
         let rt = Arc::new(Runtime::default());
         let r = rt.clone();
@@ -95,6 +96,11 @@ fn start(runtime: &str, stand_in: &str, env: &[(&str, &str)]) -> Function {
     c.env("AWS_LAMBDA_RUNTIME_API", runtime).env("AWS_REGION", "us-east-1").env("SUPERCI_STAND_IN", stand_in)
         .env("AWS_ACCESS_KEY_ID", "ASIAEXAMPLEFUNCTION1").env("AWS_SECRET_ACCESS_KEY", "example-secret").env("AWS_SESSION_TOKEN", "example-token");
     for (k, v) in env { c.env(k, v); }
+    // (A folder of its own for what it makes: Lambda's /tmp is the function's alone.)
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let tmp = std::env::temp_dir().join(format!("superci-lambda-tmp-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    std::fs::create_dir_all(&tmp).unwrap();
+    c.env("TMPDIR", &tmp);
     Function(c.spawn().unwrap())
 }
 
@@ -159,7 +165,8 @@ fn mkfs_dir() -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("superci-lambda-converter-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     let p = d.join("mkfs.erofs");
-    std::fs::write(&p, "#!/bin/sh\nfor a; do out=$a; done\ncat > \"$out\"\nif grep -q refuse \"$out\"; then echo 'unusual entry' >&2; exit 1; fi\n").unwrap();
+    // (A tar that says "nofile" makes nothing, one that says "folder" a folder where the file should be.)
+    std::fs::write(&p, "#!/bin/sh\nfor a; do out=$a; done\ncat > \"$out\"\nif grep -q refuse \"$out\"; then echo 'unusual entry' >&2; exit 1; fi\nif grep -q nofile \"$out\"; then rm \"$out\"; fi\nif grep -q folder \"$out\"; then rm \"$out\"; mkdir \"$out\"; fi\n").unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     d
@@ -263,4 +270,127 @@ fn a_queued_job_gets_its_machine_after_the_webhook_is_answered_as_aws_answered()
     };
     assert_eq!((job["cloud"].as_str(), job["machine_id"].as_str(), job["machine_type"].as_str(), job["zone"].as_str()), (Some("aws"), Some("i-00000000000000001"), Some("c8a.large"), Some("us-east-1d")), "{job}\n{:?}", aws.unanswered.lock().unwrap());
     assert!(github.unanswered.lock().unwrap().is_empty(), "{:?}", github.unanswered.lock().unwrap());
+}
+
+/// Its settings over several pages of SSM's, one of them not a setting (no value); its instance types from the deploy;
+/// a request with its query, without one, and with a header that is not text; a move's step, read fresh.
+#[test]
+fn its_settings_are_read_page_after_page_and_its_requests_as_lambda_gives_them() {
+    let aws = aws();
+    for i in 0..12 { aws.put(&format!("/superci/{PLANE}/SETTING_{i:02}"), "x"); }
+    aws.put(&format!("/superci/{PLANE}/MAX_CPU"), "16");
+    aws.fail("AmazonSSM.GetParametersByPath", 200, &json!({ "Parameters": [{ "Name": format!("/superci/{PLANE}/NO_VALUE") }], "NextToken": "next-0" }).to_string(), Some(1));
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, &aws.url, &[("PLANE_ID", PLANE), ("TABLE", TABLE), ("INSTANCE_TYPES", "c7i.large, ,m7i.large"), ("AWS_LAMBDA_FUNCTION_NAME", TABLE)]);
+    let mut event = url_event("GET", "/health", json!({ "x-number": 1 }), "");
+    event["rawQueryString"] = json!("full=1");
+    let (kind, answer) = runtime.invoke(event.clone());
+    assert_eq!((kind.as_str(), answer["statusCode"].as_u64()), ("response", Some(200)), "{answer}");
+    event.as_object_mut().unwrap().remove("rawQueryString");
+    assert_eq!(runtime.invoke(event).1["statusCode"].as_u64(), Some(200));
+    let reads = || aws.asked.lock().unwrap().iter().filter(|a| a["target"] == "AmazonSSM.GetParametersByPath").count();
+    assert!(reads() >= 3, "every page: {}", reads());
+    // (Fresh: at most every second.)
+    std::thread::sleep(Duration::from_millis(1100));
+    let before = reads();
+    let (kind, _) = runtime.invoke(url_event("POST", "/move/export", json!({}), "{}"));
+    assert_eq!(kind, "response");
+    assert!(reads() > before, "a move's step reads them fresh");
+}
+
+/// Lambda's runtime API not there yet when the program starts: it asks again until it is, as the control plane and
+/// as the converter.
+#[test]
+fn the_program_waits_for_lambdas_runtime_to_be_there() {
+    let aws = aws();
+    for env in [vec![("PLANE_ID", PLANE), ("TABLE", TABLE)], vec![("SUPERCI_CONVERTER", "1")]] {
+        let port = { let l = TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let _f = start(&format!("127.0.0.1:{port}"), &aws.url, &env);
+        std::thread::sleep(Duration::from_millis(1500));
+        let (runtime, _) = Runtime::serve_on(TcpListener::bind(("127.0.0.1", port)).unwrap());
+        let (kind, _) = runtime.invoke(if env.len() == 1 { json!({ "something": "else" }) } else { json!({ "superci": "sweep" }) });
+        assert_eq!(kind, "response");
+    }
+}
+
+/// What was left for after the answer failing (DynamoDB refusing the job's record once its machine is asked for): said
+/// in the function's log, and the next request answered.
+#[test]
+fn what_is_left_for_after_the_answer_may_fail_and_the_next_request_is_answered() {
+    let aws = aws();
+    let github = aws.github.lock().unwrap().clone().unwrap();
+    *github.aws.lock().unwrap() = Some(aws.clone());
+    aws.put(&format!("/superci/{PLANE}/GITHUB_APP"), &GitHub::app().to_string());
+    aws.replaying(include_str!("../../cli/fixtures/aws/launch/spot.jsonl"), &[]);
+    let refusing = aws.clone();
+    aws.during("CreateFleet", move || refusing.fail("DynamoDB_20120810.PutItem", 400, &superci_testkit::json_error("ValidationException", "One or more parameter values were invalid"), None));
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, &aws.url, &[("PLANE_ID", PLANE), ("TABLE", TABLE), ("RUNNER_REGION", "us-east-1"), ("AWS_LAMBDA_FUNCTION_NAME", TABLE)]);
+    let (_, (body, signature)) = github.queue("tests", "superci/cpu=2", now_ms());
+    let (kind, answer) = runtime.invoke(url_event("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": signature, "content-type": "application/json" }), &String::from_utf8(body).unwrap()));
+    assert_eq!((kind.as_str(), answer["statusCode"].as_u64()), ("response", Some(202)), "{answer}");
+    let (kind, answer) = runtime.invoke(url_event("GET", "/health", json!({}), ""));
+    assert_eq!((kind.as_str(), answer["statusCode"].as_u64()), ("response", Some(200)), "{answer}");
+}
+
+/// What the converter says when S3 does not take a step (the file, the blob's copy, what was made), when the blob is
+/// not there, when mkfs.erofs makes nothing it can read, and when S3 is out of reach: each said in what was made.
+#[test]
+fn the_converter_says_which_step_s3_or_mkfs_did_not_take() {
+    let dir = mkfs_dir();
+    let bucket = "superci-plane-lambdaplane1-us-east-1";
+    let job = |blob: &[u8], key: &str, bucket: &str| {
+        let d = sha(blob);
+        let hex = d[7..].to_string();
+        json!({ "digest": d, "size": blob.len(), "region": "us-east-1", "bucket": bucket, "source": { "key": key },
+            "erofs_key": format!("layers/{hex}.erofs"), "blob_key": format!("layers/{hex}.blob"), "done_key": format!("layers/done/{hex}.json") })
+    };
+    let converted = |aws: &Aws, blob: &[u8], fail: Option<(&str, &str, u16, &str)>| -> Value {
+        let gh = aws.github.lock().unwrap().clone().unwrap();
+        let key = format!("layers/staging/{}-x", &sha(blob)[7..]);
+        gh.put_object(&format!("{bucket}/{key}"), blob);
+        if let Some((method, part, status, body)) = fail { gh.answer_with(method, part, status, &[], body) }
+        let (runtime, at) = Runtime::serve();
+        let _f = start(&at, &aws.url, &[("SUPERCI_CONVERTER", "1"), ("LAMBDA_TASK_ROOT", dir.to_str().unwrap())]);
+        runtime.invoke(job(blob, &key, bucket)).1
+    };
+    let error = |done: &Value| done["error"].as_str().unwrap_or_default().to_string();
+    let s3_error = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>";
+    let done = converted(&aws(), &gzip(b"one layer"), Some(("PUT", ".erofs", 403, s3_error)));
+    assert!(error(&done).starts_with("putting the file: S3 answered 403"), "{done}");
+    let done = converted(&aws(), &gzip(b"two layer"), Some(("PUT", ".blob", 200, s3_error)));
+    assert_eq!(error(&done), "copying the blob: S3 failed", "{done}");
+    let done = converted(&aws(), &gzip(b"red layer"), Some(("PUT", ".blob", 500, s3_error)));
+    assert!(error(&done).starts_with("copying the blob: S3 answered 500"), "{done}");
+    let done = converted(&aws(), &gzip(b"blue layer"), Some(("PUT", "layers/done/", 500, s3_error)));
+    assert!(done["unsaid"].as_str().is_some_and(|u| u.starts_with("writing what was made")), "{done}");
+    let done = converted(&aws(), &gzip(b"a nofile layer"), None);
+    assert!(!error(&done).is_empty() && done["erofs"].is_null(), "{done}");
+    let done = converted(&aws(), &gzip(b"a folder layer"), None);
+    assert!(!error(&done).is_empty() && done["erofs"].is_null(), "{done}");
+    // Not in staging any more (taken by a converter before), a bucket no address is made of, S3 out of reach.
+    let aws = aws();
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, &aws.url, &[("SUPERCI_CONVERTER", "1"), ("LAMBDA_TASK_ROOT", dir.to_str().unwrap())]);
+    let blob = gzip(b"gone");
+    let done = runtime.invoke(job(&blob, &format!("layers/staging/{}-gone", &sha(&blob)[7..]), bucket)).1;
+    assert!(error(&done).starts_with("fetching the blob: HTTP 404"), "{done}");
+    let done = runtime.invoke(job(&blob, "layers/staging/x", "a bucket")).1;
+    assert!(!error(&done).is_empty(), "{done}");
+    // Digests that are not a sha256's (another kind; not hex); a size that is not the blob's.
+    for digest in [format!("md5:{}", "a".repeat(67)), format!("sha256:{}", "z".repeat(64))] {
+        let mut odd = job(&blob, "layers/staging/x", bucket);
+        odd["digest"] = json!(digest);
+        assert_eq!(error(&runtime.invoke(odd).1), "not a sha256 digest");
+    }
+    let gh = aws.github.lock().unwrap().clone().unwrap();
+    let key = format!("layers/staging/{}-size", &sha(&blob)[7..]);
+    gh.put_object(&format!("{bucket}/{key}"), &blob);
+    let mut sized = job(&blob, &key, bucket);
+    sized["size"] = json!(blob.len() + 5);
+    assert!(error(&runtime.invoke(sized).1).contains("bytes), not"), "the size it was said to be");
+    let (runtime, at) = Runtime::serve();
+    let _f = start(&at, "http://127.0.0.1:9", &[("SUPERCI_CONVERTER", "1"), ("LAMBDA_TASK_ROOT", dir.to_str().unwrap())]);
+    let done = runtime.invoke(job(&blob, "layers/staging/x", bucket)).1;
+    assert!(error(&done).starts_with("fetching the blob") && done["unsaid"].is_string(), "{done}");
 }

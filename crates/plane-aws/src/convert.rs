@@ -99,7 +99,8 @@ pub fn make(blob: impl Read, mkfs: &str, out: &std::path::Path, keep: Option<&st
                 (hex(&tar.hash.finalize()), tar.inner.into_inner())
             }
             Packing::Zstd => {
-                let mut tar = Hashed { inner: zstd::stream::read::Decoder::with_buffer(buffered).map_err(|e| format!("zstd: {e}"))?, hash: Sha256::new() };
+                // (Its decoder is only memory set aside: making it does not fail.)
+                let mut tar = Hashed { inner: zstd::stream::read::Decoder::with_buffer(buffered).expect("a zstd decoder"), hash: Sha256::new() };
                 copy(&mut tar, &mut stdin)?;
                 (hex(&tar.hash.finalize()), tar.inner.finish())
             }
@@ -111,14 +112,17 @@ pub fn make(blob: impl Read, mkfs: &str, out: &std::path::Path, keep: Option<&st
         })
     })();
     drop(stdin);
-    let status = child.wait().map_err(|e| format!("{mkfs}: {e}"))?;
+    // (Its own child, its input closed: waited for, it ends.)
+    let status = child.wait().expect("mkfs.erofs, a child of this program");
     let said = said.join().unwrap_or_default();
     let fail = |e: String| { let _ = std::fs::remove_file(out); Err(e) };
     let (diff_id, mut rest) = match streamed { Ok(s) => s, Err(e) => return fail(e) };
-    if let Err(e) = std::io::copy(&mut rest, &mut std::io::sink()) { return fail(format!("reading the blob: {e}")) }
+    // (Unpacking reads a blob to its end; were anything left that could not be read, its digest would not be the one
+    // asked for, and nothing is made of it.)
+    let _ = std::io::copy(&mut rest, &mut std::io::sink());
     if !status.success() { return fail(format!("mkfs.erofs refused the layer ({status}): {}", said.trim().lines().last().unwrap_or_default())) }
+    // (What was kept was written as it came: a file has nothing more to flush.)
     let taken = rest.into_inner();
-    if let Some(mut f) = taken.keep { if let Err(e) = f.flush() { return fail(e.to_string()) } }
     Ok(Made { digest: format!("sha256:{}", hex(&taken.hash.finalize())), size: taken.bytes, diff_id: format!("sha256:{diff_id}") })
 }
 
@@ -138,11 +142,11 @@ fn said(r: superci_core::io::Response, what: &str) -> Result<superci_core::io::R
     if r.status < 300 { Ok(r) } else { Err(format!("{what}: S3 answered {} {}", r.status, r.body_text().chars().take(300).collect::<String>())) }
 }
 
-/// A file put in the bucket: in one request when small, else in parts, four at once.
-fn upload(http: &(dyn Http + Sync), creds: &Credentials, region: &str, url: &str, path: &std::path::Path) -> Result<(), String> {
+/// A file put in the bucket: in one request when small, else in parts (of `part` bytes), four at once.
+fn upload(http: &(dyn Http + Sync), creds: &Credentials, region: &str, url: &str, path: &std::path::Path, part: usize) -> Result<(), String> {
     let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
     let now = super::now_ms;
-    if size <= PART as u64 {
+    if size <= part as u64 {
         let body = std::fs::read(path).map_err(|e| e.to_string())?;
         said(block_on(aws::s3(http, "PUT", url, region, creds, body, &[], now()))?, "putting the file")?;
         return Ok(())
@@ -150,34 +154,33 @@ fn upload(http: &(dyn Http + Sync), creds: &Credentials, region: &str, url: &str
     let made = said(block_on(aws::s3(http, "POST", &format!("{url}?uploads"), region, creds, vec![], &[], now()))?, "beginning the upload")?;
     let text = made.body_text();
     let id = text.split("<UploadId>").nth(1).and_then(|s| s.split("</UploadId>").next()).ok_or("S3 gave no upload id")?.to_string();
-    let parts = size.div_ceil(PART as u64) as usize;
+    let parts = size.div_ceil(part as u64) as usize;
     let tags: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(vec![]);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failed: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     std::thread::scope(|s| {
-        for _ in 0..4 {
-            s.spawn(|| loop {
+        (0..4).for_each(|_| { s.spawn(|| loop {
                 let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n >= parts || failed.lock().unwrap().is_some() { break }
                 let one = (|| -> Result<String, String> {
-                    use std::io::{Seek, SeekFrom};
-                    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
-                    f.seek(SeekFrom::Start((n * PART) as u64)).map_err(|e| e.to_string())?;
-                    let mut body = Vec::with_capacity(PART);
-                    f.take(PART as u64).read_to_end(&mut body).map_err(|e| e.to_string())?;
-                    let mut last = String::new();
-                    for _ in 0..3 {
-                        match block_on(aws::s3(http, "PUT", &format!("{url}?partNumber={}&uploadId={}", n + 1, aws::rfc3986(&id)), region, creds, body.clone(), &[], now())) {
+                    use std::os::unix::fs::FileExt;
+                    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+                    let mut body = vec![0; part.min((size - (n * part) as u64) as usize)];
+                    f.read_exact_at(&mut body, (n * part) as u64).map_err(|e| e.to_string())?;
+                    // (Asked three times.)
+                    let mut tries = 0;
+                    loop {
+                        tries += 1;
+                        let last = match block_on(aws::s3(http, "PUT", &format!("{url}?partNumber={}&uploadId={}", n + 1, aws::rfc3986(&id)), region, creds, body.clone(), &[], now())) {
                             Ok(r) if r.status < 300 => return r.header("etag").map(str::to_string).ok_or_else(|| "S3 gave no ETag".to_string()),
-                            Ok(r) => last = format!("S3 answered {}", r.status),
-                            Err(e) => last = e,
-                        }
+                            Ok(r) => format!("S3 answered {}", r.status),
+                            Err(e) => e,
+                        };
+                        if tries == 3 { return Err(format!("part {}: {last}", n + 1)) }
                     }
-                    Err(format!("part {}: {last}", n + 1))
                 })();
                 match one { Ok(tag) => tags.lock().unwrap().push((n + 1, tag)), Err(e) => { *failed.lock().unwrap() = Some(e); break } }
-            });
-        }
+            }); });
     });
     if let Some(e) = failed.into_inner().unwrap() {
         let _ = block_on(aws::s3(http, "DELETE", &format!("{url}?uploadId={}", aws::rfc3986(&id)), region, creds, vec![], &[], now()));
@@ -209,7 +212,7 @@ pub fn convert(http: &(dyn Http + Sync), creds: &Credentials, job: &Job, mkfs: &
         if made.digest != job.digest || made.size != job.size { let _ = std::fs::remove_file(&out); return Err(format!("the blob is {} ({} bytes), not {} ({} bytes)", made.digest, made.size, job.digest, job.size)) }
         let erofs_size = std::fs::metadata(&out).map_err(|e| e.to_string())?.len();
         let erofs_digest = file_sha256(&out)?;
-        upload(http, creds, &job.region, &bucket_url(&job.erofs_key), &out)?;
+        upload(http, creds, &job.region, &bucket_url(&job.erofs_key), &out, PART)?;
         let _ = std::fs::remove_file(&out);
         // The blob kept beside it (within the bucket: S3 copies it, up to 5 GB, larger than any blob converted).
         let source = format!("/{}/{key}", job.bucket);
@@ -298,5 +301,147 @@ mod tests {
         assert_eq!(first.digest, sha(&tar));
         assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap(), "the same layer makes the same file");
         if let Ok(fsck) = std::env::var("SUPERCI_FSCK_EROFS") { assert!(Command::new(fsck).arg(&a).status().unwrap().success()) }
+    }
+
+    /// S3 as a test has it answer: by what is asked (`POST ?uploads`, `PUT ?partNumber=2`, …), each call kept.
+    struct S3<F: Fn(&str, &str) -> superci_core::io::Result<superci_core::io::Response> + Sync>(F, std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait(?Send)]
+    impl<F: Fn(&str, &str) -> superci_core::io::Result<superci_core::io::Response> + Sync> Http for S3<F> {
+        async fn send(&self, r: superci_core::io::Request) -> superci_core::io::Result<superci_core::io::Response> {
+            let query = r.url.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
+            self.1.lock().unwrap().push(format!("{} {query}", r.method));
+            (self.0)(&r.method, &query)
+        }
+    }
+
+    fn creds() -> Credentials { Credentials { access_key_id: "AKIAEXAMPLE".into(), secret_access_key: "example".into(), session_token: None, expires_at_ms: u64::MAX } }
+
+    fn answer(status: u16, body: &str) -> superci_core::io::Result<superci_core::io::Response> { Ok(superci_core::io::Response::new(status, "application/xml", body)) }
+
+    /// A file in parts (four bytes each here), each part asked again up to three times, the upload finished in order; or,
+    /// where S3 does not take it, given up and taken back, saying why.
+    #[test]
+    fn a_large_file_goes_up_in_parts_asked_again_and_given_up_saying_why() {
+        let d = tmp("upload");
+        let file = d.join("layer.erofs");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let url = "https://superci-plane-p-us-east-1.s3.us-east-1.amazonaws.com/layers/a.erofs";
+        let up = |http: &(dyn Http + Sync), part: usize| upload(http, &creds(), "us-east-1", url, &file, part);
+        let begun = || answer(200, "<InitiateMultipartUploadResult><UploadId>up-1</UploadId></InitiateMultipartUploadResult>");
+        let tagged = || Ok(superci_core::io::Response::new(200, "application/xml", "").with_header("etag", "\"e\""));
+        // Small: one request; S3 refusing it, or out of reach.
+        let s3 = S3(|_, _| answer(200, ""), Default::default());
+        up(&s3, 64).unwrap();
+        assert_eq!(*s3.1.lock().unwrap(), ["PUT "]);
+        assert!(up(&S3(|_, _| answer(403, "<Error>AccessDenied</Error>"), Default::default()), 64).unwrap_err().starts_with("putting the file: S3 answered 403"));
+        assert!(up(&S3(|_, _| Err("connection refused".into()), Default::default()), 64).is_err());
+        // In parts: the second part refused once, then taken.
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        let s3 = S3(|m, q| match (m, q) {
+            ("POST", "uploads") => begun(),
+            ("PUT", q) if q.starts_with("partNumber=2&") && !refused.swap(true, std::sync::atomic::Ordering::SeqCst) => answer(500, "<Error>InternalError</Error>"),
+            ("PUT", _) => tagged(),
+            _ => answer(200, "<CompleteMultipartUploadResult/>"),
+        }, Default::default());
+        up(&s3, 4).unwrap();
+        let calls = s3.1.lock().unwrap().clone();
+        assert_eq!(calls.iter().filter(|c| c.starts_with("PUT partNumber=")).count(), 4, "{calls:?}");
+        assert_eq!(calls.last().unwrap(), "POST uploadId=up-1");
+        // What S3 may answer amiss: no upload id; a part refused three times (or out of reach), the upload taken back;
+        // no ETag; finished with 200 and an error in its body; the beginning refused.
+        assert_eq!(up(&S3(|_, _| answer(200, "<nothing/>"), Default::default()), 4).unwrap_err(), "S3 gave no upload id");
+        let s3 = S3(|m, q| match (m, q) { ("POST", "uploads") => begun(), ("PUT", _) => answer(503, "<Error>SlowDown</Error>"), _ => answer(204, "") }, Default::default());
+        assert!(up(&s3, 4).unwrap_err().ends_with("S3 answered 503"));
+        assert!(s3.1.lock().unwrap().iter().any(|c| c == "DELETE uploadId=up-1"), "taken back");
+        assert!(up(&S3(|m, q| match (m, q) { ("POST", "uploads") => begun(), ("PUT", _) => Err("reset".into()), _ => answer(204, "") }, Default::default()), 4).unwrap_err().ends_with("reset"));
+        assert_eq!(up(&S3(|m, q| match (m, q) { ("POST", "uploads") => begun(), _ => answer(200, "") }, Default::default()), 4).unwrap_err().split(": ").last(), Some("S3 gave no ETag"));
+        assert!(up(&S3(|m, q| match (m, q) { ("POST", "uploads") => begun(), ("PUT", _) => tagged(), _ => answer(200, "<Error><Code>InternalError</Code></Error>") }, Default::default()), 4).unwrap_err().starts_with("finishing the upload: <Error>"));
+        assert!(up(&S3(|_, _| answer(403, "<Error>AccessDenied</Error>"), Default::default()), 4).unwrap_err().starts_with("beginning the upload"));
+        // The file gone before it is read, or not a file (a folder): said.
+        let gone = d.join("gone.erofs");
+        assert!(upload(&S3(|_, _| answer(200, ""), Default::default()), &creds(), "us-east-1", url, &gone, 4).is_err());
+        assert!(upload(&S3(|_, _| answer(200, ""), Default::default()), &creds(), "us-east-1", url, &d, 1 << 20).is_err());
+        assert!(upload(&S3(|m, q| match (m, q) { ("POST", "uploads") => begun(), _ => tagged() }, Default::default()), &creds(), "us-east-1", url, &d, 4).is_err());
+        // S3 out of reach as the upload begins, or as it is finished.
+        assert!(up(&S3(|_, _| Err("connection refused".into()), Default::default()), 4).unwrap_err().contains("connection refused"));
+        assert!(up(&S3(|m, q| match (m, q) { ("POST", "uploads") => begun(), ("PUT", _) => tagged(), _ => Err("reset".into()) }, Default::default()), 4).unwrap_err().contains("reset"));
+        assert!(up(&S3(|m, q| match (m, q) { ("POST", "uploads") => begun(), ("PUT", _) => tagged(), _ => answer(500, "<Error>InternalError</Error>") }, Default::default()), 4).unwrap_err().starts_with("finishing the upload: S3 answered 500"));
+        // The file taken away once the upload has begun: its parts cannot be read.
+        let moving = d.join("moving.erofs");
+        std::fs::write(&moving, b"0123456789").unwrap();
+        let s3 = S3(|m, q| match (m, q) { ("POST", "uploads") => { let _ = std::fs::remove_file(&moving); begun() } _ => tagged() }, Default::default());
+        assert!(upload(&s3, &creds(), "us-east-1", url, &moving, 4).is_err());
+        // One part failing: the parts not begun yet are not asked for.
+        let many = d.join("many.erofs");
+        std::fs::write(&many, [7u8; 12]).unwrap();
+        let s3 = S3(|m, q| match (m, q) {
+            ("POST", "uploads") => begun(),
+            ("PUT", q) if q.starts_with("partNumber=1&") => Err("reset".into()),
+            ("PUT", _) => { std::thread::sleep(Duration::from_millis(100)); tagged() }
+            _ => answer(204, ""),
+        }, Default::default());
+        assert!(upload(&s3, &creds(), "us-east-1", url, &many, 1).is_err());
+        assert!(s3.1.lock().unwrap().iter().filter(|c| c.starts_with("PUT partNumber=")).count() < 12 * 3);
+    }
+
+    /// The converter with S3 out of reach as the blob is copied beside its file: what was made is not said as made.
+    #[test]
+    fn a_copy_s3_does_not_answer_is_said() {
+        let d = tmp("copy");
+        let mkfs = fake_mkfs(&d);
+        let blob = b"a tar".repeat(10);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = format!("http://{}", listener.local_addr().unwrap());
+        let served = blob.clone();
+        std::thread::spawn(move || for mut c in listener.incoming().flatten() {
+            let mut head = [0u8; 4096];
+            let _ = c.read(&mut head);
+            let _ = c.write_all(&[format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", served.len()).into_bytes(), served.clone()].concat());
+        });
+        // (The blob fetched from where the stand-in is: only this test fetches one here.)
+        std::env::set_var("SUPERCI_STAND_IN", &at);
+        // (Its file put; the copy beside it not answered.)
+        let puts = std::sync::atomic::AtomicUsize::new(0);
+        let s3 = S3(|m, _| match m { "PUT" if puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 => Err("connection reset".into()), _ => answer(200, "") }, Default::default());
+        let digest = sha(&blob);
+        let job = Job { digest: digest.clone(), size: blob.len() as u64, region: "us-east-1".into(), bucket: "superci-plane-p-us-east-1".into(), source: json!({ "key": format!("{}x", superci_core::layers::STAGING) }),
+            erofs_key: "layers/a.erofs".into(), blob_key: "layers/a.blob".into(), done_key: "layers/done/a.json".into() };
+        let done = convert(&s3, &creds(), &job, &mkfs, &d);
+        std::env::remove_var("SUPERCI_STAND_IN");
+        assert!(done["error"].as_str().is_some_and(|e| e.contains("connection reset")), "{done}");
+    }
+
+    /// A blob that cannot be read (from its start, or partway), a place to keep it that cannot be written, a file made
+    /// that cannot be read back: said, nothing left.
+    #[test]
+    fn a_blob_or_a_file_that_cannot_be_read_or_kept_is_said() {
+        struct Broken(usize);
+        impl Read for Broken {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 { return Err(std::io::Error::other("the connection broke")) }
+                let n = self.0.min(buf.len()).min(512);
+                buf[..n].fill(b'a');
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        let d = tmp("broken");
+        let mkfs = fake_mkfs(&d);
+        let out = d.join("out");
+        assert!(make(Broken(0), &mkfs, &out, None).unwrap_err().starts_with("reading the blob"));
+        assert!(make(Broken(2048), &mkfs, &out, None).unwrap_err().starts_with("unpacking the blob"));
+        let zst = zstd::encode_all(&[1u8; 1000][..], 3).unwrap();
+        assert!(make(&zst[..zst.len() - 3], &mkfs, &out, None).unwrap_err().starts_with("unpacking the blob"));
+        // (A gzip member whole, then the rest of the blob broken.)
+        let gz = { let mut e = flate2::write::GzEncoder::new(vec![], flate2::Compression::fast()); e.write_all(b"a tar").unwrap(); e.finish().unwrap() };
+        let then_broken = std::io::Read::chain(&gz[..], Broken(0));
+        assert!(make(then_broken, &mkfs, &out, None).is_err());
+        assert!(make(&b"a tar"[..], &mkfs, &out, Some(&d.join("no/such/folder/blob"))).unwrap_err().contains("no/such/folder"));
+        if std::path::Path::new("/dev/full").exists() {
+            assert!(make(&[b'a'; 4096][..], &mkfs, &out, Some(std::path::Path::new("/dev/full"))).is_err());
+        }
+        assert!(file_sha256(&d.join("none")).is_err());
+        assert!(file_sha256(&d).is_err(), "a folder is not read as a file");
     }
 }

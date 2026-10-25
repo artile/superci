@@ -67,8 +67,10 @@ impl Dynamo<'_> {
     /// One call, asked again when DynamoDB says to (throttled, or a passing error of its own), as AWS's own SDKs do:
     /// up to ten times, each wait twice the last at most (from 50 ms to 5 s), a random part of it.
     async fn call(&self, op: &str, body: Value) -> io::Result<Value> {
-        let mut most_ms = 50u64;
-        for _ in 0..9 {
+        let (mut most_ms, mut tries) = (50u64, 0);
+        loop {
+            tries += 1;
+            if tries == 10 { break }
             match aws::json_call(self.http, "POST", &format!("https://dynamodb.{}.amazonaws.com/", self.region), &self.region, "dynamodb", Some(&format!("DynamoDB_20120810.{op}")),
                 "application/x-amz-json-1.0", Some(&body), &own_credentials(), now_ms()).await {
                 Err(e) if AGAIN.iter().any(|kind| e.starts_with(kind)) => {
@@ -180,22 +182,27 @@ impl Store for Dynamo<'_> {
         }
         self.query(part(prefix), prefix, Some(n)).await
     }
-    /// A hundred at a time (DynamoDB's most), asked again for what it leaves for later.
+    /// A hundred at a time (DynamoDB's most), asked again for what it leaves for later (what it still leaves after
+    /// eight times, read one by one).
     async fn get_many(&self, keys: &[String]) -> io::Result<Vec<Option<String>>> {
         let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut left: std::collections::HashSet<String> = std::collections::HashSet::new();
         for chunk in keys.chunks(100) {
             let mut want: Vec<Value> = chunk.iter().collect::<std::collections::BTreeSet<_>>().into_iter().map(|k| self.key(k)).collect();
-            for _ in 0..8 {
-                if want.is_empty() { break }
+            let mut asked = 0;
+            loop {
+                asked += 1;
                 let v = self.call("BatchGetItem", json!({ "RequestItems": { &self.table: { "Keys": want, "ConsistentRead": true } } })).await?;
                 for item in v["Responses"][&self.table].as_array().into_iter().flatten() {
                     if let (Some(k), Some(val)) = (item["k"]["S"].as_str(), item["v"]["S"].as_str()) { found.insert(k.to_string(), val.to_string()); }
                 }
                 want = v["UnprocessedKeys"][&self.table]["Keys"].as_array().cloned().unwrap_or_default();
+                if want.is_empty() || asked == 8 { break }
             }
+            left.extend(want.iter().filter_map(|k| k["k"]["S"].as_str().map(str::to_string)));
         }
         let mut out = Vec::with_capacity(keys.len());
-        for k in keys { out.push(match found.get(k) { Some(v) => Some(v.clone()), None => self.get_old(k).await? }) }
+        for k in keys { out.push(match found.get(k) { Some(v) => Some(v.clone()), None if left.contains(k) => self.get(k).await?, None => self.get_old(k).await? }) }
         Ok(out)
     }
     /// Moves what is left in the old partition into each record's own (not over one written there since), then says
@@ -326,7 +333,7 @@ fn converter(api: &str) -> ! {
         let id = next.headers().get("lambda-runtime-aws-request-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         let event: Value = next.body_mut().read_json().unwrap_or_default();
         let done = match serde_json::from_value::<convert::Job>(event) {
-            Ok(job) => { let done = convert::convert(&http, &own_credentials(), &job, &mkfs, std::path::Path::new("/tmp")); eprintln!("superci: {done}"); done }
+            Ok(job) => { let done = convert::convert(&http, &own_credentials(), &job, &mkfs, &std::env::temp_dir()); eprintln!("superci: {done}"); done }
             Err(e) => json!({ "error": format!("not a layer to convert: {e}") }),
         };
         let _ = runtime.post(&format!("http://{api}/2018-06-01/runtime/invocation/{id}/response")).send_json(done);
@@ -416,7 +423,15 @@ mod tests {
     /// a time (so the store pages), leaves some keys of a batch for later the first time, and says it is throttled
     /// once in a while (so the store asks again).
     #[derive(Default)]
-    struct FakeDynamo { items: RefCell<BTreeMap<(String, String), Value>>, calls: RefCell<u64>, unprocessed_once: RefCell<bool> }
+    struct FakeDynamo { items: RefCell<BTreeMap<(String, String), Value>>, calls: RefCell<u64>, unprocessed_once: RefCell<bool>,
+        /// The call (counted from 1) answered with an error the store does not ask again for.
+        fail_at: RefCell<Option<u64>>,
+        /// A query's next page said to be empty, more after it (as DynamoDB may answer).
+        empty_page_once: RefCell<bool>,
+        /// Throttled ever more (every call): what asking again does not get past.
+        throttled: RefCell<bool>,
+        /// Every batch leaves all but its first key for later.
+        unprocessed_always: RefCell<bool> }
 
     #[async_trait(?Send)]
     impl Http for FakeDynamo {
@@ -424,7 +439,8 @@ mod tests {
             let n = { let mut c = self.calls.borrow_mut(); *c += 1; *c };
             let op = r.header("x-amz-target").unwrap_or_default().trim_start_matches("DynamoDB_20120810.").to_string();
             let fail = |kind: &str| Ok(Response::new(400, "application/x-amz-json-1.0", json!({ "__type": format!("com.amazonaws.dynamodb.v20120810#{kind}"), "message": kind }).to_string()));
-            if n % 13 == 0 { return fail("ThrottlingException") }
+            if n % 13 == 0 || *self.throttled.borrow() { return fail("ThrottlingException") }
+            if *self.fail_at.borrow() == Some(n) { return fail("ValidationException") }
             let b: Value = serde_json::from_slice(&r.body).unwrap_or_default();
             let key = |k: &Value| (k["p"]["S"].as_str().unwrap_or_default().to_string(), k["k"]["S"].as_str().unwrap_or_default().to_string());
             let ok = |v: Value| Ok(Response::new(200, "application/x-amz-json-1.0", v.to_string()));
@@ -452,6 +468,7 @@ mod tests {
                     let after = b["ExclusiveStartKey"]["k"]["S"].as_str().map(str::to_string);
                     let forward = b["ScanIndexForward"] != false;
                     let start = after.map(|a| hits.iter().position(|i| i["k"]["S"].as_str() == Some(a.as_str())).map(|x| x + 1).unwrap_or(0)).unwrap_or(0);
+                    if self.empty_page_once.replace(false) { return ok(json!({ "Items": [], "LastEvaluatedKey": { "p": { "S": p }, "k": { "S": "" } } })) }
                     let page = b["Limit"].as_u64().unwrap_or(2).min(2) as usize;
                     let shown: Vec<Value> = hits.iter().skip(start).take(page).cloned().collect();
                     let more = start + page < hits.len();
@@ -463,7 +480,7 @@ mod tests {
                     let keys = b["RequestItems"][&table]["Keys"].as_array().cloned().unwrap_or_default();
                     let first = !*self.unprocessed_once.borrow();
                     *self.unprocessed_once.borrow_mut() = true;
-                    let (now, later) = if first && keys.len() > 1 { keys.split_at(1) } else { keys.split_at(keys.len()) };
+                    let (now, later) = if (first || *self.unprocessed_always.borrow()) && keys.len() > 1 { keys.split_at(1) } else { keys.split_at(keys.len()) };
                     let found: Vec<Value> = now.iter().filter_map(|k| items.get(&key(k)).cloned()).collect();
                     ok(json!({ "Responses": { &table: found }, "UnprocessedKeys": if later.is_empty() { json!({}) } else { json!({ &table: { "Keys": later } }) } }))
                 }
@@ -567,5 +584,136 @@ mod tests {
         assert_eq!(block_on(s.get("job:3")).unwrap().as_deref(), Some("tres"));
         assert_eq!(block_on(s.get("hello:1")).unwrap().as_deref(), Some("h"));
         assert_eq!(fake.items.borrow()[&("layout".to_string(), "layout".to_string())]["v"]["S"], "kinds");
+    }
+
+    /// What every store's caller does with the old layout and the new, as one scenario: each step's own error kept,
+    /// none stopping the next (what a sweep run of it fails along the way).
+    fn every_operation(fake: &FakeDynamo) -> Vec<String> {
+        let old = |k: &str, v: &str| (("s".to_string(), k.to_string()), json!({ "p": { "S": "s" }, "k": { "S": k }, "v": { "S": v } }));
+        fake.items.borrow_mut().extend([old("job:1", "one"), old("job:2", "two"), old("job:3", "three"), old("hello:1", "h")]);
+        fake.items.borrow_mut().insert(("job".into(), "job:5".into()), json!({ "p": { "S": "job" }, "k": { "S": "job:5" }, "v": { "S": "five" } }));
+        // (A store each time, as each request has: it asks again where the layout is.)
+        let s = || store(fake);
+        let mut errors = vec![];
+        let mut keep = |r: io::Result<()>| if let Err(e) = r { errors.push(e) };
+        keep(block_on(s().get("job:2")).map(|_| ()));
+        keep(block_on(s().get("job:9")).map(|_| ()));
+        keep(block_on(s().list("job:")).map(|_| ()));
+        keep(block_on(s().list_last("job:", 2)).map(|_| ()));
+        keep(block_on(s().get_many(&["job:3".into(), "job:9".into(), "job:5".into()])).map(|_| ()));
+        keep(block_on(s().get_many(&(0..10).map(|i| format!("job:{i}")).collect::<Vec<_>>())).map(|_| ()));
+        keep(block_on(s().put_if_absent("job:1", "x".into())).map(|_| ()));
+        keep(block_on(s().put_if_absent("job:6", "six".into())).map(|_| ()));
+        keep(block_on(s().swap("job:3", Some("three"), "tres".into())).map(|_| ()));
+        keep(block_on(s().swap("job:5", Some("five"), "cinco".into())).map(|_| ()));
+        keep(block_on(s().swap("job:7", None, "seven".into())).map(|_| ()));
+        // (Not in its own partition, and the old one's value is not the one read: not written.)
+        keep(block_on(s().swap("hello:1", Some("not h"), "x".into())).map(|_| ()));
+        keep(block_on(s().delete("job:2")));
+        keep(block_on(s().put("job:8", "eight".into())));
+        keep(block_on(s().put_until("rline:t:1", "lines".into(), 1_790_000_000_000)));
+        for _ in 0..4 { keep(block_on(s().migrate(2)).map(|_| ())) }
+        keep(block_on(s().list_last("job:", 2)).map(|_| ()));
+        errors
+    }
+
+    /// Each of DynamoDB's calls in turn answered with an error it is not asked again for: the store says it, as
+    /// DynamoDB said it, and the operations after it go on.
+    /// (Also with DynamoDB leaving every batch's keys for later but one. The clean runs alone unless
+    /// `SUPERCI_SWEEP_FAULTS=1`, each `SUPERCI_SWEEP_SLICE` its share, as the other sweeps.)
+    #[test]
+    fn the_store_holds_with_each_call_and_store_operation_failing() {
+        let (k0, n) = superci_testkit::sweep::slice();
+        let faults = std::env::var("SUPERCI_SWEEP_FAULTS").is_ok_and(|v| v == "1");
+        for unprocessed in [false, true] {
+            let clean = FakeDynamo { unprocessed_always: RefCell::new(unprocessed), ..Default::default() };
+            assert_eq!(every_operation(&clean), Vec::<String>::new());
+            let calls = if faults { *clean.calls.borrow() } else { 0 };
+            for k in (1..=calls).filter(|k| (*k as usize - 1) % n == k0 - 1) {
+                let fake = FakeDynamo { unprocessed_always: RefCell::new(unprocessed), ..Default::default() };
+                *fake.fail_at.borrow_mut() = Some(k);
+                let errors = every_operation(&fake);
+                assert!(errors.iter().all(|e| e.starts_with("ValidationException")), "call {k}: {errors:?}");
+            }
+        }
+    }
+
+    /// What DynamoDB may answer that is not a record (an item without its key or value), an empty page with more
+    /// after it, a batch with nothing of what was asked, and throttling that does not end.
+    #[test]
+    fn the_store_reads_what_dynamodb_answers_amiss_and_stops_asking_again() {
+        let fake = FakeDynamo::default();
+        let s = store(&fake);
+        // (Partition "job", no value; "s", no key: neither is a record.)
+        fake.items.borrow_mut().insert(("job".into(), "job:0".into()), json!({ "p": { "S": "job" }, "k": { "S": "job:0" } }));
+        fake.items.borrow_mut().insert(("s".into(), "job:x".into()), json!({ "p": { "S": "s" }, "v": { "S": "no key" } }));
+        assert_eq!(block_on(s.list("job:")).unwrap(), vec![]);
+        assert_eq!(block_on(s.get_many(&["job:0".into()])).unwrap(), [None]);
+        assert!(!block_on(s.migrate(5)).unwrap() || fake.items.borrow().contains_key(&("layout".to_string(), "layout".to_string())));
+        assert_eq!(block_on(s.list_last("job:", 0)).unwrap(), vec![]);
+        // A page that says nothing, more after it.
+        let fake = FakeDynamo::default();
+        fake.items.borrow_mut().insert(("s".into(), "job:1".into()), json!({ "p": { "S": "s" }, "k": { "S": "job:1" }, "v": { "S": "one" } }));
+        *fake.empty_page_once.borrow_mut() = true;
+        assert!(!block_on(store(&fake).migrate(5)).unwrap(), "more to come");
+        // A batch DynamoDB keeps leaving for later: asked eight times, what it gave kept.
+        let fake = FakeDynamo::default();
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
+        for i in 0..10 { fake.items.borrow_mut().insert(("job".into(), format!("job:{i}")), json!({ "p": { "S": "job" }, "k": { "S": format!("job:{i}") }, "v": { "S": "v" } })); }
+        *fake.unprocessed_always.borrow_mut() = true;
+        let got = block_on(store(&fake).get_many(&(0..10).map(|i| format!("job:{i}")).collect::<Vec<_>>())).unwrap();
+        assert_eq!(got.iter().filter(|g| g.is_some()).count(), 10, "the rest read one by one");
+        // Throttled every time: asked again ten times, then what DynamoDB said.
+        let fake = FakeDynamo::default();
+        *fake.throttled.borrow_mut() = true;
+        assert!(block_on(store(&fake).get("job:1")).unwrap_err().starts_with("ThrottlingException"));
+        assert_eq!(*fake.calls.borrow(), 10);
+    }
+
+    /// An address answering each request as given (its first line and headers handed back): a redirect, a header that
+    /// is not text, a body cut short.
+    fn answering(answer: &'static [u8]) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || for mut c in listener.incoming().flatten() {
+            use std::io::{Read, Write};
+            let mut head = [0u8; 4096];
+            let n = c.read(&mut head).unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&head[..n]).to_string());
+            let _ = c.write_all(answer);
+        });
+        (at, rx)
+    }
+
+    /// The client as the function uses it: its headers sent as given (a host too, when nothing stands in for the
+    /// address), a redirect given back when asked not to follow it, a header that is not text left out; what cannot be
+    /// asked, or is answered short, said.
+    #[test]
+    fn the_client_sends_what_it_is_given_and_says_what_went_wrong() {
+        let http = Blocking(agent(10), agent(0));
+        let (at, asked) = answering(b"HTTP/1.1 302 Found\r\nlocation: https://logs.example/1\r\nx-odd: \xff\xfe\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        let r = block_on(http.send(Request::new("GET", &format!("{at}/log")).with_header("host", "example.com").with_header("x-a", "1").without_following())).unwrap();
+        assert_eq!((r.status, r.header("location"), r.header("x-odd")), (302, Some("https://logs.example/1"), None));
+        let head = asked.recv().unwrap().to_ascii_lowercase();
+        assert!(head.contains("host: example.com") && head.contains("x-a: 1"), "{head}");
+        let (short, _) = answering(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\nconnection: close\r\n\r\nshort");
+        assert!(block_on(http.send(Request::new("GET", &short))).is_err());
+        assert!(block_on(http.send(Request::new("GET", "http://not a host/"))).is_err());
+        let closed = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); format!("http://{}", l.local_addr().unwrap()) };
+        assert!(block_on(http.send(Request::new("POST", &closed))).unwrap_err().starts_with("POST http://127.0.0.1:"));
+    }
+
+    /// A call to itself that cannot be signed (a region no address is made of): not sent, its note taken away.
+    #[test]
+    fn a_call_to_itself_that_cannot_be_signed_is_left_to_the_schedule() {
+        let fake = FakeDynamo::default();
+        fake.items.borrow_mut().insert(("layout".into(), "layout".into()), json!({ "p": { "S": "layout" }, "k": { "S": "layout" }, "v": { "S": "kinds" } }));
+        let s = store(&fake);
+        let (lambda, later) = (Lambda::default(), RefCell::new(vec![]));
+        let timer = Scheduled { http: &lambda, store: &s, region: "us east-1", function: "superci-plane-t", later: &later };
+        block_on(timer.wake_in(1_000)).unwrap();
+        assert!(lambda.called.borrow().is_empty());
+        assert_eq!(block_on(s.get(WAKING)).unwrap(), None);
     }
 }
