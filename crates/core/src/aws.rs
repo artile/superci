@@ -76,12 +76,15 @@ pub fn sigv4(method: &str, url: &str, headers: &[(String, String)], body: &[u8],
     let date = &amz_date[..8];
     let scope = format!("{date}/{region}/{service}/aws4_request");
     let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
-    let mut key = hmac_sha256(format!("AWS4{}", creds.secret_access_key).as_bytes(), date.as_bytes());
-    for part in [region, service, "aws4_request"] { key = hmac_sha256(&key, part.as_bytes()); }
-    let signature = hex(&hmac_sha256(&key, to_sign.as_bytes()));
+    let signature = hex(&hmac_sha256(&signing_key(&creds.secret_access_key, date, region, service), to_sign.as_bytes()));
     let mut out = all;
     out.push(("authorization".into(), format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={signature}", creds.access_key_id)));
     Ok(out)
+}
+
+/// SigV4's signing key: the secret, then the day, the region, the service and `aws4_request`, each signed with the last.
+fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    [region, service, "aws4_request"].iter().fold(hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes()), |key, part| hmac_sha256(&key, part.as_bytes()))
 }
 
 /// A link that does one S3 request (`method` on `url`, an object's address) for `expires_s` seconds, signed in its
@@ -109,8 +112,7 @@ pub fn presign_with(method: &str, url: &str, creds: &Credentials, region: &str, 
     let canonical_query = encoded.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
     let canonical = format!("{method}\n{}\n{canonical_query}\n{}\n{names}\nUNSIGNED-PAYLOAD", u.path(), signed.iter().map(|(k, v)| format!("{k}:{v}\n")).collect::<String>());
     let to_sign = format!("AWS4-HMAC-SHA256\n{date}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
-    let mut key = hmac_sha256(format!("AWS4{}", creds.secret_access_key).as_bytes(), date[..8].as_bytes());
-    for part in [region, "s3", "aws4_request"] { key = hmac_sha256(&key, part.as_bytes()); }
+    let key = signing_key(&creds.secret_access_key, &date[..8], region, "s3");
     Ok(format!("{}://{host}{}?{canonical_query}&X-Amz-Signature={}", u.scheme(), u.path(), hex(&hmac_sha256(&key, to_sign.as_bytes()))))
 }
 
@@ -411,11 +413,7 @@ pub async fn run_instance(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, 
                 Some(_) => 1,
                 None => 2 + (cpus(kind) > size) as u8 * 2 + (speed(kind) < first - 0.001) as u8,
             };
-            let mut groups: Vec<Vec<(String, Option<String>, String)>> = vec![];
-            for t in 0..6u8 {
-                let group: Vec<_> = rest.iter().filter(|(kind, _, zone)| tier(kind, zone) == t).cloned().collect();
-                if !group.is_empty() { groups.push(group) }
-            }
+            let groups: Vec<Vec<(String, Option<String>, String)>> = (0..6u8).map(|t| rest.iter().filter(|(kind, _, zone)| tier(kind, zone) == t).cloned().collect::<Vec<_>>()).filter(|g| !g.is_empty()).collect();
             match fleet(http, creds, l, &groups, now_ms, told).await {
                 Ok(answer) => {
                     // (The pool AWS chose, with its price.)
@@ -1610,6 +1608,10 @@ poweroff
         // (Not for the runner that only says why a job failed: it uses no disk.)
         grow = if fail.is_some() { "" } else { GROW_ROOT }))
 }
+
+#[cfg(test)]
+#[path = "aws_faults.rs"]
+mod faults;
 
 #[cfg(test)]
 mod tests {
