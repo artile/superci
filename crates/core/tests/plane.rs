@@ -6205,16 +6205,27 @@ fn a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after
     let (token, job_id) = (r["jobs"][0]["token"].as_str().unwrap().to_string(), r["jobs"][0]["job_id"].as_str().unwrap().to_string());
     assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/superci/tree?part=0"))).status, 302);
     assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/runner/{token}/_apis/v1/Logfiles/p/1")).with_body("a whole log\n")).status, 200);
-    assert_eq!(run(key(get(&format!("/runs/{id}/log?job=0&log=1")))).body_text(), "a whole log\n");
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/runner/{token}/_apis/v1/Logfiles/p/1")).with_body("and more\n")).status, 200);
+    assert_eq!(run(key(get(&format!("/runs/{id}/log?job=0&log=1")))).body_text(), "a whole log\nand more\n");
+    // (A piece kept damaged: said.)
+    store.0.borrow_mut().insert(format!("rlog:{token}:0004:0000"), "!!".into());
+    assert_eq!(run(key(get(&format!("/runs/{id}/log?job=0&log=4")))).status, 500);
     let j = job(&store, job_id.parse().unwrap());
     let (runner, hello) = (j["runner"].as_str().unwrap().to_string(), j["hello"].as_str().unwrap().to_string());
     let step = "0a1b2c3d-0000-0000-0000-000000000000";
     assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/hello?runner={runner}&t={hello}&live=tl_{step}_1.log&at=0")).with_body("2026-10-16T21:18:46.0000000Z a line\npart of")).status, 200);
     assert_eq!(run(key(get(&format!("/runs/{id}/log?job=0&step={step}")))).body_text(), "2026-10-16T21:18:46.0000000Z a line\n");
     // Its steps' whole logs, linked in the bucket.
-    store.0.borrow_mut().entry(format!("rjob:{token}")).and_modify(|v| { let mut h: serde_json::Value = serde_json::from_str(v).unwrap(); h["steps"] = serde_json::json!([{ "type": "Task", "log": 1, "order": 1, "state": "completed", "id": step }]); *v = h.to_string() });
-    assert_eq!(json(&run(key(get(&format!("/job/log?id={job_id}&link")))))["urls"].as_array().map(|u| u.len()), Some(1));
-    assert!(json(&run(key(get(&format!("/job/log?id={job_id}&steps")))))["steps"][0]["text"].as_str().is_some_and(|t| t.contains("a whole log")));
+    let steps = |s: serde_json::Value| { store.0.borrow_mut().entry(format!("rjob:{token}")).and_modify(|v| { let mut h: serde_json::Value = serde_json::from_str(v).unwrap(); h["steps"] = s; *v = h.to_string() }); };
+    steps(serde_json::json!([{ "type": "Task", "log": 1, "order": 1, "state": "completed", "id": "s1" }, { "type": "Task", "log": 2, "order": 2, "state": "completed", "id": "s2" }]));
+    assert_eq!(json(&run(key(get(&format!("/job/log?id={job_id}&link")))))["urls"].as_array().map(|u| u.len()), Some(2), "a step's log with no piece kept has no link");
+    steps(serde_json::json!([{ "type": "Task", "log": 1, "order": 1, "state": "completed", "id": "s1" }, { "type": "Task", "order": 2, "state": "inProgress", "id": step }]));
+    let read = json(&run(key(get(&format!("/job/log?id={job_id}&steps")))));
+    assert!(read["steps"][0]["text"].as_str().is_some_and(|t| t.contains("a whole log")) && read["steps"][1]["text"].as_str().is_some_and(|t| t.contains("a line")), "{read}");
+    // (A log kept in a region that makes no address: no link to it.)
+    store.0.borrow_mut().insert(format!("rlog:{token}:0003:0000"), "s3:us east-1".into());
+    steps(serde_json::json!([{ "type": "Task", "log": 3, "order": 1, "state": "completed", "id": "s3" }]));
+    assert_eq!(run(key(get(&format!("/job/log?id={job_id}&link")))).status, 500);
     // A day on: what the run kept goes, from the bucket too.
     clock.0.set(t + 2 * 86_400_000);
     block_on(plane.alarm()).unwrap();
