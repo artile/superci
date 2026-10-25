@@ -382,3 +382,121 @@ fn constant_loops_and_helpers_give_what_they_did() {
     query_params(&serde_json::json!({ "A": [], "B": [1, { "C": null }] }), "", &mut out);
     assert_eq!(out, [("B.1".to_string(), "1".to_string())]);
 }
+
+/// AWS's answers with one header more (the error type a JSON API names in it).
+struct Headed(Aws, &'static str, &'static str);
+#[async_trait::async_trait(?Send)]
+impl Http for Headed { async fn send(&self, r: Request) -> Result<crate::io::Response> { Ok(self.0.send(r).await?.with_header(self.1, self.2)) } }
+
+fn answering(answer: Answer) -> Aws { Aws { answer, fail: None, n: Cell::new(0), calls: RefCell::default() } }
+
+fn sts_answer() -> Answer { Box::new(|_, _| (200, "<AccessKeyId>A</AccessKeyId><SecretAccessKey>S</SecretAccessKey><SessionToken>T</SessionToken>".into())) }
+
+#[test]
+fn what_a_json_api_says_is_wrong_is_read_from_wherever_it_says_it() {
+    let call = |aws: &dyn Http| futures::executor::block_on(json_call(aws, "POST", "https://lambda.us-east-1.amazonaws.com/x", "us-east-1", "lambda", None, "application/json", Some(&serde_json::json!({})), &creds(), 0)).unwrap_err();
+    // Its header, the body's `Type` (only who is at fault), or nothing: its status.
+    assert_eq!(call(&Headed(answering(Box::new(|_, _| (400, r#"{"message":"m"}"#.into()))), "x-amzn-errortype", "ResourceNotFoundException:http://internal")), "ResourceNotFoundException: m");
+    assert_eq!(call(&answering(Box::new(|_, _| (400, r#"{"Type":"User","Message":"m"}"#.into())))), "User: m");
+    assert_eq!(call(&answering(Box::new(|_, _| (502, "Bad gateway".into())))), "HTTP 502: Bad gateway");
+    // STS refusing, and STS, Lambda and IAM each with every call failing in turn.
+    let refused = answering(Box::new(|_, _| (403, "<ErrorResponse><Error><Code>AccessDenied</Code><Message>Not authorized</Message></Error></ErrorResponse>".into())));
+    assert_eq!(futures::executor::block_on(assume_role_with_web_identity(&refused, "us-east-1", "arn", "t", "s", 0)).unwrap_err(), "AccessDenied: Not authorized");
+    assert_eq!(swept(sts_answer, |aws| futures::executor::block_on(assume_role_with_web_identity(aws, "us-east-1", "arn", "t", "s", 0)).map(|c| c.session_token)), Some("T".to_string()));
+    swept(|| Box::new(|_, _| (202, String::new())), |aws| futures::executor::block_on(invoke_later(aws, "us-east-1", "f", &serde_json::json!({}), &creds(), 0)));
+    swept(|| Box::new(|_, _| ok()), |aws| futures::executor::block_on(iam(aws, &creds(), "GetRole", serde_json::json!({ "RoleName": "r" }), 0)));
+}
+
+#[test]
+fn small_readings_of_aws_s_words_take_every_shape() {
+    // Times cut short anywhere, or not numbers: none.
+    for t in ["2026", "2026-01", "2026-01-01", "2026-01-01T00", "2026-01-01T00:00", "2026-01-01T00:00:0", "x026-01-01T00:00:00Z"] { assert_eq!(parse_iso_ms(t), None, "{t}") }
+    assert_eq!(xml_tag("<a>open", "a"), None);
+    assert!(presign("GET", "not an address", &creds(), "us-east-1", 60, 0).is_err());
+    assert!(presign("GET", "https://b.s3.us-east-1.amazonaws.com/k?x=1", &creds(), "us-east-1", 60, 0).is_err());
+    assert!(trust_policy("arn:aws:iam::1:oidc-provider/p", "p.example", "p1", "sts.amazonaws.com").to_string().contains("plane:p1"));
+    assert!(runner_policy("111111111111", "p1").to_string().contains("p1"));
+    assert_eq!((budget_name("p1"), budget_role_name("p1"), stop_policy_name("p1")), ("superci-p1".into(), "superci-budget-p1".into(), "superci-stop-p1".into()));
+    assert!(spot_quota_link("eu-north-1").ends_with(SPOT_CPU_QUOTA));
+    assert_eq!((cpus("t3.micro"), cpus("m7a.weird")), (1, 0));
+    for (region, usd) in [("us-west-1", 0.096), ("eu-north-1", 0.0836), ("ap-south-1", 0.0912), ("ca-central-1", 0.088), ("eu-west-2", 0.0928), ("eu-central-1", 0.0952), ("eu-west-1", 0.088), ("us-east-1", 0.08), ("nowhere-1", 0.096)] { assert_eq!(disk_gb_month(region), usd) }
+    assert_eq!(image_flavor("my-own-image-*"), "my-own-image");
+    // A table's row with one cell, and a region that is none: left out.
+    assert!(published_images("### `k`\n\n| Region | AMI ID |\n| only |\n| US-EAST-1 | `ami-0123456789abcdef0` |\n", "k").is_empty());
+    // An organization's policy whose account number is none, and a policy not an organization's; a refusal said
+    // without its code.
+    let r = Refusal { action: "x".into(), by: By::Organization, policy: "arn:aws:organizations::12:policy/p-1".into() };
+    assert_eq!((r.management_account(), Refusal { policy: "arn:aws:iam::aws:policy/x".into(), ..r.clone() }.management_account()), (None, None));
+    assert!(refusal("Something: User x is not authorized to perform: ec2:RunInstances").is_some());
+    // Prices: none for no type; the Price List's products as objects, and a price without its dollars.
+    let none: Vec<String> = vec![];
+    assert_eq!(futures::executor::block_on(cheapest_for_speed(&answering(prices()), "us-east-1", &creds(), &none, "linux", 0)), None);
+    let listed: Answer = Box::new(|_, _| (200, serde_json::json!({ "PriceList": [{ "terms": { "OnDemand": { "t": { "priceDimensions": { "d": { "pricePerUnit": {} }, "e": { "pricePerUnit": { "USD": "0.5" } } } } } } }] }).to_string()));
+    assert_eq!(futures::executor::block_on(disk_price(&answering(listed), &creds(), "us-east-1", 0)).unwrap(), 0.5);
+    let spotless: Answer = Box::new(|_, _| (200, "<item><spotPrice>0.1</spotPrice></item><item><timestamp>1970-01-01T00:00:00Z</timestamp></item>".into()));
+    assert!(futures::executor::block_on(spot_cost(&answering(spotless), "us-east-1", "a", &creds(), "m7a.large", "linux", 0, 1, 0)).is_err());
+    swept(prices, |aws| futures::executor::block_on(spot_cpu_quota(aws, "us-east-1", &creds(), 0)));
+    swept(|| Box::new(|_, _| (400, "<Response><Errors><Error><Code>DryRunOperation</Code><Message>ok</Message></Error></Errors></Response>".into())), |aws| futures::executor::block_on(could_run(aws, "us-east-1", &creds(), "ami-1", "m7a.large", false, 0)));
+    // A copy without snapshots: only itself removed.
+    swept(prices, |aws| futures::executor::block_on(delete_copied_image(aws, "us-east-1", &creds(), &CopiedImage { id: "ami-1".into(), name: String::new(), state: String::new(), snapshots: vec![] }, 0)));
+    // A bucket whose last removal finds it gone.
+    let gone_at_last: Answer = Box::new(|w, _| if w.starts_with("GET") { (200, "<ListBucketResult></ListBucketResult>".into()) } else { (404, String::new()) });
+    futures::executor::block_on(delete_bucket(&answering(gone_at_last), "us-east-1", &creds(), "p1", &|| 0)).unwrap();
+    // A given network: none of either, an id that is none, and a subnet AWS answers without its VPC.
+    let given = |subnets: &[&str], groups: &[&str]| GivenNetwork { subnets: subnets.iter().map(|s| s.to_string()).collect(), security_groups: groups.iter().map(|s| s.to_string()).collect(), private: false };
+    let never = || answering(Box::new(|_, _| panic!("nothing is asked")));
+    assert!(futures::executor::block_on(given_network(&never(), "us-east-1", &creds(), &given(&["subnet-0123456789abcdef0"], &[]), 0)).unwrap_err().contains("needs a subnet and a security group"));
+    assert!(futures::executor::block_on(given_network(&never(), "us-east-1", &creds(), &given(&["subnet-0123456789abcdef0"], &["sg-x"]), 0)).unwrap_err().contains("sg-x is not"));
+    let no_vpc: Answer = Box::new(|_, _| (200, "<subnetId>subnet-0123456789abcdef0</subnetId><availabilityZone>a</availabilityZone>".into()));
+    assert!(futures::executor::block_on(given_network(&answering(no_vpc), "us-east-1", &creds(), &given(&["subnet-0123456789abcdef0"], &["sg-0123456789abcdef0"]), 0)).unwrap_err().contains("no subnet"));
+}
+
+#[test]
+fn a_machines_start_up_script_refuses_what_it_cannot_put_together() {
+    for bad in ["http://a.example/x", "https://a.example/x y"] { assert!(runner_user_data_for(&crate::io::Work::GitHub { jit: "abc".into() }, 60, "linux", Some(bad)).is_err(), "{bad}") }
+    assert!(runner_user_data_for(&crate::io::Work::GitLab { url: "https://gitlab.com".into(), token: "t".into() }, 60, "windows", None).unwrap_err().contains("GitHub jobs only"));
+    assert!(runner_user_data_for(&crate::io::Work::GitHub { jit: "not base64!".into() }, 60, "windows", None).is_err());
+    let gitlab = runner_user_data_for(&crate::io::Work::GitLab { url: "https://gitlab.com".into(), token: "t".into() }, 60, "linux", Some("https://a.example/n?x=1")).unwrap();
+    assert!(gitlab.contains("pkill -TERM -f /tmp/gitlab-runner"));
+    assert!(runner_user_data_for(&crate::io::Work::Fail { jit: "abc".into(), why: "eA==".into() }, 60, "linux", Some("https://a.example/n")).is_ok());
+    // A script without its runner, or a link that is none: refused, as said.
+    for e in [with_cache(String::new(), "https://a.example/c"), with_cache("x".into(), "https://a.example/c d"), with_cache_gitlab(String::new(), "https://a.example/c"), with_cache_gitlab("x".into(), "a b"),
+        with_cache_windows(String::new(), "https://a.example/c"), with_cache_windows("x".into(), "a b"), with_hello(String::new(), "https://a.example/h"), with_hello("x".into(), "a b"),
+        with_hello_windows(String::new(), "https://a.example/h"), with_hello_windows("x".into(), "a b"), with_keep(String::new()), with_keep("c='https://x'".into())] {
+        assert!(e.is_err_and(|e| !e.is_empty()));
+    }
+    // A configuration's addresses: only those that are host names, each once, from any spelling of the key.
+    use base64::Engine;
+    let b64 = |v: serde_json::Value| base64::engine::general_purpose::STANDARD.encode(v.to_string());
+    let jit = b64(serde_json::json!({ ".runner": b64(serde_json::json!({ "serverUrl": "https://a.example/x", "ServerUrl": "https://a.example/y", "serverUrlV2": "not an address" })) }));
+    assert_eq!(runner_hosts(&jit), ["a.example"]);
+    assert!(runner_hosts("not base64").is_empty());
+}
+
+#[test]
+fn a_machine_not_to_be_had_is_said_as_that_in_every_way_aws_says_it() {
+    let started = |answer: Answer, l: &Launch| { let mut told = Told::default(); futures::executor::block_on(run_instance(&answering(answer), &creds(), l, 0, &mut told)).map(|m| m.id) };
+    // No type given; every pool priced over an on-demand machine; asked too fast with nothing to wait with.
+    assert_eq!(started(spot_region(0, "", ""), &launch(&[], None, false, None, None, &[])).unwrap_err(), "no instance type given");
+    let types: Vec<String> = ["m7a.large", "c7a.large", "m8a.large"].map(String::from).to_vec();
+    let dear: Answer = Box::new(|w, _| if w == "DescribeSpotPriceHistory" { (200, "<item><instanceType>m7a.large</instanceType><availabilityZone>a</availabilityZone><spotPrice>9.5</spotPrice></item><item><instanceType>c7a.large</instanceType><availabilityZone>a</availabilityZone><spotPrice>9.5</spotPrice></item><item><instanceType>m8a.large</instanceType><availabilityZone>a</availabilityZone><spotPrice>9.5</spotPrice></item>".into()) } else { ok() });
+    assert!(started(dear, &launch(&types, None, true, None, None, &[])).unwrap_err().contains("cost more than an on-demand machine"));
+    assert!(started(spot_region(5, "RequestLimitExceeded", ""), &launch(&types, None, false, None, None, &[])).unwrap_err().starts_with("RequestLimitExceeded"));
+    // Five types with no price known, in the default network: the first refused, the rest asked at once with no zone
+    // named, without a clock; and a fleet that is refused for its rate every time.
+    let five: Vec<String> = ["m7a.large", "c7a.large", "m8a.large", "c8a.large", "r7a.large"].map(String::from).to_vec();
+    let unpriced = |fleet: &'static str| -> Answer { let a = spot_region(1, "InsufficientInstanceCapacity", fleet); Box::new(move |w, r| if w == "DescribeSpotPriceHistory" { (200, String::new()) } else { a(w, r) }) };
+    assert_eq!(started(unpriced(FLEET_GOT), &launch(&five, None, true, None, None, &[])).unwrap(), "i-2");
+    let timer = NoWait;
+    let throttled: Answer = { let a = unpriced(""); Box::new(move |w, r| if w == "CreateFleet" { (400, "<Response><Errors><Error><Code>RequestLimitExceeded</Code><Message>slow down</Message></Error></Errors></Response>".into()) } else { a(w, r) }) };
+    assert_eq!(started(throttled, &launch(&five, None, true, Some(&timer), None, &[])).unwrap(), "i-1", "one by one after the fleet could not be asked");
+    // What a fleet says of pools it names without a type, or of a zone for another reason than the type: not kept,
+    // or an error of its own.
+    let mut told = Told::default();
+    let pools = vec![("m7a.large".to_string(), Some("subnet-a".to_string()), "us-east-1a".to_string())];
+    let nameless = "<fleetId>f</fleetId><errorSet><item><errorCode>UnfulfillableCapacity</errorCode><errorMessage>none</errorMessage><launchTemplateAndOverrides><overrides><subnetId>subnet-a</subnetId></overrides></launchTemplateAndOverrides></item></errorSet>";
+    assert!(fleet_said(nameless, &pools, &mut told).unwrap().is_err() && told.refused.is_empty());
+    let other = "<fleetId>f</fleetId><errorSet><item><errorCode>InvalidFleetConfiguration</errorCode><errorMessage>Something else</errorMessage></item></errorSet>";
+    assert_eq!(fleet_said(other, &pools, &mut told).err().as_deref(), Some("InvalidFleetConfiguration: Something else"));
+    assert_eq!(fleet_said("<nothing/>", &pools, &mut told).err().as_deref(), Some("CreateFleet without a fleet"));
+}

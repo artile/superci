@@ -160,6 +160,9 @@ pub fn xml_tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     Some(&xml[start..start + end])
 }
 
+/// What comes before the next tag (all of it when none does).
+fn upto_tag(s: &str) -> &str { s.split_once('<').map_or(s, |(before, _)| before) }
+
 fn aws_error(xml: &str, status: u16) -> String {
     format!("{}: {}", xml_tag(xml, "Code").unwrap_or(&format!("HTTP {status}")), xml_tag(xml, "Message").unwrap_or(&xml.chars().take(200).collect::<String>()))
 }
@@ -244,7 +247,7 @@ pub async fn latest_image_sized(http: &dyn Http, region: &str, creds: &Credentia
     // has it once it is copied there.)
     let xml = ec2(http, region, creds, "DescribeImages", serde_json::json!({ "Owner": [owner, "self"], "Filter": [{ "Name": "name", "Value": [name] }, { "Name": "state", "Value": ["available"] }] }), now_ms).await?;
     let mut images: Vec<(String, String, u32)> = xml.split("<imageId>").skip(1).filter_map(|chunk| {
-        let id = chunk.split('<').next()?.to_string();
+        let id = upto_tag(chunk).to_string();
         Some((xml_tag(chunk, "creationDate")?.to_string(), id, xml_tag(chunk, "volumeSize").and_then(|v| v.parse().ok()).unwrap_or(0)))
     }).collect();
     images.sort();
@@ -322,7 +325,7 @@ pub async fn spot_price(http: &dyn Http, region: &str, zone: Option<&str>, creds
     let mut params = serde_json::json!({ "InstanceType": [instance_type], "ProductDescription": [product(os)], "StartTime": amz_iso(now_ms) });
     if let Some(z) = zone.filter(|z| !z.is_empty()) { params["AvailabilityZone"] = z.into() }
     let xml = ec2(http, region, creds, "DescribeSpotPriceHistory", params, now_ms).await?;
-    xml.split("<spotPrice>").skip(1).filter_map(|s| s.split('<').next()?.parse::<f64>().ok()).fold(None, |m: Option<f64>, p| Some(m.map_or(p, |m| m.min(p)))).ok_or_else(|| "no spot price".into())
+    xml.split("<spotPrice>").skip(1).filter_map(|s| upto_tag(s).parse::<f64>().ok()).fold(None, |m: Option<f64>, p| Some(m.map_or(p, |m| m.min(p)))).ok_or_else(|| "no spot price".into())
 }
 
 pub fn amz_iso(ms: u64) -> String {
@@ -683,7 +686,7 @@ pub async fn given_network(http: &dyn Http, region: &str, creds: &Credentials, g
     if let Some(bad) = g.subnets.iter().find(|s| !aws_id(s, "subnet-")).or(g.security_groups.iter().find(|s| !aws_id(s, "sg-"))) { return Err(format!("{region}: {bad} is not a subnet or security group id")) }
     let xml = ec2(http, region, creds, "DescribeSubnets", serde_json::json!({ "Filter": [{ "Name": "subnet-id", "Value": g.subnets }] }), now_ms).await?;
     // Only the ones named, whatever else AWS lists.
-    let found: Vec<(&str, &str, &str)> = xml.split("<subnetId>").skip(1).filter_map(|c| Some((c.split('<').next()?, xml_tag(c, "availabilityZone")?, xml_tag(c, "vpcId")?)))
+    let found: Vec<(&str, &str, &str)> = xml.split("<subnetId>").skip(1).filter_map(|c| Some((upto_tag(c), xml_tag(c, "availabilityZone")?, xml_tag(c, "vpcId")?)))
         .filter(|(id, ..)| g.subnets.iter().any(|s| s == id)).collect();
     if let Some(missing) = g.subnets.iter().find(|s| !found.iter().any(|(id, ..)| id == s)) { return Err(format!("{region}: no subnet {missing} there")) }
     let vpc = found[0].2;
@@ -731,7 +734,7 @@ fn filters(f: &[(&str, &str)]) -> serde_json::Value {
 
 /// Each `<tag>` value after `<first>` in a list answer, with the first `<then>` after it (e.g. a subnet and its zone).
 fn pairs<'a>(xml: &'a str, first: &str, then: &str) -> Vec<(&'a str, &'a str)> {
-    xml.split(&format!("<{first}>")).skip(1).filter_map(|chunk| Some((chunk.split('<').next()?, xml_tag(chunk, then).unwrap_or("")))).collect()
+    xml.split(&format!("<{first}>")).skip(1).map(|chunk| (upto_tag(chunk), xml_tag(chunk, then).unwrap_or(""))).collect()
 }
 
 /// The network a control plane's machines use in a region (its own from before, else the account's shared one), if it
@@ -886,7 +889,7 @@ pub async fn make_bucket(http: &dyn Http, region: &str, creds: &Credentials, pla
         404 => {
             let body = if region == "us-east-1" { String::new() } else { format!(r#"<CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>{region}</LocationConstraint></CreateBucketConfiguration>"#) };
             let made = s3(http, "PUT", &url, region, creds, body.into_bytes(), &[], now_ms).await?;
-            if made.status >= 300 && !made.body_text().contains("BucketAlreadyOwnedByYou") { said(made)?; }
+            if made.status >= 300 && !made.body_text().contains("BucketAlreadyOwnedByYou") { return Err(aws_error(&made.body_text(), made.status)) }
         }
         403 => return Err(format!("AccessDenied: the bucket {bucket} is not reachable with this sign-in (or is someone else's)")),
         s => return Err(format!("HTTP {s}: the bucket {bucket}")),
@@ -944,11 +947,13 @@ pub async fn spot_cost(http: &dyn Http, region: &str, zone: &str, creds: &Creden
     prices.sort_by_key(|p| p.0);
     let in_effect = |t: u64| prices.iter().take_while(|(at, _)| *at <= t).last().or(prices.first()).map(|p| p.1);
     let mut cost = 0.0;
+    // (A minute at least: an hour begun at the start, always.)
     let mut hour = from_ms;
-    while hour < to_ms {
+    loop {
         let end = (hour + 3_600_000).min(to_ms);
         cost += (end - hour) as f64 / 3_600_000.0 * in_effect(hour).ok_or("no spot price for that time")?;
         hour = end;
+        if hour >= to_ms { break }
     }
     Ok(cost)
 }
@@ -999,7 +1004,7 @@ pub async fn bytes_sent(http: &dyn Http, region: &str, creds: &Credentials, inst
         "Namespace": "AWS/EC2", "MetricName": "NetworkOut", "Period": 300, "Statistics": { "member": ["Sum"] },
         "Dimensions": { "member": [{ "Name": "InstanceId", "Value": instance_id }] },
         "StartTime": amz_iso(from_ms.saturating_sub(300_000)), "EndTime": amz_iso(to_ms + 300_000) }), now_ms).await?;
-    Ok(xml.split("<Sum>").skip(1).filter_map(|s| s.split('<').next()?.parse::<f64>().ok()).sum())
+    Ok(xml.split("<Sum>").skip(1).filter_map(|s| upto_tag(s).parse::<f64>().ok()).sum())
 }
 
 /// Data sent from AWS to the internet, per GB (the first 10 TB a month, after the account's free 100 GB).
