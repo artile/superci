@@ -261,15 +261,6 @@ pub fn json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).expect("SuperCI's records are always JSON")
 }
 
-/// application/x-www-form-urlencoded fields.
-pub fn form(body: &[u8]) -> Vec<(String, String)> {
-    url::form_urlencoded::parse(body).into_owned().collect()
-}
-
-pub fn field<'a>(fields: &'a [(String, String)], name: &str) -> &'a str {
-    fields.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).unwrap_or("")
-}
-
 /// A control plane on this computer, as tests serve one: an address taken as an https one in a debug build only.
 #[cfg(debug_assertions)]
 pub fn local_test_address(url: &str) -> bool { url.starts_with("http://127.0.0.1:") }
@@ -282,10 +273,15 @@ pub fn local_test_address(_: &str) -> bool { false }
 /// What tests run (the CLI, the dashboard, the AWS control plane's program) reaches no cloud.
 pub fn stand_in(url: &str) -> String {
     #[cfg(debug_assertions)]
-    if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) {
-        if let Some(rest) = url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".signin.aws.amazon.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h.ends_with(".ghe.com") || h == "gitlab.com" || h == "api.cloudflare.com" || h == "dash.cloudflare.com" || h == "registry.cloudflare.com" || h == "ghcr.io" || h.ends_with(".workers.dev") || h.ends_with(".modal.run"))) {
-            return format!("{}/{rest}", at.trim_end_matches('/'));
-        }
-    }
+    if let Some(at) = std::env::var("SUPERCI_STAND_IN").ok().filter(|a| !a.is_empty()) { return stand_in_at(url, &at) }
     url.to_string()
+}
+
+/// An outside address as the stand-in at `at` has it, or as it is when the stand-in has nothing for its host (the
+/// same in any build: what the CLI's live checks use offline, the stand-in given them rather than in the environment).
+pub fn stand_in_at(url: &str, at: &str) -> String {
+    match url.strip_prefix("https://").filter(|u| u.split('/').next().is_some_and(|h| h.ends_with(".amazonaws.com") || h.ends_with(".signin.aws.amazon.com") || h.ends_with(".blob.core.windows.net") || h == "api.github.com" || h.ends_with(".ghe.com") || h == "gitlab.com" || h == "api.cloudflare.com" || h == "dash.cloudflare.com" || h == "registry.cloudflare.com" || h == "ghcr.io" || h.ends_with(".workers.dev") || h.ends_with(".modal.run"))) {
+        Some(rest) => format!("{}/{rest}", at.trim_end_matches('/')),
+        None => url.to_string(),
+    }
 }
