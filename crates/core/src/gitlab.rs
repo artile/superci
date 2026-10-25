@@ -157,13 +157,11 @@ async fn our_hooks(http: &dyn Http, gl: &GitLab, project_id: u64, hook_url: &str
 pub async fn set_project(http: &dyn Http, gl: &GitLab, project_id: u64, hook_url: &str, enabled: bool) -> Result<()> {
     let existing = our_hooks(http, gl, project_id, hook_url).await?;
     let fields = [("url", hook_url), ("job_events", "true"), ("push_events", "false"), ("enable_ssl_verification", "true"), ("token", gl.hook_secret.as_str())];
-    match (enabled, existing.as_slice()) {
-        (true, []) => { api(http, gl, "POST", &format!("/projects/{project_id}/hooks"), Some(&fields)).await?; }
-        (true, ids) => for id in ids { api(http, gl, "PUT", &format!("/projects/{project_id}/hooks/{id}"), Some(&fields)).await?; },
-        (false, ids) => for id in ids {
-            let r = http.send(Request::new("DELETE", &format!("{}/api/v4/projects/{project_id}/hooks/{id}", gl.url.trim_end_matches('/'))).with_header("private-token", &gl.token)).await?;
-            if r.status >= 300 && r.status != 404 { return Err(format!("GitLab removing a webhook: {}", r.status)) }
-        },
+    if enabled && existing.is_empty() { return api(http, gl, "POST", &format!("/projects/{project_id}/hooks"), Some(&fields)).await.map(|_| ()) }
+    for id in existing {
+        if enabled { api(http, gl, "PUT", &format!("/projects/{project_id}/hooks/{id}"), Some(&fields)).await?; continue }
+        let r = http.send(Request::new("DELETE", &format!("{}/api/v4/projects/{project_id}/hooks/{id}", gl.url.trim_end_matches('/'))).with_header("private-token", &gl.token)).await?;
+        if r.status >= 300 && r.status != 404 { return Err(format!("GitLab removing a webhook: {}", r.status)) }
     }
     Ok(())
 }
@@ -193,5 +191,37 @@ mod tests {
             "project_id": 380, "project_name": "gitlab-org/gitlab-test", "project": { "id": 380, "path_with_namespace": "gitlab-org/gitlab-test" } }).to_string();
         assert_eq!(job_event(body.as_bytes()), Some(JobEvent { job_id: 1977, status: "pending".into(), project_id: 380, project: "gitlab-org/gitlab-test".into(), pipeline_id: 2366, name: "test".into(), stage: String::new(), runner_id: None, git_ref: None, tag: false, default_branch: None }));
         assert_eq!(job_event(br#"{"object_kind":"push"}"#), None);
+        // Not JSON; a job's event without its id, its status, or its project.
+        assert_eq!(job_event(b"not json"), None);
+        for missing in ["build_id", "build_status", "project_id"] {
+            let mut v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            v.as_object_mut().unwrap().remove(missing);
+            if missing == "project_id" { v.as_object_mut().unwrap().remove("project"); }
+            assert_eq!(job_event(v.to_string().as_bytes()), None, "{missing}");
+        }
+    }
+
+    /// GitLab as a test has it answer each request.
+    struct Answers(fn(&Request) -> Result<crate::io::Response>);
+    #[async_trait::async_trait(?Send)]
+    impl Http for Answers {
+        async fn send(&self, r: Request) -> Result<crate::io::Response> { (self.0)(&r) }
+    }
+    fn answer(status: u16, body: &str) -> Result<crate::io::Response> { Ok(crate::io::Response::new(status, "application/json", body.to_string())) }
+    fn run<T>(f: impl std::future::Future<Output = T>) -> T { futures::executor::block_on(f) }
+
+    #[test]
+    fn what_gitlab_answers_amiss_is_said_as_that() {
+        let gl = GitLab { url: "https://gitlab.example".into(), token: "glpat-x".into(), hook_secret: "s".repeat(20), id: String::new() };
+        // An answer that is no JSON; a runner made without its id or token.
+        assert!(run(job_json(&Answers(|_| answer(200, "not json")), &gl, 1, 2)).unwrap_err().starts_with("GitLab /projects/1/jobs/2: "));
+        assert_eq!(run(create_runner(&Answers(|_| answer(201, "{}")), &gl, 1, &[], "SuperCI", "p", 2)).unwrap_err(), "GitLab made no runner");
+        assert_eq!(run(create_runner(&Answers(|_| answer(201, r#"{"id":5}"#)), &gl, 1, &[], "SuperCI", "p", 2)).unwrap_err(), "GitLab gave no runner token");
+        // A project listed without its id is passed over.
+        assert_eq!(run(projects(&Answers(|r| answer(200, if r.url.contains("/hooks") { "[]" } else { r#"[{"path_with_namespace":"a/b"},{"id":3,"path_with_namespace":"a/c"}]"# })), &gl, "https://p/gitlab/webhook")).unwrap().len(), 1);
+        // A project's webhook switched on where there is one already (given the secret again), and off where there is none.
+        let hooks = |r: &Request| answer(200, if r.method == "GET" { r#"[{"id":7,"url":"https://p/gitlab/webhook"}]"# } else { "{}" });
+        run(set_project(&Answers(hooks), &gl, 1, "https://p/gitlab/webhook", true)).unwrap();
+        run(set_project(&Answers(|_| answer(200, "[]")), &gl, 1, "https://p/gitlab/webhook", false)).unwrap();
     }
 }
