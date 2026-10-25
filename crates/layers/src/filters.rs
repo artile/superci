@@ -187,9 +187,9 @@ impl Parser<'_> {
         let mut all = vec![self.selector().and_then(crate::faults::said)?];
         loop {
             match self.s.peek() {
+                // (A comma scans as a separator.)
                 c if c == ',' as i32 => {
-                    let (pos, tok, _) = self.s.scan();
-                    if tok != SEPARATOR { return Err(self.err(pos, "expected a separator")) }
+                    self.s.scan();
                     all.push(self.selector().and_then(crate::faults::said)?);
                 }
                 EOF => return Ok(all),
@@ -201,7 +201,7 @@ impl Parser<'_> {
     fn selector(&mut self) -> Result<Selector, String> {
         let path = self.fieldpath().and_then(crate::faults::said)?;
         let next = self.s.peek();
-        if next == ',' as i32 || next == SEPARATOR || next == EOF { return Ok(Selector { path, op: Op::Present, value: String::new(), re: None }) }
+        if next == ',' as i32 || next == EOF { return Ok(Selector { path, op: Op::Present, value: String::new(), re: None }) }
         let op = self.operator().and_then(crate::faults::said)?;
         let value = self.value(op == Op::Matches).and_then(crate::faults::said)?;
         let re = if op == Op::Matches { regex::Regex::new(&value).ok() } else { None };
@@ -210,9 +210,9 @@ impl Parser<'_> {
 
     fn fieldpath(&mut self) -> Result<Vec<String>, String> {
         let mut fields = vec![self.field().and_then(crate::faults::said)?];
+        // (A dot scans as a separator.)
         while self.s.peek() == '.' as i32 {
-            let (pos, tok, _) = self.s.scan();
-            if tok != SEPARATOR { return Err(self.err(pos, "expected a field separator (`.`)")) }
+            self.s.scan();
             fields.push(self.field().and_then(crate::faults::said)?);
         }
         Ok(fields)
@@ -253,7 +253,7 @@ impl Parser<'_> {
     }
 
     fn unquote(&self, pos: usize, s: &str, alt_quotes: bool) -> Result<String, String> {
-        if !alt_quotes && !s.starts_with(['\'', '"']) { return Err(self.err(pos, "invalid quote encountered")) }
+        if !alt_quotes && !s.starts_with('"') { return Err(self.err(pos, "invalid quote encountered")) }
         unquote(s).map_err(|e| self.err(pos, &format!("unquoting failed: {e}")))
     }
 
@@ -271,79 +271,38 @@ impl Parser<'_> {
 
 const QUOTE_SYNTAX: &str = "quote syntax error";
 
-/// Go's `strconv.Unquote`, with `/` and `|` quoting as `"` does (containerd's copy of it).
+/// Go's `strconv.Unquote` (containerd's copy of it) for what the scanner gives as quoted: `"…"`, `/…/` or `|…|`,
+/// closed, on one line, each escape one Go's scanner takes (so only a value too large for its escape is refused).
+/// `/` and `|` quote as `"` does.
 fn unquote(s: &str) -> Result<String, &'static str> {
     let b = s.as_bytes();
-    let n = b.len();
-    if n < 2 { return Err(QUOTE_SYNTAX) }
-    let quote = b[0];
-    if quote != b[n - 1] { return Err(QUOTE_SYNTAX) }
-    let inner = &b[1..n - 1];
-    if quote == b'`' {
-        if inner.contains(&b'`') { return Err(QUOTE_SYNTAX) }
-        return Ok(String::from_utf8_lossy(&inner.iter().copied().filter(|c| *c != b'\r').collect::<Vec<_>>()).into_owned());
-    }
-    if !matches!(quote, b'"' | b'\'' | b'|' | b'/') { return Err(QUOTE_SYNTAX) }
-    if inner.contains(&b'\n') { return Err(QUOTE_SYNTAX) }
-    if !inner.contains(&b'\\') && !inner.contains(&quote) {
-        match quote {
-            b'"' | b'/' | b'|' => return Ok(String::from_utf8_lossy(inner).into_owned()),
-            _ => {
-                let t = String::from_utf8_lossy(inner);
-                let mut cs = t.chars();
-                if let (Some(c), None) = (cs.next(), cs.next()) { if c != '\u{fffd}' || inner.len() != 1 { return Ok(t.into_owned()) } }
-            }
-        }
-    }
-    let mut out: Vec<u8> = Vec::with_capacity(3 * inner.len() / 2);
-    let mut rest = inner;
-    while !rest.is_empty() {
-        let (c, multibyte, tail) = unquote_char(rest, quote)?;
+    let mut rest = &b[1..b.len() - 1];
+    let mut out: Vec<u8> = Vec::with_capacity(rest.len());
+    // (A character of more than one byte is copied as its bytes are.)
+    while let Some((&c, tail)) = rest.split_first() {
         rest = tail;
-        if c < 0x80 || !multibyte { out.push(c as u8) } else { out.extend(char::from_u32(c).unwrap_or('\u{fffd}').to_string().as_bytes()) }
-        if quote == b'\'' && !rest.is_empty() { return Err(QUOTE_SYNTAX) }
+        if c != b'\\' { out.push(c); continue }
+        let (e, tail) = (rest[0], &rest[1..]);
+        rest = tail;
+        let digits = |n: usize, rest: &mut &[u8], radix: u32| { let (d, t) = rest.split_at(n.min(rest.len())); *rest = t; u32::from_str_radix(std::str::from_utf8(d).unwrap_or_default(), radix).unwrap_or(0) };
+        match e {
+            b'a' => out.push(7), b'b' => out.push(8), b'f' => out.push(12), b'n' => out.push(10), b'r' => out.push(13), b't' => out.push(9), b'v' => out.push(11),
+            b'x' => out.push(digits(2, &mut rest, 16) as u8),
+            b'u' | b'U' => {
+                let v = digits(if e == b'u' { 4 } else { 8 }, &mut rest, 16);
+                if v > 0x10ffff { return Err(QUOTE_SYNTAX) }
+                out.extend(char::from_u32(v).unwrap_or('\u{fffd}').to_string().as_bytes());
+            }
+            b'0'..=b'7' => {
+                let v = (e - b'0') as u32 * 64 + digits(2, &mut rest, 8);
+                if v > 255 { return Err(QUOTE_SYNTAX) }
+                out.push(v as u8);
+            }
+            // (`\\`, or the quote itself.)
+            _ => out.push(e),
+        }
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
-}
-
-fn unquote_char(s: &[u8], quote: u8) -> Result<(u32, bool, &[u8]), &'static str> {
-    let c = s[0];
-    if c == quote && matches!(quote, b'\'' | b'"' | b'/' | b'|') { return Err(QUOTE_SYNTAX) }
-    if c >= 0x80 {
-        let len = match c { 0xf0.. => 4, 0xe0.. => 3, 0xc0.. => 2, _ => 1 }.min(s.len());
-        return Ok(match std::str::from_utf8(&s[..len]).ok().and_then(|t| t.chars().next()) {
-            Some(ch) => (ch as u32, true, &s[len..]),
-            None => (0xfffd, true, &s[1..]),
-        });
-    }
-    if c != b'\\' { return Ok((c as u32, false, &s[1..])) }
-    if s.len() <= 1 { return Err(QUOTE_SYNTAX) }
-    let (c, mut s) = (s[1], &s[2..]);
-    let value = match c {
-        b'a' => 7, b'b' => 8, b'f' => 12, b'n' => 10, b'r' => 13, b't' => 9, b'v' => 11,
-        b'x' | b'u' | b'U' => {
-            let n = match c { b'x' => 2, b'u' => 4, _ => 8 };
-            if s.len() < n { return Err(QUOTE_SYNTAX) }
-            let mut v: u32 = 0;
-            for &d in &s[..n] { v = v << 4 | (d as char).to_digit(16).ok_or(QUOTE_SYNTAX)? }
-            s = &s[n..];
-            if c == b'x' { return Ok((v, false, s)) }
-            if v > 0x10ffff { return Err(QUOTE_SYNTAX) }
-            return Ok((v, true, s));
-        }
-        b'0'..=b'7' => {
-            if s.len() < 2 { return Err(QUOTE_SYNTAX) }
-            let mut v = (c - b'0') as u32;
-            for &d in &s[..2] { if !(b'0'..=b'7').contains(&d) { return Err(QUOTE_SYNTAX) } v = v << 3 | (d - b'0') as u32 }
-            s = &s[2..];
-            if v > 255 { return Err(QUOTE_SYNTAX) }
-            v
-        }
-        b'\\' => b'\\' as u32,
-        b'\'' | b'"' | b'|' | b'/' => { if c != quote { return Err(QUOTE_SYNTAX) } c as u32 }
-        _ => return Err(QUOTE_SYNTAX),
-    };
-    Ok((value, false, s))
 }
 
 #[cfg(test)]

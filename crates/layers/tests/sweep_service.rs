@@ -125,6 +125,13 @@ async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, sto
     let _ = step("list", async { let mut l = c.list(capi::ListContentRequest { filters: vec!["labels.superci==yes".into()] }).await?.into_inner(); while l.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
     let _ = step("write under way", async { let mut a = c.write(tokio_stream::iter(vec![msg(Write, "r2", 20, "", 0, b"part")])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
     let _ = step("status", c.status(capi::StatusRequest { r#ref: "r2".into() })).await?;
+    // Taken up again, then begun again from nothing; a write hashed again at its commit; labels set whole.
+    let _ = step("resume", async { let mut a = c.write(tokio_stream::iter(vec![msg(Write, "r2", 20, "", 4, b"more")])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let _ = step("truncate", async { let mut a = c.write(tokio_stream::iter(vec![msg(Write, "r2", 20, "", 0, b"anew")])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let big = b"kept by its sha512".to_vec();
+    let d512 = format!("sha512:{}", sha2::Sha512::digest(&big).iter().map(|x| format!("{x:02x}")).collect::<String>());
+    let _ = step("rehash", async { let mut a = c.write(tokio_stream::iter(vec![msg(Write, "r5", 0, "", 0, &big), msg(Commit, "r5", big.len() as i64, &d512, big.len() as i64, b"")])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let _ = step("labels whole", c.update(capi::UpdateRequest { info: Some(capi::Info { digest: d512.clone(), labels: [("a".to_string(), "1".to_string())].into_iter().collect(), ..Default::default() }), update_mask: None })).await?;
     let _ = step("statuses", c.list_statuses(capi::ListStatusesRequest { filters: vec![] })).await?;
     let _ = step("abort", c.abort(capi::AbortRequest { r#ref: "r2".into() })).await?;
     let _ = step("delete", c.delete(capi::DeleteContentRequest { digest: d.clone() })).await?;

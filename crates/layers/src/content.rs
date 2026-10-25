@@ -465,12 +465,8 @@ fn write_to_completion(path: &Path, data: &[u8]) -> Result<()> {
 
 /// A file's access and change times set by its path (Go's `os.Chtimes`), read-only as a blob is.
 fn set_times(p: &Path, atime: Nanos, mtime: Nanos) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e)).and_then(crate::faults::pass)?;
-    let ts = |n: Nanos| libc::timespec { tv_sec: n.div_euclid(1_000_000_000) as libc::time_t, tv_nsec: n.rem_euclid(1_000_000_000) as _ };
-    let times = [ts(atime), ts(mtime)];
-    let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
-    if r == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    let at = |n: Nanos| std::time::UNIX_EPOCH + std::time::Duration::from_nanos(n.max(0) as u64);
+    std::fs::File::open(p).and_then(crate::faults::pass)?.set_times(std::fs::FileTimes::new().set_accessed(at(atime)).set_modified(at(mtime)))
 }
 
 fn nanos_of(t: std::time::SystemTime) -> Nanos { t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0) }

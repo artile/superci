@@ -195,6 +195,72 @@ async fn its_content_store_takes_every_digest_and_write_as_containerds_does() {
     assert_eq!(listed(&mut c, &format!("digest=={d512}")).await, [d512]);
 }
 
+/// A write under way's record, as containerd writes it and as it may be found: its times in each way RFC 3339 allows
+/// (and ways it does not), its data or its ref gone, a total it did not say.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_under_ways_record_is_read_as_containerd_writes_it() {
+    use capi::WriteAction::*;
+    let s = start("record", None);
+    let mut c = s.content().await;
+    // (Begun with no total; taken up again with one.)
+    write(&mut c, vec![msg(Write, "rec", 0, "", 0, b"part")]).await.unwrap();
+    assert_eq!(write(&mut c, vec![msg(Write, "rec", 8, "", 4, b"more")]).await.unwrap().last().unwrap().offset, 8);
+    let folder = std::fs::read_dir(s.dir.join("content/ingest")).unwrap().flatten().map(|e| e.path()).find(|p| std::fs::read_to_string(p.join("ref")).unwrap_or_default() == "rec").unwrap();
+    let status = |c: &mut capi::content_client::ContentClient<tonic::transport::Channel>| { let mut c = c.clone(); async move { c.status(capi::StatusRequest { r#ref: "rec".into() }).await } };
+    for (t, good) in [("2026-10-25T10:00:00Z", true), ("2026-10-25t10:00:00z\n", true), ("2026-10-25T10:00:00.5Z", true), ("2026-10-25T10:00:00.1234567891Z", true),
+        ("2026-10-25T10:00:00+02:00", true), ("2026-10-25T10:00:00-02:30", true), ("2026-10-25T10:00:00.Z", false), ("2026-10-25T10:00:00.5", false),
+        ("2026-10-25T10:00:00+0200", false), ("2026-10-25T10:00:00+02-00", false), ("2026-10-25T10:00:00+0x:00", false), ("2026-10-25T10:00:00+02:0x", false),
+        ("2026-10-25T10:00:00Q", false), ("2026-10-25T10:00:00ZZ", false), ("2026-10-25", false), ("2026x10-25T10:00:00Z", false), ("2026-10x25T10:00:00Z", false),
+        ("2026-10-25X10:00:00Z", false), ("2026-10-25T10x00:00Z", false), ("2026-10-25T10:00x00Z", false), ("abcd-10-25T10:00:00Z", false), ("2026-ab-25T10:00:00Z", false),
+        ("2026-10-abT10:00:00Z", false), ("2026-10-25Tab:00:00Z", false), ("2026-10-25T10:ab:00Z", false), ("2026-10-25T10:00:abZ", false), ("2026-13-25T10:00:00Z", false),
+        ("2026-00-25T10:00:00Z", false), ("2026-10-32T10:00:00Z", false), ("2026-10-00T10:00:00Z", false), ("2026-10-25T24:00:00Z", false), ("2026-10-25T10:60:00Z", false),
+        ("2026-10-25T10:00:61Z", false)] {
+        std::fs::write(folder.join("startedat"), t.replace("\\n", "\n")).unwrap();
+        assert_eq!(status(&mut c).await.is_ok(), good, "{t}");
+    }
+    std::fs::write(folder.join("startedat"), "2026-10-25T10:00:00Z").unwrap();
+    // Its total not a number: none; its last change not said: refused; its ref gone, then its data: not there.
+    std::fs::write(folder.join("total"), "many").unwrap();
+    assert_eq!(status(&mut c).await.unwrap().into_inner().status.unwrap().total, 0);
+    std::fs::remove_file(folder.join("updatedat")).unwrap();
+    assert!(status(&mut c).await.is_err());
+    std::fs::remove_file(folder.join("ref")).unwrap();
+    assert_eq!(status(&mut c).await.unwrap_err().code(), Code::NotFound);
+    std::fs::remove_file(folder.join("data")).unwrap();
+    assert_eq!(status(&mut c).await.unwrap_err().code(), Code::NotFound);
+    // With no ingest folder at all, nothing under way.
+    std::fs::remove_dir_all(s.dir.join("content/ingest")).unwrap();
+    assert!(c.list_statuses(capi::ListStatusesRequest { filters: vec![] }).await.unwrap().into_inner().statuses.is_empty());
+}
+
+/// Lists chosen by containerd's filters: values quoted with each escape Go takes, regular expressions between `/`
+/// and `|`, a quoted field; and each way a filter is written amiss, refused as containerd refuses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn lists_are_chosen_by_filters_as_containerd_parses_them() {
+    let s = start("filters", None);
+    let mut c = s.content().await;
+    let blob = b"a blob with odd labels".to_vec();
+    let mut m = msg(capi::WriteAction::Commit, "f", blob.len() as i64, &digest(&blob), 0, &blob);
+    m.labels = [("esc", "\u{7}\u{8}\u{c}\n\r\t\u{b}\\\""), ("hex", "AJ"), ("uni", "é😀"), ("oct", "A"), ("a.b", "dotted"), ("re", "a/b|c"), ("sur", "\u{fffd}")]
+        .into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    write(&mut c, vec![m]).await.unwrap();
+    let list = |c: &mut capi::content_client::ContentClient<tonic::transport::Channel>, f: &str| { let (mut c, f) = (c.clone(), f.to_string()); async move {
+        let mut l = c.list(capi::ListContentRequest { filters: vec![f] }).await?.into_inner();
+        let mut n = 0;
+        while let Some(m) = l.message().await? { n += m.info.len() }
+        Ok::<_, tonic::Status>(n)
+    } };
+    for (f, n) in [(r#"labels.esc=="\a\b\f\n\r\t\v\\\"""#, 1), (r#"labels.hex=="\x41\x4A""#, 1), (r#"labels.uni=="é\U0001F600""#, 1), (r#"labels.oct=="\101""#, 1),
+        (r#"labels."a.b"==dotted"#, 1), (r#"labels.re~=/a\/b/"#, 1), ("labels.re~=|b.c|", 1), ("labels.re~=/x/", 0), (r#"labels.sur=="\uD800""#, 1), ("labels.a_b", 0),
+        ("labels.esc!=x", 1), ("labels.re~=(", 0)] {
+        assert_eq!(list(&mut c, f).await.unwrap(), n, "{f}");
+    }
+    for f in [r#"labels.oct=="\777""#, r#"labels.uni=="\U00110000""#, "labels.esc /x/", "/x/==a", "a b", "=x", "a==", "a=b", "a<b", "a\0", "\0", "a==\0", "\"unterminated",
+        r#""bad \q""#, r#""\x4""#, "a==b,,c", "a\u{fffd}", "a==b\u{1}c", "a.\"b\nc\"", "a.==b"] {
+        assert_eq!(list(&mut c, f).await.unwrap_err().code(), Code::InvalidArgument, "{f:?}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn its_snapshots_are_containerds_overlay() {
     let s = start("snapshots", None);
