@@ -159,7 +159,7 @@ jobs:
           include-hidden-files: true
 
   # Every test of every crate, in six parts side by side: each its share of the tests (dealt by name) and its sixth of
-  # every sweep's faults, two runs merged with the others'. Ubuntu 26.04, as SuperCI's machines that keep Docker's
+  # every sweep's faults, one run merged with the others'. Ubuntu 26.04, as SuperCI's machines that keep Docker's
   # images: its kernel mounts EROFS files, so the layer store's setup is measured switching Docker over.
   all:
     needs: prepare
@@ -195,20 +195,16 @@ jobs:
           uname -r
           grep -E 'CONFIG_EROFS_FS(=|_BACKED_BY_FILE|_ONDEMAND)' "/boot/config-$(uname -r)" || true
           sudo modprobe erofs && grep erofs /proc/filesystems
-      - name: Part ${{ matrix.part }} of the tests, measured
+      # (One run: its share of the tests and its sixth of every sweep's faults together. The faults change nothing for
+      # the other tests, and a run of the sweeps alone would leave out what only some tests build.)
+      - name: Part ${{ matrix.part }} of the tests and slice ${{ matrix.part }} of every sweep's faults, measured
         env:
           TESTS: ${{ matrix.tests }}
-        # shellcheck disable=SC2086
-        run: npx -y supercov@4.19.0 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS
-      # (Its own last name, which no test has, makes each part's command its own: runs of one command are merged as one.)
-      - name: Slice ${{ matrix.part }} of every sweep's faults, measured
-        if: always()
-        env:
+          SWEEPS: ${{ matrix.sweeps }}
           SUPERCI_SWEEP_FAULTS: "1"
           SUPERCI_SWEEP_SLICE: ${{ matrix.part }}/6
-          SWEEPS: ${{ matrix.sweeps }}
         # shellcheck disable=SC2086
-        run: npx -y supercov@4.19.0 -- cargo test --workspace --no-fail-fast -- --exact $SWEEPS slice_${{ matrix.part }}_of_6
+        run: npx -y supercov@4.19.0 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
