@@ -176,8 +176,7 @@ fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, 
     let total = std::sync::Mutex::new((0u64, 0u64));
     let first_error = std::sync::Mutex::new(String::new());
     std::thread::scope(|s| {
-        for _ in 0..AT_ONCE {
-            s.spawn(|| loop {
+        (0..AT_ONCE).for_each(|_| { s.spawn(|| loop {
                 if Instant::now() >= until { return }
                 let Some((digest, a)) = next.lock().unwrap().next() else { return };
                 let began = Instant::now();
@@ -190,8 +189,7 @@ fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, 
                     }
                     Err(e) => { eprintln!("superci-layers keep: {digest} not uploaded: {e}"); let mut f = first_error.lock().unwrap(); if f.is_empty() { *f = e.chars().take(200).collect() } }
                 }
-            });
-        }
+            }); });
     });
     let (n, bytes) = total.into_inner().unwrap();
     // (Asked for and not uploaded: failed, or out of time.)

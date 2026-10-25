@@ -131,9 +131,11 @@ fn main() {
             });
         // (The index written again: read again.)
         let (l, index_path) = (layers.clone(), a.index.clone());
+        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).expect("SIGHUP");
         tokio::spawn(async move {
-            let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else { return };
-            while hup.recv().await.is_some() {
+            // (A signal's stream goes on as long as the program does.)
+            loop {
+                hup.recv().await;
                 match index::Index::load(&index_path) {
                     Ok(i) => { eprintln!("superci-layers: {} layers in the store's index", i.layers.len()); l.reload(i); l.fetch_ahead() }
                     Err(e) => eprintln!("superci-layers: the index was not read again: {e}"),
@@ -143,6 +145,6 @@ fn main() {
         eprintln!("superci-layers: answering on {}", a.socket.display());
         notify_ready();
         layers.fetch_ahead();
-        if let Err(e) = server.await { eprintln!("superci-layers: {e}"); std::process::exit(1) }
+        if let Err(e) = server.await.map_err(|e| e.to_string()).and_then(superci_layers::faults::said) { eprintln!("superci-layers: {e}"); std::process::exit(1) }
     });
 }
