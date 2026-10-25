@@ -643,3 +643,115 @@ fn an_update_that_cannot_make_the_machines_network_says_so() {
     assert!(!ok && said.contains("internal error"), "{said}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Credentials the served control plane's own AWS role gives it: its machines start in the account.
+fn own_role() -> superci_core::aws::Credentials { superci_core::aws::Credentials { access_key_id: "ASIAX".into(), secret_access_key: "secret".into(), session_token: Some("tok".into()), expires_at_ms: u64::MAX } }
+
+/// AWS's budget for the account, asked for from Limits: made with the sign-in of whoever asks (here AWS's Budgets
+/// not answering as asked: said).
+#[test]
+fn an_aws_budget_is_made_with_the_sign_in_of_whoever_asks() {
+    let served = serve(|_| {});
+    let home = common::signed_in(&served);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/routing", &[("action", "account_usd"), ("account", "aws"), ("usd", "100"), ("budget", "emails")]);
+    assert!(status == 303 || said.contains("AWS did not take the budget"), "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The account's own copy of the image jobs run on, while the list of builds its maker publishes cannot be read: what
+/// the account allows is still said.
+#[test]
+fn an_accounts_copy_is_looked_at_while_the_newest_build_cannot_be_read() {
+    let served = serve(|_| {});
+    let home = common::aws_only(&served.aws);
+    served.aws.replaying(include_str!("../fixtures/aws/images/01-create.jsonl"), &[("ca-central-1", "us-east-1")]);
+    served.github.answer_with("GET", "runner-images-for-aws/releases", 500, &[], r#"{"message":"Server Error"}"#);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    until("the account looked at", || common::words(&common::part(&link, "/?p=plane&fragment=1").1).contains("AWS account"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A name checked against the other CIs in the account: a control plane there that is not a Lambda function (one
+/// elsewhere, whose machines start there) has no name to clash with.
+#[test]
+fn a_name_is_checked_only_against_the_accounts_own_control_planes() {
+    let served = serve(|_| {});
+    let role = |name: &str, description: &str| format!("<member><Path>/</Path><RoleName>{name}</RoleName><RoleId>AROAEXAMPLE000000001</RoleId><Arn>arn:aws:iam::111111111111:role/{name}</Arn><CreateDate>2026-10-18T10:00:00Z</CreateDate><Description>{description}</Description><MaxSessionDuration>3600</MaxSessionDuration></member>");
+    let roles = [role(&format!("superci-plane-{}", superci_testkit::PLANE), &format!("Runs the SuperCI control plane {} (Lambda, us-east-1, runs-on superci).", served.url)),
+        role("superci-plane-cfplane00001", "Lets the SuperCI control plane https://superci.acme.workers.dev start machines in this account.")].concat();
+    served.aws.fail("ListRoles", 200, &format!("<ListRolesResponse xmlns=\"https://iam.amazonaws.com/doc/2010-05-08/\"><ListRolesResult><IsTruncated>false</IsTruncated><Roles>{roles}</Roles></ListRolesResult><ResponseMetadata><RequestId>00000000-0000-4000-8000-000000000001</RequestId></ResponseMetadata></ListRolesResponse>"), None);
+    let home = common::signed_in(&served);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/name", &[("name", "Acme CI")]);
+    assert!(status == 303, "{status} {said}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Cloudflare's runners for a control plane in AWS go into the account named when the sign-in reaches it; and an
+/// update of that control plane whose Cloudflare launcher Cloudflare will not take says so.
+#[test]
+fn cloudflare_runners_go_into_the_account_named_and_an_update_says_a_launcher_cloudflare_did_not_take() {
+    let served = serve(move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(own_role())));
+    served.aws.put(&format!("/superci/{}/LAUNCHERS", superci_testkit::PLANE), r#"[{"cloud":"cloudflare","url":"https://superci-runners-testplane0001.acme.workers.dev"}]"#);
+    served.aws.put(&format!("/superci/{}/CONTAINERS", superci_testkit::PLANE), "off");
+    let home = common::signed_in(&served);
+    kept_as(&home, |k| k["cloudflare"] = cloudflare_signed_in());
+    served.aws.replaying(include_str!("../fixtures/aws/planes/update.jsonl"), &[("testplane0002", superci_testkit::PLANE), ("http://new-plane.test", &served.url)]);
+    served.aws.fail("/client/v4/accounts?per_page", 200, r#"{"success":true,"errors":[],"messages":[],"result":[{"id":"1111111111111111111111111111111a","name":"Acme"},{"id":"2222222222222222222222222222222b","name":"Globex"}]}"#, None);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    // (The accounts the sign-in reaches, read as one is set up in an account it does not.)
+    let (status, said) = sent(&link, "/plane/cloudflare", &[("account", "3333333333333333333333333333333c")]);
+    assert!(status >= 400 && said.contains("the sign-in cannot reach that account"), "{status} {said}");
+    let (status, said) = sent(&link, "/runners/cloudflare", &[("account", "1111111111111111111111111111111a")]);
+    assert!(status >= 400, "deployed nowhere here: {status} {said}");
+    let (status, said) = sent(&link, "/plane/update", &[("plane", superci_testkit::PLANE)]);
+    assert!(status == 303, "{status} {said}");
+    let tried = || served.aws.asked.lock().unwrap().iter().any(|a| a["url"].as_str().is_some_and(|u| u.contains("/workers/scripts/superci-runners-testplane0001")));
+    until("its launcher tried", tried);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// AWS's runners for a control plane in Cloudflare: the role made, the control plane handed what it assumes it with,
+/// and its answer awaited (connected; not yet able to use it, said; or settings Cloudflare would not keep, said).
+#[test]
+fn aws_runners_for_a_control_plane_in_cloudflare_connect_or_say_what_stopped_them() {
+    for (callback, refused) in [(Some(r#"{"connected":true}"#), None), (Some(r#"{"connected":false,"error":"AccessDenied: not yet"}"#), None), (None, Some("AWS_CONNECT")), (None, Some("AWS_REGIONS"))] {
+        let served = serve(|_| {});
+        let plane = match callback {
+            Some(said) => { let said = said.to_string(); superci_testkit::front(&served.url, move |method, target, status, body| if method == "POST" && target.starts_with("/aws/callback") { (200, said.clone().into_bytes()) } else { (status, body) }) }
+            None => served.url.clone(),
+        };
+        *served.aws.plane_url.lock().unwrap() = plane.clone();
+        let home = common::signed_in(&served);
+        as_cloudflare(&home, &served);
+        kept_as(&home, |k| { k["plane"]["Cloudflare"]["url"] = plane.clone().into(); k["cloudflare"] = cloudflare_signed_in(); });
+        if let Some(name) = refused { served.aws.fail(&format!("/secrets|{name}"), 500, CF_FAILED, None) }
+        let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+        let (status, said) = sent(&link, "/aws/connect", &[("region", "us-east-1")]);
+        assert!(status == 303 || status >= 400, "{callback:?} {refused:?}: {status} {said}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// A control plane in Cloudflare whose machines start in the AWS account signed in to: its update gives its role
+/// there what this version asks for, and says so to the control plane.
+#[test]
+fn an_update_of_a_control_plane_in_cloudflare_gives_its_aws_role_what_it_asks_for() {
+    let served = serve(|_| {});
+    let cf = superci_testkit::serve_as("cfplane00003", move |c| (c.aws_own, c.aws_own_creds) = (Some(("111111111111".into(), "us-east-1".into())), Some(own_role())));
+    let home = common::signed_in(&served);
+    let url = cf.url.clone();
+    kept_as(&home, |k| {
+        k["plane"] = serde_json::json!({ "Cloudflare": { "account_id": "1111111111111111111111111111111a", "account_name": "Acme", "script": "superci", "url": url, "plane_id": "cfplane00003", "label": "superci" } });
+        k["key"]["planes"] = serde_json::json!(["cfplane00003"]);
+        k["cloudflare"] = cloudflare_signed_in();
+    });
+    served.aws.replaying(include_str!("../fixtures/update/05-update-cf.jsonl"), &[("http://new-plane.test", &cf.url)]);
+    let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
+    let (status, said) = sent(&link, "/plane/update", &[("plane", "cfplane00003")]);
+    assert!(status == 303, "{status} {said}");
+    let given = || served.aws.asked.lock().unwrap().iter().any(|a| a["asked"].as_str().is_some_and(|s| s.contains("PutRolePolicy")));
+    until("its role given what it asks for", given);
+    let _ = std::fs::remove_dir_all(&home);
+}
