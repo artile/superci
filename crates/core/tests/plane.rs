@@ -6125,6 +6125,70 @@ fn the_dashboards_requests_go_through_with_what_github_and_gitlab_say_and_whatev
     assert_eq!(run(webhook("queued", None)).body_text(), "taken");
 }
 
+/// The fake clouds with the control plane's bucket in Virginia: this version's `superci-cache` in it (so it is ready),
+/// and what is put there kept, given back, and deleted.
+fn with_bucket() -> With<impl Fn(&Request, &str) -> Option<Response>> {
+    let objects: RefCell<BTreeMap<String, Vec<u8>>> = RefCell::default();
+    With(FakeClouds::default(), move |r: &Request, _: &str| {
+        let key = r.url.strip_prefix(BUCKET)?.split('?').next().unwrap_or_default().to_string();
+        let mut objects = objects.borrow_mut();
+        Some(match r.method.as_str() {
+            "HEAD" if key == superci_core::cache::program_key("x86_64") => Response::new(200, "application/octet-stream", ""),
+            "PUT" => { objects.insert(key, r.body.clone()); Response::new(200, "application/xml", "") }
+            "GET" | "HEAD" => match objects.get(&key) { Some(b) => Response::new(200, "application/octet-stream", b.clone()), None => Response::new(404, "application/xml", "<Error><Code>NoSuchKey</Code></Error>") },
+            "DELETE" => { objects.remove(&key); Response::new(204, "application/xml", "") }
+            _ => return None,
+        })
+    })
+}
+
+#[test]
+fn a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after_a_day() {
+    let t = 1_790_000_000_000u64;
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let clouds = with_bucket();
+    let clock = MovingClock(std::cell::Cell::new(t));
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &clock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    let run = |r: Request| block_on(plane.handle(r));
+    let key = |r: Request| r.with_header("authorization", "Bearer dashboard-session-key-1");
+    let tree = "tree-0123456789abcdef";
+    let part = |q: &str| json(&run(key(Request::new("POST", &format!("{PLANE_URL}/runs/tree?id={tree}&part=0&link{q}")))));
+    // Its working tree: kept as a base; on a base not there, or there; a layer on bases, one of them not there.
+    assert!(part("&keep=basename01").get("url").is_some_and(|u| u.is_string()));
+    assert_eq!(part("&base=nothere01")["base"], false);
+    // (The computer puts the base there.)
+    block_on(clouds.send(Request::new("PUT", &format!("{BUCKET}bases/basename01.tar.gz")).with_body("base"))).unwrap();
+    assert_eq!(part("&base=basename01")["parts"], 2);
+    assert_eq!(part("&layer=layer0001&base=basename01,nothere01")["base"], false);
+    assert_eq!(part("&layer=layer0001&base=basename01")["parts"], 2);
+    // A run of one job on it; its runner fetches the tree from the bucket, sends a log there, and its machine sends a
+    // page of a step as it goes.
+    let made = run(key(Request::new("POST", &format!("{PLANE_URL}/runs")).with_body(serde_json::json!({ "workflow": "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n", "path": ".github/workflows/ci.yml", "repository": "acme/app", "tree": tree, "parts": 2 }).to_string())));
+    let id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let r: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{id}")]).unwrap();
+    let (token, job_id) = (r["jobs"][0]["token"].as_str().unwrap().to_string(), r["jobs"][0]["job_id"].as_str().unwrap().to_string());
+    assert_eq!(run(Request::new("GET", &format!("{PLANE_URL}/runner/{token}/superci/tree?part=0"))).status, 302);
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/runner/{token}/_apis/v1/Logfiles/p/1")).with_body("a whole log\n")).status, 200);
+    assert_eq!(run(key(get(&format!("/runs/{id}/log?job=0&log=1")))).body_text(), "a whole log\n");
+    let j = job(&store, job_id.parse().unwrap());
+    let (runner, hello) = (j["runner"].as_str().unwrap().to_string(), j["hello"].as_str().unwrap().to_string());
+    let step = "0a1b2c3d-0000-0000-0000-000000000000";
+    assert_eq!(run(Request::new("POST", &format!("{PLANE_URL}/hello?runner={runner}&t={hello}&live=tl_{step}_1.log&at=0")).with_body("2026-10-16T21:18:46.0000000Z a line\npart of")).status, 200);
+    assert_eq!(run(key(get(&format!("/runs/{id}/log?job=0&step={step}")))).body_text(), "2026-10-16T21:18:46.0000000Z a line\n");
+    // Its steps' whole logs, linked in the bucket.
+    store.0.borrow_mut().entry(format!("rjob:{token}")).and_modify(|v| { let mut h: serde_json::Value = serde_json::from_str(v).unwrap(); h["steps"] = serde_json::json!([{ "type": "Task", "log": 1, "order": 1, "state": "completed", "id": step }]); *v = h.to_string() });
+    assert_eq!(json(&run(key(get(&format!("/job/log?id={job_id}&link")))))["urls"].as_array().map(|u| u.len()), Some(1));
+    assert!(json(&run(key(get(&format!("/job/log?id={job_id}&steps")))))["steps"][0]["text"].as_str().is_some_and(|t| t.contains("a whole log")));
+    // A day on: what the run kept goes, from the bucket too.
+    clock.0.set(t + 2 * 86_400_000);
+    block_on(plane.alarm()).unwrap();
+    assert!(!store.0.borrow().keys().any(|k| k.starts_with(&format!("rlog:{token}")) || k.starts_with(&format!("rtree-s3:{tree}"))), "{:?}", store.0.borrow().keys().filter(|k| k.starts_with("r")).collect::<Vec<_>>());
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6272,7 +6336,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_job_whose_label_app_gitlab_or_run_is_gone_fails_at_its_next_start_saying_which,
         containers_and_launchers_that_cannot_start_a_machine_say_why_and_a_gpu_sandbox_is_named_with_its_gpu,
         an_aws_machines_cost_is_settled_at_its_on_demand_price_and_left_an_estimate_when_aws_cannot_be_asked,
-        the_dashboards_requests_go_through_with_what_github_and_gitlab_say_and_whatever_they_refuse
+        the_dashboards_requests_go_through_with_what_github_and_gitlab_say_and_whatever_they_refuse,
+        a_runs_working_tree_logs_and_pages_go_through_the_bucket_and_go_from_it_after_a_day
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",
