@@ -193,7 +193,8 @@ pub struct Swept { pub calls: usize, pub store_ops: usize, pub runs: usize, pub 
 /// `scenario` run clean, then once for each call and each store operation it made, that one failing (a call twice:
 /// answered with an error, and dropped). It builds its own control plane each time and arms the fault it is given
 /// once set up (`Served::arm`). Panics, naming each fault and what it broke, when any run broke what must hold.
-/// (`SUPERCI_SWEEP_CLEAN=1` runs the clean run alone: what the faults add to coverage is measured against it.)
+/// (The clean run alone unless `SUPERCI_SWEEP_FAULTS=1`: a sweep is many runs, made where they are asked for (the Test
+/// workflow's sweeps step, coverage); everywhere else the scenario is one test among the others.)
 pub fn sweep(name: &str, scenario: impl Fn(Fault) -> Outcome + Sync) -> Swept { swept(name, false, scenario) }
 
 /// The same, with outages too: run again for each call, that call and every one after it failing, and for each store
@@ -210,7 +211,7 @@ fn swept(name: &str, outages: bool, scenario: impl Fn(Fault) -> Outcome + Sync) 
         Err(e) => panic!("{name}, clean: {e}"),
     };
     let mut faults: Vec<Fault> = vec![];
-    if std::env::var("SUPERCI_SWEEP_CLEAN").ok().as_deref() != Some("1") {
+    if std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() == Some("1") {
         for k in 1..=calls.len() { faults.push(Fault::Call(k)); faults.push(Fault::Dropped(k)) }
         for k in 1..=ops.len() { faults.push(Fault::Store(k)) }
         if outages {

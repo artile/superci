@@ -19,7 +19,8 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # (With the sweeps' faults: many runs of each scenario.)
+    timeout-minutes: 80
     # What the program carries, built for the tests with quicker settings (a release ships with LTO and one codegen
     # unit, for small programs; the tests do not care how small).
     env:
@@ -47,6 +48,11 @@ jobs:
         run: ./build.sh
       - name: The tests
         run: cargo test --workspace
+      # (Each sweep's scenario ran once above; here again with each of its calls and store operations failing in turn.)
+      - name: The sweeps, every call and store operation failing in turn
+        env:
+          SUPERCI_SWEEP_FAULTS: "1"
+        run: cargo test -p superci --test sweep_jobs --test sweep_plane --test sweep_commands --test sweep_flows --test sweep_dashboard
       - name: The program for Windows builds
         run: cargo zigbuild --release --target x86_64-pc-windows-gnu -p superci
       - name: The crates pack and build as crates.io would get them
