@@ -15,16 +15,26 @@ use superci_core::plane::{role_arn, Launcher, Cache, Config, ControlPlane, Pool,
 use superci_core::io::{self, Clock, Containers, Http, Request, Response, Store, Timer};
 
 /// The store: kept in memory. `1`: what another request does meanwhile, run before each operation (its name and
-/// key), as a test sets it (see `meddling`).
+/// key), as a test sets it (see `meddling`); `2`: an operation it does not answer, once (see `refusing`).
 #[derive(Default)]
-struct Mem(RefCell<BTreeMap<String, String>>, Meddle);
+struct Mem(RefCell<BTreeMap<String, String>>, Meddle, RefCell<Option<(String, String, usize)>>);
 type Meddler = Box<dyn FnMut(&str, &str, &mut BTreeMap<String, String>)>;
 #[derive(Default)]
 struct Meddle(RefCell<Option<Meddler>>);
 impl Mem {
     fn meddling(&self, f: impl FnMut(&str, &str, &mut BTreeMap<String, String>) + 'static) { *self.1 .0.borrow_mut() = Some(Box::new(f)) }
+    /// An `op` of a key beginning with `prefix` not answered: the next one, or the one after `skip` of them.
+    fn refusing(&self, op: &str, prefix: &str, skip: usize) { *self.2.borrow_mut() = Some((op.into(), prefix.into(), skip)) }
     fn before(&self, op: &str, k: &str) -> io::Result<()> {
         faults::op()?;
+        let refused = {
+            let mut r = self.2.borrow_mut();
+            match r.as_mut() {
+                Some((o, p, skip)) if o == op && k.starts_with(p.as_str()) => if *skip == 0 { *r = None; true } else { *skip -= 1; false },
+                _ => false,
+            }
+        };
+        if refused { return Err(format!("the store did not answer ({op} {k})")) }
         if let Some(f) = self.1 .0.borrow_mut().as_mut() { f(op, k, &mut self.0.borrow_mut()) }
         Ok(())
     }
@@ -5760,6 +5770,8 @@ fn the_upkeep_ends_what_waited_too_long_or_was_cut_off_and_lets_go_of_failing_ru
     put("6", serde_json::json!({ "job_id": 6, "state": "failed", "fail_pending": "why", "ended_ms": t - 60_000, "installation_id": 999 }));
     // A machine whose job was cancelled before any runner took it, the note of it missed: its runner taken back.
     put("7", serde_json::json!({ "job_id": 7, "state": "launched", "launched_ms": t - 30_000, "machine_id": "i-7", "region": "us-east-1", "runner": "r-7", "runner_id": 66 }));
+    // (Its address known, as after any request: its GitLab projects' webhooks are told apart by it.)
+    block_on(plane.handle(get("/health")));
     store.0.borrow_mut().insert("gone:7".into(), t.to_string());
     // A machine whose job GitHub took elsewhere, with no runner of its own registered.
     put("8", serde_json::json!({ "job_id": 8, "state": "launched", "launched_ms": t - 9 * 60_000, "machine_id": "i-8", "region": "us-east-1" }));
@@ -6477,6 +6489,54 @@ fn a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_a
     assert!(log["log"].as_str().is_some_and(|l| l.contains("odd time") && !l.contains(" cut")), "{log}");
 }
 
+#[test]
+fn a_job_claimed_as_the_store_fails_to_index_it_is_claimed_again_and_gets_its_machine() {
+    // GitLab's job: its event answered with the store's failure; the look for jobs GitLab did not tell of finds it.
+    let hook = format!("{PLANE_URL}/gitlab/webhook");
+    let clouds = With(FakeClouds::default(), move |r: &Request, _: &str| {
+        let (u, json) = (r.url.as_str(), |v: serde_json::Value| Some(Response::new(200, "application/json", v.to_string())));
+        if u.starts_with("https://gitlab.example/api/v4/projects?membership=true") { return json(serde_json::json!([{ "id": 380, "path_with_namespace": "acme/app" }])) }
+        if u == "https://gitlab.example/api/v4/projects/380/hooks" { return json(serde_json::json!([{ "id": 1, "url": hook }])) }
+        if u.starts_with("https://gitlab.example/api/v4/projects/380/jobs?scope[]=pending") { return json(serde_json::json!([{ "id": 1980, "name": "test", "created_at": "2026-09-21T00:00:00Z", "pipeline": { "id": 9 } }])) }
+        None
+    });
+    let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.gitlab = Some(superci_core::gitlab::GitLab { url: "https://gitlab.example".into(), token: "glpat-test".into(), hook_secret: "hook-secret-0123456789".into(), id: String::new() });
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    // (Its address known, as after any request: its projects' webhooks are told apart by it.)
+    block_on(plane.handle(get("/health")));
+    block_on(plane.alarm()).unwrap();
+    store.0.borrow_mut().remove("gitlab:untold");
+    store.0.borrow_mut().retain(|k, _| !k.contains("gl1980"));
+    store.refusing("put", "live:", 0);
+    assert_eq!(block_on(plane.handle(gitlab_event(1980, "pending", "hook-secret-0123456789"))).status, 500);
+    block_on(plane.alarm()).unwrap();
+    let j: serde_json::Value = serde_json::from_str(&store.0.borrow()["job:gl1980"]).unwrap();
+    assert_eq!(j["state"], "launched", "{j}");
+
+    // A run of three jobs, the second's record not written: it, and the third reserved with it, started at the next move on.
+    let (store, clouds, wakes, cache) = (Mem::default(), FakeClouds::default(), Wakes::default(), Cache::default());
+    let mut config = Config::new(PLANE_ID.into());
+    config.app = Some(app());
+    (config.aws_own, config.aws_own_creds) = own_aws();
+    config.device_keys = vec![(u64::MAX, "dashboard-session-key-1".into())];
+    let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+    block_on(plane.alarm()).unwrap();
+    // (The first job's record written; then the second's not.)
+    store.refusing("put", "job:", 1);
+    let three = "jobs:\n  a:\n    runs-on: superci\n    steps:\n      - run: echo\n  b:\n    runs-on: superci\n    steps:\n      - run: echo\n  c:\n    runs-on: superci\n    steps:\n      - run: echo\n";
+    let made = block_on(plane.handle(Request::new("POST", &format!("{PLANE_URL}/runs")).with_header("authorization", "Bearer dashboard-session-key-1")
+        .with_body(serde_json::json!({ "workflow": three, "path": ".github/workflows/ci.yml", "repository": "acme/app" }).to_string())));
+    let id = json(&made)["run_id"].as_str().unwrap().to_string();
+    let states = || serde_json::from_str::<serde_json::Value>(&store.0.borrow()[&format!("run:{id}")]).unwrap()["jobs"].as_array().unwrap().iter().map(|j| j["state"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(states(), ["started", "pending", "pending"]);
+    block_on(plane.alarm()).unwrap();
+    let run: serde_json::Value = serde_json::from_str(&store.0.borrow()[&format!("run:{id}")]).unwrap();
+    for j in run["jobs"].as_array().unwrap() { assert_eq!(job(&store, j["job_id"].as_str().unwrap().parse().unwrap())["state"], "launched", "{run}") }
+}
+
 /// A test of this file run under the sweep: its name, and itself.
 type Swept = (&'static str, fn());
 macro_rules! tests { ($($t:ident),* $(,)?) => { &[$((stringify!($t), $t as fn())),*] } }
@@ -6633,7 +6693,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         a_role_aws_will_not_let_this_control_plane_take_leaves_what_needs_it_undone_or_estimated,
         a_gpu_job_refused_spot_for_the_accounts_limit_with_on_demand_turned_off_says_which_limit_to_raise,
         logs_and_trees_kept_in_a_bucket_this_control_plane_can_no_longer_reach_are_passed_over_or_said,
-        a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_as_they_are
+        a_github_jobs_pages_without_whole_lines_or_times_that_are_no_times_are_read_as_they_are,
+        a_job_claimed_as_the_store_fails_to_index_it_is_claimed_again_and_gets_its_machine
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

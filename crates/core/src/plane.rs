@@ -2040,7 +2040,7 @@ impl<'a> ControlPlane<'a> {
                     provider: "gitlab".into(), gitlab: gl.id.clone(), project_id: Some(ev.project_id), tags: tags.clone(), name: ev.name.clone(), workflow: ev.stage.clone(), ..Default::default() };
                 // Claimed once, however many deliveries arrive.
                 if !self.store.put_if_absent(&key, crate::io::json(&job)).await? { return Ok(Response::text(200, "known")) }
-                self.indexes(&key, &job, true, None).await?;
+                self.index_claim(&key, &job).await?;
                 // Run again after AWS took its spot machine back: not on a spot machine this time.
                 let again = rerun_key(&project, ev.pipeline_id, &ev.name);
                 if self.store.get(&again).await?.is_some() {
@@ -2537,7 +2537,7 @@ impl<'a> ControlPlane<'a> {
             repo_id: ev.repo_id, branch: ev.branch.clone(), default_branch: ev.default_branch.clone(), ..Default::default() };
         // Claimed once, however many deliveries of the event arrive at once. A claim that never got past launching (the
         // runtime restarted mid-way) is taken over by a later delivery.
-        if self.store.put_if_absent(&key, crate::io::json(&job)).await? { self.indexes(&key, &job, true, None).await? } else {
+        if self.store.put_if_absent(&key, crate::io::json(&job)).await? { self.index_claim(&key, &job).await? } else {
             let stuck = get_json::<Job>(self.store, &key).await?.is_some_and(|j| j.state == "launching" && job.at_ms.saturating_sub(j.at_ms) > 90_000);
             if !stuck { return Ok(()); }
             self.keep(&key, &job).await?;
@@ -2739,6 +2739,15 @@ impl<'a> ControlPlane<'a> {
             self.count(j, &h).await?
         }
         Ok(())
+    }
+
+    /// A job just claimed (its record written first, by this request alone), indexed. Its indexes not made, the claim
+    /// is let go: a record no index names is cared for by nothing (the upkeep reads the indexes), and its event, or the
+    /// look for jobs not told of, or its run moving on, claims it again.
+    async fn index_claim(&self, key: &str, job: &Job) -> Result<()> {
+        let indexed = self.indexes(key, job, true, None).await;
+        if indexed.is_err() { let _ = self.store.delete(key).await; }
+        indexed
     }
 
     /// Builds the jobs' indexes from the jobs kept before them, `budget` jobs at a time (the first one not done yet is kept, to go on from);
@@ -4184,9 +4193,10 @@ impl<'a> ControlPlane<'a> {
             let secrets: Vec<(String, String)> = serde_json::from_value(run["secrets"].clone()).unwrap_or_default();
             run["jobs"] = serde_json::Value::Array(jobs.clone());
             if !self.store.swap(&key, Some(&was), run.to_string()).await? { continue }
-            for i in start {
-                if let Err(e) = self.start_instance(plane_url, run_id, &run, &jobs[i], &secrets, &wf, &called).await {
-                    self.unreserve(&key, &jobs[i]).await;
+            for (n, i) in start.iter().enumerate() {
+                if let Err(e) = self.start_instance(plane_url, run_id, &run, &jobs[*i], &secrets, &wf, &called).await {
+                    // (It, and those reserved with it not started yet: each pending again, for the next move on.)
+                    for j in &start[n..] { self.unreserve(&key, &jobs[*j]).await }
                     return Err(e)
                 }
             }
@@ -4350,7 +4360,7 @@ impl<'a> ControlPlane<'a> {
             local: Some(token.to_string()), queued_ms: Some(now), by: run["by"].as_str().map(str::to_string), no_spot: inst["off_spot"] == true, ..Default::default() };
         // (Its id is new, and the job is this request's alone: taken in the run's record, written over what was read.)
         self.store.put(&job_key(&job), crate::io::json(&job)).await?;
-        self.indexes(&job_key(&job), &job, true, None).await?;
+        self.index_claim(&job_key(&job), &job).await?;
         self.start_soon(plane_url, &mut job).await
     }
 
