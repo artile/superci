@@ -1,0 +1,184 @@
+//! superci-layers with each of its steps failing in turn (`SUPERCI_LAYERS_FAULT`, see the program's `faults`), as
+//! containerd and a machine's end use it: its content store, its snapshots, a layer from SuperCI's store, and `keep`.
+//! Whatever fails, it does not panic, answers every request (an error said as one), and does not hang. (The clean
+//! run alone unless `SUPERCI_SWEEP_FAULTS=1`, each `SUPERCI_SWEEP_SLICE` its share, as the other sweeps.)
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
+use superci_layers::containerd::services::content::v1 as capi;
+use superci_layers::containerd::services::snapshots::v1 as sapi;
+
+fn digest(b: &[u8]) -> String { format!("sha256:{}", Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>()) }
+
+/// SuperCI's store and control plane, as the service and `keep` ask them: a layer's file by ranges, its links, an
+/// offer answered with an upload, the upload, its word, what was kept.
+fn plane(files: HashMap<String, Vec<u8>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = format!("http://{}", listener.local_addr().unwrap());
+    let base = at.clone();
+    std::thread::spawn(move || for stream in listener.incoming().flatten() {
+        let (files, base) = (files.clone(), base.clone());
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            if r.read_line(&mut line).is_err() { return }
+            let mut parts = line.split_whitespace();
+            let (method, path) = (parts.next().unwrap_or_default().to_string(), parts.next().unwrap_or_default().to_string());
+            let mut headers = HashMap::new();
+            loop { let mut h = String::new(); if r.read_line(&mut h).is_err() || h.trim().is_empty() { break } if let Some((k, v)) = h.split_once(':') { headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string()); } }
+            let mut body = vec![0; headers.get("content-length").and_then(|l| l.parse().ok()).unwrap_or(0)];
+            let _ = r.read_exact(&mut body);
+            let mut out = stream;
+            let mut send = |status: u16, extra: &str, b: &[u8]| { let _ = out.write_all(format!("HTTP/1.1 {status} X\r\ncontent-length: {}\r\n{extra}connection: close\r\n\r\n", b.len()).as_bytes()); let _ = out.write_all(b); };
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            match (method.as_str(), path.as_str()) {
+                ("GET", f) if f.starts_with("/files/") => match (files.get(&f[7..]), headers.get("range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-'))) {
+                    (Some(b), Some((a, z))) => { let (a, z): (usize, usize) = (a.parse().unwrap(), z.parse::<usize>().unwrap().min(b.len() - 1)); send(206, &format!("content-range: bytes {a}-{z}/{}\r\n", b.len()), &b[a..=z]) }
+                    (Some(b), None) => send(200, "", b),
+                    (None, _) => send(404, "", b""),
+                },
+                ("POST", "/links") => {
+                    let layers: serde_json::Map<String, serde_json::Value> = json["digests"].as_array().into_iter().flatten().filter_map(|d| d.as_str()).map(|d| {
+                        let size = files.get(&format!("{d}.erofs")).map(|f| f.len()).unwrap_or(0);
+                        (d.to_string(), serde_json::json!({ "size": 1, "erofs": { "url": format!("{base}/files/{d}.erofs"), "size": size }, "blob": { "url": format!("{base}/files/{d}.blob") } }))
+                    }).collect();
+                    send(200, "", serde_json::json!({ "layers": layers }).to_string().as_bytes())
+                }
+                ("POST", "/layers-propose") => {
+                    let answers: serde_json::Map<String, serde_json::Value> = json["layers"].as_array().into_iter().flatten().filter_map(|l| l["digest"].as_str()).map(|d| (d.to_string(), serde_json::json!({ "do": "upload", "url": format!("{base}/up/{d}"), "id": d }))).collect();
+                    send(200, "", serde_json::json!({ "layers": answers, "uploaded": format!("{base}/uploaded") }).to_string().as_bytes())
+                }
+                ("PUT", _) => send(200, "", b""),
+                ("POST", "/uploaded") => send(200, "", br#"{"do": "converting"}"#),
+                _ => send(200, "", b"{}"),
+            }
+        });
+    });
+    at
+}
+
+struct Run { child: Child, dir: std::path::PathBuf }
+
+impl Run {
+    fn log(&self) -> String { std::fs::read_to_string(self.dir.join("log")).unwrap_or_default() }
+    /// Stopped as systemd stops it; what it said, and whether it ended by a panic.
+    fn stop(mut self) -> (String, bool) {
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM); }
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut status = None;
+        while Instant::now() < until { if let Ok(Some(s)) = self.child.try_wait() { status = Some(s); break } std::thread::sleep(Duration::from_millis(20)) }
+        if status.is_none() { let _ = self.child.kill(); let _ = self.child.wait(); }
+        let log = self.log();
+        let _ = std::fs::remove_dir_all(&self.dir);
+        (log.clone(), log.contains("panicked") || status.is_some_and(|s| s.code() == Some(101)))
+    }
+}
+
+/// The service started with `fault` (none: the clean run, counting its steps into `count`), an index of one stored
+/// layer at `at`.
+fn start(fault: Option<usize>, count: &std::path::Path, at: &str, stored: &str) -> Option<(Run, std::path::PathBuf)> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!("superci-layers-sweep-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("layers.sock");
+    std::fs::write(dir.join("index.json"), serde_json::json!({ "layers": { stored: { "size": 21, "erofs": { "size": 300_000 }, "blob": {} } }, "refresh": { "url": format!("{at}/links"), "token": "" } }).to_string()).unwrap();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_superci-layers"));
+    c.args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", socket.display()),
+        format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("no-containerd.sock").display()), "--parallel=2".into(), "--sync-remove".into()])
+        .env("SUPERCI_LAYERS_FAULTS", count).stderr(std::fs::File::create(dir.join("log")).unwrap());
+    if let Some(k) = fault { c.env("SUPERCI_LAYERS_FAULT", k.to_string()); }
+    let mut child = c.spawn().unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    while !socket.exists() {
+        // (A fault as it starts may end it, saying why.)
+        if let Ok(Some(_)) = child.try_wait() { let log = std::fs::read_to_string(dir.join("log")).unwrap_or_default(); assert!(!log.contains("panicked"), "{fault:?}: {log}"); return None }
+        assert!(Instant::now() < until, "{fault:?}: it did not start");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Some((Run { child, dir }, socket))
+}
+
+/// One step of a scenario, its answer whatever it is, within a time: a hang is a failure.
+async fn step<T>(what: &str, f: impl std::future::Future<Output = T>) -> Result<T, String> { tokio::time::timeout(Duration::from_secs(20), f).await.map_err(|_| format!("{what}: no answer within 20 s")) }
+
+/// The scenario: what containerd asks of the content store and the snapshots, a stored layer used, `keep` after.
+async fn scenario(socket: &std::path::Path, dir: &std::path::Path, at: &str, stored: &str) -> Result<(), String> {
+    use capi::WriteAction::*;
+    let Ok(channel) = step("connect", superci_layers::client::channel(socket)).await? else { return Ok(()) };
+    let mut c = capi::content_client::ContentClient::new(channel.clone());
+    let mut s = sapi::snapshots_client::SnapshotsClient::new(channel);
+    let msg = |action: capi::WriteAction, r: &str, total: i64, expected: &str, offset: i64, data: &[u8]| capi::WriteContentRequest { action: action as i32, r#ref: r.into(), total, expected: expected.into(), offset, data: data.to_vec(), labels: HashMap::new() };
+    let blob = b"a blob's bytes".repeat(100);
+    let d = digest(&blob);
+    // (Each answer, success or error, is taken: only no answer fails the run.)
+    let _ = step("write", async { let mut a = c.write(tokio_stream::iter(vec![msg(Stat, "r1", blob.len() as i64, "", 0, b""), msg(Write, "r1", 0, "", 0, &blob[..10]), msg(Commit, "r1", blob.len() as i64, &d, 10, &blob[10..])])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let _ = step("info", c.info(capi::InfoRequest { digest: d.clone() })).await?;
+    let _ = step("read", async { let mut r = c.read(capi::ReadContentRequest { digest: d.clone(), offset: 0, size: 0 }).await?.into_inner(); while r.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let mut labels = HashMap::new();
+    labels.insert("superci".to_string(), "yes".to_string());
+    let _ = step("update", c.update(capi::UpdateRequest { info: Some(capi::Info { digest: d.clone(), labels, ..Default::default() }), update_mask: Some(prost_types::FieldMask { paths: vec!["labels.superci".into()] }) })).await?;
+    let _ = step("list", async { let mut l = c.list(capi::ListContentRequest { filters: vec!["labels.superci==yes".into()] }).await?.into_inner(); while l.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let _ = step("write under way", async { let mut a = c.write(tokio_stream::iter(vec![msg(Write, "r2", 20, "", 0, b"part")])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let _ = step("status", c.status(capi::StatusRequest { r#ref: "r2".into() })).await?;
+    let _ = step("statuses", c.list_statuses(capi::ListStatusesRequest { filters: vec![] })).await?;
+    let _ = step("abort", c.abort(capi::AbortRequest { r#ref: "r2".into() })).await?;
+    let _ = step("delete", c.delete(capi::DeleteContentRequest { digest: d.clone() })).await?;
+    // Snapshots: prepared, committed, one on it, a view, listed, changed, removed, cleaned up.
+    let _ = step("prepare", s.prepare(sapi::PrepareSnapshotRequest { key: "ns/1/a".into(), ..Default::default() })).await?;
+    let _ = step("mounts", s.mounts(sapi::MountsRequest { key: "ns/1/a".into(), ..Default::default() })).await?;
+    let _ = step("usage", s.usage(sapi::UsageRequest { key: "ns/1/a".into(), ..Default::default() })).await?;
+    let _ = step("commit", s.commit(sapi::CommitSnapshotRequest { name: "ns/1/base".into(), key: "ns/1/a".into(), ..Default::default() })).await?;
+    let _ = step("prepare on it", s.prepare(sapi::PrepareSnapshotRequest { key: "ns/1/b".into(), parent: "ns/1/base".into(), ..Default::default() })).await?;
+    let _ = step("view", s.view(sapi::ViewSnapshotRequest { key: "ns/1/v".into(), parent: "ns/1/base".into(), ..Default::default() })).await?;
+    let _ = step("stat", s.stat(sapi::StatSnapshotRequest { key: "ns/1/base".into(), ..Default::default() })).await?;
+    let mut labels = HashMap::new();
+    labels.insert("superci".to_string(), "kept".to_string());
+    let _ = step("update", s.update(sapi::UpdateSnapshotRequest { info: Some(sapi::Info { name: "ns/1/base".into(), labels, ..Default::default() }), update_mask: Some(prost_types::FieldMask { paths: vec!["labels.superci".into()] }), ..Default::default() })).await?;
+    let _ = step("list", async { let mut l = s.list(sapi::ListSnapshotsRequest { filters: vec!["parent==ns/1/base".into()], ..Default::default() }).await?.into_inner(); while l.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    for k in ["ns/1/b", "ns/1/v", "ns/1/base"] { let _ = step("remove", s.remove(sapi::RemoveSnapshotRequest { key: k.into(), ..Default::default() })).await?; }
+    let _ = step("cleanup", s.cleanup(sapi::CleanupRequest::default())).await?;
+    // A layer from the store, then one pulled; `keep` offers what was pulled.
+    let layer = |key: &str, d: &str| sapi::PrepareSnapshotRequest { key: key.into(), labels: [("containerd.io/snapshot.ref".to_string(), format!("chain-{key}")), ("containerd.io/snapshot/cri.layer-digest".to_string(), d.to_string()), ("containerd.io/snapshot/cri.image-layers".to_string(), d.to_string())].into_iter().collect(), ..Default::default() };
+    let _ = step("stored layer", s.prepare(layer("moby/1/extract-1", stored))).await?;
+    let pulled = b"a pulled layer".repeat(50);
+    let _ = step("pull", async { let mut a = c.write(tokio_stream::iter(vec![msg(Commit, "pull-1", pulled.len() as i64, &digest(&pulled), 0, &pulled)])).await?.into_inner(); while a.message().await?.is_some() {} Ok::<_, tonic::Status>(()) }).await?;
+    let _ = step("pulled layer", s.prepare(layer("moby/2/extract-2", &digest(&pulled)))).await?;
+    let keep = Command::new(env!("CARGO_BIN_EXE_superci-layers")).args(["keep".to_string(), format!("--link={at}"), format!("--socket={}", socket.display()),
+        format!("--content={}", dir.join("content").display()), format!("--index={}", dir.join("index.json").display()), "--most=20".into()]).output().unwrap();
+    if String::from_utf8_lossy(&keep.stderr).contains("panicked") { return Err(format!("keep panicked: {}", String::from_utf8_lossy(&keep.stderr))) }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_service_holds_with_each_call_and_store_operation_failing() {
+    let stored = digest(b"a stored layer's blob");
+    let at = plane([(format!("{stored}.erofs"), vec![7u8; 300_000])].into_iter().collect());
+    let count = std::env::temp_dir().join(format!("superci-layers-sweep-count-{}", std::process::id()));
+    let (run, socket) = start(None, &count, &at, &stored).expect("the clean run starts");
+    let dir = run.dir.clone();
+    scenario(&socket, &dir, &at, &stored).await.unwrap();
+    let (log, panicked) = run.stop();
+    assert!(!panicked, "{log}");
+    let steps: usize = std::fs::read_to_string(&count).unwrap_or_default().trim().parse().unwrap_or(0);
+    assert!(steps > 0, "steps counted");
+    if std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() != Some("1") { return }
+    // (`k/n`: every n-th fault from the k-th, as the test kit's sweeps share theirs.)
+    let said = std::env::var("SUPERCI_SWEEP_SLICE").unwrap_or_default();
+    let (k0, n) = said.split_once('/').and_then(|(k, n)| Some((k.parse::<usize>().ok()?, n.parse::<usize>().ok()?))).filter(|(k, n)| *k >= 1 && k <= n).unwrap_or((1, 1));
+    let mut broke = vec![];
+    for k in (1..=steps).filter(|k| (k - 1) % n == k0 - 1) {
+        let faulted = std::env::temp_dir().join(format!("superci-layers-sweep-count-{}-{k}", std::process::id()));
+        let Some((run, socket)) = start(Some(k), &faulted, &at, &stored) else { continue };
+        let dir = run.dir.clone();
+        let done = scenario(&socket, &dir, &at, &stored).await;
+        let (log, panicked) = run.stop();
+        if panicked || done.is_err() { broke.push(format!("step {k}: {done:?}\n{}", log.lines().rev().take(8).collect::<Vec<_>>().join("\n"))) }
+        let _ = std::fs::remove_file(&faulted);
+    }
+    assert!(broke.is_empty(), "{} of {steps} faults broke it:\n{}", broke.len(), broke.join("\n\n"));
+}

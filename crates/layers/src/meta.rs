@@ -62,33 +62,33 @@ pub struct Meta { db: redb::Database }
 
 impl Meta {
     pub fn open(path: &std::path::Path) -> Result<Meta> {
-        let base = redb::Database::create(path).map_err(db)?;
-        let tx = base.begin_write().map_err(db)?;
+        let base = redb::Database::create(path).map_err(db).and_then(crate::faults::pass)?;
+        let tx = base.begin_write().map_err(db).and_then(crate::faults::pass)?;
         {
-            tx.open_table(SNAPSHOTS).map_err(db)?;
-            tx.open_table(PARENTS).map_err(db)?;
-            tx.open_table(SEQUENCE).map_err(db)?;
+            tx.open_table(SNAPSHOTS).map_err(db).and_then(crate::faults::pass)?;
+            tx.open_table(PARENTS).map_err(db).and_then(crate::faults::pass)?;
+            tx.open_table(SEQUENCE).map_err(db).and_then(crate::faults::pass)?;
         }
-        tx.commit().map_err(db)?;
+        tx.commit().map_err(db).and_then(crate::faults::pass)?;
         Ok(Meta { db: base })
     }
 
     /// A read of the store as it stands.
     pub fn read<T>(&self, f: impl FnOnce(&Read) -> Result<T>) -> Result<T> {
-        let tx = self.db.begin_read().map_err(db)?;
-        let r = Read { snapshots: tx.open_table(SNAPSHOTS).map_err(db)?, parents: tx.open_table(PARENTS).map_err(db)? };
+        let tx = self.db.begin_read().map_err(db).and_then(crate::faults::pass)?;
+        let r = Read { snapshots: tx.open_table(SNAPSHOTS).map_err(db).and_then(crate::faults::pass)?, parents: tx.open_table(PARENTS).map_err(db).and_then(crate::faults::pass)? };
         f(&r)
     }
 
     /// A change, kept only if `f` succeeds; one at a time.
     pub fn write<T>(&self, f: impl FnOnce(&mut Write) -> Result<T>) -> Result<T> {
-        let tx = self.db.begin_write().map_err(db)?;
+        let tx = self.db.begin_write().map_err(db).and_then(crate::faults::pass)?;
         let out = {
-            let mut w = Write { snapshots: tx.open_table(SNAPSHOTS).map_err(db)?, parents: tx.open_table(PARENTS).map_err(db)?, sequence: tx.open_table(SEQUENCE).map_err(db)? };
+            let mut w = Write { snapshots: tx.open_table(SNAPSHOTS).map_err(db).and_then(crate::faults::pass)?, parents: tx.open_table(PARENTS).map_err(db).and_then(crate::faults::pass)?, sequence: tx.open_table(SEQUENCE).map_err(db).and_then(crate::faults::pass)? };
             f(&mut w)
         };
         match out {
-            Ok(v) => { tx.commit().map_err(db)?; Ok(v) }
+            Ok(v) => { tx.commit().map_err(db).and_then(crate::faults::pass)?; Ok(v) }
             Err(e) => { let _ = tx.abort(); Err(e) }
         }
     }
@@ -98,7 +98,7 @@ pub struct Read { snapshots: redb::ReadOnlyTable<&'static str, &'static [u8]>, p
 pub struct Write<'t> { snapshots: redb::Table<'t, &'static str, &'static [u8]>, parents: redb::Table<'t, (u64, u64), &'static str>, sequence: redb::Table<'t, &'static str, u64> }
 
 fn get(t: &impl ReadableTable<&'static str, &'static [u8]>, key: &str) -> Result<Option<Record>> {
-    match t.get(key).map_err(db)? {
+    match t.get(key).map_err(db).and_then(crate::faults::pass)? {
         Some(v) => serde_json::from_slice(v.value()).map(Some).map_err(db),
         None => Ok(None),
     }
@@ -113,7 +113,7 @@ fn parents(t: &impl ReadableTable<&'static str, &'static [u8]>, parent: &str) ->
     let mut ids = vec![];
     let mut name = parent.to_string();
     loop {
-        let Some(r) = get(t, &name)? else { return Err(Error::NotFound("missing parent".into())) };
+        let Some(r) = get(t, &name).and_then(crate::faults::pass)? else { return Err(Error::NotFound("missing parent".into())) };
         ids.push(r.id.to_string());
         if r.parent.is_empty() { return Ok(ids) }
         name = r.parent;
@@ -136,29 +136,29 @@ macro_rules! reads {
         impl $t {
             /// A snapshot's number, what it is and its usage (containerd's `GetInfo`).
             pub fn info(&self, key: &str) -> Result<(String, Info, Usage)> {
-                let Some(r) = get(&self.snapshots, key)? else { return Err(Error::NotFound("snapshot does not exist".into())) };
+                let Some(r) = get(&self.snapshots, key).and_then(crate::faults::pass)? else { return Err(Error::NotFound("snapshot does not exist".into())) };
                 Ok((r.id.to_string(), info_of(key, &r), Usage { size: r.size, inodes: r.inodes }))
             }
 
             /// An active or view snapshot with its parents (containerd's `GetSnapshot`).
             pub fn snapshot(&self, key: &str) -> Result<Snapshot> {
-                let Some(r) = get(&self.snapshots, key)? else { return Err(Error::NotFound("snapshot does not exist".into())) };
+                let Some(r) = get(&self.snapshots, key).and_then(crate::faults::pass)? else { return Err(Error::NotFound("snapshot does not exist".into())) };
                 if r.kind == Kind::Committed { return Err(Error::FailedPrecondition(format!("requested snapshot {key} not active or view"))) }
                 let parent_ids = if r.parent.is_empty() { vec![] } else {
-                    if get(&self.snapshots, &r.parent)?.is_none() { return Err(Error::NotFound("parent does not exist".into())) }
-                    parents(&self.snapshots, &r.parent).map_err(|e| e.context("failed to get parent chain"))?
+                    if get(&self.snapshots, &r.parent).and_then(crate::faults::pass)?.is_none() { return Err(Error::NotFound("parent does not exist".into())) }
+                    parents(&self.snapshots, &r.parent).map_err(|e| e.context("failed to get parent chain")).and_then(crate::faults::pass)?
                 };
                 Ok(Snapshot { id: r.id.to_string(), kind: r.kind, parent_ids })
             }
 
             /// Each snapshot the filters match, by name (containerd's `WalkInfo`).
             pub fn walk(&self, filters: &[String], mut f: impl FnMut(Info) -> Result<()>) -> Result<()> {
-                let filters = Filters::parse_all(filters).map_err(Error::InvalidArgument)?;
-                for item in self.snapshots.iter().map_err(db)? {
-                    let (k, v) = item.map_err(db)?;
-                    let r: Record = serde_json::from_slice(v.value()).map_err(db)?;
+                let filters = Filters::parse_all(filters).map_err(Error::InvalidArgument).and_then(crate::faults::pass)?;
+                for item in self.snapshots.iter().map_err(db).and_then(crate::faults::pass)? {
+                    let (k, v) = item.map_err(db).and_then(crate::faults::pass)?;
+                    let r: Record = serde_json::from_slice(v.value()).map_err(db).and_then(crate::faults::pass)?;
                     let i = info_of(k.value(), &r);
-                    if filters.matches(&adapt(&i)) { f(i)? }
+                    if filters.matches(&adapt(&i)) { f(i).and_then(crate::faults::pass)? }
                 }
                 Ok(())
             }
@@ -166,9 +166,9 @@ macro_rules! reads {
             /// Each snapshot's number, with its name (containerd's `IDMap`).
             pub fn ids(&self) -> Result<HashMap<String, String>> {
                 let mut m = HashMap::new();
-                for item in self.snapshots.iter().map_err(db)? {
-                    let (k, v) = item.map_err(db)?;
-                    let r: Record = serde_json::from_slice(v.value()).map_err(db)?;
+                for item in self.snapshots.iter().map_err(db).and_then(crate::faults::pass)? {
+                    let (k, v) = item.map_err(db).and_then(crate::faults::pass)?;
+                    let r: Record = serde_json::from_slice(v.value()).map_err(db).and_then(crate::faults::pass)?;
                     m.insert(r.id.to_string(), k.value().to_string());
                 }
                 Ok(m)
@@ -176,7 +176,7 @@ macro_rules! reads {
 
             #[allow(dead_code)]
             fn has_children(&self, id: u64) -> Result<bool> {
-                Ok(self.parents.range((id, 0)..=(id, u64::MAX)).map_err(db)?.next().is_some())
+                Ok(self.parents.range((id, 0)..=(id, u64::MAX)).map_err(db).and_then(crate::faults::pass)?.next().is_some())
             }
         }
     };
@@ -186,15 +186,15 @@ reads!(Write<'_>);
 
 impl Write<'_> {
     fn put(&mut self, key: &str, r: &Record) -> Result<()> {
-        let v = serde_json::to_vec(r).map_err(db)?;
-        self.snapshots.insert(key, v.as_slice()).map_err(db)?;
+        let v = serde_json::to_vec(r).map_err(db).and_then(crate::faults::pass)?;
+        self.snapshots.insert(key, v.as_slice()).map_err(db).and_then(crate::faults::pass)?;
         Ok(())
     }
 
     /// The next number (from 1, never given twice), as bolt's `NextSequence`.
     fn next_id(&mut self) -> Result<u64> {
-        let n = self.sequence.get("snapshots").map_err(db)?.map(|v| v.value()).unwrap_or(0) + 1;
-        self.sequence.insert("snapshots", n).map_err(db)?;
+        let n = self.sequence.get("snapshots").map_err(db).and_then(crate::faults::pass)?.map(|v| v.value()).unwrap_or(0) + 1;
+        self.sequence.insert("snapshots", n).map_err(db).and_then(crate::faults::pass)?;
         Ok(n)
     }
 
@@ -205,31 +205,31 @@ impl Write<'_> {
             return Err(Error::InvalidArgument(format!("snapshot type {} invalid; only snapshots of type Active or View can be created", kind.word())));
         }
         let parent_record = if parent.is_empty() { None } else {
-            let Some(p) = get(&self.snapshots, parent)? else { return Err(Error::NotFound(format!("missing parent {parent:?} bucket"))) };
+            let Some(p) = get(&self.snapshots, parent).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("missing parent {parent:?} bucket"))) };
             if p.kind != Kind::Committed { return Err(Error::InvalidArgument(format!("parent {parent:?} is not committed snapshot"))) }
             Some(p)
         };
-        if get(&self.snapshots, key)?.is_some() { return Err(Error::AlreadyExists(format!("snapshot {key}"))) }
-        let id = self.next_id().map_err(|e| e.context(format!("unable to get identifier for snapshot {key:?}")))?;
+        if get(&self.snapshots, key).and_then(crate::faults::pass)?.is_some() { return Err(Error::AlreadyExists(format!("snapshot {key}"))) }
+        let id = self.next_id().map_err(|e| e.context(format!("unable to get identifier for snapshot {key:?}"))).and_then(crate::faults::pass)?;
         let t = now();
-        self.put(key, &Record { id, kind, parent: parent.to_string(), labels, created: t, updated: t, inodes: 0, size: 0 })?;
+        self.put(key, &Record { id, kind, parent: parent.to_string(), labels, created: t, updated: t, inodes: 0, size: 0 }).and_then(crate::faults::pass)?;
         let mut parent_ids = vec![];
         if let Some(p) = parent_record {
-            self.parents.insert((p.id, id), key).map_err(db)?;
-            parent_ids = parents(&self.snapshots, parent).map_err(|e| e.context(format!("failed to get parent chain for snapshot {key:?}")))?;
+            self.parents.insert((p.id, id), key).map_err(db).and_then(crate::faults::pass)?;
+            parent_ids = parents(&self.snapshots, parent).map_err(|e| e.context(format!("failed to get parent chain for snapshot {key:?}"))).and_then(crate::faults::pass)?;
         }
         Ok(Snapshot { id: id.to_string(), kind, parent_ids })
     }
 
     /// Takes a snapshot out, if it has no children: its number and kind (containerd's `Remove`).
     pub fn remove(&mut self, key: &str) -> Result<(String, Kind)> {
-        let Some(r) = get(&self.snapshots, key)? else { return Err(Error::NotFound(format!("snapshot {key}"))) };
-        if self.has_children(r.id)? { return Err(Error::FailedPrecondition("cannot remove snapshot with child".into())) }
+        let Some(r) = get(&self.snapshots, key).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("snapshot {key}"))) };
+        if self.has_children(r.id).and_then(crate::faults::pass)? { return Err(Error::FailedPrecondition("cannot remove snapshot with child".into())) }
         if !r.parent.is_empty() {
-            let Some(p) = get(&self.snapshots, &r.parent)? else { return Err(Error::NotFound(format!("snapshot {key}"))) };
-            self.parents.remove((p.id, r.id)).map_err(db)?;
+            let Some(p) = get(&self.snapshots, &r.parent).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("snapshot {key}"))) };
+            self.parents.remove((p.id, r.id)).map_err(db).and_then(crate::faults::pass)?;
         }
-        self.snapshots.remove(key).map_err(db)?;
+        self.snapshots.remove(key).map_err(db).and_then(crate::faults::pass)?;
         Ok((r.id.to_string(), r.kind))
     }
 
@@ -237,8 +237,8 @@ impl Write<'_> {
     /// parent, one created with none takes it (containerd's `CommitActive`). Its number stays.
     pub fn commit(&mut self, key: &str, name: &str, usage: Usage, mut labels: BTreeMap<String, String>, parent: &str) -> Result<String> {
         labels.retain(|_, v| !v.is_empty());
-        if get(&self.snapshots, name)?.is_some() { return Err(Error::AlreadyExists(String::new()).context(format!("committed snapshot {name}"))) }
-        let Some(mut r) = get(&self.snapshots, key)? else { return Err(Error::NotFound(format!("failed to get active snapshot {key:?}"))) };
+        if get(&self.snapshots, name).and_then(crate::faults::pass)?.is_some() { return Err(Error::AlreadyExists(String::new()).context(format!("committed snapshot {name}"))) }
+        let Some(mut r) = get(&self.snapshots, key).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("failed to get active snapshot {key:?}"))) };
         if r.kind != Kind::Active { return Err(Error::FailedPrecondition(format!("snapshot {key:?} is not active"))) }
         r.kind = Kind::Committed;
         r.created = now();
@@ -250,12 +250,12 @@ impl Write<'_> {
             }
         }
         (r.size, r.inodes) = (usage.size, usage.inodes);
-        self.put(name, &r)?;
-        self.snapshots.remove(key).map_err(db)?;
+        self.put(name, &r).and_then(crate::faults::pass)?;
+        self.snapshots.remove(key).map_err(db).and_then(crate::faults::pass)?;
         if !r.parent.is_empty() {
-            let Some(p) = get(&self.snapshots, &r.parent)? else { return Err(Error::NotFound(format!("missing parent {:?} of snapshot {key:?}", r.parent))) };
+            let Some(p) = get(&self.snapshots, &r.parent).and_then(crate::faults::pass)? else { return Err(Error::NotFound(format!("missing parent {:?} of snapshot {key:?}", r.parent))) };
             if p.kind != Kind::Committed { return Err(Error::FailedPrecondition(format!("parent {:?} is not committed", r.parent))) }
-            self.parents.insert((p.id, r.id), name).map_err(db)?;
+            self.parents.insert((p.id, r.id), name).map_err(db).and_then(crate::faults::pass)?;
         }
         Ok(r.id.to_string())
     }
@@ -263,7 +263,7 @@ impl Write<'_> {
     /// A snapshot's labels changed: all of them, or the `labels` and `labels.KEY` paths given; nothing else can be
     /// (containerd's `UpdateInfo`).
     pub fn update(&mut self, info: &Info, paths: &[String]) -> Result<Info> {
-        let Some(mut r) = get(&self.snapshots, &info.name)? else { return Err(Error::NotFound("snapshot does not exist".into())) };
+        let Some(mut r) = get(&self.snapshots, &info.name).and_then(crate::faults::pass)? else { return Err(Error::NotFound("snapshot does not exist".into())) };
         if paths.is_empty() {
             r.labels = info.labels.clone();
         } else {
@@ -281,7 +281,7 @@ impl Write<'_> {
         // (A label set to nothing is no label: containerd keeps no empty value.)
         r.labels.retain(|_, v| !v.is_empty());
         r.updated = now();
-        self.put(&info.name, &r)?;
+        self.put(&info.name, &r).and_then(crate::faults::pass)?;
         Ok(info_of(&info.name, &r))
     }
 }
@@ -322,7 +322,7 @@ mod tests {
         m.write(|w| w.remove("a")).unwrap();
         assert!(m.read(|r| r.ids()).unwrap().is_empty());
         // A failed change leaves nothing.
-        let _ = m.write(|w| { w.create(Kind::Active, "d", "", BTreeMap::new())?; Err::<(), _>(Error::Other("no".into())) });
+        let _ = m.write(|w| { w.create(Kind::Active, "d", "", BTreeMap::new()).and_then(crate::faults::pass)?; Err::<(), _>(Error::Other("no".into())) });
         assert!(m.read(|r| r.info("d")).unwrap_err().is_not_found());
         assert_eq!(m.write(|w| w.create(Kind::Active, "e", "", BTreeMap::new())).unwrap().id, "4", "a failed change gives its number back, as bolt's sequence does");
         let _ = std::fs::remove_dir_all(dir);

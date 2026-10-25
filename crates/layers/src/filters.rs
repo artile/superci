@@ -184,13 +184,13 @@ struct Parser<'a> { input: &'a str, s: Scanner<'a> }
 
 impl Parser<'_> {
     fn selectors(&mut self) -> Result<Vec<Selector>, String> {
-        let mut all = vec![self.selector()?];
+        let mut all = vec![self.selector().and_then(crate::faults::said)?];
         loop {
             match self.s.peek() {
                 c if c == ',' as i32 => {
                     let (pos, tok, _) = self.s.scan();
                     if tok != SEPARATOR { return Err(self.err(pos, "expected a separator")) }
-                    all.push(self.selector()?);
+                    all.push(self.selector().and_then(crate::faults::said)?);
                 }
                 EOF => return Ok(all),
                 c => { let at = self.s.ppos; return Err(self.err(at, &format!("unexpected input: {}", as_char(c).unwrap_or('\u{fffd}')))) }
@@ -199,21 +199,21 @@ impl Parser<'_> {
     }
 
     fn selector(&mut self) -> Result<Selector, String> {
-        let path = self.fieldpath()?;
+        let path = self.fieldpath().and_then(crate::faults::said)?;
         let next = self.s.peek();
         if next == ',' as i32 || next == SEPARATOR || next == EOF { return Ok(Selector { path, op: Op::Present, value: String::new(), re: None }) }
-        let op = self.operator()?;
-        let value = self.value(op == Op::Matches)?;
+        let op = self.operator().and_then(crate::faults::said)?;
+        let value = self.value(op == Op::Matches).and_then(crate::faults::said)?;
         let re = if op == Op::Matches { regex::Regex::new(&value).ok() } else { None };
         Ok(Selector { path, op, value, re })
     }
 
     fn fieldpath(&mut self) -> Result<Vec<String>, String> {
-        let mut fields = vec![self.field()?];
+        let mut fields = vec![self.field().and_then(crate::faults::said)?];
         while self.s.peek() == '.' as i32 {
             let (pos, tok, _) = self.s.scan();
             if tok != SEPARATOR { return Err(self.err(pos, "expected a field separator (`.`)")) }
-            fields.push(self.field()?);
+            fields.push(self.field().and_then(crate::faults::said)?);
         }
         Ok(fields)
     }

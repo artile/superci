@@ -30,13 +30,13 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn open(root: &Path, async_remove: bool) -> Result<Overlay> {
-        mkdir_all(root, 0o700)?;
-        if !supports_dtype(root)? {
+        mkdir_all(root, 0o700).and_then(crate::faults::pass)?;
+        if !supports_dtype(root).and_then(crate::faults::pass)? {
             return Err(Error::Other(format!("{} does not support d_type. If the backing filesystem is xfs, please reformat with ftype=1 to enable d_type support", root.display())));
         }
         // (containerd adds "userxattr" for an overlay made in a user namespace; this runs as the machine's root only.)
         if in_user_namespace() { return Err(Error::Other("not supported in a user namespace".into())) }
-        let meta = Meta::open(&root.join("metadata.db"))?;
+        let meta = Meta::open(&root.join("metadata.db")).and_then(crate::faults::pass)?;
         match std::fs::DirBuilder::new().mode(0o700).create(root.join("snapshots")) {
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
             _ => {}
@@ -54,7 +54,7 @@ impl Overlay {
 
     /// What a snapshot takes: an active one's upper folder as it is now (read from disk), a committed one's as kept.
     pub fn usage(&self, key: &str) -> Result<Usage> {
-        let (id, info, usage) = self.meta.read(|r| r.info(key))?;
+        let (id, info, usage) = self.meta.read(|r| r.info(key)).and_then(crate::faults::pass)?;
         if info.kind == Some(Kind::Active) { return disk_usage(&self.upper(&id)) }
         Ok(usage)
     }
@@ -69,10 +69,10 @@ impl Overlay {
 
     pub fn mounts(&self, key: &str) -> Result<Vec<Mount>> {
         let (s, info) = self.meta.read(|r| {
-            let s = r.snapshot(key).map_err(|e| e.context("failed to get active mount"))?;
-            let (_, info, _) = r.info(key).map_err(|e| e.context("failed to get snapshot info"))?;
+            let s = r.snapshot(key).map_err(|e| e.context("failed to get active mount")).and_then(crate::faults::pass)?;
+            let (_, info, _) = r.info(key).map_err(|e| e.context("failed to get snapshot info")).and_then(crate::faults::pass)?;
             Ok((s, info))
-        })?;
+        }).and_then(crate::faults::pass)?;
         Ok(self.mounts_of(&s, &info))
     }
 
@@ -84,9 +84,9 @@ impl Overlay {
     /// The same, with its usage as given (a layer mounted from SuperCI's store says its own) or read from disk.
     pub fn commit_with(&self, name: &str, key: &str, labels: BTreeMap<String, String>, parent: &str, usage: Option<Usage>) -> Result<()> {
         self.meta.write(|w| {
-            let (id, _, _) = w.info(key)?;
-            let usage = match usage { Some(u) => u, None => disk_usage(&self.upper(&id))? };
-            w.commit(key, name, usage, labels, parent).map_err(|e| e.context(format!("failed to commit snapshot {key}")))?;
+            let (id, _, _) = w.info(key).and_then(crate::faults::pass)?;
+            let usage = match usage { Some(u) => u, None => disk_usage(&self.upper(&id)).and_then(crate::faults::pass)? };
+            w.commit(key, name, usage, labels, parent).map_err(|e| e.context(format!("failed to commit snapshot {key}"))).and_then(crate::faults::pass)?;
             Ok(())
         })
     }
@@ -94,10 +94,10 @@ impl Overlay {
     /// Takes a snapshot out; its folder now, or at the next `cleanup` (`async_remove`).
     pub fn remove(&self, key: &str) -> Result<()> {
         let removals = self.meta.write(|w| {
-            w.remove(key).map_err(|e| e.context(format!("failed to remove snapshot {key}")))?;
+            w.remove(key).map_err(|e| e.context(format!("failed to remove snapshot {key}"))).and_then(crate::faults::pass)?;
             if self.async_remove { return Ok(vec![]) }
-            self.cleanup_dirs(&w.ids()?).map_err(|e| e.context("unable to get directories for removal"))
-        })?;
+            self.cleanup_dirs(&w.ids().and_then(crate::faults::pass)?).map_err(|e| e.context("unable to get directories for removal"))
+        }).and_then(crate::faults::pass)?;
         // (The snapshot is gone from the store already: a folder that cannot be taken away is said, not failed.)
         for dir in removals { if let Err(e) = remove_snapshot_dir(&dir) { eprintln!("failed to remove directory {}: {e}", dir.display()) } }
         Ok(())
@@ -108,7 +108,7 @@ impl Overlay {
     /// The folders of snapshots no longer in the store, taken away.
     pub fn cleanup(&self) -> Result<()> {
         // (In a change, so no snapshot is made while the folders are read.)
-        let dirs = self.meta.write(|w| self.cleanup_dirs(&w.ids()?))?;
+        let dirs = self.meta.write(|w| self.cleanup_dirs(&w.ids().and_then(crate::faults::pass)?)).and_then(crate::faults::pass)?;
         for dir in dirs { if let Err(e) = remove_snapshot_dir(&dir) { eprintln!("failed to remove directory {}: {e}", dir.display()) } }
         Ok(())
     }
@@ -116,8 +116,8 @@ impl Overlay {
     fn cleanup_dirs(&self, ids: &std::collections::HashMap<String, String>) -> Result<Vec<PathBuf>> {
         let dir = self.root.join("snapshots");
         let mut out = vec![];
-        for e in std::fs::read_dir(&dir)? {
-            let name = e?.file_name().to_string_lossy().into_owned();
+        for e in std::fs::read_dir(&dir).and_then(crate::faults::pass)? {
+            let name = e.and_then(crate::faults::pass)?.file_name().to_string_lossy().into_owned();
             if !ids.contains_key(&name) { out.push(dir.join(name)) }
         }
         Ok(out)
@@ -131,29 +131,29 @@ impl Overlay {
             let t = prepare_directory(&snapshots, kind).map_err(|(t, e)| (t, e.context("failed to create prepare snapshot dir")));
             let t = match t { Ok(t) => t, Err((t, e)) => { td = t; return Err(e) } };
             td = Some(t.clone());
-            let s = w.create(kind, key, parent, labels).map_err(|e| e.context("failed to create snapshot"))?;
-            let (_, info, _) = w.info(key).map_err(|e| e.context("failed to get snapshot info"))?;
+            let s = w.create(kind, key, parent, labels).map_err(|e| e.context("failed to create snapshot")).and_then(crate::faults::pass)?;
+            let (_, info, _) = w.info(key).map_err(|e| e.context("failed to get snapshot info")).and_then(crate::faults::pass)?;
             // The owner of its files' root: the user namespace's root when mapped, else its parent's root's.
             let mut owner: Option<(u32, u32)> = None;
             if info.labels.contains_key(UID_MAPPING) || info.labels.contains_key(GID_MAPPING) {
                 let unmarshal = |key| mappings(info.labels.get(key).map(String::as_str).unwrap_or("")).map_err(|e| Error::Other(format!("failed to unmarshal snapshot ID mapped labels: {e}")));
-                let (uids, gids) = (unmarshal(UID_MAPPING)?, unmarshal(GID_MAPPING)?);
+                let (uids, gids) = (unmarshal(UID_MAPPING).and_then(crate::faults::pass)?, unmarshal(GID_MAPPING).and_then(crate::faults::pass)?);
                 let root = to_host(0, &uids).and_then(|u| Ok((u, to_host(0, &gids)?))).map_err(|e| Error::Other(format!("failed to find root pair: {e}")))?;
                 owner = Some(root);
             }
             if owner.is_none() {
                 if let Some(p) = s.parent_ids.first() {
                     use std::os::unix::fs::MetadataExt;
-                    let st = std::fs::metadata(self.upper(p)).map_err(|e| Error::Other(format!("failed to stat parent: {e}")))?;
+                    let st = std::fs::metadata(self.upper(p)).map_err(|e| Error::Other(format!("failed to stat parent: {e}"))).and_then(crate::faults::pass)?;
                     owner = Some((st.uid(), st.gid()));
                 }
             }
             if let Some((uid, gid)) = owner {
-                std::os::unix::fs::lchown(t.join("fs"), Some(uid), Some(gid)).map_err(|e| Error::Other(format!("failed to chown: {e}")))?;
+                std::os::unix::fs::lchown(t.join("fs"), Some(uid), Some(gid)).map_err(|e| Error::Other(format!("failed to chown: {e}"))).and_then(crate::faults::pass)?;
             }
             let p = snapshots.join(&s.id);
             path = Some(p.clone());
-            std::fs::rename(&t, &p).map_err(|e| Error::Other(format!("failed to rename: {e}")))?;
+            std::fs::rename(&t, &p).map_err(|e| Error::Other(format!("failed to rename: {e}"))).and_then(crate::faults::pass)?;
             td = None;
             Ok((s, info))
         });
@@ -229,7 +229,7 @@ fn random_suffix() -> String {
 /// A snapshot's folder taken away; a store layer mounted on its `fs` is unmounted first.
 pub fn remove_snapshot_dir(dir: &Path) -> std::io::Result<()> {
     let fs = dir.join("fs");
-    if is_mount_point(&fs) { crate::mount::unmount(&fs)? }
+    if is_mount_point(&fs) { crate::mount::unmount(&fs).and_then(crate::faults::pass)? }
     match std::fs::remove_dir_all(dir) { Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()), r => r }
 }
 
@@ -250,9 +250,9 @@ pub fn disk_usage(root: &Path) -> Result<Usage> {
     let mut size: i64 = 0;
     let mut stack = vec![root.to_path_buf()];
     while let Some(p) = stack.pop() {
-        let m = std::fs::symlink_metadata(&p)?;
+        let m = std::fs::symlink_metadata(&p).and_then(crate::faults::pass)?;
         if seen.insert((m.dev(), m.ino())) { size += m.blocks() as i64 * 512 }
-        if m.is_dir() { for e in std::fs::read_dir(&p)? { stack.push(e?.path()) } }
+        if m.is_dir() { for e in std::fs::read_dir(&p).and_then(crate::faults::pass)? { stack.push(e.and_then(crate::faults::pass)?.path()) } }
     }
     Ok(Usage { size, inodes: seen.len() as i64 })
 }
@@ -298,10 +298,10 @@ fn to_host(id: u32, map: &Option<Vec<(u32, u32, u32)>>) -> std::result::Result<u
 fn supports_dtype(path: &Path) -> Result<bool> {
     use std::os::unix::ffi::OsStrExt;
     // (A folder with nothing in it: a file of its own while it is looked at.)
-    let empty = std::fs::read_dir(path)?.next().is_none();
+    let empty = std::fs::read_dir(path).and_then(crate::faults::pass)?.next().is_none();
     let dummy = path.join(format!(".superci-dtype-{}", random_suffix()));
-    if empty { std::fs::write(&dummy, b"")?; }
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| Error::Other(e.to_string()))?;
+    if empty { std::fs::write(&dummy, b"").and_then(crate::faults::pass)?; }
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| Error::Other(e.to_string())).and_then(crate::faults::pass)?;
     let mut ok = true;
     unsafe {
         let d = libc::opendir(c.as_ptr());

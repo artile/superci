@@ -86,11 +86,11 @@ pub struct Store {
 impl Store {
     /// The store at `root` (containerd's content folder), its labels in `labels` (a file of SuperCI's own).
     pub fn open(root: &Path, labels: &Path) -> Result<Store> {
-        std::fs::create_dir_all(root)?;
-        let labels = redb::Database::create(labels).map_err(db)?;
-        let tx = labels.begin_write().map_err(db)?;
-        tx.open_table(LABELS).map_err(db)?;
-        tx.commit().map_err(db)?;
+        std::fs::create_dir_all(root).and_then(crate::faults::pass)?;
+        let labels = redb::Database::create(labels).map_err(db).and_then(crate::faults::pass)?;
+        let tx = labels.begin_write().map_err(db).and_then(crate::faults::pass)?;
+        tx.open_table(LABELS).map_err(db).and_then(crate::faults::pass)?;
+        tx.commit().map_err(db).and_then(crate::faults::pass)?;
         Ok(Store { root: root.to_path_buf(), labels, locks: Mutex::new(HashMap::new()) })
     }
 
@@ -99,19 +99,19 @@ impl Store {
     fn ingest_root(&self, r: &str) -> PathBuf { self.root.join("ingest").join(Digest::of(Algorithm::Sha256, r.as_bytes()).hex) }
 
     fn get_labels(&self, d: &Digest) -> Result<BTreeMap<String, String>> {
-        let tx = self.labels.begin_read().map_err(db)?;
-        let t = tx.open_table(LABELS).map_err(db)?;
-        let got = redb::ReadableTable::get(&t, d.to_string().as_str()).map_err(db)?;
-        let labels = match got { Some(v) => serde_json::from_slice(v.value()).map_err(db)?, None => BTreeMap::new() };
+        let tx = self.labels.begin_read().map_err(db).and_then(crate::faults::pass)?;
+        let t = tx.open_table(LABELS).map_err(db).and_then(crate::faults::pass)?;
+        let got = redb::ReadableTable::get(&t, d.to_string().as_str()).map_err(db).and_then(crate::faults::pass)?;
+        let labels = match got { Some(v) => serde_json::from_slice(v.value()).map_err(db).and_then(crate::faults::pass)?, None => BTreeMap::new() };
         Ok(labels)
     }
 
     fn set_labels(&self, d: &Digest, labels: &BTreeMap<String, String>) -> Result<()> {
-        let tx = self.labels.begin_write().map_err(db)?;
+        let tx = self.labels.begin_write().map_err(db).and_then(crate::faults::pass)?;
         {
-            let mut t = tx.open_table(LABELS).map_err(db)?;
+            let mut t = tx.open_table(LABELS).map_err(db).and_then(crate::faults::pass)?;
             let key = d.to_string();
-            if labels.is_empty() { t.remove(key.as_str()).map_err(db)?; } else { t.insert(key.as_str(), serde_json::to_vec(labels).map_err(db)?.as_slice()).map_err(db)?; }
+            if labels.is_empty() { t.remove(key.as_str()).map_err(db).and_then(crate::faults::pass)?; } else { t.insert(key.as_str(), serde_json::to_vec(labels).map_err(db).and_then(crate::faults::pass)?.as_slice()).map_err(db).and_then(crate::faults::pass)?; }
         }
         tx.commit().map_err(db)
     }
@@ -122,7 +122,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::NotFound(format!("content {d}"))),
             Err(e) => return Err(e.into()),
         };
-        Ok(self.info_of(d, &m, self.get_labels(d)?))
+        Ok(self.info_of(d, &m, self.get_labels(d).and_then(crate::faults::pass)?))
     }
 
     fn info_of(&self, d: &Digest, m: &std::fs::Metadata, labels: BTreeMap<String, String>) -> Info {
@@ -134,8 +134,8 @@ impl Store {
     pub fn open_blob(&self, d: &Digest) -> Result<(std::fs::File, u64)> {
         let p = self.blob_path(d);
         let not_found = |e: std::io::Error| if e.kind() == std::io::ErrorKind::NotFound { Error::NotFound("blob not found".into()).context(format!("blob {d} expected at {}", p.display())) } else { e.into() };
-        let size = std::fs::metadata(&p).map_err(not_found)?.len();
-        let f = std::fs::File::open(&p).map_err(not_found)?;
+        let size = std::fs::metadata(&p).map_err(not_found).and_then(crate::faults::pass)?.len();
+        let f = std::fs::File::open(&p).map_err(not_found).and_then(crate::faults::pass)?;
         Ok((f, size))
     }
 
@@ -149,7 +149,7 @@ impl Store {
 
     /// A blob's labels changed: all of them, or the `labels` and `labels.KEY` paths given (a key given no value goes).
     pub fn update(&self, info: &Info, paths: &[String]) -> Result<Info> {
-        let d = Digest::parse(&info.digest).map_err(|e| Error::InvalidArgument(format!("{:?} failed validation: {e}", info.digest)))?;
+        let d = Digest::parse(&info.digest).map_err(|e| Error::InvalidArgument(format!("{:?} failed validation: {e}", info.digest))).and_then(crate::faults::pass)?;
         let p = self.blob_path(&d);
         let m = match std::fs::metadata(&p) {
             Ok(m) => m,
@@ -170,11 +170,11 @@ impl Store {
             }
         }
         let labels = if all { changed.retain(|_, v| !v.is_empty()); changed } else {
-            let mut l = self.get_labels(&d)?;
+            let mut l = self.get_labels(&d).and_then(crate::faults::pass)?;
             for (k, v) in changed { if v.is_empty() { l.remove(&k); } else { l.insert(k, v); } }
             l
         };
-        self.set_labels(&d, &labels)?;
+        self.set_labels(&d, &labels).and_then(crate::faults::pass)?;
         let mut out = self.info_of(&d, &m, labels);
         out.updated = crate::meta::now();
         // (Its access time is when it was last changed, as containerd's store keeps it.)
@@ -184,20 +184,20 @@ impl Store {
 
     /// Each blob the filters match (by `digest` and `labels.KEY`).
     pub fn walk(&self, filters: &[String], mut f: impl FnMut(Info) -> Result<()>) -> Result<()> {
-        let filters = Filters::parse_all(filters).map_err(Error::InvalidArgument)?;
+        let filters = Filters::parse_all(filters).map_err(Error::InvalidArgument).and_then(crate::faults::pass)?;
         let root = self.root.join("blobs");
         let Ok(algs) = std::fs::read_dir(&root) else { return Ok(()) };
         let mut algs: Vec<_> = algs.filter_map(|e| e.ok()).collect();
         algs.sort_by_key(|e| e.file_name());
         for a in algs {
             let Some(alg) = Algorithm::from_name(&a.file_name().to_string_lossy()) else { continue };
-            if !a.file_type()?.is_dir() { continue }
-            let mut blobs: Vec<_> = std::fs::read_dir(a.path())?.filter_map(|e| e.ok()).collect();
+            if !a.file_type().and_then(crate::faults::pass)?.is_dir() { continue }
+            let mut blobs: Vec<_> = std::fs::read_dir(a.path()).and_then(crate::faults::pass)?.filter_map(|e| e.ok()).collect();
             blobs.sort_by_key(|e| e.file_name());
             for b in blobs {
                 let d = Digest { algorithm: alg, hex: b.file_name().to_string_lossy().into_owned() };
-                let m = b.metadata()?;
-                let i = self.info_of(&d, &m, self.get_labels(&d)?);
+                let m = b.metadata().and_then(crate::faults::pass)?;
+                let i = self.info_of(&d, &m, self.get_labels(&d).and_then(crate::faults::pass)?);
                 let adapt = |path: &[String]| -> Option<String> {
                     match path.first().map(String::as_str) {
                         Some("digest") => Some(i.digest.clone()),
@@ -205,7 +205,7 @@ impl Store {
                         _ => None,
                     }
                 };
-                if filters.matches(&adapt) { f(i.clone())? }
+                if filters.matches(&adapt) { f(i.clone()).and_then(crate::faults::pass)? }
             }
         }
         Ok(())
@@ -215,23 +215,23 @@ impl Store {
     /// same disk so a file is moved in, not copied).
     pub fn fetch_dir(&self) -> Result<PathBuf> {
         let d = self.root.join("superci-fetch");
-        std::fs::create_dir_all(&d)?;
+        std::fs::create_dir_all(&d).and_then(crate::faults::pass)?;
         Ok(d)
     }
 
     /// A file fetched whole made the blob `d`, if it is: hashed, moved into place, made read-only (as a commit
     /// does). One there already is kept, and the file thrown away.
     pub fn put_file(&self, d: &Digest, file: &Path) -> Result<()> {
-        let got = crate::fetch::hash_file(file, d.algorithm)?;
+        let got = crate::fetch::hash_file(file, d.algorithm).and_then(crate::faults::pass)?;
         if got != *d {
             let _ = std::fs::remove_file(file);
             return Err(Error::FailedPrecondition(format!("unexpected commit digest {got}, expected {d}")));
         }
         let target = self.blob_path(d);
-        std::fs::create_dir_all(target.parent().unwrap())?;
+        std::fs::create_dir_all(target.parent().unwrap()).and_then(crate::faults::pass)?;
         if target.exists() { let _ = std::fs::remove_file(file); return Ok(()) }
-        std::fs::rename(file, &target)?;
-        std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all())?;
+        std::fs::rename(file, &target).and_then(crate::faults::pass)?;
+        std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all()).and_then(crate::faults::pass)?;
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444));
         Ok(())
@@ -243,10 +243,10 @@ impl Store {
     pub fn list_statuses(&self, filters: &[String]) -> Result<Vec<Status>> {
         let dir = self.root.join("ingest");
         let entries = match std::fs::read_dir(&dir) { Ok(e) => e, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]), Err(e) => return Err(e.into()) };
-        let filters = Filters::parse_all(filters).map_err(Error::InvalidArgument)?;
+        let filters = Filters::parse_all(filters).map_err(Error::InvalidArgument).and_then(crate::faults::pass)?;
         let mut out = vec![];
         for e in entries {
-            match status_at(&e?.path()) {
+            match status_at(&e.and_then(crate::faults::pass)?.path()) {
                 Ok(s) => if filters.matches(&|path: &[String]| (path.first().map(String::as_str) == Some("ref")).then(|| s.ref_.clone())) { out.push(s) },
                 // (One finishing while the folder is read is no longer a write in progress.)
                 Err(Error::NotFound(_)) => continue,
@@ -278,7 +278,7 @@ impl Store {
     /// is an error.
     pub fn writer<'s>(&'s self, r: &str, total: i64, expected: Option<&Digest>) -> Result<Writer<'s>> {
         if r.is_empty() { return Err(Error::InvalidArgument("ref must not be empty".into())) }
-        self.try_lock(r)?;
+        self.try_lock(r).and_then(crate::faults::pass)?;
         match self.writer_locked(r, total, expected) {
             Ok(w) => Ok(w),
             Err(e) => { self.unlock(r); Err(e) }
@@ -293,7 +293,7 @@ impl Store {
         let mut hasher = expected.map(|d| d.algorithm).unwrap_or(Algorithm::Sha256).hasher();
         let (mut offset, mut started, mut updated) = (0i64, 0, 0);
         let mut found = false;
-        std::fs::create_dir_all(self.root.join("ingest"))?;
+        std::fs::create_dir_all(self.root.join("ingest")).and_then(crate::faults::pass)?;
         match std::fs::DirBuilder::new().create(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match self.resume(&path, r, total, &mut hasher) {
@@ -305,24 +305,24 @@ impl Store {
         if !found {
             started = crate::meta::now();
             updated = started;
-            std::fs::write(path.join("ref"), r)?;
-            write_to_completion(&path.join("startedat"), rfc3339(started).as_bytes())?;
-            write_to_completion(&path.join("updatedat"), rfc3339(started).as_bytes())?;
-            if total > 0 { std::fs::write(path.join("total"), total.to_string())? }
+            std::fs::write(path.join("ref"), r).and_then(crate::faults::pass)?;
+            write_to_completion(&path.join("startedat"), rfc3339(started).as_bytes()).and_then(crate::faults::pass)?;
+            write_to_completion(&path.join("updatedat"), rfc3339(started).as_bytes()).and_then(crate::faults::pass)?;
+            if total > 0 { std::fs::write(path.join("total"), total.to_string()).and_then(crate::faults::pass)? }
         }
-        let mut fp = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(path.join("data")).map_err(|e| Error::Other(format!("failed to open data file: {e}")))?;
-        fp.seek(std::io::SeekFrom::Start(offset as u64)).map_err(|e| Error::Other(format!("could not seek to current write offset: {e}")))?;
+        let mut fp = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(path.join("data")).map_err(|e| Error::Other(format!("failed to open data file: {e}"))).and_then(crate::faults::pass)?;
+        fp.seek(std::io::SeekFrom::Start(offset as u64)).map_err(|e| Error::Other(format!("could not seek to current write offset: {e}"))).and_then(crate::faults::pass)?;
         Ok(Writer { store: self, fp: Some(fp), path, ref_: r.to_string(), offset, total, hasher, started, updated })
     }
 
     fn resume(&self, path: &Path, r: &str, total: i64, hasher: &mut Hasher) -> Result<Status> {
-        let mut s = status_at(path).map_err(|e| e.context("failed reading status of resume write"))?;
+        let mut s = status_at(path).map_err(|e| e.context("failed reading status of resume write")).and_then(crate::faults::pass)?;
         if r != s.ref_ { return Err(Error::Other(format!("ref key does not match: {r} != {}", s.ref_))) }
         if total > 0 && s.total > 0 && total != s.total { return Err(Error::Other(format!("provided total differs from status: {total} != {}", s.total))) }
-        let mut f = std::fs::File::open(path.join("data"))?;
+        let mut f = std::fs::File::open(path.join("data")).and_then(crate::faults::pass)?;
         let mut buf = vec![0u8; 1 << 20];
         let mut n: i64 = 0;
-        loop { let k = f.read(&mut buf)?; if k == 0 { break } hasher.update(&buf[..k]); n += k as i64 }
+        loop { let k = f.read(&mut buf).and_then(crate::faults::pass)?; if k == 0 { break } hasher.update(&buf[..k]); n += k as i64 }
         s.offset = n;
         Ok(s)
     }
@@ -362,8 +362,8 @@ impl Writer<'_> {
         self.offset = 0;
         self.hasher = self.hasher.algorithm().hasher();
         let Some(fp) = self.fp.as_mut() else { return Err(Error::FailedPrecondition("cannot truncate a closed writer".into())) };
-        fp.seek(std::io::SeekFrom::Start(0))?;
-        fp.set_len(0)?;
+        fp.seek(std::io::SeekFrom::Start(0)).and_then(crate::faults::pass)?;
+        fp.set_len(0).and_then(crate::faults::pass)?;
         Ok(())
     }
 
@@ -382,8 +382,8 @@ impl Writer<'_> {
 
     fn commit_inner(&mut self, size: i64, expected: &str, labels: Option<&BTreeMap<String, String>>) -> Result<()> {
         let Some(fp) = self.fp.take() else { return Err(Error::FailedPrecondition("cannot commit on closed writer".into())) };
-        fp.sync_all().map_err(|e| Error::Other(format!("sync failed: {e}")))?;
-        let m = fp.metadata().map_err(|e| Error::Other(format!("stat on ingest file failed: {e}")))?;
+        fp.sync_all().map_err(|e| Error::Other(format!("sync failed: {e}"))).and_then(crate::faults::pass)?;
+        let m = fp.metadata().map_err(|e| Error::Other(format!("stat on ingest file failed: {e}"))).and_then(crate::faults::pass)?;
         drop(fp);
         if size > 0 && size != m.len() as i64 { return Err(Error::FailedPrecondition(format!("unexpected commit size {}, expected {size}", m.len()))) }
         let mut d = self.hasher.digest();
@@ -393,9 +393,9 @@ impl Writer<'_> {
             if e.algorithm != d.algorithm {
                 // (Opened with no digest to say its algorithm: hashed again as the commit asks.)
                 let mut h = e.algorithm.hasher();
-                let mut f = std::fs::File::open(self.path.join("data")).map_err(|err| Error::Other(format!("failed to open ingest data for re-hashing to {}: {err}", e.algorithm.name())))?;
+                let mut f = std::fs::File::open(self.path.join("data")).map_err(|err| Error::Other(format!("failed to open ingest data for re-hashing to {}: {err}", e.algorithm.name()))).and_then(crate::faults::pass)?;
                 let mut buf = vec![0u8; 1 << 20];
-                loop { let k = f.read(&mut buf)?; if k == 0 { break } h.update(&buf[..k]) }
+                loop { let k = f.read(&mut buf).and_then(crate::faults::pass)?; if k == 0 { break } h.update(&buf[..k]) }
                 self.hasher = h;
                 d = self.hasher.digest();
             }
@@ -403,13 +403,13 @@ impl Writer<'_> {
         }
         let ingest = self.path.join("data");
         let target = self.store.blob_path(&d);
-        std::fs::create_dir_all(target.parent().unwrap())?;
+        std::fs::create_dir_all(target.parent().unwrap()).and_then(crate::faults::pass)?;
         if target.exists() {
             if let Err(e) = std::fs::remove_dir_all(&self.path) { eprintln!("failed to remove ingest directory {}: {e}", self.path.display()) }
             return Err(Error::AlreadyExists(format!("content {d}")));
         }
-        std::fs::rename(&ingest, &target)?;
-        std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all()).map_err(|e| Error::Other(format!("failed to sync dir {}: {e}", target.parent().unwrap().display())))?;
+        std::fs::rename(&ingest, &target).and_then(crate::faults::pass)?;
+        std::fs::File::open(target.parent().unwrap()).and_then(|f| f.sync_all()).map_err(|e| Error::Other(format!("failed to sync dir {}: {e}", target.parent().unwrap().display()))).and_then(crate::faults::pass)?;
         // From here the blob is in the store: what fails is said, not returned (it cannot be taken back).
         let t = crate::meta::now();
         if let Err(e) = set_times(&target, t, t) { eprintln!("failed to change file time to commit time for {d}: {e}") }
@@ -438,14 +438,14 @@ impl Drop for Writer<'_> {
 
 fn status_at(path: &Path) -> Result<Status> {
     let nf = |e: std::io::Error| if e.kind() == std::io::ErrorKind::NotFound { Error::NotFound(e.to_string()) } else { e.into() };
-    let m = std::fs::metadata(path.join("data")).map_err(nf)?;
-    let r = std::fs::read_to_string(path.join("ref")).map_err(nf)?;
+    let m = std::fs::metadata(path.join("data")).map_err(nf).and_then(crate::faults::pass)?;
+    let r = std::fs::read_to_string(path.join("ref")).map_err(nf).and_then(crate::faults::pass)?;
     let read_time = |name: &str| -> Result<Nanos> {
-        let t = std::fs::read_to_string(path.join(name)).map_err(nf).map_err(|e| e.context(format!("could not read {name}")))?;
+        let t = std::fs::read_to_string(path.join(name)).map_err(nf).map_err(|e| e.context(format!("could not read {name}"))).and_then(crate::faults::pass)?;
         parse_rfc3339(&t).ok_or_else(|| Error::Other(format!("could not read {name}: could not parse timestamp file {}", path.join(name).display())))
     };
-    let started = read_time("startedat")?;
-    let mut updated = read_time("updatedat")?;
+    let started = read_time("startedat").and_then(crate::faults::pass)?;
+    let mut updated = read_time("updatedat").and_then(crate::faults::pass)?;
     use std::os::unix::fs::MetadataExt;
     let mtime = m.mtime() * 1_000_000_000 + m.mtime_nsec();
     // (updatedat is not written on every write: the data file's own time may be later.)
@@ -457,17 +457,17 @@ fn status_at(path: &Path) -> Result<Status> {
 /// Written whole or not at all: to a file beside it, synced, then moved over it.
 fn write_to_completion(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tmp).map_err(|e| Error::Other(format!("create tmp file: {e}")))?;
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&tmp).map_err(|e| Error::Other(format!("create tmp file: {e}"))).and_then(crate::faults::pass)?;
     let w = f.write_all(data).and_then(|_| f.sync_all());
     drop(f);
-    w.map_err(|e| Error::Other(format!("write tmp file: {e}")))?;
+    w.map_err(|e| Error::Other(format!("write tmp file: {e}"))).and_then(crate::faults::pass)?;
     std::fs::rename(&tmp, path).map_err(|e| Error::Other(format!("rename tmp file: {e}")))
 }
 
 /// A file's access and change times set by its path (Go's `os.Chtimes`), read-only as a blob is.
 fn set_times(p: &Path, atime: Nanos, mtime: Nanos) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e)).and_then(crate::faults::pass)?;
     let ts = |n: Nanos| libc::timespec { tv_sec: n.div_euclid(1_000_000_000) as libc::time_t, tv_nsec: n.rem_euclid(1_000_000_000) as _ };
     let times = [ts(atime), ts(mtime)];
     let r = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };

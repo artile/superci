@@ -46,42 +46,42 @@ impl sapi::snapshots_server::Snapshots for Snapshots {
     async fn prepare(&self, r: Request<sapi::PrepareSnapshotRequest>) -> std::result::Result<Response<sapi::PrepareSnapshotResponse>, Status> {
         let r = r.into_inner();
         let l = self.layers.clone();
-        let mounts = l.prepare(r.key, r.parent, sorted(r.labels)).await.map_err(Status::from)?;
+        let mounts = l.prepare(r.key, r.parent, sorted(r.labels)).await.map_err(Status::from).and_then(crate::faults::pass)?;
         Ok(Response::new(sapi::PrepareSnapshotResponse { mounts: mounts_proto(mounts) }))
     }
 
     async fn view(&self, r: Request<sapi::ViewSnapshotRequest>) -> std::result::Result<Response<sapi::ViewSnapshotResponse>, Status> {
         let r = r.into_inner();
         let l = self.layers.clone();
-        let mounts = blocking(move || l.overlay.view(&r.key, &r.parent, sorted(r.labels))).await?;
+        let mounts = blocking(move || l.overlay.view(&r.key, &r.parent, sorted(r.labels))).await.and_then(crate::faults::pass)?;
         Ok(Response::new(sapi::ViewSnapshotResponse { mounts: mounts_proto(mounts) }))
     }
 
     async fn mounts(&self, r: Request<sapi::MountsRequest>) -> std::result::Result<Response<sapi::MountsResponse>, Status> {
         let key = r.into_inner().key;
         let l = self.layers.clone();
-        let mounts = blocking(move || l.overlay.mounts(&key)).await?;
+        let mounts = blocking(move || l.overlay.mounts(&key)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(sapi::MountsResponse { mounts: mounts_proto(mounts) }))
     }
 
     async fn commit(&self, r: Request<sapi::CommitSnapshotRequest>) -> std::result::Result<Response<()>, Status> {
         let r = r.into_inner();
         let l = self.layers.clone();
-        blocking(move || l.overlay.commit(&r.name, &r.key, sorted(r.labels), &r.parent)).await?;
+        blocking(move || l.overlay.commit(&r.name, &r.key, sorted(r.labels), &r.parent)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(()))
     }
 
     async fn remove(&self, r: Request<sapi::RemoveSnapshotRequest>) -> std::result::Result<Response<()>, Status> {
         let key = r.into_inner().key;
         let l = self.layers.clone();
-        blocking(move || l.remove(&key)).await?;
+        blocking(move || l.remove(&key)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(()))
     }
 
     async fn stat(&self, r: Request<sapi::StatSnapshotRequest>) -> std::result::Result<Response<sapi::StatSnapshotResponse>, Status> {
         let key = r.into_inner().key;
         let l = self.layers.clone();
-        let info = blocking(move || l.overlay.stat(&key)).await?;
+        let info = blocking(move || l.overlay.stat(&key)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(sapi::StatSnapshotResponse { info: Some(info_proto(info)) }))
     }
 
@@ -91,7 +91,7 @@ impl sapi::snapshots_server::Snapshots for Snapshots {
         let info = Info { name: i.name, parent: i.parent, kind: None, labels: sorted(i.labels), created: from_ts(i.created_at), updated: from_ts(i.updated_at) };
         let paths = r.update_mask.map(|m| m.paths).unwrap_or_default();
         let l = self.layers.clone();
-        let info = blocking(move || l.overlay.update(&info, &paths)).await?;
+        let info = blocking(move || l.overlay.update(&info, &paths)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(sapi::UpdateSnapshotResponse { info: Some(info_proto(info)) }))
     }
 
@@ -105,7 +105,7 @@ impl sapi::snapshots_server::Snapshots for Snapshots {
             let mut block = vec![];
             let walked = l.overlay.walk(&filters, |i| {
                 block.push(info_proto(i));
-                if block.len() >= 100 { tx.blocking_send(Ok(sapi::ListSnapshotsResponse { info: std::mem::take(&mut block) })).map_err(|_| Error::Other("canceled".into()))? }
+                if block.len() >= 100 { tx.blocking_send(Ok(sapi::ListSnapshotsResponse { info: std::mem::take(&mut block) })).map_err(|_| Error::Other("canceled".into())).and_then(crate::faults::pass)? }
                 Ok(())
             });
             match walked {
@@ -119,13 +119,13 @@ impl sapi::snapshots_server::Snapshots for Snapshots {
     async fn usage(&self, r: Request<sapi::UsageRequest>) -> std::result::Result<Response<sapi::UsageResponse>, Status> {
         let key = r.into_inner().key;
         let l = self.layers.clone();
-        let u = blocking(move || l.overlay.usage(&key)).await?;
+        let u = blocking(move || l.overlay.usage(&key)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(sapi::UsageResponse { size: u.size, inodes: u.inodes }))
     }
 
     async fn cleanup(&self, _r: Request<sapi::CleanupRequest>) -> std::result::Result<Response<()>, Status> {
         let l = self.layers.clone();
-        blocking(move || l.cleanup()).await?;
+        blocking(move || l.cleanup()).await.and_then(crate::faults::pass)?;
         Ok(Response::new(()))
     }
 }
@@ -145,23 +145,23 @@ fn digest_arg(d: &str) -> std::result::Result<Digest, Status> { Digest::parse(d)
 #[tonic::async_trait]
 impl capi::content_server::Content for Content {
     async fn info(&self, r: Request<capi::InfoRequest>) -> std::result::Result<Response<capi::InfoResponse>, Status> {
-        let d = digest_arg(&r.into_inner().digest)?;
+        let d = digest_arg(&r.into_inner().digest).and_then(crate::faults::pass)?;
         let l = self.layers.clone();
         let dd = d.clone();
         let i = blocking(move || l.content_info(&d)).await;
         debug(|| format!("info {dd}: {}", match &i { Ok(i) => format!("{} bytes", i.size), Err(e) => e.message().to_string() }));
-        let i = i?;
+        let i = i.and_then(crate::faults::pass)?;
         Ok(Response::new(capi::InfoResponse { info: Some(content_info(i)) }))
     }
 
     async fn update(&self, r: Request<capi::UpdateRequest>) -> std::result::Result<Response<capi::UpdateResponse>, Status> {
         let r = r.into_inner();
         let i = r.info.unwrap_or_default();
-        digest_arg(&i.digest)?;
+        digest_arg(&i.digest).and_then(crate::faults::pass)?;
         let info = crate::content::Info { digest: i.digest, size: i.size, created: from_ts(i.created_at), updated: from_ts(i.updated_at), labels: sorted(i.labels) };
         let paths = r.update_mask.map(|m| m.paths).unwrap_or_default();
         let l = self.layers.clone();
-        let out = blocking(move || l.content.update(&info, &paths)).await?;
+        let out = blocking(move || l.content.update(&info, &paths)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(capi::UpdateResponse { info: Some(content_info(out)) }))
     }
 
@@ -175,7 +175,7 @@ impl capi::content_server::Content for Content {
             let mut block = vec![];
             let walked = l.content.walk(&filters, |i| {
                 block.push(content_info(i));
-                if block.len() >= 100 { tx.blocking_send(Ok(capi::ListContentResponse { info: std::mem::take(&mut block) })).map_err(|_| Error::Other("canceled".into()))? }
+                if block.len() >= 100 { tx.blocking_send(Ok(capi::ListContentResponse { info: std::mem::take(&mut block) })).map_err(|_| Error::Other("canceled".into())).and_then(crate::faults::pass)? }
                 Ok(())
             });
             match walked {
@@ -188,9 +188,9 @@ impl capi::content_server::Content for Content {
 
     async fn delete(&self, r: Request<capi::DeleteContentRequest>) -> std::result::Result<Response<()>, Status> {
         let d = r.into_inner().digest;
-        let d = Digest::parse(&d).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let d = Digest::parse(&d).map_err(|e| Status::invalid_argument(e.to_string())).and_then(crate::faults::pass)?;
         let l = self.layers.clone();
-        blocking(move || l.content.delete(&d)).await?;
+        blocking(move || l.content.delete(&d)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(()))
     }
 
@@ -198,11 +198,11 @@ impl capi::content_server::Content for Content {
 
     async fn read(&self, r: Request<capi::ReadContentRequest>) -> std::result::Result<Response<Self::ReadStream>, Status> {
         let r = r.into_inner();
-        let d = Digest::parse(&r.digest).map_err(|e| Status::invalid_argument(format!("{}: {e}", r.digest)))?;
+        let d = Digest::parse(&r.digest).map_err(|e| Status::invalid_argument(format!("{}: {e}", r.digest))).and_then(crate::faults::pass)?;
         let l = self.layers.clone();
-        let size = blocking({ let (l, d) = (l.clone(), d.clone()); move || l.content_info(&d) }).await?.size;
+        let size = blocking({ let (l, d) = (l.clone(), d.clone()); move || l.content_info(&d) }).await.and_then(crate::faults::pass)?.size;
         // (A blob SuperCI's store has but this machine does not yet: fetched whole first.)
-        let (file, _) = l.clone().open_blob(d.clone()).await.map_err(Status::from)?;
+        let (file, _) = l.clone().open_blob(d.clone()).await.map_err(Status::from).and_then(crate::faults::pass)?;
         let mut offset = r.offset.max(0);
         if offset > size { return Err(Status::out_of_range(format!("read past object length {size} bytes"))) }
         let mut want = r.size;
@@ -233,14 +233,14 @@ impl capi::content_server::Content for Content {
         let reference = r.into_inner().r#ref;
         let l = self.layers.clone();
         let rr = reference.clone();
-        let s = blocking(move || l.content.status(&rr).map_err(|e| e.context(format!("could not get status for ref {reference:?}")))).await?;
+        let s = blocking(move || l.content.status(&rr).map_err(|e| e.context(format!("could not get status for ref {reference:?}")))).await.and_then(crate::faults::pass)?;
         Ok(Response::new(capi::StatusResponse { status: Some(status_proto(s)) }))
     }
 
     async fn list_statuses(&self, r: Request<capi::ListStatusesRequest>) -> std::result::Result<Response<capi::ListStatusesResponse>, Status> {
         let filters = r.into_inner().filters;
         let l = self.layers.clone();
-        let s = blocking(move || l.content.list_statuses(&filters)).await?;
+        let s = blocking(move || l.content.list_statuses(&filters)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(capi::ListStatusesResponse { statuses: s.into_iter().map(status_proto).collect() }))
     }
 
@@ -268,7 +268,7 @@ impl capi::content_server::Content for Content {
     async fn abort(&self, r: Request<capi::AbortRequest>) -> std::result::Result<Response<()>, Status> {
         let reference = r.into_inner().r#ref;
         let l = self.layers.clone();
-        blocking(move || l.content.abort(&reference)).await?;
+        blocking(move || l.content.abort(&reference)).await.and_then(crate::faults::pass)?;
         Ok(Response::new(()))
     }
 }
@@ -279,16 +279,16 @@ type Tx = tokio::sync::mpsc::Sender<std::result::Result<capi::WriteContentRespon
 /// message stats, writes at the current offset, or commits.
 fn write_session(l: &Layers, mut stream: tonic::Streaming<capi::WriteContentRequest>, handle: &tokio::runtime::Handle, tx: &Tx, msg: &mut capi::WriteContentResponse) -> std::result::Result<(), Status> {
     let store: &Store = &l.content;
-    let mut req = match handle.block_on(stream.message())? { Some(m) => m, None => return Err(Status::cancelled("no message")) };
+    let mut req = match handle.block_on(stream.message()).and_then(crate::faults::pass)? { Some(m) => m, None => return Err(Status::cancelled("no message")) };
     let reference = req.r#ref.clone();
     debug(|| format!("write {reference}: action {}, total {}, expected {:?}, {} bytes", req.action, req.total, req.expected, req.data.len()));
     if reference.is_empty() { return Err(Status::invalid_argument("first message must have a reference")) }
     let mut total = req.total;
     let mut expected = req.expected.clone();
     let first = if expected.is_empty() { None } else {
-        Some(Digest::parse(&expected).map_err(|e| Status::from(Error::InvalidArgument(format!("calculating expected blob path for writer: cannot calculate blob path from invalid digest: {e}"))))?)
+        Some(Digest::parse(&expected).map_err(|e| Status::from(Error::InvalidArgument(format!("calculating expected blob path for writer: cannot calculate blob path from invalid digest: {e}")))).and_then(crate::faults::pass)?)
     };
-    let mut wr = store.writer(&reference, total, first.as_ref()).map_err(Status::from)?;
+    let mut wr = store.writer(&reference, total, first.as_ref()).map_err(Status::from).and_then(crate::faults::pass)?;
     loop {
         msg.action = req.action;
         let ws = wr.status();
@@ -316,17 +316,17 @@ fn write_session(l: &Layers, mut stream: tonic::Streaming<capi::WriteContentRequ
                     return Err(Status::out_of_range(format!("write @{} must occur at current offset {}", req.offset, ws.offset)));
                 }
                 if req.offset == 0 && ws.offset > 0 {
-                    wr.truncate(0).map_err(|e| Status::unknown(format!("truncate failed: {e}")))?;
+                    wr.truncate(0).map_err(|e| Status::unknown(format!("truncate failed: {e}"))).and_then(crate::faults::pass)?;
                     msg.offset = 0;
                 }
                 if !req.data.is_empty() {
-                    let n = wr.write(&req.data).map_err(Status::from)?;
+                    let n = wr.write(&req.data).map_err(Status::from).and_then(crate::faults::pass)?;
                     if n != req.data.len() { return Err(Status::data_loss(format!("wrote {n} of {} bytes", req.data.len()))) }
                     msg.offset += n as i64;
                 }
                 if action == capi::WriteAction::Commit {
                     let labels = (!req.labels.is_empty()).then(|| sorted(std::mem::take(&mut req.labels)));
-                    wr.commit_str(total, &expected, labels.as_ref()).map_err(Status::from)?;
+                    wr.commit_str(total, &expected, labels.as_ref()).map_err(Status::from).and_then(crate::faults::pass)?;
                 }
                 msg.digest = wr.digest().to_string();
             }

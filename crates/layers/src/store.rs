@@ -72,11 +72,11 @@ impl Layers {
     /// of this service leaves them mounted; a restart of the machine does not), files no snapshot uses taken away.
     pub fn open(overlay: Overlay, content: Store, store: Option<Options>) -> Result<Layers> {
         let Some(o) = store else { return Ok(Layers { overlay, content, store: None }) };
-        std::fs::create_dir_all(&o.files)?;
-        let database = redb::Database::create(&o.db).map_err(db)?;
-        let tx = database.begin_write().map_err(db)?;
-        tx.open_table(MOUNTS).map_err(db)?;
-        tx.commit().map_err(db)?;
+        std::fs::create_dir_all(&o.files).and_then(crate::faults::pass)?;
+        let database = redb::Database::create(&o.db).map_err(db).and_then(crate::faults::pass)?;
+        let tx = database.begin_write().map_err(db).and_then(crate::faults::pass)?;
+        tx.open_table(MOUNTS).map_err(db).and_then(crate::faults::pass)?;
+        tx.commit().map_err(db).and_then(crate::faults::pass)?;
         let side = StoreSide {
             index: RwLock::new(o.index), files: o.files, db: database, served: Mutex::new(HashMap::new()),
             erofs: Mutex::new(HashMap::new()), blobs: Mutex::new(HashMap::new()), targets: Mutex::new(HashMap::new()),
@@ -85,24 +85,24 @@ impl Layers {
 
         };
         let l = Layers { overlay, content, store: Some(side) };
-        l.recover()?;
+        l.recover().and_then(crate::faults::pass)?;
         Ok(l)
     }
 
     fn recover(&self) -> Result<()> {
         let Some(st) = &self.store else { return Ok(()) };
-        let ids = self.overlay.meta.read(|r| r.ids())?;
-        let tx = st.db.begin_read().map_err(db)?;
-        let t = tx.open_table(MOUNTS).map_err(db)?;
+        let ids = self.overlay.meta.read(|r| r.ids()).and_then(crate::faults::pass)?;
+        let tx = st.db.begin_read().map_err(db).and_then(crate::faults::pass)?;
+        let t = tx.open_table(MOUNTS).map_err(db).and_then(crate::faults::pass)?;
         let mut all = vec![];
-        for item in t.iter().map_err(db)? {
-            let (k, v) = item.map_err(db)?;
-            all.push((k.value().to_string(), serde_json::from_slice::<Served>(v.value()).map_err(db)?));
+        for item in t.iter().map_err(db).and_then(crate::faults::pass)? {
+            let (k, v) = item.map_err(db).and_then(crate::faults::pass)?;
+            all.push((k.value().to_string(), serde_json::from_slice::<Served>(v.value()).map_err(db).and_then(crate::faults::pass)?));
         }
         drop(t);
         drop(tx);
         for (id, s) in all {
-            if !ids.contains_key(&id) { st.forget(&id)?; continue }
+            if !ids.contains_key(&id) { st.forget(&id).and_then(crate::faults::pass)?; continue }
             let upper = self.overlay.upper(&id);
             if !overlay::is_mount_point(&upper) {
                 let file = PathBuf::from(&s.file);
@@ -126,7 +126,7 @@ impl Layers {
     pub async fn prepare(self: Arc<Self>, key: String, parent: String, labels: BTreeMap<String, String>) -> Result<Vec<Mount>> {
         if let Some(served) = self.clone().serve(&key, &parent, &labels).await { return Err(served) }
         let l = self.clone();
-        tokio::task::spawn_blocking(move || l.overlay.prepare(&key, &parent, labels)).await.map_err(other)?
+        tokio::task::spawn_blocking(move || l.overlay.prepare(&key, &parent, labels)).await.map_err(other).and_then(crate::faults::pass)?
     }
 
     /// The layer served from the store, or `None` to make the snapshot as containerd's own does.
@@ -188,8 +188,8 @@ impl Layers {
     #[allow(clippy::too_many_arguments)]
     fn serve_snapshot(&self, key: &str, parent: &str, labels: BTreeMap<String, String>, digest: &str, file: &std::path::Path, size: u64, usage: Option<Usage>) -> Result<()> {
         let st = self.store.as_ref().unwrap();
-        self.overlay.prepare(key, parent, labels.clone())?;
-        let (id, _, _) = self.overlay.meta.read(|r| r.info(key))?;
+        self.overlay.prepare(key, parent, labels.clone()).and_then(crate::faults::pass)?;
+        let (id, _, _) = self.overlay.meta.read(|r| r.info(key)).and_then(crate::faults::pass)?;
         let upper = self.overlay.upper(&id);
         let undo = |mounted: bool| {
             if mounted { let _ = crate::mount::unmount(&upper); }
@@ -206,12 +206,12 @@ impl Layers {
     }
 
     pub fn remove(&self, key: &str) -> Result<()> {
-        self.overlay.remove(key)?;
+        self.overlay.remove(key).and_then(crate::faults::pass)?;
         self.forget_removed()
     }
 
     pub fn cleanup(&self) -> Result<()> {
-        self.overlay.cleanup()?;
+        self.overlay.cleanup().and_then(crate::faults::pass)?;
         self.forget_removed()
     }
 
@@ -219,9 +219,9 @@ impl Layers {
     /// (a file still mounted stays readable to the kernel until its folder is unmounted).
     fn forget_removed(&self) -> Result<()> {
         let Some(st) = &self.store else { return Ok(()) };
-        let ids = self.overlay.meta.read(|r| r.ids())?;
+        let ids = self.overlay.meta.read(|r| r.ids()).and_then(crate::faults::pass)?;
         let gone: Vec<String> = st.served.lock().unwrap().keys().filter(|id| !ids.contains_key(*id)).cloned().collect();
-        for id in gone { st.forget(&id)? }
+        for id in gone { st.forget(&id).and_then(crate::faults::pass)? }
         st.prune_files();
         Ok(())
     }
@@ -241,13 +241,13 @@ impl Layers {
     pub async fn open_blob(self: Arc<Self>, d: Digest) -> Result<(std::fs::File, u64)> {
         let l = self.clone();
         let dd = d.clone();
-        match tokio::task::spawn_blocking(move || l.content.open_blob(&dd)).await.map_err(other)? {
+        match tokio::task::spawn_blocking(move || l.content.open_blob(&dd)).await.map_err(other).and_then(crate::faults::pass)? {
             Err(e) if e.is_not_found() => {
                 let Some(st) = &self.store else { return Err(e) };
                 if st.served_size(&d.to_string()).is_none() { return Err(e) }
-                self.clone().fetch_blob(&d).await.map_err(Error::Other)?;
+                self.clone().fetch_blob(&d).await.map_err(Error::Other).and_then(crate::faults::pass)?;
                 let l = self.clone();
-                tokio::task::spawn_blocking(move || l.content.open_blob(&d)).await.map_err(other)?
+                tokio::task::spawn_blocking(move || l.content.open_blob(&d)).await.map_err(other).and_then(crate::faults::pass)?
             }
             r => r,
         }
@@ -326,17 +326,17 @@ impl StoreSide {
     fn served_size(&self, digest: &str) -> Option<u64> { self.served.lock().unwrap().values().find(|s| s.digest == digest).map(|s| s.size) }
 
     fn remember(&self, id: &str, s: &Served) -> Result<()> {
-        let tx = self.db.begin_write().map_err(db)?;
-        { tx.open_table(MOUNTS).map_err(db)?.insert(id, serde_json::to_vec(s).map_err(db)?.as_slice()).map_err(db)?; }
-        tx.commit().map_err(db)?;
+        let tx = self.db.begin_write().map_err(db).and_then(crate::faults::pass)?;
+        { tx.open_table(MOUNTS).map_err(db).and_then(crate::faults::pass)?.insert(id, serde_json::to_vec(s).map_err(db).and_then(crate::faults::pass)?.as_slice()).map_err(db).and_then(crate::faults::pass)?; }
+        tx.commit().map_err(db).and_then(crate::faults::pass)?;
         self.served.lock().unwrap().insert(id.to_string(), s.clone());
         Ok(())
     }
 
     fn forget(&self, id: &str) -> Result<()> {
-        let tx = self.db.begin_write().map_err(db)?;
-        { tx.open_table(MOUNTS).map_err(db)?.remove(id).map_err(db)?; }
-        tx.commit().map_err(db)?;
+        let tx = self.db.begin_write().map_err(db).and_then(crate::faults::pass)?;
+        { tx.open_table(MOUNTS).map_err(db).and_then(crate::faults::pass)?.remove(id).map_err(db).and_then(crate::faults::pass)?; }
+        tx.commit().map_err(db).and_then(crate::faults::pass)?;
         let mut served = self.served.lock().unwrap();
         if let Some(s) = served.remove(id) {
             // (Its file kept no longer once no snapshot uses its layer.)

@@ -43,9 +43,9 @@ pub fn fetch(agent: &ureq::Agent, link: &dyn Link, size: u64, dest: &Path, paral
 }
 
 fn fetch_inner(agent: &ureq::Agent, link: &dyn Link, size: u64, dest: &Path, parallel: usize, digest: Option<&str>) -> Result<u64, String> {
-    let want = digest.map(Digest::parse).transpose().map_err(|e| format!("the store's digest: {e}"))?;
-    let file = std::fs::File::create(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    file.set_len(size).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let want = digest.map(Digest::parse).transpose().map_err(|e| format!("the store's digest: {e}")).and_then(crate::faults::said)?;
+    let file = std::fs::File::create(dest).map_err(|e| format!("{}: {e}", dest.display())).and_then(crate::faults::said)?;
+    file.set_len(size).map_err(|e| format!("{}: {e}", dest.display())).and_then(crate::faults::said)?;
     let parts = size.div_ceil(PART) as usize;
     let next = AtomicUsize::new(0);
     let read = AtomicU64::new(0);
@@ -67,9 +67,9 @@ fn fetch_inner(agent: &ureq::Agent, link: &dyn Link, size: u64, dest: &Path, par
         }
     });
     if let Some(e) = failed.into_inner().unwrap() { return Err(e) }
-    file.sync_all().map_err(|e| format!("{}: {e}", dest.display()))?;
+    file.sync_all().map_err(|e| format!("{}: {e}", dest.display())).and_then(crate::faults::said)?;
     if let Some(want) = want {
-        let got = hash_file(dest, want.algorithm).map_err(|e| format!("{}: {e}", dest.display()))?;
+        let got = hash_file(dest, want.algorithm).map_err(|e| format!("{}: {e}", dest.display())).and_then(crate::faults::said)?;
         if got != want { return Err(format!("the store's file is not what its digest says ({got}, not {want})")) }
     }
     Ok(read.into_inner())
@@ -114,10 +114,10 @@ fn range(agent: &ureq::Agent, link: &dyn Link, file: &std::fs::File, from: u64, 
 }
 
 pub fn hash_file(p: &Path, algorithm: Algorithm) -> std::io::Result<Digest> {
-    let mut f = std::fs::File::open(p)?;
+    let mut f = std::fs::File::open(p).and_then(crate::faults::pass)?;
     let mut h = algorithm.hasher();
     let mut buf = vec![0u8; 1 << 20];
-    loop { let n = f.read(&mut buf)?; if n == 0 { break } h.update(&buf[..n]) }
+    loop { let n = f.read(&mut buf).and_then(crate::faults::pass)?; if n == 0 { break } h.update(&buf[..n]) }
     Ok(h.digest())
 }
 

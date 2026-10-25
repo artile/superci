@@ -62,12 +62,12 @@ pub fn sources<'a>(labels: impl IntoIterator<Item = (&'a String, &'a String)>) -
 
 /// Every blob containerd keeps in Docker's namespace, with its size and labels.
 async fn infos(socket: &Path) -> Result<BTreeMap<String, (u64, HashMap<String, String>)>, String> {
-    let ch = channel(socket).await?;
+    let ch = channel(socket).await.and_then(crate::faults::said)?;
     let mut req = tonic::Request::new(capi::ListContentRequest { filters: vec![] });
     req.metadata_mut().insert("containerd-namespace", NAMESPACE.parse().map_err(|_| "namespace")?);
-    let mut stream = capi::content_client::ContentClient::new(ch).list(req).await.map_err(|e| e.message().to_string())?.into_inner();
+    let mut stream = capi::content_client::ContentClient::new(ch).list(req).await.map_err(|e| e.message().to_string()).and_then(crate::faults::said)?.into_inner();
     let mut out = BTreeMap::new();
-    while let Some(r) = stream.message().await.map_err(|e| e.message().to_string())? {
+    while let Some(r) = stream.message().await.map_err(|e| e.message().to_string()).and_then(crate::faults::said)? {
         for i in r.info { out.insert(i.digest, (i.size.max(0) as u64, i.labels.into_iter().collect())); }
     }
     Ok(out)
@@ -140,7 +140,7 @@ pub fn keep(o: &Options) -> i32 {
 fn blob_path(content: &Path, digest: &str) -> Option<PathBuf> { digest.strip_prefix("sha256:").filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).map(|h| content.join("blobs/sha256").join(h)) }
 
 fn post(agent: &ureq::Agent, url: &str, body: &Value) -> Result<Value, String> {
-    let res = agent.post(url).header("content-type", "application/json").send(body.to_string().as_bytes()).map_err(|e| e.to_string())?;
+    let res = agent.post(url).header("content-type", "application/json").send(body.to_string().as_bytes()).map_err(|e| e.to_string()).and_then(crate::faults::said)?;
     let status = res.status().as_u16();
     let text = res.into_body().read_to_string().unwrap_or_default();
     if status != 200 { return Err(format!("the control plane answered {status}: {}", text.chars().take(200).collect::<String>())) }
@@ -203,12 +203,12 @@ fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, 
 /// The blob put at the link the control plane gave, with the headers it said (given up at `until`).
 fn upload(agent: &ureq::Agent, content: &Path, digest: &str, a: &Value, until: Instant) -> Result<u64, String> {
     let path = blob_path(content, digest).ok_or("not a digest")?;
-    let file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    let file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display())).and_then(crate::faults::said)?;
+    let size = file.metadata().map_err(|e| e.to_string()).and_then(crate::faults::said)?.len();
     let mut req = agent.put(a["url"].as_str().ok_or("no link")?).header("content-length", size.to_string())
         .config().timeout_global(Some(until.saturating_duration_since(Instant::now()).max(Duration::from_secs(1)))).build();
     for (k, v) in a["headers"].as_object().into_iter().flatten() { if let Some(v) = v.as_str() { req = req.header(k.as_str(), v) } }
-    let res = req.send(ureq::SendBody::from_reader(&mut std::io::BufReader::with_capacity(1 << 20, file))).map_err(|e| e.to_string())?;
+    let res = req.send(ureq::SendBody::from_reader(&mut std::io::BufReader::with_capacity(1 << 20, file))).map_err(|e| e.to_string()).and_then(crate::faults::said)?;
     if res.status().as_u16() >= 300 { return Err(format!("the bucket answered {}", res.status())) }
     Ok(size)
 }

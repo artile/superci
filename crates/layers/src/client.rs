@@ -17,10 +17,10 @@ const LEASE_USED_FOR: Duration = Duration::from_secs(45 * 60);
 /// A gRPC channel to a Unix socket (containerd's).
 pub async fn channel(socket: &std::path::Path) -> Result<Channel, String> {
     let path = socket.to_path_buf();
-    Endpoint::try_from("http://containerd").map_err(|e| e.to_string())?
+    Endpoint::try_from("http://containerd").map_err(|e| e.to_string()).and_then(crate::faults::said)?
         .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
             let p = path.clone();
-            async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tokio::net::UnixStream::connect(p).await?)) }
+            async move { Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(tokio::net::UnixStream::connect(p).await.and_then(crate::faults::pass)?)) }
         }))
         .await.map_err(|e| format!("containerd at {}: {e}", socket.display()))
 }
@@ -34,8 +34,8 @@ impl Containerd {
 
     fn with_namespace<T>(msg: T, namespace: &str, lease: Option<&str>) -> Result<tonic::Request<T>, String> {
         let mut r = tonic::Request::new(msg);
-        r.metadata_mut().insert("containerd-namespace", namespace.parse().map_err(|_| format!("namespace {namespace:?}"))?);
-        if let Some(l) = lease { r.metadata_mut().insert("containerd-lease", l.parse().map_err(|_| format!("lease {l:?}"))?); }
+        r.metadata_mut().insert("containerd-namespace", namespace.parse().map_err(|_| format!("namespace {namespace:?}")).and_then(crate::faults::said)?);
+        if let Some(l) = lease { r.metadata_mut().insert("containerd-lease", l.parse().map_err(|_| format!("lease {l:?}")).and_then(crate::faults::said)?); }
         Ok(r)
     }
 
@@ -46,16 +46,16 @@ impl Containerd {
         let id = format!("superci-layers-{now}");
         let expire = crate::content::rfc3339(now + LEASE_FOR.as_nanos() as i64);
         let req = lapi::CreateRequest { id: id.clone(), labels: [("containerd.io/gc.expire".to_string(), expire)].into_iter().collect() };
-        lapi::leases_client::LeasesClient::new(ch).create(Self::with_namespace(req, namespace, None)?).await.map_err(|e| format!("a lease: {}", e.message()))?;
+        lapi::leases_client::LeasesClient::new(ch).create(Self::with_namespace(req, namespace, None).and_then(crate::faults::said)?).await.map_err(|e| format!("a lease: {}", e.message())).and_then(crate::faults::said)?;
         self.leases.lock().unwrap().insert(namespace.to_string(), (id.clone(), Instant::now()));
         Ok(id)
     }
 
     /// A blob's labels in a namespace (where it was pulled from: `containerd.io/distribution.source.<registry>`).
     pub async fn labels(&self, namespace: &str, digest: &str) -> Result<HashMap<String, String>, String> {
-        let ch = self.channel().await?;
-        let req = Self::with_namespace(capi::InfoRequest { digest: digest.to_string() }, namespace, None)?;
-        let info = capi::content_client::ContentClient::new(ch).info(req).await.map_err(|e| e.message().to_string())?.into_inner();
+        let ch = self.channel().await.and_then(crate::faults::said)?;
+        let req = Self::with_namespace(capi::InfoRequest { digest: digest.to_string() }, namespace, None).and_then(crate::faults::said)?;
+        let info = capi::content_client::ContentClient::new(ch).info(req).await.map_err(|e| e.message().to_string()).and_then(crate::faults::said)?.into_inner();
         Ok(info.info.map(|i| i.labels.into_iter().collect()).unwrap_or_default())
     }
 
@@ -63,18 +63,18 @@ impl Containerd {
     /// writes content it may have: the write's status first, then a commit at the offset that says (containerd
     /// counts shared content as written whole; a commit at offset 0 would start it over).
     pub async fn register(&self, namespace: &str, digest: &str, size: i64) -> Result<(), String> {
-        let ch = self.channel().await?;
-        let lease = self.lease(ch.clone(), namespace).await?;
+        let ch = self.channel().await.and_then(crate::faults::said)?;
+        let lease = self.lease(ch.clone(), namespace).await.and_then(crate::faults::said)?;
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let r#ref = format!("superci-layers-{digest}");
         let stat = capi::WriteContentRequest { action: capi::WriteAction::Stat as i32, r#ref: r#ref.clone(), total: size, expected: digest.to_string(), ..Default::default() };
-        tx.send(stat).await.map_err(|e| e.to_string())?;
-        let req = Self::with_namespace(tokio_stream::wrappers::ReceiverStream::new(rx), namespace, Some(&lease))?;
+        tx.send(stat).await.map_err(|e| e.to_string()).and_then(crate::faults::said)?;
+        let req = Self::with_namespace(tokio_stream::wrappers::ReceiverStream::new(rx), namespace, Some(&lease)).and_then(crate::faults::said)?;
         let answer = |e: tonic::Status| if e.code() == tonic::Code::AlreadyExists { Ok(()) } else { Err(e.message().to_string()) };
         let mut s = match capi::content_client::ContentClient::new(ch).write(req).await { Ok(r) => r.into_inner(), Err(e) => return answer(e) };
         let status = match s.message().await { Ok(Some(m)) => m, Ok(None) => return Err("containerd ended the write".into()), Err(e) => return answer(e) };
         let commit = capi::WriteContentRequest { action: capi::WriteAction::Commit as i32, r#ref, total: size, expected: digest.to_string(), offset: status.offset, ..Default::default() };
-        tx.send(commit).await.map_err(|e| e.to_string())?;
+        tx.send(commit).await.map_err(|e| e.to_string()).and_then(crate::faults::said)?;
         drop(tx);
         loop {
             match s.message().await {

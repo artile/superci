@@ -11,6 +11,7 @@ pub mod containerd {
 pub mod client;
 pub mod content;
 pub mod error;
+pub mod faults;
 pub mod fetch;
 pub mod filters;
 pub mod index;
