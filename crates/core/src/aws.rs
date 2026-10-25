@@ -519,8 +519,9 @@ async fn fleet(http: &dyn Http, creds: &Credentials, l: &Launch<'_>, groups: &[V
     ec2(http, l.region, creds, "CreateLaunchTemplate", asked, now_ms).await?;
     // Each group in turn, until one has a machine. (The time of making the template is counted with the first.)
     let mut answer: Result<Result<Started>> = Err("no pools to ask".into());
-    let mut began = began;
-    for pools in groups {
+    let (mut began, mut groups) = (began, groups.into_iter());
+    loop {
+        let Some(pools) = groups.next() else { break };
         let overrides: Vec<serde_json::Value> = pools.iter().enumerate().map(|(i, (kind, subnet, zone))| {
             let mut o = serde_json::json!({ "InstanceType": kind, "Priority": i + 1 });
             match subnet { Some(id) => o["SubnetId"] = id.clone().into(), None if !zone.is_empty() => o["AvailabilityZone"] = zone.clone().into(), None => {} }
@@ -646,7 +647,7 @@ async fn spot_prices(http: &dyn Http, region: &str, creds: &Credentials, types: 
         // (The newest price of a pool comes first. An answer that names no type is of every type asked for.)
         match xml_tag(item, "instanceType") {
             Some(t) => { prices.entry((t.to_string(), z.to_string())).or_insert(p); }
-            None => for t in types { prices.entry((t.clone(), z.to_string())).or_insert(p); },
+            None => types.iter().for_each(|t| { prices.entry((t.clone(), z.to_string())).or_insert(p); }),
         }
     }
     Ok(prices)
@@ -719,13 +720,13 @@ impl Whose<'_> {
 
 /// The VPC a control plane's machines use in a region, and whose it is: its own from before, else the shared one.
 async fn network_vpc<'a>(http: &dyn Http, region: &str, creds: &Credentials, plane_id: &'a str, now_ms: u64) -> Result<Option<(String, Whose<'a>)>> {
-    for whose in [Whose::Own(plane_id), Whose::Shared] {
+    let find = async |whose: Whose<'a>| -> Result<Option<(String, Whose<'a>)>> {
         let (k, v) = whose.filter();
         let vpcs = ec2(http, region, creds, "DescribeVpcs", serde_json::json!({ "Filter": filters(&[(&k, &v)]) }), now_ms).await?;
         // (Two made at once: the one with the lowest id, as `make_network` keeps.)
-        if let Some(vpc) = pairs(&vpcs, "vpcId", "vpcId").into_iter().map(|(v, _)| v).min() { return Ok(Some((vpc.to_string(), whose))) }
-    }
-    Ok(None)
+        Ok(pairs(&vpcs, "vpcId", "vpcId").into_iter().map(|(v, _)| v).min().map(|vpc| (vpc.to_string(), whose)))
+    };
+    match find(Whose::Own(plane_id)).await? { Some(own) => Ok(Some(own)), None => find(Whose::Shared).await }
 }
 
 fn filters(f: &[(&str, &str)]) -> serde_json::Value {
@@ -837,15 +838,22 @@ pub async fn delete_network(http: &dyn Http, region: &str, creds: &Credentials, 
         if !call("DescribeVpcs", serde_json::json!({ "Filter": filters(&[(&k, &v)]) })).await?.contains("<vpcId>") { shared_used = true; break }
     }
     let mut doomed: Vec<(String, Whose)> = vec![];
-    for whose in [Whose::Own(plane_id), Whose::Shared].into_iter().filter(|w| !shared_used || matches!(w, Whose::Own(_))) {
+    // Its own, and the shared one when no other control plane uses it.
+    let mut whose_ones = [Whose::Own(plane_id), Whose::Shared].into_iter().filter(|w| !shared_used || matches!(w, Whose::Own(_)));
+    loop {
+        let Some(whose) = whose_ones.next() else { break };
         let (k, v) = whose.filter();
         for (vpc, _) in pairs(&call("DescribeVpcs", serde_json::json!({ "Filter": filters(&[(&k, &v)]) })).await?, "vpcId", "vpcId") {
             if !doomed.iter().any(|(d, _)| d == vpc) { doomed.push((vpc.to_string(), whose)) }
         }
     }
     if doomed.is_empty() { return Ok(()) }
-    for _ in 0..40 { if !up().await?.contains("<instanceId>") { break } sleep(5_000) }
-    for (vpc, whose) in doomed {
+    // (Its machines ended first: a network with one in it cannot go. Ten minutes at most.)
+    let mut waited = 0;
+    while waited < 40 && up().await?.contains("<instanceId>") { sleep(5_000); waited += 1 }
+    let mut doomed = doomed.into_iter();
+    loop {
+        let Some((vpc, whose)) = doomed.next() else { break };
         // (The shared one keeps any machine in it: another control plane's, one the caller did not know of.)
         if whose == Whose::Shared && call("DescribeInstances", serde_json::json!({ "Filter": [{ "Name": "vpc-id", "Value": [&vpc] }, { "Name": "instance-state-name", "Value": alive }] })).await?.contains("<instanceId>") { continue }
         let (tk, tv) = whose.filter();
@@ -923,7 +931,9 @@ pub async fn delete_bucket(http: &dyn Http, region: &str, creds: &Credentials, p
         let xml = listed.body_text();
         let keys: Vec<String> = xml.split("<Key>").skip(1).filter_map(|k| k.split("</Key>").next()).map(|k| k.replace("&amp;", "&")).collect();
         if keys.is_empty() { break }
-        for k in keys {
+        let mut keys = keys.into_iter();
+        loop {
+            let Some(k) = keys.next() else { break };
             let r = s3(http, "DELETE", &s3_url(&bucket, region, &k), region, creds, vec![], &[], now()).await?;
             if r.status >= 300 && r.status != 404 { return Err(aws_error(&r.body_text(), r.status)) }
         }
@@ -1285,8 +1295,8 @@ pub fn runner_user_data_for(work: &crate::io::Work, max_minutes: u32, os: &str, 
             crate::io::Work::Fail { .. } => return Ok(script),
         };
         let Some(url) = notice else { return Ok(script) };
-        let (before, after) = script.split_once(at).ok_or("no runner in the start-up script")?;
-        return Ok(format!("{before}{}{at}{after}", SPOT_WATCH.replace("NOTICE_URL", url).replace("STOP_RUNNER", stop).replace("RUNNER_PROCESS", process)));
+        // (Before where its runner starts: the script always has that, see `runner_user_data`.)
+        return Ok(script.replacen(at, &format!("{}{at}", SPOT_WATCH.replace("NOTICE_URL", url).replace("STOP_RUNNER", stop).replace("RUNNER_PROCESS", process)), 1));
     }
     let crate::io::Work::GitHub { jit } = work else { return Err("Windows machines run GitHub jobs only".into()) };
     if !jit.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)) { return Err("invalid runner config".into()); }
@@ -1553,12 +1563,10 @@ pub fn runner_hosts(jit_config: &str) -> Vec<String> {
     use base64::Engine;
     let decode = |s: &str| base64::engine::general_purpose::STANDARD.decode(s.trim()).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
     let Some(runner) = decode(jit_config).and_then(|all| all[".runner"].as_str().and_then(decode)) else { return vec![] };
-    let mut hosts = vec![];
-    for k in ["ServerUrlV2", "serverUrlV2", "ServerUrl", "serverUrl"] {
-        let Some(host) = runner[k].as_str().and_then(|u| url::Url::parse(u).ok()).and_then(|u| u.host_str().map(str::to_string)) else { continue };
-        if host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b)) && !hosts.contains(&host) { hosts.push(host) }
-    }
-    hosts
+    ["ServerUrlV2", "serverUrlV2", "ServerUrl", "serverUrl"].iter()
+        .filter_map(|k| runner[*k].as_str().and_then(|u| url::Url::parse(u).ok()).and_then(|u| u.host_str().map(str::to_string)))
+        .filter(|host| host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b)))
+        .fold(vec![], |mut hosts, host| { if !hosts.contains(&host) { hosts.push(host) } hosts })
 }
 
 /// What the start-up script adds for a runner of GitHub's: its addresses at GitHub tried before it starts, every
