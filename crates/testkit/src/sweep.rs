@@ -54,6 +54,8 @@ struct Faulting {
     ops: Vec<String>,
     /// Where counting started (`arm`): the calls, operations and answers before it.
     marks: (usize, usize, usize),
+    /// Where it stopped (`stop`), when it did: the calls and operations before it.
+    ends: Option<(usize, usize)>,
     /// The call (its place among `calls`) to fail, and whether by dropping it; the operation to fail.
     call: Option<(usize, bool)>,
     op: Option<usize>,
@@ -74,6 +76,7 @@ impl Faults {
     pub fn arm(&self, fault: Fault) {
         let mut f = self.0.lock().unwrap();
         f.marks = (f.calls.len(), f.ops.len(), f.answers.len());
+        f.ends = None;
         let (calls, ops) = (f.calls.len(), f.ops.len());
         (f.call, f.op, f.outage, f.down) = match fault {
             Fault::None => (None, None, None, None),
@@ -88,6 +91,14 @@ impl Faults {
     /// Nothing fails any more (an outage over), counting going on as before.
     pub fn calm(&self) { let mut f = self.0.lock().unwrap(); (f.call, f.op, f.outage, f.down) = (None, None, None, None) }
 
+    /// Counting stops now, and nothing more fails: what a scenario does after this (a check that the state it left
+    /// still works) is neither counted nor faulted.
+    pub fn stop(&self) {
+        let mut f = self.0.lock().unwrap();
+        f.ends = Some((f.calls.len(), f.ops.len()));
+        (f.call, f.op, f.outage, f.down) = (None, None, None, None);
+    }
+
     /// The k-th call from now answered with its service's error.
     pub fn fail_call(&self, k: usize) { let mut f = self.0.lock().unwrap(); f.call = Some((f.calls.len() + k - 1, false)) }
     /// The k-th call from now dropped before any answer.
@@ -96,9 +107,9 @@ impl Faults {
     pub fn fail_store_op(&self, k: usize) { let mut f = self.0.lock().unwrap(); f.op = Some(f.ops.len() + k - 1) }
 
     /// The calls answered since counting started (`arm`), each as one line (`POST https://ec2…/ RunInstances`).
-    pub fn calls(&self) -> Vec<String> { let f = self.0.lock().unwrap(); f.calls[f.marks.0..].to_vec() }
+    pub fn calls(&self) -> Vec<String> { let f = self.0.lock().unwrap(); f.calls[f.marks.0..f.ends.map_or(f.calls.len(), |e| e.0)].to_vec() }
     /// The store's operations since then (`put job:90000000001`).
-    pub fn store_ops(&self) -> Vec<String> { let f = self.0.lock().unwrap(); f.ops[f.marks.1..].to_vec() }
+    pub fn store_ops(&self) -> Vec<String> { let f = self.0.lock().unwrap(); f.ops[f.marks.1..f.ends.map_or(f.ops.len(), |e| e.1)].to_vec() }
     /// What was failed.
     pub fn fired(&self) -> Vec<String> { self.0.lock().unwrap().fired.clone() }
     /// Where the control plane panicked.

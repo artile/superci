@@ -280,14 +280,29 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// A runner's key. In a debug build one made once and kept: the tests start hundreds of runners, and making a 2048-bit
+/// key takes from a fraction of a second to several (nothing checks what a runner signs with it, see `jit_config`).
+fn runner_key() -> Result<rsa::RsaPrivateKey> {
+    let made = || rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).map_err(|e| e.to_string());
+    #[cfg(debug_assertions)]
+    {
+        static KEY: std::sync::OnceLock<rsa::RsaPrivateKey> = std::sync::OnceLock::new();
+        if let Some(k) = KEY.get() { return Ok(k.clone()) }
+        let k = made()?;
+        return Ok(KEY.get_or_init(|| k).clone())
+    }
+    #[cfg(not(debug_assertions))]
+    made()
+}
+
 /// The configuration a runner starts with (`run.sh --jitconfig …`), as GitHub hands one out for a just-in-time
 /// runner, here pointing at this service: `root` is where its calls go (no trailing slash), `name` what it is
 /// called. It runs one job and ends. Its key is made for it (the runner signs with it when it asks for a token;
 /// this service does not need what it signs: the address it is given is what lets it in).
 pub fn jit_config(root: &str, name: &str) -> Result<String> {
     use rsa::traits::{PrivateKeyParts, PublicKeyParts};
-    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).map_err(|e| e.to_string())?;
-    let n = |b: &rsa::BigUint| crate::crypto::b64(&b.to_bytes_be());
+    let key = runner_key()?;
+    let n =|b: &rsa::BigUint| crate::crypto::b64(&b.to_bytes_be());
     let primes = key.primes();
     let (p, q) = (&primes[0], &primes[1]);
     let one = rsa::BigUint::from(1u8);

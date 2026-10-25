@@ -234,3 +234,22 @@ pub fn plane_view(plane: &Plane, key: Option<&str>) -> PlaneView {
             s
         }) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seen(status: Option<Value>) -> PlaneView {
+        PlaneView { plane: Plane::Seen { url: "https://plane.example".into(), plane_id: "aaaaaaaaaaaa".into() }, online: true, github: false, installed: false, aws: false, runners: false, gitlab: false, moved_to: None, standby: false, version: None, status }
+    }
+
+    /// One from before there could be several GitLabs says its one, with its token's scopes; one without GitLab, none.
+    #[test]
+    fn the_gitlab_of_a_control_plane_from_before_several_is_its_one() {
+        let v = seen(Some(serde_json::json!({ "gitlab": { "url": "https://gitlab.com" }, "permissions": { "gitlab_scopes": ["api"] } })));
+        assert_eq!(v.gitlabs(), [(String::new(), "https://gitlab.com".to_string(), Some(vec!["api".to_string()]))]);
+        assert!(seen(Some(serde_json::json!({}))).gitlabs().is_empty() && seen(None).gitlabs().is_empty());
+        // A connection said without where it is: not one.
+        assert!(seen(Some(serde_json::json!({ "gitlabs": [{ "id": "x" }] }))).gitlabs().is_empty());
+    }
+}

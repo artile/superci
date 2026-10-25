@@ -2876,3 +2876,32 @@ fn a_layer_larger_than_a_chunk_is_copied_into_cloudflares_registry_a_chunk_at_a_
     assert_eq!(chunks, [at, at_more], "two chunks, the second where the first said");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Signed in to an AWS account with no control plane in it yet: every command that reads one or changes one of its
+/// settings says there is none and how to set one up, and changes nothing.
+#[test]
+fn every_command_with_no_control_plane_yet_says_to_set_one_up() {
+    let account = superci_testkit::Aws::serve();
+    let home = common::aws_only(&account);
+    let lines: [&[&str]; 39] = [&["jobs", "list"], &["jobs", "retrieve", "7"], &["runs", "list"], &["runs", "retrieve", "7"], &["runs", "cancel", "7"], &["runs", "wait", "7"], &["usage", "retrieve"],
+            &["artifacts", "list", "--run=7"], &["caches", "retrieve"], &["caches", "update", "--days=3"], &["caches", "delete", "--repo=acme/app", "--confirm"], &["secrets", "list"],
+            &["secrets", "delete", "NPM_TOKEN", "--confirm"], &["keys", "list"], &["keys", "create", "agent"], &["keys", "delete", "agent"], &["accounts", "update", "aws", "--monthly-usd=5"],
+            &["deliveries", "list"], &["planes", "allow"], &["planes", "update"], &["runners", "create", "aws"], &["runners", "delete", "aws", "--confirm"], &["runners", "order", "aws"],
+            &["runners", "update", "aws", "--max-jobs=3"], &["runners", "list"], &["labels", "list"], &["labels", "create", "gpu"], &["name", "retrieve"], &["name", "update", "Acme"],
+            &["machine", "retrieve"], &["limits", "retrieve"], &["limits", "update", "--max-cpu=8"], &["public_repos", "list"], &["public_repos", "create", "acme/site"], &["connections", "list"],
+            &["connections", "create", "gitlab"], &["projects", "list"], &["projects", "update", "7", "--enabled=true"], &["leave", "--confirm"]];
+    std::thread::scope(|s| {
+        let home = &home;
+        let ran: Vec<_> = lines.iter().map(|args| s.spawn(move || (args, common::command(&home).env("SUPERCI_GITLAB_TOKEN", "glpat-x").env("NPM_VALUE", "x").args(*args).arg("--json").output().unwrap()))).collect();
+        for r in ran {
+            let (args, o) = r.join().unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+            assert!(o.status.code() == Some(1) && v["error"].as_str().is_some_and(|e| e.starts_with("There is no control plane yet")), "{args:?}: {v}{}", String::from_utf8_lossy(&o.stderr));
+        }
+    });
+    // With nothing to set up: none listed, and the dashboard's own words for it.
+    let (code, planes) = json(&home, &["planes", "list"]);
+    assert!(code == 0 && planes["control_planes"].as_array().is_some_and(|p| p.is_empty()), "{planes}");
+    assert!(account.params.lock().unwrap().is_empty(), "nothing was made");
+    let _ = std::fs::remove_dir_all(&home);
+}

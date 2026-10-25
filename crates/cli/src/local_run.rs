@@ -101,8 +101,6 @@ fn tar_of(root: &Path, files: &[Vec<u8>], compress: bool) -> Result<Vec<u8>> {
 /// Each run's changes are kept as a layer on what came before: at most this many layers, then all of it again.
 const MOST_LAYERS: usize = 8;
 
-/// How long a run that is over is waited for, at most, for each step's own log (seconds): a minute, or in a test what
-/// `SUPERCI_LOGS_WAIT_S` says (a debug build).
 /// How long a run is followed with no answer from its control plane before giving up (it goes on there).
 fn lost_s() -> u64 {
     #[cfg(debug_assertions)]
@@ -110,6 +108,16 @@ fn lost_s() -> u64 {
     600
 }
 
+/// How often a run is asked how it stands (milliseconds): every second and a half, or in a test what `SUPERCI_POLL_MS`
+/// says (a debug build), where the waits would only slow the tests.
+fn poll_ms() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("SUPERCI_POLL_MS").ok().and_then(|v| v.parse().ok()) { return ms }
+    1500
+}
+
+/// How long a run that is over is waited for, at most, for each step's own log (seconds): a minute, or in a test what
+/// `SUPERCI_LOGS_WAIT_S` says (a debug build).
 fn logs_wait_s() -> u64 {
     #[cfg(debug_assertions)]
     if let Some(s) = std::env::var("SUPERCI_LOGS_WAIT_S").ok().and_then(|v| v.parse().ok()) { return s }
@@ -411,7 +419,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
     // (Said once: the run is over, and its summary waits for what its runner still sends.)
     let mut told_waiting = false;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(1500));
+        std::thread::sleep(std::time::Duration::from_millis(poll_ms()));
         let cursor = after.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
         // Out of touch with the control plane: asked again, a few seconds apart, for ten minutes at most.
         let st = match call("GET", &format!("/runs/{run}?after={cursor}")) {
@@ -419,7 +427,7 @@ fn follow(plane: &str, key: &str, run: &str, how: Follow, began: std::time::Inst
             Err((true, e)) => {
                 let since = *lost.get_or_insert_with(|| { say(&format!("Out of touch with the control plane ({e}); asking again. The run goes on meanwhile.")); std::time::Instant::now() });
                 if since.elapsed().as_secs() >= lost_s() { return Err(format!("Out of touch with the control plane for {} ({e}). The run goes on there: `superci runs wait {run}` follows it again.", span(since.elapsed().as_secs()))) }
-                std::thread::sleep(std::time::Duration::from_millis(3500));
+                std::thread::sleep(std::time::Duration::from_millis(poll_ms() * 7 / 3));
                 continue
             }
             Err((false, e)) => return Err(e),

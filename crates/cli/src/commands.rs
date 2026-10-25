@@ -1968,6 +1968,47 @@ mod tests {
     }
 
     #[test]
+    fn whose_rule_a_refusal_is_said_for_each_kind_of_policy() {
+        use superci_core::aws::{By, Refusal};
+        let r = |by: By, policy: &str| refused_by(&Refusal { action: "ec2:RunInstances".into(), by, policy: policy.into() });
+        assert_eq!(r(By::Organization, "arn:aws:organizations::222222222222:policy/o-1/service_control_policy/p-abc"), "your AWS organization's policy p-abc (management account 222222222222)");
+        assert_eq!(r(By::Organization, ""), "your AWS organization's policy");
+        assert_eq!(r(By::OrganizationResources, "arn:aws:organizations::222222222222:policy/o-1/resource_control_policy/p-rcp"), "your AWS organization's resource policy p-rcp");
+        assert_eq!(r(By::Boundary, ""), "the permissions boundary of the role signed in as");
+        assert_eq!(r(By::Identity, ""), "the permissions of the role signed in as");
+        assert_eq!(r(By::Session, ""), "this sign-in's session policy");
+        assert_eq!(r(By::Resource, ""), "the resource's own policy");
+        assert_eq!(r(By::Unsaid, ""), "AWS, which did not say whose rule it is");
+    }
+
+    #[test]
+    fn the_tests_that_ran_are_listed_with_each_outcome_and_none_or_too_many_are_not() {
+        let t = json!({ "ran": [{ "name": "a", "outcome": "passed", "file": "a.spec.ts" }, { "name": "b", "outcome": "failed" }, { "name": "c", "outcome": "skipped" }, { "name": "d", "outcome": "flaky" },
+            { "name": "e", "outcome": "failed as expected" }, { "name": "f", "outcome": "interrupted" }], "failed_as_expected_tests": [{ "name": "e" }] });
+        assert_eq!(ran_lines(&t, ""), ["What ran:", "  ✓ a  (a.spec.ts)", "  ✗ b", "  – c", "  ✓ (flaky) d", "  ✓ (failed as expected) e", "  · f"]);
+        assert!(ran_lines(&json!({ "ran": [] }), "").is_empty() && ran_lines(&json!({}), "").is_empty());
+        assert!(ran_lines(&json!({ "ran": vec![json!({ "name": "x" }); 31] }), "").is_empty(), "too many to read: the counts say it");
+        // Failed as expected, among few that ran: not named again, only what it means.
+        let said = expected_lines(&t, "");
+        assert!(said.len() == 1 && said[0].starts_with("(Marked to fail"), "{said:?}");
+        assert!(expected_lines(&json!({}), "").is_empty());
+        // A log that could not be read, and one with no runner's results in it.
+        assert_eq!(tests_lines(&json!({ "error": "gone" }), "  "), ["  Its log could not be read: gone"]);
+        let none = tests_lines(&json!({ "runners": [], "notes": ["a note"], "note": "the job failed", "artifacts": [{ "name": "report", "fetch": "superci artifacts retrieve report --run=1" }], "artifacts_at": "https://github.com/acme/app/actions/runs/1#artifacts" }), "");
+        assert_eq!(none, ["No test results in its log (none of Vitest, Jest, Playwright, pytest, cargo or Go said any).", "a note", "the job failed", "Artifact report: `superci artifacts retrieve report --run=1`", "Its artifacts: https://github.com/acme/app/actions/runs/1#artifacts"]);
+        // Each process's counts, with what each had beside passing and failing.
+        assert_eq!(process_lines(&json!({ "by_process": [{ "mark": "[slot 1]", "failed": 0, "passed": 2, "skipped": 1, "flaky": 1 }] }), ""), ["  [slot 1] 0 failed, 2 passed, 1 skipped, 1 flaky"]);
+        assert_eq!(totals_line(&json!({ "failed": 1, "passed": 3, "skipped": 2, "flaky": 1, "failed_as_expected": 1, "runners": ["playwright"] })), "Tests: 1 failed, 3 passed, 2 skipped (playwright), of the passed 1 failed as expected, 1 flaky");
+    }
+
+    #[test]
+    fn nothing_typed_is_no_words_and_no_flags() {
+        let a = Args::parse(&[]).unwrap();
+        assert!(a.words.is_empty() && !a.has("json") && a.word(0).is_empty());
+        assert_eq!(truth(&args("projects update 1 --enabled=true"), "enabled"), Ok(Some(true)));
+    }
+
+    #[test]
     fn a_dry_run_says_what_it_would_do() {
         let a = args("connections create gitlab --dry-run");
         let fields = [field("url", "https://gitlab.com"), field("token", "glpat-secret")];
