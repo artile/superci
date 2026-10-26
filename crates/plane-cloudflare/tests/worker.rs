@@ -25,10 +25,13 @@ fn start(settings: &[(String, String)]) -> Option<Worker> { start_with(settings,
 
 /// The same, with its runners' binding or without (a Worker deployed before Cloudflare runners); and the class kept from
 /// before 0.5.0 bound, to be asked.
-fn start_with(settings: &[(String, String)], runners: bool) -> Option<Worker> {
+fn start_with(settings: &[(String, String)], runners: bool) -> Option<Worker> { start_vars(settings, runners, &format!("LABEL = \"superci\"\nPLANE_ID = \"{PLANE}\"")) }
+
+/// The same, with these plain settings (`[vars]` lines).
+fn start_vars(settings: &[(String, String)], runners: bool, vars: &str) -> Option<Worker> {
     let bindings = format!("[[durable_objects.bindings]]\nname = \"PLANE\"\nclass_name = \"PlaneObject\"\n\n{}[[durable_objects.bindings]]\nname = \"LEGACY\"\nclass_name = \"Runner\"\n\n[[migrations]]\ntag = \"v1\"\nnew_sqlite_classes = [\"PlaneObject\", \"JobRunner\", \"Runner\"]\n",
         if runners { "[[durable_objects.bindings]]\nname = \"RUNNER\"\nclass_name = \"JobRunner\"\n\n" } else { "" });
-    Worker::start(&Setup { built: worker::built(env!("CARGO_MANIFEST_DIR")), bindings: &bindings, vars: &format!("LABEL = \"superci\"\nPLANE_ID = \"{PLANE}\"") }, settings)
+    Worker::start(&Setup { built: worker::built(env!("CARGO_MANIFEST_DIR")), bindings: &bindings, vars }, settings)
 }
 
 /// As the dashboard and GitHub ask the control plane.
@@ -251,6 +254,128 @@ fn a_run_from_a_computer_is_handed_its_secrets() {
     let b64 = |s: &str| -> Value { serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(s).unwrap()).unwrap() };
     let jit = b64(w.containers.ops("start").pop().unwrap()["options"]["env"]["SUPERCI_JIT"].as_str().unwrap());
     let root = b64(jit[".runner"].as_str().unwrap())["ServerUrl"].as_str().unwrap().to_string();
-    let (status, message) = superci_testkit::Runner { at: format!("{root}/_apis/v1") }.message();
+    let runner = superci_testkit::Runner { at: format!("{root}/_apis/v1") };
+    let (status, message) = runner.message();
     assert!(status == 200 && message.to_string().contains("npm-token-kept-for-runs"), "{status} {message}");
+    // Asking again, with its job taken: nothing more, after the control plane held the answer a while (as GitHub's
+    // broker holds a runner's long poll).
+    let asked = std::time::Instant::now();
+    assert_eq!(runner.message().0, 204);
+    assert!(asked.elapsed() >= std::time::Duration::from_secs(15), "{:?}", asked.elapsed());
+}
+
+/// Its settings as they are set: GitHub's full image for its containers, Cloudflare choosing where they start, the instance types it may use and no label of its own (its
+/// plain settings), an AWS account's connecting under way; a setting that is not a secret's text (a deploy's object)
+/// left out, as a key or an App.
+#[test]
+fn its_settings_are_read_as_they_are_set() {
+    let mut settings = deployed();
+    settings.extend([("CF_IMAGE".into(), "https://images.example.com/full/0123456789abcdef".into()), ("CF_LOCATION".into(), "auto".into()),
+        ("AWS_CONNECT".into(), json!({ "region": "eu-west-1", "token": "connect-token-0123456789" }).to_string())]);
+    let vars = format!("PLANE_ID = \"{PLANE}\"\nINSTANCE_TYPES = \"m7i.large, ,c7i.large\"\nGITHUB_APP_77 = {{ id = 77 }}\nDEVICE_KEY_4102444800_OBJECT = {{ key = \"an-object-not-a-key-01\" }}");
+    let Some(w) = start_vars(&settings, true, &vars) else { return };
+    let (status, said) = w.dashboard("GET", "/status", "");
+    assert!(status == 200 && said.contains(r#""cloudflare_location":"auto""#), "{status} {said}");
+    let (id, queued) = w.github.queue("build", "superci", now_ms());
+    w.webhook(queued);
+    w.until("a container started", || !w.containers.ops("start").is_empty());
+    let start = w.containers.ops("start").pop().unwrap();
+    assert!(start["options"]["env"]["SUPERCI_IMAGE"].as_str().is_some_and(|i| i.contains("images.example.com")), "{start}");
+    w.webhook(w.github.start(id));
+    // The AWS account's connecting: a report with another token is not this control plane's.
+    let (status, said) = w.call("POST", "/aws/callback", &[("content-type", "application/json")], json!({ "token": "another-token-0123456789" }).to_string().as_bytes());
+    assert!(status == 403 && said.contains("not this control plane's stack"), "{status} {said}");
+}
+
+/// A Worker deployed without its control plane's Durable Object bound: every request fails, none taken for done.
+#[test]
+fn a_worker_without_its_control_plane_fails_every_request() {
+    let bindings = "[[durable_objects.bindings]]\nname = \"RUNNER\"\nclass_name = \"JobRunner\"\n\n[[migrations]]\ntag = \"v1\"\nnew_sqlite_classes = [\"PlaneObject\", \"JobRunner\", \"Runner\"]\n";
+    let Some(w) = Worker::start(&Setup { built: worker::built(env!("CARGO_MANIFEST_DIR")), bindings, vars: &format!("PLANE_ID = \"{PLANE}\"") }, &deployed()) else { return };
+    let (status, said) = w.get("/health");
+    assert_eq!(status, 500, "{said}");
+}
+
+/// A move away: the secrets it keeps handed on with its one-time move token (one with letters outside ASCII, handed
+/// from the Worker to its Durable Object escaped, as they are). Its containers set to nothing: off.
+#[test]
+fn a_move_away_hands_on_the_secrets_it_keeps() {
+    let mut settings = deployed();
+    settings.retain(|(k, _)| k != "CONTAINERS");
+    settings.extend([("CONTAINERS".into(), "".into()), ("MOVE_TOKEN".into(), "move-token-0123456789".into()),
+        ("SECRET_NPM_TOKEN_ALL".into(), json!({ "name": "NPM_TOKEN", "value": "npm-token-ąžuolas-𝄞", "updated_ms": 1_760_000_000_000u64 }).to_string())]);
+    let Some(w) = start(&settings) else { return };
+    assert!(w.get("/health").1.contains("\"runners\":false"));
+    let (status, said) = w.call("POST", "/move/export", &[("authorization", &format!("Bearer {KEY}")), ("x-move-token", "move-token-0123456789")], b"{}");
+    let secrets: Value = serde_json::from_str(&said).unwrap_or_default();
+    assert!(status == 200 && secrets["secrets"].to_string().contains("npm-token-ąžuolas-𝄞"), "{status} {said}");
+}
+
+/// A job whose runner cannot start, in each way it cannot: a Worker without containers, a start Cloudflare refuses at
+/// once. Said on the job.
+#[test]
+fn a_runner_that_cannot_start_is_said_on_its_job() {
+    let Some(w) = start(&deployed()) else { return };
+    let said = |what: &'static str| { let w = &w; move || w.dashboard("GET", "/status", "").1.contains(what) };
+    w.containers_are(json!({ "noContainer": true }));
+    w.webhook(w.github.queue("build", "superci", now_ms()).1);
+    w.until("no container, said", said("no container for this runner"));
+    w.containers_are(json!({ "throwStart": "no such image" }));
+    w.webhook(w.github.queue("test", "superci", now_ms()).1);
+    w.until("the start refused, said", said("no such image"));
+}
+
+/// Its Durable Object's storage failing, each operation in turn, while a job comes and its upkeep runs: nothing
+/// panics, what failed is said, and once the storage is back it answers for its state.
+#[test]
+fn the_control_plane_holds_with_its_storage_failing() {
+    let Some(w) = start(&deployed()) else { return };
+    let mut done = 0;
+    for op in ["get", "put", "delete", "list", "setAlarm"] {
+        w.containers_are(json!({ "failStorage": [op] }));
+        let (id, queued) = w.github.queue(&format!("build-{op}"), "superci", now_ms());
+        w.webhook(queued);
+        // (Taken and finished where a runner was registered for it.)
+        if w.github.runner_names().len() > done {
+            done = w.github.runner_names().len();
+            w.webhook(w.github.start(id));
+            w.webhook(w.github.finish(id, "success", "done\n", now_ms()));
+        }
+        let (status, said) = w.dashboard("GET", "/status", "");
+        let alarm = w.alarm(None);
+        let failed = format!("storage {op} failed");
+        assert!((status == 200 || said.contains(&failed)) && (alarm.0 == 200 || alarm.1.contains(&failed)), "{op}: {status} {said}; {alarm:?}");
+        assert!(op == "delete" || said.contains(&failed) || alarm.1.contains(&failed), "{op}: its failing never said");
+    }
+    w.containers_are(json!({}));
+    assert_eq!(w.dashboard("GET", "/status", "").0, 200);
+    let log = w.log();
+    assert!(!log.contains("panicked at") && !log.contains("RuntimeError"), "{log}");
+}
+
+/// GitLab answering in each way it can fail to (not there, an address that is not one, a token that cannot go in a
+/// header, an answer cut off): the job said as not started, the Worker still answering.
+#[test]
+fn gitlab_failing_to_answer_is_said() {
+    use std::io::{Read, Write};
+    let cut = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let cut_at = format!("http://{}", cut.local_addr().unwrap());
+    std::thread::spawn(move || for s in cut.incoming() {
+        let Ok(mut s) = s else { continue };
+        let _ = s.read(&mut [0; 8192]);
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"id\":");
+    });
+    let closed = format!("http://{}", std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+    for (url, token) in [(closed.as_str(), None), ("http://[::1", None), (superci_testkit::gitlab::URL, Some("glpat-a\nb")), (cut_at.as_str(), None)] {
+        let mut conn = superci_testkit::GitLab::connection();
+        conn["url"] = json!(url);
+        if let Some(t) = token { conn["token"] = json!(t) }
+        let mut settings = deployed();
+        settings.push(("GITLAB".into(), conn.to_string()));
+        let Some(w) = start(&settings) else { return };
+        let (_, pending) = w.github.gitlab.pending("gl-build", &["superci"], now_ms());
+        let (status, said) = w.call("POST", "/gitlab/webhook", &[("content-type", "application/json"), ("x-gitlab-event", "Job Hook"), ("x-gitlab-token", superci_testkit::gitlab::HOOK_SECRET)], &pending);
+        assert!(status == 500 && !said.trim().is_empty(), "{url} {token:?}: {status} {said}");
+        assert_eq!(w.dashboard("GET", "/status", "").0, 200);
+    }
 }

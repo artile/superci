@@ -23,7 +23,9 @@ globalThis.fetch = (input, init) => {
 };
 
 // How the containers are, as the test sets them (`POST /__test/containers`): none at all (a Worker without its
-// container application), no runner image named, starts or keep-alives answered at once rather than as a promise.
+// container application), no runner image named, starts or keep-alives answered at once rather than as a promise, or
+// refused at once (thrown, `throwStart`, `throwKeep`); and the Durable Objects' storage operations named in
+// `failStorage` failing (as Cloudflare's storage fails one: the promise rejected).
 let mode = {};
 
 // What the test says of a container operation: `{}` (done), `{"throw": "why"}` (thrown as an Error; with `"as"`:
@@ -48,21 +50,32 @@ function container(id) {
     get running() { return running.get(id) === true },
     get images() { return mode.noImage ? undefined : { runner: "registry.cloudflare.com/acme/superci-runner:test" } },
     start(options) {
+      if (mode.throwStart) throw new Error(mode.throwStart);
       if (mode.syncStart) { running.set(id, true); told("start", { id, options }).catch(() => {}); return undefined }
       return told("start", { id, options }).then(() => { running.set(id, true) });
     },
     destroy(reason) { return told("destroy", { id, reason: reason ?? null }).then(() => { running.set(id, false) }) },
     setInactivityTimeout(ms) {
+      if (mode.throwKeep) throw new Error(mode.throwKeep);
       if (mode.syncKeep) { told("keep", { id, ms }).catch(() => {}); return undefined }
       return told("keep", { id, ms });
     },
   };
 }
 
-// The Durable Object's state with that container in it (and what it really has, as it is).
+// What a Durable Object really has, as it is (its own `this`), unless `instead` says otherwise.
+const as = (t, p, instead) => { const v = instead(p); if (v !== undefined) return v; const r = Reflect.get(t, p, t); return typeof r === "function" ? r.bind(t) : r };
+
+// A Durable Object's state, its storage's operations failing as the test says.
+function withStorage(ctx, more = () => undefined) {
+  const storage = new Proxy(ctx.storage, { get: (t, p) => as(t, p, (p) => mode.failStorage?.includes(p) ? () => Promise.reject(new Error(`storage ${p} failed`)) : undefined) });
+  return new Proxy(ctx, { get: (t, p) => p === "storage" ? storage : as(t, p, more) });
+}
+
+// The same, with that container in it.
 function withContainer(ctx) {
   const c = container(ctx.id.toString());
-  return new Proxy(ctx, { get(t, p) { if (p === "container") return mode.noContainer ? undefined : c; const v = Reflect.get(t, p, t); return typeof v === "function" ? v.bind(t) : v } });
+  return withStorage(ctx, (p) => p === "container" ? (mode.noContainer ? null : c) : undefined);
 }
 
 // A Durable Object's alarm, run now (as the runtime runs it when it is due).
@@ -91,7 +104,7 @@ export default class extends built.default {
 // (The control plane's own Durable Object, left out for a Worker that has none: the launcher's.)
 // PLANE {
 export class PlaneObject extends built.PlaneObject {
-  constructor(ctx, env) { given(env); super(ctx, env) }
+  constructor(ctx, env) { given(env); super(withStorage(ctx), env) }
   async fetch(request) { return await alarmNow(this, request) ?? super.fetch(request) }
 }
 // } PLANE

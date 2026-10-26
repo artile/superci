@@ -151,7 +151,7 @@ impl Config {
         // One per key that only reads: READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
         self.read_keys = named("READ_KEY_").filter_map(|(n, v)| read_key(n, v)).collect();
         self.move_token = get("MOVE_TOKEN").map(str::to_string);
-        if let Some(l) = get("CF_LOCATION") { self.cloudflare_location = l.to_string() }
+        if let Some(l) = get("CF_LOCATION").filter(|l| CLOUDFLARE_LOCATIONS.iter().any(|(k, _)| k == l)) { self.cloudflare_location = l.to_string() }
         self.cloudflare_image = get("CF_IMAGE").and_then(image_address);
         self.aws_regions = get("AWS_REGIONS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
         self.aws_networks = get("AWS_NETWORKS").and_then(|v| serde_json::from_str(v).ok()).unwrap_or_default();
@@ -498,6 +498,10 @@ fn failing_runner(name: &str) -> bool { name.ends_with(FAILING) }
 fn last_event_key(connection: &str) -> String { if connection.is_empty() { "gitlab:last_event".into() } else { format!("gitlab:last_event:{connection}") } }
 
 /// An image address as the dashboard may set it: https, and nothing a shell would read as more than a word.
+/// Where Cloudflare's containers can start (Durable Object location hints), or where Cloudflare chooses ("auto").
+pub const CLOUDFLARE_LOCATIONS: [(&str, &str); 10] = [("auto", "Automatic: Cloudflare chooses"), ("enam", "Eastern North America"), ("wnam", "Western North America"), ("sam", "South America"),
+    ("weur", "Western Europe"), ("eeur", "Eastern Europe"), ("apac", "Asia-Pacific"), ("oc", "Oceania"), ("afr", "Africa"), ("me", "Middle East")];
+
 pub fn image_address(s: &str) -> Option<String> {
     let s = s.trim().trim_end_matches('/');
     (s.starts_with("https://") && s.len() <= 300 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b":/._-".contains(&b))).then(|| s.to_string())
@@ -5588,6 +5592,18 @@ mod price_tests {
         assert_eq!((github_usd_per_minute(2, false), github_usd_per_minute(33, false), github_usd_per_minute(65, false)), (0.006, 0.162, 0.252));
         assert_eq!((github_usd_per_minute(3, true), github_usd_per_minute(33, true), github_windows_usd_per_minute(64)), (0.008, 0.098, 0.322));
         assert_eq!((gitlab_usd_per_minute(0), gitlab_usd_per_minute(16), gitlab_usd_per_minute(96)), (0.01, 0.06, 0.24));
+    }
+
+    #[test]
+    fn every_cloudflare_location_is_taken_and_any_other_leaves_the_one_before() {
+        for (l, _) in CLOUDFLARE_LOCATIONS {
+            let mut c = Config::new("p".into());
+            c.read_settings(&[("CF_LOCATION".into(), l.into())]);
+            assert_eq!(c.cloudflare_location, l);
+        }
+        let mut c = Config::new("p".into());
+        c.read_settings(&[("CF_LOCATION".into(), "nowhere".into())]);
+        assert_eq!(c.cloudflare_location, "enam");
     }
 
     #[test]

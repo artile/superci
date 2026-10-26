@@ -5,9 +5,14 @@ use async_trait::async_trait;
 use superci_core::plane::{Cache, Config, ControlPlane};
 use superci_core::io::{self, Clock, Containers, Http, Store, Timer, Work, Ending};
 use superci_core::spec::Size;
-use js_sys::{Array, Function, Object, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
 use worker::*;
+
+// (The jobs' runners, as the launcher's Worker has them.)
+#[path = "../../runners-cloudflare/src/job_runner.rs"]
+mod job_runner;
+pub use job_runner::{JobRunner, Runner};
+use job_runner::is_object_id;
 
 /// The header by which the Worker vouches for a dashboard session's key (with until when it holds, ms). The Worker
 /// sees a new key's secret within seconds; the Durable Object keeps the secrets it started with until it restarts.
@@ -22,22 +27,19 @@ const SETTING_NAMES: [&str; 16] = ["LABELS", "NAME", "GITHUB_APP", "GITLAB", "LA
 
 /// JSON with every character outside ASCII escaped, so it can travel in a header.
 fn ascii_json(v: &serde_json::Value) -> String {
-    let mut out = String::new();
-    for c in v.to_string().chars() {
-        if c.is_ascii() { out.push(c) } else { for u in c.encode_utf16(&mut [0; 2]) { out.push_str(&format!("\\u{:04x}", u)) } }
-    }
-    out
+    v.to_string().chars().map(|c| if c.is_ascii() { c.to_string() } else { c.encode_utf16(&mut [0; 2]).iter().map(|u| format!("\\u{u:04x}")).collect() }).collect()
 }
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    let stub = env.durable_object("PLANE")?.id_from_name("plane")?.get_stub()?;
+    let stub = env.durable_object("PLANE")?.id_from_name("plane").expect("a Durable Object named").get_stub().expect("a Durable Object's stub");
+    // (Headers named and valued here, all ASCII: always taken.)
+    let header = |r: Result<()>| r.expect("a header of the Worker's own");
     let headers = req.headers().clone();
-    headers.delete(VOUCHED)?;
+    header(headers.delete(VOUCHED));
     // Only the Worker says what the settings are: anything of that name from outside is dropped.
-    for name in headers.keys().filter(|k| k.starts_with(SETTINGS)).collect::<Vec<_>>() { headers.delete(&name)? }
-    let mut settings = serde_json::Map::new();
-    for n in SETTING_NAMES { if let Ok(v) = env.secret(n) { settings.insert(n.into(), v.to_string().into()); } }
+    headers.keys().filter(|k| k.starts_with(SETTINGS)).collect::<Vec<_>>().iter().for_each(|name| header(headers.delete(name)));
+    let mut settings: serde_json::Map<String, serde_json::Value> = SETTING_NAMES.iter().filter_map(|n| Some((n.to_string(), env.secret(n).ok()?.to_string().into()))).collect();
     // One secret for each further organization's GitHub App (GITHUB_APP_<its id>) and GitLab connection; and those
     // kept for runs from a computer (SECRET_<name>_<scope>), only where they are read (a run made, their list, a move).
     let path = req.path();
@@ -47,27 +49,28 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     // In pieces: a header's value has a size limit, and each further organization's App adds its key.
     let all = ascii_json(&serde_json::Value::Object(settings));
-    for (i, piece) in all.as_bytes().chunks(8_000).enumerate() { headers.set(&format!("{SETTINGS}-{i}"), &String::from_utf8_lossy(piece))? }
-    let bearer = headers.get("authorization")?.and_then(|a| a.strip_prefix("Bearer ").map(str::to_string)).unwrap_or_default();
+    all.as_bytes().chunks(8_000).enumerate().for_each(|(i, piece)| header(headers.set(&format!("{SETTINGS}-{i}"), &String::from_utf8_lossy(piece))));
+    let bearer = headers.get("authorization").expect("a header's name").and_then(|a| a.strip_prefix("Bearer ").map(str::to_string)).unwrap_or_default();
     if bearer.len() >= 16 {
         let now = js_sys::Date::now() as u64;
         if let Some((until, _)) = device_keys(&env).into_iter().find(|(until, k)| *until > now && superci_core::crypto::safe_eq(k.as_bytes(), bearer.as_bytes())) {
-            headers.set(VOUCHED, &until.to_string())?;
+            header(headers.set(VOUCHED, &until.to_string()));
         }
     }
     let mut init = RequestInit::new();
     init.with_method(req.method()).with_headers(headers);
     if req.method() != Method::Get && req.method() != Method::Head {
-        init.with_body(Some(js_sys::Uint8Array::from(req.bytes().await?.as_slice()).into()));
+        // (A body that broke on its way in: handed on as it came, empty.)
+        init.with_body(Some(js_sys::Uint8Array::from(req.bytes().await.unwrap_or_default().as_slice()).into()));
     }
-    stub.fetch_with_request(Request::new_with_init(&req.url()?.to_string(), &init)?).await
+    stub.fetch_with_request(Request::new_with_init(&req.url().expect("a request's own URL").to_string(), &init).expect("the same request")).await
 }
 
 /// The dashboard sessions' keys: one secret each, DEVICE_KEY_<expires, unix seconds>_<random>.
 fn device_keys(env: &Env) -> Vec<(u64, String)> {
     let names = js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>());
     names.iter().filter_map(|n| n.as_string()).filter_map(|n| {
-        let until: u64 = n.strip_prefix("DEVICE_KEY_")?.split('_').next()?.parse().ok()?;
+        let until: u64 = n.strip_prefix("DEVICE_KEY_")?.split('_').next().expect("a split's first piece").parse().ok()?;
         Some((until * 1000, env.secret(&n).ok()?.to_string()))
     }).collect()
 }
@@ -92,7 +95,7 @@ struct Runners<'a>(&'a Env, String, Option<String>);
 impl Containers for Runners<'_> {
     async fn start(&self, name: &str, work: &Work, max_minutes: u32, size: Size) -> io::Result<String> {
         let mut body = serde_json::json!({ "max_minutes": max_minutes, "cpu": size.cpu, "ram_gb": size.ram_gb, "disk_gb": size.disk_gb });
-        for (k, v) in work.json().as_object().into_iter().flatten() { body[k] = v.clone() }
+        body.as_object_mut().expect("an object, just made").extend(work.json().as_object().cloned().unwrap_or_default());
         if let Some(i) = &self.2 { body["image_url"] = i.clone().into() }
         // Its id is its Durable Object's: Cloudflare's usage analytics count each container by it (`instanceId`).
         self.call(name, "start", body).await
@@ -106,20 +109,20 @@ impl Runners<'_> {
         let namespace = self.0.durable_object("RUNNER").map_err(|e| e.to_string())?;
         // Where its container starts (a hint, used when the object is made): as set, or where Cloudflare chooses.
         let location = &self.1;
-        let object = if is_object_id(name) { namespace.id_from_string(name) } else { namespace.id_from_name(name) }.map_err(|e| e.to_string())?;
+        // (By its id only once its start made it: an id of this namespace's. A moved control plane brings only jobs that
+        // ended.)
+        let by_id = is_object_id(name);
+        let object = if by_id { namespace.id_from_string(name) } else { namespace.id_from_name(name) }.expect("a Durable Object named, or one of this namespace's");
         let id = object.to_string();
-        let stub = if location == "auto" || is_object_id(name) { object.get_stub() } else { object.get_stub_with_location_hint(location) }.map_err(|e| e.to_string())?;
+        let stub = if location == "auto" || by_id { object.get_stub().expect("a Durable Object's stub") } else { object.get_stub_with_location_hint(location).expect("a stub where Cloudflare has a location (as its settings are read)") };
         let mut init = RequestInit::new();
         init.with_method(Method::Post).with_body(Some(JsValue::from_str(&body.to_string())));
-        let req = Request::new_with_init(&format!("https://runner/{what}"), &init).map_err(|e| e.to_string())?;
+        let req = Request::new_with_init(&format!("https://runner/{what}"), &init).expect("a request to a runner");
         let mut r = stub.fetch_with_request(req).await.map_err(|e| e.to_string())?;
         if r.status_code() >= 300 { return Err(format!("runner container: {} {}", r.status_code(), r.text().await.unwrap_or_default())); }
         Ok(id)
     }
 }
-
-/// A Durable Object's id (64 hex digits), not a name.
-fn is_object_id(s: &str) -> bool { s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) }
 
 #[async_trait(?Send)]
 impl Store for DoStore<'_> {
@@ -140,30 +143,28 @@ impl Store for DoStore<'_> {
     /// The last `n` by key, read from the end (the storage keeps keys in order).
     async fn list_last(&self, prefix: &str, n: usize) -> io::Result<Vec<(String, String)>> {
         let map = self.0.storage().list_with_options(ListOptions::new().prefix(prefix).reverse(true).limit(n)).await.map_err(|e| e.to_string())?;
-        let mut out = vec![];
-        for entry in map.entries() {
-            let pair: js_sys::Array = entry.map_err(|e| format!("{e:?}"))?.into();
-            if let (Some(k), Some(v)) = (pair.get(0).as_string(), pair.get(1).as_string()) { out.push((k, v)); }
-        }
+        let mut out = pairs(&map);
         out.reverse();
         Ok(out)
     }
     async fn list(&self, prefix: &str) -> io::Result<Vec<(String, String)>> {
         let map = self.0.storage().list_with_options(ListOptions::new().prefix(prefix)).await.map_err(|e| e.to_string())?;
-        let mut out = vec![];
-        for entry in map.entries() {
-            let pair: js_sys::Array = entry.map_err(|e| format!("{e:?}"))?.into();
-            if let (Some(k), Some(v)) = (pair.get(0).as_string(), pair.get(1).as_string()) { out.push((k, v)); }
-        }
-        Ok(out)
+        Ok(pairs(&map))
     }
+}
+
+/// A listing's keys and values, in its order (all strings: what this store puts).
+fn pairs(map: &js_sys::Map) -> Vec<(String, String)> {
+    let mut out = vec![];
+    map.for_each(&mut |v, k| out.push((k.as_string().expect("a key"), v.as_string().expect("a value this store put"))));
+    out
 }
 
 #[async_trait(?Send)]
 impl Http for FetchHttp {
     async fn send(&self, r: io::Request) -> io::Result<io::Response> {
         let headers = Headers::new();
-        for (k, v) in &r.headers { headers.append(k, v).map_err(|e| e.to_string())?; }
+        r.headers.iter().try_for_each(|(k, v)| headers.append(k, v)).map_err(|e| e.to_string())?;
         let mut init = RequestInit::new();
         init.with_method(Method::from(r.method.clone())).with_headers(headers);
         // One request asks for its redirect back (a job's log: GitHub answers with a signed link on another site,
@@ -198,13 +199,13 @@ impl PlaneObject {
     /// The control plane's settings (`PLANE_ID`, `LABEL`) and the secrets the dashboard sets from the user's machine,
     /// read as every control plane reads its settings (`Config::read_settings`): as the Worker handed them with this
     /// request (fresh), else as this object started with them. Its keys are always its own (the Worker hands none).
-    fn config(&self, fresh: Option<&serde_json::Value>) -> Config {
+    fn config(&self, fresh: Option<&std::collections::BTreeMap<String, String>>) -> Config {
         let var = |n: &str| self.env.var(n).map(|v| v.to_string()).ok().filter(|v| !v.is_empty());
         let names: Vec<String> = js_sys::Object::keys(self.env.unchecked_ref::<js_sys::Object>()).iter().filter_map(|n| n.as_string()).collect();
         let own = |n: &String| self.env.secret(n).ok().map(|v| (n.clone(), v.to_string()));
         let key = |n: &str| n.starts_with("DEVICE_KEY_") || n.starts_with("READ_KEY_");
         let mut all: Vec<(String, String)> = match fresh {
-            Some(f) => f.as_object().into_iter().flatten().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).filter(|(k, _)| !key(k)).collect(),
+            Some(f) => f.iter().filter(|(k, _)| !key(k)).map(|(k, v)| (k.clone(), v.clone())).collect(),
             None => names.iter().filter(|n| !key(n)).filter_map(own).collect(),
         };
         all.extend(names.iter().filter(|n| key(n)).filter_map(own));
@@ -230,21 +231,21 @@ impl DurableObject for PlaneObject {
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let body = if req.method() == Method::Get || req.method() == Method::Head { vec![] } else { req.bytes().await.unwrap_or_default() };
-        let request = io::Request { method: req.method().to_string(), url: req.url()?.to_string(), headers: req.headers().entries().collect(), body, no_follow: false };
-        let mut all = String::new();
-        for i in 0.. { match req.headers().get(&format!("{SETTINGS}-{i}"))? { Some(piece) => all.push_str(&piece), None => break } }
-        let fresh = serde_json::from_str::<serde_json::Value>(&all).ok();
+        let request = io::Request { method: req.method().to_string(), url: req.url().expect("a request's own URL").to_string(), headers: req.headers().entries().collect(), body, no_follow: false };
+        let header = |n: &str| req.headers().get(n).expect("a header's name");
+        let all: String = (0..).map_while(|i| header(&format!("{SETTINGS}-{i}"))).collect();
+        let fresh = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&all).ok();
         let mut config = self.config(fresh.as_ref());
         // A key the Worker vouched for (it reads the secrets fresh).
-        if let (Some(until), Some(key)) = (req.headers().get(VOUCHED)?.and_then(|u| u.parse::<u64>().ok()), req.headers().get("authorization")?.and_then(|a| a.strip_prefix("Bearer ").map(str::to_string))) {
+        if let (Some(until), Some(key)) = (header(VOUCHED).and_then(|u| u.parse::<u64>().ok()), header("authorization").and_then(|a| a.strip_prefix("Bearer ").map(str::to_string))) {
             config.device_keys.push((until, key));
         }
         let (store, timer) = (Ending(DoStore(&self.state)), DoTimer(&self.state));
         let plane = ControlPlane { store: &store, http: &FetchHttp, clock: &WorkerClock, timer: &timer, config: &config, cache: &self.cache, containers: Some(&Runners(&self.env, config.cloudflare_location.clone(), config.cloudflare_image.clone())) };
         let r = plane.handle(request).await;
         let headers = Headers::new();
-        for (k, v) in &r.headers { headers.append(k, v)?; }
-        Ok(Response::from_bytes(r.body)?.with_status(r.status).with_headers(headers))
+        r.headers.iter().for_each(|(k, v)| headers.append(k, v).expect("a header the control plane answers with"));
+        Ok(Response::from_bytes(r.body).expect("a body of bytes").with_status(r.status).with_headers(headers))
     }
 
     async fn alarm(&self) -> Result<Response> {
@@ -254,119 +255,4 @@ impl DurableObject for PlaneObject {
         plane.alarm().await.map_err(Error::RustError)?;
         Response::ok("ok")
     }
-}
-
-/// One job's runner: GitHub's runner image in a container, with a just-in-time configuration that runs exactly one job;
-/// it ends when the job ends, when asked, or at its time bound.
-#[durable_object]
-pub struct JobRunner { state: State }
-
-impl DurableObject for JobRunner {
-    fn new(state: State, _env: Env) -> Self { JobRunner { state } }
-
-    async fn fetch(&self, mut req: Request) -> Result<Response> {
-        let container = self.state.container().ok_or("no container for this runner")?;
-        let body: serde_json::Value = req.json().await?;
-        if req.path() == "/stop" {
-            // (A stop Cloudflare fails: said, for the one who asked to try again.)
-            if container.running() { if let Err(e) = container.destroy(None).await { return Response::error(format!("the container did not stop: {e}"), 502) } }
-            self.state.storage().delete_alarm().await?;
-            return Response::ok("stopped")
-        }
-        let jit = body["jit"].as_str().unwrap_or_default();
-        if jit.is_empty() && !body["gitlab"].is_object() { return Response::error("no runner configuration", 400) }
-        // A start is always a fresh runner: one left from a start that failed half-way goes first.
-        if container.running() { let _ = container.destroy(Some("starting again")).await; }
-        if let Err(e) = start_runner(&container, jit, &body).await { console_error!("{e}"); return Response::error(e.to_string(), 502) }
-        let minutes = body["max_minutes"].as_u64().unwrap_or(70);
-        self.state.storage().set_alarm(std::time::Duration::from_secs(minutes * 60)).await?;
-        Response::ok("started")
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        if let Some(c) = self.state.container() { if c.running() { c.destroy(Some("time bound")).await? } }
-        Response::ok("ended")
-    }
-}
-
-/// Starts GitHub's runner: `/home/runner/run.sh` with a just-in-time configuration runs exactly one job. The container
-/// is sized for the job, from the runner image this Worker names (Cloudflare's per-container scheduling).
-async fn start_runner(container: &Container, jit: &str, body: &serde_json::Value) -> Result<()> {
-    let options = Object::new();
-    if body["gitlab"].is_object() { gitlab_options(&options, body)? }
-    else {
-        // GitHub's runner, with Docker that works here (see superci_core::docker).
-        Reflect::set(&options, &"entrypoint".into(), &Array::of3(&"bash".into(), &"-c".into(), &superci_core::docker::start().into()))?;
-        let env = Object::new();
-        Reflect::set(&env, &"SUPERCI_JIT".into(), &jit.into())?;
-        Reflect::set(&env, &"SUPERCI_DOCKER".into(), &superci_core::docker::WRAPPER.into())?;
-        // A failing runner (a job nothing here can run): why, for its job-started hook.
-        if let Some(why) = body["fail"].as_str() { Reflect::set(&env, &"SUPERCI_FAIL".into(), &why.into())?; }
-        // GitHub's full image, loaded as it is read (checked again here: it goes into the start script's environment).
-        if let Some(i) = body["image_url"].as_str().and_then(superci_core::plane::image_address) { Reflect::set(&env, &"SUPERCI_IMAGE".into(), &i.into())?; }
-        Reflect::set(&options, &"env".into(), &env)?;
-    }
-    Reflect::set(&options, &"enableInternet".into(), &JsValue::TRUE)?;
-    let image = Reflect::get(container.as_ref(), &"images".into()).ok().filter(|i| i.is_object()).and_then(|i| Reflect::get(&i, &"runner".into()).ok()).filter(|i| !i.is_undefined());
-    let image = image.ok_or("this Worker names no runner image: update the control plane from the dashboard")?;
-    Reflect::set(&options, &"image".into(), &image)?;
-    let n = |k: &str, d: u64| body[k].as_u64().unwrap_or(d) as f64;
-    let instance = Object::new();
-    Reflect::set(&instance, &"vcpu".into(), &n("cpu", 4).into())?;
-    Reflect::set(&instance, &"memoryMib".into(), &(n("ram_gb", 12) * 1024.0).into())?;
-    Reflect::set(&instance, &"diskMb".into(), &(n("disk_gb", 20) * 1000.0).into())?;
-    Reflect::set(&options, &"instance".into(), &instance)?;
-    let start: Function = Reflect::get(container.as_ref(), &"start".into())?.dyn_into()?;
-    // A start that fails (an image or size Cloudflare refuses) says so, rather than leaving the job waiting.
-    let started = start.call1(container.as_ref(), &options).map_err(|e| Error::RustError(format!("the container did not start: {}", js_message(&e))))?;
-    if let Ok(promise) = started.dyn_into::<js_sys::Promise>() {
-        wasm_bindgen_futures::JsFuture::from(promise).await.map_err(|e| Error::RustError(format!("the container did not start: {}", js_message(&e))))?;
-    }
-    // Cloudflare stops a container soon after its Durable Object goes idle unless told otherwise: it runs until the job
-    // ends (or its time bound; Cloudflare's longest is 6 hours).
-    let minutes = body["max_minutes"].as_u64().unwrap_or(70).min(360);
-    // Cloudflare can answer "temporarily unavailable" right after a start: asked again, three times, a second apart.
-    let keep: Function = Reflect::get(container.as_ref(), &"setInactivityTimeout".into())?.dyn_into()?;
-    let mut last = String::new();
-    for attempt in 0..4 {
-        if attempt > 0 { Delay::from(std::time::Duration::from_secs(1)).await }
-        let kept = match keep.call1(container.as_ref(), &((minutes * 60_000) as f64).into()) { Ok(v) => v, Err(e) => { last = js_message(&e); continue } };
-        match kept.dyn_into::<js_sys::Promise>() {
-            Ok(promise) => match wasm_bindgen_futures::JsFuture::from(promise).await { Ok(_) => return Ok(()), Err(e) => last = js_message(&e) },
-            Err(_) => return Ok(()),
-        }
-    }
-    Err(Error::RustError(format!("the container cannot be kept running: {last}")))
-}
-
-/// What a JavaScript error says (its message), not how it is built.
-fn js_message(e: &wasm_bindgen::JsValue) -> String {
-    use wasm_bindgen::JsCast;
-    match e.dyn_ref::<js_sys::Error>() {
-        Some(err) => String::from(err.message()),
-        None => e.as_string().unwrap_or_else(|| js_sys::JSON::stringify(e).map(String::from).unwrap_or_else(|_| "an error without a message".into())),
-    }
-}
-
-/// The containers of one size from before 0.5.0: the class stays (Cloudflare keeps its namespace), with nothing in it.
-#[durable_object]
-pub struct Runner { _state: State }
-
-impl DurableObject for Runner {
-    fn new(state: State, _env: Env) -> Self { Runner { _state: state } }
-    async fn fetch(&self, _req: Request) -> Result<Response> { Response::error("superseded by JobRunner", 410) }
-}
-
-/// GitLab's runner for one job, in Docker on the container's own network (no bridge networks here). The token and URL go
-/// in the environment, not the command line.
-fn gitlab_options(options: &Object, body: &serde_json::Value) -> Result<()> {
-    let gl = &body["gitlab"];
-    Reflect::set(options, &"entrypoint".into(), &Array::of3(&"bash".into(), &"-c".into(), &superci_core::gitlab::RUNNER_SCRIPT.into()))?;
-    let env = Object::new();
-    Reflect::set(&env, &"GL_URL".into(), &gl["url"].as_str().unwrap_or_default().into())?;
-    Reflect::set(&env, &"GL_TOKEN".into(), &gl["token"].as_str().unwrap_or_default().into())?;
-    Reflect::set(&env, &"DOCKERD_FLAGS".into(), &"--iptables=false --ip6tables=false --ip-forward=false".into())?;
-    Reflect::set(&env, &"GL_RUNNER_FLAGS".into(), &"--docker-network-mode host".into())?;
-    Reflect::set(options, &"env".into(), &env)?;
-    Ok(())
 }

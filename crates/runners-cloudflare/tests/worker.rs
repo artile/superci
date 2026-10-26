@@ -17,10 +17,13 @@ const BINDINGS: &str = "[[durable_objects.bindings]]\nname = \"RUNNER\"\nclass_n
 
 /// The launcher as the dashboard sets it up for a control plane (its address, its id, its public keys pinned); with
 /// `trust` given, these settings instead (`[vars]` lines: none, for a launcher set up with no control plane).
-fn start(keys: &SigningKeyStore, trust: Option<&str>) -> Option<Worker> {
+fn start(keys: &SigningKeyStore, trust: Option<&str>) -> Option<Worker> { start_bound(keys, trust, BINDINGS) }
+
+/// The same, its Durable Objects bound as these lines say.
+fn start_bound(keys: &SigningKeyStore, trust: Option<&str>, bindings: &str) -> Option<Worker> {
     let pinned = json!({ "keys": [keys.public_jwk().unwrap()] }).to_string();
     let vars = trust.map(str::to_string).unwrap_or_else(|| format!("TRUSTED_ISSUER = \"{PLANE_URL}\"\nTRUSTED_SUBJECT = \"{SUBJECT}\"\nTRUSTED_KEYS = '{pinned}'"));
-    Worker::start(&Setup { built: worker::built(env!("CARGO_MANIFEST_DIR")), bindings: BINDINGS, vars: &vars }, &[])
+    Worker::start(&Setup { built: worker::built(env!("CARGO_MANIFEST_DIR")), bindings, vars: &vars }, &[])
 }
 
 /// A token as a control plane signs one: for `aud`, from `sub`, by `iss`, good for a few minutes (or ended).
@@ -47,7 +50,7 @@ fn the_launcher_says_what_it_is_and_has_nothing_else() {
 
 /// Only its control plane's tokens are taken: none, one not signed by its keys, one for another launcher, from another
 /// control plane or of another, one that ended: refused, saying why. A launcher set up with no control plane, or with
-/// keys that are none, takes nothing.
+/// keys that are none (or a list of none), takes nothing.
 #[test]
 fn only_its_control_planes_tokens_are_taken() {
     let keys = SigningKeyStore::generate();
@@ -65,7 +68,8 @@ fn only_its_control_planes_tokens_are_taken() {
     assert!(w.containers.ops("start").is_empty());
     drop(w);
     for (trust, why) in [("", "no trusted control plane"), (&format!("TRUSTED_ISSUER = \"{PLANE_URL}\""), "no trusted control plane"),
-        (&format!("TRUSTED_ISSUER = \"{PLANE_URL}\"\nTRUSTED_SUBJECT = \"{SUBJECT}\""), "no trusted keys"), (&format!("TRUSTED_ISSUER = \"{PLANE_URL}\"\nTRUSTED_SUBJECT = \"{SUBJECT}\"\nTRUSTED_KEYS = \"none\""), "not allowed")] {
+        (&format!("TRUSTED_ISSUER = \"{PLANE_URL}\"\nTRUSTED_SUBJECT = \"{SUBJECT}\""), "no trusted keys"), (&format!("TRUSTED_ISSUER = \"{PLANE_URL}\"\nTRUSTED_SUBJECT = \"{SUBJECT}\"\nTRUSTED_KEYS = \"none\""), "not allowed"),
+        (&format!("TRUSTED_ISSUER = \"{PLANE_URL}\"\nTRUSTED_SUBJECT = \"{SUBJECT}\"\nTRUSTED_KEYS = '{{}}'"), "bad token")] {
         let Some(w) = start(&keys, Some(trust)) else { return };
         let (status, said) = asked(&w, "/launch", &token(&keys, PLANE_URL, SUBJECT, &w.url, false), launch.clone());
         assert!(status == 401 && said.contains(why), "{why}: {status} {said}");
@@ -93,6 +97,33 @@ fn runners_are_launched_and_stopped_as_the_control_plane_asks() {
     let (status, said) = asked(&w, "/launch", &t, json!({ "name": "job-3" }));
     assert!(status == 400 && said.contains("no runner configuration"), "{status} {said}");
     assert_ne!(asked(&w, "/launch", &t, json!({ "jit": "eyJqaXQiOnRydWV9" })).0, 200);
+}
+
+/// What the launcher cannot do fails, not taken for done: a body that is not JSON; a runner by an id that is not one of
+/// its Durable Objects'; one whose Worker has no containers; a Worker without its runners' binding. A name of 64
+/// characters that are not an id's is a name. A location Cloudflare has not: refused, said.
+#[test]
+fn what_the_launcher_cannot_do_fails() {
+    let keys = SigningKeyStore::generate();
+    let Some(w) = start(&keys, None) else { return };
+    let t = token(&keys, PLANE_URL, SUBJECT, &w.url, false);
+    let (status, said) = w.call("POST", "/launch", &[("authorization", &format!("Bearer {t}"))], b"not json");
+    assert_eq!(status, 500, "{said}");
+    let (status, said) = asked(&w, "/stop", &t, json!({ "id": "f".repeat(64) }));
+    assert_eq!(status, 500, "{said}");
+    let (status, said) = asked(&w, "/stop", &t, json!({ "id": "z".repeat(64) }));
+    assert!(status == 200 && said.contains("stopped"), "{status} {said}");
+    let (status, said) = asked(&w, "/launch", &t, json!({ "name": "job-9", "jit": "eyJqaXQiOnRydWV9", "location": "nowhere" }));
+    assert!(status == 400 && said.contains("no location nowhere"), "{status} {said}");
+    w.containers_are(json!({ "noContainer": true }));
+    let (status, said) = asked(&w, "/launch", &t, json!({ "name": "job-10", "jit": "eyJqaXQiOnRydWV9" }));
+    assert_eq!(status, 500, "{said}");
+    assert!(w.containers.ops("start").is_empty());
+    drop(w);
+    let Some(w) = start_bound(&keys, None, "[[durable_objects.bindings]]\nname = \"LEGACY\"\nclass_name = \"Runner\"\n\n[[migrations]]\ntag = \"v1\"\nnew_sqlite_classes = [\"JobRunner\", \"Runner\"]\n") else { return };
+    let t = token(&keys, PLANE_URL, SUBJECT, &w.url, false);
+    let (status, said) = asked(&w, "/launch", &t, json!({ "name": "job-11", "jit": "eyJqaXQiOnRydWV9" }));
+    assert_eq!(status, 500, "{said}");
 }
 
 /// A runner's container, each way Cloudflare's may go, as the launcher asks it.

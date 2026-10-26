@@ -18,7 +18,7 @@ use superci_core::crypto::{random_token, safe_eq};
 use superci_core::github::{self, app_manifest, manifest_target, Owner};
 use superci_core::plane::AUDIENCE;
 use superci_core::io::Response;
-use superci_core::plane::{AwsBudget, Pool, Routing, Rule, AWS_ON_DEMAND, MAX_CPU, MAX_JOB_MINUTES};
+use superci_core::plane::{AwsBudget, Pool, Routing, Rule, AWS_ON_DEMAND, CLOUDFLARE_LOCATIONS as CF_LOCATIONS, MAX_CPU, MAX_JOB_MINUTES};
 use superci_core::spec::{Capacity, Spec};
 use superci_core::page::{document, esc, manifest_form, nearby_regions, region_name, region_short, REGIONS};
 
@@ -586,10 +586,6 @@ fn closest(v: Option<&PlaneView>) -> String {
     let gl = v.and_then(|v| v.gitlab_url()).is_some_and(|u| u.contains("://gitlab.com"));
     match (gh, gl) { (true, true) => "closest to GitHub and GitLab", (false, true) => "closest to GitLab", _ => "closest to GitHub" }.into()
 }
-
-/// Where Cloudflare's containers can start (Durable Object location hints), or where Cloudflare chooses.
-const CF_LOCATIONS: [(&str, &str); 10] = [("auto", "Automatic: Cloudflare chooses"), ("enam", "Eastern North America"), ("wnam", "Western North America"), ("sam", "South America"),
-    ("weur", "Western Europe"), ("eeur", "Eastern Europe"), ("apac", "Asia-Pacific"), ("oc", "Oceania"), ("afr", "Africa"), ("me", "Middle East")];
 
 /// Regions by their full names, with what this account may run there when known.
 fn region_select_options(selected: &str, quotas: &HashMap<String, Result<u32>>, best: &str, look: Option<&aws::Look>) -> String {

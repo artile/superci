@@ -28,17 +28,21 @@ fn wrangler() -> Vec<String> {
     else { vec!["npx".into(), "-y".into(), WRANGLER.into()] }
 }
 
-/// Where supercov measures this run: the Worker is built from the source here (supercov's copy, with its probes) once,
-/// before it starts, rather than taken as `./build.sh` left it (a build without probes has nothing to read).
+/// Where supercov measures this run: the Worker is built from the source here (supercov's copy, with its probes) once
+/// for the run, before it starts, rather than taken as `./build.sh` left it (a build without probes has nothing to
+/// read). (supercov runs each test in a process of its own, a few at once: the first builds, under a lock, the others
+/// find it built.)
 fn build_once(built: &Path) {
-    static BUILT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-    if !measured() { return }
-    let mut done = BUILT.lock().unwrap();
-    if done.iter().any(|b| b == built) { return }
+    let Some(run) = std::env::var_os("SUPERCOV_RUN_ID") else { return };
     let crate_dir = built.parent().and_then(Path::parent).unwrap();
+    let name = crate_dir.file_name().unwrap().to_string_lossy();
+    let mark = std::env::temp_dir().join(format!("superci-worker-built-{}-{name}", run.to_string_lossy()));
+    let lock = std::fs::File::create(mark.with_extension("lock")).unwrap();
+    lock.lock().unwrap();
+    if mark.exists() { return }
     let o = Command::new("worker-build").arg("--release").current_dir(crate_dir).output().unwrap();
     assert!(o.status.success(), "worker-build: {}", String::from_utf8_lossy(&o.stderr));
-    done.push(built.to_path_buf());
+    std::fs::write(&mark, "").unwrap();
 }
 
 fn free_port() -> u16 { TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port() }
@@ -300,7 +304,28 @@ pub fn each_way_a_container_goes(w: &Worker) {
     w.containers_are(json!({ "noContainer": true }));
     assert_ne!(w.runner("r6", "start", job(json!({}))).0, 200);
     assert_eq!(w.alarm(Some("r6")).0, 200);
+    // Refused at once (thrown, not as a promise): said, with what Cloudflare said; kept running not at all.
+    w.containers_are(json!({ "throwStart": "no such image" }));
+    let (status, text) = w.runner("r7", "start", job(json!({})));
+    assert!(status == 502 && text.contains("the container did not start: no such image"), "{status} {text}");
+    w.containers_are(json!({ "throwKeep": "temporarily unavailable" }));
+    let (status, text) = w.runner("r7", "start", job(json!({})));
+    assert!(status == 502 && text.contains("cannot be kept running: temporarily unavailable"), "{status} {text}");
     w.containers_are(json!({}));
+    // A stop Cloudflare fails: said, for the one who asked to try again; an end at its time bound that fails: failed.
+    assert_eq!(w.runner("r8", "start", job(json!({}))).0, 200);
+    w.containers.answer("destroy", json!({ "throw": "busy" }));
+    let (status, text) = w.runner("r8", "stop", json!({}));
+    assert!(status == 502 && text.contains("the container did not stop") && text.contains("busy"), "{status} {text}");
+    w.containers.answer("destroy", json!({ "throw": "busy" }));
+    assert_eq!(w.alarm(Some("r8")).0, 500);
+    // Its time bound not set, or not taken off: failed, not taken for done. Asked with what is not JSON: the same.
+    w.containers_are(json!({ "failStorage": ["setAlarm"] }));
+    assert_eq!(w.runner("r9", "start", job(json!({}))).0, 500);
+    w.containers_are(json!({ "failStorage": ["deleteAlarm"] }));
+    assert_eq!(w.runner("r9", "stop", json!({})).0, 500);
+    w.containers_are(json!({}));
+    assert_eq!(http(&w.url, "POST", "/__test/runner?name=r9&what=start", &[], b"not json").0, 500);
     // The class kept from before 0.5.0: gone, said.
     assert_eq!(w.get("/__test/legacy").0, 410);
 }
