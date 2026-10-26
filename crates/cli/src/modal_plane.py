@@ -63,19 +63,27 @@ async def moved():
 settings = modal.Dict.from_name(f"{NAME}-settings", create_if_missing=True)
 
 
+# How many messages a container answers side by side: each by a control plane program of its own, as AWS's Lambda
+# answers its requests (each store operation atomic in itself; the upkeep already runs in a container of its own).
+SIDE_BY_SIDE = 8
+
+
 class Plane:
-    """The control plane program: one per container, one message at a time (like a Durable Object)."""
+    """The control plane programs of a container, each answering one message at a time."""
 
     def __init__(self):
-        self.proc = None
-        self.lock = asyncio.Lock()
+        self.free = []
+        self.slots = asyncio.Semaphore(SIDE_BY_SIDE)
         self.cached = ({}, 0.0)
 
     def process(self):
-        if self.proc is None or self.proc.poll() is not None:
-            env = dict(os.environ, PLANE_ID=PLANE_ID, LABEL=LABEL)
-            self.proc = subprocess.Popen(["/opt/superci/plane"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
-        return self.proc
+        """A program not answering anything now, or a new one."""
+        while self.free:
+            p = self.free.pop()
+            if p.poll() is None:
+                return p
+        env = dict(os.environ, PLANE_ID=PLANE_ID, LABEL=LABEL)
+        return subprocess.Popen(["/opt/superci/plane"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
 
     async def secrets(self, bearer="", fresh=False):
         values, at = self.cached
@@ -164,30 +172,39 @@ class Plane:
         return {"error": f"unknown question {op}"}
 
     async def run(self, message):
-        async with self.lock:
-            auth = message.get("headers", {}).get("authorization", "")
-            fresh = message.get("url", "").split("?")[0].split("/", 3)[-1].startswith("move/")
-            message["secrets"] = await self.secrets(auth[7:] if auth.startswith("Bearer ") else "", fresh)
+        async with self.slots:
             p = self.process()
+            try:
+                m = await self.exchange(p, message)
+            except BaseException:
+                # (Left mid-message: not handed another.)
+                p.kill()
+                raise
+            self.free.append(p)
+            return m
 
-            def write(obj):
-                p.stdin.write((json.dumps(obj) + "\n").encode())
-                p.stdin.flush()
+    async def exchange(self, p, message):
+        auth = message.get("headers", {}).get("authorization", "")
+        fresh = message.get("url", "").split("?")[0].split("/", 3)[-1].startswith("move/")
+        message["secrets"] = await self.secrets(auth[7:] if auth.startswith("Bearer ") else "", fresh)
 
-            await asyncio.to_thread(write, message)
-            while True:
-                line = await asyncio.to_thread(p.stdout.readline)
-                if not line:
-                    self.proc = None
-                    raise RuntimeError("the control plane stopped")
-                m = json.loads(line)
-                if m.get("type") != "ask":
-                    return m
-                try:
-                    a = await self.answer(m)
-                except Exception as e:  # what Modal said goes back to the control plane as its error
-                    a = {"error": f"{type(e).__name__}: {e}"}
-                await asyncio.to_thread(write, a)
+        def write(obj):
+            p.stdin.write((json.dumps(obj) + "\n").encode())
+            p.stdin.flush()
+
+        await asyncio.to_thread(write, message)
+        while True:
+            line = await asyncio.to_thread(p.stdout.readline)
+            if not line:
+                raise RuntimeError("the control plane stopped")
+            m = json.loads(line)
+            if m.get("type") != "ask":
+                return m
+            try:
+                a = await self.answer(m)
+            except Exception as e:  # what Modal said goes back to the control plane as its error
+                a = {"error": f"{type(e).__name__}: {e}"}
+            await asyncio.to_thread(write, a)
 
 
 plane = Plane()

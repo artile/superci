@@ -171,7 +171,7 @@ fn the_control_plane_answers_plane_py_keeps_its_dict_and_starts_sandboxes_as_mod
         py.answers.clear();
     }
     // plane.py gone while the program waits for an answer: said as the request's answer, and the program ends.
-    py.send(&request("GET", "/status", json!({}), b"", &secrets));
+    py.send(&request("GET", "/health", json!({}), b"", &secrets));
     let q = py.line().unwrap();
     assert_eq!(q["type"], "ask", "{q}");
     py.input.take();

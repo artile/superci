@@ -326,7 +326,8 @@ fn modal_deploy(session: &Session, script: &str, file: Option<&[u8]>) -> Result<
 }
 
 /// Runs a command of Modal's client (`modal …`) in a sandbox in the workspace, with `script` as /tmp/app.py and
-/// `file` as /tmp/superci-plane.
+/// `file` as /tmp/superci-plane. Both come on the sandbox's standard input (Modal takes 16 KB of variables in all):
+/// the script's base64 on the first line, the file's after it.
 fn modal_run(session: &Session, command: &str, script: &str, file: Option<&[u8]>) -> Result<String> {
     let mut c = Client::new(Some(session.clone()))?;
     let env: pb::EnvironmentGetOrCreateResponse = c.unary("EnvironmentGetOrCreate", pb::EnvironmentGetOrCreateRequest { deployment_name: String::new() })?;
@@ -355,21 +356,18 @@ fn modal_run(session: &Session, command: &str, script: &str, file: Option<&[u8]>
     let mut vars = std::collections::HashMap::new();
     vars.insert("MODAL_TOKEN_ID".to_string(), session.token_id.clone());
     vars.insert("MODAL_TOKEN_SECRET".to_string(), session.token_secret.clone());
-    vars.insert("SCRIPT".to_string(), b64.encode(script));
-    // The file comes on the sandbox's standard input (too big for a variable).
     let receive = if file.is_some() { "base64 -d > /tmp/superci-plane && " } else { "" };
     let sandbox: pb::SandboxCreateResponse = c.unary("SandboxCreate", pb::SandboxCreateRequest { app_id: app.app_id, definition: Some(pb::Sandbox {
-        entrypoint_args: vec!["sh".into(), "-c".into(), format!("{receive}echo \"$SCRIPT\" | base64 -d > /tmp/app.py && cd /tmp && {command}")],
+        entrypoint_args: vec!["sh".into(), "-c".into(), format!("IFS= read -r script && printf %s \"$script\" | base64 -d > /tmp/app.py && {receive}cd /tmp && {command}")],
         image_id: image.image_id, resources: Some(pb::Resources { memory_mb: 1024, milli_cpu: 1000 }), timeout_secs: 900,
         environment_variables: Some(pb::StringMap { contents: vars }),
     }) })?;
-    if let Some(bytes) = file {
-        let encoded = b64.encode(bytes).into_bytes();
-        let chunks: Vec<&[u8]> = encoded.chunks(512 * 1024).collect();
-        chunks.iter().enumerate().try_for_each(|(i, chunk)| {
-            c.unary::<_, pb::Empty>("SandboxStdinWrite", pb::SandboxStdinWriteRequest { sandbox_id: sandbox.sandbox_id.clone(), input: chunk.to_vec(), index: i as u32 + 1, eof: i + 1 == chunks.len() }).map(|_| ())
-        })?;
-    }
+    let mut input = format!("{}\n", b64.encode(script)).into_bytes();
+    if let Some(bytes) = file { input.extend(b64.encode(bytes).into_bytes()) }
+    let chunks: Vec<&[u8]> = input.chunks(512 * 1024).collect();
+    chunks.iter().enumerate().try_for_each(|(i, chunk)| {
+        c.unary::<_, pb::Empty>("SandboxStdinWrite", pb::SandboxStdinWriteRequest { sandbox_id: sandbox.sandbox_id.clone(), input: chunk.to_vec(), index: i as u32 + 1, eof: i + 1 == chunks.len() }).map(|_| ())
+    })?;
     // (Eighteen waits of up to 50 seconds each, at most.)
     let mut waits = 0;
     let done = loop {
@@ -510,9 +508,10 @@ mod answers {
         let built = pb::ImageGetOrCreateResponse { image_id: "im-1".into(), result: Some(pb::GenericResult { status: 1, exception: String::new(), exitcode: 0 }) };
         let mut given = start(built, says(vec![]));
         given.extend([("SandboxCreate", says(vec![kept(&pb::SandboxCreateResponse { sandbox_id: "sb-1".into() })])), ("SandboxWait", says(vec![kept(&pb::SandboxWaitResponse { result: None })])),
-            ("SandboxGetLogs", says(vec![kept(&pb::TaskLogsBatch { items: vec![pb::TaskLogs { data: "deploying\n".into() }], entry_id: "1".into(), eof: true })]))]);
+            ("SandboxGetLogs", says(vec![kept(&pb::TaskLogsBatch { items: vec![pb::TaskLogs { data: "deploying\n".into() }], entry_id: "1".into(), eof: true })])),
+            ("SandboxStdinWrite", says(vec![kept(&pb::Empty {})]))]);
         let aws = modal(given);
-        // (An empty file is given as none: nothing on the sandbox's input.)
+        // (The script on the sandbox's input, an empty file after it.)
         let said = with(&aws.url, || modal_run(&session(), "modal deploy app.py", "", Some(b""))).unwrap_err();
         assert!(said.contains("still running") && said.contains("deploying"), "{said}");
     }

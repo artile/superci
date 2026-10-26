@@ -217,6 +217,9 @@ impl Config {
 /// What a runtime keeps between requests while it is alive (credentials, tokens, the image id).
 #[derive(Default)]
 pub struct Cache {
+    /// The control plane's address as this process last read or wrote it (read and written again when a request comes
+    /// to another).
+    plane_url: RefCell<Option<String>>,
     /// Whether the jobs' indexes are complete (once they are, they stay so).
     indexed: std::cell::Cell<bool>,
     /// Runners' links known to be a job's (`rjob:<token>`), until when; and a count for posts of lines in one
@@ -1186,7 +1189,10 @@ impl<'a> ControlPlane<'a> {
     async fn route(&self, req: Request) -> Result<Response> {
         let url = url::Url::parse(&req.url).map_err(|e| e.to_string())?;
         let plane_url = origin(&req.url);
-        if get_json::<String>(self.store, "plane_url").await?.as_deref() != Some(plane_url.as_str()) { put_json(self.store, "plane_url", &plane_url).await? }
+        if self.cache.plane_url.borrow().as_deref() != Some(plane_url.as_str()) {
+            if get_json::<String>(self.store, "plane_url").await?.as_deref() != Some(plane_url.as_str()) { put_json(self.store, "plane_url", &plane_url).await? }
+            *self.cache.plane_url.borrow_mut() = Some(plane_url.clone());
+        }
         // A device key in use: noted (ten minutes apart at most), for whoever looks after the CI to see.
         if let Some(name) = self.device_key_name(&req) { let _ = self.note_key(&name, None).await; }
         match (req.method.as_str(), url.path()) {
