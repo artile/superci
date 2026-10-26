@@ -334,14 +334,15 @@ fn setup_holds_with_each_call_and_store_operation_failing() {
     // How many steps `setup` takes each way, and `setup-finish` and `off`. (`setup-finish` counts in the same file once
     // it is started, a restart later: what `setup` counted is read as it ends.)
     let mut counts = vec![];
-    for (_, env, args, before, clean) in &ways {
+    for (way, env, args, before, clean) in &ways {
         if !before.is_empty() { m.sh(before); }
         m.sh("rm -f /run/superci-layers.state");
         let mut e = measured_env();
         e.extend(env.iter().cloned());
         e.extend(fault(None, "count"));
         let o = m.exec(&e, &["sh", "-c", &format!("/usr/local/bin/superci-layers setup {} >/dev/null && cat /var/tmp/count", args.join(" "))]);
-        counts.push(String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().unwrap());
+        let count = String::from_utf8_lossy(&o.stdout).trim().parse::<usize>();
+        counts.push(count.unwrap_or_else(|_| panic!("{way}: setup counted nothing: {}", String::from_utf8_lossy(&o.stderr))));
         m.sh("for i in $(seq 240); do [ -s /run/superci-layers.state ] && exit 0; sleep 0.5; done; exit 1");
         after(clean);
     }

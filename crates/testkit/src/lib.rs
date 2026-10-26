@@ -624,7 +624,9 @@ impl Aws {
                     continue;
                 }
             }
-            if (!host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com")) || s3 {
+            // (So is a control plane assuming the role it was given: GitHub's stand-in answers it as AWS documents it.)
+            let sts = host.starts_with("sts.") && (target.contains("Action=AssumeRoleWithWebIdentity") || String::from_utf8_lossy(&body).contains("Action=AssumeRoleWithWebIdentity"));
+            if (!host.ends_with(".amazonaws.com") && !host.ends_with(".signin.aws.amazon.com")) || s3 || sts {
                 let gh = a.github.lock().unwrap().clone().unwrap_or_default();
                 let mut req = Request::new(&method, &format!("https:/{target}")).with_body(body);
                 for (k, v) in &headers { if !k.eq_ignore_ascii_case("host") { req = req.with_header(k, v) } }

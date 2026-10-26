@@ -16821,16 +16821,21 @@ fn jobs_aws_took_back_are_run_again_once_their_runs_end_or_say_why_not_for_each_
     let first_run = run_of(first);
     edit(second, &|j| { j["rerun"]["run_id"] = first_run.into(); j["run_id"] = first_run.into(); });
     let going = taken_back("its run still going");
-    let (still, q) = served.github.queue("still running", "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(still));
+    // (Its run on the branch below, with newer runs there: still going all the same.)
+    let (still, q) = served.github.queue("still running", "superci", served.now_ms()); served.github.set_commit(still, "fix/login", "6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d"); served.webhook(q); served.webhook(served.github.start(still));
     let still_run = run_of(still);
     edit(going, &|j| { j["rerun"]["run_id"] = still_run.into(); });
-    // (On a branch of its own: the newer push is newer than the others' runs only there.)
+    // (On a branch of its own: the newer push is newer than the others' runs only there. Beside it there, what is no
+    // newer run of its workflow: an older push's run still going, another workflow's, a newer push's that ended.)
+    let on_branch = |name: &str, sha: &str| { let (id, q) = served.github.queue(name, "superci", served.now_ms()); served.github.set_commit(id, "fix/login", sha); served.webhook(q); served.webhook(served.github.start(id)); id };
+    on_branch("an older push", "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a");
     let moved_on = taken_back("its branch pushed again");
     served.github.set_commit(moved_on, "fix/login", "5b1d0c3e7a9f2b4d6e8c0a1f3b5d7e9c1a3f5b7d");
-    let (newer, q) = served.github.queue("the newer push", "superci", served.now_ms());
-    served.github.set_commit(newer, "fix/login", "0e1c3f5b2a7d9e8c6b4a2f0e1d3c5b7a9e8d6c4b");
-    served.webhook(q);
-    served.webhook(served.github.start(newer));
+    let other = on_branch("another workflow", "8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b");
+    served.github.set_workflow(other, 4242);
+    let ended = on_branch("a newer push that ended", "9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c");
+    served.webhook(served.github.finish(ended, "success", "done\n", served.now_ms()));
+    let newer = on_branch("the newer push", "0e1c3f5b2a7d9e8c6b4a2f0e1d3c5b7a9e8d6c4b");
     let gone = taken_back("its run gone");
     edit(gone, &|j| { j["rerun"]["run_id"] = 39_999_999_999u64.into(); });
     let late = taken_back("six hours on");

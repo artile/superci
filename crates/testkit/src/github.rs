@@ -320,6 +320,9 @@ impl GitHub {
         (j["head_branch"], j["head_sha"]) = (branch.into(), sha.into());
     }
 
+    /// Its run's workflow (another than the fixture's), by its id.
+    pub fn set_workflow(&self, id: u64, workflow_id: u64) { self.hub.lock().unwrap().jobs.get_mut(&id).unwrap()["workflow_id"] = workflow_id.into() }
+
     pub fn set_steps(&self, id: u64, steps: Value) { self.hub.lock().unwrap().jobs.get_mut(&id).unwrap()["steps"] = steps }
 
     /// Its run ended, with these logs (GitHub keeps a run's logs, each step's apart, once the whole run has ended).
@@ -510,6 +513,7 @@ impl GitHub {
                 let first = jobs.first()?;
                 let mut run = fixture("run");
                 let status = if jobs.iter().all(|j| j["status"] == "completed") { "completed" } else if jobs.iter().any(|j| j["status"] == "in_progress") { "in_progress" } else { "queued" };
+                if first.get("workflow_id").is_some() { run["workflow_id"] = first["workflow_id"].clone() }
                 for (k, v) in [("id", json!(id)), ("status", json!(status)), ("conclusion", if status == "completed" { first["conclusion"].clone() } else { Value::Null }),
                     ("head_sha", first["head_sha"].clone()), ("head_branch", first["head_branch"].clone()),
                     ("run_attempt", json!(1)), ("created_at", first["created_at"].clone()), ("run_started_at", first["created_at"].clone()), ("updated_at", first["created_at"].clone())] { run[k] = v }

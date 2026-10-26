@@ -248,3 +248,24 @@ fn a_run_from_a_computer_hands_its_job_once_then_tells_the_runner_to_wait() {
     assert_eq!((then["status"].as_u64(), then["headers"]["x-superci-hold"].as_str()), (Some(204), Some("20000")), "{then}");
     assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
 }
+
+/// A GitHub job its routing sends to AWS (through the role its AWS account gave it), AWS refusing the first request
+/// for its rate: asked again after a wait, as the other control planes do, and its machine started.
+#[test]
+fn a_job_on_aws_is_asked_again_after_a_wait_when_aws_refuses_it_for_its_rate() {
+    let aws = aws();
+    let gh = aws.github.lock().unwrap().clone().unwrap();
+    aws.replaying(include_str!("../../cli/fixtures/aws/launch/spot.jsonl"), &[]);
+    aws.fail("RunInstances", 503, &superci_testkit::ec2_error("RequestLimitExceeded", "Request limit exceeded."), Some(1));
+    let routing = json!({ "default": null, "rules": [], "order": [{ "cloud": "aws", "max_jobs": 100 }] });
+    let secrets = json!({ "GITHUB_APP": GitHub::app().to_string(), "ROUTING": routing.to_string() });
+    let mut py = PlanePy::start(&aws);
+    py.dict.insert("aws".into(), json!({ "account_id": "111111111111", "region": "us-east-1", "role_arn": format!("arn:aws:iam::111111111111:role/superci-plane-{PLANE}"), "connected": true }).to_string());
+    py.dict.insert("aws:no-fleet".into(), now_ms().to_string());
+    let (_, hook) = gh.queue("build", "acmeci", now_ms());
+    let answer = py.exchange(request("POST", "/webhook", json!({ "x-github-event": "workflow_job", "x-hub-signature-256": hook.1 }), &hook.0, &secrets)).unwrap();
+    assert!(answer["status"].as_u64().unwrap() < 300, "{answer} {}", body(&answer));
+    let runs = aws.asked.lock().unwrap().iter().filter(|a| a["asked"].as_str().unwrap_or_default().contains("Action=RunInstances")).count();
+    let asked: Vec<String> = aws.asked.lock().unwrap().iter().map(|a| format!("{} {}", a["url"], a["asked"].as_str().unwrap_or_default().chars().take(60).collect::<String>())).collect();
+    assert!(runs >= 2, "{runs} RunInstances: {}\n{asked:#?}", py.dict["job:90000000001"]);
+}
