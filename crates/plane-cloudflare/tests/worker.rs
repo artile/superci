@@ -297,7 +297,8 @@ fn a_worker_without_its_control_plane_fails_every_request() {
 }
 
 /// A move away: the secrets it keeps handed on with its one-time move token (one with letters outside ASCII, handed
-/// from the Worker to its Durable Object escaped, as they are). Its containers set to nothing: off.
+/// from the Worker to its Durable Object escaped, as they are), and where it moves to only an https address. Its
+/// containers set to nothing: off.
 #[test]
 fn a_move_away_hands_on_the_secrets_it_keeps() {
     let mut settings = deployed();
@@ -309,6 +310,13 @@ fn a_move_away_hands_on_the_secrets_it_keeps() {
     let (status, said) = w.call("POST", "/move/export", &[("authorization", &format!("Bearer {KEY}")), ("x-move-token", "move-token-0123456789")], b"{}");
     let secrets: Value = serde_json::from_str(&said).unwrap_or_default();
     assert!(status == 200 && secrets["secrets"].to_string().contains("npm-token-ąžuolas-𝄞"), "{status} {said}");
+    // Moved away only to an https address: as Cloudflare runs it (a release build), not even one on this computer.
+    for to in ["http://127.0.0.1:8977", "ftp://plane.example.com"] {
+        let (status, said) = w.dashboard("POST", "/move/away", &json!({ "to": to }).to_string());
+        assert!(status == 400 && said.contains("where to?"), "{to}: {status} {said}");
+    }
+    let (status, said) = w.dashboard("POST", "/move/away", &json!({ "to": "https://superci.globex.workers.dev" }).to_string());
+    assert!(status == 200 && said.contains("globex"), "{status} {said}");
 }
 
 /// A job whose runner cannot start, in each way it cannot: a Worker without containers, a start Cloudflare refuses at

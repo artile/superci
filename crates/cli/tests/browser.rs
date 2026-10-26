@@ -11889,6 +11889,9 @@ mod github_in_browser {
         let mut globex = superci_testkit::GitHub::app();
         for (k, v) in [("id", serde_json::json!(2002)), ("slug", serde_json::json!("superci-globex")), ("owner", serde_json::json!("globex"))] { globex[k] = v }
         served.aws.put(&format!("/superci/{}/GITHUB_APP_2002", superci_testkit::PLANE), &globex.to_string());
+        let mut initech = globex.clone();
+        for (k, v) in [("id", serde_json::json!(2003)), ("slug", serde_json::json!("superci-initech")), ("owner", serde_json::json!("initech"))] { initech[k] = v }
+        served.aws.put(&format!("/superci/{}/GITHUB_APP_2003", superci_testkit::PLANE), &initech.to_string());
         let home = signed_in(&served);
         let (mut child, link) = dashboard(&home);
         // (The control plane has both.)
@@ -11906,6 +11909,15 @@ mod github_in_browser {
         assert!(served.aws.settings(superci_testkit::PLANE).iter().all(|(k, _)| k != "GITHUB_APP_2002"));
         let (_, page) = part(&link, "/?p=repos&fragment=1");
         assert!(words(&page).contains("Removed globex. Its App") && words(&page).contains("is uninstalled; delete the App itself on GitHub"), "{}", words(&page));
+        // One whose uninstalling the control plane does not answer in time (GitHub slow): forgotten all the same, and
+        // what to do on GitHub said.
+        served.github.during("GET", "/app/installations", || std::thread::sleep(std::time::Duration::from_secs(9)));
+        let (status, _, _) = common::post(&link, "/github/remove", &[("app", "2003")]);
+        served.github.during.lock().unwrap().clear();
+        assert_eq!(status, 303);
+        assert!(served.aws.settings(superci_testkit::PLANE).iter().all(|(k, _)| k != "GITHUB_APP_2003"));
+        let (_, page) = part(&link, "/?p=repos&fragment=1");
+        assert!(words(&page).contains("Removed initech from this control plane. GitHub would not uninstall its App"), "{}", words(&page));
         let _ = child.kill();
         let _ = std::fs::remove_dir_all(&home);
         super::seen_in_browser(&served);
