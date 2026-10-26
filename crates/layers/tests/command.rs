@@ -62,11 +62,13 @@ fn what_the_program_is_told_amiss_is_said_and_its_service_says_it_is_ready() {
     assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
     // In a user namespace (as containerd's overlay, it runs as the machine's own root only): said, ended. (Where a
     // user may make one, or root through sudo where only root may; a coverage tool's settings on the command line.)
-    let unshare = if Command::new("unshare").args(["-Ur", "true"]).status().is_ok_and(|s| s.success()) { Some(vec!["unshare"]) }
-        else if Command::new("sudo").args(["-n", "unshare", "-Ur", "true"]).status().is_ok_and(|s| s.success()) { Some(vec!["sudo", "-n", "unshare"]) } else { None };
+    // (Through sudo, the users mapped as they are, up to 65536: the files of this user, whose folders root in the
+    // namespace may then read, as outside.)
+    let tries = [vec!["unshare", "-Ur"], vec!["sudo", "-n", "unshare", "-U", "--map-users=0:0:65536", "--map-groups=0:0:65536"]];
+    let unshare = tries.into_iter().find(|u| Command::new(u[0]).args(&u[1..]).arg("true").status().is_ok_and(|s| s.success()));
     if let Some(unshare) = unshare.filter(|_| cfg!(target_os = "linux")) {
         let dir = folder("userns");
-        let o = Command::new(unshare[0]).args(&unshare[1..]).args(["-Ur", "env"]).args(std::env::vars().filter(|(k, _)| k.starts_with("SUPERCOV_")).map(|(k, v)| format!("{k}={v}"))).arg(env!("CARGO_BIN_EXE_superci-layers")).args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", dir.join("s.sock").display())]).output().unwrap();
+        let o = Command::new(unshare[0]).args(&unshare[1..]).arg("env").args(std::env::vars().filter(|(k, _)| k.starts_with("SUPERCOV_")).map(|(k, v)| format!("{k}={v}"))).arg(env!("CARGO_BIN_EXE_superci-layers")).args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", dir.join("s.sock").display())]).output().unwrap();
         assert!(o.status.code() == Some(1) && String::from_utf8_lossy(&o.stderr).contains("not supported in a user namespace"), "{}", String::from_utf8_lossy(&o.stderr));
     }
     // Its own files folder, layers at once, removing at cleanup: up, and (on Linux) systemd told it is ready, at a path

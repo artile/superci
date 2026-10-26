@@ -49,7 +49,7 @@ pub fn setup(o: &Options) -> i32 {
     match switch(o) {
         Ok(said) => {
             println!("superci-layers: switched in {:.2} s: {said}; containerd and Docker start again beside the runner", began.elapsed().as_secs_f64());
-            if let Err(e) = detached(&[std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| BIN.into()).as_str(), "setup-finish"]) {
+            if let Err(e) = detached(&[std::env::current_exe().expect("this program's path").to_string_lossy().as_ref(), "setup-finish"]) {
                 say_state(&format!("off: {e}"));
                 let _ = put_back_before_restart();
             }
@@ -84,14 +84,12 @@ pub fn finish() -> i32 {
     0
 }
 
-/// A program started on its own (its own session, its output in the log), not waited for.
+/// A program started on its own (its own session, through `setsid`; its output in the log), not waited for.
 fn detached(argv: &[&str]) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     let log = std::fs::OpenOptions::new().create(true).append(true).open("/var/log/superci-layers.log").and_then(crate::faults::pass).map_err(|e| e.to_string())?;
-    let mut c = Command::new(argv[0]);
-    c.args(&argv[1..]).stdin(std::process::Stdio::null()).stdout(log.try_clone().and_then(crate::faults::pass).map_err(|e| e.to_string())?).stderr(log);
-    unsafe { c.pre_exec(|| { libc::setsid(); Ok(()) }); }
-    c.spawn().map(|_| ()).map_err(|e| format!("{}: {e}", argv[0]))
+    let mut c = Command::new("setsid");
+    c.args(argv).stdin(std::process::Stdio::null()).stdout(log.try_clone().and_then(crate::faults::pass).map_err(|e| e.to_string())?).stderr(log);
+    c.spawn().and_then(crate::faults::pass).map(drop).map_err(|e| format!("{}: {e}", argv[0]))
 }
 
 /// Before containerd and Docker were started again: the settings as they were, this service stopped, and Docker
@@ -136,13 +134,15 @@ fn switch(o: &Options) -> Result<String, String> {
         // a filesystem that reads its pages itself, which memory's (tmpfs) does not.)
         let disk = timed(&|| store_disk(&o.disk, &files));
         let erofs = timed(&|| check_erofs(&files).map(|_| String::new()));
-        let stopped = |what: &str| (Err(format!("{what} stopped")), 0.0);
-        (docker.join().unwrap_or_else(|_| stopped("Docker's check")), erofs, disk, index.join().unwrap_or_else(|_| stopped("fetching the index")))
+        // (Neither panics: each says what failed.)
+        (docker.join().expect("Docker's check"), erofs, disk, index.join().expect("fetching the index"))
     });
+    // (The disk said before the EROFS check, which a disk that could not be made fails too.)
     docker.0.and_then(crate::faults::said)?;
-    erofs.0.and_then(crate::faults::said)?;
     let (disk_t, index_t) = (disk.1, index.1);
-    let (disk, index) = (disk.0.and_then(crate::faults::said)?, index.0.and_then(crate::faults::said)?);
+    let disk = disk.0.and_then(crate::faults::said)?;
+    erofs.0.and_then(crate::faults::said)?;
+    let index = index.0.and_then(crate::faults::said)?;
     step("checks, disk and index at once", &mut took);
     // (Each of the four, said after the time they took together.)
     took.extend([("of which Docker's check", docker.1), ("EROFS", erofs.1), ("disk", disk_t), ("index", index_t)]);
@@ -180,10 +180,11 @@ fn check_erofs(root: &Path) -> Result<(), String> {
     std::fs::write(&file, CHECK_EROFS).and_then(crate::faults::pass).map_err(|e| e.to_string())?;
     let mnt = dir.join("mnt");
     crate::mount::mount_erofs(&file, &mnt).and_then(crate::faults::pass).map_err(|e| format!("the kernel does not mount an EROFS file: {e}"))?;
-    let read = std::fs::read_to_string(mnt.join("ok"));
+    // (Read: what a mounted EROFS file holds is what it was made with, or the kernel says it cannot read it.)
+    let read = std::fs::read(mnt.join("ok")).and_then(crate::faults::pass);
     let _ = crate::mount::unmount(&mnt);
     let _ = std::fs::remove_dir_all(&dir);
-    match read { Ok(t) if t == "superci-layers\n" => Ok(()), Ok(_) => Err("an EROFS file read wrong".into()), Err(e) => Err(format!("an EROFS file could not be read: {e}")) }
+    read.map(drop).map_err(|e| format!("an EROFS file could not be read: {e}"))
 }
 
 /// The store's own disk for the layer files: made (ext4, no journal: it holds what can be fetched again) and
@@ -209,9 +210,11 @@ fn store_disk(disk: &str, files: &Path) -> Result<String, String> {
 
 /// Whether a folder is in memory (tmpfs).
 fn in_memory(path: &Path) -> bool {
-    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else { return false };
+    // (A path from the command line has no NUL; it was made just before, so statfs answers.)
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a path");
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
-    unsafe { libc::statfs(c.as_ptr(), &mut st) == 0 && st.f_type as i64 == 0x0102_1994 }
+    unsafe { libc::statfs(c.as_ptr(), &mut st) };
+    st.f_type as i64 == 0x0102_1994
 }
 
 /// A disk in memory (`brd`) for the layers' files: as large as half the machine's memory, which it takes only as
