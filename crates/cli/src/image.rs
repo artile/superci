@@ -139,7 +139,14 @@ fn copy_blob(github: &mut Registry, cloudflare: &mut Registry, repo: &str, diges
         let filled = chunk.len();
         if filled == 0 { break }
         let range = format!("{}-{}", offset, offset + filled as u64 - 1);
-        let r = cloudflare.send("PATCH", &location, &[("content-type", "application/octet-stream"), ("content-range", &range)], Some(&chunk))?;
+        // (Cloudflare's registry fails a chunk now and then, with a 500 of its own: the same chunk sent again, twice.)
+        let mut tries = 0;
+        let r = loop {
+            let r = cloudflare.send("PATCH", &location, &[("content-type", "application/octet-stream"), ("content-range", &range)], Some(&chunk))?;
+            if r.status < 500 || tries == 2 { break r }
+            tries += 1;
+            std::thread::sleep(std::time::Duration::from_millis(500 * tries));
+        };
         if r.status >= 300 { return Err(format!("Cloudflare's registry refused a layer chunk: {} {}", r.status, String::from_utf8_lossy(&r.body))) }
         location = r.location.unwrap_or(location);
         offset += filled as u64;
@@ -169,11 +176,16 @@ mod tests {
     /// GitHub's registry and the account's (`acc`) as a copy of the runner image meets them: GitHub's asks for a token
     /// first, the image has one layer, and Cloudflare's registry has none of it. What a request ("METHOD address") starts with in `given` is answered
     /// as given there instead (nothing: its connection closed unanswered).
-    fn registries(given: Vec<(&'static str, Vec<u8>)>) -> String {
+    fn registries(given: Vec<(&'static str, Vec<u8>)>) -> String { registries_failing(given, 0) }
+
+    /// The same, Cloudflare's registry failing the first `chunks` chunks sent with a 500 of its own.
+    fn registries_failing(given: Vec<(&'static str, Vec<u8>)>, chunks: usize) -> String {
         let challenged = std::sync::atomic::AtomicBool::new(false);
+        let failed = std::sync::atomic::AtomicUsize::new(0);
         clouds::serve(move |method, path, _| {
             let asked = format!("{method} {path}");
             if let Some((_, a)) = given.iter().find(|(p, _)| asked.starts_with(p)) { return a.clone() }
+            if method == "PATCH" && failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < chunks { return answer(500, r#"{"errors":[{"code":"INTERNAL_ERROR","message":"internal error","detail":null}]}"#) }
             if asked == INDEX_AT && !challenged.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 return answer_with(401, r#"www-authenticate: Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:actions/actions-runner:pull""#, "")
             }
@@ -194,6 +206,14 @@ mod tests {
     }
 
     fn copy(given: Vec<(&'static str, Vec<u8>)>) -> Result<String> { with(&registries(given), || copy_runner_image(&Cloudflare::new("t"), "acc")) }
+
+    /// A chunk Cloudflare's registry fails with an error of its own is sent again: twice, then the copy fails saying so.
+    #[test]
+    fn a_chunk_the_registry_fails_is_sent_again() {
+        let copy_failing = |n| with(&registries_failing(vec![], n), || copy_runner_image(&Cloudflare::new("t"), "acc"));
+        assert!(copy_failing(2).is_ok());
+        assert!(copy_failing(3).unwrap_err().contains("refused a layer chunk: 500"));
+    }
 
     #[test]
     fn the_runner_image_is_copied_layer_by_layer_and_pinned_by_its_manifest() {

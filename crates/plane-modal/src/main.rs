@@ -64,6 +64,9 @@ impl Timer for Bridge {
     /// The schedule calls the sweep every minute; plane.py runs it only when one is due.
     async fn wake_in(&self, ms: u64) -> io::Result<()> { self.ask(json!({ "op": "wake", "at_ms": now_ms() + ms })).map(|_| ()) }
     async fn pause(&self, ms: u64) { std::thread::sleep(std::time::Duration::from_millis(ms)) }
+    /// plane.py holds the answer itself, once it has let go of the program: the program answers one request at a time,
+    /// and a runner asking for its messages would hold every other request behind it (its job's end too).
+    async fn hold(&self, _ms: u64) {}
 }
 
 /// The jobs' sandboxes, started by plane.py with Modal's client (no token needed inside Modal).

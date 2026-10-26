@@ -210,6 +210,11 @@ def web():
         m = await plane.run({"kind": "request", "method": request.method, "url": url, "headers": dict(request.headers),
                              "body": base64.b64encode(body).decode()})
         headers = {k: v for k, v in m.get("headers", {}).items() if k.lower() not in ("content-length", "transfer-encoding")}
+        # An answer that says to wait (a runner asking for a message when there is none) waits here, the program let
+        # go: the requests behind it are answered meanwhile.
+        hold = next((v for k, v in headers.items() if k.lower() == "x-superci-hold"), None)
+        if hold and hold.isdigit():
+            await asyncio.sleep(int(hold) / 1000)
         return Response(content=base64.b64decode(m.get("body", "")), status_code=m.get("status", 500), headers=headers)
 
     return api

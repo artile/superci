@@ -4617,7 +4617,7 @@ impl<'a> ControlPlane<'a> {
                 put_json(self.store, &key, &done).await?;
             }
         }
-        if res.header("x-superci-hold").is_some() { self.timer.pause(crate::runner_service::HOLD_MS).await }
+        if res.header("x-superci-hold").is_some() { self.timer.hold(crate::runner_service::HOLD_MS).await }
         Ok(res)
     }
 

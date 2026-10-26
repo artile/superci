@@ -225,7 +225,8 @@ fn github_out_of_reach_leaves_the_job_unstarted() {
 }
 
 /// A run from a computer: its job's sandbox started with the control plane's own runner service, which hands the job to
-/// the runner once, then tells it to wait (and waits that long itself before it answers).
+/// the runner once, then tells it to wait, at once (plane.py holds that answer, once it has let go of the program, so
+/// that the runner's other calls are not held behind it).
 #[test]
 fn a_run_from_a_computer_hands_its_job_once_then_tells_the_runner_to_wait() {
     let aws = aws();
@@ -245,5 +246,5 @@ fn a_run_from_a_computer_hands_its_job_once_then_tells_the_runner_to_wait() {
     let began = Instant::now();
     let then = message(&mut py);
     assert_eq!((then["status"].as_u64(), then["headers"]["x-superci-hold"].as_str()), (Some(204), Some("20000")), "{then}");
-    assert!(began.elapsed() >= Duration::from_secs(19), "{:?}", began.elapsed());
+    assert!(began.elapsed() < Duration::from_secs(5), "{:?}", began.elapsed());
 }

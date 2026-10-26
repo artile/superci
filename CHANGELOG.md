@@ -17,6 +17,8 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - An AWS control plane reading many records at once while DynamoDB is busy reads every one of them. Records DynamoDB still left for later after eight tries were taken as not there: a job or a cache entry could look missing for that moment. Update your control plane for it.
 - A Cloudflare control plane reads its settings as the others do: the secrets kept for runs from a computer are listed and given to its runs, Settings lists each device's key, and AWS runners turned off stay off. It read none of them. Update your control plane for it.
 - A Cloudflare runner whose container Cloudflare fails to stop says why, for the control plane to try again. It failed with an error Cloudflare's runtime reported as uncaught. Update your control plane and its Cloudflare launcher for it.
+- A job on Modal ends as soon as its steps do. Its machine stayed up for minutes after them, paid for meanwhile: the control plane answers one request at a time there, and its runner's asking for messages held the job's other calls (its end too). Update your control plane for it.
+- Setting up Cloudflare runners sends a chunk of the runner image that Cloudflare's registry fails (a 500 of its own) again, twice. One such failure ended the setup.
 - Whether the GitHub App is installed is not kept while there is no App yet. A dashboard that asked before the App was made saw it not installed for a minute after it was. Update your control plane for it.
 
 ## 0.19.19 — 2026-10-21

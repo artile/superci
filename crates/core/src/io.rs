@@ -238,6 +238,10 @@ pub trait Timer {
     async fn wake_in(&self, ms: u64) -> Result<()>;
     /// Waits `ms` in place, the request being answered waiting with it, where the runtime can; at once where not.
     async fn pause(&self, _ms: u64) {}
+    /// Holds an answer that says to wait (`x-superci-hold`: a runner asking for a message when there is none) `ms`
+    /// before it goes: in place, unless the runtime holds it itself once the answer has left the control plane (one
+    /// that answers one request at a time, so that the others are not held behind it).
+    async fn hold(&self, ms: u64) { self.pause(ms).await }
     /// Leaves `what` to be done once the request at hand is answered: the runtime then gives it to the control
     /// plane's `later`. Whether it will; a runtime that cannot says no, and it is done before the answer.
     fn later(&self, _what: &str) -> bool { false }
