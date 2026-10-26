@@ -536,6 +536,16 @@ fn the_program_says_what_it_needs_to_serve() {
     assert!(fails(command().args(["serve", dir.to_str().unwrap()]).envs(plane).env("SUPERCI_CACHE_LISTEN", "not an address")).contains("SUPERCI_CACHE_LISTEN"));
     assert!(!fails(command().args(["serve", dir.to_str().unwrap()]).envs(plane).env("SUPERCI_CACHE_LISTEN", "192.0.2.1")).is_empty());
     assert!(fails(command().args(["serve", dir.join("missing").to_str().unwrap()]).envs(plane).env("SUPERCI_CACHE_LISTEN", "127.0.0.1").env("SUPERCI_CACHE_PORT", "0")).contains("missing"));
+    // In a network with no way out (a namespace of its own, as root): its private address cannot be found, said.
+    // (Linux, as root or through sudo; a coverage tool's settings given on the command line, which sudo keeps.)
+    let root = cfg!(target_os = "linux") && std::process::Command::new("id").arg("-u").output().is_ok_and(|o| o.stdout.starts_with(b"0\n"));
+    if cfg!(target_os = "linux") && (root || std::process::Command::new("sudo").args(["-n", "true"]).status().is_ok_and(|s| s.success())) {
+        let mut c = std::process::Command::new(if root { "unshare" } else { "sudo" });
+        if !root { c.args(["-n", "unshare"]); }
+        c.args(["-n", "env"]).args(std::env::vars().filter(|(k, _)| k.starts_with("SUPERCOV_")).map(|(k, v)| format!("{k}={v}")))
+            .args(["SUPERCI_CACHE_PLANE=http://127.0.0.1:9/cache/t", env!("CARGO_BIN_EXE_superci-cache"), "serve", dir.to_str().unwrap()]);
+        assert!(fails(&mut c).contains("unreachable"));
+    }
     // On IPv6's loopback, and on the machine's private address (what it wrote beside the externals).
     for listen in [Some("::1"), None] {
         let dir = folder("listen");

@@ -67,6 +67,7 @@ fn what_pack_refuses_is_said() {
         (vec![empty.to_str().unwrap(), o, "--piece", "65536"], "an image of 0 bytes"),
         (vec![d.join("none.img").to_str().unwrap(), o], "none.img"),
         (vec![small.to_str().unwrap(), o, "--piece", "65536", "--hot", bad.to_str().unwrap()], "bad.json"),
+        (vec![small.to_str().unwrap(), o, "--piece", "65536", "--hot", d.join("no-hot.json").to_str().unwrap()], "no-hot.json"),
         (vec![small.to_str().unwrap(), o, "--piece", "65536", "--reader", d.join("no-reader").to_str().unwrap()], "no-reader"),
         (vec!["/", o], "the image file has no name"),
         // (A folder for the image: it opens, and cannot be read.)

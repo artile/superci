@@ -129,7 +129,7 @@ fn pack(args: &[String]) -> Result<String, String> {
     let body = serde_json::to_vec(&index).expect("an index as JSON");
     Index::parse(&body)?;
     beside.push(("index.json", body.clone()));
-    for (name, b) in beside { std::fs::write(format!("{staging}/{name}"), b).map_err(|e| format!("{staging}/{name}: {e}"))? }
+    beside.into_iter().try_for_each(|(name, b)| std::fs::write(format!("{staging}/{name}"), b).map_err(|e| format!("{staging}/{name}: {e}")))?;
     let pin = &sha256_hex(&body)[..32];
     let to = format!("{out}/{pin}");
     let _ = std::fs::remove_dir_all(&to);

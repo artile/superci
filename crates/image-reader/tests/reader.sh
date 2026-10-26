@@ -153,5 +153,31 @@ sleep 1
 start_at "http://127.0.0.1:8002/out/$PIN" o --parallel 1 --ahead 4
 ok "one slow fetcher: files read" "$(sums o | sha256sum)" "$(cat /t/expected.txt | sha256sum)"
 
+# 14. An address that has not a piece, and one that cuts answers short (a piece, the hot list, the index): the piece is
+# said, the rest reads; the hot list is not used; with no index, it stops.
+mkdir -p /srv/cutroot /srv/cutindex && cp -r /srv/plain-c/p /srv/plain-c/index.json /srv/cutroot/ && echo '[3]' > /srv/cutroot/hot.json && rm /srv/cutroot/p/000005
+cp /srv/plain-b/index.json /srv/cutindex/
+cat > /srv/cut.py <<'PY'
+import functools, http.server
+class Cut(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        p = self.path
+        if not ((p.startswith('/cutroot/') and (p.endswith('/p/000003') or p.endswith('/hot.json'))) or (p.startswith('/cutindex/') and p.endswith('/index.json'))): return super().do_GET()
+        data = open('/srv' + p, 'rb').read()
+        self.send_response(200); self.send_header('Content-Length', str(len(data))); self.end_headers()
+        self.wfile.write(data[:len(data) // 2]); self.wfile.flush(); self.close_connection = True
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(('127.0.0.1', 8003), functools.partial(Cut, directory='/srv')).serve_forever()
+PY
+(python3 /srv/cut.py >/dev/null 2>&1 &)
+sleep 1
+start_at http://127.0.0.1:8003/cutroot q
+sums q > /dev/null
+ok "a piece the address has not is said" "$(grep -c '^piece 5: ' /mnt/q/log | sed 's/[1-9][0-9]*/some/')" some
+ok "a piece cut short is said" "$(grep -c '^piece 3: ' /mnt/q/log | sed 's/[1-9][0-9]*/some/')" some
+ok "a hot list cut short is not used" "$(grep -c 'hot:' /mnt/q/log)" 0
+finish q > /dev/null
+ok "an index cut short stops it" "$(stops http://127.0.0.1:8003/cutindex /mnt/c/file /mnt/c/cache | grep -c '^1 .*no index.json at the address')" 1
+
 echo "passed $pass, failed $fail"
-[ $fail = 0 ] || { for d in a b c d e f g hb hc hd i m n o; do echo "--- $d"; tail -5 /mnt/$d/log 2>/dev/null; cat /mnt/$d/mounterr 2>/dev/null; done; }
+[ $fail = 0 ] || { for d in a b c d e f g hb hc hd i m n o q; do echo "--- $d"; tail -5 /mnt/$d/log 2>/dev/null; cat /mnt/$d/mounterr 2>/dev/null; done; }
