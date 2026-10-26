@@ -17,3 +17,7 @@ wasm-bindgen-futures = "0.4"
 async-trait.workspace = true
 serde_json.workspace = true
 getrandom.workspace = true
+
+[dev-dependencies]
+superci-testkit = { path = "../testkit" }
+libc = "0.2"

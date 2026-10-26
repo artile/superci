@@ -12,6 +12,9 @@ pub mod cloudflare;
 #[cfg(unix)]
 pub use cloudflare::{serve_cloudflare, CloudflarePlane};
 pub mod sweep;
+/// A SuperCI Worker under `wrangler dev`, as Cloudflare runs it.
+#[cfg(unix)]
+pub mod worker;
 pub use sweep::{sweep, sweep_with_outages, Fault, Faults, Outcome};
 #[cfg(unix)]
 mod browser;

@@ -18,7 +18,7 @@ const VOUCHED: &str = "x-superci-key-until";
 /// Durable Object keeps the ones it started with until it restarts, which can take half a minute after a change).
 /// One from outside is dropped: only the Worker sets it.
 const SETTINGS: &str = "x-superci-settings";
-const SETTING_NAMES: [&str; 15] = ["LABELS", "NAME", "GITHUB_APP", "GITLAB", "LAUNCHERS", "ROUTING", "MACHINE", "CONTAINERS", "AWS_CONNECT", "AWS_REGIONS", "AWS_NETWORKS", "CF_LOCATION", "CF_IMAGE", "MOVE_TOKEN", "INSTANCE_TYPES"];
+const SETTING_NAMES: [&str; 16] = ["LABELS", "NAME", "GITHUB_APP", "GITLAB", "LAUNCHERS", "ROUTING", "MACHINE", "CONTAINERS", "AWS_CONNECT", "AWS_REGIONS", "AWS_NETWORKS", "AWS_RUNNERS", "CF_LOCATION", "CF_IMAGE", "MOVE_TOKEN", "INSTANCE_TYPES"];
 
 /// JSON with every character outside ASCII escaped, so it can travel in a header.
 fn ascii_json(v: &serde_json::Value) -> String {
@@ -63,16 +63,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     stub.fetch_with_request(Request::new_with_init(&req.url()?.to_string(), &init)?).await
 }
 
-/// The GitHub Apps of further organizations, from their secrets' values (one that is the first App again, or not an
-/// App, is left out).
-fn more_apps(values: impl Iterator<Item = String>, first: Option<&superci_core::github::App>) -> Vec<superci_core::github::App> {
-    let mut apps: Vec<superci_core::github::App> = values.filter_map(|v| serde_json::from_str(&v).ok()).collect();
-    apps.retain(|a: &superci_core::github::App| first.is_none_or(|f| f.id != a.id));
-    apps.sort_by_key(|a| a.id);
-    apps.dedup_by_key(|a| a.id);
-    apps
-}
-
 /// The dashboard sessions' keys: one secret each, DEVICE_KEY_<expires, unix seconds>_<random>.
 fn device_keys(env: &Env) -> Vec<(u64, String)> {
     let names = js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>());
@@ -80,12 +70,6 @@ fn device_keys(env: &Env) -> Vec<(u64, String)> {
         let until: u64 = n.strip_prefix("DEVICE_KEY_")?.split('_').next()?.parse().ok()?;
         Some((until * 1000, env.secret(&n).ok()?.to_string()))
     }).collect()
-}
-
-/// Keys that only read: one secret each, READ_KEY_<expires, unix seconds>_<NAME>, holding the key's SHA-256.
-fn read_keys(env: &Env) -> Vec<(u64, String, String)> {
-    let names = js_sys::Object::keys(env.unchecked_ref::<js_sys::Object>());
-    names.iter().filter_map(|n| n.as_string()).filter(|n| n.starts_with("READ_KEY_")).filter_map(|n| superci_core::plane::read_key(&n, &env.secret(&n).ok()?.to_string())).collect()
 }
 
 #[durable_object]
@@ -211,45 +195,30 @@ impl Timer for DoTimer<'_> {
 }
 
 impl PlaneObject {
-    /// The control plane's settings (`PLANE_ID`, `LABEL`) and the secrets the dashboard sets from the user's machine:
-    /// `GITHUB_APP` (the App's id, slug, owner, key and webhook secret) and `AWS_CONNECT` (region and one-time token).
-    /// The settings: as the Worker handed them with this request (fresh), else as this object started with.
+    /// The control plane's settings (`PLANE_ID`, `LABEL`) and the secrets the dashboard sets from the user's machine,
+    /// read as every control plane reads its settings (`Config::read_settings`): as the Worker handed them with this
+    /// request (fresh), else as this object started with them. Its keys are always its own (the Worker hands none).
     fn config(&self, fresh: Option<&serde_json::Value>) -> Config {
         let var = |n: &str| self.env.var(n).map(|v| v.to_string()).ok().filter(|v| !v.is_empty());
-        let secret = |n: &str| match fresh {
-            Some(f) => f[n].as_str().map(str::to_string),
-            None => self.env.secret(n).map(|v| v.to_string()).ok(),
-        }.filter(|v| !v.is_empty());
+        let names: Vec<String> = js_sys::Object::keys(self.env.unchecked_ref::<js_sys::Object>()).iter().filter_map(|n| n.as_string()).collect();
+        let own = |n: &String| self.env.secret(n).ok().map(|v| (n.clone(), v.to_string()));
+        let key = |n: &str| n.starts_with("DEVICE_KEY_") || n.starts_with("READ_KEY_");
+        let mut all: Vec<(String, String)> = match fresh {
+            Some(f) => f.as_object().into_iter().flatten().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).filter(|(k, _)| !key(k)).collect(),
+            None => names.iter().filter(|n| !key(n)).filter_map(own).collect(),
+        };
+        all.extend(names.iter().filter(|n| key(n)).filter_map(own));
         let mut c = Config::new(var("PLANE_ID").unwrap_or_default());
         if let Some(v) = var("LABEL") { c.label = v.to_ascii_lowercase(); }
-        if let Some(v) = secret("LABELS") { c.set_labels(&v) }
-        if let Some(v) = secret("NAME") { c.set_name(&v) }
         if let Some(v) = var("INSTANCE_TYPES") { c.instance_types = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
-        c.device_keys = device_keys(&self.env);
-        c.read_keys = read_keys(&self.env);
-        c.launchers = secret("LAUNCHERS").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-        c.routing = secret("ROUTING").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-        c.gitlab = secret("GITLAB").and_then(|v| serde_json::from_str(&v).ok());
-        c.machine = secret("MACHINE").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-        c.containers = secret("CONTAINERS").is_some_and(|v| v == "on");
-        c.app = secret("GITHUB_APP").and_then(|v| serde_json::from_str(&v).ok());
-        let names: Vec<String> = match fresh {
-            Some(f) => f.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default(),
-            None => js_sys::Object::keys(self.env.unchecked_ref::<js_sys::Object>()).iter().filter_map(|n| n.as_string()).collect(),
-        };
-        c.more_apps = more_apps(names.iter().filter(|n| n.starts_with("GITHUB_APP_")).filter_map(|n| secret(n)), c.app.as_ref());
-        // One secret for each further GitLab connection: GITLAB_<its name>.
-        c.more_gitlabs = names.iter().filter(|n| n.starts_with("GITLAB_")).filter_map(|n| secret(n)).filter_map(|v| serde_json::from_str::<superci_core::gitlab::GitLab>(&v).ok())
-            .filter(|g| superci_core::gitlab::valid_id(&g.id)).collect();
-        if let Some(v) = secret("AWS_CONNECT").and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok()) {
+        c.read_settings(&all);
+        let setting = |n: &str| all.iter().find(|(k, v)| k == n && !v.is_empty()).map(|(_, v)| v.as_str());
+        c.containers = setting("CONTAINERS") == Some("on");
+        // (AWS_CONNECT: the region and one-time token the dashboard gives an AWS account's connecting.)
+        if let Some(v) = setting("AWS_CONNECT").and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()) {
             c.aws_region = v["region"].as_str().map(str::to_string);
             c.aws_connect_token = v["token"].as_str().map(str::to_string);
         }
-        c.move_token = secret("MOVE_TOKEN");
-        if let Some(l) = secret("CF_LOCATION") { c.cloudflare_location = l }
-        c.cloudflare_image = secret("CF_IMAGE").and_then(|i| superci_core::plane::image_address(&i));
-        c.aws_regions = secret("AWS_REGIONS").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-        c.aws_networks = secret("AWS_NETWORKS").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
         c
     }
 }
