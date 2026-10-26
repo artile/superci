@@ -2,7 +2,7 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
-## 0.19.21
+## 0.19.21 — 2026-10-27
 - A spot machine is asked for first among the pools near the cheapest in any of its regions, then in each region whole. When the first region had no room for the cheapest type, its dearer types were asked before the next region's cheap one: a job whose label names `family=c8a+m8a+r8a` got r8a in N. Virginia at three times the price, and Ohio's c8a was never asked. The first region still counts 15% cheaper. Update your control plane for it.
 
 ## 0.19.20 — 2026-10-26
