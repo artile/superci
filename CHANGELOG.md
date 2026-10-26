@@ -2,6 +2,9 @@
 
 What changed in each version of SuperCI. The dashboard shows the entries your control plane does not have yet.
 
+## 0.19.21
+- A spot machine is asked for first among the pools near the cheapest in any of its regions, then in each region whole. When the first region had no room for the cheapest type, its dearer types were asked before the next region's cheap one: a job whose label names `family=c8a+m8a+r8a` got r8a in N. Virginia at three times the price, and Ohio's c8a was never asked. The first region still counts 15% cheaper. Update your control plane for it.
+
 ## 0.19.20 — 2026-10-26
 - The spinner beside a step that takes more than one line ("Uploading the new functions (the control plane and its Docker image converter)", in an update) stays round, beside the step's first line. The step's text squeezed it into an oval.
 - A job whose runner said it had ended, in a request the control plane could not finish (its store or a call failing midway), is ended when the runner says so again, and its machine stopped. It stayed running, its machine paid for until its time was up, because the runner's second word said nothing new. The same for a runner saying it took its job. Update your control plane for it.

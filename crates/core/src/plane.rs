@@ -235,8 +235,8 @@ pub struct Cache {
     image: RefCell<HashMap<String, ((String, u32), u64)>>,
     /// Which of a set of machine types a region has, and until when that is taken as current.
     types: RefCell<HashMap<String, (Vec<String>, u64)>>,
-    /// What a job costs at least on spot in a region, for a set of types (see `spot_regions_by_cost`), and until when.
-    spot_best: RefCell<HashMap<String, (Option<f64>, u64)>>,
+    /// A region's spot prices for a set of types, by (type, zone) (see `spot_steps`), and until when.
+    spot_prices: RefCell<HashMap<String, (HashMap<(String, String), f64>, u64)>>,
     /// What the GitHub App asks for and the GitLab token's scopes, and until when they are taken as current.
     app_permissions: RefCell<HashMap<u64, (serde_json::Value, u64)>>,
     /// Each App's address on GitHub as GitHub last said it (its owner may rename the App there).
@@ -470,7 +470,7 @@ fn is_zero(n: &u32) -> bool { *n == 0 }
 const SPOT_PAUSE: (usize, u64, u64) = (2, 15 * 60_000, 30 * 60_000);
 
 /// How much cheaper the first of a place's spot regions counts when they are ranked by what a job costs (see
-/// `spot_regions_by_cost`): its cache and Docker layers are there, where another region reads them from afar.
+/// `spot_steps`): its cache and Docker layers are there, where another region reads them from afar.
 const HOME_FAVOUR: f64 = 0.15;
 
 /// The most an answer of the control plane's may be (bytes): AWS's function URLs answer 502 for one over six MB, and
@@ -2214,31 +2214,52 @@ impl<'a> ControlPlane<'a> {
         if own.is_empty() { all } else { own }
     }
 
-    /// A place's spot regions, where a job costs least first (the spot price for the speed of the cheapest pool of
-    /// the types it may get there), the first of them counted `HOME_FAVOUR` cheaper. A region whose prices could not be
-    /// read goes after those whose could; the first keeps its place unless another's are known to be lower.
-    async fn spot_regions_by_cost(&self, a: &AwsConnection, place: &str, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<String> {
+    /// Where a place asks for a job's spot machine, step by step. First only the pools within `aws::BAND` of what the
+    /// job costs on the cheapest pool of any of its regions (the spot price for the speed; the first region's counted
+    /// `HOME_FAVOUR` cheaper; a pool that lately had no machine left out), each region that has such pools, cheapest
+    /// first; then each region whole, in the same order. A machine three times the price in one region is not asked
+    /// for before a cheap one in the next. Each step: its region, the types it asks for, and the pools it leaves out.
+    /// (One region: itself, whole. A region whose prices could not be read goes after those whose could; the first
+    /// keeps its place unless another's are known to be lower.)
+    async fn spot_steps(&self, a: &AwsConnection, place: &str, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<(String, Vec<String>, Vec<(String, String)>)> {
         let regions = self.place_regions(a, place);
-        if regions.len() < 2 { return regions }
-        let (mut scored, mut each) = (vec![], regions.iter().enumerate());
-        loop {
-            let Some((i, r)) = each.next() else { break };
+        if regions.len() < 2 { return regions.into_iter().map(|r| (r, types.to_vec(), vec![])).collect() }
+        let mut seen = vec![];
+        for (i, r) in regions.iter().enumerate() {
             // (Kept two minutes: a burst of jobs asks AWS once, and spot prices move by the hour.)
             let key = format!("{r}/{os}/{}", types.join(","));
-            let kept = self.cache.spot_best.borrow().get(&key).filter(|(_, until)| *until > now).map(|(best, _)| *best);
-            let best = match kept {
-                Some(best) => best,
+            let kept = self.cache.spot_prices.borrow().get(&key).filter(|(_, until)| *until > now).map(|(prices, _)| prices.clone());
+            let prices = match kept {
+                Some(prices) => prices,
                 None => {
                     let offered = self.offered(r, types, creds, now).await;
-                    let best = aws::cheapest_for_speed(self.http, r, creds, &offered, os, now).await;
-                    self.cache.spot_best.borrow_mut().insert(key, (best, now + 120_000));
-                    best
+                    let prices = aws::spot_prices(self.http, r, creds, &offered, os, now).await.unwrap_or_default();
+                    self.cache.spot_prices.borrow_mut().insert(key, (prices.clone(), now + 120_000));
+                    prices
                 }
             };
-            scored.push((match (i, best) { (0, Some(b)) => b * (1.0 - HOME_FAVOUR), (0, None) => 0.0, (_, Some(b)) => b, (_, None) => f64::MAX }, i, r.clone()));
+            let avoid = self.pools_to_avoid(r, now).await;
+            let favour = if i == 0 { 1.0 - HOME_FAVOUR } else { 1.0 };
+            // (A pool that lately had no machine counts for nothing here: it is asked last, in the region's own turn.)
+            let worth: HashMap<(String, String), f64> = prices.iter().filter(|(pool, _)| !avoid.contains(pool)).map(|((t, z), p)| ((t.clone(), z.clone()), p / aws::speed(t) * favour)).collect();
+            let best = worth.values().copied().reduce(f64::min);
+            seen.push(((best.unwrap_or(if i == 0 { 0.0 } else { f64::MAX }), i), r.clone(), prices, worth));
         }
-        scored.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
-        scored.into_iter().map(|(_, _, r)| r).collect()
+        seen.sort_by(|(x, ..), (y, ..)| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        let mut steps = vec![];
+        if let Some(band) = seen.iter().filter_map(|(_, _, _, worth)| worth.values().copied().reduce(f64::min)).reduce(f64::min).map(|lowest| lowest * aws::BAND) {
+            for (_, r, prices, worth) in &seen {
+                let near = |pool: &(String, String)| worth.get(pool).is_some_and(|w| *w <= band);
+                let kinds: Vec<String> = types.iter().filter(|t| worth.keys().any(|pool| pool.0 == **t && near(pool))).cloned().collect();
+                if kinds.is_empty() { continue }
+                steps.push((r.clone(), kinds, prices.keys().filter(|pool| !near(pool)).cloned().collect()));
+            }
+            // (Then each region whole where what is left in it costs least: its pools near the cheapest were asked.)
+            for ((key, _), _, _, worth) in seen.iter_mut() { if let Some(rest) = worth.values().copied().filter(|w| *w > band).reduce(f64::min) { *key = rest } }
+            seen.sort_by(|(x, ..), (y, ..)| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        }
+        steps.extend(seen.into_iter().map(|(_, r, ..)| (r, types.to_vec(), vec![])));
+        steps
     }
 
     /// The current machine image in a region for a machine (Linux x64 or arm64, Linux with NVIDIA's drivers for GPUs,
@@ -3058,17 +3079,18 @@ impl<'a> ControlPlane<'a> {
                         let mut launched = None;
                         // Its regions in order: the next when this one has no room (capacity or quota) for any of the types.
                         // (Spot: the region where a job costs least first, the first counted a little cheaper.)
-                        let regions = if on_demand { self.place_regions(&a, &place) } else { self.spot_regions_by_cost(&a, &place, &types, spec.os(), &creds, now).await };
-                        let mut each = regions.iter();
+                        // (Spot: first the pools near the cheapest in any region, then each region whole: see `spot_steps`.)
+                        let steps = if on_demand { self.place_regions(&a, &place).into_iter().map(|r| (r, types.clone(), vec![])).collect() } else { self.spot_steps(&a, &place, &types, spec.os(), &creds, now).await };
+                        let mut each = steps.iter();
                         loop {
-                            let Some(region) = each.next() else { break };
+                            let Some((region, kinds, out)) = each.next() else { break };
                             if self.clock.now_ms().saturating_sub(began) > LAUNCH_BUDGET_MS { return Ok(Tried::OutOfTime) }
                             let said = |what: &str| format!("{region}{}: {what}", if on_demand { " on-demand" } else { "" });
                             let (image, image_gb) = match self.image(region, &spec, &creds, now).await { Ok(i) => i, Err(e) => { last = said(&e); continue } };
                             // Never smaller than its image's disk (Windows' is 100 GB).
                             disk_gb = disk_gb.max(image_gb);
                             let network = self.network(region, &creds, now).await?;
-                            let types = self.offered(region, &types, &creds, now).await;
+                            let types = self.offered(region, kinds, &creds, now).await;
                             // Spot pools that had no machine, or took one back, in the last quarter of an hour: asked last.
                             let avoid = if on_demand { vec![] } else { self.pools_to_avoid(region, now).await };
                             // Many jobs queued at once: AWS lets a few requests through and refuses the rest for a
@@ -3076,7 +3098,8 @@ impl<'a> ControlPlane<'a> {
                             // after a wait of its own (see `aws::run_instance`).
                             // The disk's speed: by the machine's size unless the label or the default machine says.
                             (disk_mibs, disk_iops) = disk_speed(job.cpu.unwrap_or(4), disk_gb, &spec);
-                            let skip = self.pools_to_skip(region, !on_demand, self.clock.now_ms()).await;
+                            let mut skip = self.pools_to_skip(region, !on_demand, self.clock.now_ms()).await;
+                            skip.extend(out.iter().cloned());
                             // The spot pools left after the best has no machine are asked in one request, unless
                             // this role lately could not.
                             let fleet = !on_demand && !self.store.get(NO_FLEET_KEY).await.ok().flatten().and_then(|at| at.parse::<u64>().ok()).is_some_and(|at| now < at + 600_000);
@@ -3169,7 +3192,9 @@ impl<'a> ControlPlane<'a> {
                                     let quota = ["VcpuLimitExceeded", "MaxSpotInstanceCountExceeded"].iter().any(|c| e.starts_with(c));
                                     quota_only &= quota;
                                     if on_demand { on_demand_refused = true; on_demand_quota_only &= quota }
-                                    answers.push(said(e.split(':').next().unwrap_or(&e)));
+                                    // (A region asked twice, its pools near the cheapest first, says so once.)
+                                    let answer = said(e.split(':').next().unwrap_or(&e));
+                                    if !answers.contains(&answer) { answers.push(answer) }
                                     last = said(&e);
                                 }
                                 // A network that is no longer there (removed, made again): looked up anew next try.

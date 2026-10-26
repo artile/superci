@@ -260,10 +260,10 @@ fn prices_images_and_quotas_read_hold_with_each_call_failing() {
     swept(prices, |aws| futures::executor::block_on(delete_copied_image(aws, "us-east-1", &creds(), &copies[0], 0)));
     swept(prices, |aws| futures::executor::block_on(terminate_instance(aws, "us-east-1", &creds(), "i-1", 0)));
     swept(prices, |aws| futures::executor::block_on(delete_template(aws, "us-east-1", &creds(), "t", 0)));
-    // The cheapest for the speed, of those with a price; none known, none.
-    let cheapest = |answer: Answer| futures::executor::block_on(cheapest_for_speed(&Aws { answer, fail: None, n: Cell::new(0), calls: RefCell::default() }, "us-east-1", &creds(), &types, "linux", 0));
-    assert!(cheapest(prices()).is_some_and(|p| (p - 0.03 / speed("m7a.large")).abs() < 1e-9));
-    assert_eq!(cheapest(Box::new(|_, _| (500, String::new()))), None);
+    // Each pool's price, by type and zone; none to be had, AWS's failure.
+    let priced = |answer: Answer| futures::executor::block_on(spot_prices(&Aws { answer, fail: None, n: Cell::new(0), calls: RefCell::default() }, "us-east-1", &creds(), &types, "linux", 0));
+    assert!(priced(prices()).unwrap().iter().any(|((t, _), p)| t == "m7a.large" && (p - 0.03).abs() < 1e-9));
+    assert!(priced(Box::new(|_, _| (500, String::new()))).is_err());
 }
 
 #[test]
@@ -430,7 +430,7 @@ fn small_readings_of_aws_s_words_take_every_shape() {
     assert!(refusal("Something: User x is not authorized to perform: ec2:RunInstances").is_some());
     // Prices: none for no type; the Price List's products as objects, and a price without its dollars.
     let none: Vec<String> = vec![];
-    assert_eq!(futures::executor::block_on(cheapest_for_speed(&answering(prices()), "us-east-1", &creds(), &none, "linux", 0)), None);
+    assert!(futures::executor::block_on(spot_prices(&answering(prices()), "us-east-1", &creds(), &none, "linux", 0)).unwrap().is_empty());
     let listed: Answer = Box::new(|_, _| (200, serde_json::json!({ "PriceList": [{ "terms": { "OnDemand": { "t": { "priceDimensions": { "d": { "pricePerUnit": {} }, "e": { "pricePerUnit": { "USD": "0.5" } } } } } } }] }).to_string()));
     assert_eq!(futures::executor::block_on(disk_price(&answering(listed), &creds(), "us-east-1", 0)).unwrap(), 0.5);
     let spotless: Answer = Box::new(|_, _| (200, "<item><spotPrice>0.1</spotPrice></item><item><timestamp>1970-01-01T00:00:00Z</timestamp></item><item><timestamp>1970-01-01T00:00:00Z</timestamp><spotPrice>x</spotPrice></item>".into()));

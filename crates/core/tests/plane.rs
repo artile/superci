@@ -5353,6 +5353,43 @@ fn spot_goes_first_to_the_region_where_a_job_costs_least_with_the_first_favoured
     }
 }
 
+/// Spot pools ordered across regions by what a job costs: N. Virginia's c8a pools lately had no machine (its r8a is
+/// three times the price), Ohio's c8a has the price of N. Virginia's: Ohio's c8a is asked first, and r8a only once it
+/// has no machine either, where r8a costs least (each region then whole, where what is left costs least; Ohio's c8a
+/// not asked again). N. Virginia's c8a with room: asked first, in the first region, as before.
+#[test]
+fn spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first() {
+    let now = FixedClock.now_ms();
+    for (ohio_full, virginia_full, first, got, ohio_asks) in [(false, true, "us-east-2", "c8a.xlarge", 1), (true, true, "us-east-1", "r8a.xlarge", 2), (false, false, "us-east-1", "c8a.xlarge", 0)] {
+        let clouds = With(FakeClouds::default(), move |r: &Request, body: &str| {
+            let region = if r.url.contains("us-east-2") { "us-east-2" } else { "us-east-1" };
+            if body.contains("Action=DescribeSpotPriceHistory") {
+                let rows: &[(&str, f64)] = if region == "us-east-2" { &[("c8a.xlarge", 0.10), ("r8a.xlarge", 0.40)] } else { &[("c8a.xlarge", 0.10), ("r8a.xlarge", 0.30)] };
+                let items = rows.iter().flat_map(|(t, p)| ["a", "b"].map(|z| format!("<item><instanceType>{t}</instanceType><availabilityZone>{region}{z}</availabilityZone><spotPrice>{p}</spotPrice></item>"))).collect::<String>();
+                return Some(Response::new(200, "text/xml", format!("<spotPriceHistorySet>{items}</spotPriceHistorySet>")))
+            }
+            let full = body.contains("Action=RunInstances") && body.contains("c8a.xlarge") && ((region == "us-east-2" && ohio_full) || (region == "us-east-1" && virginia_full));
+            full.then(|| Response::new(500, "text/xml", "<Response><Errors><Error><Code>InsufficientInstanceCapacity</Code><Message>no room</Message></Error></Errors></Response>"))
+        });
+        let (store, wakes, cache) = (Mem::default(), Wakes::default(), Cache::default());
+        // (N. Virginia's c8a pools: no machine five minutes ago, when another job asked.)
+        if virginia_full { for z in ["a", "b"] { store.0.borrow_mut().insert(format!("aws:pool:us-east-1:c8a.xlarge:us-east-1{z}"), (now - 300_000).to_string()); } }
+        let mut config = Config::new(PLANE_ID.into());
+        config.app = Some(app());
+        (config.aws_own, config.aws_own_creds) = own_aws();
+        config.aws_regions = vec!["us-east-1".into(), "us-east-2".into()];
+        config.instance_types = ["c8a.xlarge", "r8a.xlarge"].map(String::from).to_vec();
+        let plane = ControlPlane { store: &store, http: &clouds, clock: &FixedClock, timer: &wakes, config: &config, cache: &cache, containers: None };
+        block_on(plane.handle(webhook("queued", None)));
+        let asked: Vec<(String, String)> = clouds.0.calls.borrow().iter().filter(|c| c.2.contains("Action=RunInstances")).map(|c| (if c.1.contains("us-east-2") { "us-east-2" } else { "us-east-1" }.to_string(),
+            if c.2.contains("r8a.xlarge") { "r8a.xlarge" } else { "c8a.xlarge" }.to_string())).collect();
+        let j = job(&store, 7);
+        assert_eq!((j["region"].as_str(), j["machine_type"].as_str()), (Some(first), Some(got)), "Ohio full {ohio_full}, N. Virginia full {virginia_full}: {asked:?} {j}");
+        if virginia_full { assert_eq!(asked[0], ("us-east-2".to_string(), "c8a.xlarge".to_string()), "{asked:?}") }
+        assert_eq!(asked.iter().filter(|(r, t)| r == "us-east-2" && t == "c8a.xlarge").count(), ohio_asks, "Ohio's c8a pools asked at most once each: {asked:?}");
+    }
+}
+
 /// Settings with an App, GitLab, a dashboard key and a move token.
 fn odd_plane(config: &mut Config) {
     config.app = Some(app());
@@ -6947,7 +6984,8 @@ fn every_test_here_holds_with_each_call_and_store_operation_failing() {
         machines_whose_jobs_went_elsewhere_hand_themselves_on_or_end_as_github_and_gitlab_say,
         launchers_and_failing_runners_start_where_they_can_and_say_what_they_could_not,
         a_runs_repository_environment_and_signing_key_are_read_as_they_are_or_said,
-        a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again
+        a_failing_runner_that_takes_a_job_waiting_for_room_fails_it_and_its_own_job_gets_a_failing_runner_again,
+        spot_pools_near_the_cheapest_in_any_region_are_asked_before_a_dearer_type_in_the_first
     ];
     // (Each test of this file is in it but those that already step through every point of a flow themselves.)
     let stepping = ["a_job_cancelled_at_any_step_of_its_start_or_of_a_sweep_leaves_no_machine_and_stays_cancelled", "a_job_that_begins_at_any_step_of_a_sweep_keeps_its_machine",

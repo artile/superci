@@ -631,14 +631,8 @@ pub fn speed(kind: &str) -> f64 {
     1.2f64.powi(generation - 7) * if intel { 0.75 } else { 1.0 }
 }
 
-/// What a job costs at least on spot in a region, as a spot price for the speed (see `speed`): of these machine types,
-/// in any of its zones. None: no price known there.
-pub async fn cheapest_for_speed(http: &dyn Http, region: &str, creds: &Credentials, types: &[String], os: &str, now_ms: u64) -> Option<f64> {
-    spot_prices(http, region, creds, types, os, now_ms).await.ok()?.into_iter().filter(|((t, _), _)| types.contains(t)).map(|((t, _), p)| p / speed(&t)).reduce(f64::min)
-}
-
 /// The spot price now of each of these machine types in each of a region's zones, by (type, zone). One request.
-async fn spot_prices(http: &dyn Http, region: &str, creds: &Credentials, types: &[String], os: &str, now_ms: u64) -> Result<std::collections::HashMap<(String, String), f64>> {
+pub async fn spot_prices(http: &dyn Http, region: &str, creds: &Credentials, types: &[String], os: &str, now_ms: u64) -> Result<std::collections::HashMap<(String, String), f64>> {
     if types.is_empty() { return Ok(Default::default()) }
     let xml = ec2(http, region, creds, "DescribeSpotPriceHistory", serde_json::json!({ "InstanceType": types, "ProductDescription": [product(os)], "StartTime": amz_iso(now_ms) }), now_ms).await?;
     let mut prices = std::collections::HashMap::new();
