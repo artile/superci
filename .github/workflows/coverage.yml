@@ -211,6 +211,7 @@ jobs:
           SWEEPS: ${{ matrix.sweeps }}
           SUPERCI_SWEEP_FAULTS: "1"
           SUPERCI_SWEEP_SLICE: ${{ matrix.part }}/6
+          SUPERCI_BUILT: ${{ github.workspace }}
         # shellcheck disable=SC2086
         run: npx -y supercov@4.19.0 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
       - uses: actions/upload-artifact@v4
