@@ -684,7 +684,8 @@ fn an_accounts_copy_is_looked_at_while_the_newest_build_cannot_be_read() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// The image copied into a region, AWS refusing the copy: what AWS said, with the region it was asked for in.
+/// The image copied into a region, AWS refusing the copy: what AWS said, with the region it was asked for in; the
+/// maker's list of images not read: said.
 #[test]
 fn an_image_copy_aws_refuses_is_said_with_its_region() {
     let served = serve(|_| {});
@@ -694,6 +695,10 @@ fn an_image_copy_aws_refuses_is_said_with_its_region() {
     let (_child, link) = common::dashboard_with(&home, &[("SUPERCI_PAUSE_MS", "1")]);
     let (status, said) = sent(&link, "/aws/image", &[("region", "ca-central-1")]);
     assert!(status >= 400 && said.contains("ca-central-1") && said.contains("does not exist"), "{status} {said}");
+    // The maker's list of images not read: nothing to copy from, said.
+    served.github.fail("GET", "runner-images-for-aws/releases", 503, "unavailable");
+    let (status, said) = sent(&link, "/aws/image", &[("region", "ca-central-1")]);
+    assert!(status >= 400 && said.contains("list of runner images could not be read"), "{status} {said}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

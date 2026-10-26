@@ -366,8 +366,8 @@ fn setup_holds_with_each_call_and_store_operation_failing() {
             }
         }
     }
-    // `setup-finish` by itself, each of its steps failing; with the first and every one after failing, and the third
-    // and every one after (after its restart: Docker never answering, for the minute it is waited for).
+    // `setup-finish` by itself, each of its steps failing; with the first and every one after failing, and the fourth
+    // and every one after (after its restart, checked: Docker never answering, for the minute it is waited for).
     let finish_alone = |f: &str| -> String {
         assert!(m.switch(&[], &none_args).1.starts_with("on: "));
         let mut e = measured_env();
@@ -376,7 +376,7 @@ fn setup_holds_with_each_call_and_store_operation_failing() {
         String::from_utf8_lossy(&o.stdout).into_owned() + &String::from_utf8_lossy(&o.stderr)
     };
     let mut alone: Vec<String> = (1..=finish).filter(mine).map(|k| k.to_string()).collect();
-    if k0 == 1 { alone.extend(["1+".into(), "3+".into()]) }
+    if k0 == 1 { alone.extend(["1+".into(), "4+".into()]) }
     for f in alone { let said = finish_alone(&f); look(format!("setup-finish step {f}"), said); m.back(&stock); }
     for k in (1..=off).filter(mine) {
         assert!(m.switch(&[], &none_args).1.starts_with("on: "));

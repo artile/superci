@@ -371,8 +371,9 @@ fn check_containerd() -> Result<(), String> {
         let mut list = sapi::snapshots_client::SnapshotsClient::new(ch.clone()).list(ns(sapi::ListSnapshotsRequest { snapshotter: "superci".into(), filters: vec![] })).await.and_then(crate::faults::pass).map_err(|e| format!("containerd's snapshots from superci-layers: {}", e.message()))?.into_inner();
         while list.message().await.and_then(crate::faults::pass).map_err(|e| format!("containerd's snapshots from superci-layers: {}", e.message()))?.is_some() {}
         let empty = crate::content::Digest::of(crate::content::Algorithm::Sha256, b"").to_string();
-        // (There or not there: either is an answer from the store.)
-        crate::faults::check(capi::content_client::ContentClient::new(ch).info(ns(capi::InfoRequest { digest: empty })).await).map(drop)
+        // (There or not there: either is an answer from the store. Its step, in a test, may fail whatever it answered.)
+        let info = capi::content_client::ContentClient::new(ch).info(ns(capi::InfoRequest { digest: empty })).await;
+        crate::faults::pass(info).and_then(|r| r).map(drop)
             .or_else(|e| if e.code() == tonic::Code::NotFound { Ok(()) } else { Err(format!("containerd's content from superci-layers: {}", e.message())) })
     })
 }
