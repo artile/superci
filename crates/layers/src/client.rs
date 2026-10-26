@@ -72,11 +72,11 @@ impl Containerd {
         // (Were containerd to end the write meanwhile, its answer says so below.)
         let _ = tx.send(commit).await;
         drop(tx);
+        // (Its answers read to the end: ended well, or with an error that is answered as the write's refusal is.)
         loop {
             match crate::faults::check(s.message().await) {
                 Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(e) => return answer(e),
+                end => return end.map(drop).or_else(answer),
             }
         }
     }
