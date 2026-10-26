@@ -123,11 +123,6 @@ jobs:
         include: ${{ fromJSON(needs.prepare.outputs.shards) }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.PROGRAMS }}
-          key: ${{ needs.prepare.outputs.programs }}
-          fail-on-cache-miss: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -136,6 +131,12 @@ jobs:
         with:
           shared-key: coverage-shard
           save-if: ${{ matrix.shard == 1 }}
+      # (After the Rust cache: restoring it takes away what else is in its target folder.)
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PROGRAMS }}
+          key: ${{ needs.prepare.outputs.programs }}
+          fail-on-cache-miss: true
       - name: Shard ${{ matrix.shard }} of the tests, measured
         env:
           SUPERCI_BUILT: ${{ github.workspace }}
@@ -178,11 +179,6 @@ jobs:
       SUPERCI_BROWSER_WAIT_S: "120"
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.PROGRAMS }}
-          key: ${{ needs.prepare.outputs.programs }}
-          fail-on-cache-miss: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -190,6 +186,12 @@ jobs:
         with:
           shared-key: coverage-all
           save-if: ${{ matrix.part == 1 }}
+      # (After the Rust cache: restoring it takes away what else is in its target folder.)
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PROGRAMS }}
+          key: ${{ needs.prepare.outputs.programs }}
+          fail-on-cache-miss: true
       - name: The kernel's EROFS (the layer store's setup test mounts its files from a container, which loads no module)
         run: |
           uname -r
