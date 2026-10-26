@@ -211,3 +211,46 @@ fn the_workers_job_holds_with_each_call_and_store_operation_failing() {
         if status == 200 { vec![] } else { vec![format!("its status: {status} {said}")] }
     });
 }
+
+/// A GitLab job, as Cloudflare runs it: its event taken, its runner's container started with GitLab's runner (its
+/// token and address in its environment), the job run and finished (its runner ends by itself after its one job).
+#[test]
+fn a_gitlab_job_runs_in_a_container_of_its_own() {
+    let mut settings = deployed();
+    settings.push(("GITLAB".into(), superci_testkit::GitLab::connection().to_string()));
+    let Some(w) = start(&settings) else { return };
+    let gitlab = w.github.gitlab.clone();
+    let hook = |body: Vec<u8>| w.call("POST", "/gitlab/webhook", &[("content-type", "application/json"), ("x-gitlab-event", "Job Hook"), ("x-gitlab-token", superci_testkit::gitlab::HOOK_SECRET)], &body).0;
+    let (id, pending) = gitlab.pending("gl-build", &["superci"], now_ms());
+    assert_eq!(hook(pending) / 100, 2, "{}", w.log());
+    w.until("its container started", || !w.containers.ops("start").is_empty());
+    let start = w.containers.ops("start").pop().unwrap();
+    assert!(start["options"]["env"]["GL_TOKEN"].as_str().is_some_and(|t| !t.is_empty()) && start["options"]["env"]["GL_URL"].as_str().is_some(), "{start}");
+    hook(gitlab.running(id, now_ms()));
+    hook(gitlab.finish(id, "success", "built it\n", now_ms()));
+    let done = || serde_json::from_str::<Value>(&w.dashboard("GET", "/status", "").1).unwrap_or_default()["jobs"].as_array().into_iter().flatten().any(|j| j["name"] == "gl-build" && j["state"] == "done");
+    w.until("the job done", done);
+}
+
+/// A run from a computer, as Cloudflare runs it: started with a run key, its job's runner started in a container of
+/// its own; the runner, taking its job, is handed the secret the run's workflow names (kept in the Worker's secrets).
+#[test]
+fn a_run_from_a_computer_is_handed_its_secrets() {
+    use base64::Engine;
+    let run_key = "superci_run_0123456789abcdef0123456789abcdef";
+    let mut settings = deployed();
+    settings.push(("READ_KEY_4102444800_AGENT".into(), format!("{}:runs", superci_core::crypto::sha256_hex(run_key.as_bytes()))));
+    settings.push(("SECRET_NPM_TOKEN_ALL".into(), json!({ "name": "NPM_TOKEN", "value": "npm-token-kept-for-runs", "updated_ms": 1_760_000_000_000u64 }).to_string()));
+    let Some(w) = start(&settings) else { return };
+    let workflow = "jobs:\n  publish:\n    runs-on: superci\n    steps:\n      - run: npm publish\n        env:\n          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n";
+    let (status, said) = w.call("POST", "/runs", &[("authorization", &format!("Bearer {run_key}")), ("content-type", "application/json")],
+        json!({ "workflow": workflow, "path": ".github/workflows/publish.yml", "repository": "acme/app", "ref": "refs/heads/main" }).to_string().as_bytes());
+    assert_eq!(status, 200, "{said}\n{}", w.log());
+    w.until("its job's container started", || !w.containers.ops("start").is_empty());
+    // (The runner's link, as its configuration gives it: `.runner`'s ServerUrl.)
+    let b64 = |s: &str| -> Value { serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(s).unwrap()).unwrap() };
+    let jit = b64(w.containers.ops("start").pop().unwrap()["options"]["env"]["SUPERCI_JIT"].as_str().unwrap());
+    let root = b64(jit[".runner"].as_str().unwrap())["ServerUrl"].as_str().unwrap().to_string();
+    let (status, message) = superci_testkit::Runner { at: format!("{root}/_apis/v1") }.message();
+    assert!(status == 200 && message.to_string().contains("npm-token-kept-for-runs"), "{status} {message}");
+}

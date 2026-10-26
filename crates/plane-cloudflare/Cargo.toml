@@ -21,3 +21,4 @@ getrandom.workspace = true
 [dev-dependencies]
 superci-testkit = { path = "../testkit" }
 libc = "0.2"
+base64.workspace = true
