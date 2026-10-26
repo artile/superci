@@ -356,7 +356,7 @@ fn docker_info() -> Result<serde_json::Value, String> {
 }
 
 fn wait_for_docker() -> Result<(), String> {
-    let answered = (0..120).any(|_| docker_info().is_ok() || { std::thread::sleep(std::time::Duration::from_millis(500)); false });
+    let answered = (0..120).any(|i| { if i > 0 { std::thread::sleep(std::time::Duration::from_millis(500)) } docker_info().is_ok() });
     if answered { Ok(()) } else { Err("Docker did not answer after the switch".into()) }
 }
 
