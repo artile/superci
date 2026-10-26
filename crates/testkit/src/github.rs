@@ -313,6 +313,13 @@ impl GitHub {
     }
 
     /// Its steps as GitHub has them now (their names, numbers and times), for a job that ran some side by side.
+    /// Its branch and commit (another than the fixture's `main` and its commit).
+    pub fn set_commit(&self, id: u64, branch: &str, sha: &str) {
+        let mut h = self.hub.lock().unwrap();
+        let j = h.jobs.get_mut(&id).unwrap();
+        (j["head_branch"], j["head_sha"]) = (branch.into(), sha.into());
+    }
+
     pub fn set_steps(&self, id: u64, steps: Value) { self.hub.lock().unwrap().jobs.get_mut(&id).unwrap()["steps"] = steps }
 
     /// Its run ended, with these logs (GitHub keeps a run's logs, each step's apart, once the whole run has ended).
@@ -504,6 +511,7 @@ impl GitHub {
                 let mut run = fixture("run");
                 let status = if jobs.iter().all(|j| j["status"] == "completed") { "completed" } else if jobs.iter().any(|j| j["status"] == "in_progress") { "in_progress" } else { "queued" };
                 for (k, v) in [("id", json!(id)), ("status", json!(status)), ("conclusion", if status == "completed" { first["conclusion"].clone() } else { Value::Null }),
+                    ("head_sha", first["head_sha"].clone()), ("head_branch", first["head_branch"].clone()),
                     ("run_attempt", json!(1)), ("created_at", first["created_at"].clone()), ("run_started_at", first["created_at"].clone()), ("updated_at", first["created_at"].clone())] { run[k] = v }
                 ok(200, run)
             }

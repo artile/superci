@@ -19,6 +19,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 - A Cloudflare runner whose container Cloudflare fails to stop says why, for the control plane to try again. It failed with an error Cloudflare's runtime reported as uncaught. Update your control plane and its Cloudflare launcher for it.
 - A job on Modal ends as soon as its steps do, and a Modal control plane answers several requests side by side: a job whose steps take a second takes 5 seconds, where it took over 4 minutes, its machine paid for meanwhile. It answered one request at a time, and its runner's asking for messages, the CLI following a run and the job's own calls (its end too) each waited for the others. Update your control plane for it.
 - Setting up Cloudflare runners sends a chunk of the runner image that Cloudflare's registry fails (a 500 of its own) again, twice. One such failure ended the setup.
+- A job whose spot machine AWS took back is not run again when its branch has a newer push whose run of the same workflow is still going. Run again, it came after that run, and a workflow that cancels runs in progress (`concurrency` with `cancel-in-progress`) cancelled the newer push's run before any of its jobs began. Its page says why. Update your control plane for it.
 - Whether the GitHub App is installed is not kept while there is no App yet. A dashboard that asked before the App was made saw it not installed for a minute after it was. Update your control plane for it.
 
 ## 0.19.19 — 2026-10-21

@@ -16787,7 +16787,9 @@ fn a_jobs_end_is_settled_for_each_way_its_record_stands_and_said_on_its_page() {
 
 /// Jobs whose spot machines AWS took back, run again once their runs have finished, for each way GitHub answers: run
 /// again alone, two of one run together, a run still going (asked later), a run gone, six hours on, the App not
-/// allowed, GitHub refusing, GitHub failing (asked later). Each job's page says what became of it.
+/// allowed, GitHub refusing, GitHub failing (asked later), and its branch pushed again with that run still going (not
+/// run again: it would cancel the newer run where the workflow cancels runs in progress). Each job's page says what
+/// became of it.
 #[test]
 fn jobs_aws_took_back_are_run_again_once_their_runs_end_or_say_why_not_for_each_way_github_answers() {
     let Some(mut b) = Browser::open(1300, 1000) else { eprintln!("no Chrome here: skipped"); return };
@@ -16822,6 +16824,13 @@ fn jobs_aws_took_back_are_run_again_once_their_runs_end_or_say_why_not_for_each_
     let (still, q) = served.github.queue("still running", "superci", served.now_ms()); served.webhook(q); served.webhook(served.github.start(still));
     let still_run = run_of(still);
     edit(going, &|j| { j["rerun"]["run_id"] = still_run.into(); });
+    // (On a branch of its own: the newer push is newer than the others' runs only there.)
+    let moved_on = taken_back("its branch pushed again");
+    served.github.set_commit(moved_on, "fix/login", "5b1d0c3e7a9f2b4d6e8c0a1f3b5d7e9c1a3f5b7d");
+    let (newer, q) = served.github.queue("the newer push", "superci", served.now_ms());
+    served.github.set_commit(newer, "fix/login", "0e1c3f5b2a7d9e8c6b4a2f0e1d3c5b7a9e8d6c4b");
+    served.webhook(q);
+    served.webhook(served.github.start(newer));
     let gone = taken_back("its run gone");
     edit(gone, &|j| { j["rerun"]["run_id"] = 39_999_999_999u64.into(); });
     let late = taken_back("six hours on");
@@ -16838,6 +16847,8 @@ fn jobs_aws_took_back_are_run_again_once_their_runs_end_or_say_why_not_for_each_
     assert!(served.github.asked.lock().unwrap().iter().any(|a| a.contains(&format!("/actions/runs/{first_run}/rerun-failed-jobs"))), "the two asked for together");
     assert_eq!(rerun(going), "pending");
     assert!(rerun(gone).contains("its run is gone"), "{}", state(gone));
+    assert!(rerun(moved_on).contains(&format!("a newer run of its workflow ({})", run_of(newer))), "{}", state(moved_on));
+    assert!(!served.github.asked.lock().unwrap().iter().any(|a| a.contains(&format!("/actions/jobs/{moved_on}/rerun"))), "not asked for");
     assert!(rerun(late).contains("six hours later"), "{}", state(late));
     assert!(rerun(not_allowed).contains("GitHub's App may not"), "{}", state(not_allowed));
     assert!(rerun(refused).starts_with("not run again: "), "{}", state(refused));
@@ -16847,7 +16858,7 @@ fn jobs_aws_took_back_are_run_again_once_their_runs_end_or_say_why_not_for_each_
     served.aws.fail_none();
     let home = signed_in(&served);
     let (mut child, link) = dashboard(&home);
-    for (id, said) in [(alone, "ran the job again by itself"), (going, "SuperCI runs the job again by itself"), (gone, "its run is gone"), (late, "six hours later"), (not_allowed, "GitHub's App may not")] {
+    for (id, said) in [(alone, "ran the job again by itself"), (going, "SuperCI runs the job again by itself"), (gone, "its run is gone"), (late, "six hours later"), (not_allowed, "GitHub's App may not"), (moved_on, "newer run of its workflow")] {
         b.goto(&format!("{link}&p=job&id={id}"));
         b.wait(&format!("{} && !document.querySelector('main').innerText.includes('Reading your control plane')", shows("Status")));
         let page = b.eval("document.querySelector('main').innerText").as_str().unwrap_or_default().replace('\n', " ");

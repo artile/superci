@@ -2303,7 +2303,10 @@ impl<'a> ControlPlane<'a> {
             let (app, token) = self.github_for(j).await?;
             let api = app.api();
             match github::run_status(self.http, &api, &token, &r.repo, r.run_id).await {
-                Ok(s) if s == "completed" => {}
+                // (A newer run of its workflow on its branch, still going: run again, this one would come after it,
+                // and a workflow that cancels runs in progress would cancel that newer one.)
+                Ok((s, Some(newer))) if s == "completed" => return Some(format!("not run again: its branch has a newer run of its workflow ({newer}), which running this one again would cancel where the workflow cancels runs in progress")),
+                Ok((s, None)) if s == "completed" => {}
                 Err(e) if e.contains(" 404 ") => return Some("not run again: its run is gone".into()),
                 _ => return None,
             }
