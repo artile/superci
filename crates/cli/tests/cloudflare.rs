@@ -1,6 +1,6 @@
 //! The Cloudflare control plane as Cloudflare runs it (its Worker and Durable Object, built, in Cloudflare's own
-//! runtime on this computer: `superci_testkit::serve_cloudflare`), read and used by the CLI. Skipped where `wrangler`
-//! is not installed or the Worker is not built.
+//! runtime on this computer: `superci_testkit::serve_cloudflare`), read and used by the CLI. Skipped where there is no
+//! Node or the Worker is not built.
 #![cfg(unix)]
 mod common;
 use common::temp;
@@ -30,7 +30,7 @@ fn json(home: &std::path::Path, env: &[(&str, &str)], args: &[&str]) -> (i32, se
 
 #[test]
 fn the_cloudflare_control_plane_answers_with_its_keys_and_keeps_a_run_from_a_computer() {
-    let Some(plane) = serve_cloudflare() else { eprintln!("no wrangler or no built Worker here: skipped"); return };
+    let Some(plane) = serve_cloudflare() else { return };
     let home = home(&plane);
     // Read with this computer's key.
     let (code, status) = json(&home, &[], &["status"]);
