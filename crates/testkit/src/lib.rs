@@ -478,7 +478,10 @@ impl Aws {
         if self.faults.call(format!("POST {url}")).is_some() { return (vec![], Some((13, "internal error".to_string()))) }
         // (What a Modal settings Dict is given, kept: a Modal control plane served here reads it.)
         if method == "DictUpdate" { for (k, v) in modal_entries(message) { self.modal_settings.lock().unwrap().insert(k, v); } }
-        let (status, _, answer) = self.replay("POST", &url, "", &asked).unwrap_or_else(|| {
+        // (What a sandbox is given on its input, taken as Modal takes it: nothing answered but that it was, a recording
+        // having it or not.)
+        let written = (method == "SandboxStdinWrite").then(|| (200, vec![], json!({ "answers": [""] }).to_string()));
+        let (status, _, answer) = self.replay("POST", &url, "", &asked).or(written).unwrap_or_else(|| {
             self.unanswered.lock().unwrap().push(format!("POST {url}"));
             (404, vec![], json!({ "error": format!("Modal {method}: the test kit's Modal has no answer for it") }).to_string())
         });
