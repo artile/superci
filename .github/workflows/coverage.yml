@@ -151,7 +151,7 @@ jobs:
           google-chrome --version || { echo "No Chrome on this runner: the browser suite would skip itself." >&2; exit 1; }
           if [ "${{ inputs.tests }}" = e2e ]; then set -- --test '*'; else set -- --test browser; fi
           # shellcheck disable=SC2086
-          npx -y supercov@4.20.1 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
+          npx -y supercov@4.20.2 -- cargo test -p superci --no-fail-fast "$@" -- --test-threads=4 --exact $TESTS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -223,7 +223,7 @@ jobs:
           SUPERCI_SWEEP_SLICE: ${{ matrix.part }}/6
           SUPERCI_BUILT: ${{ github.workspace }}
         # shellcheck disable=SC2086
-        run: npx -y supercov@4.20.1 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
+        run: npx -y supercov@4.20.2 -- cargo test --workspace --no-fail-fast -- --test-threads=4 --exact $TESTS $SWEEPS
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -246,7 +246,7 @@ jobs:
           path: .supercov/runs
           merge-multiple: true
       - name: The shards' runs merged
-        run: npx -y supercov@4.20.1 merge
+        run: npx -y supercov@4.20.2 merge
       - name: What the tests reach
         run: .github/coverage-gaps.sh
       - uses: actions/upload-artifact@v4
