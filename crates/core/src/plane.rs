@@ -2224,8 +2224,9 @@ impl<'a> ControlPlane<'a> {
     async fn spot_steps(&self, a: &AwsConnection, place: &str, types: &[String], os: &str, creds: &Credentials, now: u64) -> Vec<(String, Vec<String>, Vec<(String, String)>)> {
         let regions = self.place_regions(a, place);
         if regions.len() < 2 { return regions.into_iter().map(|r| (r, types.to_vec(), vec![])).collect() }
-        let mut seen = vec![];
-        for (i, r) in regions.iter().enumerate() {
+        let (mut seen, mut each) = (vec![], regions.iter().enumerate());
+        loop {
+            let Some((i, r)) = each.next() else { break };
             // (Kept two minutes: a burst of jobs asks AWS once, and spot prices move by the hour.)
             let key = format!("{r}/{os}/{}", types.join(","));
             let kept = self.cache.spot_prices.borrow().get(&key).filter(|(_, until)| *until > now).map(|(prices, _)| prices.clone());
@@ -2248,14 +2249,13 @@ impl<'a> ControlPlane<'a> {
         seen.sort_by(|(x, ..), (y, ..)| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
         let mut steps = vec![];
         if let Some(band) = seen.iter().filter_map(|(_, _, _, worth)| worth.values().copied().reduce(f64::min)).reduce(f64::min).map(|lowest| lowest * aws::BAND) {
-            for (_, r, prices, worth) in &seen {
+            steps.extend(seen.iter().filter_map(|(_, r, prices, worth)| {
                 let near = |pool: &(String, String)| worth.get(pool).is_some_and(|w| *w <= band);
                 let kinds: Vec<String> = types.iter().filter(|t| worth.keys().any(|pool| pool.0 == **t && near(pool))).cloned().collect();
-                if kinds.is_empty() { continue }
-                steps.push((r.clone(), kinds, prices.keys().filter(|pool| !near(pool)).cloned().collect()));
-            }
+                (!kinds.is_empty()).then(|| (r.clone(), kinds, prices.keys().filter(|pool| !near(pool)).cloned().collect()))
+            }));
             // (Then each region whole where what is left in it costs least: its pools near the cheapest were asked.)
-            for ((key, _), _, _, worth) in seen.iter_mut() { if let Some(rest) = worth.values().copied().filter(|w| *w > band).reduce(f64::min) { *key = rest } }
+            seen.iter_mut().for_each(|((key, _), _, _, worth)| if let Some(rest) = worth.values().copied().filter(|w| *w > band).reduce(f64::min) { *key = rest });
             seen.sort_by(|(x, ..), (y, ..)| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
         }
         steps.extend(seen.into_iter().map(|(_, r, ..)| (r, types.to_vec(), vec![])));

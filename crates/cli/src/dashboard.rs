@@ -7658,6 +7658,20 @@ mod tests {
         assert!(r.status == 303 && lock(&d.deploying).is_none() && d.plane_page().contains("Set up a control plane"));
     }
 
+    /// Cloudflare's costs are read once at a time and at most every two minutes: asked while a reading is under way,
+    /// or within two minutes of the last, nothing more is started (a page refreshing meanwhile asks each time).
+    #[test]
+    fn cloudflare_costs_are_not_read_again_while_a_reading_is_under_way_or_was_just_made() {
+        let shared = Arc::new(Mutex::new(Dashboard::new()));
+        for (measuring, measured_at) in [(true, 0), (false, now_ms())] {
+            let mut d = Dashboard::new();
+            (d.measuring, d.measured_at) = (measuring, measured_at);
+            d.views = Some((vec![], now_ms()));
+            Dashboard::measure(&shared, &mut d);
+            assert_eq!((d.measuring, d.measured_at), (measuring, measured_at));
+        }
+    }
+
     /// An account whose refusals are not its organization's: spot refused by the sign-in's own permissions and a
     /// region by a rule AWS did not name are said as "Restricted", each with whose rule it is; with several accounts
     /// signed in and none named, which one is asked.
