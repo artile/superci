@@ -15,8 +15,31 @@ use serde_json::{json, Value};
 use crate::sweep::{Fault, Faults};
 use crate::{Aws, GitHub};
 
-/// The wrangler that runs the tests (its workerd: Cloudflare's runtime, as of this version).
+/// The wrangler that runs the tests (its workerd: Cloudflare's runtime, as of this version), where none is on PATH.
 const WRANGLER: &str = "wrangler@4.149.0";
+
+/// Whether supercov measures this run (it sets `SUPERCOV_RUN_ID` in every process of a measured command).
+fn measured() -> bool { std::env::var_os("SUPERCOV_RUN_ID").is_some() }
+
+/// The command that starts wrangler: where supercov measures the run, the one on PATH (supercov's own, which reads
+/// what the Worker runs, before the run's wrangler); else this version through npx.
+fn wrangler() -> Vec<String> {
+    if measured() && Command::new("wrangler").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()) { vec!["wrangler".into()] }
+    else { vec!["npx".into(), "-y".into(), WRANGLER.into()] }
+}
+
+/// Where supercov measures this run: the Worker is built from the source here (supercov's copy, with its probes) once,
+/// before it starts, rather than taken as `./build.sh` left it (a build without probes has nothing to read).
+fn build_once(built: &Path) {
+    static BUILT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    if !measured() { return }
+    let mut done = BUILT.lock().unwrap();
+    if done.iter().any(|b| b == built) { return }
+    let crate_dir = built.parent().and_then(Path::parent).unwrap();
+    let o = Command::new("worker-build").arg("--release").current_dir(crate_dir).output().unwrap();
+    assert!(o.status.success(), "worker-build: {}", String::from_utf8_lossy(&o.stderr));
+    done.push(built.to_path_buf());
+}
 
 fn free_port() -> u16 { TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port() }
 
@@ -116,6 +139,7 @@ impl Worker {
     pub fn start(setup: &Setup, settings: &[(String, String)]) -> Option<Worker> {
         if !setup.built.exists() { eprintln!("the Worker is not built (./build.sh): skipped"); return None }
         if !Command::new("npx").arg("--version").output().is_ok_and(|o| o.status.success()) { eprintln!("no Node here: skipped"); return None }
+        build_once(&setup.built);
         let aws = Aws::serve();
         let github = GitHub::default();
         *aws.github.lock().unwrap() = Some(github.clone());
@@ -143,7 +167,8 @@ impl Worker {
             let port = free_port();
             let log = std::fs::File::create(dir.join("log")).unwrap();
             use std::os::unix::process::CommandExt;
-            let child = Command::new("npx").args(["-y", WRANGLER, "dev", "--local", "--ip", "127.0.0.1", "--port", &port.to_string(), "--inspector-port", &free_port().to_string(), "--persist-to"])
+            let w = wrangler();
+            let child = Command::new(&w[0]).args(&w[1..]).args(["dev", "-c", "wrangler.toml", "--local", "--ip", "127.0.0.1", "--port", &port.to_string(), "--inspector-port", &free_port().to_string(), "--persist-to"])
                 .arg(dir.join("state")).current_dir(&dir).env("WRANGLER_SEND_METRICS", "false").env("NO_COLOR", "1").env("CI", "1")
                 .stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).process_group(0).spawn().unwrap();
             let url = format!("http://127.0.0.1:{port}");
