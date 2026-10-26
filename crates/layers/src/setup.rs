@@ -127,16 +127,15 @@ fn switch(o: &Options) -> Result<String, String> {
     let files = o.root.join("files");
     std::fs::create_dir_all(&files).and_then(crate::faults::pass).map_err(|e| format!("{}: {e}", files.display()))?;
     let timed = |f: &dyn Fn() -> Result<String, String>| { let t = std::time::Instant::now(); (f(), t.elapsed().as_secs_f64()) };
-    let (docker, erofs, disk, index) = std::thread::scope(|s| {
-        let docker = s.spawn(|| timed(&|| docker_keeps_images_in_containerd().map(|_| String::new())));
-        let index = s.spawn(|| timed(&|| fetch_index(&o.index_url).map(|n| n.to_string())));
-        // (The disk first, then an EROFS file mounted where the layers' files will be: the kernel mounts one only from
-        // a filesystem that reads its pages itself, which memory's (tmpfs) does not.)
-        let disk = timed(&|| store_disk(&o.disk, &files));
-        let erofs = timed(&|| check_erofs(&files).map(|_| String::new()));
-        // (Neither panics: each says what failed.)
-        (docker.join().expect("Docker's check"), erofs, disk, index.join().expect("fetching the index"))
-    });
+    let docker_check = || timed(&|| docker_keeps_images_in_containerd().map(|_| String::new()));
+    let index_fetch = || timed(&|| fetch_index(&o.index_url).map(|n| n.to_string()));
+    // (The disk first, then an EROFS file mounted where the layers' files will be: the kernel mounts one only from a
+    // filesystem that reads its pages itself, which memory's (tmpfs) does not.)
+    let disk_then_erofs = || (timed(&|| store_disk(&o.disk, &files)), timed(&|| check_erofs(&files).map(|_| String::new())));
+    // (Neither thread panics: each says what failed.)
+    let (docker, (disk, erofs), index) = if crate::faults::together() {
+        std::thread::scope(|s| { let (d, i) = (s.spawn(docker_check), s.spawn(index_fetch)); let de = disk_then_erofs(); (d.join().expect("Docker's check"), de, i.join().expect("fetching the index")) })
+    } else { (docker_check(), disk_then_erofs(), index_fetch()) };
     // (The disk said before the EROFS check, which a disk that could not be made fails too.)
     docker.0.and_then(crate::faults::said)?;
     let (disk_t, index_t) = (disk.1, index.1);
@@ -266,7 +265,7 @@ fn keep(path: &str) -> Result<(), String> {
     if Path::new(&kept).exists() || Path::new(&format!("{kept}-none")).exists() { return Ok(()) }
     match crate::faults::check(std::fs::copy(path, &kept)) {
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::write(format!("{kept}-none"), b"").map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::faults::check(std::fs::write(format!("{kept}-none"), b"")).map_err(|e| e.to_string()),
         Err(e) => Err(format!("{path}: {e}")),
     }
 }
@@ -313,7 +312,7 @@ pub fn docker_config(daemon: &str) -> Result<String, String> {
     o.insert("storage-driver".into(), "superci".into());
     let features = o.entry("features").or_insert_with(|| serde_json::json!({}));
     features.as_object_mut().ok_or("Docker's features are not an object")?.insert("containerd-snapshotter".into(), true.into());
-    serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+    Ok(serde_json::to_string_pretty(&v).expect("JSON as text"))
 }
 
 /// Whether Docker keeps its images in containerd: Docker 29 or later (its installed package says) with no setting
@@ -332,16 +331,12 @@ fn docker_keeps_images_in_containerd() -> Result<(), String> {
 
 /// Docker's major version from dpkg's record of installed packages (`docker-ce`, else `docker.io`).
 fn docker_version(status: &str) -> Option<u32> {
-    for package in ["docker-ce", "docker.io"] {
-        for block in status.split("\n\n") {
-            if !block.lines().any(|l| l == format!("Package: {package}")) || !block.lines().any(|l| l.starts_with("Status:") && l.ends_with(" installed")) { continue }
-            let v = block.lines().find_map(|l| l.strip_prefix("Version: "))?;
-            // ("5:29.4.2-1~ubuntu.26.04~resolute": the epoch, then the version.)
-            let v = v.split_once(':').map(|(_, v)| v).unwrap_or(v);
-            return v.split('.').next()?.parse().ok();
-        }
-    }
-    None
+    let installed = |package: &&str| status.split("\n\n").find(|block| block.lines().any(|l| l == format!("Package: {package}")) && block.lines().any(|l| l.starts_with("Status:") && l.ends_with(" installed")));
+    let block = ["docker-ce", "docker.io"].iter().find_map(installed)?;
+    let v = block.lines().find_map(|l| l.strip_prefix("Version: "))?;
+    // ("5:29.4.2-1~ubuntu.26.04~resolute": the epoch, then the version.)
+    let v = v.split_once(':').map(|(_, v)| v).unwrap_or(v);
+    v.split('.').next().unwrap_or_default().parse().ok()
 }
 
 /// What Docker's daemon says of itself (`GET /info` on its socket): asked of the daemon, not of the `docker`
@@ -361,11 +356,8 @@ fn docker_info() -> Result<serde_json::Value, String> {
 }
 
 fn wait_for_docker() -> Result<(), String> {
-    for _ in 0..120 {
-        if docker_info().is_ok() { return Ok(()) }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    Err("Docker did not answer after the switch".into())
+    let answered = (0..120).any(|_| docker_info().is_ok() || { std::thread::sleep(std::time::Duration::from_millis(500)); false });
+    if answered { Ok(()) } else { Err("Docker did not answer after the switch".into()) }
 }
 
 /// containerd reaches this service for snapshots (a list) and for content (a blob that is not there: not found,
@@ -379,22 +371,20 @@ fn check_containerd() -> Result<(), String> {
         let mut list = sapi::snapshots_client::SnapshotsClient::new(ch.clone()).list(ns(sapi::ListSnapshotsRequest { snapshotter: "superci".into(), filters: vec![] })).await.and_then(crate::faults::pass).map_err(|e| format!("containerd's snapshots from superci-layers: {}", e.message()))?.into_inner();
         while list.message().await.and_then(crate::faults::pass).map_err(|e| format!("containerd's snapshots from superci-layers: {}", e.message()))?.is_some() {}
         let empty = crate::content::Digest::of(crate::content::Algorithm::Sha256, b"").to_string();
-        match capi::content_client::ContentClient::new(ch).info(ns(capi::InfoRequest { digest: empty })).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.code() == tonic::Code::NotFound => Ok(()),
-            Err(e) => Err(format!("containerd's content from superci-layers: {}", e.message())),
-        }
+        // (There or not there: either is an answer from the store.)
+        crate::faults::check(capi::content_client::ContentClient::new(ch).info(ns(capi::InfoRequest { digest: empty })).await).map(drop)
+            .or_else(|e| if e.code() == tonic::Code::NotFound { Ok(()) } else { Err(format!("containerd's content from superci-layers: {}", e.message())) })
     })
 }
 
 /// containerd's and Docker's settings as they were (kept by `keep`).
 fn restore_settings() -> Result<(), String> {
-    for path in [CONTAINERD_CONFIG, DOCKER_CONFIG] {
+    [CONTAINERD_CONFIG, DOCKER_CONFIG].iter().try_for_each(|path| {
         let kept = format!("{path}{KEPT}");
         if Path::new(&kept).exists() { std::fs::rename(&kept, path).and_then(crate::faults::pass).map_err(|e| format!("{path}: {e}"))? }
         else if Path::new(&format!("{kept}-none")).exists() { let _ = std::fs::remove_file(path); let _ = std::fs::remove_file(format!("{kept}-none")); }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// containerd's and Docker's settings as they were, this service stopped, both started again, Docker answering.
@@ -427,6 +417,8 @@ mod tests {
         // Twice is the same as once; proxy plugins of its own are left alone (the switch is not made).
         assert_eq!(containerd_config("disabled_plugins = [\"cri\", \"io.containerd.content.v1.content\"]\n").unwrap().matches("io.containerd.content.v1.content").count(), 1);
         assert!(containerd_config("[proxy_plugins.other]\n").is_err());
+        // disabled_plugins that is not a list, or not on one line: said, not guessed at.
+        for odd in ["disabled_plugins = \"cri\"\n", "disabled_plugins = [\"cri\",\n  \"x\"]\n"] { assert!(containerd_config(odd).unwrap_err().contains("not a list on one line"), "{odd}") }
     }
 
     #[test]
@@ -435,6 +427,8 @@ mod tests {
         assert_eq!(got, serde_json::json!({"max-concurrent-downloads": 16, "storage-driver": "superci", "features": {"x": true, "containerd-snapshotter": true}}));
         assert_eq!(serde_json::from_str::<serde_json::Value>(&docker_config("").unwrap()).unwrap()["storage-driver"], "superci");
         assert!(docker_config("[]").is_err());
+        assert!(docker_config("not json").unwrap_err().starts_with("/etc/docker/daemon.json: "));
+        assert!(docker_config(r#"{"features": 1}"#).unwrap_err().contains("features are not an object"));
     }
 
     #[test]
@@ -444,6 +438,7 @@ mod tests {
         assert_eq!(docker_version("Package: docker.io\nStatus: install ok installed\nVersion: 28.2.2-0ubuntu1\n"), Some(28));
         assert_eq!(docker_version("Package: docker-ce\nStatus: deinstall ok config-files\nVersion: 5:29.0.0-1\n"), None, "removed is not installed");
         assert_eq!(docker_version(""), None);
+        assert_eq!(docker_version("Package: docker-ce\nStatus: install ok installed\n"), None, "no version said");
     }
 
     #[test]
