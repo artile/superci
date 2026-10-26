@@ -190,3 +190,24 @@ fn runners_start_where_told_and_a_worker_without_them_says_so() {
     w.webhook(queued);
     w.until("a container started", || !w.containers.ops("start").is_empty());
 }
+
+/// A GitHub job's whole way through the Worker (queued, its container started, taken, finished, its container
+/// ended, the upkeep after) with each call it makes failing in turn: GitHub's, and Cloudflare's container service's.
+/// Nothing panics, and the Worker still answers for its state.
+#[test]
+fn the_workers_job_holds_with_each_call_and_store_operation_failing() {
+    worker::sweep("the Worker's job", || start(&deployed()), |w| {
+        let (id, queued) = w.github.queue("build", "superci", now_ms());
+        w.webhook(queued);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while w.containers.ops("start").is_empty() && std::time::Instant::now() < until { std::thread::sleep(std::time::Duration::from_millis(100)) }
+        // (Taken and finished where a runner was registered for it: a failure before leaves the job waiting.)
+        if !w.github.runner_names().is_empty() {
+            w.webhook(w.github.start(id));
+            w.webhook(w.github.finish(id, "success", "done\n", now_ms()));
+        }
+        let _ = w.alarm(None);
+        let (status, said) = w.dashboard("GET", "/status", "");
+        if status == 200 { vec![] } else { vec![format!("its status: {status} {said}")] }
+    });
+}

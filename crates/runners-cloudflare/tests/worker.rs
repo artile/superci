@@ -101,3 +101,19 @@ fn a_runners_container_goes_each_way_cloudflares_may() {
     let Some(w) = start(&SigningKeyStore::generate(), None) else { return };
     worker::each_way_a_container_goes(&w);
 }
+
+/// A runner launched and stopped with each of Cloudflare's container calls failing in turn: nothing panics, and each
+/// answer of the launcher's that is an error says what failed.
+#[test]
+fn a_launched_runner_holds_with_each_call_and_store_operation_failing() {
+    let keys = SigningKeyStore::generate();
+    worker::sweep("a launched runner", || start(&keys, None), |w| {
+        let t = token(&keys, PLANE_URL, SUBJECT, &w.url, false);
+        let mut problems = vec![];
+        for (path, body) in [("/launch", json!({ "name": "job-1", "jit": "eyJqaXQiOnRydWV9", "max_minutes": 30 })), ("/stop", json!({ "id": "job-1" }))] {
+            let (status, said) = asked(w, path, &t, body);
+            if status != 200 && said.trim().is_empty() { problems.push(format!("{path}: {status} with nothing said")) }
+        }
+        problems
+    });
+}

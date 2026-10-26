@@ -62,7 +62,8 @@ impl DurableObject for JobRunner {
         let container = self.state.container().ok_or("no container for this runner")?;
         let body: serde_json::Value = req.json().await?;
         if req.path() == "/stop" {
-            if container.running() { container.destroy(None).await? }
+            // (A stop Cloudflare fails: said, for the one who asked to try again.)
+            if container.running() { if let Err(e) = container.destroy(None).await { return Response::error(format!("the container did not stop: {e}"), 502) } }
             self.state.storage().delete_alarm().await?;
             return Response::from_json(&serde_json::json!({ "stopped": true }))
         }

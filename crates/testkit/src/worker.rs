@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::sweep::{Fault, Faults};
 use crate::{Aws, GitHub};
 
 /// The wrangler that runs the tests (its workerd: Cloudflare's runtime, as of this version).
@@ -49,12 +50,13 @@ fn unchunk(mut s: &str) -> String {
 }
 
 /// The runners' containers, as the test has them: each operation the Worker asked (`start`, `keep`, `destroy`) with
-/// what it gave, and how each goes (done, unless an answer for it was queued: `{"throw": "why"}`).
+/// what it gave, and how each goes (done, unless an answer for it was queued: `{"throw": "why"}`). Each counted as a
+/// call among the stand-ins' (`Faults`): a sweep fails it (Cloudflare's container service failing) or drops it.
 #[derive(Clone)]
 pub struct Containers { pub url: String, ops: Arc<Mutex<Vec<(String, Value)>>>, answers: Arc<Mutex<VecDeque<(String, Value)>>> }
 
 impl Containers {
-    fn serve() -> Containers {
+    fn serve(faults: Faults) -> Containers {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let c = Containers { url: format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port()), ops: Arc::default(), answers: Arc::default() };
         let me = c.clone();
@@ -72,7 +74,11 @@ impl Containers {
             let mut body = vec![0; len];
             let _ = r.read_exact(&mut body);
             me.ops.lock().unwrap().push((op.clone(), serde_json::from_slice(&body).unwrap_or_default()));
-            let answer = { let mut a = me.answers.lock().unwrap(); a.iter().position(|(o, _)| *o == op).and_then(|i| a.remove(i)).map(|(_, v)| v).unwrap_or(json!({})) };
+            let answer = match faults.call(format!("container {op}")) {
+                Some(true) => continue,
+                Some(false) => json!({ "throw": "Cloudflare's container service failed" }),
+                None => { let mut a = me.answers.lock().unwrap(); a.iter().position(|(o, _)| *o == op).and_then(|i| a.remove(i)).map(|(_, v)| v).unwrap_or(json!({})) }
+            };
             let answer = answer.to_string();
             let mut stream = stream;
             let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}", answer.len()).as_bytes());
@@ -114,7 +120,7 @@ impl Worker {
         let github = GitHub::default();
         *aws.github.lock().unwrap() = Some(github.clone());
         *github.aws.lock().unwrap() = Some(aws.clone());
-        let containers = Containers::serve();
+        let containers = Containers::serve(aws.faults.clone());
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!("superci-worker-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -131,17 +137,27 @@ impl Worker {
         // (Its secrets, as `wrangler dev` reads them beside its settings.)
         let vars: String = settings.iter().map(|(k, v)| { assert!(!v.contains('\'')); format!("{k}='{v}'\n") }).collect();
         std::fs::write(dir.join(".dev.vars"), vars).unwrap();
-        let port = free_port();
-        let log = std::fs::File::create(dir.join("log")).unwrap();
-        use std::os::unix::process::CommandExt;
-        let child = Command::new("npx").args(["-y", WRANGLER, "dev", "--local", "--ip", "127.0.0.1", "--port", &port.to_string(), "--inspector-port", &free_port().to_string(), "--persist-to"])
-            .arg(dir.join("state")).current_dir(&dir).env("WRANGLER_SEND_METRICS", "false").env("NO_COLOR", "1").env("CI", "1")
-            .stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).process_group(0).spawn().unwrap();
-        let url = format!("http://127.0.0.1:{port}");
-        *aws.plane_url.lock().unwrap() = url.clone();
-        let w = Worker { child, url, dir, aws, github, containers };
-        let until = Instant::now() + Duration::from_secs(120);
-        while !w.log().contains("Ready on") { assert!(Instant::now() < until, "wrangler did not start:\n{}", w.log()); std::thread::sleep(Duration::from_millis(200)) }
+        // (Its ports picked free, then taken by wrangler: one taken meanwhile by another test's, started again on others.)
+        let mut tries = 0;
+        let w = loop {
+            let port = free_port();
+            let log = std::fs::File::create(dir.join("log")).unwrap();
+            use std::os::unix::process::CommandExt;
+            let child = Command::new("npx").args(["-y", WRANGLER, "dev", "--local", "--ip", "127.0.0.1", "--port", &port.to_string(), "--inspector-port", &free_port().to_string(), "--persist-to"])
+                .arg(dir.join("state")).current_dir(&dir).env("WRANGLER_SEND_METRICS", "false").env("NO_COLOR", "1").env("CI", "1")
+                .stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).process_group(0).spawn().unwrap();
+            let url = format!("http://127.0.0.1:{port}");
+            let w = Worker { child, url, dir: dir.clone(), aws: aws.clone(), github: github.clone(), containers: containers.clone() };
+            let until = Instant::now() + Duration::from_secs(120);
+            while !w.log().contains("Ready on") && !w.log().contains("Address already in use") { assert!(Instant::now() < until, "wrangler did not start:\n{}", w.log()); std::thread::sleep(Duration::from_millis(200)) }
+            if !w.log().contains("Address already in use") { break w }
+            tries += 1;
+            assert!(tries < 5, "wrangler found no port free:\n{}", w.log());
+            // (Ended without its folder going: the next start keeps it.)
+            let mut w = w;
+            w.dir = PathBuf::new();
+        };
+        *w.aws.plane_url.lock().unwrap() = w.url.clone();
         Some(w)
     }
 
@@ -169,6 +185,37 @@ impl Worker {
         let until = Instant::now() + Duration::from_secs(30);
         while !f() { assert!(Instant::now() < until, "{what}:\n{}", self.log()); std::thread::sleep(Duration::from_millis(100)) }
     }
+}
+
+/// What a run broke that must hold whatever fails: the Worker panicking (wasm's `unreachable`), the runtime saying
+/// what it did not catch.
+fn broke(w: &Worker) -> Vec<String> {
+    w.log().lines().filter(|l| l.contains("panicked at") || l.contains("RuntimeError") || l.contains("Uncaught")).map(str::to_string).collect()
+}
+
+/// A Worker's scenario run clean, then once for each call it made (to the stand-ins, and to its runners' containers),
+/// that one failing (answered with its service's error, and dropped), a Worker of its own each time: held to what must
+/// hold whatever fails (nothing panics; and the scenario's own checks: what it returns). The clean run alone unless
+/// `SUPERCI_SWEEP_FAULTS=1`, and this run's slice of the faults (`SUPERCI_SWEEP_SLICE`), as every sweep.
+pub fn sweep(name: &str, start: impl Fn() -> Option<Worker>, scenario: impl Fn(&Worker) -> Vec<String>) {
+    let run = |fault: Fault| -> Option<(Vec<String>, usize)> {
+        let w = start()?;
+        w.aws.faults.arm(fault);
+        let mut problems = scenario(&w);
+        problems.extend(broke(&w));
+        Some((problems, w.aws.faults.calls().len()))
+    };
+    let Some((problems, calls)) = run(Fault::None) else { return };
+    assert!(problems.is_empty(), "{name}, clean: {}", problems.join("\n  "));
+    if std::env::var("SUPERCI_SWEEP_FAULTS").ok().as_deref() != Some("1") { return }
+    let (k0, n) = crate::sweep::slice();
+    let faults: Vec<Fault> = (1..=calls).flat_map(|k| [Fault::Call(k), Fault::Dropped(k)]).enumerate().filter(|(i, _)| i % n == k0 - 1).map(|(_, f)| f).collect();
+    let mut broken = vec![];
+    for f in faults {
+        let Some((problems, _)) = run(f) else { return };
+        if !problems.is_empty() { broken.push(format!("{f}: {}", problems.join("\n    "))) }
+    }
+    assert!(broken.is_empty(), "{name}: {} of the faults broke it:\n  {}", broken.len(), broken.join("\n  "));
 }
 
 /// `build/index.js` of a crate (`CARGO_MANIFEST_DIR`).
