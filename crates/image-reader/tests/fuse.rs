@@ -52,7 +52,7 @@ fn an_image_is_shown_from_its_pieces_and_mounted_as_a_machine_mounts_it() {
     std::fs::copy(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/reader.sh"), t.join("test.sh")).unwrap();
     // Packed there (squashfs-tools in the container), then read as on a machine.
     let script = "set -e; apt-get update -qq >/dev/null && apt-get install -y -qq squashfs-tools python3-minimal >/dev/null; mksquashfs /t/tree /t/small.sqsh -comp zstd -b 131072 -noappend -quiet -no-progress >/dev/null; \
-        /t/reader pack /t/small.sqsh /t/out --piece 1048576 --hot /t/hot.json --reader /t/reader >/dev/null; bash /t/test.sh";
+        /t/reader pack /t/small.sqsh /t/out --piece 1048576 --hot /t/hot.json --reader /t/reader >/dev/null; timeout 900 bash /t/test.sh";
     let mut args: Vec<String> = ["run", "--rm", "--privileged", "-v", &format!("{}:/t", t.display())].iter().map(|s| s.to_string()).collect();
     args.extend(measured());
     // (Ubuntu 26.04: a C library as new as the one the program was built against, as machines have.)

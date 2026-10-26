@@ -11,21 +11,27 @@ mkdir -p /srv/hotroot && cp -r /srv/out/$PIN /srv/hotroot/$PIN && echo '[5,6,7]'
 (cd /srv && python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &)
 sleep 1
 pass=0; fail=0
-ok() { if [ "$2" = "$3" ]; then echo "ok   $1"; pass=$((pass+1)); else echo "FAIL $1: got '$2', expected '$3'"; fail=$((fail+1)); fi; }
+ok() { if [ "$2" = "$3" ]; then echo "ok   $1 (${SECONDS} s)"; pass=$((pass+1)); else echo "FAIL $1 (${SECONDS} s): got '$2', expected '$3'"; fail=$((fail+1)); fi; }
 start_at() { # address, cache name, extra args
   mkdir -p /mnt/$2/file /mnt/$2/lower /mnt/$2/cache
   /t/reader "$1" /mnt/$2/file /mnt/$2/cache "${@:3}" > /mnt/$2/log 2>&1 &
   echo $! > /mnt/$2/pid
   for i in $(seq 1 100); do ls /mnt/$2/file/* >/dev/null 2>&1 && break; sleep 0.05; done
-  mount -t squashfs -o loop,ro /mnt/$2/file/* /mnt/$2/lower 2>/mnt/$2/mounterr
+  timeout 60 mount -t squashfs -o loop,ro /mnt/$2/file/* /mnt/$2/lower 2>/mnt/$2/mounterr
 }
 start() { start_at "http://127.0.0.1:8000/$1/$PIN" "${@:2}"; } # root dir, cache name, extra args
 # (Unmounted: the reader ends, saying how.)
-finish() { umount /mnt/$1/lower 2>/dev/null; umount /mnt/$1/file 2>/dev/null; wait "$(cat /mnt/$1/pid)"; echo $?; }
+# (Each step bounded: a hang ends, said, rather than holding the whole test.)
+finish() {
+  local p; p=$(cat /mnt/$1/pid)
+  umount /mnt/$1/lower 2>/dev/null; umount /mnt/$1/file 2>/dev/null || umount -l /mnt/$1/file 2>/dev/null
+  for i in $(seq 1 100); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+  kill -9 "$p" 2>/dev/null; wait "$p"; echo $?
+}
 # (How a start that cannot go on ends: its code, and what it said, on one line.)
-stops() { /t/reader "$@" > /mnt/c/stop 2>&1; echo "$? $(tr '\n' ' ' < /mnt/c/stop | head -c 600)"; }
+stops() { timeout 60 /t/reader "$@" > /mnt/c/stop 2>&1; echo "$? $(tr '\n' ' ' < /mnt/c/stop | head -c 600)"; }
 # (Each file by itself: some sha256sum stop at the first file they cannot read.)
-sums() { (cd /mnt/$1/lower && find . -type f | sort | while read -r f; do sha256sum "$f" 2>&1; done); }
+sums() { (cd /mnt/$1/lower && find . -type f | sort | while read -r f; do timeout 120 sha256sum "$f" 2>&1; done); }
 stat_of() { sleep 1.2; python3 -c "import json,sys; print(json.load(open('/mnt/$1/cache/stats.json')).get('$2'))"; }
 
 # 1. As published: every file reads as it was packed; each piece checked; the hot list fetched.
