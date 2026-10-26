@@ -702,7 +702,7 @@ fn launch_rooted(prefix: &[&str], dir: &std::path::Path, containerd: &std::path:
 /// store (as `setup` makes a machine's): its socket.
 fn own_containerd(prefix: &[&str], dir: &std::path::Path) -> Option<(Child, std::path::PathBuf)> {
     if !Command::new("containerd").arg("--version").output().is_ok_and(|o| o.status.success()) { return None }
-    let socket = dir.join("containerd.sock");
+    let socket = dir.join("c.sock");
     // (Without CRI, which this containerd has no use for and whose fixed port one left running would hold.)
     let config = superci_layers::setup::containerd_config("version = 2\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n").unwrap().replace("/run/superci-layers.sock", dir.join("layers.sock").to_str().unwrap());
     std::fs::write(dir.join("containerd.toml"), config).unwrap();
@@ -739,8 +739,9 @@ async fn a_layer_from_the_store_is_served_and_mounted_again_after_a_restart() {
     let mut third = entry(&d3, tar3.len(), &erofs3, true);
     third.as_object_mut().unwrap().remove("usage");
     let index = serde_json::json!({ "layers": { &d: entry(&d, tar.len(), &erofs, false), &d2: entry(&d2, tar2.len(), &erofs2, true), &d3: third, &d4: entry(&d4, tar4.len(), &erofs4, true) }, "refresh": { "url": format!("{at}/links"), "token": "" } });
-    // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself, which tmpfs is not.)
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("superci-layers-served-{}", std::process::id()));
+    // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself, which tmpfs is not. Short
+    // names: the folder may be deep, as a coverage tool's is, and containerd takes no socket path over 104 bytes.)
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sl-{}", std::process::id()));
     let _ = rooted(&prefix, "rm").arg("-rf").arg(&dir).status();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("index.json"), index.to_string()).unwrap();

@@ -280,7 +280,7 @@ fn start_rooted(prefix: &[&str], dir: &std::path::Path, fault: Option<usize>, co
     let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log")).unwrap();
     let mut child = rooted(prefix, env!("CARGO_BIN_EXE_superci-layers"), &env)
         .args([format!("--root={}", dir.join("root").display()), format!("--content={}", dir.join("content").display()), format!("--socket={}", socket.display()),
-            format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("containerd.sock").display()), "--parallel=2".into()])
+            format!("--index={}", dir.join("index.json").display()), format!("--containerd={}", dir.join("c.sock").display()), "--parallel=2".into()])
         .stderr(log).spawn().unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     while !socket.exists() {
@@ -358,10 +358,10 @@ fn own_containerd(prefix: &[&str], dir: &std::path::Path) -> Option<Child> {
     std::fs::write(dir.join("containerd.toml"), config).unwrap();
     let mut c = Command::new(prefix.first().copied().unwrap_or("containerd"));
     if !prefix.is_empty() { c.args(&prefix[1..]).arg("containerd"); }
-    let child = c.args(["--config".as_ref(), dir.join("containerd.toml").as_os_str(), "--address".as_ref(), dir.join("containerd.sock").as_os_str(), "--root".as_ref(), dir.join("containerd-root").as_os_str(), "--state".as_ref(), dir.join("containerd-state").as_os_str()])
+    let child = c.args(["--config".as_ref(), dir.join("containerd.toml").as_os_str(), "--address".as_ref(), dir.join("c.sock").as_os_str(), "--root".as_ref(), dir.join("containerd-root").as_os_str(), "--state".as_ref(), dir.join("containerd-state").as_os_str()])
         .stdout(std::process::Stdio::null()).stderr(std::fs::File::create(dir.join("containerd.log")).unwrap()).spawn().ok()?;
     let until = Instant::now() + Duration::from_secs(20);
-    while !dir.join("containerd.sock").exists() {
+    while !dir.join("c.sock").exists() {
         assert!(Instant::now() < until, "containerd did not start:\n{}", std::fs::read_to_string(dir.join("containerd.log")).unwrap_or_default().lines().rev().take(20).collect::<Vec<_>>().join("\n"));
         std::thread::sleep(Duration::from_millis(20))
     }
@@ -379,8 +379,9 @@ async fn the_served_store_holds_with_each_call_and_store_operation_failing() {
     // (A fault for the first program, and one for it restarted: each step of each swept, the other one's run whole.)
     let run = |first: Option<usize>, fault: Option<usize>| { let (prefix, index, d) = (prefix.clone(), index.clone(), d.clone()); async move {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself.)
-        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sl-served-sweep-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        // (On disk: the kernel mounts an EROFS file from a filesystem that reads pages itself. Short names: the
+        // folder may be deep, as a coverage tool's is, and containerd takes no socket path over 104 bytes.)
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sl-s-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.json"), index.to_string()).unwrap();
         let count = dir.join("count");
