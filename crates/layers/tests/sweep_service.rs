@@ -310,6 +310,9 @@ async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Chi
     let socket = dir.join("layers.sock");
     let layer = |key: &str, chain: &str| sapi::PrepareSnapshotRequest { key: key.into(), labels: [("containerd.io/snapshot.ref".to_string(), chain.to_string()),
         ("containerd.io/snapshot/cri.layer-digest".to_string(), d.to_string()), ("containerd.io/snapshot/cri.image-layers".to_string(), format!(",{d},sha256:{}", "e".repeat(64)))].into_iter().collect(), ..Default::default() };
+    // (Its layer fetched ahead first, said in its log either way: each step then the same one in every run.)
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until && !std::fs::read_to_string(dir.join("log")).unwrap_or_default().contains("fetched ahead") { tokio::time::sleep(Duration::from_millis(20)).await }
     for round in 0..2 {
         let Ok(ch) = step("connect", superci_layers::client::channel(&socket)).await? else { return Ok(()) };
         let mut s = sapi::snapshots_client::SnapshotsClient::new(ch.clone());
@@ -334,9 +337,11 @@ async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Chi
     let ch = step("connect", superci_layers::client::channel(&socket)).await?.map_err(|e| e.to_string())?;
     let mut s = sapi::snapshots_client::SnapshotsClient::new(ch);
     for k in ["moby/0/top", "moby/1/top", "moby/0/c/superci-layers", "moby/1/c/superci-layers", "moby/0/a/superci-layers", "moby/1/a/superci-layers"] { let _ = step("remove", s.remove(sapi::RemoveSnapshotRequest { key: k.into(), ..Default::default() })).await?; }
-    // Restarted once more, with no fault: what a removal under one left is put right; then cleaned up.
+    // Restarted once more (the fault its own too): what a removal under one left is put right; then cleaned up, the
+    // removed layers' files unmounted.
     stop_rooted(prefix, child);
-    if let Some(next) = start_rooted(prefix, dir, None, count) { *child = next }
+    let Some(next) = start_rooted(prefix, dir, fault, count) else { return Ok(()) };
+    *child = next;
     let ch = step("connect", superci_layers::client::channel(&socket)).await?.map_err(|e| e.to_string())?;
     let _ = step("cleanup", sapi::snapshots_client::SnapshotsClient::new(ch).cleanup(sapi::CleanupRequest::default())).await?;
     Ok(())

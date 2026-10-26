@@ -145,6 +145,7 @@ fn main() {
         eprintln!("superci-layers: answering on {}", a.socket.display());
         notify_ready();
         layers.fetch_ahead();
-        if let Err(e) = server.await.map_err(|e| e.to_string()).and_then(superci_layers::faults::said) { eprintln!("superci-layers: {e}"); std::process::exit(1) }
+        let failed = server.await.as_ref().err().map(ToString::to_string).or_else(|| superci_layers::faults::said(()).err());
+        if let Some(e) = failed { eprintln!("superci-layers: {e}"); std::process::exit(1) }
     });
 }

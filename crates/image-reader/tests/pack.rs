@@ -68,10 +68,52 @@ fn what_pack_refuses_is_said() {
         (vec![d.join("none.img").to_str().unwrap(), o], "none.img"),
         (vec![small.to_str().unwrap(), o, "--piece", "65536", "--hot", bad.to_str().unwrap()], "bad.json"),
         (vec![small.to_str().unwrap(), o, "--piece", "65536", "--reader", d.join("no-reader").to_str().unwrap()], "no-reader"),
+        (vec!["/", o], "the image file has no name"),
+        // (A folder for the image: it opens, and cannot be read.)
+        (vec![d.to_str().unwrap(), o, "--piece", "65536"], d.to_str().unwrap()),
+        (vec![small.to_str().unwrap(), small.to_str().unwrap(), "--piece", "65536"], ".packing"),
     ] {
         let (ok, got) = pack(&args);
         assert!(!ok && got.contains(said), "{args:?}: {got}");
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Where the pieces, what goes beside them or the finished directory cannot be written: said. (As another user than
+/// root: folders it may not write in, left from before, that it cannot clear.)
+#[cfg(unix)]
+#[test]
+fn what_pack_cannot_write_is_said() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 { eprintln!("root writes anywhere: skipped"); return }
+    let d = dir("unwritable");
+    std::fs::write(d.join("small.img"), vec![1u8; 70_000]).unwrap();
+    let small = d.join("small.img").to_str().unwrap().to_string();
+    let mode = |p: &std::path::Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    // The pieces' folder left, not writable (nor, with a file in it, taken away).
+    let out = d.join("pieces");
+    std::fs::create_dir_all(out.join(".packing/p")).unwrap();
+    std::fs::write(out.join(".packing/p/x"), b"").unwrap();
+    mode(&out.join(".packing/p"), 0o555);
+    let (ok, got) = pack(&[&small, out.to_str().unwrap(), "--piece", "65536"]);
+    assert!(!ok && got.contains("Permission denied"), "{got}");
+    mode(&out.join(".packing/p"), 0o755);
+    // The folder the index goes in left, not writable (its pieces' folder in it, so it is not taken away).
+    let out = d.join("beside");
+    std::fs::create_dir_all(out.join(".packing/p")).unwrap();
+    mode(&out.join(".packing"), 0o555);
+    let (ok, got) = pack(&[&small, out.to_str().unwrap(), "--piece", "65536"]);
+    assert!(!ok && got.contains("index.json") && got.contains("Permission denied"), "{got}");
+    mode(&out.join(".packing"), 0o755);
+    // A file where the finished directory goes.
+    let out = d.join("taken");
+    let (ok, said) = pack(&[&small, out.to_str().unwrap(), "--piece", "65536"]);
+    assert!(ok, "{said}");
+    let to = said.lines().next().unwrap().to_string();
+    std::fs::remove_dir_all(&to).unwrap();
+    std::fs::write(&to, b"a file").unwrap();
+    let (ok, got) = pack(&[&small, out.to_str().unwrap(), "--piece", "65536"]);
+    assert!(!ok && got.contains(&to), "{got}");
     let _ = std::fs::remove_dir_all(&d);
 }
 

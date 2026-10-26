@@ -328,12 +328,12 @@ fn write_session(l: &Layers, mut stream: tonic::Streaming<capi::WriteContentRequ
             }
             Err(_) => {}
         }
-        if tx.blocking_send(Ok(msg.clone())).is_err() { return Err(Status::cancelled("the caller went away")) }
+        // (A caller gone has reset the write: its next message is that error.)
+        let _ = tx.blocking_send(Ok(msg.clone()));
         if req.action == capi::WriteAction::Commit as i32 { return Ok(()) }
-        req = match handle.block_on(stream.message()) {
-            Ok(Some(m)) => m,
-            Ok(None) => return Ok(()),
-            Err(e) => return Err(e),
-        };
+        // (Ended by the caller, or reset: the session is over, saying which.)
+        let next = handle.block_on(stream.message());
+        let Ok(Some(m)) = next else { return next.map(drop) };
+        req = m;
     }
 }

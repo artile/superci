@@ -96,7 +96,8 @@ fn pack(args: &[String]) -> Result<String, String> {
     let piece: u64 = match flag("--piece") { Some(p) => p.parse().map_err(|_| "--piece: a number of bytes")?, None => 4 * 1024 * 1024 };
     let name = std::path::Path::new(file).file_name().and_then(|n| n.to_str()).ok_or("the image file has no name")?.to_string();
     let mut input = std::fs::File::open(file).map_err(|e| format!("{file}: {e}"))?;
-    let size = input.metadata().map_err(|e| e.to_string())?.len();
+    // (An open file's size: fstat, which does not fail on one.)
+    let size = input.metadata().expect("an open file's size").len();
     let staging = format!("{out}/.packing");
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(format!("{staging}/p")).map_err(|e| format!("{staging}: {e}"))?;
@@ -109,23 +110,26 @@ fn pack(args: &[String]) -> Result<String, String> {
         std::fs::write(format!("{staging}/p/{i:06}"), &buf[..want]).map_err(|e| e.to_string())?;
     }
     let mut index = serde_json::json!({ "name": name, "size": size, "piece": piece, "sha256": sums });
+    // (What goes beside the pieces, written once the index is known to be one.)
+    let mut beside: Vec<(&str, Vec<u8>)> = vec![];
     if let Some(hot) = flag("--hot") {
         // As recorded (`--record`): piece numbers, kept in order, each once, only ones the image has.
         let list: Vec<u64> = serde_json::from_slice(&std::fs::read(&hot).map_err(|e| format!("{hot}: {e}"))?).map_err(|e| format!("{hot}: {e}"))?;
         let mut seen = std::collections::HashSet::new();
         let list: Vec<u64> = list.into_iter().filter(|i| *i < sums.len() as u64 && seen.insert(*i)).collect();
-        let body = serde_json::to_vec(&list).map_err(|e| e.to_string())?;
+        let body = serde_json::to_vec(&list).expect("numbers as JSON");
         index["hot"] = sha256_hex(&body).into();
-        std::fs::write(format!("{staging}/hot.json"), body).map_err(|e| e.to_string())?;
+        beside.push(("hot.json", body));
     }
     if let Some(reader) = flag("--reader") {
         let body = std::fs::read(&reader).map_err(|e| format!("{reader}: {e}"))?;
         index["readers"] = serde_json::json!({ "x86_64": sha256_hex(&body) });
-        std::fs::write(format!("{staging}/reader-x86_64"), body).map_err(|e| e.to_string())?;
+        beside.push(("reader-x86_64", body));
     }
-    let body = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec(&index).expect("an index as JSON");
     Index::parse(&body)?;
-    std::fs::write(format!("{staging}/index.json"), &body).map_err(|e| e.to_string())?;
+    beside.push(("index.json", body.clone()));
+    for (name, b) in beside { std::fs::write(format!("{staging}/{name}"), b).map_err(|e| format!("{staging}/{name}: {e}"))? }
     let pin = &sha256_hex(&body)[..32];
     let to = format!("{out}/{pin}");
     let _ = std::fs::remove_dir_all(&to);
@@ -186,7 +190,7 @@ mod linux {
     impl Drop for Hold<'_> {
         fn drop(&mut self) {
             let mut s = self.shared.state.lock().unwrap();
-            for i in self.first..=self.last { s.held[i as usize] = s.held[i as usize].saturating_sub(1) }
+            (self.first..=self.last).for_each(|i| s.held[i as usize] = s.held[i as usize].saturating_sub(1));
         }
     }
 
@@ -199,20 +203,18 @@ mod linux {
         /// read only: the next read of it tries again.
         fn hold(&self, first: u64, last: u64) -> Result<Hold<'_>, String> {
             let mut s = self.state.lock().unwrap();
-            for i in first..=last { s.held[i as usize] += 1 }
+            (first..=last).for_each(|i| s.held[i as usize] += 1);
             let hold = Hold { shared: self, first, last };
             let mut missing = false;
-            for i in first..=last {
-                match s.pieces[i as usize] {
-                    Piece::Present => {}
-                    Piece::Missing => { s.pieces[i as usize] = Piece::Queued; s.urgent.push_back(i); missing = true }
-                    Piece::Queued => {
-                        // Queued to be fetched later: now.
-                        if let Some(at) = s.later.iter().position(|p| *p == i) { s.later.remove(at); s.urgent.push_back(i) }
-                        missing = true
-                    }
+            (first..=last).for_each(|i| match s.pieces[i as usize] {
+                Piece::Present => {}
+                Piece::Missing => { s.pieces[i as usize] = Piece::Queued; s.urgent.push_back(i); missing = true }
+                Piece::Queued => {
+                    // Queued to be fetched later: now.
+                    if let Some(at) = s.later.iter().position(|p| *p == i) { s.later.remove(at); s.urgent.push_back(i) }
+                    missing = true
                 }
-            }
+            });
             if !missing { return Ok(hold) }
             self.asked_pieces.fetch_add(1, Ordering::Relaxed);
             for i in last + 1..(last + 1 + self.ahead).min(self.count()) {
@@ -262,10 +264,11 @@ mod linux {
             res.into_body().into_reader().take(want as u64 + 1).read_to_end(&mut body).map_err(|e| e.to_string())?;
             if body.len() != want { return Err(format!("{} bytes, expected {want}", body.len())) }
             if let Some(sums) = &self.index.sums { if sha256_hex(&body) != sums[i as usize] { return Err("not what the index says it is (its checksum differs)".into()) } }
-            // A full disk: the oldest pieces give way, once.
+            // A full disk: the oldest pieces give way, once (what was written of this one given back first, each time).
             if self.cache.write_all_at(&body, i * self.index.piece).is_err() {
+                self.punch(i);
                 self.make_room(&mut self.state.lock().unwrap(), true);
-                self.cache.write_all_at(&body, i * self.index.piece).map_err(|e| format!("kept nowhere: {e}"))?;
+                self.cache.write_all_at(&body, i * self.index.piece).map_err(|e| { self.punch(i); format!("kept nowhere: {e}") })?;
             }
             self.fetched_bytes.fetch_add(want as u64, Ordering::Relaxed);
             self.fetched_pieces.fetch_add(1, Ordering::Relaxed);
@@ -275,8 +278,14 @@ mod linux {
         /// Free space on the cache's disk.
         fn free(&self) -> u64 {
             let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstatvfs(self.cache.as_raw_fd(), &mut st) } != 0 { return u64::MAX }
+            // (Of an open file, it does not fail.)
+            unsafe { libc::fstatvfs(self.cache.as_raw_fd(), &mut st) };
             st.f_bavail as u64 * st.f_frsize as u64
+        }
+
+        /// A piece's blocks given back to the disk; the file keeps its size.
+        fn punch(&self, i: u64) {
+            unsafe { libc::fallocate(self.cache.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, (i * self.index.piece) as libc::off_t, self.len_of(i) as libc::off_t) };
         }
 
         /// Drops the pieces fetched longest ago (not ones a read holds) while the disk is short of free space or the
@@ -284,14 +293,13 @@ mod linux {
         fn make_room(&self, s: &mut State, hard: bool) {
             let target = if hard { s.kept_bytes / 2 } else { u64::MAX };
             let mut passed = 0;
-            while passed < s.kept.len() && (s.kept_bytes > self.max || s.kept_bytes > target || (s.kept_bytes > 0 && self.free() < self.keep_free)) {
-                let Some(i) = s.kept.pop_front() else { break };
+            while passed < s.kept.len() && (s.kept_bytes > self.max || s.kept_bytes > target || self.free() < self.keep_free) {
+                // (Something is kept while fewer than all were passed over.)
+                let i = s.kept.pop_front().expect("a piece kept");
                 if s.held[i as usize] > 0 { s.kept.push_back(i); passed += 1; continue }
-                let len = self.len_of(i);
-                // The piece's blocks go back to the disk; the file keeps its size.
-                unsafe { libc::fallocate(self.cache.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, (i * self.index.piece) as libc::off_t, len as libc::off_t) };
+                self.punch(i);
                 s.pieces[i as usize] = Piece::Missing;
-                s.kept_bytes -= len;
+                s.kept_bytes -= self.len_of(i);
                 self.dropped_pieces.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -309,48 +317,51 @@ mod linux {
     impl Filesystem for Fs {
         fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
             // The kernel reads ahead generously (a piece is several megabytes anyway): as far as it lets us ask.
-            if let Err(most) = config.set_max_readahead(4 * 1024 * 1024) { let _ = config.set_max_readahead(most); }
+            // (Asked for more than it allows, it says the most it allows.)
+            let most = config.set_max_readahead(4 * 1024 * 1024).unwrap_or_else(|most| most);
+            let _ = config.set_max_readahead(most);
             Ok(())
         }
-        fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-            if parent.0 == ROOT && name.to_str() == Some(self.name.as_str()) { reply.entry(&TTL, &self.attr(IMAGE), Generation(0)) } else { reply.error(Errno::ENOENT) }
+        // (The kernel asks only of what it was told of: the folder, which is the only one, and the image in it.)
+        fn lookup(&self, _req: &Request, _parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+            if name.to_str() == Some(self.name.as_str()) { reply.entry(&TTL, &self.attr(IMAGE), Generation(0)) } else { reply.error(Errno::ENOENT) }
         }
         fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-            if ino.0 == ROOT || ino.0 == IMAGE { reply.attr(&TTL, &self.attr(ino.0)) } else { reply.error(Errno::ENOENT) }
+            reply.attr(&TTL, &self.attr(ino.0))
         }
-        fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
-            if ino.0 != ROOT { return reply.error(Errno::ENOTDIR) }
+        fn readdir(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
             let entries = [(ROOT, FileType::Directory, "."), (ROOT, FileType::Directory, ".."), (IMAGE, FileType::RegularFile, self.name.as_str())];
-            for (i, (ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) { if reply.add(INodeNo(*ino), i as u64 + 1, *kind, name) { break } }
+            // (Added while they fit: what does not is asked for again from where it left off.)
+            let _ = entries.iter().enumerate().skip(offset as usize).all(|(i, (ino, kind, name))| !reply.add(INodeNo(*ino), i as u64 + 1, *kind, name));
             reply.ok()
         }
-        fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        // (A folder is opened with opendir: what is opened is the image.)
+        fn open(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
             // What was read stays in the kernel's page cache.
-            if ino.0 == IMAGE { reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE) } else { reply.error(Errno::EISDIR) }
+            reply.opened(FileHandle(0), FopenFlags::FOPEN_KEEP_CACHE)
         }
-        fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
-            if ino.0 != IMAGE { return reply.error(Errno::EISDIR) }
+        fn read(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
             let shared = self.shared.clone();
-            if offset >= shared.index.size { return reply.data(&[]) }
+            // (The kernel asks for nothing past the end of a file whose size it was told, O_DIRECT or not.)
             let len = (size as u64).min(shared.index.size - offset);
             let (first, last) = (offset / shared.index.piece, (offset + len - 1) / shared.index.piece);
             // Already here: answered at once. Else on a thread of its own, so other reads go on meanwhile.
             let here = {
                 let mut s = self.shared.state.lock().unwrap();
-                for i in first..=last { if !s.seen[i as usize] { s.seen[i as usize] = true; s.used.push(i) } }
+                (first..=last).for_each(|i| if !s.seen[i as usize] { s.seen[i as usize] = true; s.used.push(i) });
                 (first..=last).all(|i| s.pieces[i as usize] == Piece::Present)
             };
-            // The reply travels in a cell: a thread that could not be started hands it back, and it is answered here.
-            let cell = Arc::new(Mutex::new(Some(reply)));
-            let answer = { let cell = cell.clone(); move || {
-                let Some(reply) = cell.lock().unwrap().take() else { return };
+            let answer = move || {
                 let held = match shared.hold(first, last) { Ok(h) => h, Err(e) => { eprintln!("{e}"); return reply.error(Errno::EIO) } };
                 let mut buf = vec![0u8; len as usize];
-                match shared.cache.read_exact_at(&mut buf, offset) { Ok(()) => reply.data(&buf), Err(_) => reply.error(Errno::EIO) }
+                // (Pieces held are in the cache file whole.)
+                shared.cache.read_exact_at(&mut buf, offset).expect("held pieces in the cache");
+                reply.data(&buf);
                 drop(held);
-            } };
+            };
             if here { return answer() }
-            if std::thread::Builder::new().stack_size(256 * 1024).spawn(answer.clone()).is_err() { answer() }
+            // (A program that cannot start threads does not get this far: ureq starts one for each connection.)
+            std::thread::Builder::new().stack_size(256 * 1024).spawn(answer).expect("a thread");
         }
     }
 
@@ -403,9 +414,8 @@ mod linux {
             state: Mutex::new(State { pieces: vec![Piece::Missing; count], urgent: VecDeque::new(), later: VecDeque::new(), used: vec![], seen: vec![false; count], held: vec![0; count], kept: VecDeque::new(), kept_bytes: 0 }),
             changed: Condvar::new(), fetched_bytes: AtomicU64::new(0), fetched_pieces: AtomicU64::new(0), asked_pieces: AtomicU64::new(0), dropped_pieces: AtomicU64::new(0), failed_pieces: AtomicU64::new(0) });
 
-        let mut fetchers = 0;
-        for _ in 0..parallel { let s = shared.clone(); if std::thread::Builder::new().stack_size(512 * 1024).spawn(move || s.fetch_loop()).is_ok() { fetchers += 1 } }
-        if fetchers == 0 { stop("no thread could be started") }
+        // (Threads start, or the program could not have fetched the index: ureq starts one for each connection.)
+        (0..parallel).for_each(|_| { let s = shared.clone(); std::thread::Builder::new().stack_size(512 * 1024).spawn(move || s.fetch_loop()).expect("a thread"); });
 
         // The pieces most jobs need, fetched from the start (after anything asked for); the image does not wait for
         // the list. One the index names is used only if it is that one.
@@ -460,11 +470,18 @@ mod tests {
         let with = |k: &str, v: serde_json::Value| { let mut i = ok.clone(); i[k] = v; i };
         for (bad, why) in [(with("name", "../etc/passwd".into()), "plain file name"), (with("name", ".hidden".into()), "plain file name"), (with("piece", 0.into()), "pieces of 0"),
             (with("piece", (1u64 << 30).into()), "pieces of"), (with("size", 0.into()), "0 bytes"), (with("size", (1u64 << 50).into()), "up to 1 TiB"),
-            (with("sha256", serde_json::json!(["ab"])), "checksums for 3 pieces"), (with("hot", "nope".into()), "checksum that is not one")] {
+            (with("sha256", serde_json::json!(["ab"])), "checksums for 3 pieces"), (with("hot", "nope".into()), "checksum that is not one"),
+            (with("name", "".into()), "plain file name"), (with("name", "a".repeat(101).into()), "plain file name"), (with("name", "a b".into()), "plain file name"),
+            (with("piece", serde_json::Value::Null), "no piece size"), (with("size", serde_json::Value::Null), "no size"),
+            (with("readers", serde_json::json!({ "x86_64": "nope" })), "checksum that is not one"),
+            (with("sha256", serde_json::json!([sha256_hex(b"0"), sha256_hex(b"1"), sha256_hex(b"2"), "not one"])), "4 checksums for 3 pieces")] {
             assert!(parse(&bad).unwrap_err().contains(why), "{bad}");
         }
+        assert!(Index::parse(b"not json").unwrap_err().starts_with("index.json: "));
         let sums: Vec<String> = (0..3).map(|i| sha256_hex(&[i])).collect();
         assert_eq!(parse(&with("sha256", serde_json::json!(sums))).unwrap().sums.unwrap().len(), 3);
+        // (A reader named by something other than a checksum is no reader.)
+        assert!(parse(&with("readers", serde_json::json!({ "x86_64": 1 }))).unwrap().readers.is_empty());
     }
 
     #[test]

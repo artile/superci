@@ -103,9 +103,10 @@ impl Layers {
         drop(t);
         drop(tx);
         for (id, s) in all {
-            if !ids.contains_key(&id) { st.forget(&id).and_then(crate::faults::pass)?; continue }
             let upper = self.overlay.upper(&id);
-            if !overlay::is_mount_point(&upper) {
+            // (One whose snapshot is gone, as a removal cut short leaves it, is not mounted again: it is forgotten
+            // below, as a removal forgets it.)
+            if ids.contains_key(&id) && !overlay::is_mount_point(&upper) {
                 let file = PathBuf::from(&s.file);
                 if !file.exists() {
                     // (The file is gone: fetched again, if the index still has it.)
@@ -119,8 +120,7 @@ impl Layers {
             }
             st.served.lock().unwrap().insert(id, s);
         }
-        st.prune_files();
-        Ok(())
+        self.forget_removed()
     }
 
     /// A new active snapshot; for a layer the store has, the layer served, and containerd told it exists.
@@ -339,10 +339,9 @@ impl StoreSide {
         { tx.open_table(MOUNTS).map_err(db).and_then(crate::faults::pass)?.remove(id).map_err(db).and_then(crate::faults::pass)?; }
         tx.commit().map_err(db).and_then(crate::faults::pass)?;
         let mut served = self.served.lock().unwrap();
-        if let Some(s) = served.remove(id) {
-            // (Its file kept no longer once no snapshot uses its layer.)
-            if !served.values().any(|o| o.digest == s.digest) { self.erofs.lock().unwrap().remove(&s.digest); }
-        }
+        // (Its file kept no longer once no snapshot uses its layer. A removal at the same time may have forgotten it.)
+        let removed = served.remove(id);
+        removed.into_iter().for_each(|s| if !served.values().any(|o| o.digest == s.digest) { self.erofs.lock().unwrap().remove(&s.digest); });
         Ok(())
     }
 

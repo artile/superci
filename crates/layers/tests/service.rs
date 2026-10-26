@@ -131,6 +131,8 @@ async fn its_content_store_is_containerds() {
     assert_eq!(write(&mut c, vec![msg(Write, "ref-3", 0, "", 9, b"x")]).await.unwrap_err().code(), Code::OutOfRange);
     c.abort(capi::AbortRequest { r#ref: "ref-3".into() }).await.unwrap();
     assert_eq!(c.status(capi::StatusRequest { r#ref: "ref-3".into() }).await.unwrap_err().code(), Code::NotFound);
+    // (No write under way now: none listed.)
+    assert!(c.list_statuses(capi::ListStatusesRequest { filters: vec![] }).await.unwrap().into_inner().statuses.is_empty());
     // A commit that is not what it said: refused, nothing kept.
     assert_eq!(write(&mut c, vec![msg(Commit, "ref-4", 3, &digest(b"abd"), 0, b"abc")]).await.unwrap_err().code(), Code::FailedPrecondition);
     // What it refuses to begin with.
@@ -411,6 +413,7 @@ async fn what_containerd_asks_amiss_or_leaves_midway_is_answered_as_containerd_d
     let big = vec![5u8; 9 << 20];
     let d = digest(&big);
     write(&mut content, vec![msg(Commit, "big", big.len() as i64, &d, 0, &big)]).await.unwrap();
+    assert_eq!(content.info(capi::InfoRequest { digest: d.clone() }).await.unwrap().into_inner().info.unwrap().size, big.len() as i64);
     assert!(read_all(&mut content, &d, big.len() as i64, 0).await.unwrap().is_empty());
     let mut r = content.read(capi::ReadContentRequest { digest: d.clone(), offset: 0, size: 0 }).await.unwrap().into_inner();
     let _ = r.message().await;

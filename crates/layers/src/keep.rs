@@ -202,7 +202,8 @@ fn offer(agent: &ureq::Agent, link: &str, content: &Path, offered: Vec<Pulled>, 
 fn upload(agent: &ureq::Agent, content: &Path, digest: &str, a: &Value, until: Instant) -> Result<u64, String> {
     let path = blob_path(content, digest).ok_or("not a digest")?;
     let file = std::fs::File::open(&path).and_then(crate::faults::pass).map_err(|e| format!("{}: {e}", path.display()))?;
-    let size = file.metadata().and_then(crate::faults::pass).map_err(|e| e.to_string())?.len();
+    // (An open file's size: fstat, which does not fail on one.)
+    let size = file.metadata().expect("an open file's size").len();
     let mut req = agent.put(a["url"].as_str().ok_or("no link")?).header("content-length", size.to_string())
         .config().timeout_global(Some(until.saturating_duration_since(Instant::now()).max(Duration::from_secs(1)))).build();
     for (k, v) in a["headers"].as_object().into_iter().flatten() { if let Some(v) = v.as_str() { req = req.header(k.as_str(), v) } }
