@@ -243,7 +243,12 @@ fn unused_ebs() -> Result<Option<String>, String> {
 
 fn fetch_index(url: &str) -> Result<usize, String> {
     let agent = crate::fetch::agent();
-    let res = agent.get(url).call().and_then(crate::faults::pass).map_err(|e| format!("the index: {e}"))?;
+    // (Asked three times: a moment's failure, a signal interrupting it, does not leave the machine without the store.)
+    let mut last = String::new();
+    let res = (0..3).find_map(|n| {
+        if n > 0 { std::thread::sleep(std::time::Duration::from_millis(300)) }
+        agent.get(url).call().and_then(crate::faults::pass).map_err(|e| last = format!("the index: {e}")).ok()
+    }).ok_or(last)?;
     if res.status().as_u16() != 200 { return Err(format!("the index: the control plane answered {}", res.status())) }
     let text = res.into_body().with_config().limit(64 << 20).read_to_string().and_then(crate::faults::pass).map_err(|e| format!("the index: {e}"))?;
     let index: crate::index::Index = serde_json::from_str(&text).map_err(|e| format!("the index: {e}")).and_then(crate::faults::said)?;
