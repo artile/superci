@@ -232,9 +232,12 @@ fn setup_switches_a_machines_docker_to_the_layers_service_and_off_puts_it_back()
         m.sh(if no_file { "rm -f /etc/docker/daemon.json" } else { "echo '{}' > /etc/docker/daemon.json" });
         // (Docker's settings made, then written, last of `setup`'s own steps: the three after start `setup-finish`.
         // Their making failing leaves Docker's file as it was.)
-        let count = m.exec(&[measured_env(), vec!["-e".into(), "SUPERCI_LAYERS_FAULTS=/var/tmp/count".into()]].concat(), &["sh", "-c", &format!("/usr/local/bin/superci-layers setup {index} --disk=none >/dev/null && cat /var/tmp/count")]);
+        // (Its own count, and its `setup-finish` waited for: one left running would write into the next one's.)
+        m.sh("rm -f /run/superci-layers.state");
+        let count = m.exec(&[measured_env(), vec!["-e".into(), format!("SUPERCI_LAYERS_FAULTS=/var/tmp/count-{no_file}")]].concat(), &["sh", "-c", &format!("/usr/local/bin/superci-layers setup {index} --disk=none >/dev/null && cat /var/tmp/count-{no_file}")]);
         let count: usize = String::from_utf8_lossy(&count.stdout).trim().parse().unwrap();
         m.sh("for i in $(seq 240); do [ -s /run/superci-layers.state ] && exit 0; sleep 0.5; done; exit 1");
+        assert!(m.sh("cat /run/superci-layers.state").starts_with("on: ") && count > 4, "{count}: {}", m.sh("cat /run/superci-layers.state"));
         m.back(&stock);
         let (_, state) = m.switch(&["-e".into(), format!("SUPERCI_LAYERS_FAULT={}+", count - 4)], &[index, "--disk=none"]);
         assert!(state.starts_with("off: "), "{state}");
