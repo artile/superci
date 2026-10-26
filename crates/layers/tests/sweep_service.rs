@@ -299,6 +299,8 @@ fn stop_rooted(prefix: &[&str], child: &mut Child) {
     let _ = c.args(["-TERM", &child.id().to_string()]).status();
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until { if let Ok(Some(_)) = child.try_wait() { return } std::thread::sleep(Duration::from_millis(20)) }
+    // (Through sudo, what it started is killed too: killing sudo alone leaves it running.)
+    if !prefix.is_empty() { let _ = Command::new(prefix[0]).args(&prefix[1..]).args(["pkill", "-KILL", "-P", &child.id().to_string()]).status(); }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -351,14 +353,18 @@ async fn served_scenario(prefix: &[&str], dir: &std::path::Path, child: &mut Chi
 /// where there is one.
 fn own_containerd(prefix: &[&str], dir: &std::path::Path) -> Option<Child> {
     if !Command::new("containerd").arg("--version").output().is_ok_and(|o| o.status.success()) { return None }
-    let config = superci_layers::setup::containerd_config("version = 2\n").unwrap().replace("/run/superci-layers.sock", dir.join("layers.sock").to_str().unwrap());
+    // (Without CRI, which this containerd has no use for and whose fixed port one left running would hold.)
+    let config = superci_layers::setup::containerd_config("version = 2\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n").unwrap().replace("/run/superci-layers.sock", dir.join("layers.sock").to_str().unwrap());
     std::fs::write(dir.join("containerd.toml"), config).unwrap();
     let mut c = Command::new(prefix.first().copied().unwrap_or("containerd"));
     if !prefix.is_empty() { c.args(&prefix[1..]).arg("containerd"); }
     let child = c.args(["--config".as_ref(), dir.join("containerd.toml").as_os_str(), "--address".as_ref(), dir.join("containerd.sock").as_os_str(), "--root".as_ref(), dir.join("containerd-root").as_os_str(), "--state".as_ref(), dir.join("containerd-state").as_os_str()])
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().ok()?;
+        .stdout(std::process::Stdio::null()).stderr(std::fs::File::create(dir.join("containerd.log")).unwrap()).spawn().ok()?;
     let until = Instant::now() + Duration::from_secs(20);
-    while !dir.join("containerd.sock").exists() { assert!(Instant::now() < until, "containerd did not start"); std::thread::sleep(Duration::from_millis(20)) }
+    while !dir.join("containerd.sock").exists() {
+        assert!(Instant::now() < until, "containerd did not start:\n{}", std::fs::read_to_string(dir.join("containerd.log")).unwrap_or_default().lines().rev().take(20).collect::<Vec<_>>().join("\n"));
+        std::thread::sleep(Duration::from_millis(20))
+    }
     Some(child)
 }
 

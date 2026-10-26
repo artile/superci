@@ -703,7 +703,8 @@ fn launch_rooted(prefix: &[&str], dir: &std::path::Path, containerd: &std::path:
 fn own_containerd(prefix: &[&str], dir: &std::path::Path) -> Option<(Child, std::path::PathBuf)> {
     if !Command::new("containerd").arg("--version").output().is_ok_and(|o| o.status.success()) { return None }
     let socket = dir.join("containerd.sock");
-    let config = superci_layers::setup::containerd_config("version = 2\n").unwrap().replace("/run/superci-layers.sock", dir.join("layers.sock").to_str().unwrap());
+    // (Without CRI, which this containerd has no use for and whose fixed port one left running would hold.)
+    let config = superci_layers::setup::containerd_config("version = 2\ndisabled_plugins = [\"io.containerd.grpc.v1.cri\"]\n").unwrap().replace("/run/superci-layers.sock", dir.join("layers.sock").to_str().unwrap());
     std::fs::write(dir.join("containerd.toml"), config).unwrap();
     let child = rooted(prefix, "containerd").args(["--config".as_ref(), dir.join("containerd.toml").as_os_str(), "--address".as_ref(), socket.as_os_str(),
         "--root".as_ref(), dir.join("containerd-root").as_os_str(), "--state".as_ref(), dir.join("containerd-state").as_os_str()])
