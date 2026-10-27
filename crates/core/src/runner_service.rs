@@ -176,6 +176,10 @@ pub fn access_token(now_ms: u64) -> String {
     format!("{}.{}.{}", b(json!({ "alg": "RS256", "typ": "JWT" })), b(json!({ "nbf": secs, "iat": secs, "exp": secs + 6 * 3600, "iss": "superci", "aud": "superci" })), crate::crypto::b64url(&crate::crypto::random_bytes(32)))
 }
 
+/// The commit `actions/checkout` is said to resolve to for a run from a computer: none of GitHub's (see
+/// `ActionDownloadInfo`), so that no copy of GitHub's checkout kept on the machine is taken for this service's.
+pub const CHECKOUT_SHA: &str = "5c1c0c4e0000000000000000000000000000c1c0";
+
 /// What runs in place of `actions/checkout` for a run from a computer: the working tree the run was started with,
 /// fetched in its parts from `tree` (an address this job's machine alone has), unpacked where the checkout would
 /// have put the repository, and made one commit, as a checkout of one commit leaves it. It takes every input
@@ -361,13 +365,16 @@ pub async fn answer(store: &dyn Store, id: &str, req: &Request, path: &str) -> R
         Response::new(400, "text/plain", "")
     } else if p.contains("/ActionDownloadInfo/") {
         // Where each action's code is: GitHub's public tarball of it at the version named; `actions/checkout`
-        // is this service's own, which puts the run's working tree in place (see `checkout_tarball`).
+        // is this service's own, which puts the run's working tree in place (see `checkout_tarball`), under a
+        // resolved name of its own: GitHub's image keeps popular actions by their commit (`/opt/actionarchivecache`),
+        // and a checkout named by its commit was taken from there, GitHub's own, which asks for a token.
         let service = job.message["resources"]["endpoints"][0]["url"].as_str().unwrap_or_default().to_string();
         let mut out = serde_json::Map::new();
         for a in body["actions"].as_array().into_iter().flatten() {
             let (name, r) = (a["nameWithOwner"].as_str().unwrap_or_default(), a["ref"].as_str().unwrap_or_default());
-            let tarball = if name.eq_ignore_ascii_case("actions/checkout") { format!("{service}superci/checkout.tar.gz") } else { format!("https://api.github.com/repos/{name}/tarball/{r}") };
-            out.insert(format!("{name}@{r}"), json!({ "nameWithOwner": name, "resolvedNameWithOwner": name, "resolvedSha": r, "ref": r,
+            let ours = name.eq_ignore_ascii_case("actions/checkout");
+            let tarball = if ours { format!("{service}superci/checkout.tar.gz") } else { format!("https://api.github.com/repos/{name}/tarball/{r}") };
+            out.insert(format!("{name}@{r}"), json!({ "nameWithOwner": name, "resolvedNameWithOwner": name, "resolvedSha": if ours { CHECKOUT_SHA } else { r }, "ref": r,
                 "tarballUrl": tarball, "zipballUrl": format!("https://api.github.com/repos/{name}/zipball/{r}") }));
         }
         ok(json!({ "actions": out }))

@@ -13549,6 +13549,14 @@ mod runs_suite_in_browser {
             let (status, _, _) = http(method, &format!("{base}{path}"), body.as_bytes());
             assert!(status < 500, "{method} {path}: {status}");
         }
+        // A checkout named by its commit is this service's all the same, under a commit of its own: GitHub's image
+        // keeps GitHub's checkout by its commit, which the runner would take instead. Other actions keep theirs.
+        let pinned = "de0fac2e4500dabe0009e67214ff5f5447ce83dd";
+        let (_, _, said) = http("POST", &format!("{base}/_apis/distributedtask/hubs/Actions/plans/p/ActionDownloadInfo/1"), format!(r#"{{"actions":[{{"nameWithOwner":"actions/checkout","ref":"{pinned}"}},{{"nameWithOwner":"actions/setup-node","ref":"{pinned}"}}]}}"#).as_bytes());
+        let actions: serde_json::Value = serde_json::from_slice(&said).unwrap();
+        let checkout = &actions["actions"][format!("actions/checkout@{pinned}")];
+        assert!(checkout["resolvedSha"] == superci_core::runner_service::CHECKOUT_SHA && checkout["tarballUrl"].as_str().is_some_and(|u| u.ends_with("superci/checkout.tar.gz")), "{actions}");
+        assert_eq!(actions["actions"][format!("actions/setup-node@{pinned}")]["resolvedSha"], pinned, "{actions}");
         r.take();
         r.finish("succeeded");
         let _ = std::fs::remove_dir_all(&dir);
