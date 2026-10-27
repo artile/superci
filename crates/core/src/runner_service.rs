@@ -220,7 +220,11 @@ inputs:
         set -Eeuo pipefail
         trap 'echo "::error::The checkout stopped at its line $LINENO ($BASH_COMMAND), with status $?."' ERR
         if [ -n "$SUPERCI_REPOSITORY" ] && [ "$SUPERCI_REPOSITORY" != "$GITHUB_REPOSITORY" ]; then echo "::error::A run from a computer has its own working tree only; $SUPERCI_REPOSITORY is not checked out here."; exit 1; fi
-        dir="$GITHUB_WORKSPACE/$SUPERCI_PATH"; mkdir -p "$dir"; cd "$dir"
+        # (Its path as checkout takes it: under the workspace, or a full one inside it.)
+        case "$SUPERCI_PATH" in /*) dir="$SUPERCI_PATH";; *) dir="$GITHUB_WORKSPACE/$SUPERCI_PATH";; esac
+        case "$dir/" in */../*|*/..) dir=/;; "${{GITHUB_WORKSPACE%/}}"/*) ;; *) dir=/;; esac
+        [ "$dir" != / ] || {{ echo "::error::Repository path '$SUPERCI_PATH' is not under '$GITHUB_WORKSPACE'"; exit 1; }}
+        mkdir -p "$dir"; cd "$dir"
         {fetch}
         git init -q . && git add -A && git -c user.name=superci -c user.email=superci@users.noreply.github.com commit -q --no-verify --allow-empty -m "The working tree of a run from a computer"
         echo "The working tree as it was on the computer: $(git ls-files | wc -l | tr -d ' ') files"
@@ -512,6 +516,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(out.status.success(), "{said}");
         assert_eq!((a.as_deref(), gone.as_deref(), marker), (Some("two\n"), Some("back\n"), false), "{said}");
+    }
+
+    /// The checkout's path as GitHub's checkout takes it: one under the workspace, a full one inside it (a workflow
+    /// that puts it in its GOPATH), refused outside it.
+    #[test]
+    fn the_checkout_goes_where_its_path_says_inside_the_workspace_only() {
+        let dir = std::env::temp_dir().join(format!("superci-paths-{}", guid()));
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let action = checkout_action("http://127.0.0.1:9/tree", 0, false);
+        let script: String = action.split("run: |\n").nth(1).unwrap().lines().map(|l| l.strip_prefix("        ").unwrap_or(l)).collect::<Vec<_>>().join("\n");
+        let run = |path: &str| std::process::Command::new("bash").args(["-c", &script]).env("GITHUB_WORKSPACE", &work).env("SUPERCI_PATH", path).env("SUPERCI_REPOSITORY", "").env("GITHUB_REPOSITORY", "acme/app").output().unwrap();
+        let full = work.join("src/github.com/acme/app");
+        for (path, at) in [("sub", work.join("sub")), (full.to_str().unwrap(), full.clone())] {
+            let out = run(path);
+            assert!(out.status.success() && at.join(".git").is_dir(), "{path}: {}", String::from_utf8_lossy(&out.stdout));
+        }
+        let outside = dir.join("elsewhere");
+        let out = run(outside.to_str().unwrap());
+        let said = String::from_utf8_lossy(&out.stdout).into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!out.status.success() && said.contains("is not under") && !outside.exists(), "{said}");
     }
 
     /// The checkout's script run by bash, as the runner runs it, against a control plane that sends each part on to

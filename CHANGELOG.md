@@ -4,6 +4,7 @@ What changed in each version of SuperCI. The dashboard shows the entries your co
 
 ## 0.19.22
 - A run from a computer whose workflow names `actions/checkout` by its commit (`actions/checkout@3d3c42e…`, as security guides advise) checks out the working tree as with a version (`@v4`). GitHub's runner took its own copy of GitHub's checkout, kept on the machine by that commit, which failed asking for a token. Update your control plane for it.
+- A run from a computer whose checkout names a full path inside the workspace (`path: ${{ github.workspace }}/src/github.com/acme/app`, as Go projects do) checks out there, as GitHub's checkout does; one outside the workspace is refused, saying so. The full path was put under the workspace again, so the steps after found no checkout. Update your control plane for it.
 
 ## 0.19.21 — 2026-10-27
 - A spot machine is asked for first among the pools near the cheapest in any of its regions, then in each region whole. When the first region had no room for the cheapest type, its dearer types were asked before the next region's cheap one: a job whose label names `family=c8a+m8a+r8a` got r8a in N. Virginia at three times the price, and Ohio's c8a was never asked. The first region still counts 15% cheaper. Update your control plane for it.
