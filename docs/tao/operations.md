@@ -28,8 +28,9 @@ The dashboard is at https://ci.myremotely.ai/. Only the tailnet can reach it.
 | `feat/modal-workspaces` | PR #6 | Several Modal workspaces, each a pool `modal:<workspace>` with its own monthly limit. `superci login modal --add`. |
 | `fix/modal-client-1.6.3` | PR #7 | Deploys use `modal==1.6.3`. Workspaces on image builder 2026.10 need it. |
 | `feat/modal-function-mode` | PR #9, issue #8 | `superci runners update modal --mode=function\|sandbox`. Jobs run as preemptible Functions at 1/3 of the Sandbox price. A preempted job runs again once, on a Sandbox. |
-| `fix/fast-status` (3eb4878, f822d41, c356926) | no PR yet | Own image in a further workspace (#4 × #6). `/status` reads Dict records in one batch. The CLI waits 30 s for `/status`. |
-| `fix/modal-status-reads` | to open | The fast-status change rebased on upstream `main`. |
+| `fix/fast-status` (3eb4878, f822d41, c356926) | see the next two rows | The integration copy of the next two changes. |
+| `fix/modal-status-reads` | PR #10 | `/status` reads Dict records in one batch. The CLI waits 30 s for `/status` (health stays at 8 s). |
+| `fix/runner-image-in-workspaces` | PR #11, stacked on #4 and #6 | Your own image runs in a further workspace too, with its Secret read there. Only the last commit needs review. |
 
 Issue #3: the dashboard on a remote server cannot finish sign-ins, because the links point to `localhost`.
 
@@ -125,7 +126,7 @@ Modal prices (per second):
 
 ## Open items
 
-- Upstream PRs for `fix/modal-status-reads` and 3eb4878 (#4 × #6).
+- When upstream merges #4 and #6, check that #11 holds only `881eea9`.
 - Start Redis in shard 3, then turn `CI_DB_STAGE` on again.
 - Find what uses 14–15 GB in shards 2 and 3.
 - Check the real cost of Function mode in the Modal bill.
