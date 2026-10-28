@@ -1,4 +1,4 @@
-![Your CI jobs, on your own cloud](https://raw.githubusercontent.com/supercorp-ai/superci/main/superci.jpg)
+![CI on AWS spot. 8.6x cheaper.](https://raw.githubusercontent.com/supercorp-ai/superci/main/superci.jpg)
 
 # SuperCI
 
