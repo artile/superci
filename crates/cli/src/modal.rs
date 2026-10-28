@@ -14,6 +14,10 @@ use crate::Result;
 const API: &str = "https://api.modal.com";
 /// Modal's server knows its own clients only; this one behaves like its Go SDK and says who it is.
 const CLIENT_TYPE: &str = "9";
+/// The Go SDK's release it behaves like, as that SDK says it (`modal-go/<version>`). Modal reads the SDK's version from
+/// it and refuses to create an app for a Go client whose version it cannot read ("Could not determine the SDK
+/// version for client type CLIENT_TYPE_LIBMODAL_GO"): every deploy (control plane, launcher) creates one.
+const LIBMODAL_VERSION: &str = "modal-go/v0.7.3";
 
 mod pb {
     #[derive(Clone, PartialEq, prost::Message)] pub struct Empty {}
@@ -153,7 +157,7 @@ impl Client {
         let set = |m: &mut tonic::metadata::MetadataMap, k: &'static str, v: &str| { if let Ok(v) = MetadataValue::try_from(v) { m.insert(k, v); } };
         set(m, "x-modal-client-type", CLIENT_TYPE);
         set(m, "x-modal-client-version", "1.0.0");
-        set(m, "x-modal-libmodal-version", concat!("superci/", env!("CARGO_PKG_VERSION")));
+        set(m, "x-modal-libmodal-version", LIBMODAL_VERSION);
         set(m, "x-modal-host", "api.modal.com");
         if let Some(s) = &self.session {
             set(m, "x-modal-token-id", &s.token_id);
@@ -410,6 +414,13 @@ mod answers {
     }
 
     fn session() -> Session { Session { token_id: "ak-test".into(), token_secret: "as-test".into(), workspace: "acmeorg".into() } }
+
+    /// Modal creates apps only for a Go client whose version it can read: `modal-go/` and a release, as the Go SDK says.
+    #[test]
+    fn it_says_its_go_sdk_version_as_the_go_sdk_does() {
+        let version = LIBMODAL_VERSION.strip_prefix("modal-go/v").expect("modal-go/v<release>");
+        assert_eq!(version.split('.').filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).count(), 3, "{LIBMODAL_VERSION}");
+    }
 
     #[test]
     fn modals_own_api_is_reached_without_a_stand_in() {
