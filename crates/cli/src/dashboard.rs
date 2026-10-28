@@ -1357,6 +1357,13 @@ impl Dashboard {
         match cloud.split_once(':') { Some((_, w)) => self.modal.iter().chain(&self.modal_others).find(|m| m.workspace == w), None => self.modal.as_ref() }
     }
 
+    /// Deploys the jobs' Modal Functions (one per image) in the workspace of a Modal place in Function mode.
+    fn deploy_jobs(&self, plane: &Plane, cloud: &str, images: &std::collections::BTreeMap<String, superci_core::plane::RunnerImage>) -> Result<()> {
+        let session = self.modal_for(cloud).ok_or_else(|| match cloud.split_once(':') { Some((_, w)) => format!("Sign in with Modal to the workspace {w} first: `superci login modal --add`."), None => "Sign in with Modal first.".to_string() })?;
+        eprintln!("Deploying the jobs' Modal Functions in {} (the first time builds their images there)…", session.workspace);
+        modal::deploy_jobs(session, plane.plane_id(), images)
+    }
+
     /// The same of Modal's.
     fn modal_over(&mut self) {
         (self.modal, self.modal_ended, self.views) = (None, true, None);
@@ -2866,6 +2873,8 @@ impl Dashboard {
             // A Modal control plane starts sandboxes itself: switching them on is one setting.
             ("POST", "/runners/modal-own") => {
                 let plane = self.plane()?;
+                // (In Function mode: its Functions again, for the images there are now.)
+                if let Some(r) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()).filter(|r| r.pool("modal").is_some_and(|p| p.function)) { self.deploy_jobs(&plane, "modal", &r.images)? }
                 self.put_secret(&plane, "CONTAINERS", "on")?;
                 wait_for(plane.url(), &self.status_key, |s| s["containers"] == true);
                 Ok(Response::redirect("/?p=runners"))
@@ -3448,6 +3457,8 @@ impl Dashboard {
                 eprintln!("Deploying the Modal launcher (the first time builds a small image in your workspace)…");
                 let url = modal::deploy_runners(&session, plane.url(), plane.plane_id(), &keys)?;
                 launcher_up(&url);
+                // (In Function mode: its Functions too, for the images there are now.)
+                if let Some(r) = status_soon(plane.url(), &self.status_key).and_then(|s| serde_json::from_value::<Routing>(s["routing"].clone()).ok()).filter(|r| r.pool(&cloud).is_some_and(|p| p.function)) { self.deploy_jobs(&plane, &cloud, &r.images)? }
                 launchers.retain(|a| a.cloud != cloud);
                 launchers.push(superci_core::plane::Launcher { cloud: cloud.clone(), url });
                 self.put_secret(&plane, "LAUNCHERS", &json_text(&launchers))?;
@@ -3824,6 +3835,16 @@ impl Dashboard {
                                 self.shown(&plane, move |s| s["cloudflare_image"].as_str().map(str::to_string) == w)?;
                             }
                         }
+                        // Modal: its jobs as Functions (preemptible, a third of a sandbox's price) or as sandboxes. The
+                        // Functions are deployed first, in that workspace: no job asks for one that is not there.
+                        if field("action") == "pool" && form_has("mode") {
+                            let function = match field("mode").as_str() { "function" => true, "sandbox" => false, _ => return Ok(message(400, "A mode is function or sandbox", "")) };
+                            if superci_core::plane::kind_of(&cloud) != "modal" { return Ok(message(400, "Only Modal has a mode", "Modal's jobs run as sandboxes or as Functions.")) }
+                            if function && !status.as_ref().is_some_and(|s| s["function_mode"] == true) { return Ok(message(409, "Update the control plane first", "Function mode needs a newer control plane: update it on the Control plane page (or `superci planes update`), then set it.")) }
+                            // (Deployed when it is switched on; after that, when images change, see below.)
+                            if function && !order.iter().any(|p| p.cloud == cloud && p.function) { self.deploy_jobs(&plane, &cloud, &routing.images)? }
+                            order.iter_mut().filter(|p| p.cloud == cloud).for_each(|p| p.function = function);
+                        }
                         if field("action") == "pool" {
                             order.iter_mut().filter(|p| p.cloud == cloud).for_each(|p| {
                                 p.max_jobs = field("max").parse().ok().filter(|n| *n > 0 && *n <= 999);
@@ -3834,6 +3855,10 @@ impl Dashboard {
                         routing.default = None;
                     }
                     _ => return Ok(message(400, "Unknown change", "")),
+                }
+                // An image added or changed: each Modal workspace in Function mode gets its Function first.
+                if ["image_add", "image_update"].contains(&field("action").as_str()) {
+                    for p in routing.order.iter().filter(|p| p.function && superci_core::plane::kind_of(&p.cloud) == "modal") { self.deploy_jobs(&plane, &p.cloud, &routing.images)? }
                 }
                 let want = json_value(&routing);
                 self.put_secret(&plane, "ROUTING", &want.to_string())?;
@@ -6004,6 +6029,10 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
         let mut limits = vec![];
         if let Some(n) = p.max_jobs { limits.push(format!("{n} at once")) }
         if let Some(cap) = p.monthly_usd { limits.push(format!("{} of {}", usd(spent), usd(cap))) }
+        // Modal in Function mode: so said, with its preemptions this month (all of Modal's together).
+        if p.function { limits.push("Functions".into()) }
+        let preempted = v.status.as_ref().and_then(|s| s["preempted"]["month"].as_u64()).unwrap_or(0);
+        if p.function && preempted > 0 { limits.push(format!("{preempted} preempted · {} run again", v.status.as_ref().and_then(|s| s["preempted"]["rerun"].as_u64()).unwrap_or(0))) }
         let mut limits = limits.iter().map(|l| format!(r#"<span class="lim">{}</span>"#, esc(l))).collect::<String>();
         limits.push_str(&month_text(&p.cloud, spent, p.monthly_usd.is_none(), cf_month, modal_month));
         rows.push_str(&format!(r#"<li class="pool" draggable="true" data-cloud="{}"><span class="grip" title="Drag to reorder">{ICON_GRIP}</span>{}<span class="pool-main"><strong>{}</strong><small>{}</small></span><span class="pool-now">{limits}{state}</span><button type="button" class="icon-btn" aria-label="{} settings" onclick="document.getElementById('pool-{i}').showModal()">{ICON_GEAR}</button></li>"#,
@@ -6019,6 +6048,11 @@ fn pools_card(v: &PlaneView, quotas: &HashMap<String, Result<u32>>, cf_month: Op
                 let best = closest(Some(v));
                 let opts = CF_LOCATIONS.iter().map(|(k, name)| format!(r#"<option value="{k}"{}>{name}{}</option>"#, if *k == current { " selected" } else { "" }, if *k == "enam" { format!(" · {best}") } else { String::new() })).collect::<String>();
                 format!(r#"<label class="field"><span>Location</span><select name="location">{opts}</select><small>Where its containers start. Cloudflare places each one; this is the area it starts in.</small></label>"#)
+            } else if superci_core::plane::kind_of(&p.cloud) == "modal" && v.status.as_ref().is_some_and(|s| s["function_mode"] == true) {
+                // Modal: its jobs as sandboxes or as Functions.
+                let opt = |m: &str, name: &str, on: bool| format!(r#"<option value="{m}"{}>{name}</option>"#, if on { " selected" } else { "" });
+                format!(r#"<label class="field"><span>Runs jobs as</span><select name="mode">{}{}</select><small>A Function costs a third of a sandbox. Modal may preempt it: its job is then run again on a sandbox once its run has finished.</small></label>"#,
+                    opt("sandbox", "Sandboxes", !p.function), opt("function", "Functions (preemptible)", p.function))
             } else { String::new() };
         // (Taking it out keeps its settings; nothing is deleted anywhere.)
         let take_out = r#"<button type="button" class="button secondary sm" style="margin-right:auto" onclick="var f=this.form;f.elements.action.value='take_out';f.requestSubmit()">Take out of the order</button>"#;
@@ -9921,6 +9955,29 @@ mod rest_tests {
             assert_eq!(add(&mut d, "rust-ci", reference, secret).err().as_deref(), Some("Sign in with Modal first."), "{reference}");
         }
         assert_eq!(send(&mut d, "/routing", &[("action", "image_remove"), ("name", "rust-ci")]).err().as_deref(), Some("Sign in with Modal first."));
+    }
+
+    /// Modal's jobs as Functions: only Modal's, only on a control plane that keeps it, and its Functions deployed in
+    /// that workspace before it is set (and again before an image is added); sandboxes need no deploy.
+    #[test]
+    fn modals_function_mode_is_checked_and_its_functions_deployed_before_it_is_set() {
+        let mode = |d: &mut Dashboard, cloud: &str, mode: &str| send(d, "/routing", &[("action", "pool"), ("cloud", cloud), ("mode", mode)]);
+        let mut d = modal_answering(serde_json::json!({ "routing": {} }));
+        let r = mode(&mut d, "modal", "function").unwrap();
+        assert!(r.status == 409 && words_of(&r).contains("Function mode needs a newer control plane"), "{}", words_of(&r));
+        let mut d = modal_answering(serde_json::json!({ "routing": {}, "function_mode": true }));
+        for (cloud, m, says) in [("aws", "function", "Only Modal has a mode"), ("modal", "fast", "A mode is function or sandbox")] {
+            let r = mode(&mut d, cloud, m).unwrap();
+            assert!(r.status == 400 && words_of(&r).contains(says), "{cloud} {m}: {}", words_of(&r));
+        }
+        // Its Functions first, with that workspace's sign-in; sandboxes: straight to the one write.
+        assert_eq!(mode(&mut d, "modal:initech", "function").err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
+        assert_eq!(mode(&mut d, "modal", "function").err().as_deref(), Some("Sign in with Modal first."));
+        assert_eq!(mode(&mut d, "modal:initech", "sandbox").err().as_deref(), Some("Sign in with Modal first."));
+        // An image added while a workspace runs Functions: its Function there first.
+        let mut d = modal_answering(serde_json::json!({ "routing": { "order": [{ "cloud": "modal:initech", "function": true }] }, "runner_images": true, "function_mode": true }));
+        let r = send(&mut d, "/routing", &[("action", "image_add"), ("name", "rust-ci"), ("reference", "ghcr.io/acme/ci:1"), ("modal_secret", "")]);
+        assert_eq!(r.err().as_deref(), Some("Sign in with Modal to the workspace initech first: `superci login modal --add`."));
     }
 
     #[test]
