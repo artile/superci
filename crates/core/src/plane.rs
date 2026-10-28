@@ -770,7 +770,8 @@ pub struct Routing {
 pub struct RunnerImage {
     /// Where it is: a registry's address, as `docker pull` takes it.
     pub reference: String,
-    /// For a private registry: the name of a Secret in the Modal workspace with REGISTRY_USERNAME and REGISTRY_PASSWORD
+    /// For a private registry: the name of a Secret in each Modal workspace that runs jobs (`modal`, and each
+    /// `modal:<workspace>`, reads its own) with REGISTRY_USERNAME and REGISTRY_PASSWORD
     /// (Modal's names for them). Only its name is kept here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modal_secret: Option<String>,
@@ -3301,7 +3302,9 @@ impl<'a> ControlPlane<'a> {
                         // (it says back no image): its sandbox is stopped, and the job says to update it.
                         if let Some(i) = image.filter(|i| v["image"].as_str() != Some(&i.reference)) {
                             let _ = self.launcher_call(plane_url, &a, "/stop", serde_json::json!({ "id": id })).await;
-                            return Err(format!("the {} launcher is from before images of your own, and would start GitHub's runner image in place of {}: update it (`superci runners create {}`)", cloud_name(&a.cloud), i.reference, a.cloud))
+                            // (A further Modal workspace's, `modal:<workspace>`, is made again with `--account`.)
+                            let again = a.cloud.split_once(':').map_or(a.cloud.clone(), |(kind, w)| format!("{kind} --account={w}"));
+                            return Err(format!("the {} launcher is from before images of your own, and would start GitHub's runner image in place of {}: update it (`superci runners create {again}`)", cloud_name(&a.cloud), i.reference))
                         }
                         Ok(Tried::Started(id, v["kind"].as_str().unwrap_or_default().to_string()))
                     }.await,
