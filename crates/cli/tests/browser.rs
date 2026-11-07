@@ -7437,7 +7437,8 @@ fn a_change_needing_a_cloud_noted_as_ended_or_given_for_the_run_says_which() {
     let (mut child, link) = dashboard(&home);
     b.goto(&link);
     b.wait("document.querySelector('main') !== null");
-    let _ = child.kill();
+    // Reap the old dashboard before changing its saved sign-ins. Its last write must have ended.
+    drop(child);
     let mut kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     for k in ["aws", "aws_more"] { kept.as_object_mut().unwrap().remove(k); }
     for k in ["aws_ended", "cloudflare_ended", "modal_ended"] { kept[k] = true.into(); }
