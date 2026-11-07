@@ -584,6 +584,18 @@ mod tests {
         }
     }
 
+    /// Settings stay alive through point reads, including an idle scheduled sweep.
+    #[test]
+    fn modal_settings_stay_alive_without_pending_jobs() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let python = Command::new("python3").args(["-I", "-c", include_str!("../fixtures/modal/settings-retention.py")]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+        let Ok(mut python) = python else { return };
+        python.stdin.take().unwrap().write_all(include_str!("modal_plane.py").as_bytes()).unwrap();
+        let out = python.wait_with_output().unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok settings retention"), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// A job's sandbox, from the launcher or a Modal control plane, starts from GitHub's runner image, or from an image
     /// of the control plane's own: from its registry with its Secret, checked for GitHub's runner; one Modal could not
     /// make fails its job, saying why (see fixtures/modal/job-images.py). Checked with Python, if present.
