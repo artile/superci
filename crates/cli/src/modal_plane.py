@@ -129,6 +129,13 @@ async def moved():
 settings = modal.Dict.from_name(f"{NAME}-settings", create_if_missing=True)
 
 
+async def read_settings():
+    """Touch each entry so Modal's seven-day inactivity expiry cannot remove settings kept only through listings."""
+    keys = [k async for k in settings.keys.aio()]
+    values = await asyncio.gather(*(settings.get.aio(k) for k in keys))
+    return {k: v for k, v in zip(keys, values) if v is not None}
+
+
 # How many messages a container answers side by side: each by a control plane program of its own, as AWS's Lambda
 # answers its requests (each store operation atomic in itself; the upkeep already runs in a container of its own).
 SIDE_BY_SIDE = 8
@@ -157,7 +164,7 @@ class Plane:
         # dashboard wrote a moment ago): read again now, at most every second.
         unknown = fresh or (len(bearer) >= 16 and not any(k.startswith("DEVICE_KEY_") and v == bearer for k, v in values.items()))
         if time.time() - at > (1 if unknown else 10):
-            values = {k: v async for k, v in settings.items.aio()}
+            values = await read_settings()
             self.cached = (values, time.time())
         return values
 
@@ -321,6 +328,8 @@ def web():
 @app.function(image=image, schedule=modal.Period(minutes=1), timeout=600, scaledown_window=2)
 async def sweep():
     """Runs the control plane's sweep when one is due (it asks for the next one itself)."""
+    # An idle CI still needs its credentials, pools and image aliases next week.
+    await read_settings()
     due = await state.get.aio("__wake_at")
     if due is None or due > time.time() * 1000:
         return
